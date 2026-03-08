@@ -1,0 +1,16 @@
+Running 30s test @ http://localhost:3001/api/users
+  8 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.60ms  393.40us   8.71ms   87.52%
+    Req/Sec     7.12k   235.59     7.87k    84.29%
+  Latency Distribution
+     50%    1.67ms
+     75%    1.80ms
+     90%    1.91ms
+     99%    2.10ms
+  1700520 requests in 30.02s, 325.83MB read
+Requests/sec:  56654.41
+Transfer/sec:     10.86MB
+
+--- Backend Baseline Statistics ---
+Direct backend requests: 0

@@ -1,0 +1,53 @@
+---
+# Performance testing configuration for Ferrum Gateway
+# Optimized for minimal latency and maximum throughput
+
+proxies:
+  - id: "proxy-health"
+    name: "Health Check Proxy"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3001
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: true
+    auth_mode: single
+    plugins: []
+
+  - id: "proxy-users"
+    name: "Users API Proxy"
+    listen_path: "/api/users"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3001
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: true
+    auth_mode: single
+    plugins: []
+
+  - id: "proxy-data"
+    name: "Data API Proxy"
+    listen_path: "/api/data"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3001
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 10000
+    backend_write_timeout_ms: 10000
+    backend_tls_verify_server_cert: true
+    auth_mode: single
+    plugins: []
+
+consumers: []
+
+plugin_configs: []

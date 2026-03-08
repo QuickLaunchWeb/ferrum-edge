@@ -1,0 +1,216 @@
+use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use chrono::Utc;
+
+#[test]
+fn test_unique_listen_paths_valid() {
+    let config = GatewayConfig {
+        proxies: vec![
+            Proxy {
+                id: "1".into(),
+                name: None,
+                listen_path: "/api/v1".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3000,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            Proxy {
+                id: "2".into(),
+                name: None,
+                listen_path: "/api/v2".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3001,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+        consumers: vec![],
+        plugin_configs: vec![],
+        loaded_at: Utc::now(),
+    };
+    assert!(config.validate_unique_listen_paths().is_ok());
+}
+
+#[test]
+fn test_unique_listen_paths_duplicate() {
+    let config = GatewayConfig {
+        proxies: vec![
+            Proxy {
+                id: "1".into(),
+                name: None,
+                listen_path: "/api/v1".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3000,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            Proxy {
+                id: "2".into(),
+                name: None,
+                listen_path: "/api/v1".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3001,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+        consumers: vec![],
+        plugin_configs: vec![],
+        loaded_at: Utc::now(),
+    };
+    assert!(config.validate_unique_listen_paths().is_err());
+}
+
+#[test]
+fn test_route_table_sorted_by_length() {
+    let config = GatewayConfig {
+        proxies: vec![
+            Proxy {
+                id: "short".into(),
+                name: None,
+                listen_path: "/api".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3000,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            Proxy {
+                id: "long".into(),
+                name: None,
+                listen_path: "/api/v1/users".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3001,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            Proxy {
+                id: "medium".into(),
+                name: None,
+                listen_path: "/api/v1".into(),
+                backend_protocol: BackendProtocol::Http,
+                backend_host: "localhost".into(),
+                backend_port: 3002,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: AuthMode::Single,
+                plugins: vec![],
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+        consumers: vec![],
+        plugin_configs: vec![],
+        loaded_at: Utc::now(),
+    };
+    
+    let route_table = config.build_route_table();
+    assert_eq!(route_table.len(), 3);
+    
+    // Routes should be sorted by length (longest first)
+    assert_eq!(route_table[0].0, "/api/v1/users");
+    assert_eq!(route_table[0].1, "long");
+    assert_eq!(route_table[1].0, "/api/v1");
+    assert_eq!(route_table[1].1, "medium");
+    assert_eq!(route_table[2].0, "/api");
+    assert_eq!(route_table[2].1, "short");
+}
