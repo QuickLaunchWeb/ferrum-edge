@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package ferrum;
+
+service ConfigSync {
+  // DP subscribes to config updates from CP
+  rpc Subscribe(SubscribeRequest) returns (stream ConfigUpdate);
+  // DP can request a full config snapshot
+  rpc GetFullConfig(FullConfigRequest) returns (FullConfigResponse);
+}
+
+message SubscribeRequest {
+  string node_id = 1;
+}
+
+message FullConfigRequest {
+  string node_id = 1;
+}
+
+message FullConfigResponse {
+  string config_json = 1;
+  string version = 2;
+}
+
+message ConfigUpdate {
+  enum UpdateType {
+    FULL_SNAPSHOT = 0;
+    DELTA = 1;
+  }
+  UpdateType update_type = 1;
+  string config_json = 2;
+  string version = 3;
+  int64 timestamp = 4;
+}

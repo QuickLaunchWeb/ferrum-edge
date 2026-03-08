@@ -1,0 +1,171 @@
+---
+# Ferrum Gateway - Example Configuration File
+# Used with FERRUM_MODE=file
+
+proxies:
+  - id: "proxy-httpbin"
+    name: "HTTPBin Proxy"
+    listen_path: "/httpbin"
+    backend_protocol: https
+    backend_host: "httpbin.org"
+    backend_port: 443
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    backend_tls_verify_server_cert: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-stdout"
+
+  - id: "proxy-jsonplaceholder"
+    name: "JSONPlaceholder API"
+    listen_path: "/jsonapi"
+    backend_protocol: https
+    backend_host: "jsonplaceholder.typicode.com"
+    backend_port: 443
+    strip_listen_path: true
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    auth_mode: single
+    plugins: []
+
+  - id: "proxy-websocket"
+    name: "WebSocket Echo Test"
+    listen_path: "/ws-echo"
+    backend_protocol: ws
+    backend_host: "localhost"
+    backend_port: 8080
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-stdout"
+
+  - id: "proxy-websocket-secure"
+    name: "Secure WebSocket Echo Test"
+    listen_path: "/wss-echo"
+    backend_protocol: wss
+    backend_host: "localhost"
+    backend_port: 8443
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-stdout"
+
+  - id: "proxy-protected"
+    name: "Protected API"
+    listen_path: "/protected"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3001
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-keyauth"
+      - plugin_config_id: "plugin-acl"
+      - plugin_config_id: "plugin-ratelimit"
+      - plugin_config_id: "plugin-stdout"
+
+  - id: "proxy-multi-auth"
+    name: "Multi-Auth API"
+    listen_path: "/multi-auth"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3002
+    strip_listen_path: true
+    auth_mode: multi
+    plugins:
+      - plugin_config_id: "plugin-jwtauth"
+      - plugin_config_id: "plugin-keyauth"
+      - plugin_config_id: "plugin-acl"
+      - plugin_config_id: "plugin-stdout"
+
+consumers:
+  - id: "consumer-alice"
+    username: "alice"
+    custom_id: "alice-001"
+    credentials:
+      keyauth:
+        key: "alice-secret-api-key-12345"
+      jwt:
+        secret: "alice-jwt-secret-key"
+      basicauth:
+        password_hash: "$2b$12$LJ3m4ys3Lk0TSwHjOHRHOeUK/6Nh1GUz8QLXfYcR8x0e3kYzLhWS"
+
+  - id: "consumer-bob"
+    username: "bob"
+    custom_id: "bob-002"
+    credentials:
+      keyauth:
+        key: "bob-secret-api-key-67890"
+      jwt:
+        secret: "bob-jwt-secret-key"
+
+plugin_configs:
+  - id: "plugin-stdout"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+
+  - id: "plugin-keyauth"
+    plugin_name: "key_auth"
+    config:
+      key_location: "header:X-API-Key"
+    scope: proxy
+    proxy_id: "proxy-protected"
+    enabled: true
+
+  - id: "plugin-jwtauth"
+    plugin_name: "jwt_auth"
+    config:
+      token_lookup: "header:Authorization"
+      consumer_claim_field: "sub"
+    scope: proxy
+    proxy_id: "proxy-multi-auth"
+    enabled: true
+
+  - id: "plugin-acl"
+    plugin_name: "access_control"
+    config:
+      allowed_consumers:
+        - "alice"
+        - "bob"
+      disallowed_consumers: []
+    scope: proxy
+    proxy_id: "proxy-protected"
+    enabled: true
+
+  - id: "plugin-ratelimit"
+    plugin_name: "rate_limiting"
+    config:
+      limit_by: "consumer"
+      requests_per_second: 10
+      requests_per_minute: 100
+    scope: proxy
+    proxy_id: "proxy-protected"
+    enabled: true
+
+  - id: "plugin-req-transform"
+    plugin_name: "request_transformer"
+    config:
+      rules:
+        - operation: add
+          target: header
+          key: "X-Gateway"
+          value: "Ferrum"
+    scope: global
+    enabled: true
+
+  - id: "plugin-resp-transform"
+    plugin_name: "response_transformer"
+    config:
+      rules:
+        - operation: add
+          target: header
+          key: "X-Powered-By"
+          value: "Ferrum-Gateway"
+    scope: global
+    enabled: true

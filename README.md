@@ -1,2 +1,613 @@
-# ferrum-gateway
-Ferrum Gateway - Rust API Gateway | Proxy layer built on hyper and tokio
+# Ferrum Gateway
+
+A high-performance API Gateway and Reverse Proxy built in Rust, powered by `tokio` and `hyper`.
+
+## Overview
+
+Ferrum Gateway is a lightweight, extensible API gateway designed for modern microservice architectures. It provides dynamic routing, protocol flexibility (HTTP, WebSocket, gRPC), a robust plugin system with authentication, authorization, rate limiting, and request/response transformation capabilities. It supports multiple deployment topologies through its operating modes — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
+
+## Features
+
+- **Multiple Operating Modes**: Database, File, Control Plane (CP), and Data Plane (DP) modes
+- **Protocol Support**: HTTP/1.1, HTTP/2, WebSocket (`ws`/`wss`), and gRPC proxying
+- **Longest Prefix Match Routing**: Efficient route matching with unique `listen_path` enforcement
+- **Dynamic Configuration**: Zero-downtime configuration reloads via DB polling, SIGHUP signals, or CP push
+- **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
+- **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
+- **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
+- **DNS Caching**: In-memory async DNS cache with startup warmup, per-proxy TTL overrides, and static overrides
+- **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
+- **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
+- **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
+- **Observability**: Structured JSON logging via the `tracing` ecosystem and runtime metrics endpoint
+
+## Operating Modes
+
+### Database Mode (`FERRUM_MODE=database`)
+
+A single gateway instance reads configuration from a database, handles proxy traffic, and serves the Admin API.
+
+**Use case**: Single-node or small-scale deployments where simplicity is preferred.
+
+- Connects to PostgreSQL, MySQL, or SQLite
+- Polls the database periodically for configuration changes
+- Maintains an in-memory cache for resilience during DB outages
+- Serves both proxy traffic and Admin API
+
+### File Mode (`FERRUM_MODE=file`)
+
+A gateway instance reads its entire configuration from a local YAML or JSON file. No Admin API is exposed.
+
+**Use case**: Development, testing, or immutable infrastructure deployments (e.g., Kubernetes ConfigMaps).
+
+- Reads config from `FERRUM_FILE_CONFIG_PATH`
+- Reloads on `SIGHUP` signal
+- Failed reloads keep the previous valid configuration
+- Only proxy traffic listeners are active
+
+### Control Plane Mode (`FERRUM_MODE=cp`)
+
+Acts as the centralized configuration authority. Reads from the database, serves the Admin API, and pushes configuration to Data Plane nodes via gRPC. Does **not** handle proxy traffic.
+
+**Use case**: Distributed deployments where configuration management is separated from traffic handling.
+
+- Serves Admin API and gRPC config distribution
+- Authenticates DP nodes via HS256 JWT
+- Pushes config updates to all subscribed DP nodes
+- Caches config for resilience during DB outages
+
+### Data Plane Mode (`FERRUM_MODE=dp`)
+
+Handles proxy traffic only, receiving its configuration from a Control Plane node. No database access or Admin API.
+
+**Use case**: Horizontally scalable traffic processing nodes in a distributed deployment.
+
+- Connects to CP via gRPC with JWT authentication
+- Receives initial config and subsequent updates
+- Continues serving with cached config if CP connection is lost
+- Automatically reconnects to CP
+
+## Prerequisites
+
+- **Rust** toolchain (latest stable, 1.75+)
+- **Database** (optional): PostgreSQL, MySQL, or SQLite (for database and CP modes)
+- **protoc** (Protocol Buffers compiler) for gRPC code generation
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/your-org/ferrum-gateway.git
+cd ferrum-gateway
+
+# Build in release mode
+cargo build --release
+
+# The binary is at target/release/ferrum-gateway
+```
+
+## Getting Started
+
+### File Mode (quickest start)
+
+```bash
+# Run with the example configuration
+FERRUM_MODE=file \
+FERRUM_FILE_CONFIG_PATH=examples/config.yaml \
+FERRUM_LOG_LEVEL=info \
+cargo run --release
+```
+
+### Database Mode (SQLite)
+
+```bash
+FERRUM_MODE=database \
+FERRUM_DB_TYPE=sqlite \
+FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
+FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
+FERRUM_LOG_LEVEL=info \
+cargo run --release
+```
+
+### Database Mode (PostgreSQL)
+
+```bash
+FERRUM_MODE=database \
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@localhost/ferrum" \
+FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
+cargo run --release
+```
+
+### Control Plane + Data Plane
+
+**Control Plane:**
+```bash
+FERRUM_MODE=cp \
+FERRUM_DB_TYPE=sqlite \
+FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
+FERRUM_ADMIN_JWT_SECRET="admin-secret" \
+FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
+FERRUM_CP_GRPC_JWT_SECRET="grpc-secret" \
+cargo run --release
+```
+
+**Data Plane:**
+```bash
+FERRUM_MODE=dp \
+FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
+FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
+cargo run --release
+```
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp` |
+| `FERRUM_LOG_LEVEL` | No | `info` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
+| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
+| `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
+| `FERRUM_PROXY_TLS_CERT_PATH` | If HTTPS | — | Path to proxy TLS certificate |
+| `FERRUM_PROXY_TLS_KEY_PATH` | If HTTPS | — | Path to proxy TLS private key |
+| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
+| `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
+| `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
+| `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
+| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth |
+| `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
+| `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
+| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |
+| `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
+| `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling |
+| `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
+| `FERRUM_CP_GRPC_JWT_SECRET` | CP mode | — | HS256 secret for DP node authentication |
+| `FERRUM_DP_CP_GRPC_URL` | DP mode | — | Control Plane gRPC URL |
+| `FERRUM_DP_GRPC_AUTH_TOKEN` | DP mode | — | Pre-signed HS256 JWT for CP authentication |
+| `FERRUM_MAX_HEADER_SIZE_BYTES` | No | `16384` | Maximum request header size |
+| `FERRUM_MAX_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
+| `FERRUM_DNS_CACHE_TTL_SECONDS` | No | `300` | Default DNS cache TTL |
+| `FERRUM_DNS_OVERRIDES` | No | `{}` | JSON map of hostname→IP static overrides |
+
+### Configuration File Format (File Mode)
+
+Configuration files can be YAML or JSON. See `examples/config.yaml` for a complete example.
+
+```yaml
+proxies:
+  - id: "my-api"
+    name: "My Backend API"
+    listen_path: "/api/v1"
+    backend_protocol: http
+    backend_host: "backend-service"
+    backend_port: 3000
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "log-plugin"
+
+consumers:
+  - id: "user-1"
+    username: "alice"
+    credentials:
+      keyauth:
+        key: "alice-api-key"
+
+plugin_configs:
+  - id: "log-plugin"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+```
+
+### Database Schema
+
+When using Database or CP modes, Ferrum auto-creates the following tables on startup:
+
+- **`proxies`**: Proxy route definitions (with `UNIQUE` constraint on `listen_path`)
+- **`consumers`**: API consumer/user definitions
+- **`plugin_configs`**: Plugin configurations (global or per-proxy scoped)
+- **`proxy_plugins`**: Many-to-many linking proxies to plugin configs
+
+## Admin API
+
+### Authentication
+
+All Admin API endpoints (except `/health`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET`.
+
+Generate a token:
+```bash
+# Using any JWT library; payload can be minimal
+# Example using Node.js jsonwebtoken:
+node -e "console.log(require('jsonwebtoken').sign({sub:'admin'}, 'my-super-secret-jwt-key'))"
+```
+
+### Endpoints
+
+#### Proxies
+
+```bash
+# List all proxies
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies
+
+# Create a proxy
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "listen_path": "/new-api",
+    "backend_protocol": "http",
+    "backend_host": "backend",
+    "backend_port": 3000,
+    "strip_listen_path": true
+  }' \
+  http://localhost:9000/proxies
+
+# Get a proxy
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
+
+# Update a proxy
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"listen_path": "/new-api", "backend_host": "new-backend", "backend_port": 4000, "backend_protocol": "http"}' \
+  http://localhost:9000/proxies/{proxy_id}
+
+# Delete a proxy
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
+```
+
+#### Consumers
+
+```bash
+# List consumers
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/consumers
+
+# Create consumer
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"username": "alice", "credentials": {"keyauth": {"key": "my-key"}}}' \
+  http://localhost:9000/consumers
+
+# Update consumer credentials
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key": "new-api-key"}' \
+  http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
+
+# Delete a credential type
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
+```
+
+#### Plugin Configs
+
+```bash
+# List available plugin types
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
+
+# List all plugin configs
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins/config
+
+# Create plugin config
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plugin_name": "rate_limiting",
+    "config": {"limit_by": "ip", "requests_per_minute": 60},
+    "scope": "global",
+    "enabled": true
+  }' \
+  http://localhost:9000/plugins/config
+```
+
+#### Metrics
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/admin/metrics
+```
+
+Returns:
+```json
+{
+  "mode": "database",
+  "config_last_updated_at": "2025-01-15T10:30:00Z",
+  "config_source_status": "online",
+  "proxy_count": 5,
+  "consumer_count": 10,
+  "requests_per_second_current": 150,
+  "status_codes_last_second": {"200": 145, "404": 3, "429": 2}
+}
+```
+
+#### Health Check (Unauthenticated)
+
+```bash
+curl http://localhost:9000/health
+# Returns: {"status": "ok"}
+```
+
+## Plugin System
+
+### Lifecycle Hooks
+
+Plugins execute in a defined pipeline for each request:
+
+1. **`on_request_received`** — Called immediately when a request arrives (rate limiting executes here)
+2. **`authenticate`** — Identifies the consumer (JWT, API Key, Basic Auth, OAuth2)
+3. **`authorize`** — Checks consumer permissions (Access Control)
+4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
+5. **`after_proxy`** — Modifies the response from the backend (Response Transformer)
+6. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
+
+### Global vs. Proxy Scope
+
+- **Global** plugins apply to all proxies
+- **Proxy-scoped** plugins apply only to a specific proxy and override globals of the same plugin type
+
+### Multi-Authentication Mode
+
+When a proxy has `auth_mode: multi`, all attached authentication plugins execute sequentially. The first plugin that successfully identifies a consumer attaches that consumer's context. Subsequent auth plugins cannot overwrite it. After all auth plugins run, the Access Control plugin verifies that at least one consumer was identified.
+
+### Available Plugins
+
+#### `stdout_logging`
+
+Logs a JSON transaction summary to stdout for each request.
+
+**Config**: None required.
+
+```yaml
+plugin_name: stdout_logging
+config: {}
+```
+
+#### `http_logging`
+
+Sends the transaction summary as JSON to an external HTTP endpoint.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `endpoint_url` | String | URL to POST transaction logs to |
+| `authorization_header` | String (optional) | Authorization header value for the logging endpoint |
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://logging-service.example.com/ingest"
+  authorization_header: "Bearer log-token-123"
+```
+
+#### `transaction_debugger`
+
+Logs verbose request/response details to stdout. Enable per-proxy only for debugging.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `log_request_body` | bool | `false` | Log incoming request body |
+| `log_response_body` | bool | `false` | Log backend response body |
+
+#### `jwt_auth`
+
+Authenticates requests using HS256 JWT Bearer tokens matched against consumer credentials.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
+| `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
+
+**Consumer credential** (`jwt`):
+```yaml
+credentials:
+  jwt:
+    secret: "consumer-specific-hs256-secret"
+```
+
+#### `key_auth`
+
+Authenticates requests using an API key matched against consumer credentials.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
+
+**Consumer credential** (`keyauth`):
+```yaml
+credentials:
+  keyauth:
+    key: "the-api-key-value"
+```
+
+#### `basic_auth`
+
+Authenticates using HTTP Basic credentials with bcrypt-hashed password verification.
+
+**Config**: None required.
+
+**Consumer credential** (`basicauth`):
+```yaml
+credentials:
+  basicauth:
+    password_hash: "$2b$12$..." # bcrypt hash
+```
+
+#### `oauth2_auth`
+
+Authenticates using OAuth2 Bearer tokens via introspection or local JWKS-style validation.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `validation_mode` | String | `introspection` or `jwks` |
+| `introspection_url` | String | Token introspection endpoint URL |
+| `jwks_uri` | String | JWKS URI for key retrieval |
+| `expected_issuer` | String (optional) | Expected JWT issuer |
+| `expected_audience` | String (optional) | Expected JWT audience |
+
+#### `access_control`
+
+Authorizes requests based on the identified consumer's username.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
+| `disallowed_consumers` | String[] | Usernames explicitly denied |
+
+#### `request_transformer`
+
+Modifies request headers and query parameters before proxying.
+
+**Config**:
+```yaml
+config:
+  rules:
+    - operation: add     # add, remove, update
+      target: header     # header, query
+      key: "X-Custom"
+      value: "my-value"
+```
+
+#### `response_transformer`
+
+Modifies response headers before sending to the client.
+
+**Config**:
+```yaml
+config:
+  rules:
+    - operation: add
+      key: "X-Powered-By"
+      value: "Ferrum-Gateway"
+```
+
+#### `rate_limiting`
+
+Enforces request rate limits per time window. State is maintained in-memory per node.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `limit_by` | String | `ip` | Rate limit key: `consumer` or `ip` |
+| `requests_per_second` | u64 (optional) | — | Max requests per second |
+| `requests_per_minute` | u64 (optional) | — | Max requests per minute |
+| `requests_per_hour` | u64 (optional) | — | Max requests per hour |
+
+Returns HTTP `429 Too Many Requests` when exceeded.
+
+## Proxying Behavior
+
+### Routing
+
+Ferrum uses **longest prefix matching** on `listen_path` values. All paths must be unique. If no proxy matches, the gateway returns `404 Not Found`.
+
+### Path Forwarding
+
+- **`strip_listen_path: true`** (default): Strips the matched prefix, forwarding only the remainder
+  - Request: `/api/v1/users` with `listen_path: /api/v1` → Backend receives `/users`
+- **`strip_listen_path: false`**: Forwards the full original path
+  - Request: `/api/v1/users` → Backend receives `/api/v1/users`
+- **`backend_path`**: Optional prefix prepended to the forwarded path
+
+### WebSocket Proxying
+
+Set `backend_protocol: ws` or `wss`. Ferrum handles the HTTP Upgrade and proxies the bidirectional stream.
+
+### gRPC Proxying
+
+Set `backend_protocol: grpc`. Ferrum proxies gRPC requests over HTTP/2.
+
+## Resilience & Caching
+
+### Configuration Caching
+
+All modes maintain an in-memory cache of the last valid configuration. If the configuration source (database or CP) becomes unavailable, the gateway continues operating with the cached config.
+
+### Database Outage (Database/CP Modes)
+
+- Proxy traffic continues using cached configuration
+- Admin API write operations return `503 Service Unavailable`
+- Warnings are logged about the connection status
+- Automatic reconnection on next poll interval
+
+### CP Outage (DP Mode)
+
+- DP continues serving with its last known configuration
+- Periodic reconnection attempts (every 5 seconds)
+- Full config resynchronization on reconnect
+
+### DNS Caching
+
+- In-memory cache with configurable TTL (`FERRUM_DNS_CACHE_TTL_SECONDS`)
+- Per-proxy TTL override via `dns_cache_ttl_seconds`
+- Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
+- Non-blocking startup warmup resolves all backend hostnames
+
+## Security
+
+### TLS Configuration
+
+Ferrum supports TLS on both proxy and admin listeners:
+
+```bash
+FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem \
+FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
+FERRUM_ADMIN_TLS_CERT_PATH=/path/to/admin-cert.pem \
+FERRUM_ADMIN_TLS_KEY_PATH=/path/to/admin-key.pem
+```
+
+### Backend mTLS
+
+Configure per-proxy for mutual TLS to backends:
+```yaml
+backend_tls_client_cert_path: "/path/to/client-cert.pem"
+backend_tls_client_key_path: "/path/to/client-key.pem"
+backend_tls_verify_server_cert: true
+backend_tls_server_ca_cert_path: "/path/to/ca.pem"
+```
+
+### JWT Secrets
+
+- Use strong, randomly generated secrets for `FERRUM_ADMIN_JWT_SECRET` and `FERRUM_CP_GRPC_JWT_SECRET`
+- Store secrets securely (environment variables, secret managers)
+- Rotate secrets by updating the environment variable and restarting
+
+### Credential Hashing
+
+Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API automatically hashes plaintext passwords on creation/update.
+
+## Troubleshooting
+
+| Issue | Solution |
+|---|---|
+| `Configuration validation failed: duplicate listen_path` | Ensure all proxy `listen_path` values are unique |
+| `FERRUM_MODE not set` | Set the `FERRUM_MODE` environment variable |
+| `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` are correct |
+| `401 Unauthorized on Admin API` | Check that your JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
+| `404 Not Found on proxy request` | Verify the request path matches a configured `listen_path` prefix |
+| `502 Bad Gateway` | Backend is unreachable; check `backend_host`, `backend_port`, DNS, and timeouts |
+| `429 Too Many Requests` | Rate limit exceeded; check `rate_limiting` plugin config |
+| DP not receiving config | Verify `FERRUM_DP_GRPC_AUTH_TOKEN` is a valid JWT signed with `FERRUM_CP_GRPC_JWT_SECRET` |
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-feature`)
+3. Write tests for new functionality
+4. Ensure all tests pass (`cargo test`)
+5. Run `cargo clippy` and `cargo fmt`
+6. Submit a pull request
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
