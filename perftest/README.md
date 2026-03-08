@@ -81,7 +81,16 @@ WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./run_perf_test.sh
 
 After running the test, you'll get:
 
-- **HTML Report** (`performance_report.html`) with visual analysis
+### 📊 Visual Performance Report
+![Performance Report](perf_report_example.png)
+
+The HTML report (`performance_report.html`) provides visual analysis with:
+- **Interactive charts** for throughput and latency comparison
+- **Gateway overhead visualization** showing performance impact
+- **Detailed metrics breakdown** by endpoint and test type
+- **Performance recommendations** based on test results
+
+### 📄 Raw Data Files
 - **Raw Data** files with detailed wrk output
 - **Performance Metrics** including:
   - Requests per second (RPS)
