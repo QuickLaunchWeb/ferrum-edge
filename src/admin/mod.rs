@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::admin::jwt_auth::{JwtManager, JwtError};
@@ -36,11 +36,21 @@ pub struct AdminState {
     pub mode: String,
 }
 
-/// Start the Admin API listener.
+/// Start the Admin API listener with dual-path handling.
 pub async fn start_admin_listener(
     addr: SocketAddr,
     state: AdminState,
     shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), anyhow::Error> {
+    start_admin_listener_with_tls(addr, state, shutdown, None).await
+}
+
+/// Start the Admin API listener with optional TLS support.
+pub async fn start_admin_listener_with_tls(
+    addr: SocketAddr,
+    state: AdminState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
@@ -51,36 +61,101 @@ pub async fn start_admin_listener(
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _remote_addr)) => {
+                    Ok((stream, remote_addr)) => {
                         let state = state.clone();
+                        let tls_config = tls_config.clone();
+                        
                         tokio::spawn(async move {
-                            let io = TokioIo::new(stream);
-                            let svc = service_fn(move |req: Request<Incoming>| {
-                                let state = state.clone();
-                                async move {
-                                    handle_admin_request(req, state).await
-                                }
-                            });
-                            if let Err(e) = http1::Builder::new()
-                                .serve_connection(io, svc)
-                                .await
-                            {
-                                debug!("Admin connection error: {}", e);
+                            let result = if let Some(tls_config) = tls_config {
+                                // Handle TLS connection
+                                handle_admin_tls_connection(stream, remote_addr, state, tls_config).await
+                            } else {
+                                // Handle plain HTTP connection
+                                handle_admin_connection(stream, remote_addr, state).await
+                            };
+                            
+                            if let Err(e) = result {
+                                debug!("Admin connection handling error: {}", e);
                             }
                         });
                     }
                     Err(e) => {
-                        error!("Admin: failed to accept connection: {}", e);
+                        error!("Failed to accept admin connection: {}", e);
                     }
                 }
             }
             _ = shutdown_rx.changed() => {
                 info!("Admin API listener shutting down");
-                break;
+                return Ok(());
             }
         }
     }
+}
 
+/// Handle TLS connections for Admin API.
+async fn handle_admin_tls_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: SocketAddr,
+    state: AdminState,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio_rustls::TlsAcceptor;
+    
+    let acceptor = TlsAcceptor::from(tls_config);
+    let tls_stream = match acceptor.accept(stream).await {
+        Ok(stream) => {
+            info!("Admin TLS connection established from {}", remote_addr.ip());
+            stream
+        }
+        Err(e) => {
+            warn!("Admin TLS handshake failed from {}: {}", remote_addr.ip(), e);
+            return Err(e.into());
+        }
+    };
+    
+    // Convert TLS stream to TokioIo for hyper
+    let io = hyper_util::rt::TokioIo::new(tls_stream);
+    
+    // Use the same HTTP service function
+    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let state = state.clone();
+        async move {
+            handle_admin_request(req, state).await
+        }
+    });
+
+    // Serve the HTTP service over TLS
+    let conn = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, svc);
+    
+    if let Err(e) = conn.await {
+        error!("Admin HTTP connection error over TLS: {}", e);
+    }
+    
+    Ok(())
+}
+
+/// Handle a single admin connection.
+async fn handle_admin_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: SocketAddr,
+    state: AdminState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let io = TokioIo::new(stream);
+    let svc = service_fn(move |req: Request<Incoming>| {
+        let state = state.clone();
+        async move {
+            handle_admin_request(req, state).await
+        }
+    });
+    
+    if let Err(e) = http1::Builder::new()
+        .serve_connection(io, svc)
+        .await
+    {
+        error!("Admin HTTP connection error: {}", e);
+    }
+    
     Ok(())
 }
 

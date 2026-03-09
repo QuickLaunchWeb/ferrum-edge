@@ -141,7 +141,30 @@ The proxy engine handles all request routing and processing with **consistent se
 - **Rate limiting plugins** prevent WebSocket connection abuse
 - **Logging plugins** provide complete audit trail for WebSocket connections
 
-### **3. Connection Pool (`src/connection_pool.rs`)**
+### **3. Frontend TLS (`src/tls/mod.rs`)**
+
+TLS configuration for client connections with optional mutual authentication:
+
+**Key Features**:
+- HTTP/HTTPS dual-mode operation
+- Server certificate presentation for HTTPS
+- Optional client certificate verification for mTLS
+- Global environment variable configuration
+- Support for all operating modes
+
+**TLS Modes**:
+- **HTTP**: Plain text connections on dedicated port (default 8000)
+- **HTTPS**: Encrypted connections with server authentication on dedicated port (default 8443)
+- **mTLS**: Encrypted connections with mutual authentication on HTTPS port
+
+**Listener Architecture**:
+- **Separate HTTP and HTTPS listeners** for clear protocol separation
+- **HTTP listener**: Always enabled, handles plain text traffic
+- **HTTPS listener**: Enabled only when TLS certificates are configured
+- **No protocol conflicts**: Each listener handles its protocol exclusively
+- **Standard port conventions**: HTTP (8000), HTTPS (8443), both configurable
+
+### **4. Connection Pool (`src/connection_pool.rs`)**
 
 High-performance HTTP client connection pooling with backend mTLS support:
 

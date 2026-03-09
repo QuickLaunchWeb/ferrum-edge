@@ -80,6 +80,15 @@ pub struct EnvConfig {
     pub backend_tls_client_cert_path: Option<String>,
     /// Path to a PEM file containing the client key for backend TLS verification
     pub backend_tls_client_key_path: Option<String>,
+    /// Path to a PEM file containing trusted CA certificates for client certificate verification
+    pub frontend_tls_client_ca_bundle_path: Option<String>,
+    
+    /// Admin API TLS client CA bundle for mTLS verification
+    pub admin_tls_client_ca_bundle_path: Option<String>,
+    /// Disable backend TLS certificate verification (for testing only)
+    pub backend_tls_no_verify: bool,
+    /// Disable admin TLS certificate verification (for testing only)
+    pub admin_tls_no_verify: bool,
 }
 
 impl EnvConfig {
@@ -131,6 +140,14 @@ impl EnvConfig {
             backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),
             backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
             backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
+            
+            // Global Frontend mTLS (client certificate verification)
+            frontend_tls_client_ca_bundle_path: env::var("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH").ok(),
+            
+            // Admin API TLS enhancements
+            admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH").ok(),
+            backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default() == "true",
+            admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default() == "true",
         };
 
         config.validate()?;

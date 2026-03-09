@@ -129,6 +129,12 @@
 - 🛠️ **Features**: Unified plugin pipeline, full auth/authz support, rate limiting, complete logging
 - 🎯 **Impact**: WebSocket endpoints now protected by same security model as HTTP
 
+### **🔐 Frontend TLS/mTLS**
+- ✅ **Status**: Implemented
+- 📋 **Requirement**: TLS and mutual TLS for client connections
+- 🛠️ **Features**: HTTPS support, optional client certificate verification, global configuration
+- 🎯 **Impact**: Encrypted client connections with optional mutual authentication
+
 ---
 
 ## **❌ NOT IMPLEMENTED (Missing Features)**
@@ -198,6 +204,7 @@ The Ferrum Gateway is **production-ready for most use cases** with:
 - ✅ Robust configuration management
 - ✅ Backend mTLS authentication with global and per-proxy configuration
 - ✅ Custom CA bundle support for backend TLS verification
+- ✅ Frontend TLS/mTLS support for encrypted client connections
 - ✅ Comprehensive logging and basic metrics
 
 **This is a highly functional API gateway that meets the majority of enterprise requirements!** 🎉

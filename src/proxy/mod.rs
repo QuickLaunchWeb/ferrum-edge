@@ -461,6 +461,16 @@ pub async fn start_proxy_listener(
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls(addr, state, shutdown, None).await
+}
+
+/// Start the proxy listener with optional TLS and client certificate verification.
+pub async fn start_proxy_listener_with_tls(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), anyhow::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!("Proxy listener started on {}", addr);
 
@@ -472,8 +482,18 @@ pub async fn start_proxy_listener(
                 match result {
                     Ok((stream, remote_addr)) => {
                         let state = state.clone();
+                        let tls_config = tls_config.clone();
+                        
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, remote_addr, state).await {
+                            let result = if let Some(tls_config) = tls_config {
+                                // Handle TLS connection with client certificate verification
+                                handle_tls_connection(stream, remote_addr, state, tls_config).await
+                            } else {
+                                // Handle plain HTTP connection
+                                handle_connection(stream, remote_addr, state).await
+                            };
+                            
+                            if let Err(e) = result {
                                 debug!("Connection handling error: {}", e);
                             }
                         });
@@ -485,11 +505,59 @@ pub async fn start_proxy_listener(
             }
             _ = shutdown_rx.changed() => {
                 info!("Proxy listener shutting down");
-                break;
+                return Ok(());
             }
         }
     }
+}
 
+/// Handle TLS connections with client certificate verification.
+async fn handle_tls_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: SocketAddr,
+    state: ProxyState,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio_rustls::TlsAcceptor;
+    
+    let acceptor = TlsAcceptor::from(tls_config);
+    let tls_stream = match acceptor.accept(stream).await {
+        Ok(stream) => {
+            info!("TLS connection established with client certificate verification from {}", remote_addr.ip());
+            stream
+        }
+        Err(e) => {
+            warn!("TLS handshake failed from {}: {}", remote_addr.ip(), e);
+            return Err(e.into());
+        }
+    };
+    
+    // Convert TLS stream to TokioIo for hyper
+    let io = hyper_util::rt::TokioIo::new(tls_stream);
+    
+    // Use the same HTTP service function
+    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        let state = state.clone();
+        let addr = remote_addr;
+        async move {
+            // Check if this is a WebSocket upgrade request
+            if is_websocket_upgrade(&req) {
+                debug!("Detected WebSocket upgrade request over TLS, routing to WebSocket handler");
+                handle_websocket_request(req, state, addr).await
+            } else {
+                handle_proxy_request(req, state, addr).await
+            }
+        }
+    });
+
+    // Serve the HTTP service over TLS
+    let conn = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, svc);
+    
+    if let Err(e) = conn.await {
+        error!("HTTP connection error over TLS: {}", e);
+    }
+    
     Ok(())
 }
 

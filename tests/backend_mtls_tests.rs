@@ -82,6 +82,7 @@ fn create_test_env_config_with_mtls(cert_path: Option<String>, key_path: Option<
         backend_tls_ca_bundle_path: None,
         backend_tls_client_cert_path: cert_path,
         backend_tls_client_key_path: key_path,
+        frontend_tls_client_ca_bundle_path: None,
     }
 }
 

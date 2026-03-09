@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use anyhow::Result;
+use tracing::warn;
 
 /// Connection pool entry with client and last used timestamp
 #[derive(Clone)]
@@ -103,13 +104,19 @@ impl ConnectionPool {
             client_builder = client_builder.http2_prior_knowledge(); // WebSockets work better with HTTP/1.1
         }
 
-        // Add custom CA bundle for server certificate verification
-        if let Some(ca_bundle_path) = &self.global_mtls_config.backend_tls_ca_bundle_path {
-            let ca_pem = std::fs::read_to_string(ca_bundle_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e))?;
-            let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
-                .map_err(|e| anyhow::anyhow!("Failed to parse CA bundle: {}", e))?;
-            client_builder = client_builder.add_root_certificate(certificate);
+        // Add custom CA bundle for server certificate verification (unless no_verify is set)
+        if !self.global_mtls_config.backend_tls_no_verify {
+            if let Some(ca_bundle_path) = &self.global_mtls_config.backend_tls_ca_bundle_path {
+                let ca_pem = std::fs::read_to_string(ca_bundle_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e))?;
+                let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse CA bundle: {}", e))?;
+                client_builder = client_builder.add_root_certificate(certificate);
+            }
+        } else {
+            // Danger: Disable certificate verification (for testing only)
+            warn!("Backend TLS certificate verification DISABLED (testing mode)");
+            client_builder = client_builder.danger_accept_invalid_certs(true);
         }
 
         // Add client certificate for mTLS (proxy-specific overrides take priority)
@@ -307,6 +314,7 @@ mod tests {
             backend_tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
+            frontend_tls_client_ca_bundle_path: None,
         };
         let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
@@ -351,6 +359,7 @@ mod tests {
             backend_tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
+            frontend_tls_client_ca_bundle_path: None,
         };
         let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
