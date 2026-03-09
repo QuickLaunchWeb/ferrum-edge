@@ -123,16 +123,23 @@ The configuration system provides flexible configuration management through mult
 
 ### **2. Proxy Engine (`src/proxy/`)**
 
-The proxy engine handles all request routing and processing:
-
-- **`mod.rs`**: Contains `ProxyState` - the main state management structure
-- **`handler.rs`**: HTTP request/response processing logic
+The proxy engine handles all request routing and processing with **consistent security for HTTP and WebSocket**:
 
 **Key Features**:
 - Longest prefix match routing
 - Protocol translation (HTTP ↔ WebSocket)
 - Request/response transformation
-- Plugin pipeline execution
+- **Unified plugin pipeline** for HTTP and WebSocket requests
+- **Full authentication and authorization** for WebSocket connections
+- **Rate limiting** applies to WebSocket connections
+- **Complete logging** of WebSocket connections
+
+**Security Model**:
+- **WebSocket requests** go through the same plugin pipeline as HTTP requests
+- **Authentication plugins** (key_auth, jwt_auth, etc.) protect WebSocket endpoints
+- **Authorization plugins** (access_control) enforce IP restrictions on WebSocket connections
+- **Rate limiting plugins** prevent WebSocket connection abuse
+- **Logging plugins** provide complete audit trail for WebSocket connections
 
 ### **3. Connection Pool (`src/connection_pool.rs`)**
 

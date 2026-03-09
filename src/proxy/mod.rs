@@ -220,6 +220,106 @@ async fn handle_websocket_request(
     Ok(upgrade_response)
 }
 
+/// Handle WebSocket requests AFTER authentication and authorization plugins have run
+async fn handle_websocket_request_authenticated(
+    req: Request<Incoming>,
+    state: ProxyState,
+    remote_addr: SocketAddr,
+    proxy: Proxy,
+    ctx: RequestContext,
+    plugins: Vec<Arc<dyn Plugin>>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    info!("WebSocket upgrade request authenticated for proxy: {} from: {}", proxy.id, remote_addr.ip());
+    
+    // Record successful WebSocket connection attempt
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    record_status(&state, 101); // Switching Protocols
+    
+    // Get backend URL
+    let backend_url = match proxy.backend_protocol {
+        BackendProtocol::Ws => format!("ws://{}:{}", proxy.backend_host, proxy.backend_port),
+        BackendProtocol::Wss => format!("wss://{}:{}", proxy.backend_host, proxy.backend_port),
+        _ => unreachable!(), // We already checked this above
+    };
+    
+    // Log the WebSocket connection attempt
+    let start_time = std::time::Instant::now();
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    
+    // Build transaction summary for logging
+    let summary = TransactionSummary {
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        http_method: "GET".to_string(), // WebSocket upgrades are always GET
+        request_path: ctx.path.clone(),
+        matched_proxy_id: Some(proxy.id.clone()),
+        matched_proxy_name: proxy.name.clone(),
+        backend_target_url: Some(strip_query_params(&backend_url)),
+        response_status_code: 101, // Switching Protocols
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: total_ms,
+        latency_backend_ttfb_ms: 0.0, // Not applicable for WebSocket upgrade
+        latency_backend_total_ms: 0.0, // Not applicable for WebSocket upgrade
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        metadata: ctx.metadata.clone(),
+    };
+
+    // Log the successful WebSocket connection (after auth)
+    for plugin in &plugins {
+        plugin.log(&summary).await;
+    }
+    
+    // Get the upgrade parts from the request
+    let (mut parts, _body) = req.into_parts();
+    
+    // Extract the OnUpgrade future
+    let on_upgrade = match parts.extensions.remove::<OnUpgrade>() {
+        Some(on_upgrade) => on_upgrade,
+        None => {
+            error!("Failed to extract OnUpgrade extension from WebSocket request");
+            return Ok(build_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Internal server error during WebSocket upgrade"}"#,
+            ));
+        }
+    };
+    
+    // Create the upgrade response with proper headers
+    let upgrade_response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-accept", derive_accept_key(
+            parts.headers.get("sec-websocket-key")
+                .and_then(|k| k.to_str().ok())
+                .unwrap_or("")
+                .as_bytes()
+        ))
+        .body(Full::new(Bytes::from("")))
+        .unwrap();
+
+    // Spawn the WebSocket proxying task
+    let proxy_id = proxy.id.clone();
+    let backend_url_for_spawn = backend_url.clone();
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                if let Err(e) = handle_websocket_proxying(upgraded, &backend_url_for_spawn, &proxy_id).await {
+                    error!("WebSocket proxying error for {}: {}", proxy_id, e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to upgrade WebSocket connection for {}: {}", proxy_id, e);
+            }
+        }
+    });
+
+    info!("WebSocket upgrade response sent for authenticated connection: {} -> {}", proxy.id, backend_url);
+    
+    Ok(upgrade_response)
+}
+
 /// Handle actual WebSocket proxying after connection upgrade
 async fn handle_websocket_proxying(
     upgraded: Upgraded,
@@ -439,11 +539,6 @@ async fn handle_proxy_request(
         }
     };
 
-    // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
-    if is_websocket_upgrade(&req) && matches!(proxy.backend_protocol, BackendProtocol::Ws | BackendProtocol::Wss) {
-        return handle_websocket_request(req, state, remote_addr).await;
-    }
-
     ctx.matched_proxy = Some(proxy.clone());
 
     // Resolve plugins for this proxy
@@ -535,6 +630,12 @@ async fn handle_proxy_request(
             }
             PluginResult::Continue => {}
         }
+    }
+
+    // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
+    // This check happens AFTER authentication and authorization plugins have run
+    if is_websocket_upgrade(&req) && matches!(proxy.backend_protocol, BackendProtocol::Ws | BackendProtocol::Wss) {
+        return handle_websocket_request_authenticated(req, state, remote_addr, proxy, ctx, plugins).await;
     }
 
     // Build backend URL

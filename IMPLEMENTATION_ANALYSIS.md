@@ -123,6 +123,12 @@
 - 🛠️ **Features**: Global environment variables, per-proxy overrides, connection pooling support
 - 🎯 **Impact**: Can authenticate to mTLS-protected backends
 
+### **🔒 WebSocket Security**
+- ✅ **Status**: Implemented
+- 📋 **Requirement**: Authentication and authorization for WebSocket connections
+- 🛠️ **Features**: Unified plugin pipeline, full auth/authz support, rate limiting, complete logging
+- 🎯 **Impact**: WebSocket endpoints now protected by same security model as HTTP
+
 ---
 
 ## **❌ NOT IMPLEMENTED (Missing Features)**
@@ -185,8 +191,8 @@
 The Ferrum Gateway is **production-ready for most use cases** with:
 
 - ✅ Complete HTTP/1.1 and HTTP/2 proxying
-- ✅ Full WebSocket (ws:// and wss://) support
-- ✅ All authentication and authorization plugins
+- ✅ Full WebSocket (ws:// and wss://) support with unified security model
+- ✅ All authentication and authorization plugins protect WebSocket endpoints
 - ✅ Complete Admin API with JWT security
 - ✅ All operating modes (DB, File, CP, DP)
 - ✅ Robust configuration management
