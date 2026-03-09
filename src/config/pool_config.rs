@@ -10,6 +10,7 @@ pub struct PoolConfig {
     pub idle_timeout_seconds: u64,
     pub enable_http_keep_alive: bool,
     pub enable_http2: bool,
+    pub tcp_keepalive_seconds: u64,
 }
 
 impl Default for PoolConfig {
@@ -19,6 +20,7 @@ impl Default for PoolConfig {
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,
+            tcp_keepalive_seconds: 60,
         }
     }
 }
@@ -49,6 +51,12 @@ impl PoolConfig {
             config.enable_http2 = val.parse::<bool>().unwrap_or(true);
         }
         
+        if let Ok(val) = env::var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS") {
+            if let Ok(parsed) = val.parse::<u64>() {
+                config.tcp_keepalive_seconds = parsed;
+            }
+        }
+        
         config
     }
     
@@ -71,6 +79,10 @@ impl PoolConfig {
         
         if let Some(val) = proxy.pool_enable_http2 {
             config.enable_http2 = val;
+        }
+        
+        if let Some(val) = proxy.pool_tcp_keepalive_seconds {
+            config.tcp_keepalive_seconds = val;
         }
         
         config
@@ -114,6 +126,7 @@ mod tests {
             pool_idle_timeout_seconds: None,
             pool_enable_http_keep_alive: None,
             pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -124,6 +137,7 @@ mod tests {
         let config = PoolConfig::default();
         assert_eq!(config.max_idle_per_host, 10);
         assert_eq!(config.idle_timeout_seconds, 90);
+        assert_eq!(config.tcp_keepalive_seconds, 60);
         assert!(config.enable_http_keep_alive);
         assert!(config.enable_http2);
     }
@@ -136,10 +150,12 @@ mod tests {
         // Apply overrides
         proxy.pool_max_idle_per_host = Some(25);
         proxy.pool_enable_http2 = Some(false);
+        proxy.pool_tcp_keepalive_seconds = Some(30);
         
         let config = global.for_proxy(&proxy);
         assert_eq!(config.max_idle_per_host, 25);
         assert_eq!(config.idle_timeout_seconds, 90); // unchanged
+        assert_eq!(config.tcp_keepalive_seconds, 30); // overridden
         assert!(config.enable_http_keep_alive); // unchanged
         assert!(!config.enable_http2); // overridden
     }
@@ -152,6 +168,7 @@ mod tests {
         let config = global.for_proxy(&proxy);
         assert_eq!(config.max_idle_per_host, global.max_idle_per_host);
         assert_eq!(config.idle_timeout_seconds, global.idle_timeout_seconds);
+        assert_eq!(config.tcp_keepalive_seconds, global.tcp_keepalive_seconds);
         assert_eq!(config.enable_http_keep_alive, global.enable_http_keep_alive);
         assert_eq!(config.enable_http2, global.enable_http2);
     }

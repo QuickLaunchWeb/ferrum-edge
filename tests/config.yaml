@@ -18,6 +18,7 @@ proxies:
     # Override global defaults for this high-traffic external API
     pool_max_idle_per_host: 25
     pool_idle_timeout_seconds: 120
+    pool_tcp_keepalive_seconds: 45
     # pool_enable_http_keep_alive and pool_enable_http2 use global defaults
     auth_mode: single
     plugins:
@@ -47,6 +48,7 @@ proxies:
     # Override global defaults for WebSocket connections
     pool_max_idle_per_host: 10
     pool_idle_timeout_seconds: 300
+    pool_tcp_keepalive_seconds: 90  # Longer keep-alive for persistent WebSocket connections
     pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
     # pool_enable_http_keep_alive uses global default (true)
     auth_mode: single
@@ -63,6 +65,7 @@ proxies:
     # Override global defaults for secure WebSocket connections
     pool_max_idle_per_host: 10
     pool_idle_timeout_seconds: 300
+    pool_tcp_keepalive_seconds: 90  # Longer keep-alive for persistent WebSocket connections
     pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
     auth_mode: single
     plugins:

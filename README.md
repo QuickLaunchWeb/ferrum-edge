@@ -270,6 +270,7 @@ FERRUM_POOL_MAX_IDLE_PER_HOST=10
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=true
+FERRUM_POOL_TCP_KEEPALIVE_SECONDS=60
 ```
 
 #### Per-Proxy Overrides (Optional)
@@ -279,6 +280,7 @@ proxies:
     # Override specific settings for this proxy
     pool_max_idle_per_host: 50
     pool_enable_http2: false
+    pool_tcp_keepalive_seconds: 30
     # Other settings use global defaults
 ```
 
@@ -298,6 +300,7 @@ proxies:
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse |
 | `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
+| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 
 ### Protocol-Specific Recommendations
 

@@ -87,7 +87,7 @@ impl ConnectionPool {
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
-            .tcp_keepalive(Duration::from_secs(60));
+            .tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
 
         // Enable HTTP/2 if configured
         if config.enable_http2 {
@@ -96,7 +96,7 @@ impl ConnectionPool {
 
         // Enable HTTP keep-alive
         if config.enable_http_keep_alive {
-            client_builder = client_builder.tcp_keepalive(Duration::from_secs(60));
+            client_builder = client_builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
         }
 
         // Configure WebSocket support
@@ -280,6 +280,7 @@ mod tests {
             pool_idle_timeout_seconds: None,
             pool_enable_http_keep_alive: None,
             pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

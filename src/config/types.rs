@@ -94,6 +94,8 @@ pub struct Proxy {
     pub pool_enable_http_keep_alive: Option<bool>,
     #[serde(default)]
     pub pool_enable_http2: Option<bool>,
+    #[serde(default)]
+    pub pool_tcp_keepalive_seconds: Option<u64>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
