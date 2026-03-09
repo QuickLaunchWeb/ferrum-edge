@@ -156,6 +156,7 @@ TLS configuration for client connections with optional mutual authentication:
 - **HTTP**: Plain text connections on dedicated port (default 8000)
 - **HTTPS**: Encrypted connections with server authentication on dedicated port (default 8443)
 - **mTLS**: Encrypted connections with mutual authentication on HTTPS port
+- **No-Verify Mode**: Testing mode with disabled certificate verification
 
 **Listener Architecture**:
 - **Separate HTTP and HTTPS listeners** for clear protocol separation
@@ -163,6 +164,31 @@ TLS configuration for client connections with optional mutual authentication:
 - **HTTPS listener**: Enabled only when TLS certificates are configured
 - **No protocol conflicts**: Each listener handles its protocol exclusively
 - **Standard port conventions**: HTTP (8000), HTTPS (8443), both configurable
+
+### **3.1 Admin API Listeners (`src/admin/mod.rs`)**
+
+Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
+
+**Key Features**:
+- **Separate Admin Listeners**: Independent from proxy listeners
+- **Admin HTTP**: Always enabled on port 9000 (configurable)
+- **Admin HTTPS**: Enabled when admin TLS certificates are configured on port 9443 (configurable)
+- **Admin mTLS**: Client certificate verification for admin access
+- **JWT Authentication**: Required on both HTTP and HTTPS endpoints
+- **No-Verify Mode**: Testing mode for admin API TLS
+
+**Admin Listener Architecture**:
+- **Admin HTTP Listener**: `FERRUM_ADMIN_HTTP_PORT` (default 9000)
+- **Admin HTTPS Listener**: `FERRUM_ADMIN_HTTPS_PORT` (default 9443)
+- **Admin TLS Certificates**: `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`
+- **Admin Client CA Bundle**: `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` for mTLS
+- **Admin No-Verify**: `FERRUM_ADMIN_TLS_NO_VERIFY` for testing
+
+**Operating Mode Support**:
+- **Database Mode**: Full admin API with HTTP/HTTPS/mTLS
+- **Control Plane Mode**: Full admin API with HTTP/HTTPS/mTLS
+- **File Mode**: No admin API (proxy only)
+- **Data Plane Mode**: No admin API (proxy only)
 
 ### **4. Connection Pool (`src/connection_pool.rs`)**
 
@@ -172,6 +198,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - Connection reuse and keep-alive
 - Backend mTLS authentication with client certificates
 - Custom CA bundle support for server certificate verification
+- No-Verify mode for testing environments (`FERRUM_BACKEND_TLS_NO_VERIFY`)
 - Per-proxy connection configuration
 - DNS resolution integration
 - Connection statistics and monitoring

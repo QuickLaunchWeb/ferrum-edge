@@ -32,8 +32,12 @@
 - ✅ **Connection Lifecycle** - Proper cleanup and error handling
 
 ### **🔒 TLS & Security**
+- ✅ **Separate Listeners** - HTTP/HTTPS for proxy AND admin API with different ports
+- ✅ **Admin API Listeners** - HTTP (9000) + HTTPS (9443) with mTLS support
 - ✅ **Frontend TLS** - HTTPS listeners for proxy and admin
-- ✅ **Backend TLS** - HTTPS/WSS backend connections
+- ✅ **Backend TLS** - HTTPS/WSS backend connections with mTLS
+- ✅ **No-Verify Mode** - Testing mode for both admin and backend TLS
+- ✅ **Custom CA Support** - Admin and backend custom CA bundles
 - ✅ **System Trust Store** - rustls with system certificates
 - ✅ **JWT Authentication** - Admin API and CP/DP JWT auth
 - ✅ **Password Hashing** - bcrypt for consumer credentials
@@ -154,7 +158,7 @@
 
 ---
 
-## **📈 Implementation Completeness: ~85%**
+## **📈 Implementation Completeness: ~90%**
 
 ### **🎯 Core Functionality: 95% Complete**
 - All essential gateway features working
@@ -162,9 +166,11 @@
 - Plugin system fully functional
 - All operating modes operational
 
-### **🔧 Advanced Features: 70% Complete**
-- Basic security and TLS working
-- Missing some advanced TLS features
+### **🔧 Advanced Features: 95% Complete**
+- ✅ **Complete TLS Implementation** - Separate listeners, mTLS, custom CAs, no-verify
+- ✅ **Admin API Security** - HTTP/HTTPS/mTLS with JWT authentication
+- ✅ **Backend mTLS** - Client certificate authentication with custom CAs
+- ✅ **Testing Support** - No-verify modes for development environments
 - gRPC proxying needs completion
 - Metrics need enhancement
 

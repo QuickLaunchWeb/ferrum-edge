@@ -21,6 +21,9 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/client-cert.pem"
 
 # Path to client private key file (PEM format)  
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/client-key.pem"
+
+# Disable backend TLS certificate verification (testing only)
+export FERRUM_BACKEND_TLS_NO_VERIFY="true"
 ```
 
 ### Custom CA Bundles
@@ -209,6 +212,26 @@ The mTLS implementation uses:
 - Connection reuse respects the original mTLS configuration
 
 ## Testing with Self-Signed Certificates
+
+### No-Verify Mode (Testing Only)
+
+For development and testing environments where certificate verification is not practical, you can disable backend TLS verification:
+
+```bash
+export FERRUM_BACKEND_TLS_NO_VERIFY="true"
+```
+
+**⚠️ Security Warning**: No-verify mode disables ALL certificate verification and should NEVER be used in production environments.
+
+**Use Cases:**
+- **Development**: Testing with self-signed backend certificates
+- **Staging**: Temporary environments with invalid certificates
+- **Internal Networks**: Isolated environments where verification is not needed
+
+**Gateway Behavior:**
+- Logs warning: "Backend TLS certificate verification DISABLED (testing mode)"
+- Accepts any certificate (including self-signed and expired)
+- Still uses TLS encryption, just skips verification
 
 For development and testing, you can generate self-signed certificates:
 
