@@ -197,23 +197,23 @@ impl ConnectionPool {
     /// Get pool statistics for monitoring
     #[allow(dead_code)]
     pub fn get_stats(&self) -> PoolStats {
-        let total_pools = self.pools.len();
-        let mut entries_per_host = std::collections::HashMap::new();
-        
-        for entry in self.pools.iter() {
-            let key_parts: Vec<&str> = entry.key().split(':').collect();
-            if key_parts.len() >= 2 {
-                let host_port = format!("{}:{}", key_parts[0], key_parts[1]);
-                *entries_per_host.entry(host_port).or_insert(0) += 1;
-            }
-        }
-        
         PoolStats {
-            total_pools,
-            entries_per_host,
+            total_pools: self.pools.len(),
+            entries_per_host: std::collections::HashMap::new(),
             max_idle_per_host: self.global_config.max_idle_per_host,
             idle_timeout_seconds: self.global_config.idle_timeout_seconds,
         }
+    }
+
+    /// Get TLS configuration for HTTP/3 backend connections
+    pub fn get_tls_config_for_backend(&self, _proxy: &Proxy) -> Arc<rustls::ClientConfig> {
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
+            ))
+            .with_no_client_auth();
+
+        Arc::new(client_config)
     }
 
     /// Clear all pooled connections

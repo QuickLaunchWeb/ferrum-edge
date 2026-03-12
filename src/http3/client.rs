@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use http::Request;
 use quinn::crypto::rustls::QuicClientConfig;
 use tracing::debug;
@@ -12,6 +12,7 @@ use tracing::debug;
 use crate::config::types::Proxy;
 
 /// HTTP/3 client for connecting to backend services over QUIC.
+#[derive(Clone)]
 pub struct Http3Client {
     endpoint: quinn::Endpoint,
 }
@@ -48,27 +49,36 @@ impl Http3Client {
         &self,
         proxy: &Proxy,
         method: &str,
-        path: &str,
-        headers: &std::collections::HashMap<String, String>,
-        body: Vec<u8>,
-        resolved_addr: Option<SocketAddr>,
+        backend_url: &str,
+        headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>,
+        body: bytes::Bytes,
     ) -> Result<(u16, Vec<u8>, std::collections::HashMap<String, String>), anyhow::Error> {
-        let addr = match resolved_addr {
-            Some(a) => a,
-            None => {
-                let ip: std::net::IpAddr = proxy
-                    .backend_host
-                    .parse()
-                    .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
-                SocketAddr::new(ip, proxy.backend_port)
+        // Parse URL to get host and port
+        let uri: http::Uri = backend_url.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+        
+        let host = uri.host().unwrap_or(&proxy.backend_host);
+        let port = uri.port_u16().unwrap_or(proxy.backend_port);
+        let _path = uri.path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        let addr = match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+            Ok(addrs) => addrs.into_iter().next().unwrap_or_else(|| {
+                let ip: std::net::IpAddr = host.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+                SocketAddr::new(ip, port)
+            }),
+            Err(_) => {
+                let ip: std::net::IpAddr = host.parse().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+                SocketAddr::new(ip, port)
             }
         };
 
-        let server_name = proxy.backend_host.clone();
+        let server_name = host.to_string();
 
         debug!(
             "HTTP/3 client connecting to {}:{} ({})",
-            server_name, proxy.backend_port, addr
+            server_name, port, addr
         );
 
         // Establish QUIC connection
@@ -89,11 +99,6 @@ impl Http3Client {
         });
 
         // Build the request
-        let uri = format!(
-            "https://{}:{}{}",
-            proxy.backend_host, proxy.backend_port, path
-        );
-
         let req_method = match method {
             "GET" => http::Method::GET,
             "POST" => http::Method::POST,
@@ -105,55 +110,42 @@ impl Http3Client {
             _ => http::Method::GET,
         };
 
-        let mut req_builder = Request::builder().method(req_method).uri(&uri);
+        let mut req_builder = Request::builder().method(req_method).uri(backend_url);
 
-        for (k, v) in headers {
-            match k.as_str() {
-                "host" | ":authority" => {
-                    if proxy.preserve_host_header {
-                        req_builder = req_builder.header("host", v.as_str());
-                    } else {
-                        req_builder = req_builder.header("host", &proxy.backend_host);
-                    }
-                }
-                "connection" | "transfer-encoding" => continue,
-                k if k.starts_with(':') => continue,
-                _ => {
-                    req_builder = req_builder.header(k, v.as_str());
-                }
-            }
+        // Add headers
+        for (name, value) in headers {
+            req_builder = req_builder.header(name, value);
         }
 
-        let req = req_builder
-            .body(())
-            .map_err(|e| anyhow::anyhow!("Failed to build request: {}", e))?;
+        let req = req_builder.body(())?;
 
         // Send request
         let mut stream = send_request.send_request(req).await?;
 
         // Send body if present
         if !body.is_empty() {
-            stream.send_data(Bytes::from(body)).await?;
+            stream.send_data(body).await?;
         }
         stream.finish().await?;
 
         // Receive response
-        let resp = stream.recv_response().await?;
-        let status = resp.status().as_u16();
+        let response = stream.recv_response().await?;
+        let status = response.status().as_u16();
 
-        let mut resp_headers = std::collections::HashMap::new();
-        for (k, v) in resp.headers() {
-            if let Ok(vs) = v.to_str() {
-                resp_headers.insert(k.as_str().to_string(), vs.to_string());
+        // Collect response headers
+        let mut response_headers = std::collections::HashMap::new();
+        for (name, value) in response.headers() {
+            if let Ok(value_str) = value.to_str() {
+                response_headers.insert(name.as_str().to_string(), value_str.to_string());
             }
         }
 
         // Collect response body
-        let mut resp_body = Vec::new();
+        let mut response_body = Vec::new();
         while let Some(chunk) = stream.recv_data().await? {
-            resp_body.extend_from_slice(chunk.chunk());
+            response_body.extend_from_slice(&chunk.chunk());
         }
 
-        Ok((status, resp_body, resp_headers))
+        Ok((status, response_body, response_headers))
     }
 }

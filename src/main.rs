@@ -15,6 +15,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // Initialize rustls crypto provider
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .expect("Failed to install crypto provider");
+    
     // Initialize tracing/logging
     let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt()

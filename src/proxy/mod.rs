@@ -25,6 +25,7 @@ use crate::dns::DnsCache;
 use crate::plugins::{
     create_plugin, Plugin, PluginResult, RequestContext, TransactionSummary,
 };
+use crate::http3::client::Http3Client;
 
 /// Check if the request is a WebSocket upgrade request
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
@@ -887,7 +888,12 @@ async fn proxy_to_backend(
         )
         .await;
 
-    // Get client from connection pool
+    // Handle HTTP/3 backend requests differently
+    if matches!(proxy.backend_protocol, BackendProtocol::H3) {
+        return proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req).await;
+    }
+
+    // Get client from connection pool for HTTP/1.1 and HTTP/2
     let client = match state.connection_pool.get_client(proxy, resolved_ip.ok()).await {
         Ok(client) => client,
         Err(e) => {
@@ -1000,4 +1006,56 @@ fn build_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
+}
+
+/// Proxy the request to an HTTP/3 backend.
+async fn proxy_to_backend_http3(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    original_req: Request<Incoming>,
+) -> (u16, Vec<u8>, HashMap<String, String>) {
+    info!("Proxying request to HTTP/3 backend: {}", backend_url);
+    
+    // Create HTTP/3 client with TLS configuration
+    let tls_config = state.connection_pool.get_tls_config_for_backend(proxy);
+    let http3_client = match Http3Client::new(tls_config) {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to create HTTP/3 client: {}", e);
+            let body = r#"{"error":"HTTP/3 client creation failed"}"#;
+            return (502, body.as_bytes().to_vec(), HashMap::new());
+        }
+    };
+
+    // Read request body
+    let (_parts, body) = original_req.into_parts();
+    let request_body = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
+            Bytes::new()
+        }
+    };
+
+    // Convert headers to HTTP/3 format
+    let mut http3_headers = Vec::new();
+    for (name, value) in headers {
+        http3_headers.push((name.parse().unwrap_or_else(|_| http::header::HeaderName::from_static("x-custom")), value.parse().unwrap()));
+    }
+
+    // Make HTTP/3 request
+    match http3_client.request(proxy, method, backend_url, http3_headers, request_body).await {
+        Ok(response) => {
+            info!("HTTP/3 backend request successful");
+            (response.0, response.1, response.2)
+        }
+        Err(e) => {
+            error!("HTTP/3 backend request failed: {}", e);
+            let body = format!(r#"{{"error":"HTTP/3 backend request failed: {}"}}"#, e);
+            (502, body.into_bytes(), HashMap::new())
+        }
+    }
 }
