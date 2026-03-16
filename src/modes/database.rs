@@ -103,7 +103,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
     if env_config.enable_http3 {
         if let Some(tls_config) = tls_config.clone() {
-            let h3_addr: SocketAddr = format!("0.0.0.0:{}", env_config.http3_port).parse()?;
+            let h3_addr: SocketAddr = format!("0.0.0.0:{}", env_config.proxy_https_port).parse()?;
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);

@@ -92,7 +92,6 @@ fn create_test_env_config_with_mtls(cert_path: Option<String>, key_path: Option<
         backend_tls_client_key_path: key_path,
         frontend_tls_client_ca_bundle_path: None,
         enable_http3: false,
-        http3_port: 7843,
         http3_idle_timeout: 30,
         http3_max_streams: 100,
     }

@@ -49,20 +49,28 @@ pub struct ProxyState {
     pub connection_pool: Arc<ConnectionPool>,
     pub request_count: Arc<AtomicU64>,
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
+    /// Whether HTTP/3 is enabled (used for Alt-Svc header advertisement)
+    pub enable_http3: bool,
+    /// The HTTPS port (shared by HTTP/3 QUIC listener)
+    pub proxy_https_port: u16,
 }
 
 impl ProxyState {
     pub fn new(config: GatewayConfig, dns_cache: DnsCache, env_config: crate::config::EnvConfig) -> Self {
+        let enable_http3 = env_config.enable_http3;
+        let proxy_https_port = env_config.proxy_https_port;
         // Create connection pool with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
-        
+
         Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),
             dns_cache,
             connection_pool,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
+            enable_http3,
+            proxy_https_port,
         }
     }
 
@@ -761,6 +769,14 @@ async fn handle_proxy_request(
 
     for (k, v) in &response_headers {
         resp_builder = resp_builder.header(k.as_str(), v.as_str());
+    }
+
+    // Advertise HTTP/3 availability via Alt-Svc header
+    if state.enable_http3 {
+        resp_builder = resp_builder.header(
+            "alt-svc",
+            format!("h3=\":{}\"; ma=86400", state.proxy_https_port),
+        );
     }
 
     Ok(resp_builder

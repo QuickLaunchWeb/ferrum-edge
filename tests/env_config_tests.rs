@@ -287,13 +287,11 @@ fn test_env_config_http3_defaults() {
         ],
         || {
             remove_var("FERRUM_ENABLE_HTTP3");
-            remove_var("FERRUM_HTTP3_PORT");
             remove_var("FERRUM_HTTP3_IDLE_TIMEOUT");
             remove_var("FERRUM_HTTP3_MAX_STREAMS");
 
             let config = EnvConfig::from_env().unwrap();
             assert!(!config.enable_http3);
-            assert_eq!(config.http3_port, 7843);
             assert_eq!(config.http3_idle_timeout, 30);
             assert_eq!(config.http3_max_streams, 100);
         },

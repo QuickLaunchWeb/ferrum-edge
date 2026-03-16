@@ -95,8 +95,6 @@ pub struct EnvConfig {
     // HTTP/3 / QUIC
     /// Enable HTTP/3 listener (default: false)
     pub enable_http3: bool,
-    /// HTTP/3 (QUIC) port (default: 7843)
-    pub http3_port: u16,
     /// HTTP/3 idle timeout in seconds (default: 30)
     pub http3_idle_timeout: u64,
     /// HTTP/3 max concurrent streams (default: 100)
@@ -163,7 +161,6 @@ impl EnvConfig {
 
             // HTTP/3 / QUIC
             enable_http3: env::var("FERRUM_ENABLE_HTTP3").unwrap_or_default() == "true",
-            http3_port: parse_env_u16("FERRUM_HTTP3_PORT", 7843),
             http3_idle_timeout: parse_env_u64("FERRUM_HTTP3_IDLE_TIMEOUT", 30),
             http3_max_streams: env::var("FERRUM_HTTP3_MAX_STREAMS")
                 .ok()

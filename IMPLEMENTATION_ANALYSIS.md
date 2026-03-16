@@ -98,10 +98,10 @@
 ## **🔄 PARTIALLY IMPLEMENTED (Needs Work)**
 
 ### **🌐 HTTP/3 Support**
-- ⚠️ **Status**: Not implemented
+- ✅ **Status**: Implemented — QUIC listener shares the HTTPS port (TCP for HTTP/1.1+2, UDP for HTTP/3)
 - 📋 **Requirement**: HTTP/3 protocol support
-- 🛠️ **Missing**: HTTP/3 listener and proxying capabilities
-- 🎯 **Impact**: Limited to HTTP/1.1 and HTTP/2
+- 🛠️ **Implemented**: HTTP/3 server (Quinn/h3), HTTP/3 client for backend proxying, Alt-Svc header advertisement
+- 🎯 **Note**: Enable via `FERRUM_ENABLE_HTTP3=true`; no separate port needed
 
 ### **🔧 gRPC Proxying**
 - ⚠️ **Status**: Basic framework implemented but proxying incomplete
@@ -213,7 +213,7 @@
 - All major security features implemented (TLS/mTLS, JWT auth, plugin system)
 - Robust configuration management and caching with outage resilience
 - Graceful shutdown and request draining
-- ⚠️ Need HTTP/3 support for next-gen protocols
+- ✅ HTTP/3 support implemented (shares HTTPS port, Alt-Svc advertisement)
 - ⚠️ Need complete gRPC proxying for microservice architectures
 - ❌ Missing certificate pinning for high-security scenarios
 
@@ -224,12 +224,9 @@
 ### **High Priority (Core Completion)**
 1. **gRPC Proxying** - Complete gRPC message forwarding and streaming support
 
-### **Medium Priority (Production Enhancement)**
-2. **HTTP/3 Support** - Add next-gen protocol support for modern clients
-
 ### **Low Priority (Advanced Features)**
-3. **Certificate Pinning** - Enhanced security for sensitive connections
-4. **Advanced Metrics** - Detailed performance tracking (connection pools, cache stats, plugin latencies)
+2. **Certificate Pinning** - Enhanced security for sensitive connections
+3. **Advanced Metrics** - Detailed performance tracking (connection pools, cache stats, plugin latencies)
 
 ---
 

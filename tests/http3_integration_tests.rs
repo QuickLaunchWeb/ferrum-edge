@@ -26,7 +26,6 @@ fn init_crypto_provider() {
 /// Test HTTP/3 server configuration
 #[derive(Debug, Clone)]
 struct Http3TestConfig {
-    pub http3_port: u16,
     pub http3_idle_timeout: u64,
     pub http3_max_streams: u32,
     pub enable_http3: bool,
@@ -35,7 +34,6 @@ struct Http3TestConfig {
 impl Default for Http3TestConfig {
     fn default() -> Self {
         Self {
-            http3_port: 7843,
             http3_idle_timeout: 30,
             http3_max_streams: 100,
             enable_http3: true,
@@ -124,9 +122,8 @@ fn create_http3_test_env_config() -> EnvConfig {
         backend_tls_no_verify: false,
         admin_read_only: false,
         admin_tls_no_verify: false,
-        // HTTP/3 specific configuration
+        // HTTP/3 specific configuration (shares proxy_https_port for QUIC listener)
         enable_http3: true,
-        http3_port: 7843,
         http3_idle_timeout: 30,
         http3_max_streams: 100,
     }
@@ -226,8 +223,9 @@ async fn test_http3_configuration_loading() {
     let env_config = create_http3_test_env_config();
     
     // Verify HTTP/3 configuration is loaded correctly
+    // HTTP/3 shares proxy_https_port (no separate http3_port)
     assert_eq!(env_config.enable_http3, true);
-    assert_eq!(env_config.http3_port, 7843);
+    assert_eq!(env_config.proxy_https_port, 8443);
     assert_eq!(env_config.http3_idle_timeout, 30);
     assert_eq!(env_config.http3_max_streams, 100);
     
@@ -256,6 +254,8 @@ async fn test_http3_proxy_state_creation() {
         connection_pool,
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
+        enable_http3: true,
+        proxy_https_port: 8443,
     };
     
     // Verify proxy state is created successfully
@@ -268,46 +268,36 @@ async fn test_http3_proxy_state_creation() {
 #[tokio::test]
 async fn test_http3_environment_variables() {
     // Set environment variables
+    // Note: FERRUM_HTTP3_PORT no longer exists — HTTP/3 shares FERRUM_PROXY_HTTPS_PORT
     unsafe {
         std::env::set_var("FERRUM_ENABLE_HTTP3", "true");
-        std::env::set_var("FERRUM_HTTP3_PORT", "7843");
         std::env::set_var("FERRUM_HTTP3_IDLE_TIMEOUT", "30");
         std::env::set_var("FERRUM_HTTP3_MAX_STREAMS", "100");
     }
-    
-    // This would normally be done in EnvConfig::from_env()
-    // For now, we'll test the parsing logic manually
-    
+
     let enable_http3 = std::env::var("FERRUM_ENABLE_HTTP3")
         .unwrap_or_else(|_| "false".to_string())
         .parse::<bool>()
         .unwrap_or(false);
-    
-    let http3_port = std::env::var("FERRUM_HTTP3_PORT")
-        .unwrap_or_else(|_| "7843".to_string())
-        .parse::<u16>()
-        .unwrap_or(7843);
-    
+
     let http3_idle_timeout = std::env::var("FERRUM_HTTP3_IDLE_TIMEOUT")
         .unwrap_or_else(|_| "30".to_string())
         .parse::<u64>()
         .unwrap_or(30);
-    
+
     let http3_max_streams = std::env::var("FERRUM_HTTP3_MAX_STREAMS")
         .unwrap_or_else(|_| "100".to_string())
         .parse::<u32>()
         .unwrap_or(100);
-    
+
     // Verify environment variables are parsed correctly
     assert_eq!(enable_http3, true);
-    assert_eq!(http3_port, 7843);
     assert_eq!(http3_idle_timeout, 30);
     assert_eq!(http3_max_streams, 100);
-    
+
     // Clean up environment variables
     unsafe {
         std::env::remove_var("FERRUM_ENABLE_HTTP3");
-        std::env::remove_var("FERRUM_HTTP3_PORT");
         std::env::remove_var("FERRUM_HTTP3_IDLE_TIMEOUT");
         std::env::remove_var("FERRUM_HTTP3_MAX_STREAMS");
     }
@@ -337,24 +327,14 @@ async fn test_http3_protocol_enum() {
 /// Test HTTP/3 configuration validation
 #[tokio::test]
 async fn test_http3_configuration_validation() {
-    let mut config = create_http3_test_env_config();
-    
-    // Test valid configuration
-    assert!(config.http3_port > 0);
-    assert!(config.http3_port <= 65535);
+    let config = create_http3_test_env_config();
+
+    // HTTP/3 shares proxy_https_port (no separate http3_port)
+    assert!(config.proxy_https_port > 0);
+    assert!(config.proxy_https_port <= 65535);
     assert!(config.http3_idle_timeout > 0);
     assert!(config.http3_max_streams > 0);
-    
-    // Test invalid port (should be caught in real implementation)
-    config.http3_port = 0;
-    assert_eq!(config.http3_port, 0); // This would be validated in real code
-    
-    config.http3_port = 65535;
-    assert_eq!(config.http3_port, 65535); // This would be validated in real code
-    
-    // Reset to valid values
-    config.http3_port = 7843;
-    assert_eq!(config.http3_port, 7843);
+    assert!(config.enable_http3);
 }
 
 /// Integration test placeholder for full HTTP/3 flow
@@ -385,6 +365,8 @@ async fn test_http3_full_integration() {
         connection_pool,
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
+        enable_http3: true,
+        proxy_https_port: 8443,
     };
     
     // Verify proxy state is created successfully
