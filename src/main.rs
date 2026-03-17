@@ -7,6 +7,7 @@ mod http3;
 mod modes;
 mod plugins;
 mod proxy;
+mod router_cache;
 mod tls;
 
 use config::{EnvConfig, OperatingMode};

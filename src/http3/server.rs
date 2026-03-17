@@ -157,11 +157,11 @@ async fn handle_h3_request(
         }
     }
 
-    // Route: longest prefix match
-    let matched_proxy = crate::proxy::find_matching_proxy(&config, &path);
+    // Route: longest prefix match via router cache
+    let matched_proxy = state.router_cache.find_proxy(&path);
 
     let proxy = match matched_proxy {
-        Some(p) => p,
+        Some(p) => (*p).clone(),
         None => {
             record_request(&state, 404);
             send_h3_response(&mut stream, StatusCode::NOT_FOUND, r#"{"error":"Not Found"}"#).await?;

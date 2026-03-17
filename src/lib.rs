@@ -9,7 +9,9 @@ pub mod http3;
 pub mod modes;
 pub mod plugins;
 pub mod proxy;
+pub mod router_cache;
 pub mod tls;
 
 pub use config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 pub use proxy::{build_backend_url, find_matching_proxy};
+pub use router_cache::RouterCache;

@@ -25,6 +25,7 @@ use crate::plugins::{
     create_plugin, Plugin, PluginResult, RequestContext, TransactionSummary,
 };
 use crate::http3::client::Http3Client;
+use crate::router_cache::RouterCache;
 
 /// Check if the request is a WebSocket upgrade request
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
@@ -46,6 +47,7 @@ pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
+    pub router_cache: Arc<RouterCache>,
     pub request_count: Arc<AtomicU64>,
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
     /// Whether HTTP/3 is enabled (used for Alt-Svc header advertisement)
@@ -61,11 +63,14 @@ impl ProxyState {
         // Create connection pool with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
+        // Build router cache with pre-sorted route table for fast prefix matching
+        let router_cache = Arc::new(RouterCache::new(&config, 10_000));
 
         Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),
             dns_cache,
             connection_pool,
+            router_cache,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             enable_http3,
@@ -74,6 +79,7 @@ impl ProxyState {
     }
 
     pub fn update_config(&self, new_config: GatewayConfig) {
+        self.router_cache.rebuild(&new_config);
         self.config.store(Arc::new(new_config));
         info!("Proxy configuration updated atomically");
     }
@@ -142,13 +148,12 @@ async fn handle_websocket_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     info!("WebSocket upgrade request for proxy routing from {}", remote_addr.ip());
     
-    // Find matching proxy for WebSocket request
-    let config = state.current_config();
+    // Find matching proxy for WebSocket request via router cache
     let path = req.uri().path().to_string();
-    let matched_proxy = find_matching_proxy(&config, &path);
-    
+    let matched_proxy = state.router_cache.find_proxy(&path);
+
     let proxy = match matched_proxy {
-        Some(p) => p,
+        Some(p) => (*p).clone(),
         None => {
             state.request_count.fetch_add(1, Ordering::Relaxed);
             record_status(&state, 404);
@@ -617,11 +622,11 @@ async fn handle_proxy_request(
         }
     }
 
-    // Route: longest prefix match
-    let matched_proxy = find_matching_proxy(&config, &path);
+    // Route: longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
+    let matched_proxy = state.router_cache.find_proxy(&path);
 
     let proxy = match matched_proxy {
-        Some(p) => p,
+        Some(p) => (*p).clone(),
         None => {
             state.request_count.fetch_add(1, Ordering::Relaxed);
             record_status(&state, 404);
