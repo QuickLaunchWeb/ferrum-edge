@@ -381,8 +381,10 @@ fn test_env_config_request_limits_defaults() {
             remove_var("FERRUM_MAX_BODY_SIZE_BYTES");
 
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.max_header_size_bytes, 16384);
+            assert_eq!(config.max_header_size_bytes, 32768);
+            assert_eq!(config.max_single_header_size_bytes, 16384);
             assert_eq!(config.max_body_size_bytes, 10_485_760);
+            assert_eq!(config.max_response_body_size_bytes, 10_485_760);
         },
     );
 }
@@ -593,6 +595,83 @@ fn test_env_config_dns_error_ttl_custom() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.dns_error_ttl, 5);
+        },
+    );
+}
+
+// --- Size Limit Tests ---
+
+#[test]
+fn test_env_config_max_single_header_size_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_single_header_size_bytes, 16384, "max_single_header_size_bytes should default to 16384");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_single_header_size_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", "4096"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_single_header_size_bytes, 4096);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_response_body_size_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_response_body_size_bytes, 10_485_760, "max_response_body_size_bytes should default to 10MB");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_response_body_size_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "52428800"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_response_body_size_bytes, 52_428_800);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_header_size_updated_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_HEADER_SIZE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_header_size_bytes, 32768, "max_header_size_bytes should default to 32KB");
         },
     );
 }

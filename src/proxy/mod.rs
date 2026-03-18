@@ -58,12 +58,21 @@ pub struct ProxyState {
     pub enable_http3: bool,
     /// The HTTPS port (shared by HTTP/3 QUIC listener)
     pub proxy_https_port: u16,
+    // Size limits
+    pub max_header_size_bytes: usize,
+    pub max_single_header_size_bytes: usize,
+    pub max_body_size_bytes: usize,
+    pub max_response_body_size_bytes: usize,
 }
 
 impl ProxyState {
     pub fn new(config: GatewayConfig, dns_cache: DnsCache, env_config: crate::config::EnvConfig) -> Self {
         let enable_http3 = env_config.enable_http3;
         let proxy_https_port = env_config.proxy_https_port;
+        let max_header_size_bytes = env_config.max_header_size_bytes;
+        let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
+        let max_body_size_bytes = env_config.max_body_size_bytes;
+        let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
         // Create connection pool with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
@@ -85,6 +94,10 @@ impl ProxyState {
             status_counts: Arc::new(dashmap::DashMap::new()),
             enable_http3,
             proxy_https_port,
+            max_header_size_bytes,
+            max_single_header_size_bytes,
+            max_body_size_bytes,
+            max_response_body_size_bytes,
         }
     }
 
@@ -113,6 +126,11 @@ async fn handle_connection(
     // Use TokioIo to adapt the TCP stream for hyper
     let io = TokioIo::new(stream);
 
+    // Plain HTTP uses HTTP/1.1 only (HTTP/2 cleartext requires prior knowledge
+    // or upgrade which is rarely used; HTTP/2 is negotiated via ALPN on TLS)
+    let mut http1_builder = hyper::server::conn::http1::Builder::new();
+    http1_builder.max_buf_size(state.max_header_size_bytes);
+
     // Create a service function that can handle both HTTP and WebSocket
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
@@ -126,10 +144,7 @@ async fn handle_connection(
             }
         }
     });
-
-    // Plain HTTP uses HTTP/1.1 only (HTTP/2 cleartext requires prior knowledge
-    // or upgrade which is rarely used; HTTP/2 is negotiated via ALPN on TLS)
-    if let Err(e) = hyper::server::conn::http1::Builder::new()
+    if let Err(e) = http1_builder
         .serve_connection(io, svc)
         .with_upgrades()
         .await
@@ -576,6 +591,12 @@ async fn handle_tls_connection(
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
+    // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
+    // HTTP/2 clients get multiplexed streams; HTTP/1.1 clients get upgrade support.
+    let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder.http1().max_buf_size(state.max_header_size_bytes);
+    builder.http2().max_header_list_size(state.max_header_size_bytes as u32);
+
     // Use the same HTTP service function
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
@@ -589,10 +610,6 @@ async fn handle_tls_connection(
             }
         }
     });
-
-    // Use hyper-util's auto builder which negotiates HTTP/1.1 or HTTP/2 via ALPN.
-    // HTTP/2 clients get multiplexed streams; HTTP/1.1 clients get upgrade support.
-    let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         error!("HTTP connection error over TLS: {}", e);
     }
@@ -619,11 +636,32 @@ async fn handle_proxy_request(
         path.clone(),
     );
 
-    // Extract headers
+    // Validate and extract headers with size limits
+    let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
+        let header_size = name.as_str().len() + value.len();
+        if header_size > state.max_single_header_size_bytes {
+            record_request(&state, 431);
+            return Ok(build_response(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                &format!(
+                    r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
+                    name.as_str(),
+                    state.max_single_header_size_bytes
+                ),
+            ));
+        }
+        total_header_size += header_size;
         if let Ok(v) = value.to_str() {
             ctx.headers.insert(name.as_str().to_lowercase(), v.to_string());
         }
+    }
+    if total_header_size > state.max_header_size_bytes {
+        record_request(&state, 431);
+        return Ok(build_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            r#"{"error":"Total request headers exceed maximum size"}"#,
+        ));
     }
 
     // Parse query params
@@ -951,12 +989,41 @@ async fn proxy_to_backend(
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
 
-    // Collect and forward body
-    let body_bytes = match original_req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes().to_vec(),
-        Err(e) => {
-            warn!("Failed to read request body: {}", e);
-            Vec::new()
+    // Enforce request body size limit via Content-Length fast path
+    if state.max_body_size_bytes > 0 {
+        if let Some(content_length) = headers.get("content-length") {
+            if let Ok(len) = content_length.parse::<usize>() {
+                if len > state.max_body_size_bytes {
+                    return (
+                        413,
+                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        HashMap::new(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Collect and forward body with size limit
+    let body_bytes = if state.max_body_size_bytes > 0 {
+        let limited = http_body_util::Limited::new(original_req.into_body(), state.max_body_size_bytes);
+        match limited.collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(_) => {
+                return (
+                    413,
+                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                    HashMap::new(),
+                );
+            }
+        }
+    } else {
+        match original_req.into_body().collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(e) => {
+                warn!("Failed to read request body: {}", e);
+                Vec::new()
+            }
         }
     };
 
@@ -974,8 +1041,37 @@ async fn proxy_to_backend(
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());
                 }
             }
-            let body = response.bytes().await.unwrap_or_default().to_vec();
-            (status, body, resp_headers)
+
+            // Enforce response body size limit
+            if state.max_response_body_size_bytes > 0 {
+                // Fast path: check Content-Length header from backend
+                let content_length = response.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok());
+
+                if let Some(len) = content_length {
+                    if len > state.max_response_body_size_bytes {
+                        warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
+                              len, state.max_response_body_size_bytes);
+                        return (
+                            502,
+                            r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
+                            HashMap::new(),
+                        );
+                    }
+                }
+
+                // Stream-collect with size limit using chunk_with_limit
+                let max_size = state.max_response_body_size_bytes;
+                match collect_response_with_limit(response, max_size).await {
+                    Ok((resp_body, _)) => (status, resp_body, resp_headers),
+                    Err(err_body) => (502, err_body, HashMap::new()),
+                }
+            } else {
+                let body = response.bytes().await.unwrap_or_default().to_vec();
+                (status, body, resp_headers)
+            }
         }
         Err(e) => {
             error!("Backend request failed: {}", e);
@@ -983,6 +1079,33 @@ async fn proxy_to_backend(
             (502, body.into_bytes(), HashMap::new())
         }
     }
+}
+
+/// Collect a response body with a size limit, returning Err with error body if exceeded.
+async fn collect_response_with_limit(
+    response: reqwest::Response,
+    max_size: usize,
+) -> Result<(Vec<u8>, usize), Vec<u8>> {
+    use futures_util::StreamExt as _;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                if body.len() + chunk.len() > max_size {
+                    warn!("Backend response truncated: exceeded {} byte limit", max_size);
+                    return Err(r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                error!("Error reading backend response: {}", e);
+                return Err(format!(r#"{{"error":"Backend error: {}"}}"#, e).into_bytes());
+            }
+        }
+    }
+    let len = body.len();
+    Ok((body, len))
 }
 
 fn strip_query_params(url: &str) -> String {
@@ -1032,13 +1155,39 @@ async fn proxy_to_backend_http3(
         }
     };
 
-    // Read request body
+    // Read request body with size limit
     let (_parts, body) = original_req.into_parts();
-    let request_body = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("Failed to read request body: {}", e);
-            Bytes::new()
+    let request_body = if state.max_body_size_bytes > 0 {
+        // Check Content-Length fast path
+        if let Some(content_length) = headers.get("content-length") {
+            if let Ok(len) = content_length.parse::<usize>() {
+                if len > state.max_body_size_bytes {
+                    return (
+                        413,
+                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        HashMap::new(),
+                    );
+                }
+            }
+        }
+        let limited = http_body_util::Limited::new(body, state.max_body_size_bytes);
+        match limited.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => {
+                return (
+                    413,
+                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                    HashMap::new(),
+                );
+            }
+        }
+    } else {
+        match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                error!("Failed to read request body: {}", e);
+                Bytes::new()
+            }
         }
     };
 

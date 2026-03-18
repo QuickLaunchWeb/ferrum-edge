@@ -66,9 +66,11 @@ pub struct EnvConfig {
     pub dp_cp_grpc_url: Option<String>,
     pub dp_grpc_auth_token: Option<String>,
 
-    // Request limits
+    // Request/Response limits
     pub max_header_size_bytes: usize,
+    pub max_single_header_size_bytes: usize,
     pub max_body_size_bytes: usize,
+    pub max_response_body_size_bytes: usize,
 
     // DNS
     pub dns_cache_ttl_seconds: u64,
@@ -153,8 +155,10 @@ impl EnvConfig {
             dp_cp_grpc_url: env::var("FERRUM_DP_CP_GRPC_URL").ok(),
             dp_grpc_auth_token: env::var("FERRUM_DP_GRPC_AUTH_TOKEN").ok(),
 
-            max_header_size_bytes: parse_env_usize("FERRUM_MAX_HEADER_SIZE_BYTES", 16384),
+            max_header_size_bytes: parse_env_usize("FERRUM_MAX_HEADER_SIZE_BYTES", 32_768),
+            max_single_header_size_bytes: parse_env_usize("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", 16_384),
             max_body_size_bytes: parse_env_usize("FERRUM_MAX_BODY_SIZE_BYTES", 10_485_760),
+            max_response_body_size_bytes: parse_env_usize("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", 10_485_760),
 
             dns_cache_ttl_seconds: parse_env_u64("FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,

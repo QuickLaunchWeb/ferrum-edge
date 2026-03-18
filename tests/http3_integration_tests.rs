@@ -111,8 +111,10 @@ fn create_http3_test_env_config() -> EnvConfig {
         cp_grpc_jwt_secret: None,
         dp_cp_grpc_url: None,
         dp_grpc_auth_token: None,
-        max_header_size_bytes: 16384,
+        max_header_size_bytes: 32768,
+        max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
+        max_response_body_size_bytes: 10_485_760,
         dns_cache_ttl_seconds: 300,
         dns_overrides: std::collections::HashMap::new(),
         dns_resolver_address: None,
@@ -270,6 +272,10 @@ async fn test_http3_proxy_state_creation() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         enable_http3: true,
         proxy_https_port: 8443,
+        max_header_size_bytes: 32768,
+        max_single_header_size_bytes: 16384,
+        max_body_size_bytes: 10_485_760,
+        max_response_body_size_bytes: 10_485_760,
     };
 
     // Verify proxy state is created successfully
@@ -388,6 +394,10 @@ async fn test_http3_full_integration() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         enable_http3: true,
         proxy_https_port: 8443,
+        max_header_size_bytes: 32768,
+        max_single_header_size_bytes: 16384,
+        max_body_size_bytes: 10_485_760,
+        max_response_body_size_bytes: 10_485_760,
     };
     
     // Verify proxy state is created successfully

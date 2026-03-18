@@ -141,12 +141,37 @@ async fn handle_h3_request(
         path.clone(),
     );
 
-    // Extract headers
+    // Validate and extract headers with size limits
+    let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
+        let header_size = name.as_str().len() + value.len();
+        if header_size > state.max_single_header_size_bytes {
+            record_request(&state, 431);
+            send_h3_response(
+                &mut stream,
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                &format!(
+                    r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
+                    name.as_str(),
+                    state.max_single_header_size_bytes
+                ),
+            ).await?;
+            return Ok(());
+        }
+        total_header_size += header_size;
         if let Ok(v) = value.to_str() {
             ctx.headers
                 .insert(name.as_str().to_lowercase(), v.to_string());
         }
+    }
+    if total_header_size > state.max_header_size_bytes {
+        record_request(&state, 431);
+        send_h3_response(
+            &mut stream,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            r#"{"error":"Total request headers exceed maximum size"}"#,
+        ).await?;
+        return Ok(());
     }
 
     // Parse query params
@@ -262,10 +287,36 @@ async fn handle_h3_request(
         }
     }
 
-    // Collect request body from the H3 stream
+    // Enforce request body size limit via Content-Length fast path
+    if state.max_body_size_bytes > 0 {
+        if let Some(content_length) = ctx.headers.get("content-length") {
+            if let Ok(len) = content_length.parse::<usize>() {
+                if len > state.max_body_size_bytes {
+                    record_request(&state, 413);
+                    send_h3_response(
+                        &mut stream,
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"Request body exceeds maximum size"}"#,
+                    ).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Collect request body from the H3 stream with size limit
     let mut body_data = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
         let bytes = chunk.chunk();
+        if state.max_body_size_bytes > 0 && body_data.len() + bytes.len() > state.max_body_size_bytes {
+            record_request(&state, 413);
+            send_h3_response(
+                &mut stream,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                r#"{"error":"Request body exceeds maximum size"}"#,
+            ).await?;
+            return Ok(());
+        }
         body_data.extend_from_slice(bytes);
     }
 
@@ -336,7 +387,7 @@ async fn handle_h3_request(
     Ok(())
 }
 
-/// Proxy a request to the backend (adapted for HTTP/3 - uses collected body bytes).
+/// Proxy a request to the backend (adapted for HTTP/3 — uses collected body bytes).
 async fn proxy_to_backend_h3(
     state: &ProxyState,
     proxy: &Proxy,
@@ -428,8 +479,37 @@ async fn proxy_to_backend_h3(
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());
                 }
             }
-            let body = response.bytes().await.unwrap_or_default().to_vec();
-            (status, body, resp_headers)
+
+            // Enforce response body size limit
+            if state.max_response_body_size_bytes > 0 {
+                // Fast path: check Content-Length header from backend
+                let content_length = response.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok());
+
+                if let Some(len) = content_length {
+                    if len > state.max_response_body_size_bytes {
+                        warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
+                              len, state.max_response_body_size_bytes);
+                        return (
+                            502,
+                            r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
+                            std::collections::HashMap::new(),
+                        );
+                    }
+                }
+
+                // Stream-collect with size limit
+                let max_size = state.max_response_body_size_bytes;
+                match collect_response_with_limit_h3(response, max_size).await {
+                    Ok((resp_body, _)) => (status, resp_body, resp_headers),
+                    Err(err_body) => (502, err_body, std::collections::HashMap::new()),
+                }
+            } else {
+                let body = response.bytes().await.unwrap_or_default().to_vec();
+                (status, body, resp_headers)
+            }
         }
         Err(e) => {
             error!("Backend request failed (HTTP/3 frontend): {}", e);
@@ -470,4 +550,31 @@ fn record_request(state: &ProxyState, status: u16) {
         .entry(status)
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Collect a response body with a size limit, returning Err with error body if exceeded.
+async fn collect_response_with_limit_h3(
+    response: reqwest::Response,
+    max_size: usize,
+) -> Result<(Vec<u8>, usize), Vec<u8>> {
+    use futures_util::StreamExt as _;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        match chunk_result {
+            Ok(chunk) => {
+                if body.len() + chunk.len() > max_size {
+                    warn!("Backend response truncated: exceeded {} byte limit", max_size);
+                    return Err(r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                error!("Error reading backend response: {}", e);
+                return Err(format!(r#"{{"error":"Backend error: {}"}}"#, e).into_bytes());
+            }
+        }
+    }
+    let len = body.len();
+    Ok((body, len))
 }
