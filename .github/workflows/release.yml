@@ -38,7 +38,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install protoc (Ubuntu)

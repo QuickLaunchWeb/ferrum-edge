@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: stable
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -63,7 +63,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Install protoc
@@ -116,7 +116,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install protoc (Ubuntu)
