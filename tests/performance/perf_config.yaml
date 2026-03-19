@@ -7,7 +7,7 @@ proxies:
     name: "Health Check Proxy"
     listen_path: "/health"
     backend_protocol: http
-    backend_host: "localhost"
+    backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false
     preserve_host_header: false
@@ -17,7 +17,7 @@ proxies:
     backend_tls_verify_server_cert: true
     auth_mode: single
     # Override for high-frequency health checks
-    pool_max_idle_per_host: 20
+    pool_max_idle_per_host: 200
     # Other settings use global defaults
     plugins: []
 
@@ -25,7 +25,7 @@ proxies:
     name: "Users API Proxy"
     listen_path: "/api/users"
     backend_protocol: http
-    backend_host: "localhost"
+    backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false
     preserve_host_header: false
@@ -35,7 +35,7 @@ proxies:
     backend_tls_verify_server_cert: true
     auth_mode: single
     # Override for high-traffic API
-    pool_max_idle_per_host: 50
+    pool_max_idle_per_host: 200
     pool_idle_timeout_seconds: 180
     # Other settings use global defaults
     plugins: []
@@ -44,7 +44,7 @@ proxies:
     name: "Data API Proxy"
     listen_path: "/api/data"
     backend_protocol: http
-    backend_host: "localhost"
+    backend_host: "127.0.0.1"
     backend_port: 3001
     strip_listen_path: false
     preserve_host_header: false
@@ -54,7 +54,7 @@ proxies:
     backend_tls_verify_server_cert: true
     auth_mode: single
     # Override for large payload API
-    pool_max_idle_per_host: 30
+    pool_max_idle_per_host: 200
     # Other settings use global defaults
     plugins: []
 

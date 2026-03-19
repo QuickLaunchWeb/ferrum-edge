@@ -41,7 +41,7 @@ fn create_test_proxy() -> Proxy {
 #[test]
 fn test_default_config() {
     let config = PoolConfig::default();
-    assert_eq!(config.max_idle_per_host, 10);
+    assert_eq!(config.max_idle_per_host, 64);
     assert_eq!(config.idle_timeout_seconds, 90);
     assert_eq!(config.tcp_keepalive_seconds, 60);
     assert_eq!(config.http2_keep_alive_interval_seconds, 30);

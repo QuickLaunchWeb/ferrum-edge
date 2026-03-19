@@ -164,6 +164,8 @@ async fn handle_connection(
 /// Set TCP keepalive on a stream to detect dead connections.
 fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     use std::os::fd::AsFd;
+    // Disable Nagle's algorithm for lower latency on small responses
+    let _ = stream.set_nodelay(true);
     let fd = stream.as_fd();
     let socket = socket2::SockRef::from(&fd);
     let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
@@ -188,7 +190,7 @@ async fn handle_websocket_request(
     let matched_proxy = state.router_cache.find_proxy(&path);
 
     let proxy = match matched_proxy {
-        Some(p) => (*p).clone(),
+        Some(p) => p,
         None => {
             state.request_count.fetch_add(1, Ordering::Relaxed);
             record_status(&state, 404);
@@ -304,7 +306,7 @@ async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
-    proxy: Proxy,
+    proxy: Arc<Proxy>,
     ctx: RequestContext,
     plugins: Vec<Arc<dyn Plugin>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -721,7 +723,7 @@ async fn handle_proxy_request(
     let matched_proxy = state.router_cache.find_proxy(&path);
 
     let proxy = match matched_proxy {
-        Some(p) => (*p).clone(),
+        Some(p) => p,
         None => {
             state.request_count.fetch_add(1, Ordering::Relaxed);
             record_status(&state, 404);
@@ -732,7 +734,7 @@ async fn handle_proxy_request(
         }
     };
 
-    ctx.matched_proxy = Some(proxy.clone());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
 
     // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
@@ -810,20 +812,30 @@ async fn handle_proxy_request(
         }
     }
 
-    // before_proxy hooks
-    let mut proxy_headers = ctx.headers.clone();
-    for plugin in &plugins {
-        match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
-            PluginResult::Reject { status_code, body } => {
-                record_request(&state, status_code);
-                return Ok(build_response(
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &body,
-                ));
+    // before_proxy hooks — only clone headers if plugins need to modify them
+    let mut owned_proxy_headers;
+    let proxy_headers: &HashMap<String, String> = if plugins.is_empty() {
+        &ctx.headers
+    } else {
+        owned_proxy_headers = ctx.headers.clone();
+        for plugin in &plugins {
+            match plugin
+                .before_proxy(&mut ctx, &mut owned_proxy_headers)
+                .await
+            {
+                PluginResult::Reject { status_code, body } => {
+                    record_request(&state, status_code);
+                    return Ok(build_response(
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                    ));
+                }
+                PluginResult::Continue => {}
             }
-            PluginResult::Continue => {}
         }
-    }
+        &owned_proxy_headers
+    };
 
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
     // This check happens AFTER authentication and authorization plugins have run
@@ -850,7 +862,7 @@ async fn handle_proxy_request(
 
     // Perform the backend request
     let (response_status, response_body, mut response_headers) =
-        proxy_to_backend(&state, &proxy, &backend_url, &method, &proxy_headers, req).await;
+        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await;
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -865,28 +877,29 @@ async fn handle_proxy_request(
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let gateway_processing_ms = total_ms - backend_total_ms;
 
-    // Build transaction summary for logging
-    let summary = TransactionSummary {
-        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-        client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
-        http_method: method,
-        request_path: path,
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url)),
-        response_status_code: response_status,
-        latency_total_ms: total_ms,
-        latency_gateway_processing_ms: gateway_processing_ms,
-        latency_backend_ttfb_ms: backend_ttfb_ms,
-        latency_backend_total_ms: backend_total_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
-        metadata: ctx.metadata.clone(),
-    };
+    // Log phase — skip TransactionSummary construction when no plugins need it
+    if !plugins.is_empty() {
+        let summary = TransactionSummary {
+            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+            client_ip: ctx.client_ip.clone(),
+            consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+            http_method: method,
+            request_path: path,
+            matched_proxy_id: Some(proxy.id.clone()),
+            matched_proxy_name: proxy.name.clone(),
+            backend_target_url: Some(strip_query_params(&backend_url)),
+            response_status_code: response_status,
+            latency_total_ms: total_ms,
+            latency_gateway_processing_ms: gateway_processing_ms,
+            latency_backend_ttfb_ms: backend_ttfb_ms,
+            latency_backend_total_ms: backend_total_ms,
+            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            metadata: ctx.metadata.clone(),
+        };
 
-    // Log phase
-    for plugin in &plugins {
-        plugin.log(&summary).await;
+        for plugin in &plugins {
+            plugin.log(&summary).await;
+        }
     }
 
     record_request(&state, response_status);
@@ -1058,45 +1071,50 @@ async fn proxy_to_backend(
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
 
-    // Enforce request body size limit via Content-Length fast path
-    if state.max_body_size_bytes > 0
-        && let Some(content_length) = headers.get("content-length")
-        && let Ok(len) = content_length.parse::<usize>()
-        && len > state.max_body_size_bytes
-    {
-        return (
-            413,
-            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-            HashMap::new(),
-        );
-    }
+    // Fast path: skip body collection for methods that typically have no body
+    let has_body = !matches!(method, "GET" | "HEAD" | "DELETE" | "OPTIONS");
 
-    // Collect and forward body with size limit
-    let body_bytes = if state.max_body_size_bytes > 0 {
-        let limited =
-            http_body_util::Limited::new(original_req.into_body(), state.max_body_size_bytes);
-        match limited.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(_) => {
-                return (
-                    413,
-                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                    HashMap::new(),
-                );
-            }
+    if has_body {
+        // Enforce request body size limit via Content-Length fast path
+        if state.max_body_size_bytes > 0
+            && let Some(content_length) = headers.get("content-length")
+            && let Ok(len) = content_length.parse::<usize>()
+            && len > state.max_body_size_bytes
+        {
+            return (
+                413,
+                r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                HashMap::new(),
+            );
         }
-    } else {
-        match original_req.into_body().collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(e) => {
-                warn!("Failed to read request body: {}", e);
-                Vec::new()
-            }
-        }
-    };
 
-    if !body_bytes.is_empty() {
-        req_builder = req_builder.body(body_bytes);
+        // Collect and forward body with size limit
+        let body_bytes = if state.max_body_size_bytes > 0 {
+            let limited =
+                http_body_util::Limited::new(original_req.into_body(), state.max_body_size_bytes);
+            match limited.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(_) => {
+                    return (
+                        413,
+                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        HashMap::new(),
+                    );
+                }
+            }
+        } else {
+            match original_req.into_body().collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(e) => {
+                    warn!("Failed to read request body: {}", e);
+                    Vec::new()
+                }
+            }
+        };
+
+        if !body_bytes.is_empty() {
+            req_builder = req_builder.body(body_bytes);
+        }
     }
 
     // Send

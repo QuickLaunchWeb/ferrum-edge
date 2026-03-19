@@ -181,7 +181,7 @@ async fn handle_h3_request(
     let matched_proxy = state.router_cache.find_proxy(&path);
 
     let proxy = match matched_proxy {
-        Some(p) => (*p).clone(),
+        Some(p) => p,
         None => {
             record_request(&state, 404);
             send_h3_response(
@@ -194,7 +194,7 @@ async fn handle_h3_request(
         }
     };
 
-    ctx.matched_proxy = Some(proxy.clone());
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
 
     // Get pre-resolved plugins from cache (O(1) lookup)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);

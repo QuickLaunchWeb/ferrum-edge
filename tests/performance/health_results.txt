@@ -1,18 +1,18 @@
-Running 15s test @ http://localhost:8000/health
-  4 threads and 50 connections
+Running 30s test @ http://127.0.0.1:8000/health
+  8 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   617.67us  444.56us  45.39ms   98.15%
-    Req/Sec    20.05k     2.06k   22.68k    82.78%
+    Latency     0.99ms  349.72us  41.05ms   80.18%
+    Req/Sec    12.13k   485.96    13.92k    78.69%
   Latency Distribution
-     50%  573.00us
-     75%  638.00us
-     90%  730.00us
-     99%    1.56ms
-  1204933 requests in 15.10s, 187.31MB read
-Requests/sec:  79792.82
-Transfer/sec:     12.40MB
+     50%    0.96ms
+     75%    1.16ms
+     90%    1.35ms
+     99%    1.84ms
+  2905090 requests in 30.10s, 451.59MB read
+Requests/sec:  96512.15
+Transfer/sec:     15.00MB
 
 --- Health Check Statistics ---
-Total requests: 1204933
+Total requests: 2905090
 Non-2xx responses: 0
 Socket errors: connect 0, read 0, write 0, timeout 0

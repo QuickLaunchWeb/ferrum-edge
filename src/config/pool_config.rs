@@ -3,6 +3,21 @@
 
 use std::env;
 
+/// Minimum allowed value for `max_idle_per_host`.
+///
+/// Setting this too low causes excessive connection churn under load — each
+/// request that cannot reuse an idle connection must open a new TCP connection
+/// to the backend, dramatically increasing latency and error rates.
+pub const MIN_IDLE_PER_HOST: usize = 4;
+
+/// Maximum allowed value for `max_idle_per_host`.
+///
+/// Excessively high values waste memory (each idle connection holds a kernel
+/// socket buffer) and file descriptors.  On most systems the practical ceiling
+/// is the per-process file-descriptor limit (`ulimit -n`), but values above
+/// 1024 rarely help because the backend itself becomes the bottleneck.
+pub const MAX_IDLE_PER_HOST: usize = 1024;
+
 /// Global connection pool configuration from environment variables
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
@@ -22,7 +37,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_idle_per_host: 10,
+            max_idle_per_host: 64,
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,
@@ -85,6 +100,10 @@ impl PoolConfig {
             );
         }
 
+        // Validate and clamp max_idle_per_host
+        config.max_idle_per_host =
+            Self::validate_max_idle_per_host(config.max_idle_per_host, "global");
+
         config
     }
 
@@ -121,11 +140,89 @@ impl PoolConfig {
             config.http2_keep_alive_timeout_seconds = val;
         }
 
+        // Validate the final max_idle_per_host after overrides
+        config.max_idle_per_host =
+            Self::validate_max_idle_per_host(config.max_idle_per_host, &proxy.id);
+
         config
     }
 
     /// Get configuration for a specific proxy (global defaults + proxy overrides)
     pub fn for_proxy(&self, proxy: &crate::config::types::Proxy) -> PoolConfig {
         self.apply_proxy_overrides(proxy)
+    }
+
+    /// Validate and clamp `max_idle_per_host` to the allowed range, logging
+    /// a warning when the value is adjusted.
+    fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
+        if value < MIN_IDLE_PER_HOST {
+            tracing::warn!(
+                "pool_max_idle_per_host={} for '{}' is below the minimum ({}). \
+                 Values this low cause excessive connection churn under load, \
+                 leading to high latency and errors. Clamping to {}.",
+                value,
+                source,
+                MIN_IDLE_PER_HOST,
+                MIN_IDLE_PER_HOST,
+            );
+            MIN_IDLE_PER_HOST
+        } else if value > MAX_IDLE_PER_HOST {
+            tracing::warn!(
+                "pool_max_idle_per_host={} for '{}' exceeds the maximum ({}). \
+                 Very high values waste file descriptors and memory without \
+                 improving performance. Clamping to {}.",
+                value,
+                source,
+                MAX_IDLE_PER_HOST,
+                MAX_IDLE_PER_HOST,
+            );
+            MAX_IDLE_PER_HOST
+        } else {
+            value
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_pool_config() {
+        let config = PoolConfig::default();
+        assert_eq!(config.max_idle_per_host, 64);
+        assert_eq!(config.idle_timeout_seconds, 90);
+        assert!(config.enable_http_keep_alive);
+        assert!(config.enable_http2);
+    }
+
+    #[test]
+    fn test_validate_clamps_too_low() {
+        let result = PoolConfig::validate_max_idle_per_host(1, "test");
+        assert_eq!(result, MIN_IDLE_PER_HOST);
+    }
+
+    #[test]
+    fn test_validate_clamps_too_high() {
+        let result = PoolConfig::validate_max_idle_per_host(5000, "test");
+        assert_eq!(result, MAX_IDLE_PER_HOST);
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_value() {
+        let result = PoolConfig::validate_max_idle_per_host(100, "test");
+        assert_eq!(result, 100);
+    }
+
+    #[test]
+    fn test_validate_accepts_boundary_values() {
+        assert_eq!(
+            PoolConfig::validate_max_idle_per_host(MIN_IDLE_PER_HOST, "test"),
+            MIN_IDLE_PER_HOST
+        );
+        assert_eq!(
+            PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
+            MAX_IDLE_PER_HOST
+        );
     }
 }

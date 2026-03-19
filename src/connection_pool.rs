@@ -73,27 +73,16 @@ impl ConnectionPool {
             return Ok(entry.client.clone());
         }
 
-        // Create new client with effective configuration
+        // Create new client with effective configuration.
+        // reqwest::Client has its own internal connection pool, so we only need
+        // one Client per unique pool key. Always cache it for reuse.
         let client = self.create_client(proxy, resolved_ip, &config).await?;
 
-        // Add to pool if we haven't reached the limit
-        let host_entries: Vec<_> = self
-            .pools
-            .iter()
-            .filter(|entry| {
-                entry
-                    .key()
-                    .starts_with(&format!("{}:{}:", proxy.backend_host, proxy.backend_port))
-            })
-            .collect();
-
-        if host_entries.len() < config.max_idle_per_host {
-            let entry = PoolEntry {
-                client: client.clone(),
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            };
-            self.pools.insert(pool_key, entry);
-        }
+        let entry = PoolEntry {
+            client: client.clone(),
+            last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+        };
+        self.pools.insert(pool_key, entry);
 
         Ok(client)
     }

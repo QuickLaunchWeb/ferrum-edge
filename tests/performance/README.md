@@ -144,16 +144,21 @@ This test suite uses the **hybrid configuration approach**:
 
 #### Global Defaults (Environment Variables)
 ```bash
-FERRUM_POOL_MAX_IDLE_PER_HOST=15
+FERRUM_POOL_MAX_IDLE_PER_HOST=200
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=false
 ```
 
 #### Per-Proxy Overrides
-- **Health Check**: `pool_max_idle_per_host: 20` (high-frequency)
-- **Users API**: `pool_max_idle_per_host: 50` + `pool_idle_timeout_seconds: 180` (high-traffic)
-- **Data API**: `pool_max_idle_per_host: 30` (large payloads)
+- **Health Check**: `pool_max_idle_per_host: 200` (high-frequency)
+- **Users API**: `pool_max_idle_per_host: 200` + `pool_idle_timeout_seconds: 180` (high-traffic)
+- **Data API**: `pool_max_idle_per_host: 200` (large payloads)
+
+> **Note:** The performance test uses `pool_max_idle_per_host: 200` because wrk
+> opens 100 concurrent connections. In production, set this value to match your
+> expected peak concurrency per backend host. The gateway default of 64 is
+> suitable for most workloads. See the main README for sizing guidance.
 
 ### Performance Analysis
 
