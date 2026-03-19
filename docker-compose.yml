@@ -1,0 +1,196 @@
+version: '3.9'
+
+services:
+  # ============================================================================
+  # Single-Node Database Mode with SQLite
+  # ============================================================================
+  # This is the simplest setup - single gateway instance using SQLite
+  # No CP/DP complexity, no external database required
+  ferrum-sqlite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrum-sqlite
+    ports:
+      - "8000:8000"     # HTTP proxy
+      - "8443:8443"     # HTTPS proxy
+      - "9000:9000"     # Admin API HTTP
+      - "9443:9443"     # Admin API HTTPS
+    environment:
+      FERRUM_MODE: database
+      FERRUM_DB_TYPE: sqlite
+      FERRUM_DB_URL: sqlite:////data/ferrum.db?mode=rwc
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_LOG_LEVEL: info
+    volumes:
+      - ferrum_data:/data
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # ============================================================================
+  # PostgreSQL Database (for use with database mode)
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: ferrum-postgres
+    environment:
+      POSTGRES_DB: ferrum
+      POSTGRES_USER: ferrum
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev-password-change-in-production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ferrum -d ferrum"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # Single-Node Database Mode with PostgreSQL
+  # ============================================================================
+  # Production-ready setup with external PostgreSQL database
+  ferrum-postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrum-postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8001:8000"     # HTTP proxy
+      - "8444:8443"     # HTTPS proxy
+      - "9001:9000"     # Admin API HTTP
+      - "9444:9443"     # Admin API HTTPS
+    environment:
+      FERRUM_MODE: database
+      FERRUM_DB_TYPE: postgres
+      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_LOG_LEVEL: info
+      FERRUM_DB_POLL_INTERVAL: 30
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - postgres
+
+  # ============================================================================
+  # Control Plane Mode
+  # ============================================================================
+  # Centralized configuration authority for distributed deployments
+  # Reads from database, serves Admin API, pushes config to Data Plane nodes
+  ferrum-cp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrum-cp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "9002:9000"     # Admin API HTTP
+      - "9445:9443"     # Admin API HTTPS
+      - "50051:50051"   # gRPC config distribution
+    environment:
+      FERRUM_MODE: cp
+      FERRUM_DB_TYPE: postgres
+      FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_CP_GRPC_LISTEN_ADDR: 0.0.0.0:50051
+      FERRUM_CP_GRPC_JWT_SECRET: ${FERRUM_CP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
+      FERRUM_LOG_LEVEL: info
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - cp-dp
+
+  # ============================================================================
+  # Data Plane Mode (Node 1)
+  # ============================================================================
+  # Handles proxy traffic only, receives config from Control Plane
+  # No database access or Admin API modifications
+  ferrum-dp-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrum-dp-1
+    depends_on:
+      - ferrum-cp
+    ports:
+      - "8002:8000"     # HTTP proxy
+      - "8445:8443"     # HTTPS proxy
+      - "9003:9000"     # Read-only Admin API HTTP
+    environment:
+      FERRUM_MODE: dp
+      FERRUM_DP_CP_GRPC_URL: http://ferrum-cp:50051
+      FERRUM_DP_GRPC_AUTH_TOKEN: ${FERRUM_DP_GRPC_AUTH_TOKEN:-dev-dp-token}
+      FERRUM_LOG_LEVEL: info
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - cp-dp
+
+  # ============================================================================
+  # Data Plane Mode (Node 2)
+  # ============================================================================
+  # Additional DP node for horizontal scaling
+  ferrum-dp-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrum-dp-2
+    depends_on:
+      - ferrum-cp
+    ports:
+      - "8003:8000"     # HTTP proxy
+      - "8446:8443"     # HTTPS proxy
+      - "9004:9000"     # Read-only Admin API HTTP
+    environment:
+      FERRUM_MODE: dp
+      FERRUM_DP_CP_GRPC_URL: http://ferrum-cp:50051
+      FERRUM_DP_GRPC_AUTH_TOKEN: ${FERRUM_DP_GRPC_AUTH_TOKEN:-dev-dp-token}
+      FERRUM_LOG_LEVEL: info
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - cp-dp
+
+networks:
+  ferrum-network:
+    driver: bridge
+
+volumes:
+  ferrum_data:
+  postgres_data:

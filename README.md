@@ -110,6 +110,8 @@ Ferrum Gateway supports a configurable read-only mode for the Admin API, providi
 
 ## Installation
 
+### From Source
+
 ```bash
 # Clone the repository
 git clone https://github.com/your-org/ferrum-gateway.git
@@ -120,6 +122,48 @@ cargo build --release
 
 # The binary is at target/release/ferrum-gateway
 ```
+
+### From Release Binaries
+
+Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/your-org/ferrum-gateway/releases) page:
+
+```bash
+# Download the latest release for your platform
+# Linux x86_64
+wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
+chmod +x ferrum-gateway-linux-x86_64
+
+# macOS x86_64 (Intel)
+wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
+chmod +x ferrum-gateway-macos-x86_64
+
+# macOS ARM64 (Apple Silicon)
+wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
+chmod +x ferrum-gateway-macos-aarch64
+
+# Verify checksum
+sha256sum -c ferrum-gateway-linux-x86_64.sha256
+```
+
+### Using Docker
+
+```bash
+# Pull and run the latest Docker image
+docker pull your-registry/ferrum-gateway:latest
+
+docker run -d \
+  --name ferrum-gateway \
+  -p 8000:8000 \
+  -p 9000:9000 \
+  -e FERRUM_MODE=database \
+  -e FERRUM_DB_TYPE=sqlite \
+  -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
+  -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
+  -v ferrum_data:/data \
+  your-registry/ferrum-gateway:latest
+```
+
+See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
 
 ## Getting Started
 
@@ -174,6 +218,80 @@ FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
 FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
 cargo run --release
 ```
+
+## Docker Deployment
+
+Ferrum Gateway can be deployed using Docker or Docker Compose for development, testing, and production.
+
+### Quick Start with Docker Compose
+
+**SQLite Single-Node** (simplest):
+```bash
+docker-compose up ferrum-sqlite
+```
+
+**PostgreSQL Single-Node** (production-ready):
+```bash
+docker-compose --profile postgres up ferrum-postgres
+```
+
+**CP/DP Distributed** (horizontal scaling):
+```bash
+docker-compose --profile cp-dp up
+```
+
+### Building Docker Image
+
+```bash
+# Build locally
+docker build -t ferrum-gateway:latest .
+
+# Build for specific platform
+docker buildx build --platform linux/amd64,linux/arm64 -t ferrum-gateway:latest .
+```
+
+**Image Features**:
+- Multi-stage build for minimal size (~200MB)
+- Non-root user execution
+- Health check endpoint
+- Comprehensive metadata labels
+
+See [Docker Deployment Guide](docs/docker.md) for detailed examples, configuration, and production best practices.
+
+## CI/CD Pipeline
+
+Ferrum Gateway includes automated CI/CD workflows for testing, building, and releasing.
+
+### Automated Testing & Builds
+
+On every push to `main` and pull request:
+- Run all tests (`cargo test`)
+- Check code quality (clippy, fmt)
+- Build release binaries for Linux x86_64, macOS x86_64, and macOS ARM64
+- Build Docker image (pushed to registry on main branch only)
+
+### Automated Releases
+
+When you create a version tag (e.g., `v0.2.0`):
+1. Builds optimized binaries for all platforms (Linux x86_64/ARM64, macOS x86_64/ARM64)
+2. Generates SHA256 checksums
+3. Creates GitHub Release with binaries, checksums, and release notes
+4. Builds Docker image with version tag
+
+### Creating a Release
+
+```bash
+# 1. Update version in Cargo.toml
+# 2. Commit changes to main branch
+# 3. Create and push version tag
+git tag -a v0.2.0 -m "Release version 0.2.0"
+git push origin v0.2.0
+
+# Binaries automatically available at:
+# https://github.com/your-org/ferrum-gateway/releases/tag/v0.2.0
+```
+
+See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets configuration, and customization.
 
 ## Configuration
 

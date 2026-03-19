@@ -135,6 +135,11 @@ fn create_http3_test_env_config() -> EnvConfig {
         enable_http3: true,
         http3_idle_timeout: 30,
         http3_max_streams: 100,
+        db_tls_enabled: false,
+        db_tls_ca_cert_path: None,
+        db_tls_client_cert_path: None,
+        db_tls_client_key_path: None,
+        db_tls_insecure: false,
     }
 }
 

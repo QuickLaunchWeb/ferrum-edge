@@ -4,8 +4,7 @@ use ferrum_gateway::plugins::{basic_auth::BasicAuth, Plugin, RequestContext};
 use ferrum_gateway::ConsumerIndex;
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject};
 
 fn make_ctx() -> RequestContext {
     RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/test".to_string())

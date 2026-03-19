@@ -13,9 +13,14 @@ use crate::grpc::cp_server::CpGrpcServer;
 use crate::tls;
 
 pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Result<(), anyhow::Error> {
-    let db = DatabaseStore::connect(
+    let db = DatabaseStore::connect_with_tls_config(
         env_config.db_type.as_deref().unwrap_or("sqlite"),
         env_config.db_url.as_deref().unwrap_or("sqlite://ferrum.db"),
+        env_config.db_tls_enabled,
+        env_config.db_tls_ca_cert_path.as_deref(),
+        env_config.db_tls_client_cert_path.as_deref(),
+        env_config.db_tls_client_key_path.as_deref(),
+        env_config.db_tls_insecure,
     )
     .await?;
 

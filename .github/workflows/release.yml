@@ -1,0 +1,167 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release-binaries:
+    name: Build Release Binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: ferrum-gateway
+            asset_name: ferrum-gateway-linux-x86_64
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: ferrum-gateway
+            asset_name: ferrum-gateway-linux-aarch64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: ferrum-gateway
+            asset_name: ferrum-gateway-macos-x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: ferrum-gateway
+            asset_name: ferrum-gateway-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85
+          targets: ${{ matrix.target }}
+
+      - name: Install protoc (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install cross (for Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build release binary (cargo)
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create release assets directory
+        run: mkdir -p release-assets
+
+      - name: Copy binary
+        run: cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release-assets/${{ matrix.asset_name }}
+
+      - name: Generate SHA256 checksum
+        run: |
+          cd release-assets
+          sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
+          cat ${{ matrix.asset_name }}.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-binaries-${{ matrix.target }}
+          path: release-assets/
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: downloaded-artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find downloaded-artifacts -type f -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          TAG="${{ github.ref }}"
+          TAG_NAME="${TAG#refs/tags/}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+
+          # Create release notes with checksums
+          cat > RELEASE_NOTES.md << EOF
+          # Release $TAG_NAME
+
+          ## Binaries
+
+          This release includes pre-built binaries for multiple platforms:
+
+          - \`ferrum-gateway-linux-x86_64\` - Linux x86_64
+          - \`ferrum-gateway-linux-aarch64\` - Linux ARM64
+          - \`ferrum-gateway-macos-x86_64\` - macOS x86_64
+          - \`ferrum-gateway-macos-aarch64\` - macOS ARM64 (Apple Silicon)
+
+          ## Checksums
+
+          Verify the integrity of downloaded binaries using SHA256 checksums:
+
+          \`\`\`
+          EOF
+
+          cat release-assets/*.sha256 >> RELEASE_NOTES.md
+
+          cat >> RELEASE_NOTES.md << EOF
+          \`\`\`
+
+          ## Usage
+
+          Download the appropriate binary for your platform and make it executable:
+
+          \`\`\`bash
+          chmod +x ferrum-gateway-linux-x86_64
+          ./ferrum-gateway-linux-x86_64
+          \`\`\`
+
+          See [README.md](../README.md) for configuration and usage instructions.
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.release_notes.outputs.TAG_NAME }}
+          body_path: RELEASE_NOTES.md
+          files: release-assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

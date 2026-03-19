@@ -3,8 +3,7 @@
 use ferrum_gateway::plugins::{http_logging::HttpLogging, Plugin};
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::create_test_transaction_summary;
 
 #[tokio::test]
 async fn test_http_logging_plugin_creation() {

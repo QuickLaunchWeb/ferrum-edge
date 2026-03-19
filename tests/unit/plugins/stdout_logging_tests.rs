@@ -3,8 +3,7 @@
 use ferrum_gateway::plugins::{stdout_logging::StdoutLogging, Plugin, PluginResult};
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::{create_test_context, create_test_transaction_summary};
+use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
 #[tokio::test]
 async fn test_stdout_logging_plugin_creation() {

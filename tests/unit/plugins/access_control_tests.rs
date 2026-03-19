@@ -3,8 +3,7 @@
 use ferrum_gateway::plugins::{access_control::AccessControl, Plugin};
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::{create_test_context, assert_continue, assert_reject};
+use super::plugin_utils::{create_test_context, assert_continue, assert_reject};
 
 #[tokio::test]
 async fn test_access_control_plugin_creation() {

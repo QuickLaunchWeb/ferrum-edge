@@ -1,0 +1,65 @@
+# Multi-stage build for Ferrum Gateway
+# Stage 1: Builder
+FROM rust:1.85-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy source code
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+COPY proto ./proto
+
+# Build release binary
+RUN cargo build --release
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 ferrum
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder --chown=ferrum:ferrum /build/target/release/ferrum-gateway /app/ferrum-gateway
+
+# Set environment variables
+ENV FERRUM_MODE=database \
+    FERRUM_LOG_LEVEL=info \
+    FERRUM_PROXY_HTTP_PORT=8000 \
+    FERRUM_PROXY_HTTPS_PORT=8443 \
+    FERRUM_ADMIN_HTTP_PORT=9000 \
+    FERRUM_ADMIN_HTTPS_PORT=9443
+
+# Expose ports
+EXPOSE 8000 8443 9000 9443 50051
+
+# Switch to non-root user
+USER ferrum
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9000/health || exit 1
+
+# Add labels
+LABEL org.opencontainers.image.title="Ferrum Gateway" \
+      org.opencontainers.image.description="High-performance API Gateway and Reverse Proxy built in Rust" \
+      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.source="https://github.com/your-org/ferrum-gateway"
+
+# Run the gateway
+ENTRYPOINT ["/app/ferrum-gateway"]

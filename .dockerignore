@@ -1,0 +1,15 @@
+.git
+.gitignore
+.github
+target
+*.md
+docs
+tests
+perftest
+.claude
+.vscode
+.DS_Store
+*.swp
+*.swo
+*~
+Cargo.lock

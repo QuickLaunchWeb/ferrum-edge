@@ -4,8 +4,7 @@ use ferrum_gateway::plugins::{transaction_debugger::TransactionDebugger, Plugin,
 use serde_json::json;
 use std::collections::HashMap;
 
-mod plugin_utils;
-use plugin_utils::create_test_transaction_summary;
+use super::plugin_utils::create_test_transaction_summary;
 
 fn make_ctx() -> RequestContext {
     let mut ctx = RequestContext::new("10.0.0.1".to_string(), "POST".to_string(), "/api/data".to_string());

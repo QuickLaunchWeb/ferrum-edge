@@ -3,8 +3,7 @@
 use ferrum_gateway::plugins::{rate_limiting::RateLimiting, Plugin, PluginResult};
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::{create_test_consumer, create_test_context, assert_continue, assert_reject};
+use super::plugin_utils::{create_test_consumer, create_test_context, assert_continue, assert_reject};
 
 #[tokio::test]
 async fn test_rate_limiting_plugin_creation() {

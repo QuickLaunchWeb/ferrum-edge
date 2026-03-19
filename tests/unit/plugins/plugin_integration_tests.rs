@@ -5,8 +5,7 @@ use ferrum_gateway::plugins::{create_plugin, available_plugins};
 use ferrum_gateway::config::types::{PluginConfig, PluginScope};
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::{create_test_consumer, create_test_context};
+use super::plugin_utils::{create_test_consumer, create_test_context};
 
 #[tokio::test]
 async fn test_all_plugins_available() {

@@ -4,8 +4,7 @@ use ferrum_gateway::plugins::{key_auth::KeyAuth, Plugin};
 use ferrum_gateway::ConsumerIndex;
 use serde_json::json;
 
-mod plugin_utils;
-use plugin_utils::{create_test_consumer, create_test_context, assert_continue, assert_reject};
+use super::plugin_utils::{create_test_consumer, create_test_context, assert_continue, assert_reject};
 
 #[tokio::test]
 async fn test_key_auth_plugin_creation() {

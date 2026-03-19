@@ -56,6 +56,11 @@ pub struct EnvConfig {
     pub db_poll_interval: u64,
     pub db_poll_check_interval: u64,
     pub db_incremental_polling: bool,
+    pub db_tls_enabled: bool,
+    pub db_tls_ca_cert_path: Option<String>,
+    pub db_tls_client_cert_path: Option<String>,
+    pub db_tls_client_key_path: Option<String>,
+    pub db_tls_insecure: bool,
 
     // File mode
     pub file_config_path: Option<String>,
@@ -147,6 +152,11 @@ impl EnvConfig {
             db_incremental_polling: env::var("FERRUM_DB_INCREMENTAL_POLLING")
                 .map(|v| v != "false")
                 .unwrap_or(true),
+            db_tls_enabled: env::var("FERRUM_DB_TLS_ENABLED").unwrap_or_default() == "true",
+            db_tls_ca_cert_path: env::var("FERRUM_DB_TLS_CA_CERT_PATH").ok(),
+            db_tls_client_cert_path: env::var("FERRUM_DB_TLS_CLIENT_CERT_PATH").ok(),
+            db_tls_client_key_path: env::var("FERRUM_DB_TLS_CLIENT_KEY_PATH").ok(),
+            db_tls_insecure: env::var("FERRUM_DB_TLS_INSECURE").unwrap_or_default() == "true",
 
             file_config_path: env::var("FERRUM_FILE_CONFIG_PATH").ok(),
 
