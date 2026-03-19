@@ -316,6 +316,10 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |
 | `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
 | `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling |
+| `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `FERRUM_DB_SSL_ROOT_CERT` | No | — | Path to CA certificate for database server verification |
+| `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
+| `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
 | `FERRUM_CP_GRPC_JWT_SECRET` | CP mode | — | HS256 secret for DP node authentication |
@@ -884,6 +888,48 @@ FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
 FERRUM_ADMIN_TLS_CERT_PATH=/path/to/admin-cert.pem \
 FERRUM_ADMIN_TLS_KEY_PATH=/path/to/admin-key.pem
 ```
+
+### Database TLS/SSL
+
+Ferrum supports TLS encryption for PostgreSQL and MySQL database connections via dedicated environment variables. These are translated into connection string parameters automatically, so you don't need to embed them in `FERRUM_DB_URL`.
+
+**PostgreSQL with server certificate verification:**
+```bash
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
+FERRUM_DB_SSL_MODE=verify-ca \
+FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
+```
+
+**PostgreSQL with mutual TLS (mTLS):**
+```bash
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
+FERRUM_DB_SSL_MODE=verify-full \
+FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem \
+FERRUM_DB_SSL_CLIENT_CERT=/certs/client.pem \
+FERRUM_DB_SSL_CLIENT_KEY=/certs/client-key.pem
+```
+
+**MySQL with TLS:**
+```bash
+FERRUM_DB_TYPE=mysql \
+FERRUM_DB_URL="mysql://user:pass@db.example.com/ferrum" \
+FERRUM_DB_SSL_MODE=require \
+FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
+```
+
+**SSL mode values:**
+
+| Mode | Description |
+|------|-------------|
+| `disable` | No SSL |
+| `prefer` | Try SSL, fall back to plain |
+| `require` | Require SSL, skip CA verification |
+| `verify-ca` | Require SSL, verify server CA certificate |
+| `verify-full` | Require SSL, verify CA and hostname |
+
+> **Note:** SQLite connections ignore SSL settings (file-based, no network TLS). MySQL mode values are automatically mapped to the MySQL-native format (e.g., `require` → `REQUIRED`, `verify-ca` → `VERIFY_CA`).
 
 ### Backend mTLS
 

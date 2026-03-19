@@ -62,6 +62,16 @@ pub struct EnvConfig {
     pub db_tls_client_key_path: Option<String>,
     pub db_tls_insecure: bool,
 
+    // Database TLS/SSL
+    /// SSL mode for database connections (e.g., disable, prefer, require, verify-ca, verify-full)
+    pub db_ssl_mode: Option<String>,
+    /// Path to CA certificate for database server verification
+    pub db_ssl_root_cert: Option<String>,
+    /// Path to client certificate for database mTLS
+    pub db_ssl_client_cert: Option<String>,
+    /// Path to client private key for database mTLS
+    pub db_ssl_client_key: Option<String>,
+
     // File mode
     pub file_config_path: Option<String>,
 
@@ -158,6 +168,12 @@ impl EnvConfig {
             db_tls_client_key_path: env::var("FERRUM_DB_TLS_CLIENT_KEY_PATH").ok(),
             db_tls_insecure: env::var("FERRUM_DB_TLS_INSECURE").unwrap_or_default() == "true",
 
+            // Database TLS/SSL
+            db_ssl_mode: env::var("FERRUM_DB_SSL_MODE").ok(),
+            db_ssl_root_cert: env::var("FERRUM_DB_SSL_ROOT_CERT").ok(),
+            db_ssl_client_cert: env::var("FERRUM_DB_SSL_CLIENT_CERT").ok(),
+            db_ssl_client_key: env::var("FERRUM_DB_SSL_CLIENT_KEY").ok(),
+
             file_config_path: env::var("FERRUM_FILE_CONFIG_PATH").ok(),
 
             cp_grpc_listen_addr: env::var("FERRUM_CP_GRPC_LISTEN_ADDR").ok(),
@@ -206,6 +222,81 @@ impl EnvConfig {
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// Returns the database URL with TLS/SSL query parameters appended based on
+    /// the `FERRUM_DB_SSL_*` environment variables. For PostgreSQL and MySQL, the
+    /// SSL settings are translated into the appropriate connection string parameters.
+    /// SQLite URLs are returned unchanged (no network TLS).
+    pub fn effective_db_url(&self) -> Option<String> {
+        let base_url = self.db_url.as_ref()?;
+        let db_type = self.db_type.as_deref().unwrap_or("");
+
+        // SQLite has no network TLS
+        if db_type == "sqlite" {
+            return Some(base_url.clone());
+        }
+
+        let has_ssl_params = self.db_ssl_mode.is_some()
+            || self.db_ssl_root_cert.is_some()
+            || self.db_ssl_client_cert.is_some()
+            || self.db_ssl_client_key.is_some();
+
+        if !has_ssl_params {
+            return Some(base_url.clone());
+        }
+
+        let mut params: Vec<String> = Vec::new();
+
+        match db_type {
+            "postgres" => {
+                if let Some(ref mode) = self.db_ssl_mode {
+                    params.push(format!("sslmode={}", mode));
+                }
+                if let Some(ref cert) = self.db_ssl_root_cert {
+                    params.push(format!("sslrootcert={}", cert));
+                }
+                if let Some(ref cert) = self.db_ssl_client_cert {
+                    params.push(format!("sslcert={}", cert));
+                }
+                if let Some(ref key) = self.db_ssl_client_key {
+                    params.push(format!("sslkey={}", key));
+                }
+            }
+            "mysql" => {
+                if let Some(ref mode) = self.db_ssl_mode {
+                    // MySQL uses uppercase mode values
+                    let mysql_mode = match mode.as_str() {
+                        "disable" => "DISABLED",
+                        "prefer" => "PREFERRED",
+                        "require" => "REQUIRED",
+                        "verify-ca" => "VERIFY_CA",
+                        "verify-full" => "VERIFY_IDENTITY",
+                        other => other,
+                    };
+                    params.push(format!("ssl-mode={}", mysql_mode));
+                }
+                if let Some(ref cert) = self.db_ssl_root_cert {
+                    params.push(format!("ssl-ca={}", cert));
+                }
+                if let Some(ref cert) = self.db_ssl_client_cert {
+                    params.push(format!("ssl-cert={}", cert));
+                }
+                if let Some(ref key) = self.db_ssl_client_key {
+                    params.push(format!("ssl-key={}", key));
+                }
+            }
+            _ => {
+                return Some(base_url.clone());
+            }
+        }
+
+        if params.is_empty() {
+            return Some(base_url.clone());
+        }
+
+        let separator = if base_url.contains('?') { "&" } else { "?" };
+        Some(format!("{}{}{}", base_url, separator, params.join("&")))
     }
 
     fn validate(&self) -> Result<(), String> {

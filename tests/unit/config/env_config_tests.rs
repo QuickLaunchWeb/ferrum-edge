@@ -675,3 +675,254 @@ fn test_env_config_max_header_size_updated_default() {
         },
     );
 }
+
+// ============================================================================
+// Database TLS/SSL Configuration Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_db_ssl_defaults_none() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DB_SSL_MODE");
+            remove_var("FERRUM_DB_SSL_ROOT_CERT");
+            remove_var("FERRUM_DB_SSL_CLIENT_CERT");
+            remove_var("FERRUM_DB_SSL_CLIENT_KEY");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.db_ssl_mode.is_none());
+            assert!(config.db_ssl_root_cert.is_none());
+            assert!(config.db_ssl_client_cert.is_none());
+            assert!(config.db_ssl_client_key.is_none());
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_ssl_mode_parsed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_ssl_mode, Some("require".to_string()));
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_no_ssl_params() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+        ],
+        || {
+            remove_var("FERRUM_DB_SSL_MODE");
+            remove_var("FERRUM_DB_SSL_ROOT_CERT");
+            remove_var("FERRUM_DB_SSL_CLIENT_CERT");
+            remove_var("FERRUM_DB_SSL_CLIENT_KEY");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "postgres://localhost/ferrum"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_postgres_ssl_mode() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "postgres://localhost/ferrum?sslmode=require"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_postgres_all_ssl_params() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://user:pass@db.example.com/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "verify-full"),
+            ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
+            ("FERRUM_DB_SSL_CLIENT_CERT", "/certs/client.pem"),
+            ("FERRUM_DB_SSL_CLIENT_KEY", "/certs/client-key.pem"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "postgres://user:pass@db.example.com/ferrum?sslmode=verify-full&sslrootcert=/certs/ca.pem&sslcert=/certs/client.pem&sslkey=/certs/client-key.pem"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_postgres_existing_query_params() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum?connect_timeout=10"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "postgres://localhost/ferrum?connect_timeout=10&sslmode=require"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_mysql_ssl_mode_mapping() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "mysql://localhost/ferrum?ssl-mode=REQUIRED"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_mysql_verify_ca() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "verify-ca"),
+            ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "mysql://localhost/ferrum?ssl-mode=VERIFY_CA&ssl-ca=/certs/ca.pem"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_mysql_all_ssl_params() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://user:pass@db.example.com/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "verify-full"),
+            ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
+            ("FERRUM_DB_SSL_CLIENT_CERT", "/certs/client.pem"),
+            ("FERRUM_DB_SSL_CLIENT_KEY", "/certs/client-key.pem"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "mysql://user:pass@db.example.com/ferrum?ssl-mode=VERIFY_IDENTITY&ssl-ca=/certs/ca.pem&ssl-cert=/certs/client.pem&ssl-key=/certs/client-key.pem"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_sqlite_ignores_ssl() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "sqlite"),
+            ("FERRUM_DB_URL", "sqlite://ferrum.db?mode=rwc"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+            ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "sqlite://ferrum.db?mode=rwc"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_root_cert_only() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
+        ],
+        || {
+            remove_var("FERRUM_DB_SSL_MODE");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "postgres://localhost/ferrum?sslrootcert=/certs/ca.pem"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_none_when_no_db_url() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DB_URL");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.effective_db_url().is_none());
+        },
+    );
+}
