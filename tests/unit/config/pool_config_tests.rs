@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use ferrum_gateway::config::PoolConfig;
+use ferrum_gateway::config::pool_config::{MAX_IDLE_PER_HOST, MIN_IDLE_PER_HOST};
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
 
 fn create_test_proxy() -> Proxy {
@@ -91,4 +92,34 @@ fn test_no_overrides() {
     );
     assert_eq!(config.enable_http_keep_alive, global.enable_http_keep_alive);
     assert_eq!(config.enable_http2, global.enable_http2);
+}
+
+#[test]
+fn test_validate_clamps_too_low() {
+    let result = PoolConfig::validate_max_idle_per_host(1, "test");
+    assert_eq!(result, MIN_IDLE_PER_HOST);
+}
+
+#[test]
+fn test_validate_clamps_too_high() {
+    let result = PoolConfig::validate_max_idle_per_host(5000, "test");
+    assert_eq!(result, MAX_IDLE_PER_HOST);
+}
+
+#[test]
+fn test_validate_accepts_valid_value() {
+    let result = PoolConfig::validate_max_idle_per_host(100, "test");
+    assert_eq!(result, 100);
+}
+
+#[test]
+fn test_validate_accepts_boundary_values() {
+    assert_eq!(
+        PoolConfig::validate_max_idle_per_host(MIN_IDLE_PER_HOST, "test"),
+        MIN_IDLE_PER_HOST
+    );
+    assert_eq!(
+        PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
+        MAX_IDLE_PER_HOST
+    );
 }

@@ -154,7 +154,7 @@ impl PoolConfig {
 
     /// Validate and clamp `max_idle_per_host` to the allowed range, logging
     /// a warning when the value is adjusted.
-    fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
+    pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
         if value < MIN_IDLE_PER_HOST {
             tracing::warn!(
                 "pool_max_idle_per_host={} for '{}' is below the minimum ({}). \
@@ -180,49 +180,5 @@ impl PoolConfig {
         } else {
             value
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_pool_config() {
-        let config = PoolConfig::default();
-        assert_eq!(config.max_idle_per_host, 64);
-        assert_eq!(config.idle_timeout_seconds, 90);
-        assert!(config.enable_http_keep_alive);
-        assert!(config.enable_http2);
-    }
-
-    #[test]
-    fn test_validate_clamps_too_low() {
-        let result = PoolConfig::validate_max_idle_per_host(1, "test");
-        assert_eq!(result, MIN_IDLE_PER_HOST);
-    }
-
-    #[test]
-    fn test_validate_clamps_too_high() {
-        let result = PoolConfig::validate_max_idle_per_host(5000, "test");
-        assert_eq!(result, MAX_IDLE_PER_HOST);
-    }
-
-    #[test]
-    fn test_validate_accepts_valid_value() {
-        let result = PoolConfig::validate_max_idle_per_host(100, "test");
-        assert_eq!(result, 100);
-    }
-
-    #[test]
-    fn test_validate_accepts_boundary_values() {
-        assert_eq!(
-            PoolConfig::validate_max_idle_per_host(MIN_IDLE_PER_HOST, "test"),
-            MIN_IDLE_PER_HOST
-        );
-        assert_eq!(
-            PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
-            MAX_IDLE_PER_HOST
-        );
     }
 }
