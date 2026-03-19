@@ -1,6 +1,6 @@
 # Multi-stage build for Ferrum Gateway
 # Stage 1: Builder
-FROM rust:1.85-slim as builder
+FROM rust:latest AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
