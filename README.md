@@ -408,7 +408,7 @@ Connection pooling uses a **hybrid configuration** with global defaults and per-
 #### Global Environment Variables
 ```bash
 # Set global defaults (optional - shown with defaults)
-FERRUM_POOL_MAX_IDLE_PER_HOST=10
+FERRUM_POOL_MAX_IDLE_PER_HOST=64
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=true
@@ -422,7 +422,7 @@ FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS=45
 proxies:
   - id: "high-traffic-api"
     # Override specific settings for this proxy
-    pool_max_idle_per_host: 50
+    pool_max_idle_per_host: 128
     pool_enable_http2: false
     pool_tcp_keepalive_seconds: 30
     pool_http2_keep_alive_interval_seconds: 15
@@ -442,13 +442,48 @@ proxies:
 
 | Setting | Global Default | Description |
 |---------|----------------|-------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `10` | Maximum idle connections per backend host |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse |
 | `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
+
+### Sizing `pool_max_idle_per_host`
+
+This is the single most important pool setting for performance and reliability.
+It controls how many idle backend connections are kept alive and ready for reuse
+per backend host. Values that are too low cause connection churn under load (new
+TCP handshakes per request), while values that are too high waste file
+descriptors and memory.
+
+**Safety bounds:** The gateway enforces a minimum of **4** and a maximum of
+**1024**. Values outside this range are automatically clamped with a warning in
+the logs.
+
+#### Recommended values by workload
+
+| Workload | Expected Concurrency | Recommended Value | Notes |
+|----------|---------------------|-------------------|-------|
+| Low-traffic internal API | < 20 concurrent requests | `16`–`32` | Default of 64 is fine; keep-alive reuses connections efficiently |
+| Standard production API | 20–100 concurrent requests | `64`–`128` | Match or slightly exceed your expected peak concurrency per backend host |
+| High-traffic public API | 100–500 concurrent requests | `128`–`256` | Higher values prevent connection churn at peak; monitor backend capacity |
+| Health checks / monitoring | Low volume, high frequency | `16`–`32` | Small responses finish quickly; fewer idle connections needed |
+| WebSocket services | Long-lived connections | `16`–`64` | WebSocket connections are persistent; pool mainly holds upgrade handshakes |
+
+#### How to choose
+
+1. **Start with the default (64).** This handles most workloads well.
+2. **Match your expected peak concurrency.** If your gateway handles 200
+   concurrent requests to a single backend, set the value to at least `200`.
+   Idle connections beyond the limit are closed, so requests that arrive when no
+   idle connection is available must open a new TCP connection, adding latency.
+3. **Monitor for connection churn.** If your logs show frequent
+   "Backend request failed" errors under load, increase this value.
+4. **Do not exceed your backend's capacity.** Setting this to 1024 does not help
+   if your backend can only handle 100 concurrent connections — it just moves
+   the bottleneck.
 
 ### Timeout Mechanisms Explained
 
@@ -480,7 +515,7 @@ proxies:
 #### HTTP/HTTPS APIs
 ```bash
 # Global environment
-FERRUM_POOL_MAX_IDLE_PER_HOST=25
+FERRUM_POOL_MAX_IDLE_PER_HOST=128
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
 FERRUM_POOL_ENABLE_HTTP2=true
 ```
@@ -488,7 +523,7 @@ FERRUM_POOL_ENABLE_HTTP2=true
 #### WebSocket Services
 ```yaml
 # Per-proxy override for WS/WSS
-pool_max_idle_per_host: 10
+pool_max_idle_per_host: 32
 pool_idle_timeout_seconds: 300
 pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 ```
@@ -496,27 +531,26 @@ pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 #### Auth-Protected APIs
 ```yaml
 # Per-proxy override for auth-heavy services
-pool_max_idle_per_host: 15
+pool_max_idle_per_host: 64
 pool_enable_http2: false  # Better compatibility with auth plugins
 ```
 
 ### Performance Impact
 
-In performance tests, connection pooling provides:
-- **~150,000 RPS** vs ~56,000 RPS direct backend access
-- **~600μs latency** vs ~1.6ms without pooling
+In performance tests (8 threads, 100 connections, 30 seconds), connection
+pooling with properly tuned `pool_max_idle_per_host` provides:
+- **~97,000 RPS** for lightweight health checks through the gateway
+- **~85,000 RPS** for API proxy vs ~54,000 RPS direct backend access
+- **Sub-millisecond p50 latency** for health checks, ~1.15ms for API proxy
 - **Zero errors** under sustained load
 
 ### Performance Testing
 
-Ferrum Gateway includes a comprehensive performance testing suite in the `perftest/` directory:
+Ferrum Gateway includes a comprehensive performance testing suite in the `tests/performance/` directory:
 
 ```bash
-# Quick performance test
-cd perftest && ./quick_test.sh
-
 # Full performance test suite with HTML report
-cd perftest && ./run_perf_test.sh
+cd tests/performance && ./run_perf_test.sh
 
 # Custom test parameters
 WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./run_perf_test.sh
@@ -529,7 +563,7 @@ The testing suite provides:
 - **Configurable load testing** with wrk
 - **Protocol support** for HTTP, HTTPS, and WebSockets
 
-See `perftest/README.md` for detailed usage instructions.
+See `tests/performance/README.md` for detailed usage instructions.
 
 ### Database Schema
 

@@ -27,7 +27,7 @@ pub struct RequestContext {
     pub path: String,
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
-    pub matched_proxy: Option<Proxy>,
+    pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Consumer>,
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
