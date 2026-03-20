@@ -60,12 +60,22 @@ REDIS_CONTAINER="ferrum-bench-redis"
 # PIDs to track
 BACKEND_PID=""
 FERRUM_PID=""
+KONG_PID=""
 
 # Detect platform for Docker networking
+# macOS Docker Desktop does not support --network host; use port mapping instead
 if [[ "$(uname -s)" == "Darwin" ]]; then
     BACKEND_HOST="host.docker.internal"
+    DOCKER_USE_HOST_NETWORK=false
 else
     BACKEND_HOST="127.0.0.1"
+    DOCKER_USE_HOST_NETWORK=true
+fi
+
+# Detect whether Kong is installed natively (preferred over Docker for fair benchmarking)
+KONG_NATIVE=false
+if command -v kong &>/dev/null; then
+    KONG_NATIVE=true
 fi
 
 # ===========================================================================
@@ -135,14 +145,19 @@ cleanup() {
         kill "$FERRUM_PID" 2>/dev/null || true
         log_ok "Ferrum gateway stopped"
     fi
+    if [[ "$KONG_PID" == "native" ]]; then
+        KONG_PREFIX="/tmp/kong-bench" kong stop 2>/dev/null || true
+    fi
 
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
     docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
 
-    # Clean up temporary config files
+    # Clean up Docker network and temporary config files
+    docker network rm "$TYK_NETWORK" 2>/dev/null || true
     rm -f "$COMP_DIR/configs/.kong_runtime.yaml" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
+    rm -rf "$COMP_DIR/configs/.tyk_runtime" 2>/dev/null || true
 
     kill_port "$BACKEND_PORT"
     kill_port "$GATEWAY_HTTP_PORT"
@@ -155,11 +170,27 @@ trap cleanup EXIT
 # Dependency checks
 # ===========================================================================
 
+needs_docker() {
+    # Docker is needed for Tyk (always) and Kong (unless native)
+    if ! should_skip "tyk"; then
+        return 0
+    fi
+    if ! should_skip "kong" && [[ "$KONG_NATIVE" != "true" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 check_dependencies() {
     log_header "Checking dependencies"
 
     local missing=0
-    for cmd in wrk docker python3 cargo curl; do
+    local required_cmds=(wrk python3 cargo curl)
+    if needs_docker; then
+        required_cmds+=(docker)
+    fi
+
+    for cmd in "${required_cmds[@]}"; do
         if command -v "$cmd" &>/dev/null; then
             log_ok "$cmd"
         else
@@ -176,10 +207,15 @@ check_dependencies() {
         exit 1
     fi
 
-    # Check Docker daemon is running
-    if ! docker info &>/dev/null; then
-        log_err "Docker daemon is not running. Start Docker and try again."
-        exit 1
+    # Check Docker daemon is running (only if needed)
+    if needs_docker; then
+        if ! docker info &>/dev/null; then
+            log_err "Docker daemon is not running. Start Docker and try again."
+            exit 1
+        fi
+        log_ok "Docker daemon"
+    else
+        log_info "Docker not required (Kong and Tyk skipped)"
     fi
 }
 
@@ -188,6 +224,10 @@ check_dependencies() {
 # ===========================================================================
 
 pull_images() {
+    if ! needs_docker; then
+        return
+    fi
+
     log_header "Pulling Docker images"
 
     if ! should_skip "kong"; then
@@ -246,8 +286,11 @@ run_wrk() {
     local protocol="$2"
     local endpoint="$3"
     local port="$4"
-    local label="${gateway}/${protocol}/${endpoint}"
-    local result_file="${RESULTS_DIR}/${gateway}_${protocol}_${endpoint}_results.txt"
+    local label="${gateway}/${protocol}${endpoint}"
+    # Sanitize endpoint for filename: /health -> health, /api/users -> api_users
+    local safe_endpoint
+    safe_endpoint=$(echo "$endpoint" | sed 's|^/||; s|/|_|g')
+    local result_file="${RESULTS_DIR}/${gateway}_${protocol}_${safe_endpoint}_results.txt"
 
     local url
     if [[ "$protocol" == "https" ]]; then
@@ -347,18 +390,82 @@ test_ferrum() {
 # ===========================================================================
 
 prepare_kong_config() {
-    # Replace BACKEND_HOST placeholder in Kong config
-    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
-        "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
+    # For Docker: replace BACKEND_HOST placeholder
+    # For native: always use 127.0.0.1 (backend is on localhost)
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        sed "s/BACKEND_HOST/127.0.0.1/g" \
+            "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
+    else
+        sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+            "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
+    fi
 }
 
-start_kong_http() {
-    log_info "Starting Kong Gateway (HTTP) on port $GATEWAY_HTTP_PORT..."
+# --- Kong Native ---
+
+start_kong_native_http() {
+    log_info "Starting Kong Gateway native (HTTP) on port $GATEWAY_HTTP_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+
+    KONG_DATABASE=off \
+    KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime.yaml" \
+    KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
+    KONG_ADMIN_LISTEN="off" \
+    KONG_PROXY_ACCESS_LOG=/dev/null \
+    KONG_PROXY_ERROR_LOG=/dev/stderr \
+    KONG_LOG_LEVEL=warn \
+    KONG_PREFIX="/tmp/kong-bench" \
+    kong start > "$RESULTS_DIR/kong_http.log" 2>&1
+
+    KONG_PID="native"
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong native (HTTP)" 20
+}
+
+start_kong_native_https() {
+    log_info "Starting Kong Gateway native (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    KONG_DATABASE=off \
+    KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime.yaml" \
+    KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
+    KONG_SSL_CERT="$CERTS_DIR/server.crt" \
+    KONG_SSL_CERT_KEY="$CERTS_DIR/server.key" \
+    KONG_ADMIN_LISTEN="off" \
+    KONG_PROXY_ACCESS_LOG=/dev/null \
+    KONG_PROXY_ERROR_LOG=/dev/stderr \
+    KONG_LOG_LEVEL=warn \
+    KONG_PREFIX="/tmp/kong-bench" \
+    kong start > "$RESULTS_DIR/kong_https.log" 2>&1
+
+    KONG_PID="native"
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong native (HTTPS)" 20
+}
+
+stop_kong_native() {
+    KONG_PREFIX="/tmp/kong-bench" kong stop 2>/dev/null || true
+    KONG_PID=""
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    sleep 1
+}
+
+# --- Kong Docker ---
+
+start_kong_docker_http() {
+    log_info "Starting Kong Gateway Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
 
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+    fi
+
     docker run -d --name "$KONG_CONTAINER" \
-        --network host \
+        "${network_args[@]}" \
         -v "$COMP_DIR/configs/.kong_runtime.yaml:/etc/kong/kong.yml:ro" \
         -e KONG_DATABASE=off \
         -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
@@ -369,17 +476,24 @@ start_kong_http() {
         -e KONG_LOG_LEVEL=warn \
         "kong/kong-gateway:${KONG_VERSION}" > /dev/null
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong (HTTP)" 20
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (HTTP)" 20
 }
 
-start_kong_https() {
-    log_info "Starting Kong Gateway (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+start_kong_docker_https() {
+    log_info "Starting Kong Gateway Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
     docker run -d --name "$KONG_CONTAINER" \
-        --network host \
+        "${network_args[@]}" \
         -v "$COMP_DIR/configs/.kong_runtime.yaml:/etc/kong/kong.yml:ro" \
         -v "$CERTS_DIR/server.crt:/etc/kong/ssl/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/kong/ssl/server.key:ro" \
@@ -394,32 +508,60 @@ start_kong_https() {
         -e KONG_LOG_LEVEL=warn \
         "kong/kong-gateway:${KONG_VERSION}" > /dev/null
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong (HTTPS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (HTTPS)" 20
 }
 
-stop_kong() {
+stop_kong_docker() {
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     sleep 1
 }
 
+# --- Kong dispatch ---
+
+stop_kong() {
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        stop_kong_native
+    else
+        stop_kong_docker
+    fi
+}
+
 test_kong() {
-    log_header "Testing Kong Gateway (${KONG_VERSION})"
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        log_header "Testing Kong Gateway (native, $(kong version 2>/dev/null || echo 'unknown'))"
+    else
+        log_header "Testing Kong Gateway (Docker ${KONG_VERSION})"
+    fi
 
     prepare_kong_config
 
-    # HTTP tests
-    start_kong_http
-    run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
-    stop_kong
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        # HTTP tests
+        start_kong_native_http
+        run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
+        run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+        stop_kong_native
 
-    # HTTPS tests
-    start_kong_https
-    run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
-    stop_kong
+        # HTTPS tests
+        start_kong_native_https
+        run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
+        run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+        stop_kong_native
+    else
+        # HTTP tests
+        start_kong_docker_http
+        run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
+        run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+        stop_kong_docker
+
+        # HTTPS tests
+        start_kong_docker_https
+        run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
+        run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+        stop_kong_docker
+    fi
 }
 
 # ===========================================================================
@@ -432,14 +574,38 @@ prepare_tyk_config() {
     for f in "$COMP_DIR/configs/tyk/apps"/*.json; do
         sed "s/BACKEND_HOST/$BACKEND_HOST/g" "$f" > "$COMP_DIR/configs/.tyk_runtime_apps/$(basename "$f")"
     done
+
+    # On macOS (no --network host), Tyk and Redis share a Docker network.
+    # Tyk must connect to Redis by container name instead of 127.0.0.1.
+    if [[ "$DOCKER_USE_HOST_NETWORK" != "true" ]]; then
+        local redis_host="$REDIS_CONTAINER"
+        mkdir -p "$COMP_DIR/configs/.tyk_runtime"
+        sed "s/127.0.0.1/$redis_host/g" \
+            "$COMP_DIR/configs/tyk/tyk.conf" > "$COMP_DIR/configs/.tyk_runtime/tyk.conf"
+        sed "s/127.0.0.1/$redis_host/g" \
+            "$COMP_DIR/configs/tyk/tyk_tls.conf" > "$COMP_DIR/configs/.tyk_runtime/tyk_tls.conf"
+        TYK_CONF_DIR="$COMP_DIR/configs/.tyk_runtime"
+    else
+        TYK_CONF_DIR="$COMP_DIR/configs/tyk"
+    fi
 }
+
+TYK_NETWORK="ferrum-bench-net"
 
 start_redis() {
     log_info "Starting Redis for Tyk..."
     docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
-    docker run -d --name "$REDIS_CONTAINER" \
-        --network host \
-        redis:7-alpine > /dev/null
+
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        docker run -d --name "$REDIS_CONTAINER" \
+            --network host \
+            redis:7-alpine > /dev/null
+    else
+        docker network create "$TYK_NETWORK" 2>/dev/null || true
+        docker run -d --name "$REDIS_CONTAINER" \
+            --network "$TYK_NETWORK" \
+            redis:7-alpine > /dev/null
+    fi
     sleep 2
     log_ok "Redis started"
 }
@@ -453,13 +619,20 @@ start_tyk_http() {
     docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
 
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+    fi
+
     docker run -d --name "$TYK_CONTAINER" \
-        --network host \
-        -v "$COMP_DIR/configs/tyk/tyk.conf:/opt/tyk-gateway/tyk.conf:ro" \
+        "${network_args[@]}" \
+        -v "$TYK_CONF_DIR/tyk.conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$COMP_DIR/configs/.tyk_runtime_apps:/etc/tyk/apps:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Tyk (HTTP)" 20
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (HTTP)" 20
 }
 
 start_tyk_https() {
@@ -468,15 +641,22 @@ start_tyk_https() {
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
     docker run -d --name "$TYK_CONTAINER" \
-        --network host \
-        -v "$COMP_DIR/configs/tyk/tyk_tls.conf:/opt/tyk-gateway/tyk.conf:ro" \
+        "${network_args[@]}" \
+        -v "$TYK_CONF_DIR/tyk_tls.conf:/opt/tyk-gateway/tyk.conf:ro" \
         -v "$COMP_DIR/configs/.tyk_runtime_apps:/etc/tyk/apps:ro" \
         -v "$CERTS_DIR/server.crt:/etc/tyk/certs/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Tyk (HTTPS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (HTTPS)" 20
 }
 
 stop_tyk() {
@@ -521,13 +701,21 @@ test_baseline() {
 # ===========================================================================
 
 write_metadata() {
+    local kong_info
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        kong_info="native ($(kong version 2>/dev/null || echo 'unknown'))"
+    else
+        kong_info="Docker ${KONG_VERSION}"
+    fi
+
     cat > "$RESULTS_DIR/meta.json" <<METAEOF
 {
     "duration": "$WRK_DURATION",
     "threads": "$WRK_THREADS",
     "connections": "$WRK_CONNECTIONS",
-    "kong_version": "$KONG_VERSION",
-    "tyk_version": "$TYK_VERSION",
+    "kong_version": "$kong_info",
+    "tyk_version": "Docker ${TYK_VERSION}",
+    "kong_native": $KONG_NATIVE,
     "os": "$(uname -s) $(uname -r) $(uname -m)",
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -553,7 +741,11 @@ main() {
     echo "  ╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  Duration: ${WRK_DURATION}  Threads: ${WRK_THREADS}  Connections: ${WRK_CONNECTIONS}"
-    echo "  Kong: ${KONG_VERSION}  Tyk: ${TYK_VERSION}  Backend host: ${BACKEND_HOST}"
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        echo "  Kong: native ($(kong version 2>/dev/null || echo '?'))  Tyk: Docker ${TYK_VERSION}"
+    else
+        echo "  Kong: Docker ${KONG_VERSION}  Tyk: Docker ${TYK_VERSION}"
+    fi
     if [[ -n "$SKIP_GATEWAYS" ]]; then
         echo -e "  ${YELLOW}Skipping: ${SKIP_GATEWAYS}${NC}"
     fi

@@ -106,12 +106,23 @@ def _latency_to_ms(s):
 GATEWAYS = ["baseline", "ferrum", "kong", "tyk"]
 PROTOCOLS = ["http", "https"]
 ENDPOINTS = ["health", "users"]
-GATEWAY_LABELS = {
-    "baseline": "Direct Backend",
-    "ferrum": "Ferrum Gateway",
-    "kong": "Kong Gateway",
-    "tyk": "Tyk Gateway",
-}
+
+
+def _gateway_labels(meta):
+    """Build gateway display labels based on metadata (native vs Docker)."""
+    kong_native = meta.get("kong_native", False)
+    kong_ver = meta.get("kong_version", "")
+    tyk_ver = meta.get("tyk_version", "")
+    return {
+        "baseline": "Direct Backend",
+        "ferrum": "Ferrum Gateway (native)",
+        "kong": f"Kong Gateway ({'native' if kong_native else 'Docker'})" if not kong_ver else f"Kong ({kong_ver})",
+        "tyk": f"Tyk ({tyk_ver})" if tyk_ver else "Tyk Gateway (Docker)",
+    }
+
+
+# Default labels (overridden by metadata at report generation time)
+GATEWAY_LABELS = _gateway_labels({})
 
 
 def discover_results(results_dir):
@@ -269,6 +280,7 @@ def _build_tls_overhead_table(data):
 
 def generate_report(results_dir, output_path, meta=None):
     """Generate the full HTML comparison report."""
+    global GATEWAY_LABELS
     data = discover_results(results_dir)
     if not data:
         print(f"No result files found in {results_dir}", file=sys.stderr)
@@ -279,6 +291,7 @@ def generate_report(results_dir, output_path, meta=None):
     bl_users = data.get("baseline", {}).get("http", {}).get("users", {})
 
     meta = meta or {}
+    GATEWAY_LABELS = _gateway_labels(meta)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     html = f"""<!DOCTYPE html>
@@ -380,6 +393,19 @@ def generate_report(results_dir, output_path, meta=None):
 <div class="section">
   <h2>TLS Overhead (HTTP vs HTTPS per Gateway)</h2>
   {_build_tls_overhead_table(data)}
+</div>
+
+<div class="section">
+  <h2>Methodology &amp; Caveats</h2>
+  <ul>
+    <li><strong>Ferrum Gateway</strong> runs as a native binary on the host — zero container overhead.</li>
+    <li><strong>Kong</strong> runs {"natively on the host (installed via Homebrew or package manager) — no container overhead." if meta.get("kong_native") else "inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s). To eliminate this overhead, install Kong natively: <code>brew tap kong/kong &amp;&amp; brew install kong</code> (macOS) or use the official apt/yum packages (Linux)."}</li>
+    <li><strong>Tyk</strong> runs inside a Docker container (no official macOS binary; Linux-only native packages available via <a href="https://tyk.io/docs/apim/open-source/installation">packagecloud</a>). The same Docker overhead caveats as Kong apply. Additionally, Tyk requires Redis which also runs in a container.</li>
+    <li><strong>TLS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). This is the standard API gateway deployment pattern.</li>
+    <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
+    <li>Each test includes a {meta.get("duration", "30s")} measured run preceded by a warm-up phase (results discarded).</li>
+    <li>To get the fairest comparison on macOS, install Kong natively and run the benchmark again. Tyk results on macOS should be interpreted with Docker overhead in mind (~0.1–0.5 ms added latency, ~5-15% throughput reduction).</li>
+  </ul>
 </div>
 
 <div class="footer">

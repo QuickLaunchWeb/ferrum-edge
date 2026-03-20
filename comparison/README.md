@@ -22,17 +22,51 @@ A direct backend baseline (no gateway) is run first for comparison.
 - Gateways are tested **sequentially** (one at a time) to avoid resource contention
 - Each test gets a **5-second warm-up** (results discarded) before the measured 30-second run
 - The same backend echo server, wrk parameters, and endpoints are used across all gateways
-- Ferrum runs as a native binary; Kong and Tyk run in Docker containers
+- Ferrum runs as a native binary; Kong runs natively if installed (preferred) or in Docker; Tyk runs in Docker (no official macOS binary)
+- The script auto-detects native Kong and prefers it over Docker for fairer benchmarking
 
 ## Prerequisites
 
-| Dependency | Install |
-|------------|---------|
-| **wrk** | `brew install wrk` (macOS) or `apt install wrk` (Ubuntu) |
-| **Docker** | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
-| **Python 3** | Usually pre-installed; needed for report generation |
-| **Rust/Cargo** | [rustup.rs](https://rustup.rs/) — builds Ferrum and the backend server |
-| **curl** | Usually pre-installed; used for health checks |
+| Dependency | Required | Install |
+|------------|----------|---------|
+| **wrk** | Yes | `brew install wrk` (macOS) or `apt install wrk` (Ubuntu) |
+| **Python 3** | Yes | Usually pre-installed; needed for report generation |
+| **Rust/Cargo** | Yes | [rustup.rs](https://rustup.rs/) — builds Ferrum and the backend server |
+| **curl** | Yes | Usually pre-installed; used for health checks |
+| **Docker** | For Tyk (always), Kong (if not native) | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
+| **Kong** (native) | Recommended | See below |
+
+### Native Kong Installation (Recommended for Fair Benchmarks)
+
+Installing Kong natively eliminates Docker overhead and provides the fairest comparison against Ferrum. The script auto-detects a native `kong` binary and uses it automatically.
+
+**macOS:** Kong dropped Homebrew support in 2023. No native macOS binary is officially available — Docker is the only supported option on macOS. If you have a Kong binary from another source, place it on your `$PATH` and the script will use it.
+
+**Ubuntu/Debian:**
+```bash
+curl -1sLf 'https://packages.konghq.com/public/gateway-39/setup.deb.sh' | sudo bash
+sudo apt install kong
+```
+
+**RHEL/CentOS:**
+```bash
+curl -1sLf 'https://packages.konghq.com/public/gateway-39/setup.rpm.sh' | sudo bash
+sudo yum install kong
+```
+
+### Native Tyk Installation (Linux Only)
+
+Tyk has no official macOS binary. On Linux, native installation is available:
+
+**Ubuntu/Debian:**
+```bash
+curl -1sLf 'https://packagecloud.io/tyk/tyk-gateway/setup.deb.sh' | sudo bash
+sudo apt install tyk-gateway
+```
+
+Tyk always requires Redis (`brew install redis` on macOS, `apt install redis-server` on Linux).
+
+On macOS, Tyk runs in Docker — see the "Docker Overhead" section below for what this means for results.
 
 **System recommendations:** Run on a dedicated machine or close resource-intensive applications. CPU governor set to "performance" improves consistency on Linux.
 
@@ -133,9 +167,26 @@ To add a new gateway (e.g., Envoy, NGINX, Traefik):
 
 Each test function should follow the pattern: start → run_wrk (per endpoint) → stop. Use the same ports (8000/8443) since gateways run sequentially.
 
-## Known Limitations
+## Docker Overhead
 
-- **Docker overhead:** Kong and Tyk run inside Docker containers while Ferrum runs as a native binary. This gives Ferrum a slight advantage from lower syscall overhead and no container networking layer. For a truly apples-to-apples comparison on Linux, use `--network host` (already configured) which minimizes Docker networking overhead. On macOS, Docker Desktop runs in a Linux VM which adds additional overhead for Kong/Tyk.
+When a gateway runs in Docker instead of natively, there is measurable overhead that affects benchmark results. The amount varies by platform:
+
+| Platform | Networking Mode | Added Latency | Throughput Impact | Notes |
+|----------|----------------|---------------|-------------------|-------|
+| **Linux** | `--network host` | < 5 μs | < 1% | Negligible; containers share the host network stack |
+| **Linux** | port mapping (`-p`) | ~10–50 μs | ~2–5% | Userspace proxy adds a small hop |
+| **macOS** | port mapping (`-p`) | ~0.1–0.5 ms | ~5–15% | Docker Desktop runs in a Linux VM; each packet crosses the VM boundary + userspace networking |
+
+**On macOS**, Docker overhead is the most significant. Docker Desktop 4.19+ improved this with the gVisor TCP/IP stack (5x faster than the older vpnkit), but the VM boundary remains. CPU scheduling variance is also ~9.5x higher in the VM compared to native.
+
+**To minimize Docker overhead:**
+1. Install Kong natively (`brew install kong` on macOS) — the script auto-detects and prefers it
+2. On Linux, use `--network host` (already configured automatically)
+3. For Tyk on macOS, acknowledge ~5-15% throughput disadvantage vs native gateways in results
+
+The HTML report's "Methodology & Caveats" section notes which gateways ran natively vs in Docker.
+
+## Known Limitations
 
 - **No plugins enabled:** Tests measure pure proxy overhead only. Real-world performance with authentication, rate limiting, or transformation plugins will differ. Each gateway has different plugin performance characteristics.
 
@@ -144,6 +195,8 @@ Each test function should follow the pattern: start → run_wrk (per endpoint) �
 - **Single-node only:** All tests run on localhost. Distributed deployment characteristics (network latency, cluster synchronization) are not captured.
 
 - **In-memory state:** Tyk requires Redis even in standalone mode. The Redis instance runs locally and is fast, but it's a dependency that Kong and Ferrum don't need, which could slightly affect Tyk's resource usage.
+
+- **Tyk on macOS:** No native macOS binary exists, so Tyk always runs in Docker on macOS. On Linux, Tyk can be installed natively via packagecloud (adding native Tyk support to this script is a welcome contribution).
 
 ## File Structure
 
