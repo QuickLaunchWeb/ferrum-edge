@@ -92,15 +92,15 @@ pub struct TransactionSummary {
 ///
 /// | Band    | Range   | Purpose                                      | Plugins                          |
 /// |---------|---------|----------------------------------------------|----------------------------------|
-/// | Early   | 0–99    | Pre-processing: CORS preflight, rate limits  | cors (10), rate_limiting (20)    |
+/// | Early   | 0–99    | Pre-processing: CORS preflight               | cors (10)                        |
 /// | AuthN   | 100–199 | Authentication: identity verification         | oauth2 (100), jwt (110), key (120), basic (130) |
-/// | AuthZ   | 200–299 | Authorization: access control decisions       | access_control (200)             |
+/// | AuthZ   | 200–299 | Authorization & post-auth enforcement         | access_control (200), rate_limiting (299) |
 /// | Transform | 300–399 | Request transformation before backend       | request_transformer (300)        |
 /// | Response | 400–499 | Response transformation after backend        | response_transformer (400)       |
 /// | Logging | 900–999 | Logging & observability (fire-and-forget)     | stdout (900), http (910), debugger (920) |
 pub mod priority {
     pub const CORS: u16 = 10;
-    pub const RATE_LIMITING: u16 = 20;
+    pub const RATE_LIMITING: u16 = 299;
     pub const OAUTH2_AUTH: u16 = 100;
     pub const JWT_AUTH: u16 = 110;
     pub const KEY_AUTH: u16 = 120;

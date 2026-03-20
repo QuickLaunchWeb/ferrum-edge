@@ -11,7 +11,7 @@ Request In
     │
     ▼
 ┌─────────────────────────┐
-│ 1. on_request_received  │  Pre-processing: CORS preflight, rate limiting
+│ 1. on_request_received  │  Pre-processing: CORS preflight
 └────────────┬────────────┘
              │
              ▼
@@ -21,7 +21,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 3. authorize            │  Access decisions: ACL allow/deny lists
+│ 3. authorize            │  Access control, consumer rate limiting
 └────────────┬────────────┘
              │
              ▼
@@ -45,7 +45,7 @@ Request In
 └─────────────────────────┘
 ```
 
-Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in phase 1 before any backend work occurs.
+Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
 ## Priority Bands
 
@@ -55,9 +55,9 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–99 | Pre-processing that must run before auth | `cors` (10), `rate_limiting` (20) |
+| **Early** | 0–99 | Pre-processing that must run before auth | `cors` (10) |
 | **AuthN** | 100–199 | Authentication / identity verification | `oauth2_auth` (100), `jwt_auth` (110), `key_auth` (120), `basic_auth` (130) |
-| **AuthZ** | 200–299 | Authorization / access control decisions | `access_control` (200) |
+| **AuthZ** | 200–299 | Authorization & post-auth enforcement | `access_control` (200), `rate_limiting` (299) |
 | **Transform** | 300–399 | Request modification before backend call | `request_transformer` (300) |
 | **Response** | 400–499 | Response modification after backend call | `response_transformer` (400) |
 | **Custom** | 500 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -70,12 +70,12 @@ Given all built-in plugins enabled, the execution order is:
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
 | 1 | `cors` | 10 | on_request_received, after_proxy |
-| 2 | `rate_limiting` | 20 | on_request_received |
-| 3 | `oauth2_auth` | 100 | authenticate |
-| 4 | `jwt_auth` | 110 | authenticate |
-| 5 | `key_auth` | 120 | authenticate |
-| 6 | `basic_auth` | 130 | authenticate |
-| 7 | `access_control` | 200 | authorize |
+| 2 | `oauth2_auth` | 100 | authenticate |
+| 3 | `jwt_auth` | 110 | authenticate |
+| 4 | `key_auth` | 120 | authenticate |
+| 5 | `basic_auth` | 130 | authenticate |
+| 6 | `access_control` | 200 | authorize |
+| 7 | `rate_limiting` | 299 | on_request_received (IP mode), authorize (consumer mode) |
 | 8 | `request_transformer` | 300 | before_proxy |
 | 9 | `response_transformer` | 400 | after_proxy |
 | 10 | `stdout_logging` | 900 | log |
@@ -88,13 +88,17 @@ Given all built-in plugins enabled, the execution order is:
 
 Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 10 ensures preflight responses are returned immediately.
 
-### Rate limiting runs before auth (priority 20)
-
-Rate limiting at priority 20 rejects excessive requests with `429` before spending CPU cycles on authentication (JWT decoding, bcrypt verification, token introspection). This protects the gateway from brute-force attacks that would otherwise consume auth resources.
-
 ### Authentication before authorization (100s before 200s)
 
 Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer`). Authorization plugins like `access_control` then decide *whether* that consumer is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
+
+### Rate limiting runs after auth (priority 299)
+
+Rate limiting sits at the end of the AuthZ band (priority 299) so it can enforce limits by **authenticated consumer identity**, not just by IP address. When `limit_by: "consumer"`, the plugin needs `ctx.identified_consumer` which is only available after the authenticate phase.
+
+**Dual-phase behavior:**
+- `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
+- `limit_by: "consumer"` — enforces consumer-based limits in `authorize` (phase 3, after auth). If no consumer is identified (unauthenticated request), falls back to IP-based keying.
 
 ### Transforms after auth (300+)
 
@@ -116,11 +120,11 @@ impl Plugin for MyPlugin {
         // Pick a value in the appropriate band:
         // 0-99: pre-processing (before auth)
         // 100-199: authentication
-        // 200-299: authorization
+        // 200-299: authorization / post-auth enforcement
         // 300-399: request transformation
         // 400-499: response transformation
         // 900-999: logging
-        50  // Example: runs after CORS (10) and rate limiting (20)
+        50  // Example: runs after CORS (10), before auth (100+)
     }
 }
 ```

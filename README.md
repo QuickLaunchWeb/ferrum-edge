@@ -714,9 +714,9 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 | Priority | Band | Plugins |
 |----------|------|---------|
 | 10 | Early | `cors` |
-| 20 | Early | `rate_limiting` |
 | 100–130 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
 | 200 | Authorization | `access_control` |
+| 299 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
 | 300 | Transform | `request_transformer` |
 | 400 | Response | `response_transformer` |
 | 900–920 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
@@ -900,15 +900,19 @@ config:
 
 #### `rate_limiting`
 
-Enforces request rate limits per time window. State is maintained in-memory per node.
+Enforces request rate limits per time window. Supports limiting by client IP address or by authenticated consumer identity. State is maintained in-memory per node.
 
 **Config**:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `limit_by` | String | `ip` | Rate limit key: `consumer` or `ip` |
+| `limit_by` | String | `ip` | Rate limit key: `ip` (client IP) or `consumer` (authenticated consumer username) |
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
+
+**Behavior by mode:**
+- `limit_by: "ip"` — Enforces limits in the `on_request_received` phase (before authentication), keyed by client IP. This protects auth endpoints from brute-force attacks.
+- `limit_by: "consumer"` — Enforces limits in the `authorize` phase (after authentication), keyed by the authenticated consumer's username. If no consumer is identified, falls back to client IP as the key.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 

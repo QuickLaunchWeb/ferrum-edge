@@ -806,24 +806,22 @@ async fn handle_proxy_request(
         }
     }
 
-    // Authorization phase (access_control)
+    // Authorization phase (access_control, rate_limiting by consumer, etc.)
     for plugin in &plugins {
-        if plugin.name() == "access_control" {
-            match plugin.authorize(&mut ctx).await {
-                PluginResult::Reject {
-                    status_code,
-                    body,
-                    headers,
-                } => {
-                    record_request(&state, status_code);
-                    return Ok(build_reject_response(
-                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
-                        &body,
-                        &headers,
-                    ));
-                }
-                PluginResult::Continue => {}
+        match plugin.authorize(&mut ctx).await {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                record_request(&state, status_code);
+                return Ok(build_reject_response(
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                    &body,
+                    &headers,
+                ));
             }
+            PluginResult::Continue => {}
         }
     }
 

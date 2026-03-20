@@ -321,9 +321,9 @@ fn test_full_plugin_priority_chain() {
         names,
         vec![
             "cors",                 // 10  — Early
-            "rate_limiting",        // 20  — Early
             "key_auth",             // 120 — AuthN
             "access_control",       // 200 — AuthZ
+            "rate_limiting",        // 299 — AuthZ (tail)
             "request_transformer",  // 300 — Transform
             "response_transformer", // 400 — Response
             "stdout_logging",       // 900 — Logging

@@ -29,18 +29,24 @@ async fn test_rate_limiting_plugin_consumer_limiting() {
 
     let consumer = create_test_consumer();
 
-    // First request should pass
+    // In consumer mode, on_request_received should pass through (no-op)
     let mut ctx = create_test_context();
     ctx.identified_consumer = Some(consumer.clone());
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
 
-    // Multiple requests for same consumer should be rate limited
+    // Consumer-based limiting happens in authorize phase (after auth identifies consumer)
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(consumer.clone());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+
+    // Multiple requests for same consumer should be rate limited via authorize
     let mut rejected_count = 0;
     for _i in 0..6 {
         let mut ctx_test = create_test_context();
         ctx_test.identified_consumer = Some(consumer.clone());
-        let result = plugin.on_request_received(&mut ctx_test).await;
+        let result = plugin.authorize(&mut ctx_test).await;
         if matches!(result, PluginResult::Reject { .. }) {
             rejected_count += 1;
         }
@@ -144,8 +150,8 @@ async fn test_rate_limiting_plugin_invalid_config() {
 }
 
 #[tokio::test]
-async fn test_rate_limiting_authorize_does_not_double_count() {
-    // After our fix, authorize() should NOT apply rate limiting (defaults to Continue)
+async fn test_rate_limiting_ip_mode_authorize_is_noop() {
+    // In IP mode, authorize() should NOT apply rate limiting (only on_request_received does)
     let config = json!({
         "window_seconds": 60,
         "max_requests": 1,
@@ -159,12 +165,62 @@ async fn test_rate_limiting_authorize_does_not_double_count() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
 
-    // authorize should always return Continue (not count against the limit)
+    // authorize should always return Continue in IP mode (not count against the limit)
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 
     // The next on_request_received should be rejected (limit=1, already used)
     let result = plugin.on_request_received(&mut ctx).await;
+    assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
+    // In consumer mode, on_request_received() should be a no-op (authorize handles limiting)
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "consumer"
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let consumer = create_test_consumer();
+
+    // on_request_received should pass through in consumer mode
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(consumer.clone());
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+
+    // authorize uses the limit for consumer mode
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+
+    // Second authorize should be rejected (limit=1, already used)
+    let mut ctx2 = create_test_context();
+    ctx2.identified_consumer = Some(consumer.clone());
+    let result = plugin.authorize(&mut ctx2).await;
+    assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_rate_limiting_consumer_fallback_to_ip() {
+    // In consumer mode, unauthenticated requests fall back to IP-based keying
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "consumer"
+    });
+    let plugin = RateLimiting::new(&config);
+
+    // No consumer set — should fall back to IP-based key
+    let mut ctx = create_test_context();
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+
+    // Second request from same IP (no consumer) should be rejected
+    let mut ctx2 = create_test_context();
+    let result = plugin.authorize(&mut ctx2).await;
     assert_reject(result, Some(429));
 }
 
