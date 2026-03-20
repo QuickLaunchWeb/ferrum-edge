@@ -1,0 +1,22 @@
+{
+  "name": "Users API",
+  "slug": "users-api",
+  "api_id": "users-api",
+  "org_id": "default",
+  "use_keyless": true,
+  "active": true,
+  "proxy": {
+    "listen_path": "/api/users",
+    "target_url": "http://BACKEND_HOST:3001/api/users",
+    "strip_listen_path": false
+  },
+  "version_data": {
+    "not_versioned": true,
+    "default_version": "Default",
+    "versions": {
+      "Default": {
+        "name": "Default"
+      }
+    }
+  }
+}

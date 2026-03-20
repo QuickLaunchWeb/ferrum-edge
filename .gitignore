@@ -25,3 +25,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Comparison benchmark results (regenerated each run)
+comparison/results/*.txt
+comparison/results/*.html
+comparison/results/*.json

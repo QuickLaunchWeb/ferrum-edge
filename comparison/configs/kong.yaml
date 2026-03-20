@@ -1,0 +1,36 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration for comparison benchmarks
+# Two services/routes matching the same endpoints tested on Ferrum and Tyk
+#
+# NOTE: BACKEND_HOST is replaced at runtime by run_comparison.sh
+# (host.docker.internal on macOS, 127.0.0.1 on Linux)
+
+services:
+  - name: health-service
+    host: BACKEND_HOST
+    port: 3001
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        strip_path: false
+        preserve_host: false
+
+  - name: users-service
+    host: BACKEND_HOST
+    port: 3001
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: users-route
+        paths:
+          - /api/users
+        strip_path: false
+        preserve_host: false
