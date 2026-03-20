@@ -47,6 +47,10 @@ impl Plugin for OAuth2Auth {
         "oauth2_auth"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::OAUTH2_AUTH
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,

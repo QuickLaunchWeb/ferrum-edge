@@ -65,6 +65,10 @@ impl Plugin for AccessControl {
         "access_control"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::ACCESS_CONTROL
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Check IP-based access control first
         let client_ip = &ctx.client_ip;

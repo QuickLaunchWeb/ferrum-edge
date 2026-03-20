@@ -45,6 +45,10 @@ impl Plugin for RequestTransformer {
         "request_transformer"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::REQUEST_TRANSFORMER
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

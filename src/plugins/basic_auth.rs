@@ -22,6 +22,10 @@ impl Plugin for BasicAuth {
         "basic_auth"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::BASIC_AUTH
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,

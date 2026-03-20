@@ -17,6 +17,10 @@ impl Plugin for StdoutLogging {
         "stdout_logging"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::STDOUT_LOGGING
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         // Create a mutable copy we can enhance
         let enhanced_summary = summary.clone();

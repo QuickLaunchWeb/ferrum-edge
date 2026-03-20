@@ -84,11 +84,50 @@ pub struct TransactionSummary {
     pub metadata: HashMap<String, String>,
 }
 
+/// Plugin execution priority bands.
+///
+/// Plugins are sorted by priority (lowest runs first) within each lifecycle
+/// phase. Plugins at the same priority have no guaranteed relative order.
+/// Gaps between bands leave room for future plugins to slot in.
+///
+/// | Band    | Range   | Purpose                                      | Plugins                          |
+/// |---------|---------|----------------------------------------------|----------------------------------|
+/// | Early   | 0–99    | Pre-processing: CORS preflight, rate limits  | cors (10), rate_limiting (20)    |
+/// | AuthN   | 100–199 | Authentication: identity verification         | oauth2 (100), jwt (110), key (120), basic (130) |
+/// | AuthZ   | 200–299 | Authorization: access control decisions       | access_control (200)             |
+/// | Transform | 300–399 | Request transformation before backend       | request_transformer (300)        |
+/// | Response | 400–499 | Response transformation after backend        | response_transformer (400)       |
+/// | Logging | 900–999 | Logging & observability (fire-and-forget)     | stdout (900), http (910), debugger (920) |
+pub mod priority {
+    pub const CORS: u16 = 10;
+    pub const RATE_LIMITING: u16 = 20;
+    pub const OAUTH2_AUTH: u16 = 100;
+    pub const JWT_AUTH: u16 = 110;
+    pub const KEY_AUTH: u16 = 120;
+    pub const BASIC_AUTH: u16 = 130;
+    pub const ACCESS_CONTROL: u16 = 200;
+    pub const REQUEST_TRANSFORMER: u16 = 300;
+    pub const RESPONSE_TRANSFORMER: u16 = 400;
+    pub const STDOUT_LOGGING: u16 = 900;
+    pub const HTTP_LOGGING: u16 = 910;
+    pub const TRANSACTION_DEBUGGER: u16 = 920;
+    /// Default priority for unknown/custom plugins — runs after transforms, before logging.
+    pub const DEFAULT: u16 = 500;
+}
+
 /// Plugin lifecycle hooks.
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// Returns the plugin name.
     fn name(&self) -> &str;
+
+    /// Returns the execution priority (lower = runs first).
+    ///
+    /// Plugins are sorted by priority within each lifecycle phase.
+    /// See [`priority`] module for standard bands and assignments.
+    fn priority(&self) -> u16 {
+        priority::DEFAULT
+    }
 
     /// Called when a request is first received (before routing).
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {

@@ -58,6 +58,10 @@ impl Plugin for JwtAuth {
         "jwt_auth"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::JWT_AUTH
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,

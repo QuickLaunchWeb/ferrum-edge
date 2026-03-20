@@ -700,12 +700,28 @@ Both `/health` and `/status` return the same response and do not require JWT aut
 
 Plugins execute in a defined pipeline for each request:
 
-1. **`on_request_received`** — Called immediately when a request arrives (rate limiting executes here)
+1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, rate limiting)
 2. **`authenticate`** — Identifies the consumer (JWT, API Key, Basic Auth, OAuth2)
 3. **`authorize`** — Checks consumer permissions (Access Control)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`after_proxy`** — Modifies the response from the backend (Response Transformer)
+5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
 6. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
+
+### Execution Order
+
+Within each phase, plugins run in **priority order** (lowest number first). This ensures predictable behavior — for example, CORS preflight responses are sent before authentication can reject them, and rate limiting fires before expensive auth operations.
+
+| Priority | Band | Plugins |
+|----------|------|---------|
+| 10 | Early | `cors` |
+| 20 | Early | `rate_limiting` |
+| 100–130 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
+| 200 | Authorization | `access_control` |
+| 300 | Transform | `request_transformer` |
+| 400 | Response | `response_transformer` |
+| 900–920 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
+
+Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 
 ### Global vs. Proxy Scope
 

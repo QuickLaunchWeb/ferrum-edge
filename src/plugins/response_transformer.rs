@@ -43,6 +43,10 @@ impl Plugin for ResponseTransformer {
         "response_transformer"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::RESPONSE_TRANSFORMER
+    }
+
     async fn after_proxy(
         &self,
         _ctx: &mut RequestContext,

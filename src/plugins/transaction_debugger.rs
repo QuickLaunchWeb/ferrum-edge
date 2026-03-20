@@ -24,6 +24,10 @@ impl Plugin for TransactionDebugger {
         "transaction_debugger"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::TRANSACTION_DEBUGGER
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         println!("[DEBUG] === Incoming Request ===");
         println!("[DEBUG] {} {} from {}", ctx.method, ctx.path, ctx.client_ip);

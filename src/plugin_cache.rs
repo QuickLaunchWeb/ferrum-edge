@@ -107,8 +107,14 @@ impl PluginCache {
                 }
             }
 
+            // Sort by priority so execution order is deterministic
+            merged.sort_by_key(|p| p.priority());
+
             proxy_map.insert(proxy.id.clone(), merged);
         }
+
+        // Sort global fallback list too
+        global_plugins.sort_by_key(|p| p.priority());
 
         (proxy_map, global_plugins)
     }

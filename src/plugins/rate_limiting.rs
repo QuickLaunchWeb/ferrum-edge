@@ -106,6 +106,10 @@ impl Plugin for RateLimiting {
         "rate_limiting"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::RATE_LIMITING
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let key = self.get_key(ctx);
 

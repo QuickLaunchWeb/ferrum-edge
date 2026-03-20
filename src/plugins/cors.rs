@@ -184,6 +184,10 @@ impl Plugin for CorsPlugin {
         "cors"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::CORS
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Only act on requests that include an Origin header
         let origin = match ctx.headers.get("origin") {

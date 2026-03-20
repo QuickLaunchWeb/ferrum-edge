@@ -26,6 +26,10 @@ impl Plugin for HttpLogging {
         "http_logging"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::HTTP_LOGGING
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         if self.endpoint_url.is_empty() {
             return;

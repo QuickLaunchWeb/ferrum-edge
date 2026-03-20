@@ -46,6 +46,10 @@ impl Plugin for KeyAuth {
         "key_auth"
     }
 
+    fn priority(&self) -> u16 {
+        super::priority::KEY_AUTH
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
