@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -128,6 +129,7 @@ impl Plugin for RateLimiting {
                 return PluginResult::Reject {
                     status_code: 429,
                     body: r#"{"error":"Rate limit exceeded"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         }

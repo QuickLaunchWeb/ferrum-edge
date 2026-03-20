@@ -742,11 +742,16 @@ async fn handle_proxy_request(
     // Execute on_request_received hooks
     for plugin in &plugins {
         match plugin.on_request_received(&mut ctx).await {
-            PluginResult::Reject { status_code, body } => {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
                 record_request(&state, status_code);
-                return Ok(build_response(
+                return Ok(build_reject_response(
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &body,
+                    &headers,
                 ));
             }
             PluginResult::Continue => {}
@@ -783,11 +788,16 @@ async fn handle_proxy_request(
                     .authenticate(&mut ctx, &state.consumer_index)
                     .await
                 {
-                    PluginResult::Reject { status_code, body } => {
+                    PluginResult::Reject {
+                        status_code,
+                        body,
+                        headers,
+                    } => {
                         record_request(&state, status_code);
-                        return Ok(build_response(
+                        return Ok(build_reject_response(
                             StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
                             &body,
+                            &headers,
                         ));
                     }
                     PluginResult::Continue => {}
@@ -800,11 +810,16 @@ async fn handle_proxy_request(
     for plugin in &plugins {
         if plugin.name() == "access_control" {
             match plugin.authorize(&mut ctx).await {
-                PluginResult::Reject { status_code, body } => {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
                     record_request(&state, status_code);
-                    return Ok(build_response(
+                    return Ok(build_reject_response(
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
                         &body,
+                        &headers,
                     ));
                 }
                 PluginResult::Continue => {}
@@ -823,12 +838,17 @@ async fn handle_proxy_request(
                 .before_proxy(&mut ctx, &mut owned_proxy_headers)
                 .await
             {
-                PluginResult::Reject { status_code, body } => {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
                     record_request(&state, status_code);
-                    return Ok(build_response(
+                    return Ok(build_reject_response(
                         StatusCode::from_u16(status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                         &body,
+                        &headers,
                     ));
                 }
                 PluginResult::Continue => {}
@@ -1227,6 +1247,23 @@ fn build_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap()
+}
+
+fn build_reject_response(
+    status: StatusCode,
+    body: &str,
+    headers: &HashMap<String, String>,
+) -> Response<Full<Bytes>> {
+    let mut resp = build_response(status, body);
+    for (k, v) in headers {
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            resp.headers_mut().insert(name, val);
+        }
+    }
+    resp
 }
 
 /// Proxy the request to an HTTP/3 backend.

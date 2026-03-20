@@ -1,5 +1,6 @@
 pub mod access_control;
 pub mod basic_auth;
+pub mod cors;
 pub mod http_logging;
 pub mod jwt_auth;
 pub mod key_auth;
@@ -56,7 +57,11 @@ pub enum PluginResult {
     /// Continue to the next plugin/phase.
     Continue,
     /// Short-circuit: immediately return this response to the client.
-    Reject { status_code: u16, body: String },
+    Reject {
+        status_code: u16,
+        body: String,
+        headers: HashMap<String, String>,
+    },
 }
 
 /// Transaction summary for logging plugins.
@@ -139,6 +144,7 @@ pub fn create_plugin(name: &str, config: &Value) -> Option<Arc<dyn Plugin>> {
         "jwt_auth" => Some(Arc::new(jwt_auth::JwtAuth::new(config))),
         "key_auth" => Some(Arc::new(key_auth::KeyAuth::new(config))),
         "basic_auth" => Some(Arc::new(basic_auth::BasicAuth::new(config))),
+        "cors" => Some(Arc::new(cors::CorsPlugin::new(config))),
         "access_control" => Some(Arc::new(access_control::AccessControl::new(config))),
         "request_transformer" => Some(Arc::new(request_transformer::RequestTransformer::new(
             config,
@@ -164,6 +170,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "jwt_auth",
         "key_auth",
         "basic_auth",
+        "cors",
         "access_control",
         "request_transformer",
         "response_transformer",

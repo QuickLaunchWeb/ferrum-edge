@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
@@ -78,6 +79,7 @@ impl Plugin for AccessControl {
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address is blocked"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -92,6 +94,7 @@ impl Plugin for AccessControl {
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address not allowed"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -102,6 +105,7 @@ impl Plugin for AccessControl {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"No consumer identified"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -114,6 +118,7 @@ impl Plugin for AccessControl {
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 
@@ -126,6 +131,7 @@ impl Plugin for AccessControl {
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
+                headers: HashMap::new(),
             };
         }
 

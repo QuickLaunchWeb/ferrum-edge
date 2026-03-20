@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
@@ -69,6 +70,7 @@ impl Plugin for JwtAuth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Missing JWT token"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -104,6 +106,7 @@ impl Plugin for JwtAuth {
         PluginResult::Reject {
             status_code: 401,
             body: r#"{"error":"Invalid JWT token"}"#.into(),
+            headers: HashMap::new(),
         }
     }
 }

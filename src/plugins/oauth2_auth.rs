@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
+use std::collections::HashMap;
 use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
@@ -57,6 +58,7 @@ impl Plugin for OAuth2Auth {
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Missing Bearer token"}"#.into(),
+                    headers: HashMap::new(),
                 };
             }
         };
@@ -92,6 +94,7 @@ impl Plugin for OAuth2Auth {
                 PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Token introspection failed"}"#.into(),
+                    headers: HashMap::new(),
                 }
             }
             _ => {
@@ -130,6 +133,7 @@ impl Plugin for OAuth2Auth {
                 PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Invalid OAuth2 token"}"#.into(),
+                    headers: HashMap::new(),
                 }
             }
         }

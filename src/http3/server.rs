@@ -1,5 +1,6 @@
 //! HTTP/3 server listener using Quinn (QUIC) and h3
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -202,12 +203,17 @@ async fn handle_h3_request(
     // Execute on_request_received hooks
     for plugin in &plugins {
         match plugin.on_request_received(&mut ctx).await {
-            PluginResult::Reject { status_code, body } => {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
                 record_request(&state, status_code);
-                send_h3_response(
+                send_h3_reject_response(
                     &mut stream,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &body,
+                    &headers,
                 )
                 .await?;
                 return Ok(());
@@ -241,12 +247,17 @@ async fn handle_h3_request(
                     .authenticate(&mut ctx, &state.consumer_index)
                     .await
                 {
-                    PluginResult::Reject { status_code, body } => {
+                    PluginResult::Reject {
+                        status_code,
+                        body,
+                        headers,
+                    } => {
                         record_request(&state, status_code);
-                        send_h3_response(
+                        send_h3_reject_response(
                             &mut stream,
                             StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
                             &body,
+                            &headers,
                         )
                         .await?;
                         return Ok(());
@@ -261,12 +272,17 @@ async fn handle_h3_request(
     for plugin in &plugins {
         if plugin.name() == "access_control" {
             match plugin.authorize(&mut ctx).await {
-                PluginResult::Reject { status_code, body } => {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
                     record_request(&state, status_code);
-                    send_h3_response(
+                    send_h3_reject_response(
                         &mut stream,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
                         &body,
+                        &headers,
                     )
                     .await?;
                     return Ok(());
@@ -280,12 +296,17 @@ async fn handle_h3_request(
     let mut proxy_headers = ctx.headers.clone();
     for plugin in &plugins {
         match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
-            PluginResult::Reject { status_code, body } => {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
                 record_request(&state, status_code);
-                send_h3_response(
+                send_h3_reject_response(
                     &mut stream,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &body,
+                    &headers,
                 )
                 .await?;
                 return Ok(());
@@ -550,6 +571,26 @@ async fn send_h3_response(
         .header("content-type", "application/json")
         .body(())
         .unwrap();
+    stream.send_response(resp).await?;
+    stream.send_data(Bytes::from(body.to_string())).await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+/// Send an HTTP/3 rejection response with custom headers.
+async fn send_h3_reject_response(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    body: &str,
+    headers: &HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let resp = builder.body(()).unwrap();
     stream.send_response(resp).await?;
     stream.send_data(Bytes::from(body.to_string())).await?;
     stream.finish().await?;

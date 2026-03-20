@@ -10,7 +10,7 @@ use super::plugin_utils::{create_test_consumer, create_test_context};
 #[tokio::test]
 async fn test_all_plugins_available() {
     let plugins = available_plugins();
-    assert_eq!(plugins.len(), 11);
+    assert_eq!(plugins.len(), 12);
 
     let expected_plugins = vec![
         "stdout_logging",
@@ -20,6 +20,7 @@ async fn test_all_plugins_available() {
         "jwt_auth",
         "key_auth",
         "basic_auth",
+        "cors",
         "access_control",
         "request_transformer",
         "response_transformer",

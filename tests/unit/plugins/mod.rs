@@ -3,6 +3,7 @@ mod plugin_utils;
 
 mod access_control_tests;
 mod basic_auth_tests;
+mod cors_tests;
 mod http_logging_tests;
 mod jwt_auth_plugin_tests;
 mod key_auth_tests;

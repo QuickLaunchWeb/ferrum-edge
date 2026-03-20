@@ -827,6 +827,34 @@ Authorizes requests based on IP address, CIDR range, and/or the identified consu
 | `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
 | `disallowed_consumers` | String[] | Usernames explicitly denied |
 
+#### `cors`
+
+Handles Cross-Origin Resource Sharing (CORS) at the gateway level. Intercepts preflight `OPTIONS` requests, validates origins and methods against configured allow-lists, and injects CORS response headers on actual cross-origin requests. Disallowed origins or methods are rejected with `403 Forbidden`.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allowed_origins` | String[] | `["*"]` | Permitted origins; `["*"]` allows any origin |
+| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Methods returned in preflight `Access-Control-Allow-Methods` |
+| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Headers returned in preflight `Access-Control-Allow-Headers` |
+| `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
+| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` (cannot combine with wildcard origins) |
+| `max_age` | u64 | `86400` | Preflight cache duration in seconds |
+| `preflight_continue` | bool | `false` | Pass preflight requests to backend instead of short-circuiting |
+
+```yaml
+plugin_name: cors
+config:
+  allowed_origins: ["https://app.example.com", "https://admin.example.com"]
+  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  allowed_headers: ["Authorization", "Content-Type", "X-Request-ID"]
+  exposed_headers: ["X-Request-ID", "X-RateLimit-Remaining"]
+  allow_credentials: true
+  max_age: 3600
+```
+
+See [docs/cors_plugin.md](docs/cors_plugin.md) for detailed configuration, request flow diagrams, and troubleshooting.
+
 #### `request_transformer`
 
 Modifies request headers and query parameters before proxying.
