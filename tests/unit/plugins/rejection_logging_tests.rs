@@ -168,7 +168,11 @@ async fn test_rejected_request_summary_no_backend_fields() {
 
     let summary = &summaries[0];
     assert_eq!(summary.response_status_code, 401);
-    assert!(summary.backend_target_url.is_none());
+    // backend_target_url is populated from the matched proxy so log consumers
+    // can query which backend API proxy had rejected traffic.
+    assert!(summary.backend_target_url.is_some());
+    let target_url = summary.backend_target_url.as_ref().unwrap();
+    assert!(target_url.contains("localhost"), "Expected backend host in URL, got: {}", target_url);
     assert_eq!(summary.latency_backend_ttfb_ms, -1.0);
     assert_eq!(summary.latency_backend_total_ms, -1.0);
     assert_eq!(summary.client_ip, "127.0.0.1");

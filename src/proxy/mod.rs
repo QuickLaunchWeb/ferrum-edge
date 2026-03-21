@@ -719,7 +719,10 @@ pub async fn log_rejected_request(
         request_path: ctx.path.clone(),
         matched_proxy_id: proxy.map(|p| p.id.clone()),
         matched_proxy_name: proxy.and_then(|p| p.name.clone()),
-        backend_target_url: None,
+        backend_target_url: proxy.map(|p| {
+            let url = build_backend_url(p, &ctx.path, "");
+            strip_query_params(&url)
+        }),
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
