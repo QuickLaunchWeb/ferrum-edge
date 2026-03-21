@@ -109,14 +109,14 @@ impl HealthChecker {
                 // automatically restores unhealthy targets after a cooldown
                 // period, preventing the "all targets unhealthy forever"
                 // death spiral when only passive checks are configured.
-                if let Some(passive) = &hc_config.passive {
-                    if passive.healthy_after_seconds > 0 {
-                        let handle = self.start_passive_recovery_timer(
-                            &upstream.targets,
-                            passive.healthy_after_seconds,
-                        );
-                        self.active_check_handles.push(handle);
-                    }
+                if let Some(passive) = &hc_config.passive
+                    && passive.healthy_after_seconds > 0
+                {
+                    let handle = self.start_passive_recovery_timer(
+                        &upstream.targets,
+                        passive.healthy_after_seconds,
+                    );
+                    self.active_check_handles.push(handle);
                 }
             }
         }

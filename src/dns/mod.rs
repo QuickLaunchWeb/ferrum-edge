@@ -659,7 +659,7 @@ impl reqwest::dns::Resolve for DnsCacheResolver {
                 .resolve(&hostname, None, None)
                 .await
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    Box::new(std::io::Error::other(e.to_string()))
                 })?;
 
             // reqwest expects an iterator of SocketAddr. The port is ignored

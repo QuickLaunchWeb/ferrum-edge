@@ -210,11 +210,11 @@ impl ConnectionPool {
         // override IP takes priority over the DnsCacheResolver for this
         // specific hostname. This preserves backward compatibility with
         // per-proxy dns_override configuration.
-        if let Some(ref dns_override) = proxy.dns_override {
-            if let Ok(ip) = dns_override.parse::<std::net::IpAddr>() {
-                let socket_addr = SocketAddr::new(ip, proxy.backend_port);
-                client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
-            }
+        if let Some(ref dns_override) = proxy.dns_override
+            && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
+        {
+            let socket_addr = SocketAddr::new(ip, proxy.backend_port);
+            client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
         }
 
         let client = client_builder.build()?;
