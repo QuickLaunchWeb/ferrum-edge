@@ -14,4 +14,5 @@ mod rate_limiting_tests;
 mod request_transformer_tests;
 mod response_transformer_tests;
 mod stdout_logging_tests;
+mod rejection_logging_tests;
 mod transaction_debugger_tests;
