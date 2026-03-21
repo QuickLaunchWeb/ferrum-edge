@@ -486,22 +486,8 @@ async fn proxy_to_backend_h3(
     headers: &std::collections::HashMap<String, String>,
     body_bytes: Vec<u8>,
 ) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
-    // Resolve backend hostname
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await;
-
-    // Get client from connection pool
-    let client = match state
-        .connection_pool
-        .get_client(proxy, resolved_ip.ok())
-        .await
-    {
+    // Get client from connection pool (uses DnsCacheResolver for DNS lookups)
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);

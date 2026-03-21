@@ -50,8 +50,10 @@ pub async fn run(
     });
 
     // DNS warmup — await before accepting requests to avoid cold-cache
-    // DNS lookups in the hot request path
-    let hostnames: Vec<_> = config
+    // DNS lookups in the hot request path. Includes both proxy backend hosts
+    // and upstream target hostnames so load-balanced proxies also benefit
+    // from pre-warmed DNS entries.
+    let mut hostnames: Vec<_> = config
         .proxies
         .iter()
         .map(|p| {
@@ -62,6 +64,13 @@ pub async fn run(
             )
         })
         .collect();
+
+    // Add upstream target hostnames for load-balanced proxies
+    for upstream in &config.upstreams {
+        for target in &upstream.targets {
+            hostnames.push((target.host.clone(), None, None));
+        }
+    }
     dns_cache.warmup(hostnames).await;
 
     // Start background TTL refresh to keep cache warm
