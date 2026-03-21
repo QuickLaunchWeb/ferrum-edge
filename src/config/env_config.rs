@@ -432,18 +432,27 @@ impl EnvConfig {
         // Validate TLS version settings
         match self.tls_min_version.as_str() {
             "1.2" | "1.3" => {}
-            other => return Err(format!(
-                "Invalid FERRUM_TLS_MIN_VERSION '{}'. Expected: 1.2, 1.3", other
-            )),
+            other => {
+                return Err(format!(
+                    "Invalid FERRUM_TLS_MIN_VERSION '{}'. Expected: 1.2, 1.3",
+                    other
+                ));
+            }
         }
         match self.tls_max_version.as_str() {
             "1.2" | "1.3" => {}
-            other => return Err(format!(
-                "Invalid FERRUM_TLS_MAX_VERSION '{}'. Expected: 1.2, 1.3", other
-            )),
+            other => {
+                return Err(format!(
+                    "Invalid FERRUM_TLS_MAX_VERSION '{}'. Expected: 1.2, 1.3",
+                    other
+                ));
+            }
         }
         if self.tls_min_version == "1.3" && self.tls_max_version == "1.2" {
-            return Err("FERRUM_TLS_MIN_VERSION (1.3) cannot be greater than FERRUM_TLS_MAX_VERSION (1.2)".into());
+            return Err(
+                "FERRUM_TLS_MIN_VERSION (1.3) cannot be greater than FERRUM_TLS_MAX_VERSION (1.2)"
+                    .into(),
+            );
         }
 
         if self.mode == OperatingMode::ControlPlane {

@@ -31,17 +31,21 @@ pub async fn start_http3_listener(
 ) -> Result<(), anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
     // Filter cipher suites to TLS 1.3 only and force TLS 1.3 protocol version.
-    let has_tls13 = tls_policy.protocol_versions.iter().any(|v| {
-        std::ptr::eq(*v, &rustls::version::TLS13)
-    });
+    let has_tls13 = tls_policy
+        .protocol_versions
+        .iter()
+        .any(|v| std::ptr::eq(*v, &rustls::version::TLS13));
 
     if !has_tls13 {
-        warn!("HTTP/3 (QUIC) requires TLS 1.3, but FERRUM_TLS_MAX_VERSION excludes it. \
-               Forcing TLS 1.3 for the QUIC listener.");
+        warn!(
+            "HTTP/3 (QUIC) requires TLS 1.3, but FERRUM_TLS_MAX_VERSION excludes it. \
+               Forcing TLS 1.3 for the QUIC listener."
+        );
     }
 
     // Build an H3-specific crypto provider with only TLS 1.3 cipher suites
-    let tls13_suites: Vec<rustls::SupportedCipherSuite> = tls_policy.crypto_provider
+    let tls13_suites: Vec<rustls::SupportedCipherSuite> = tls_policy
+        .crypto_provider
         .cipher_suites
         .iter()
         .filter(|s| s.tls13().is_some())

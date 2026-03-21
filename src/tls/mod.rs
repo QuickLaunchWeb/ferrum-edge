@@ -1,5 +1,5 @@
-use rustls::crypto::CryptoProvider;
 use rustls::ServerConfig;
+use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
 use std::fs::File;
 use std::io::BufReader;
@@ -38,7 +38,9 @@ impl TlsPolicy {
 
         if versions.is_empty() {
             return Err(anyhow::anyhow!(
-                "No valid TLS versions selected (min={}, max={})", min, max
+                "No valid TLS versions selected (min={}, max={})",
+                min,
+                max
             ));
         }
 
@@ -57,19 +59,29 @@ impl TlsPolicy {
         };
 
         // Log the TLS policy
-        let version_names: Vec<&str> = versions.iter().map(|v| {
-            if std::ptr::eq(*v, &rustls::version::TLS12) { "TLS 1.2" }
-            else { "TLS 1.3" }
-        }).collect();
-        let suite_names: Vec<String> = cipher_suites.iter()
+        let version_names: Vec<&str> = versions
+            .iter()
+            .map(|v| {
+                if std::ptr::eq(*v, &rustls::version::TLS12) {
+                    "TLS 1.2"
+                } else {
+                    "TLS 1.3"
+                }
+            })
+            .collect();
+        let suite_names: Vec<String> = cipher_suites
+            .iter()
             .map(|s| format!("{:?}", s.suite()))
             .collect();
-        let group_names: Vec<String> = kx_groups.iter()
+        let group_names: Vec<String> = kx_groups
+            .iter()
             .map(|g: &&'static dyn rustls::crypto::SupportedKxGroup| format!("{:?}", g.name()))
             .collect();
 
-        info!("TLS policy: versions={:?}, cipher_suites={:?}, curves={:?}, prefer_server_order={}",
-              version_names, suite_names, group_names, env_config.tls_prefer_server_cipher_order);
+        info!(
+            "TLS policy: versions={:?}, cipher_suites={:?}, curves={:?}, prefer_server_order={}",
+            version_names, suite_names, group_names, env_config.tls_prefer_server_cipher_order
+        );
 
         // Build custom CryptoProvider
         let base_provider = rustls::crypto::ring::default_provider();
@@ -133,23 +145,43 @@ fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>,
     for name in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let suite = match name {
             // TLS 1.3
-            "TLS_AES_256_GCM_SHA384" => rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
-            "TLS_AES_128_GCM_SHA256" => rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
-            "TLS_CHACHA20_POLY1305_SHA256" => rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            "TLS_AES_256_GCM_SHA384" => {
+                rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384
+            }
+            "TLS_AES_128_GCM_SHA256" => {
+                rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+            }
+            "TLS_CHACHA20_POLY1305_SHA256" => {
+                rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
+            }
             // TLS 1.2 (OpenSSL naming)
-            "ECDHE-ECDSA-AES256-GCM-SHA384" => rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            "ECDHE-RSA-AES256-GCM-SHA384" => rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            "ECDHE-ECDSA-AES128-GCM-SHA256" => rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            "ECDHE-RSA-AES128-GCM-SHA256" => rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            "ECDHE-ECDSA-CHACHA20-POLY1305" => rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-            "ECDHE-RSA-CHACHA20-POLY1305" => rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-            unknown => return Err(anyhow::anyhow!(
-                "Unknown cipher suite '{}'. Supported TLS 1.3: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256. \
+            "ECDHE-ECDSA-AES256-GCM-SHA384" => {
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            }
+            "ECDHE-RSA-AES256-GCM-SHA384" => {
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+            }
+            "ECDHE-ECDSA-AES128-GCM-SHA256" => {
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            }
+            "ECDHE-RSA-AES128-GCM-SHA256" => {
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+            }
+            "ECDHE-ECDSA-CHACHA20-POLY1305" => {
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            "ECDHE-RSA-CHACHA20-POLY1305" => {
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            }
+            unknown => {
+                return Err(anyhow::anyhow!(
+                    "Unknown cipher suite '{}'. Supported TLS 1.3: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256. \
                  Supported TLS 1.2: ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384, \
                  ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256, \
                  ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305",
-                unknown
-            )),
+                    unknown
+                ));
+            }
         };
         suites.push(suite);
     }
@@ -160,17 +192,24 @@ fn parse_cipher_suites(input: &str) -> Result<Vec<rustls::SupportedCipherSuite>,
 }
 
 /// Parse comma-separated curve/key-exchange group names.
-fn parse_kx_groups(input: &str) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>, anyhow::Error> {
+fn parse_kx_groups(
+    input: &str,
+) -> Result<Vec<&'static dyn rustls::crypto::SupportedKxGroup>, anyhow::Error> {
     let mut groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = Vec::new();
     for name in input.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let group: &'static dyn rustls::crypto::SupportedKxGroup = match name.to_lowercase().as_str() {
+        let group: &'static dyn rustls::crypto::SupportedKxGroup = match name
+            .to_lowercase()
+            .as_str()
+        {
             "x25519" => rustls::crypto::ring::kx_group::X25519,
             "secp256r1" | "p-256" | "p256" => rustls::crypto::ring::kx_group::SECP256R1,
             "secp384r1" | "p-384" | "p384" => rustls::crypto::ring::kx_group::SECP384R1,
-            unknown => return Err(anyhow::anyhow!(
-                "Unknown curve/group '{}'. Supported: X25519, secp256r1 (P-256), secp384r1 (P-384)",
-                unknown
-            )),
+            unknown => {
+                return Err(anyhow::anyhow!(
+                    "Unknown curve/group '{}'. Supported: X25519, secp256r1 (P-256), secp384r1 (P-384)",
+                    unknown
+                ));
+            }
         };
         groups.push(group);
     }
@@ -186,7 +225,13 @@ pub fn load_tls_config(
     cert_path: &str,
     key_path: &str,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    load_tls_config_with_client_auth(cert_path, key_path, None, false, &TlsPolicy::default_policy())
+    load_tls_config_with_client_auth(
+        cert_path,
+        key_path,
+        None,
+        false,
+        &TlsPolicy::default_policy(),
+    )
 }
 
 /// Load TLS server configuration with optional client certificate verification
@@ -296,11 +341,14 @@ pub fn build_h3_client_tls_config(
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let mut config = rustls::ClientConfig::builder_with_provider(tls_policy.crypto_provider.clone())
-        .with_protocol_versions(&tls_policy.protocol_versions)
-        .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions for H3 client: {}", e))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let mut config =
+        rustls::ClientConfig::builder_with_provider(tls_policy.crypto_provider.clone())
+            .with_protocol_versions(&tls_policy.protocol_versions)
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to set TLS protocol versions for H3 client: {}", e)
+            })?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
     config.alpn_protocols = vec![b"h3".to_vec()];
 

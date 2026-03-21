@@ -1238,18 +1238,14 @@ async fn proxy_to_backend(
             // Fast path: skip body collection entirely for bodyless requests
             Vec::new()
         } else if state.max_body_size_bytes > 0 {
-            let limited = http_body_util::Limited::new(
-                original_req.into_body(),
-                state.max_body_size_bytes,
-            );
+            let limited =
+                http_body_util::Limited::new(original_req.into_body(), state.max_body_size_bytes);
             match limited.collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
                 Err(_) => {
                     return (
                         413,
-                        r#"{"error":"Request body exceeds maximum size"}"#
-                            .as_bytes()
-                            .to_vec(),
+                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         HashMap::new(),
                     );
                 }
