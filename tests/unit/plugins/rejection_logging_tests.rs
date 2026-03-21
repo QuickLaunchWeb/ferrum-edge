@@ -169,8 +169,8 @@ async fn test_rejected_request_summary_no_backend_fields() {
     let summary = &summaries[0];
     assert_eq!(summary.response_status_code, 401);
     assert!(summary.backend_target_url.is_none());
-    assert_eq!(summary.latency_backend_ttfb_ms, 0.0);
-    assert_eq!(summary.latency_backend_total_ms, 0.0);
+    assert_eq!(summary.latency_backend_ttfb_ms, -1.0);
+    assert_eq!(summary.latency_backend_total_ms, -1.0);
     assert_eq!(summary.client_ip, "127.0.0.1");
     assert_eq!(summary.http_method, "GET");
     assert_eq!(summary.request_path, "/test");

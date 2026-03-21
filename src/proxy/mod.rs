@@ -723,8 +723,8 @@ pub async fn log_rejected_request(
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
-        latency_backend_ttfb_ms: 0.0,
-        latency_backend_total_ms: 0.0,
+        latency_backend_ttfb_ms: -1.0,
+        latency_backend_total_ms: -1.0,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         metadata,
     };
