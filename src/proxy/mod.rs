@@ -26,7 +26,9 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::http3::client::Http3Client;
 use crate::plugin_cache::PluginCache;
-use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority};
+use crate::plugins::{
+    Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority,
+};
 use crate::router_cache::RouterCache;
 
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
@@ -816,7 +818,14 @@ pub async fn handle_proxy_request(
                 body,
                 headers,
             } => {
-                log_rejected_request(&plugins, &ctx, status_code, start_time, "on_request_received").await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    status_code,
+                    start_time,
+                    "on_request_received",
+                )
+                .await;
                 record_request(&state, status_code);
                 return Ok(build_reject_response(
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -863,7 +872,14 @@ pub async fn handle_proxy_request(
                         body,
                         headers,
                     } => {
-                        log_rejected_request(&plugins, &ctx, status_code, start_time, "authenticate").await;
+                        log_rejected_request(
+                            &plugins,
+                            &ctx,
+                            status_code,
+                            start_time,
+                            "authenticate",
+                        )
+                        .await;
                         record_request(&state, status_code);
                         return Ok(build_reject_response(
                             StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
@@ -913,7 +929,8 @@ pub async fn handle_proxy_request(
                     body,
                     headers,
                 } => {
-                    log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy").await;
+                    log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
+                        .await;
                     record_request(&state, status_code);
                     return Ok(build_reject_response(
                         StatusCode::from_u16(status_code)

@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ferrum_gateway::plugins::{
-    create_plugin, Plugin, TransactionSummary,
-    priority as plugin_priority,
+    Plugin, TransactionSummary, create_plugin, priority as plugin_priority,
 };
 use ferrum_gateway::proxy::log_rejected_request;
 use serde_json::json;
@@ -73,11 +72,8 @@ async fn test_rejected_request_summary_has_rejection_phase() {
 async fn test_log_rejected_request_noop_without_logging_plugins() {
     // Only auth plugins, no logging plugins
     let key_auth = create_plugin("key_auth", &json!({})).unwrap();
-    let access_ctrl = create_plugin(
-        "access_control",
-        &json!({"allowed_ips": ["0.0.0.0/0"]}),
-    )
-    .unwrap();
+    let access_ctrl =
+        create_plugin("access_control", &json!({"allowed_ips": ["0.0.0.0/0"]})).unwrap();
 
     let plugins: Vec<Arc<dyn Plugin>> = vec![key_auth, access_ctrl];
 
@@ -172,7 +168,11 @@ async fn test_rejected_request_summary_no_backend_fields() {
     // can query which backend API proxy had rejected traffic.
     assert!(summary.backend_target_url.is_some());
     let target_url = summary.backend_target_url.as_ref().unwrap();
-    assert!(target_url.contains("localhost"), "Expected backend host in URL, got: {}", target_url);
+    assert!(
+        target_url.contains("localhost"),
+        "Expected backend host in URL, got: {}",
+        target_url
+    );
     assert_eq!(summary.latency_backend_ttfb_ms, -1.0);
     assert_eq!(summary.latency_backend_total_ms, -1.0);
     assert_eq!(summary.client_ip, "127.0.0.1");
