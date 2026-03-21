@@ -128,6 +128,9 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -180,6 +183,7 @@ async fn test_cp_dp_grpc_config_sync() {
             updated_at: Utc::now(),
         }],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
 
@@ -252,6 +256,7 @@ async fn test_cp_dp_grpc_config_sync() {
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
 

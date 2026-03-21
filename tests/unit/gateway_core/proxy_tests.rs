@@ -31,6 +31,9 @@ fn test_proxy() -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -83,6 +86,7 @@ fn test_longest_prefix_match() {
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     let matched = find_matching_proxy(&config, "/api/v1/users");
@@ -99,6 +103,7 @@ fn test_no_match() {
         }],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     let matched = find_matching_proxy(&config, "/other/path");

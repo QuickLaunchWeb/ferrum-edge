@@ -1,14 +1,18 @@
 mod admin;
+mod circuit_breaker;
 mod config;
 mod connection_pool;
 mod consumer_index;
 mod dns;
 mod grpc;
+mod health_check;
 mod http3;
+mod load_balancer;
 mod modes;
 mod plugin_cache;
 mod plugins;
 mod proxy;
+mod retry;
 mod router_cache;
 mod tls;
 

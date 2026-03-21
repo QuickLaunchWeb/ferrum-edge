@@ -33,6 +33,9 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -43,6 +46,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         proxies,
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     }
 }

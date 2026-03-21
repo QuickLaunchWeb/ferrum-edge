@@ -91,6 +91,9 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -121,6 +124,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     }
 }

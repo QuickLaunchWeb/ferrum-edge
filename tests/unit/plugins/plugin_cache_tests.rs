@@ -41,6 +41,9 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -70,6 +73,7 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
         proxies,
         consumers: vec![],
         plugin_configs,
+        upstreams: vec![],
         loaded_at: Utc::now(),
     }
 }

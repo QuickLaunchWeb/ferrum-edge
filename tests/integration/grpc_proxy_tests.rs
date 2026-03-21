@@ -55,6 +55,9 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -140,6 +143,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         proxies,
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     ProxyState::new(config, dns_cache, create_test_env_config())

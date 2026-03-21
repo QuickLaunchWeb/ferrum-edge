@@ -1,11 +1,19 @@
 pub mod access_control;
 pub mod basic_auth;
+pub mod body_validator;
+pub mod bot_detection;
+pub mod correlation_id;
 pub mod cors;
+pub mod hmac_auth;
 pub mod http_logging;
+pub mod ip_restriction;
 pub mod jwt_auth;
 pub mod key_auth;
 pub mod oauth2_auth;
+pub mod otel_tracing;
+pub mod prometheus_metrics;
 pub mod rate_limiting;
+pub mod request_termination;
 pub mod request_transformer;
 pub mod response_transformer;
 pub mod stdout_logging;
@@ -101,19 +109,28 @@ pub struct TransactionSummary {
 /// | Transform | 3000–3999 | Request transformation before backend         | request_transformer (3000)       |
 /// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
 /// | Logging | 9000–9999   | Logging & observability (fire-and-forget)     | stdout (9000), http (9100), debugger (9200) |
+#[allow(dead_code)]
 pub mod priority {
+    pub const OTEL_TRACING: u16 = 25;
+    pub const CORRELATION_ID: u16 = 50;
+    pub const REQUEST_TERMINATION: u16 = 75;
     pub const CORS: u16 = 100;
+    pub const IP_RESTRICTION: u16 = 150;
+    pub const BOT_DETECTION: u16 = 200;
     pub const OAUTH2_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
     pub const BASIC_AUTH: u16 = 1300;
+    pub const HMAC_AUTH: u16 = 1400;
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const RATE_LIMITING: u16 = 2900;
+    pub const BODY_VALIDATOR: u16 = 2950;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
+    pub const PROMETHEUS_METRICS: u16 = 9300;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
     pub const DEFAULT: u16 = 5000;
 }
@@ -213,8 +230,12 @@ pub fn create_plugin_with_http_client(
         "jwt_auth" => Some(Arc::new(jwt_auth::JwtAuth::new(config))),
         "key_auth" => Some(Arc::new(key_auth::KeyAuth::new(config))),
         "basic_auth" => Some(Arc::new(basic_auth::BasicAuth::new(config))),
+        "hmac_auth" => Some(Arc::new(hmac_auth::HmacAuth::new(config))),
         "cors" => Some(Arc::new(cors::CorsPlugin::new(config))),
         "access_control" => Some(Arc::new(access_control::AccessControl::new(config))),
+        "ip_restriction" => Some(Arc::new(ip_restriction::IpRestriction::new(config))),
+        "bot_detection" => Some(Arc::new(bot_detection::BotDetection::new(config))),
+        "correlation_id" => Some(Arc::new(correlation_id::CorrelationId::new(config))),
         "request_transformer" => Some(Arc::new(request_transformer::RequestTransformer::new(
             config,
         ))),
@@ -222,6 +243,10 @@ pub fn create_plugin_with_http_client(
             config,
         ))),
         "rate_limiting" => Some(Arc::new(rate_limiting::RateLimiting::new(config))),
+        "body_validator" => Some(Arc::new(body_validator::BodyValidator::new(config))),
+        "request_termination" => Some(Arc::new(request_termination::RequestTermination::new(config))),
+        "prometheus_metrics" => Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(config))),
+        "otel_tracing" => Some(Arc::new(otel_tracing::OtelTracing::new(config))),
         _ => {
             tracing::warn!("Unknown plugin: {}", name);
             None
@@ -239,10 +264,18 @@ pub fn available_plugins() -> Vec<&'static str> {
         "jwt_auth",
         "key_auth",
         "basic_auth",
+        "hmac_auth",
         "cors",
         "access_control",
+        "ip_restriction",
+        "bot_detection",
+        "correlation_id",
         "request_transformer",
         "response_transformer",
         "rate_limiting",
+        "body_validator",
+        "request_termination",
+        "prometheus_metrics",
+        "otel_tracing",
     ]
 }

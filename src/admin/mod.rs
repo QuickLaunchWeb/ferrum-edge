@@ -220,6 +220,18 @@ pub async fn handle_admin_request(
         return Ok(json_response(StatusCode::OK, &health_status));
     }
 
+    // Prometheus metrics endpoint (unauthenticated for scraping)
+    if path == "/metrics" && method == Method::GET {
+        let registry = crate::plugins::prometheus_metrics::global_registry();
+        let metrics_output = registry.render();
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            .body(Full::new(Bytes::from(metrics_output)))
+            .unwrap();
+        return Ok(resp);
+    }
+
     // Authenticate
     match state.jwt_manager.verify_request(
         req.headers()

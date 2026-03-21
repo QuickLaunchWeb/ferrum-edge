@@ -77,6 +77,9 @@ fn create_http3_test_proxy() -> Proxy {
         pool_tcp_keepalive_seconds: Some(60),
         pool_http2_keep_alive_interval_seconds: Some(30),
         pool_http2_keep_alive_timeout_seconds: Some(45),
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -88,6 +91,7 @@ fn create_http3_test_gateway_config() -> GatewayConfig {
         proxies: vec![create_http3_test_proxy()],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: chrono::Utc::now(),
     }
 }
@@ -314,6 +318,9 @@ async fn test_http3_proxy_state_creation() {
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
+        load_balancer_cache: Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc)),
+        health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
+        circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
         enable_http3: true,
         proxy_https_port: 8443,
         max_header_size_bytes: 32768,
@@ -441,6 +448,9 @@ async fn test_http3_full_integration() {
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
+        load_balancer_cache: Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc)),
+        health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
+        circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
         enable_http3: true,
         proxy_https_port: 8443,
         max_header_size_bytes: 32768,

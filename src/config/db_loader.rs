@@ -208,6 +208,7 @@ impl DatabaseStore {
             proxies,
             consumers,
             plugin_configs,
+            upstreams: Vec::new(),
             loaded_at: Utc::now(),
         };
 
@@ -287,6 +288,10 @@ impl DatabaseStore {
                     .map(|v| v as u64),
                 auth_mode: parse_auth_mode(&auth_mode_str),
                 plugins,
+                // Load balancing, circuit breaker, retry - None to use defaults
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
                 // Connection pooling settings - None to use global defaults
                 pool_max_idle_per_host: None,
                 pool_idle_timeout_seconds: None,

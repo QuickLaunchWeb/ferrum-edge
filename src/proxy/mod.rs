@@ -19,16 +19,20 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{WebSocketStream, tungstenite::handshake::derive_accept_key};
 use tracing::{debug, error, info, warn};
 
+use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::PoolConfig;
-use crate::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use crate::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy, UpstreamTarget};
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
+use crate::health_check::HealthChecker;
 use crate::http3::client::Http3Client;
+use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority,
 };
+use crate::retry;
 use crate::router_cache::RouterCache;
 
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
@@ -64,6 +68,12 @@ pub struct ProxyState {
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
     /// gRPC-specific HTTP/2 connection pool (h2c + h2 with trailer support)
     pub grpc_pool: Arc<GrpcConnectionPool>,
+    /// Load balancer cache for upstream target selection.
+    pub load_balancer_cache: Arc<LoadBalancerCache>,
+    /// Health checker for upstream targets.
+    pub health_checker: Arc<HealthChecker>,
+    /// Circuit breaker cache for proxy-level circuit breaking.
+    pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Whether HTTP/3 is enabled (used for Alt-Svc header advertisement)
     pub enable_http3: bool,
     /// The HTTPS port (shared by HTTP/3 QUIC listener)
@@ -104,6 +114,14 @@ impl ProxyState {
         let plugin_cache = Arc::new(PluginCache::with_http_client(&config, plugin_http_client));
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
+        // Build load balancer cache for upstream target selection
+        let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
+        // Initialize health checker and start active checks
+        let mut health_checker = HealthChecker::new();
+        health_checker.start(&config);
+        let health_checker = Arc::new(health_checker);
+        // Circuit breaker cache
+        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
 
         Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),
@@ -112,6 +130,9 @@ impl ProxyState {
             router_cache,
             plugin_cache,
             consumer_index,
+            load_balancer_cache,
+            health_checker,
+            circuit_breaker_cache,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
@@ -128,8 +149,9 @@ impl ProxyState {
         self.router_cache.rebuild(&new_config);
         self.plugin_cache.rebuild(&new_config);
         self.consumer_index.rebuild(&new_config.consumers);
+        self.load_balancer_cache.rebuild(&new_config);
         self.config.store(Arc::new(new_config));
-        info!("Proxy configuration updated atomically (router + plugins + consumers rebuilt)");
+        info!("Proxy configuration updated atomically (router + plugins + consumers + load balancers rebuilt)");
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
@@ -847,7 +869,7 @@ pub async fn handle_proxy_request(
         .filter(|p| {
             matches!(
                 p.name(),
-                "jwt_auth" | "key_auth" | "basic_auth" | "oauth2_auth"
+                "jwt_auth" | "key_auth" | "basic_auth" | "oauth2_auth" | "hmac_auth"
             )
         })
         .collect();
@@ -1073,13 +1095,132 @@ pub async fn handle_proxy_request(
         }
     }
 
-    // Build backend URL
-    let backend_url = build_backend_url(&proxy, &path, &query_string);
+    // Resolve upstream target if load balancing is configured
+    let upstream_target: Option<UpstreamTarget> = if let Some(upstream_id) = &proxy.upstream_id {
+        let hash_key = ctx.client_ip.clone(); // Default hash key for consistent hashing
+        state.load_balancer_cache.select_target(
+            upstream_id,
+            &hash_key,
+            Some(&state.health_checker.unhealthy_targets),
+        )
+    } else {
+        None
+    };
+
+    // Circuit breaker check
+    let circuit_breaker = if let Some(cb_config) = &proxy.circuit_breaker {
+        match state.circuit_breaker_cache.can_execute(&proxy.id, cb_config) {
+            Ok(cb) => Some(cb),
+            Err(_) => {
+                log_rejected_request(&plugins, &ctx, 503, start_time, "circuit_breaker_open")
+                    .await;
+                record_request(&state, 503);
+                return Ok(build_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build backend URL (using upstream target if available)
+    let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
+        (target.host.as_str(), target.port)
+    } else {
+        (proxy.backend_host.as_str(), proxy.backend_port)
+    };
+
+    let backend_url = build_backend_url_with_target(
+        &proxy,
+        &path,
+        &query_string,
+        effective_host,
+        effective_port,
+    );
     let backend_start = Instant::now();
 
-    // Perform the backend request
-    let (response_status, response_body, mut response_headers) =
-        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await;
+    // Track connection for least-connections load balancing
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+        state
+            .load_balancer_cache
+            .record_connection_start(upstream_id, target);
+    }
+
+    // Perform the backend request with retry logic
+    let (response_status, response_body, mut response_headers) = if let Some(retry_config) =
+        &proxy.retry
+    {
+        let mut attempt = 0u32;
+        let mut current_target = upstream_target.clone();
+        let mut current_url = backend_url.clone();
+        let mut result =
+            proxy_to_backend(&state, &proxy, &current_url, &method, proxy_headers, req).await;
+
+        while retry::should_retry(retry_config, &method, result.0, attempt) {
+            let delay = retry::retry_delay(retry_config, attempt);
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+
+            // Try a different target on retry if load balancing is configured
+            if let (Some(upstream_id), Some(prev_target)) =
+                (&proxy.upstream_id, &current_target)
+            {
+                if let Some(next) = state.load_balancer_cache.select_next_target(
+                    upstream_id,
+                    &ctx.client_ip,
+                    prev_target,
+                    Some(&state.health_checker.unhealthy_targets),
+                ) {
+                    current_url = build_backend_url_with_target(
+                        &proxy,
+                        &path,
+                        &query_string,
+                        &next.host,
+                        next.port,
+                    );
+                    current_target = Some(next);
+                }
+            }
+
+            debug!(
+                "Retrying request to {} (attempt {}/{})",
+                current_url, attempt, retry_config.max_retries
+            );
+
+            // Build a minimal request for retry (body was consumed on first attempt)
+            result = proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers)
+                .await;
+        }
+        result
+    } else {
+        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await
+    };
+
+    // End connection tracking for least-connections
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+        state
+            .load_balancer_cache
+            .record_connection_end(upstream_id, target);
+    }
+
+    // Record circuit breaker result
+    if let Some(cb) = &circuit_breaker {
+        cb.record_failure(response_status); // record_failure checks if status is a failure
+    }
+
+    // Passive health check reporting
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+        let config = state.config.load();
+        if let Some(upstream) = config.upstreams.iter().find(|u| u.id == *upstream_id) {
+            if let Some(hc) = &upstream.health_checks {
+                state
+                    .health_checker
+                    .report_response(target, response_status, hc.passive.as_ref());
+            }
+        }
+    }
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -1200,6 +1341,133 @@ pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str)
         base
     } else {
         format!("{}?{}", base, query_string)
+    }
+}
+
+/// Build backend URL using a specific host and port (for load-balanced targets).
+pub fn build_backend_url_with_target(
+    proxy: &Proxy,
+    incoming_path: &str,
+    query_string: &str,
+    host: &str,
+    port: u16,
+) -> String {
+    let scheme = match proxy.backend_protocol {
+        BackendProtocol::Http | BackendProtocol::Ws | BackendProtocol::Grpc => "http",
+        BackendProtocol::Https
+        | BackendProtocol::Wss
+        | BackendProtocol::H3
+        | BackendProtocol::Grpcs => "https",
+    };
+
+    let remaining_path = if proxy.strip_listen_path {
+        incoming_path
+            .strip_prefix(&proxy.listen_path)
+            .unwrap_or("")
+    } else {
+        incoming_path
+    };
+
+    let backend_path = proxy.backend_path.as_deref().unwrap_or("");
+    let full_path = format!("{}{}", backend_path, remaining_path);
+    let full_path = if full_path.is_empty() {
+        "/".to_string()
+    } else if !full_path.starts_with('/') {
+        format!("/{}", full_path)
+    } else {
+        full_path
+    };
+
+    let base = format!("{}://{}:{}{}", scheme, host, port, full_path);
+
+    if query_string.is_empty() {
+        base
+    } else {
+        format!("{}?{}", base, query_string)
+    }
+}
+
+/// Retry a backend request without a body (body was consumed on the first attempt).
+/// For idempotent methods (GET, HEAD, DELETE, OPTIONS) this is safe.
+async fn proxy_to_backend_retry(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+) -> (u16, Vec<u8>, HashMap<String, String>) {
+    // Resolve backend hostname
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            &proxy.backend_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await;
+
+    let client = match state
+        .connection_pool
+        .get_client(proxy, resolved_ip.ok())
+        .await
+    {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get client from pool for retry: {}", e);
+            return (
+                502,
+                format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                HashMap::new(),
+            );
+        }
+    };
+
+    let req_method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        _ => reqwest::Method::GET,
+    };
+
+    let mut req_builder = client.request(req_method, backend_url);
+
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" => {
+                if proxy.preserve_host_header {
+                    req_builder = req_builder.header("Host", v.as_str());
+                } else {
+                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                }
+            }
+            "connection" | "transfer-encoding" => continue,
+            _ => {
+                req_builder = req_builder.header(k.as_str(), v.as_str());
+            }
+        }
+    }
+
+    match req_builder.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let mut resp_headers = HashMap::new();
+            for (k, v) in response.headers() {
+                if let Ok(vs) = v.to_str() {
+                    resp_headers.insert(k.as_str().to_string(), vs.to_string());
+                }
+            }
+            let body = response.bytes().await.unwrap_or_default().to_vec();
+            (status, body, resp_headers)
+        }
+        Err(e) => {
+            error!("Backend retry request failed: {}", e);
+            let body = format!(r#"{{"error":"Backend unavailable: {}"}}"#, e);
+            (502, body.into_bytes(), HashMap::new())
+        }
     }
 }
 
