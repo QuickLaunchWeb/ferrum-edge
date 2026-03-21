@@ -202,6 +202,13 @@ pub struct RetryConfig {
     pub retryable_methods: Vec<String>,
     #[serde(default)]
     pub backoff: BackoffStrategy,
+    /// Whether to retry on TCP/connection failures (connect refused, timeout,
+    /// DNS resolution failure, TLS handshake error). Defaults to true.
+    /// This is independent of `retryable_status_codes` — a connection failure
+    /// never reaches the HTTP layer, so it would not be retried by status code
+    /// matching alone.
+    #[serde(default = "default_retry_on_connect_failure")]
+    pub retry_on_connect_failure: bool,
 }
 
 impl Default for RetryConfig {
@@ -211,6 +218,7 @@ impl Default for RetryConfig {
             retryable_status_codes: default_retryable_status_codes(),
             retryable_methods: default_retryable_methods(),
             backoff: BackoffStrategy::default(),
+            retry_on_connect_failure: default_retry_on_connect_failure(),
         }
     }
 }
@@ -229,6 +237,9 @@ fn default_retryable_methods() -> Vec<String> {
         "PUT".to_string(),
         "DELETE".to_string(),
     ]
+}
+fn default_retry_on_connect_failure() -> bool {
+    true
 }
 
 /// Backend protocol for a proxy resource.

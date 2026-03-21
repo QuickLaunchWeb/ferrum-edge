@@ -1150,16 +1150,14 @@ pub async fn handle_proxy_request(
     }
 
     // Perform the backend request with retry logic
-    let (response_status, response_body, mut response_headers) = if let Some(retry_config) =
-        &proxy.retry
-    {
+    let backend_resp = if let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_url = backend_url.clone();
         let mut result =
             proxy_to_backend(&state, &proxy, &current_url, &method, proxy_headers, req).await;
 
-        while retry::should_retry(retry_config, &method, result.0, attempt) {
+        while retry::should_retry(retry_config, &method, &result, attempt) {
             let delay = retry::retry_delay(retry_config, attempt);
             tokio::time::sleep(delay).await;
             attempt += 1;
@@ -1184,8 +1182,8 @@ pub async fn handle_proxy_request(
             }
 
             debug!(
-                "Retrying request to {} (attempt {}/{})",
-                current_url, attempt, retry_config.max_retries
+                "Retrying request to {} (attempt {}/{}, connection_error={})",
+                current_url, attempt, retry_config.max_retries, result.connection_error
             );
 
             // Build a minimal request for retry (body was consumed on first attempt)
@@ -1196,6 +1194,9 @@ pub async fn handle_proxy_request(
     } else {
         proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await
     };
+    let response_status = backend_resp.status_code;
+    let response_body = backend_resp.body;
+    let mut response_headers = backend_resp.headers;
 
     // End connection tracking for least-connections
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
@@ -1392,7 +1393,7 @@ async fn proxy_to_backend_retry(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
-) -> (u16, Vec<u8>, HashMap<String, String>) {
+) -> retry::BackendResponse {
     // Resolve backend hostname
     let resolved_ip = state
         .dns_cache
@@ -1411,11 +1412,12 @@ async fn proxy_to_backend_retry(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool for retry: {}", e);
-            return (
-                502,
-                format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
-                HashMap::new(),
-            );
+            return retry::BackendResponse {
+                status_code: 502,
+                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                headers: HashMap::new(),
+                connection_error: true,
+            };
         }
     };
 
@@ -1458,12 +1460,22 @@ async fn proxy_to_backend_retry(
                 }
             }
             let body = response.bytes().await.unwrap_or_default().to_vec();
-            (status, body, resp_headers)
+            retry::BackendResponse {
+                status_code: status,
+                body,
+                headers: resp_headers,
+                connection_error: false,
+            }
         }
         Err(e) => {
             error!("Backend retry request failed: {}", e);
-            let body = format!(r#"{{"error":"Backend unavailable: {}"}}"#, e);
-            (502, body.into_bytes(), HashMap::new())
+            let is_connect = e.is_connect() || e.is_timeout();
+            retry::BackendResponse {
+                status_code: 502,
+                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                headers: HashMap::new(),
+                connection_error: is_connect,
+            }
         }
     }
 }
@@ -1476,7 +1488,7 @@ async fn proxy_to_backend(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
-) -> (u16, Vec<u8>, HashMap<String, String>) {
+) -> retry::BackendResponse {
     // Resolve backend hostname
     let resolved_ip = state
         .dns_cache
@@ -1489,8 +1501,14 @@ async fn proxy_to_backend(
 
     // Handle HTTP/3 backend requests differently
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
-        return proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req)
-            .await;
+        let (status, body, hdrs) =
+            proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req).await;
+        return retry::BackendResponse {
+            status_code: status,
+            body,
+            headers: hdrs,
+            connection_error: false,
+        };
     }
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2
@@ -1565,11 +1583,12 @@ async fn proxy_to_backend(
             && let Ok(len) = content_length.parse::<usize>()
             && len > state.max_body_size_bytes
         {
-            return (
-                413,
-                r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                HashMap::new(),
-            );
+            return retry::BackendResponse {
+                status_code: 413,
+                body: r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                headers: HashMap::new(),
+                connection_error: false,
+            };
         }
 
         // Collect and forward body with size limit.
@@ -1588,11 +1607,13 @@ async fn proxy_to_backend(
             match limited.collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
                 Err(_) => {
-                    return (
-                        413,
-                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                        HashMap::new(),
-                    );
+                    return retry::BackendResponse {
+                        status_code: 413,
+                        body:
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                    };
                 }
             }
         } else {
@@ -1637,30 +1658,51 @@ async fn proxy_to_backend(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
                         len, state.max_response_body_size_bytes
                     );
-                    return (
-                        502,
-                        r#"{"error":"Backend response body exceeds maximum size"}"#
+                    return retry::BackendResponse {
+                        status_code: 502,
+                        body: r#"{"error":"Backend response body exceeds maximum size"}"#
                             .as_bytes()
                             .to_vec(),
-                        HashMap::new(),
-                    );
+                        headers: HashMap::new(),
+                        connection_error: false,
+                    };
                 }
 
                 // Stream-collect with size limit using chunk_with_limit
                 let max_size = state.max_response_body_size_bytes;
                 match collect_response_with_limit(response, max_size).await {
-                    Ok((resp_body, _)) => (status, resp_body, resp_headers),
-                    Err(err_body) => (502, err_body, HashMap::new()),
+                    Ok((resp_body, _)) => retry::BackendResponse {
+                        status_code: status,
+                        body: resp_body,
+                        headers: resp_headers,
+                        connection_error: false,
+                    },
+                    Err(err_body) => retry::BackendResponse {
+                        status_code: 502,
+                        body: err_body,
+                        headers: HashMap::new(),
+                        connection_error: false,
+                    },
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
-                (status, body, resp_headers)
+                retry::BackendResponse {
+                    status_code: status,
+                    body,
+                    headers: resp_headers,
+                    connection_error: false,
+                }
             }
         }
         Err(e) => {
             error!("Backend request failed: {}", e);
-            let body = format!(r#"{{"error":"Backend unavailable: {}"}}"#, e);
-            (502, body.into_bytes(), HashMap::new())
+            let is_connect = e.is_connect() || e.is_timeout();
+            retry::BackendResponse {
+                status_code: 502,
+                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                headers: HashMap::new(),
+                connection_error: is_connect,
+            }
         }
     }
 }
