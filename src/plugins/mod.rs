@@ -244,7 +244,9 @@ pub fn create_plugin_with_http_client(
         ))),
         "rate_limiting" => Some(Arc::new(rate_limiting::RateLimiting::new(config))),
         "body_validator" => Some(Arc::new(body_validator::BodyValidator::new(config))),
-        "request_termination" => Some(Arc::new(request_termination::RequestTermination::new(config))),
+        "request_termination" => Some(Arc::new(request_termination::RequestTermination::new(
+            config,
+        ))),
         "prometheus_metrics" => Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(config))),
         "otel_tracing" => Some(Arc::new(otel_tracing::OtelTracing::new(config))),
         _ => {

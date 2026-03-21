@@ -54,8 +54,7 @@ impl Plugin for CorrelationId {
         };
 
         // Store in metadata for logging plugins
-        ctx.metadata
-            .insert("request_id".to_string(), request_id);
+        ctx.metadata.insert("request_id".to_string(), request_id);
 
         PluginResult::Continue
     }

@@ -78,8 +78,8 @@ impl BodyValidator {
 
     fn validate_json_body(&self, body: &str) -> Result<(), String> {
         // Parse as JSON
-        let parsed: Value = serde_json::from_str(body)
-            .map_err(|e| format!("Invalid JSON: {}", e))?;
+        let parsed: Value =
+            serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Check required fields
         if let Value::Object(map) = &parsed {
@@ -290,7 +290,10 @@ impl Plugin for BodyValidator {
                 debug!("body_validator: validation failed: {}", msg);
                 PluginResult::Reject {
                     status_code: 400,
-                    body: format!(r#"{{"error":"Request body validation failed","details":"{}"}}"#, msg),
+                    body: format!(
+                        r#"{{"error":"Request body validation failed","details":"{}"}}"#,
+                        msg
+                    ),
                     headers: HashMap::new(),
                 }
             }

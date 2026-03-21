@@ -153,7 +153,9 @@ impl ProxyState {
         self.consumer_index.rebuild(&new_config.consumers);
         self.load_balancer_cache.rebuild(&new_config);
         self.config.store(Arc::new(new_config));
-        info!("Proxy configuration updated atomically (router + plugins + consumers + load balancers rebuilt)");
+        info!(
+            "Proxy configuration updated atomically (router + plugins + consumers + load balancers rebuilt)"
+        );
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
@@ -1111,11 +1113,13 @@ pub async fn handle_proxy_request(
 
     // Circuit breaker check
     let circuit_breaker = if let Some(cb_config) = &proxy.circuit_breaker {
-        match state.circuit_breaker_cache.can_execute(&proxy.id, cb_config) {
+        match state
+            .circuit_breaker_cache
+            .can_execute(&proxy.id, cb_config)
+        {
             Ok(cb) => Some(cb),
             Err(_) => {
-                log_rejected_request(&plugins, &ctx, 503, start_time, "circuit_breaker_open")
-                    .await;
+                log_rejected_request(&plugins, &ctx, 503, start_time, "circuit_breaker_open").await;
                 record_request(&state, 503);
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1134,13 +1138,8 @@ pub async fn handle_proxy_request(
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
 
-    let backend_url = build_backend_url_with_target(
-        &proxy,
-        &path,
-        &query_string,
-        effective_host,
-        effective_port,
-    );
+    let backend_url =
+        build_backend_url_with_target(&proxy, &path, &query_string, effective_host, effective_port);
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
@@ -1166,8 +1165,7 @@ pub async fn handle_proxy_request(
             attempt += 1;
 
             // Try a different target on retry if load balancing is configured
-            if let (Some(upstream_id), Some(prev_target)) =
-                (&proxy.upstream_id, &current_target)
+            if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(next) = state.load_balancer_cache.select_next_target(
                     upstream_id,
                     &ctx.client_ip,
@@ -1191,8 +1189,8 @@ pub async fn handle_proxy_request(
             );
 
             // Build a minimal request for retry (body was consumed on first attempt)
-            result = proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers)
-                .await;
+            result =
+                proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers).await;
         }
         result
     } else {
@@ -1362,9 +1360,7 @@ pub fn build_backend_url_with_target(
     };
 
     let remaining_path = if proxy.strip_listen_path {
-        incoming_path
-            .strip_prefix(&proxy.listen_path)
-            .unwrap_or("")
+        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
     } else {
         incoming_path
     };

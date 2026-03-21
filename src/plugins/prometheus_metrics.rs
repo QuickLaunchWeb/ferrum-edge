@@ -47,7 +47,9 @@ pub struct HistogramBuckets {
 
 impl HistogramBuckets {
     fn new() -> Self {
-        let boundaries = vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
+        let boundaries = vec![
+            5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+        ];
         let counts = boundaries.iter().map(|_| AtomicU64::new(0)).collect();
         Self {
             boundaries,
@@ -143,9 +145,7 @@ impl MetricsRegistry {
         }
 
         // Request duration histogram
-        output.push_str(
-            "# HELP ferrum_request_duration_ms Request duration in milliseconds.\n",
-        );
+        output.push_str("# HELP ferrum_request_duration_ms Request duration in milliseconds.\n");
         output.push_str("# TYPE ferrum_request_duration_ms histogram\n");
         for entry in self.request_duration_buckets.iter() {
             let proxy_id = entry.key();
@@ -174,9 +174,8 @@ impl MetricsRegistry {
         }
 
         // Backend duration histogram
-        output.push_str(
-            "# HELP ferrum_backend_duration_ms Backend response time in milliseconds.\n",
-        );
+        output
+            .push_str("# HELP ferrum_backend_duration_ms Backend response time in milliseconds.\n");
         output.push_str("# TYPE ferrum_backend_duration_ms histogram\n");
         for entry in self.backend_duration_buckets.iter() {
             let proxy_id = entry.key();
@@ -205,9 +204,7 @@ impl MetricsRegistry {
         }
 
         // Rate limit exceeded
-        output.push_str(
-            "# HELP ferrum_rate_limit_exceeded_total Total rate limit rejections.\n",
-        );
+        output.push_str("# HELP ferrum_rate_limit_exceeded_total Total rate limit rejections.\n");
         output.push_str("# TYPE ferrum_rate_limit_exceeded_total counter\n");
         output.push_str(&format!(
             "ferrum_rate_limit_exceeded_total {}\n",

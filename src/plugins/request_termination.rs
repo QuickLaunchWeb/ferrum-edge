@@ -33,10 +33,7 @@ impl RequestTermination {
             .as_str()
             .unwrap_or("application/json")
             .to_string();
-        let body = config["body"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let body = config["body"].as_str().unwrap_or("").to_string();
         let message = config["message"].as_str().map(String::from);
 
         let trigger = if let Some(path) = config["trigger"]["path_prefix"].as_str() {
@@ -69,13 +66,13 @@ impl RequestTermination {
         }
 
         // Build a default response based on content type
-        let msg = self
-            .message
-            .as_deref()
-            .unwrap_or("Service unavailable");
+        let msg = self.message.as_deref().unwrap_or("Service unavailable");
 
         if self.content_type.contains("json") {
-            format!(r#"{{"message":"{}","status_code":{}}}"#, msg, self.status_code)
+            format!(
+                r#"{{"message":"{}","status_code":{}}}"#,
+                msg, self.status_code
+            )
         } else if self.content_type.contains("xml") {
             format!(
                 r#"<?xml version="1.0"?><response><message>{}</message><status_code>{}</status_code></response>"#,

@@ -8,8 +8,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Load balancer cache, rebuilt atomically on config change.
 pub struct LoadBalancerCache {
@@ -34,7 +34,11 @@ impl LoadBalancerCache {
         for upstream in &config.upstreams {
             map.insert(
                 upstream.id.clone(),
-                LoadBalancer::new(upstream.algorithm, &upstream.targets, upstream.hash_on.clone()),
+                LoadBalancer::new(
+                    upstream.algorithm,
+                    &upstream.targets,
+                    upstream.hash_on.clone(),
+                ),
             );
         }
         map
@@ -42,7 +46,11 @@ impl LoadBalancerCache {
 
     /// Look up an upstream by ID.
     #[allow(dead_code)]
-    pub fn get_upstream<'a>(&self, config: &'a GatewayConfig, upstream_id: &str) -> Option<&'a Upstream> {
+    pub fn get_upstream<'a>(
+        &self,
+        config: &'a GatewayConfig,
+        upstream_id: &str,
+    ) -> Option<&'a Upstream> {
         config.upstreams.iter().find(|u| u.id == upstream_id)
     }
 
@@ -150,7 +158,10 @@ impl LoadBalancer {
         }
     }
 
-    fn healthy_targets(&self, unhealthy: Option<&DashMap<String, ()>>) -> Vec<(usize, &UpstreamTarget)> {
+    fn healthy_targets(
+        &self,
+        unhealthy: Option<&DashMap<String, ()>>,
+    ) -> Vec<(usize, &UpstreamTarget)> {
         self.targets
             .iter()
             .enumerate()
@@ -164,7 +175,11 @@ impl LoadBalancer {
             .collect()
     }
 
-    fn select(&self, ctx_key: &str, unhealthy: Option<&DashMap<String, ()>>) -> Option<UpstreamTarget> {
+    fn select(
+        &self,
+        ctx_key: &str,
+        unhealthy: Option<&DashMap<String, ()>>,
+    ) -> Option<UpstreamTarget> {
         let healthy = self.healthy_targets(unhealthy);
         if healthy.is_empty() {
             // Fallback: try all targets if everything is unhealthy
@@ -180,12 +195,8 @@ impl LoadBalancer {
                 let target_idx = idx % healthy.len();
                 Some(healthy[target_idx].1.clone())
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                self.select_wrr(&healthy)
-            }
-            LoadBalancerAlgorithm::LeastConnections => {
-                self.select_least_connections(&healthy)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
+            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
             LoadBalancerAlgorithm::ConsistentHashing => {
                 self.select_consistent_hash(ctx_key, &healthy)
             }
@@ -248,7 +259,9 @@ impl LoadBalancer {
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
-            LoadBalancerAlgorithm::ConsistentHashing => self.select_consistent_hash(ctx_key, &healthy),
+            LoadBalancerAlgorithm::ConsistentHashing => {
+                self.select_consistent_hash(ctx_key, &healthy)
+            }
         }
     }
 
@@ -270,7 +283,8 @@ impl LoadBalancer {
         let mut best_current = i64::MIN;
 
         for (i, (orig_idx, target)) in candidates.iter().enumerate() {
-            let current = self.wrr_weights[*orig_idx].fetch_add(target.weight as i64, Ordering::Relaxed)
+            let current = self.wrr_weights[*orig_idx]
+                .fetch_add(target.weight as i64, Ordering::Relaxed)
                 + target.weight as i64;
             if current > best_current {
                 best_current = current;
@@ -286,7 +300,10 @@ impl LoadBalancer {
     }
 
     /// Select target with least active connections.
-    fn select_least_connections(&self, candidates: &[(usize, &UpstreamTarget)]) -> Option<UpstreamTarget> {
+    fn select_least_connections(
+        &self,
+        candidates: &[(usize, &UpstreamTarget)],
+    ) -> Option<UpstreamTarget> {
         if candidates.is_empty() {
             return None;
         }

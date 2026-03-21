@@ -80,10 +80,8 @@ impl Plugin for OtelTracing {
                 // Store incoming trace context
                 ctx.metadata
                     .insert("trace_id".to_string(), trace_id.clone());
-                ctx.metadata.insert(
-                    "parent_span_id".to_string(),
-                    _parent_span.clone(),
-                );
+                ctx.metadata
+                    .insert("parent_span_id".to_string(), _parent_span.clone());
 
                 // Generate new span ID for the gateway
                 let gateway_span = Self::generate_span_id();
@@ -105,8 +103,7 @@ impl Plugin for OtelTracing {
             return PluginResult::Continue;
         };
 
-        ctx.metadata
-            .insert("traceparent".to_string(), traceparent);
+        ctx.metadata.insert("traceparent".to_string(), traceparent);
 
         // Preserve tracestate if present
         if let Some(tracestate) = ctx.headers.get("tracestate") {
@@ -148,8 +145,16 @@ impl Plugin for OtelTracing {
     async fn log(&self, summary: &TransactionSummary) {
         // Emit structured trace log
         if let Some(trace_id) = summary.metadata.get("trace_id") {
-            let span_id = summary.metadata.get("span_id").map(|s| s.as_str()).unwrap_or("");
-            let parent_span_id = summary.metadata.get("parent_span_id").map(|s| s.as_str()).unwrap_or("");
+            let span_id = summary
+                .metadata
+                .get("span_id")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let parent_span_id = summary
+                .metadata
+                .get("parent_span_id")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             tracing::info!(
                 target: "otel",
                 service_name = %self.service_name,

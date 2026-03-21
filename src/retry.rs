@@ -7,12 +7,7 @@ use crate::config::types::{BackoffStrategy, RetryConfig};
 use std::time::Duration;
 
 /// Determine if a request should be retried.
-pub fn should_retry(
-    config: &RetryConfig,
-    method: &str,
-    status_code: u16,
-    attempt: u32,
-) -> bool {
+pub fn should_retry(config: &RetryConfig, method: &str, status_code: u16, attempt: u32) -> bool {
     if attempt >= config.max_retries {
         return false;
     }

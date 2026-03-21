@@ -11,8 +11,8 @@
 use crate::config::pool_config::PoolConfig;
 use crate::config::types::{ActiveHealthCheck, GatewayConfig, PassiveHealthCheck, UpstreamTarget};
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -252,8 +252,7 @@ impl HealthChecker {
 
                         debug!("Active health check failed for {}: {}", key, e);
 
-                        if !unhealthy_targets.contains_key(&key)
-                            && failures >= unhealthy_threshold
+                        if !unhealthy_targets.contains_key(&key) && failures >= unhealthy_threshold
                         {
                             warn!(
                                 "Active health check: target {} is unhealthy (connection error)",
@@ -295,8 +294,7 @@ fn build_health_check_client(pool_config: &PoolConfig) -> reqwest::Client {
         .danger_accept_invalid_certs(true);
 
     if pool_config.enable_http_keep_alive {
-        builder =
-            builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+        builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
     }
 
     if pool_config.enable_http2 {

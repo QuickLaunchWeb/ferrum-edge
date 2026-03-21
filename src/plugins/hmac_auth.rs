@@ -271,11 +271,7 @@ impl Plugin for HmacAuth {
         };
 
         // Build the signing string: METHOD\nPATH\nDATE
-        let date = ctx
-            .headers
-            .get("date")
-            .cloned()
-            .unwrap_or_default();
+        let date = ctx.headers.get("date").cloned().unwrap_or_default();
 
         let signing_string = format!("{}\n{}\n{}", ctx.method, ctx.path, date);
 

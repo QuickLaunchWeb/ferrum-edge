@@ -35,9 +35,7 @@ impl BotDetection {
             })
             .unwrap_or_default();
 
-        let custom_response_code = config["custom_response_code"]
-            .as_u64()
-            .unwrap_or(403) as u16;
+        let custom_response_code = config["custom_response_code"].as_u64().unwrap_or(403) as u16;
 
         Self {
             blocked_patterns,

@@ -7,8 +7,8 @@
 
 use crate::config::types::CircuitBreakerConfig;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tracing::{info, warn};
 
 const STATE_CLOSED: u8 = 0;
@@ -61,7 +61,12 @@ impl CircuitBreaker {
                 if now.saturating_sub(last_failure) >= timeout_ms {
                     // Transition to half-open
                     self.state
-                        .compare_exchange(STATE_OPEN, STATE_HALF_OPEN, Ordering::AcqRel, Ordering::Relaxed)
+                        .compare_exchange(
+                            STATE_OPEN,
+                            STATE_HALF_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
                         .ok();
                     self.half_open_in_flight.store(0, Ordering::Relaxed);
                     self.success_count.store(0, Ordering::Relaxed);
@@ -125,10 +130,7 @@ impl CircuitBreaker {
             STATE_CLOSED => {
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
-                    warn!(
-                        "Circuit breaker opening after {} failures",
-                        failures
-                    );
+                    warn!("Circuit breaker opening after {} failures", failures);
                     self.state.store(STATE_OPEN, Ordering::Release);
                 }
             }
@@ -173,7 +175,11 @@ impl CircuitBreakerCache {
     }
 
     /// Get or create a circuit breaker for a proxy.
-    pub fn get_or_create(&self, proxy_id: &str, config: &CircuitBreakerConfig) -> Arc<CircuitBreaker> {
+    pub fn get_or_create(
+        &self,
+        proxy_id: &str,
+        config: &CircuitBreakerConfig,
+    ) -> Arc<CircuitBreaker> {
         self.breakers
             .entry(proxy_id.to_string())
             .or_insert_with(|| Arc::new(CircuitBreaker::new(config.clone())))
@@ -181,7 +187,11 @@ impl CircuitBreakerCache {
     }
 
     /// Check if a request can proceed for a given proxy.
-    pub fn can_execute(&self, proxy_id: &str, config: &CircuitBreakerConfig) -> Result<Arc<CircuitBreaker>, CircuitOpenError> {
+    pub fn can_execute(
+        &self,
+        proxy_id: &str,
+        config: &CircuitBreakerConfig,
+    ) -> Result<Arc<CircuitBreaker>, CircuitOpenError> {
         let cb = self.get_or_create(proxy_id, config);
         cb.can_execute()?;
         Ok(cb)
