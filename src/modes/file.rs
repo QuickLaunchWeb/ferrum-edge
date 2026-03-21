@@ -5,7 +5,7 @@ use crate::config::EnvConfig;
 use crate::config::file_loader;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
-use crate::tls;
+use crate::tls::{self, TlsPolicy};
 
 pub async fn run(
     env_config: EnvConfig,
@@ -84,6 +84,9 @@ pub async fn run(
 
     let proxy_state = ProxyState::new(config, dns_cache, env_config.clone());
 
+    // Build TLS hardening policy from environment
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+
     // Validate TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
         &env_config.proxy_tls_cert_path,
@@ -96,6 +99,7 @@ pub async fn run(
             key_path,
             client_ca_bundle_path,
             false,
+            &tls_policy,
         ) {
             Ok(config) => {
                 if client_ca_bundle_path.is_some() {
@@ -206,6 +210,7 @@ pub async fn run(
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
+            let h3_tls_policy = tls_policy.clone();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener(
@@ -214,6 +219,7 @@ pub async fn run(
                     h3_shutdown,
                     tls_config,
                     h3_config,
+                    &h3_tls_policy,
                 )
                 .await
                 {

@@ -3,6 +3,11 @@
 # Uses global defaults with selective per-proxy overrides
 
 proxies:
+  # ⚠️  IMPORTANT: Per-proxy pool_max_idle_per_host values MUST be >= the wrk
+  # connection count (default 100) to avoid connection churn during benchmarks.
+  # These are intentionally set to 200 to match the global FERRUM_POOL_MAX_IDLE_PER_HOST.
+  # DO NOT reduce these values below 200 for performance testing.
+
   - id: "proxy-health"
     name: "Health Check Proxy"
     listen_path: "/health"
@@ -16,9 +21,7 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
-    # Override for high-frequency health checks
     pool_max_idle_per_host: 200
-    # Other settings use global defaults
     plugins: []
 
   - id: "proxy-users"
@@ -34,10 +37,8 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
-    # Override for high-traffic API
     pool_max_idle_per_host: 200
     pool_idle_timeout_seconds: 180
-    # Other settings use global defaults
     plugins: []
 
   - id: "proxy-data"
@@ -53,9 +54,7 @@ proxies:
     backend_write_timeout_ms: 10000
     backend_tls_verify_server_cert: true
     auth_mode: single
-    # Override for large payload API
     pool_max_idle_per_host: 200
-    # Other settings use global defaults
     plugins: []
 
 consumers: []

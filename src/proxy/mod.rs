@@ -1227,8 +1227,17 @@ async fn proxy_to_backend(
             );
         }
 
-        // Collect and forward body with size limit
-        let body_bytes = if state.max_body_size_bytes > 0 {
+        // Collect and forward body with size limit.
+        // Skip body collection for methods that typically carry no body to avoid
+        // unnecessary Limited wrapper overhead on the hot path (GET health checks, etc.).
+        let has_body = !matches!(method, "GET" | "HEAD" | "OPTIONS")
+            || headers.contains_key("content-length")
+            || headers.get("transfer-encoding").is_some();
+
+        let body_bytes = if !has_body {
+            // Fast path: skip body collection entirely for bodyless requests
+            Vec::new()
+        } else if state.max_body_size_bytes > 0 {
             let limited =
                 http_body_util::Limited::new(original_req.into_body(), state.max_body_size_bytes);
             match limited.collect().await {

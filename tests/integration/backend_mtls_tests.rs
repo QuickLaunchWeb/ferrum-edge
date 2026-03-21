@@ -114,6 +114,11 @@ fn create_test_env_config_with_mtls(
         db_tls_client_cert_path: None,
         db_tls_client_key_path: None,
         db_tls_insecure: false,
+        tls_min_version: "1.2".into(),
+        tls_max_version: "1.3".into(),
+        tls_cipher_suites: None,
+        tls_prefer_server_cipher_order: true,
+        tls_curves: None,
     }
 }
 

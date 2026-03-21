@@ -116,6 +116,11 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         enable_http3: false,
         http3_idle_timeout: 30,
         http3_max_streams: 100,
+        tls_min_version: "1.2".into(),
+        tls_max_version: "1.3".into(),
+        tls_cipher_suites: None,
+        tls_prefer_server_cipher_order: true,
+        tls_curves: None,
     }
 }
 

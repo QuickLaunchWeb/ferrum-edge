@@ -86,7 +86,12 @@ start_backend() {
 start_gateway() {
     echo -e "${YELLOW}Starting gateway on port $GATEWAY_PORT...${NC}"
     cd "$PROJECT_ROOT"
-    # Set global connection pool defaults optimized for performance testing
+    # ⚠️  IMPORTANT: These pool settings are tuned for performance benchmarking.
+    # FERRUM_POOL_MAX_IDLE_PER_HOST MUST be kept at 200 (or higher) to avoid
+    # connection churn under high-concurrency wrk load. Lowering this value
+    # causes severe throughput degradation and non-2xx errors under load as the
+    # pool exhausts idle connections and must re-establish them mid-benchmark.
+    # DO NOT reduce FERRUM_POOL_MAX_IDLE_PER_HOST below 200 for perf testing.
     FERRUM_MODE=file \
     FERRUM_FILE_CONFIG_PATH="$PERF_DIR/perf_config.yaml" \
     FERRUM_POOL_MAX_IDLE_PER_HOST=200 \

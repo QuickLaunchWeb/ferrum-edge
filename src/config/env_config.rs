@@ -130,6 +130,22 @@ pub struct EnvConfig {
     pub http3_idle_timeout: u64,
     /// HTTP/3 max concurrent streams (default: 100)
     pub http3_max_streams: u32,
+
+    // TLS Hardening
+    /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
+    pub tls_min_version: String,
+    /// Maximum TLS version: "1.2" or "1.3" (default: "1.3")
+    pub tls_max_version: String,
+    /// Comma-separated cipher suites (OpenSSL names). If empty, uses secure defaults.
+    /// TLS 1.3: TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256
+    /// TLS 1.2: ECDHE-ECDSA-AES256-GCM-SHA384, ECDHE-RSA-AES256-GCM-SHA384,
+    ///          ECDHE-ECDSA-AES128-GCM-SHA256, ECDHE-RSA-AES128-GCM-SHA256,
+    ///          ECDHE-ECDSA-CHACHA20-POLY1305, ECDHE-RSA-CHACHA20-POLY1305
+    pub tls_cipher_suites: Option<String>,
+    /// Prefer server cipher order for TLS 1.2 (default: true)
+    pub tls_prefer_server_cipher_order: bool,
+    /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
+    pub tls_curves: Option<String>,
 }
 
 impl Default for EnvConfig {
@@ -188,6 +204,11 @@ impl Default for EnvConfig {
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 100,
+            tls_min_version: "1.2".into(),
+            tls_max_version: "1.3".into(),
+            tls_cipher_suites: None,
+            tls_prefer_server_cipher_order: true,
+            tls_curves: None,
         }
     }
 }
@@ -290,6 +311,15 @@ impl EnvConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
+
+            // TLS Hardening
+            tls_min_version: env::var("FERRUM_TLS_MIN_VERSION").unwrap_or_else(|_| "1.2".into()),
+            tls_max_version: env::var("FERRUM_TLS_MAX_VERSION").unwrap_or_else(|_| "1.3".into()),
+            tls_cipher_suites: env::var("FERRUM_TLS_CIPHER_SUITES").ok(),
+            tls_prefer_server_cipher_order: env::var("FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+            tls_curves: env::var("FERRUM_TLS_CURVES").ok(),
         };
 
         config.validate()?;
@@ -397,6 +427,32 @@ impl EnvConfig {
                     return Err("FERRUM_DP_GRPC_AUTH_TOKEN is required in dp mode".into());
                 }
             }
+        }
+
+        // Validate TLS version settings
+        match self.tls_min_version.as_str() {
+            "1.2" | "1.3" => {}
+            other => {
+                return Err(format!(
+                    "Invalid FERRUM_TLS_MIN_VERSION '{}'. Expected: 1.2, 1.3",
+                    other
+                ));
+            }
+        }
+        match self.tls_max_version.as_str() {
+            "1.2" | "1.3" => {}
+            other => {
+                return Err(format!(
+                    "Invalid FERRUM_TLS_MAX_VERSION '{}'. Expected: 1.2, 1.3",
+                    other
+                ));
+            }
+        }
+        if self.tls_min_version == "1.3" && self.tls_max_version == "1.2" {
+            return Err(
+                "FERRUM_TLS_MIN_VERSION (1.3) cannot be greater than FERRUM_TLS_MAX_VERSION (1.2)"
+                    .into(),
+            );
         }
 
         if self.mode == OperatingMode::ControlPlane {

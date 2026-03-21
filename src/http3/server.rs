@@ -14,17 +14,73 @@ use super::config::Http3ServerConfig;
 use crate::config::types::{AuthMode, Proxy};
 use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
 use crate::proxy::ProxyState;
+use crate::tls::TlsPolicy;
 
 /// Start the HTTP/3 (QUIC) proxy listener.
+///
+/// HTTP/3 (QUIC) mandates TLS 1.3. If the provided TLS policy does not include
+/// TLS 1.3, this function will override it to force TLS 1.3 for the QUIC listener
+/// and log a warning.
 pub async fn start_http3_listener(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Arc<rustls::ServerConfig>,
     h3_config: Http3ServerConfig,
+    tls_policy: &TlsPolicy,
 ) -> Result<(), anyhow::Error> {
-    // Configure QUIC server with the TLS config
-    let mut server_tls_config = (*tls_config).clone();
+    // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
+    // Filter cipher suites to TLS 1.3 only and force TLS 1.3 protocol version.
+    let has_tls13 = tls_policy
+        .protocol_versions
+        .iter()
+        .any(|v| std::ptr::eq(*v, &rustls::version::TLS13));
+
+    if !has_tls13 {
+        warn!(
+            "HTTP/3 (QUIC) requires TLS 1.3, but FERRUM_TLS_MAX_VERSION excludes it. \
+               Forcing TLS 1.3 for the QUIC listener."
+        );
+    }
+
+    // Build an H3-specific crypto provider with only TLS 1.3 cipher suites
+    let tls13_suites: Vec<rustls::SupportedCipherSuite> = tls_policy
+        .crypto_provider
+        .cipher_suites
+        .iter()
+        .filter(|s| s.tls13().is_some())
+        .copied()
+        .collect();
+
+    // If user didn't configure any TLS 1.3 suites, use defaults
+    let h3_suites = if tls13_suites.is_empty() {
+        vec![
+            rustls::crypto::ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+            rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        ]
+    } else {
+        tls13_suites
+    };
+
+    let base_provider = rustls::crypto::ring::default_provider();
+    let h3_provider = rustls::crypto::CryptoProvider {
+        cipher_suites: h3_suites,
+        kx_groups: tls_policy.crypto_provider.kx_groups.clone(),
+        ..base_provider
+    };
+
+    // Rebuild server config with TLS 1.3 only for QUIC
+    let h3_builder = rustls::ServerConfig::builder_with_provider(Arc::new(h3_provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| anyhow::anyhow!("Failed to set TLS 1.3 for HTTP/3: {}", e))?;
+
+    // Reuse the cert chain and key from the original config
+    // We need to clone the certified key from the original config
+    let mut server_tls_config = h3_builder
+        .with_no_client_auth()
+        .with_cert_resolver(tls_config.cert_resolver.clone());
+
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
     server_tls_config.max_early_data_size = u32::MAX; // Enable 0-RTT
 

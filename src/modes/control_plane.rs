@@ -10,7 +10,7 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_loader::DatabaseStore;
 use crate::grpc::cp_server::CpGrpcServer;
-use crate::tls;
+use crate::tls::{self, TlsPolicy};
 
 pub async fn run(
     env_config: EnvConfig,
@@ -44,6 +44,9 @@ pub async fn run(
 
     // Create gRPC server
     let (grpc_server, update_tx) = CpGrpcServer::new(config_arc.clone(), grpc_secret);
+
+    // Build TLS hardening policy from environment
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
     let admin_http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_http_port).parse()?;
@@ -92,6 +95,7 @@ pub async fn run(
             admin_key_path,
             admin_client_ca_bundle,
             env_config.admin_tls_no_verify,
+            &tls_policy,
         ) {
             Ok(config) => {
                 if admin_client_ca_bundle.is_some() {
