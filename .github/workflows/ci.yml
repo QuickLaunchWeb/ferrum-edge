@@ -50,7 +50,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Run unit tests
-        run: cargo test --lib --verbose --all-features
+        run: cargo test --test unit_tests --verbose --all-features
         env:
           RUST_BACKTRACE: 1
 
@@ -95,8 +95,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Run functional/integration tests
-        run: cargo test --tests --verbose --all-features
+      - name: Run integration tests
+        run: cargo test --test integration_tests --test admin_cached_config_tests --verbose --all-features
         env:
           RUST_BACKTRACE: 1
 
@@ -104,7 +104,7 @@ jobs:
         run: cargo build --bin ferrum-gateway
 
       - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
-        run: cargo test --tests --verbose --all-features -- --ignored
+        run: cargo test --test functional_tests --verbose --all-features -- --ignored
         env:
           RUST_BACKTRACE: 1
         timeout-minutes: 15
