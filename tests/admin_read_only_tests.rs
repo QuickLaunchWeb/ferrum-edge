@@ -40,6 +40,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(config),
+        cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
         read_only,
@@ -138,6 +139,7 @@ async fn test_admin_state_mode_field() {
     let admin_state_prod = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&config),
+        cached_config: None,
         proxy_state: None,
         mode: "production".to_string(),
         read_only: false,

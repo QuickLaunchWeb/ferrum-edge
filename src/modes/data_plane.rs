@@ -118,6 +118,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     let admin_state = AdminState {
         db: None,  // DP has no direct DB access
         jwt_manager,
+        cached_config: Some(proxy_state.config.clone()),
         proxy_state: Some(proxy_state.clone()),
         mode: "dp".into(),
         read_only: true,  // DP admin API is always read-only
@@ -140,6 +141,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
             db: None,
             jwt_manager: create_jwt_manager_from_env()
                 .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
+            cached_config: Some(proxy_state.config.clone()),
             proxy_state: Some(proxy_state.clone()),
             mode: "dp".into(),
             read_only: true,
