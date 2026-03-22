@@ -235,7 +235,7 @@ async fn handle_h3_request(
             let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
             if let Some(val) = header_val {
                 let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
-                if socket_addr.map_or(false, |ip| state.trusted_proxies.contains(&ip)) {
+                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
                     val.trim().to_string()
                 } else {
                     crate::proxy::client_ip::resolve_client_ip(

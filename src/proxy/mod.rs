@@ -1215,7 +1215,7 @@ pub async fn handle_proxy_request(
                 // Validate the direct connection is from a trusted proxy before
                 // trusting this header
                 let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
-                if socket_addr.map_or(false, |ip| state.trusted_proxies.contains(&ip)) {
+                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
                     val.trim().to_string()
                 } else {
                     client_ip::resolve_client_ip(
@@ -1873,6 +1873,7 @@ pub fn build_backend_url_with_target(
 
 /// Retry a backend request without a body (body was consumed on the first attempt).
 /// For idempotent methods (GET, HEAD, DELETE, OPTIONS) this is safe.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_retry(
     state: &ProxyState,
     proxy: &Proxy,

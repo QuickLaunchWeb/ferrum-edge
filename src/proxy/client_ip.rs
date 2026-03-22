@@ -76,6 +76,7 @@ impl TrustedProxies {
     }
 
     /// Returns an empty set (no trusted proxies — XFF headers will be ignored).
+    #[cfg(test)]
     pub fn none() -> Self {
         Self { cidrs: Vec::new() }
     }
