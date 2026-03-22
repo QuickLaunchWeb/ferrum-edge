@@ -89,6 +89,7 @@ fn create_http3_test_proxy() -> Proxy {
 /// Create a test gateway configuration with HTTP/3
 fn create_http3_test_gateway_config() -> GatewayConfig {
     GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![create_http3_test_proxy()],
         consumers: vec![],
         plugin_configs: vec![],

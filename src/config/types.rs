@@ -446,6 +446,10 @@ pub struct PluginConfig {
 /// Full gateway configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GatewayConfig {
+    /// Configuration schema version. Defaults to "1" for backwards compatibility
+    /// with config files that predate the versioning system.
+    #[serde(default = "default_config_version")]
+    pub version: String,
     pub proxies: Vec<Proxy>,
     pub consumers: Vec<Consumer>,
     pub plugin_configs: Vec<PluginConfig>,
@@ -453,6 +457,13 @@ pub struct GatewayConfig {
     pub upstreams: Vec<Upstream>,
     #[serde(default = "Utc::now")]
     pub loaded_at: DateTime<Utc>,
+}
+
+/// The current config schema version. Increment this when adding config migrations.
+pub const CURRENT_CONFIG_VERSION: &str = "1";
+
+fn default_config_version() -> String {
+    "1".to_string()
 }
 
 impl GatewayConfig {

@@ -44,6 +44,7 @@ fn test_proxy(id: &str, listen_path: &str) -> Proxy {
 
 fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
     GatewayConfig {
+        version: "1".to_string(),
         proxies,
         consumers: vec![],
         plugin_configs: vec![],

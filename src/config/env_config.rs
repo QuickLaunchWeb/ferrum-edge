@@ -8,6 +8,7 @@ pub enum OperatingMode {
     File,
     ControlPlane,
     DataPlane,
+    Migrate,
 }
 
 impl OperatingMode {
@@ -21,8 +22,9 @@ impl OperatingMode {
             "file" => Ok(Self::File),
             "cp" => Ok(Self::ControlPlane),
             "dp" => Ok(Self::DataPlane),
+            "migrate" => Ok(Self::Migrate),
             other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp",
+                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, migrate",
                 other
             )),
         }
@@ -425,6 +427,42 @@ impl EnvConfig {
                 }
                 if self.dp_grpc_auth_token.is_none() {
                     return Err("FERRUM_DP_GRPC_AUTH_TOKEN is required in dp mode".into());
+                }
+            }
+            OperatingMode::Migrate => {
+                // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
+                // For "config", FERRUM_FILE_CONFIG_PATH is required.
+                // For "up" and "status", FERRUM_DB_TYPE and FERRUM_DB_URL are required.
+                let action = std::env::var("FERRUM_MIGRATE_ACTION")
+                    .unwrap_or_else(|_| "up".into())
+                    .to_lowercase();
+                match action.as_str() {
+                    "config" => {
+                        if self.file_config_path.is_none() {
+                            return Err(
+                                "FERRUM_FILE_CONFIG_PATH is required for migrate config action"
+                                    .into(),
+                            );
+                        }
+                    }
+                    "up" | "status" => {
+                        if self.db_type.is_none() {
+                            return Err(
+                                "FERRUM_DB_TYPE is required for migrate up/status action".into()
+                            );
+                        }
+                        if self.db_url.is_none() {
+                            return Err(
+                                "FERRUM_DB_URL is required for migrate up/status action".into()
+                            );
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "Invalid FERRUM_MIGRATE_ACTION '{}'. Expected: up, status, config",
+                            other
+                        ));
+                    }
                 }
             }
         }

@@ -82,6 +82,7 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         .map(|i| create_test_proxy(&format!("proxy-{}", i), &format!("/api-{}", i)))
         .collect();
     GatewayConfig {
+        version: "1".to_string(),
         proxies,
         consumers: vec![],
         plugin_configs: vec![],

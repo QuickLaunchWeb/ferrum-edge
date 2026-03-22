@@ -73,6 +73,7 @@ fn test_build_backend_url_with_query() {
 #[test]
 fn test_longest_prefix_match() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 listen_path: "/api".into(),
@@ -98,6 +99,7 @@ fn test_longest_prefix_match() {
 #[test]
 fn test_no_match() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![Proxy {
             listen_path: "/api".into(),
             ..test_proxy()

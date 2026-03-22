@@ -71,6 +71,7 @@ fn make_plugin_config(
 
 fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
     GatewayConfig {
+        version: "1".to_string(),
         proxies,
         consumers: vec![],
         plugin_configs,

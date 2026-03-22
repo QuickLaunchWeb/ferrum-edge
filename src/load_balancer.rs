@@ -620,6 +620,7 @@ mod tests {
     #[test]
     fn test_load_balancer_cache() {
         let config = GatewayConfig {
+            version: "1".to_string(),
             upstreams: vec![Upstream {
                 id: "us1".into(),
                 name: Some("test".into()),

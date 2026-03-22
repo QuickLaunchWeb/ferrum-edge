@@ -141,6 +141,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         error_ttl_seconds: 1,
     });
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies,
         consumers: vec![],
         plugin_configs: vec![],

@@ -88,6 +88,7 @@ async fn main() {
         OperatingMode::File => modes::file::run(env_config, shutdown_tx).await,
         OperatingMode::ControlPlane => modes::control_plane::run(env_config, shutdown_tx).await,
         OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
+        OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
     };
 
     if let Err(e) = result {

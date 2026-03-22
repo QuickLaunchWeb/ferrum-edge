@@ -174,6 +174,7 @@ async fn test_cp_dp_grpc_config_sync() {
 
     // Create initial config with one proxy
     let initial_config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![create_test_proxy("proxy-func-1", "/api/v1", 3001)],
         consumers: vec![Consumer {
             id: "consumer-1".into(),
@@ -251,6 +252,7 @@ async fn test_cp_dp_grpc_config_sync() {
     // Update config on CP and broadcast to DP
     println!("Updating config on CP (adding another proxy)...");
     let updated_config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             create_test_proxy("proxy-func-1", "/api/v1", 3001),
             create_test_proxy("proxy-func-2", "/api/v2", 3002),

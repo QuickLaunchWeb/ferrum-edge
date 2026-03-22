@@ -4,6 +4,7 @@ use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Pr
 #[test]
 fn test_unique_listen_paths_valid() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 id: "1".into(),
@@ -87,6 +88,7 @@ fn test_unique_listen_paths_valid() {
 #[test]
 fn test_unique_listen_paths_duplicate() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 id: "1".into(),
@@ -170,6 +172,7 @@ fn test_unique_listen_paths_duplicate() {
 #[test]
 fn test_route_table_sorted_by_length() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 id: "short".into(),
