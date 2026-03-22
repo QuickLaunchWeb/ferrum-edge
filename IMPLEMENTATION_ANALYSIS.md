@@ -1,269 +1,246 @@
-# 📊 **Ferrum Gateway Implementation Analysis**
+# Ferrum Gateway Implementation Analysis
 
-## **✅ FULLY IMPLEMENTED (100% Complete)**
+## FULLY IMPLEMENTED (100% Complete)
 
-### **🏗️ Core Architecture**
-- ✅ **Rust + Tokio + Hyper Stack** - Complete implementation
-- ✅ **Multi-Mode Architecture** - All 4 modes implemented (`database`, `file`, `cp`, `dp`)
-- ✅ **Environment Configuration** - All required env vars supported
-- ✅ **Graceful Shutdown** - SIGTERM/SIGINT handling with request draining
-- ✅ **Structured Logging** - Tracing ecosystem with JSON output
+### Core Architecture
+- **Rust + Tokio + Hyper Stack** - Complete implementation
+- **Multi-Mode Architecture** - All 4 modes implemented (`database`, `file`, `cp`, `dp`)
+- **Environment Configuration** - All required env vars supported
+- **Graceful Shutdown** - SIGTERM/SIGINT handling with request draining
+- **Structured Logging** - Tracing ecosystem with JSON output
 
-### **🌐 Operating Modes**
-- ✅ **Database Mode** - Full DB polling, caching, Admin API, proxy traffic
-- ✅ **File Mode** - YAML/JSON config, SIGHUP reload, proxy-only
-- ✅ **Control Plane** - gRPC server, JWT auth, config distribution
-- ✅ **Data Plane** - gRPC client, config sync, proxy-only
+### Operating Modes
+- **Database Mode** - Full DB polling, caching, Admin API, proxy traffic
+- **File Mode** - YAML/JSON config, SIGHUP reload, proxy-only
+- **Control Plane** - gRPC server, JWT auth, config distribution
+- **Data Plane** - gRPC client, config sync, proxy-only
 
-### **🔧 Core Proxying**
-- ✅ **HTTP/1.1 & HTTP/2 Support** - Full hyper implementation with ALPN auto-negotiation on TLS
-- ✅ **Longest Prefix Matching** - Pre-sorted route table with bounded DashMap path cache (`RouterCache`)
-- ✅ **Router Cache** - O(1) cache hits for repeated paths; route table rebuilt atomically via ArcSwap on config changes
-- ✅ **Path Forwarding Logic** - strip_listen_path, backend_path support with wildcard suffix appending
-- ✅ **Header Management** - X-Forwarded-* headers, Host header handling
-- ✅ **Request/Response Streaming** - Async streaming support
-- ✅ **Connection Pooling** - Lock-free cleanup via AtomicU64, per-proxy pool keys, no forced h2c
-- ✅ **TCP Keepalive** - 60s keepalive on inbound connections via socket2 for stale client detection
-- ✅ **Timeout Handling** - Connect/read/write timeouts
+### Core Proxying
+- **HTTP/1.1 & HTTP/2 Support** - Full hyper implementation with ALPN auto-negotiation on TLS
+- **HTTP/2 Inbound** - Auto-negotiated via ALPN on TLS connections
+- **Longest Prefix Matching** - Pre-sorted route table with bounded DashMap path cache (`RouterCache`)
+- **Router Cache** - O(1) cache hits for repeated paths; route table rebuilt atomically via ArcSwap on config changes
+- **Path Forwarding Logic** - strip_listen_path, backend_path support with wildcard suffix appending
+- **Header Management** - X-Forwarded-* headers, Host header handling
+- **Request/Response Streaming** - Async streaming support
+- **Connection Pooling** - Lock-free cleanup via AtomicU64, per-proxy pool keys, no forced h2c
+- **TCP Keepalive** - 60s keepalive on inbound connections via socket2 for stale client detection
+- **Timeout Handling** - Connect/read/write timeouts
 
-### **🔐 WebSocket Support**
-- ✅ **WebSocket Proxying** - Complete bidirectional ws:// proxying
-- ✅ **Secure WebSocket** - wss:// configuration and connection handling
-- ✅ **Connection Upgrade** - HTTP 101 handling with hyper upgrade
-- ✅ **Bidirectional Streaming** - Client ↔ Gateway ↔ Backend message flow
-- ✅ **Connection Lifecycle** - Proper cleanup and error handling
+### Load Balancing
+- **5 Load Balancing Algorithms**:
+  - **RoundRobin** (default) - Sequential distribution
+  - **WeightedRoundRobin** - Weight-based distribution
+  - **LeastConnections** - Tracks active connections per target
+  - **ConsistentHashing** - Hash-based routing with configurable hash_on field
+  - **Random** - Random target selection
+- **Connection Tracking** - Per-target active connection counts for least-connections
+- **Unhealthy Target Filtering** - Integrates with health checking to skip unhealthy backends
+- **Per-Upstream Configuration** - Each upstream can specify its own balancer
 
-### **🔒 TLS & Security**
-- ✅ **Separate Listeners** - HTTP/HTTPS for proxy AND admin API with different ports
-- ✅ **Admin API Listeners** - HTTP (9000) + HTTPS (9443) with mTLS support
-- ✅ **Frontend TLS** - HTTPS listeners for proxy and admin
-- ✅ **Backend TLS** - HTTPS/WSS backend connections with mTLS
-- ✅ **No-Verify Mode** - Testing mode for both admin and backend TLS
-- ✅ **Custom CA Support** - Admin and backend custom CA bundles
-- ✅ **System Trust Store** - rustls with system certificates
-- ✅ **JWT Authentication** - Admin API and CP/DP JWT auth
-- ✅ **Password Hashing** - bcrypt for consumer credentials
+### Health Checking
+- **Active Health Checks** - Periodic HTTP probes to backend targets
+  - Custom HTTP paths, methods, expected status codes
+  - Configurable timeout, interval, and threshold settings
+  - Shared `reqwest::Client` using gateway pool config
+- **Passive Health Checks** - Monitors HTTP status codes from proxied requests
+  - Windowed failure counting with recent failure timestamps
+- **Per-Target Health State** - Consecutive success/failure counters, failure metrics
+- **Unhealthy Target Tracking** - DashMap-based, integrates with load balancer
+- **Background Task Management** - Managed lifecycle for active check tasks
 
-### **🗄️ Database Integration**
-- ✅ **Multi-DB Support** - PostgreSQL, MySQL, SQLite via sqlx
-- ✅ **Database Schema** - Auto-migration on startup
-- ✅ **Connection Pooling** - Efficient DB connections
-- ✅ **Uniqueness Constraints** - listen_path uniqueness enforced
-- ✅ **Resilient Caching** - In-memory config cache for outages
+### Circuit Breaker
+- **Three-State Pattern** - Closed, Open, Half-Open
+- **Cascading Failure Prevention** - Stops forwarding to failing backends
+- **Configurable Thresholds**:
+  - `failure_threshold` - Transitions Closed to Open
+  - `success_threshold` - Recovers Half-Open to Closed
+  - `timeout_seconds` - Transitions Open to Half-Open
+  - `half_open_max_requests` - Max probe requests when half-open
+- **Atomic State Management** - Thread-safe state transitions
 
-### **🔌 Plugin System**
-- ✅ **Plugin Architecture** - Complete lifecycle hooks
-- ✅ **Multi-Auth Mode** - Sequential auth with first-match consumer
-- ✅ **Global vs Proxy Scope** - Proper plugin scoping
-- ✅ **All Required Plugins Implemented**:
-  - ✅ `stdout_logging` - JSON transaction logging
-  - ✅ `http_logging` - HTTP endpoint logging
-  - ✅ `transaction_debugger` - Verbose request/response debugging
-  - ✅ `jwt_auth` - HS256 JWT authentication
-  - ✅ `key_auth` - API key authentication
-  - ✅ `basic_auth` - HTTP Basic auth with bcrypt
-  - ✅ `oauth2_auth` - OAuth2 introspection/JWKS validation
-  - ✅ `access_control` - Consumer-based authorization
-  - ✅ `request_transformer` - Header/query modification
-  - ✅ `response_transformer` - Response header modification
-  - ✅ `rate_limiting` - In-memory rate limiting
+### Retry Logic
+- **Connection-Level Retries** - TCP connect refused, DNS failure, TLS handshake error, connect timeout
+- **HTTP-Level Retries** - Configurable retryable status codes (e.g., 502, 503)
+- **Independent Configuration** - Separate flags for connection vs HTTP failures
+- **Configurable Methods** - `retryable_methods` (default: GET, HEAD, OPTIONS, PUT, DELETE)
+- **Backoff Strategies**:
+  - **Fixed** - Constant delay between retries
+  - **Exponential** - base_ms * 2^attempt, capped at max_ms
 
-### **🌐 Admin API**
-- ✅ **JWT Authentication** - HS256 Bearer token auth
-- ✅ **RESTful API** - Full JSON CRUD operations
-- ✅ **Proxy CRUD** - /proxies endpoints with validation
-- ✅ **Consumer CRUD** - /consumers with credential management
-- ✅ **Plugin Config CRUD** - /plugins/config with scoping
-- ✅ **Metrics Endpoint** - /admin/metrics with runtime stats
-- ✅ **Health Check** - Unauthenticated /health endpoint
+### WebSocket Support
+- **WebSocket Proxying** - Complete bidirectional ws:// proxying
+- **Secure WebSocket** - wss:// configuration and connection handling
+- **Connection Upgrade** - HTTP 101 handling with hyper upgrade
+- **Bidirectional Streaming** - Client <-> Gateway <-> Backend message flow
+- **Connection Lifecycle** - Proper cleanup and error handling
+- **Unified Security Model** - All auth/authz plugins protect WebSocket endpoints
 
-### **🌍 DNS & Caching**
-- ✅ **DNS Caching** - In-memory DashMap cache with configurable TTL
-- ✅ **Startup Warmup** - Awaited before accepting requests (no cold-cache hot-path lookups)
-- ✅ **Background Refresh** - Proactive re-resolution at 75% TTL keeps cache warm
-- ✅ **Static Overrides** - Global and per-proxy DNS overrides
-- ✅ **Cache Expiration** - TTL-based cache invalidation with graceful degradation
+### TLS & Security
+- **Separate Listeners** - HTTP/HTTPS for proxy AND admin API with different ports
+- **Admin API Listeners** - HTTP (9000) + HTTPS (9443) with mTLS support
+- **Frontend TLS** - HTTPS listeners for proxy and admin
+- **Backend TLS** - HTTPS/WSS backend connections with mTLS
+- **No-Verify Mode** - Testing mode for both admin and backend TLS
+- **Custom CA Support** - Admin and backend custom CA bundles
+- **System Trust Store** - rustls with system certificates
+- **JWT Authentication** - Admin API and CP/DP JWT auth
+- **Password Hashing** - bcrypt for consumer credentials
+- **Advanced TLS Hardening**:
+  - Configurable TLS protocol versions (1.2 and/or 1.3) via `FERRUM_TLS_MIN_VERSION`/`FERRUM_TLS_MAX_VERSION`
+  - Custom cipher suites via `FERRUM_TLS_CIPHER_SUITES`
+  - Custom key exchange groups/curves via `FERRUM_TLS_CURVES`
+  - Per-proxy TLS certificate overrides
+  - Per-proxy mTLS client certificate configuration
 
-### **📡 gRPC Support**
-- ✅ **Control Plane gRPC** - Tonic server for config distribution
-- ✅ **Data Plane gRPC** - Tonic client for config sync
-- ✅ **JWT Authentication** - Secure CP/DP communication
-- ✅ **Configuration Push** - Real-time config updates
+### Database Integration
+- **Multi-DB Support** - PostgreSQL, MySQL, SQLite via sqlx
+- **Database Schema** - Auto-migration on startup
+- **Connection Pooling** - Efficient DB connections
+- **Uniqueness Constraints** - listen_path uniqueness enforced
+- **Resilient Caching** - In-memory config cache for outages
 
-### **📊 Observability**
-- ✅ **Structured Logging** - JSON logs with tracing
-- ✅ **Runtime Metrics** - Request rates, status codes, proxy counts
-- ✅ **Configuration Status** - DB/CP connection health
-- ✅ **Performance Tracking** - Latency and throughput metrics
+### Plugin System
+- **Plugin Architecture** - Complete lifecycle hooks
+- **Multi-Auth Mode** - Sequential auth with first-match consumer
+- **Global vs Proxy Scope** - Proper plugin scoping
+- **20 Plugins Implemented**:
+  - `stdout_logging` - JSON transaction logging
+  - `http_logging` - HTTP endpoint logging
+  - `transaction_debugger` - Verbose request/response debugging
+  - `jwt_auth` - HS256 JWT authentication
+  - `key_auth` - API key authentication
+  - `basic_auth` - HTTP Basic auth with bcrypt
+  - `oauth2_auth` - OAuth2 introspection/JWKS validation
+  - `hmac_auth` - HMAC authentication
+  - `access_control` - Consumer-based authorization
+  - `ip_restriction` - IP-based access control
+  - `bot_detection` - Bot detection and mitigation
+  - `cors` - Cross-Origin Resource Sharing handling
+  - `request_transformer` - Header/query modification
+  - `response_transformer` - Response header modification
+  - `request_termination` - Early response / request termination
+  - `body_validator` - JSON/XML request body validation against schemas
+  - `rate_limiting` - In-memory rate limiting
+  - `correlation_id` - Correlation ID generation and propagation
+  - `prometheus_metrics` - Prometheus metrics export
+  - `otel_tracing` - OpenTelemetry distributed tracing integration
+
+### Admin API
+- **JWT Authentication** - HS256 Bearer token auth
+- **RESTful API** - Full JSON CRUD operations
+- **Proxy CRUD** - /proxies endpoints with validation
+- **Consumer CRUD** - /consumers with credential management
+- **Plugin Config CRUD** - /plugins/config with scoping
+- **Metrics Endpoint** - /admin/metrics with runtime stats
+- **Health Check** - Unauthenticated /health endpoint
+- **Read-Only Mode** - Configurable read-only access
+- **Cached Config Fallback** - Resilient to data source outages
+
+### DNS & Caching
+- **DNS Caching** - In-memory DashMap cache with configurable TTL
+- **Startup Warmup** - Awaited before accepting requests (no cold-cache hot-path lookups)
+- **Background Refresh** - Proactive re-resolution at 75% TTL keeps cache warm
+- **Static Overrides** - Global and per-proxy DNS overrides
+- **Cache Expiration** - TTL-based cache invalidation with graceful degradation
+
+### gRPC Proxying
+- **Full HTTP/2 Reverse Proxy** - Using hyper's HTTP/2 client
+- **H2C Support** - Cleartext HTTP/2 via prior knowledge handshake
+- **Trailer Forwarding** - `grpc-status`, `grpc-message` trailers
+- **Dedicated Connection Pool** - `GrpcConnectionPool` with per-connection state tracking and idle cleanup
+- **Proper Error Responses** - gRPC-specific error responses when backend unavailable
+- **Backend Protocols** - Supports `Grpc` and `Grpcs` backend protocol types
+- **mTLS Support** - Global and per-proxy client certificates for gRPC backends
+- **Connection Configuration** - Connect/read timeouts, TCP keepalive, HTTP/2 PING keepalive
+
+### gRPC Control/Data Plane
+- **Control Plane gRPC** - Tonic server for config distribution
+- **Data Plane gRPC** - Tonic client for config sync
+- **JWT Authentication** - Secure CP/DP communication
+- **Configuration Push** - Real-time config updates
+
+### HTTP/3 Support
+- **QUIC Listener** - Shares the HTTPS port (TCP for HTTP/1.1+2, UDP for HTTP/3)
+- **HTTP/3 Server** - Quinn/h3-based server implementation
+- **HTTP/3 Client** - Backend proxying over HTTP/3
+- **Alt-Svc Header** - HTTP/3 advertisement to clients
+- **Enable via** `FERRUM_ENABLE_HTTP3=true`; no separate port needed
+
+### Connection Pool
+- **Per-Host Idle Pooling** - Configurable limits (MIN: 4, MAX: 1024)
+- **HTTP/2 Support** - Dedicated HTTP/2 configuration with PING keepalive
+- **Lock-Free Cleanup** - AtomicU64-based idle connection management
+- **Environment Variable Control**:
+  - `FERRUM_POOL_MAX_IDLE_PER_HOST`
+  - `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`
+  - `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE`
+  - `FERRUM_POOL_ENABLE_HTTP2`
+  - `FERRUM_POOL_TCP_KEEPALIVE_SECONDS`
+  - `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS`
+  - `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS`
+
+### Observability
+- **Structured Logging** - JSON logs with tracing
+- **Runtime Metrics** - Request rates, status codes, proxy counts via /admin/metrics
+- **Prometheus Metrics** - Prometheus-format metrics export plugin
+- **OpenTelemetry Tracing** - Distributed tracing integration plugin
+- **Correlation IDs** - Request correlation ID generation and propagation
+- **Configuration Status** - DB/CP connection health
+- **Performance Tracking** - Latency and throughput metrics
+
+### Testing Coverage
+- **58 test files** with **433 tests** (183 `#[test]` + 250 `#[tokio::test]`)
+- **Unit tests** - Config, plugins, gateway core, admin
+- **Integration tests** - Backend mTLS, connection pool, CP/DP gRPC, gRPC proxy, HTTP/3
+- **Functional tests** - File mode, database, CP/DP, gRPC, WebSocket
+- **Performance tests** - Automated benchmarks
+- **All tests in `tests/` directory** - No inline `#[cfg(test)]` modules in source files
 
 ---
 
-## **🔄 PARTIALLY IMPLEMENTED (Needs Work)**
+## NOT IMPLEMENTED
 
-### **🌐 HTTP/3 Support**
-- ✅ **Status**: Implemented — QUIC listener shares the HTTPS port (TCP for HTTP/1.1+2, UDP for HTTP/3)
-- 📋 **Requirement**: HTTP/3 protocol support
-- 🛠️ **Implemented**: HTTP/3 server (Quinn/h3), HTTP/3 client for backend proxying, Alt-Svc header advertisement
-- 🎯 **Note**: Enable via `FERRUM_ENABLE_HTTP3=true`; no separate port needed
-
-### **🔧 gRPC Proxying**
-- ⚠️ **Status**: Basic framework implemented but proxying incomplete
-- 📋 **Requirement**: gRPC request/response proxying over HTTP/2
-- 🛠️ **Implemented**: BackendProtocol::Grpc enum exists, basic routing to HTTP/2 endpoints
-- 🛠️ **Missing**: Actual gRPC message forwarding logic, proper gRPC streaming support
-- 🎯 **Impact**: gRPC backend services only work for basic HTTP/2 requests, not full gRPC semantics
-
-
-### **🧪 Testing Coverage**
-- ✅ **Status**: Comprehensive test suite with 35+ test files and 280+ tests
-- 📋 **Requirement**: Comprehensive unit and integration tests
-- 🛠️ **Implemented**: All tests in `tests/` directory (no inline tests in `src/`). Covers admin API, all 11 plugins, TLS/mTLS, WebSocket auth, backend mTLS, connection pooling, DNS cache, router cache, pool config, JWT auth, HTTP/3 integration, and end-to-end URL mapping
-- 🛠️ **Missing**: Advanced gRPC proxying tests
-- 🎯 **Impact**: High confidence in core and networking functionality
-
-### **🔧 Backend mTLS**
-- ✅ **Status**: Implemented
-- 📋 **Requirement**: Client certificate authentication to backends
-- 🛠️ **Features**: Global environment variables, per-proxy overrides, connection pooling support
-- 🎯 **Impact**: Can authenticate to mTLS-protected backends
-
-### **🔒 WebSocket Security**
-- ✅ **Status**: Implemented
-- 📋 **Requirement**: Authentication and authorization for WebSocket connections
-- 🛠️ **Features**: Unified plugin pipeline, full auth/authz support, rate limiting, complete logging
-- 🎯 **Impact**: WebSocket endpoints now protected by same security model as HTTP
-
-### **🔐 Frontend TLS/mTLS**
-- ✅ **Status**: Implemented
-- 📋 **Requirement**: TLS and mutual TLS for client connections
-- 🛠️ **Features**: HTTPS support, optional client certificate verification, global configuration
-- 🎯 **Impact**: Encrypted client connections with optional mutual authentication
+### Certificate Pinning
+- **Status**: Not implemented
+- **Description**: Backend certificate pinning for high-security scenarios
+- **Impact**: Reduced security for connections requiring pinned certificates
 
 ---
 
-## **❌ NOT IMPLEMENTED (Missing Features)**
+## Implementation Completeness: ~98%
 
-
-### **🔧 Certificate Pinning**
-- ❌ **Status**: Not implemented
-- 📋 **Requirement**: Certificate pinning for security
-- 🛠️ **Missing**: Backend certificate pinning logic
-- 🎯 **Impact**: Reduced security for sensitive connections
-
-### **📊 Advanced Metrics**
-- ❌ **Status**: Not implemented
-- 📋 **Requirement**: Detailed performance counters
-- 🛠️ **Missing**: Connection pools, cache stats, plugin latencies
-- 🎯 **Impact**: Limited operational visibility
-
----
-
-## **� Key Discrepancies Found During Review**
-
-### **Testing Coverage Assessment**
-- **Previous Assessment**: "Basic tests exist" with "reduced confidence in edge cases"
-- **Actual State**: Comprehensive test suite with 35+ test files and 280+ passing tests covering:
-  - Admin API functionality (admin_tests.rs, admin_enhanced_tls_tests.rs, admin_listeners_tests.rs, admin_read_only_tests.rs)
-  - All 11 plugins with dedicated test suites (stdout_logging, http_logging, transaction_debugger, jwt_auth, key_auth, basic_auth, oauth2_auth, access_control, request_transformer, response_transformer, rate_limiting)
-  - Core networking (connection_pool_tests.rs, pool_config_tests.rs, dns_tests.rs, router_cache_tests.rs)
-  - Route matching and URL mapping (proxy_tests.rs, router_cache_tests.rs with 29 tests)
-  - TLS/mTLS (backend_mtls_tests.rs, frontend_tls_tests.rs, separate_listeners_tests.rs)
-  - WebSocket authentication (websocket_auth_tests.rs)
-  - Configuration management (config_file_loader_tests.rs, config_types_tests.rs, env_config_tests.rs)
-  - JWT authentication (admin_jwt_auth_tests.rs)
-  - HTTP/3 integration (http3_integration_tests.rs)
-  - Performance testing (performance/ directory with automated benchmarks)
-  - **All tests in `tests/` directory** — no inline `#[cfg(test)]` modules in source files
-
-### **gRPC Proxying Implementation**
-- **Previous Assessment**: "Framework ready but proxying incomplete"
-- **Actual State**: More complete than initially assessed:
-  - `BackendProtocol::Grpc` enum implemented
-  - Basic routing to HTTP/2 endpoints working
-  - Connection pooling supports gRPC traffic
-  - **Missing**: Proper gRPC message forwarding semantics and streaming support
-
-### **Metrics Implementation**
-- **Previous Assessment**: "Basic metrics implemented"
-- **Actual State**: Fully functional JSON metrics endpoint:
-  - `/admin/metrics` endpoint with comprehensive runtime statistics
-  - Request rates, status code tracking, proxy/consumer counts
-  - Configuration source status and health monitoring
-  - **Status**: Complete for current requirements (JSON format sufficient)
-
-### **Production Readiness**
-- **Previous Assessment**: 80% complete with "need testing coverage improvements"
-- **Actual State**: 95% complete with comprehensive testing, optimized networking, and robust feature set
-
----
-
-## **🚀 Implementation Completeness: ~95%**
-
-### **🎯 Core Functionality: 99% Complete**
+### Core Functionality: 100% Complete
 - All essential gateway features working
-- **Router cache** with pre-sorted route table and O(1) path lookup cache
-- **Connection pool** with lock-free AtomicU64 cleanup, proper HTTP/2 ALPN negotiation (no h2c)
-- **DNS cache** with background refresh at 75% TTL — no hot-path DNS lookups
-- **HTTP/2 inbound** auto-negotiated via ALPN on TLS connections
-- **TCP keepalive** on inbound connections (60s) for stale client detection
+- Router cache with pre-sorted route table and O(1) path lookup cache
+- Connection pool with lock-free AtomicU64 cleanup, proper HTTP/2 ALPN negotiation
+- DNS cache with background refresh at 75% TTL
+- HTTP/2 inbound auto-negotiated via ALPN on TLS connections
+- TCP keepalive on inbound connections for stale client detection
+- Full gRPC proxying with trailers, h2c, and dedicated connection pool
 - WebSocket implementation complete with unified security model
-- Plugin system fully functional with all required plugins implemented
+- 20 plugins covering auth, security, observability, and transformation
 - All operating modes operational (Database, File, CP, DP)
 - Comprehensive Admin API with JWT authentication and read-only mode
 
-### **🔧 Advanced Features: 95% Complete**
-- ✅ **Complete TLS Implementation** - Separate listeners, mTLS, custom CAs, no-verify modes, ALPN h2+http/1.1
-- ✅ **Admin API Security** - HTTP/HTTPS/mTLS with JWT authentication and read-only mode
-- ✅ **Backend mTLS** - Client certificate authentication with custom CAs and per-proxy configuration
-- ✅ **Testing Support** - 35+ test files with 280+ tests, all in `tests/` directory (no inline tests in `src/`)
-- ✅ **Connection Pooling** - Lock-free AtomicU64 cleanup, per-proxy pool keys, no forced h2c
-- ✅ **DNS Caching** - In-memory DashMap with TTL, background refresh at 75%, startup warmup (backends + upstreams + plugin endpoints, deduplicated), static overrides, shared cache for plugin outbound calls via `DnsCacheResolver`
-- ✅ **Router Cache** - Pre-sorted route table with bounded DashMap path cache, atomic ArcSwap rebuild
-- ⚠️ **gRPC Proxying** - Basic framework exists but needs full gRPC message forwarding (90% complete)
+### Advanced Features: 98% Complete
+- Load balancing with 5 algorithms including consistent hashing and least connections
+- Active and passive health checking with unhealthy target filtering
+- Circuit breaker with three-state pattern for cascading failure prevention
+- Retry logic with backoff strategies and connection vs HTTP failure differentiation
+- Complete TLS implementation with advanced hardening (cipher suites, curves, protocol versions)
+- HTTP/3 support with QUIC listener and backend proxying
+- Full gRPC proxying with dedicated connection pool and trailer forwarding
+- Prometheus metrics and OpenTelemetry tracing for production observability
+- 58 test files with 433 tests across unit, integration, functional, and performance suites
+- Missing: certificate pinning
 
-### **🧪 Production Readiness: 95% Complete**
-- Core production features ready with comprehensive testing
-- All major security features implemented (TLS/mTLS, JWT auth, plugin system)
-- Robust configuration management and caching with outage resilience
-- High-performance networking: router cache, connection pooling, DNS cache — all optimized for hot path
-- Graceful shutdown and request draining
-- ✅ HTTP/3 support implemented (shares HTTPS port, Alt-Svc advertisement)
-- ⚠️ Need complete gRPC proxying for microservice architectures
-- ❌ Missing certificate pinning for high-security scenarios
-
----
-
-## **🚀 Immediate Priorities for 100% Completion**
-
-### **High Priority (Core Completion)**
-1. **gRPC Proxying** - Complete gRPC message forwarding and streaming support
-
-### **Low Priority (Advanced Features)**
-2. **Certificate Pinning** - Enhanced security for sensitive connections
-3. **Advanced Metrics** - Detailed performance tracking (connection pools, cache stats, plugin latencies)
-
----
-
-## **✅ What's Working Right Now**
-
-The Ferrum Gateway is **highly production-ready** with:
-
-- ✅ Complete HTTP/1.1 and HTTP/2 proxying with connection pooling and router cache
-- ✅ Router cache with pre-sorted route table, bounded O(1) path cache, and atomic config-driven rebuild
-- ✅ Connection pool with lock-free AtomicU64 cleanup, per-proxy keys, ALPN-based HTTP/2 (no h2c)
-- ✅ DNS cache with startup warmup, background refresh at 75% TTL, and per-proxy overrides
-- ✅ HTTP/2 inbound via ALPN auto-negotiation on TLS; TCP keepalive on all inbound connections
-- ✅ Full WebSocket (ws:// and wss://) support with unified security model
-- ✅ All authentication and authorization plugins protect WebSocket endpoints
-- ✅ Complete Admin API with JWT security, read-only mode, and separate TLS listeners
-- ✅ All operating modes (DB, File, CP, DP) with configuration caching and outage resilience
-- ✅ Robust configuration management with zero-downtime reloads
-- ✅ Backend mTLS authentication with global and per-proxy configuration
-- ✅ Frontend TLS/mTLS support with ALPN protocol advertisement
-- ✅ Comprehensive logging and JSON metrics endpoint with runtime statistics
-- ✅ 35+ test files with 280+ tests, all in `tests/` directory (clean source separation)
-- ✅ Graceful shutdown with request draining
-- ✅ Multi-authentication plugin support with consumer identification
-- ✅ Rate limiting, access control, and request/response transformations
-
-**This is an enterprise-grade API gateway that exceeds the majority of production requirements!** 🎉
+### Production Readiness: 98% Complete
+- Enterprise-grade feature set with comprehensive testing
+- All major security features implemented (TLS/mTLS, JWT, 6 auth plugins, IP restriction, bot detection, CORS)
+- Resilient configuration management with outage fallback
+- High-performance networking: router cache, connection pooling, DNS cache, load balancing
+- Reliability features: circuit breaker, retry logic, health checking
+- Full observability: structured logging, Prometheus metrics, OpenTelemetry tracing, correlation IDs
+- Graceful shutdown with request draining
+- Missing: certificate pinning for high-security scenarios

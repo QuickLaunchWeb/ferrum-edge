@@ -26,6 +26,11 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
 - **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
+- **Load Balancing**: Five algorithms (RoundRobin, Weighted, LeastConnections, ConsistentHash, Random) with unhealthy target filtering
+- **Health Checking**: Active HTTP probes and passive status monitoring with configurable thresholds
+- **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
+- **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
+- **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
 
 ## Operating Modes
 
@@ -117,7 +122,7 @@ Ferrum Gateway supports a configurable read-only mode for the Admin API, providi
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/ferrum-gateway.git
+git clone https://github.com/QuickLaunchWeb/ferrum-gateway.git
 cd ferrum-gateway
 
 # Build in release mode
@@ -128,20 +133,20 @@ cargo build --release
 
 ### From Release Binaries
 
-Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/your-org/ferrum-gateway/releases) page:
+Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-gateway/releases) page:
 
 ```bash
 # Download the latest release for your platform
 # Linux x86_64
-wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
+wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
 chmod +x ferrum-gateway-linux-x86_64
 
 # macOS x86_64 (Intel)
-wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
+wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
 chmod +x ferrum-gateway-macos-x86_64
 
 # macOS ARM64 (Apple Silicon)
-wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
+wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
 chmod +x ferrum-gateway-macos-aarch64
 
 # Verify checksum
@@ -152,7 +157,7 @@ sha256sum -c ferrum-gateway-linux-x86_64.sha256
 
 ```bash
 # Pull and run the latest Docker image
-docker pull your-registry/ferrum-gateway:latest
+docker pull ghcr.io/quicklaunchweb/ferrum-gateway:latest
 
 docker run -d \
   --name ferrum-gateway \
@@ -163,7 +168,7 @@ docker run -d \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
   -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
   -v ferrum_data:/data \
-  your-registry/ferrum-gateway:latest
+  ghcr.io/quicklaunchweb/ferrum-gateway:latest
 ```
 
 See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
@@ -291,7 +296,7 @@ git tag -a v0.2.0 -m "Release version 0.2.0"
 git push origin v0.2.0
 
 # Binaries automatically available at:
-# https://github.com/your-org/ferrum-gateway/releases/tag/v0.2.0
+# https://github.com/QuickLaunchWeb/ferrum-gateway/releases/tag/v0.2.0
 ```
 
 See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets configuration, and customization.
@@ -770,13 +775,13 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 
 | Priority | Band | Plugins |
 |----------|------|---------|
-| 100 | Early | `cors` |
-| 1000–1300 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
+| 100 | Early | `cors`, `ip_restriction`, `bot_detection` |
+| 1000-1400 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
 | 2000 | Authorization | `access_control` |
 | 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
-| 3000 | Transform | `request_transformer` |
+| 3000 | Transform | `request_transformer`, `body_validator`, `request_termination` |
 | 4000 | Response | `response_transformer` |
-| 9000–9200 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
+| 9000-9400 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing` |
 
 Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 
@@ -984,6 +989,88 @@ Enforces request rate limits per time window. Supports limiting by client IP add
 - `limit_by: "consumer"` — Enforces limits in the `authorize` phase (after authentication), keyed by the authenticated consumer's username. If no consumer is identified, falls back to client IP as the key.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
+
+#### `hmac_auth`
+
+Authenticates requests using HMAC signatures.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `secret` | String | Shared secret for HMAC computation |
+| `algorithm` | String | Hash algorithm (e.g., `sha256`) |
+| `header` | String | Header containing the HMAC signature |
+
+#### `ip_restriction`
+
+Restricts access based on client IP address or CIDR range.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `allow` | String[] | Allowed IP addresses or CIDR ranges |
+| `deny` | String[] | Denied IP addresses or CIDR ranges |
+
+#### `bot_detection`
+
+Detects and blocks bot traffic based on User-Agent patterns.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `block_mode` | String | Action on detection: `block` or `log` |
+
+#### `body_validator`
+
+Validates JSON or XML request bodies against schemas.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `schema` | Object | JSON Schema or XML schema for validation |
+| `content_types` | String[] | Content types to validate |
+
+#### `request_termination`
+
+Returns a predefined response without proxying to the backend. Useful for maintenance mode or stubbing endpoints.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `status_code` | u16 | HTTP status code to return |
+| `body` | String | Response body |
+| `content_type` | String | Response Content-Type header |
+| `message` | String | Error message |
+
+#### `correlation_id`
+
+Generates and propagates correlation IDs for request tracing across services.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `header_name` | String | Header name for correlation ID (default: `X-Correlation-ID`) |
+| `generator` | String | ID generation strategy (e.g., `uuid`) |
+| `echo_downstream` | bool | Include correlation ID in response headers |
+
+#### `prometheus_metrics`
+
+Exports gateway metrics in Prometheus exposition format.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | String | Metrics endpoint path (default: `/metrics`) |
+
+#### `otel_tracing`
+
+Integrates with OpenTelemetry for distributed tracing.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `endpoint` | String | OTLP collector endpoint |
+| `service_name` | String | Service name for traces |
 
 ## Proxying Behavior
 

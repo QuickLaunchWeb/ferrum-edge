@@ -4,7 +4,7 @@ This document describes the comprehensive functional test suite for the ferrum-g
 
 ## Overview
 
-The functional test (`tests/functional_database_test.rs`) validates the complete end-to-end functionality of ferrum-gateway when operating in database mode. This includes:
+The functional test (`tests/functional/functional_database_test.rs`) validates the complete end-to-end functionality of ferrum-gateway when operating in database mode. This includes:
 
 - Building the gateway binary
 - Creating and initializing a temporary SQLite database
@@ -28,13 +28,11 @@ The functional test (`tests/functional_database_test.rs`) validates the complete
 ### Execute the Test
 
 ```bash
-cd /sessions/inspiring-elegant-allen/mnt/ferrum-gateway
-
 # Run the functional test (ignored by default)
-cargo test --test functional_database_test -- --ignored --nocapture
+cargo test --test functional_tests functional_database -- --ignored --nocapture
 
 # Or with verbose logging
-RUST_LOG=debug cargo test --test functional_database_test -- --ignored --nocapture
+RUST_LOG=debug cargo test --test functional_tests functional_database -- --ignored --nocapture
 ```
 
 ### Test Output

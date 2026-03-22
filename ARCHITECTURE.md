@@ -26,101 +26,131 @@ Ferrum Gateway is a high-performance API Gateway built in Rust that follows a mo
 src/
 ├── main.rs                 # Application entry point and CLI argument parsing
 ├── lib.rs                  # Library root with public API exports
+├── circuit_breaker.rs      # Three-state circuit breaker (Closed/Open/Half-Open)
+├── connection_pool.rs      # HTTP client connection pooling with mTLS support
+├── consumer_index.rs       # Consumer lookup index for auth plugins
+├── health_check.rs         # Active and passive backend health checking
+├── load_balancer.rs        # Load balancing (RoundRobin, Weighted, LeastConn, ConsistentHash, Random)
+├── plugin_cache.rs         # Plugin configuration cache with atomic updates
+├── retry.rs                # Retry logic with backoff strategies
+├── router_cache.rs         # Pre-sorted route table with bounded path cache
 ├── config/                 # Configuration management
 │   ├── mod.rs             # Configuration module exports
+│   ├── db_loader.rs       # Database configuration loading and migrations
 │   ├── env_config.rs      # Environment variable configuration
+│   ├── file_loader.rs     # YAML/JSON file configuration loading
 │   ├── pool_config.rs     # Connection pool configuration
 │   └── types.rs           # Core data structures (Proxy, Consumer, Plugin)
 ├── proxy/                 # Proxy request handling
 │   ├── mod.rs             # ProxyState and main proxy logic
 │   ├── body.rs            # ProxyBody sum type (Full/Stream) for response streaming
-│   └── handler.rs         # HTTP request/response processing
+│   ├── handler.rs         # HTTP request/response processing
+│   └── grpc_proxy.rs      # gRPC reverse proxy with HTTP/2 and trailer support
 ├── router_cache.rs        # Pre-sorted route table with bounded path cache
 ├── connection_pool.rs     # HTTP client connection pooling with mTLS support
 ├── load_balancer.rs       # Load balancing algorithms and upstream target selection
 ├── health_check.rs        # Active and passive health checking for upstream targets
+├── tls/
+│   └── mod.rs             # TLS configuration with advanced hardening
 ├── dns/                   # DNS resolution and caching
 │   ├── mod.rs             # DNS module exports, DnsCacheResolver for HTTP clients
 │   └── resolver.rs        # Async DNS resolver with caching
+├── http3/                 # HTTP/3 (QUIC) support
+│   ├── mod.rs
+│   ├── client.rs
+│   ├── server.rs
+│   └── config.rs
 ├── admin/                 # Admin API for configuration management
 │   ├── mod.rs             # Admin API routes and handlers
-│   ├── jwt_auth.rs        # JWT authentication for Admin API
-│   └── handlers/          # Individual Admin API endpoints
-│       ├── proxies.rs     # Proxy CRUD operations
-│       ├── consumers.rs   # Consumer CRUD operations
-│       └── plugins.rs     # Plugin configuration management
+│   └── jwt_auth.rs        # JWT authentication for Admin API
 ├── plugins/               # Plugin system for extensibility
-│   ├── mod.rs             # Plugin framework and registry
-│   ├── key_auth.rs        # API key authentication plugin
-│   ├── access_control.rs  # IP-based access control plugin
-│   ├── rate_limiting.rs   # Rate limiting plugin
-│   └── stdout_logging.rs  # Request/response logging plugin
-├── modes/                 # Operating modes (DB, File, CP, DP)
-│   ├── database.rs        # Database mode configuration
-│   ├── file.rs            # File mode configuration
-│   ├── data_plane.rs      # Data Plane mode configuration
-│   └── control_plane.rs   # Control Plane mode configuration
-└── utils/                 # Shared utilities
-    ├── grpc/              # gRPC protocol buffer definitions
-    └── logging.rs         # Structured logging configuration
+│   ├── mod.rs             # Plugin framework, registry, and priority constants
+│   ├── access_control.rs  # Consumer-based authorization
+│   ├── basic_auth.rs      # HTTP Basic auth with bcrypt
+│   ├── body_validator.rs  # JSON/XML request body validation
+│   ├── bot_detection.rs   # Bot detection and mitigation
+│   ├── correlation_id.rs  # Correlation ID generation and propagation
+│   ├── cors.rs            # Cross-Origin Resource Sharing
+│   ├── hmac_auth.rs       # HMAC authentication
+│   ├── http_logging.rs    # HTTP endpoint logging
+│   ├── ip_restriction.rs  # IP-based access control
+│   ├── jwt_auth.rs        # HS256 JWT authentication
+│   ├── key_auth.rs        # API key authentication
+│   ├── oauth2_auth.rs     # OAuth2 introspection/JWKS validation
+│   ├── otel_tracing.rs    # OpenTelemetry distributed tracing
+│   ├── prometheus_metrics.rs # Prometheus metrics export
+│   ├── rate_limiting.rs   # In-memory rate limiting
+│   ├── request_termination.rs # Early response / request termination
+│   ├── request_transformer.rs # Header/query modification
+│   ├── response_transformer.rs # Response header modification
+│   ├── stdout_logging.rs  # JSON transaction logging
+│   ├── transaction_debugger.rs # Verbose request/response debugging
+│   └── utils/             # Plugin utilities
+│       ├── mod.rs
+│       └── http_client.rs
+├── grpc/                  # gRPC CP/DP communication
+│   ├── mod.rs
+│   ├── cp_server.rs       # Control Plane gRPC server
+│   └── dp_client.rs       # Data Plane gRPC client
+└── modes/                 # Operating modes
+    ├── mod.rs
+    ├── control_plane.rs   # Control Plane mode
+    ├── data_plane.rs      # Data Plane mode
+    ├── database.rs        # Database mode
+    └── file.rs            # File mode
 ```
 
 ### **Tests (`tests/`)**
 
 ```
 tests/
-├── README.md              # Test suite documentation and guidelines
-├── admin_tests.rs         # Admin API integration tests
-├── backend_mtls_tests.rs  # Backend mTLS functionality tests
-├── access_control_tests.rs # Access control plugin tests
-├── key_auth_tests.rs      # Key authentication plugin tests
-├── rate_limiting_tests.rs # Rate limiting plugin tests
-├── plugin_integration_tests.rs # Plugin system integration tests
-├── plugin_utils.rs        # Shared test utilities for plugins
-├── config_file_loader_tests.rs # Configuration file loading tests
-├── config_types_tests.rs  # Configuration type validation tests
-├── proxy_tests.rs         # Proxy routing and URL building tests
-├── router_cache_tests.rs  # Router cache matching, caching, and e2e URL tests
-├── connection_pool_tests.rs # Connection pool reuse and cleanup tests
-├── pool_config_tests.rs   # Pool config defaults and overrides tests
-├── admin_jwt_auth_tests.rs # JWT verification tests
-├── dns_tests.rs           # DNS cache, warmup, TTL, and background refresh tests
-└── stdout_logging_tests.rs # Logging plugin tests
-```
-
-### **Test Infrastructure (`tests/`)**
-
-```
-tests/
-├── config.yaml            # Example configuration file
-├── websocket_echo_server.rs  # WebSocket echo server for testing
-├── websocket_gateway_test.rs  # WebSocket gateway integration test
-├── secure_echo_server_simple.rs # Simple HTTPS echo server
-├── certs/                 # TLS certificates for testing
-└── [other test files]     # Comprehensive test suite
+├── README.md                           # Test suite documentation
+├── config.yaml                         # Test configuration fixture
+├── certs/                              # TLS certificates for testing
+│
+├── unit_tests.rs                       # Entry point: unit test crate
+├── unit/                               # Unit tests by component
+│   ├── plugins/                        # All 20 plugin tests
+│   ├── config/                         # Configuration parsing tests
+│   ├── admin/                          # Admin API tests
+│   └── gateway_core/                   # Core data structure tests
+│
+├── integration_tests.rs                # Entry point: integration test crate
+├── integration/                        # Integration tests
+│
+├── functional_tests.rs                 # Entry point: functional test crate
+├── functional/                         # End-to-end functional tests
+│
+├── helpers/bin/                        # Standalone test server binaries
+│
+└── performance/                        # Performance/load testing (separate crate)
 ```
 
 ### **Documentation (`docs/`)**
 
 ```
 docs/
-├── backend_mtls.md        # Backend mTLS configuration guide
-├── dns_resolver.md        # DNS resolver and caching configuration
-├── load_balancing.md      # Load balancing, health checks, retry, circuit breaker
-├── cors_plugin.md         # CORS plugin configuration
-├── frontend_tls.md        # Frontend TLS/mTLS configuration
-├── cp_dp_mode.md          # Control Plane / Data Plane architecture
+├── admin_read_only_mode.md  # Admin API read-only mode
+├── backend_mtls.md          # Backend mTLS configuration
+├── ci_cd.md                 # CI/CD pipeline documentation
+├── cors_plugin.md           # CORS plugin configuration
+├── cp_dp_mode.md            # Control Plane / Data Plane architecture
+├── dns_resolver.md          # DNS resolver configuration
+├── docker.md                # Docker deployment guide
+├── frontend_tls.md          # Frontend TLS/mTLS configuration
+├── functional_testing.md    # CP/DP functional testing guide
+├── functional_testing_database.md  # Database mode testing
+├── functional_testing_file_mode.md # File mode testing
+├── load_balancing.md        # Load balancing, health checks, retry, circuit breaker
+├── plugin_execution_order.md # Plugin priority and execution order
 ├── response_body_streaming.md # Response body streaming vs buffering
-└── ...                    # Additional documentation
+└── size_limits.md           # Request/response size limits
 ```
 
-### **Performance Testing (`perftest/`)**
+### **Performance Testing (`tests/performance/`)**
 
 ```
-perftest/
-├── README.md              # Performance testing documentation
-├── performance_report.html # Generated performance report
-└── scripts/               # Performance test scripts
+tests/performance/
 ```
 
 ## 🧩 Core Components
@@ -252,11 +282,13 @@ High-performance HTTP client connection pooling with backend mTLS support:
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**Plugin Types**:
-- **Authentication**: `key_auth.rs` - API key validation
-- **Authorization**: `access_control.rs` - IP-based access control
-- **Rate Limiting**: `rate_limiting.rs` - Request rate limiting
-- **Logging**: `stdout_logging.rs` - Request/response logging
+**20 Plugins Implemented**:
+- **Authentication**: `jwt_auth`, `key_auth`, `basic_auth`, `oauth2_auth`, `hmac_auth`
+- **Authorization**: `access_control`, `ip_restriction`
+- **Security**: `cors`, `bot_detection`
+- **Rate Limiting**: `rate_limiting`
+- **Transformation**: `request_transformer`, `response_transformer`, `request_termination`, `body_validator`
+- **Observability**: `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
 
 **Plugin Lifecycle**:
 1. **Request Phase**: Authentication → Authorization → Rate Limiting
@@ -342,7 +374,39 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
 
-## ⚡ Performance & Scalability
+### **8. Load Balancer (`src/load_balancer.rs`)**
+
+Five load balancing algorithms for distributing traffic across backend targets:
+
+- **RoundRobin** (default) - Sequential distribution
+- **WeightedRoundRobin** - Weight-based distribution
+- **LeastConnections** - Routes to the target with fewest active connections
+- **ConsistentHashing** - Hash-based routing with configurable hash_on field
+- **Random** - Random target selection
+
+Integrates with health checking to skip unhealthy targets.
+
+### **9. Health Checker (`src/health_check.rs`)**
+
+Active and passive backend health checking:
+
+- **Active checks**: Periodic HTTP probes with configurable path, method, expected status, timeout, and interval
+- **Passive checks**: Monitors HTTP status codes from proxied requests with windowed failure counting
+- **Unhealthy target tracking**: DashMap-based, integrates with load balancer to skip failing backends
+
+### **10. Circuit Breaker (`src/circuit_breaker.rs`)**
+
+Three-state circuit breaker pattern (Closed/Open/Half-Open) to prevent cascading failures. Configurable failure and success thresholds, timeout for Open-to-Half-Open transitions, and max probe requests in Half-Open state.
+
+### **11. Retry Logic (`src/retry.rs`)**
+
+Configurable retry logic with backoff strategies:
+
+- Distinguishes TCP/connection-level failures from HTTP status failures
+- Fixed and exponential backoff strategies
+- Configurable retryable methods and status codes
+
+## Performance & Scalability
 
 The gateway is designed to scale to **10,000+ proxy/consumer resources** and **30,000+ plugin configurations** with minimal per-request overhead. All hot-path data structures use lock-free reads and pre-computed indexes.
 
@@ -467,7 +531,7 @@ The project uses comprehensive testing at multiple levels:
 - Test plugin lifecycle and configuration
 
 ### **Performance Testing**
-- `perftest/` directory contains performance benchmarks
+- `tests/performance/` directory contains performance benchmarks
 - Automated performance regression testing
 - Load testing scenarios
 
@@ -601,12 +665,10 @@ cargo test --test websocket_echo_server -- --nocapture
 ## 📚 Additional Resources
 
 - **`IMPLEMENTATION_ANALYSIS.md`** - Detailed implementation status
-- **`docs/backend_mtls.md`** - Backend mTLS configuration guide
-- **`docs/load_balancing.md`** - Load balancing, health checks, retry, circuit breaker guide
-- **`docs/dns_resolver.md`** - DNS resolver and caching configuration
-- **`docs/response_body_streaming.md`** - Response body streaming vs buffering configuration
+- **`docs/`** - Feature-specific documentation (TLS, DNS, CORS, Docker, CI/CD, etc.)
 - **`tests/README.md`** - Test suite documentation
-- **`perftest/README.md`** - Performance testing guide
+- **`tests/performance/README.md`** - Performance testing guide
+- **`comparison/README.md`** - API gateway comparison benchmarks
 
 ## 🤝 Contributing
 
