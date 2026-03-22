@@ -1151,15 +1151,8 @@ pub async fn handle_proxy_request(
     }
 
     // Authentication phase
-    let auth_plugins: Vec<&Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| {
-            matches!(
-                p.name(),
-                "jwt_auth" | "key_auth" | "basic_auth" | "oauth2_auth" | "hmac_auth"
-            )
-        })
-        .collect();
+    let auth_plugins: Vec<&Arc<dyn Plugin>> =
+        plugins.iter().filter(|p| p.is_auth_plugin()).collect();
 
     match proxy.auth_mode {
         AuthMode::Multi => {
