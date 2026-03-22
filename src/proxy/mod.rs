@@ -1,9 +1,10 @@
+pub mod body;
 pub mod grpc_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
@@ -14,14 +15,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{WebSocketStream, tungstenite::handshake::derive_accept_key};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::{
+    WebSocketStream, connect_async_tls_with_config, tungstenite::handshake::derive_accept_key,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::PoolConfig;
-use crate::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy, UpstreamTarget};
+use crate::config::types::{
+    AuthMode, BackendProtocol, GatewayConfig, Proxy, ResponseBodyMode, UpstreamTarget,
+};
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
@@ -33,8 +38,10 @@ use crate::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority,
 };
 use crate::retry;
+use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 
+pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
 
 /// Check if the request is a WebSocket upgrade request
@@ -78,6 +85,8 @@ pub struct ProxyState {
     pub enable_http3: bool,
     /// The HTTPS port (shared by HTTP/3 QUIC listener)
     pub proxy_https_port: u16,
+    /// Environment config for backend TLS settings (WebSocket, etc.)
+    pub env_config: Arc<crate::config::EnvConfig>,
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
@@ -103,7 +112,12 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config.clone(),
         ));
-        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config.clone(), env_config));
+        let env_config_arc = Arc::new(env_config.clone());
+        let connection_pool = Arc::new(ConnectionPool::new(
+            global_pool_config.clone(),
+            env_config,
+            dns_cache.clone(),
+        ));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
@@ -140,6 +154,7 @@ impl ProxyState {
             grpc_pool,
             enable_http3,
             proxy_https_port,
+            env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
             max_body_size_bytes,
@@ -226,7 +241,7 @@ async fn handle_websocket_request(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request for proxy routing from {}",
         remote_addr.ip()
@@ -264,12 +279,9 @@ async fn handle_websocket_request(
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(&state, 101); // Switching Protocols
 
-    // Get backend URL
-    let backend_url = match proxy.backend_protocol {
-        BackendProtocol::Ws => format!("ws://{}:{}", proxy.backend_host, proxy.backend_port),
-        BackendProtocol::Wss => format!("wss://{}:{}", proxy.backend_host, proxy.backend_port),
-        _ => unreachable!(), // We already checked this above
-    };
+    // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
+    let query_string = req.uri().query().unwrap_or("");
+    let backend_url = build_websocket_backend_url(&proxy, &path, query_string);
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
@@ -307,18 +319,28 @@ async fn handle_websocket_request(
     // Generate accept key
     let accept_key = derive_accept_key(ws_key.as_bytes());
 
+    // Collect client headers to forward to backend
+    let client_headers = collect_forwardable_headers(&parts.headers);
+
     // Spawn a task to handle the WebSocket connection after upgrade
-    let proxy_id = proxy.id.clone();
+    let proxy_clone = proxy.clone();
+    let env_config = state.env_config.clone();
     let backend_url_clone = backend_url.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
                 info!(
                     "WebSocket connection upgraded successfully for: {}",
-                    proxy_id
+                    proxy_clone.id
                 );
-                if let Err(e) =
-                    handle_websocket_proxying(upgraded, &backend_url_clone, &proxy_id).await
+                if let Err(e) = handle_websocket_proxying(
+                    upgraded,
+                    &backend_url_clone,
+                    &proxy_clone,
+                    &env_config,
+                    &client_headers,
+                )
+                .await
                 {
                     error!("WebSocket proxying error: {}", e);
                 }
@@ -337,7 +359,7 @@ async fn handle_websocket_request(
         .header("sec-websocket-accept", accept_key)
         .header("x-websocket-proxy", "ferrum-gateway")
         .header("x-websocket-backend", backend_url.clone())
-        .body(Full::new(Bytes::from("")))
+        .body(ProxyBody::empty())
         .unwrap();
 
     info!(
@@ -356,7 +378,7 @@ async fn handle_websocket_request_authenticated(
     proxy: Arc<Proxy>,
     ctx: RequestContext,
     plugins: Vec<Arc<dyn Plugin>>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
         proxy.id,
@@ -367,12 +389,9 @@ async fn handle_websocket_request_authenticated(
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(&state, 101); // Switching Protocols
 
-    // Get backend URL
-    let backend_url = match proxy.backend_protocol {
-        BackendProtocol::Ws => format!("ws://{}:{}", proxy.backend_host, proxy.backend_port),
-        BackendProtocol::Wss => format!("wss://{}:{}", proxy.backend_host, proxy.backend_port),
-        _ => unreachable!(), // We already checked this above
-    };
+    // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
+    let query_string = req.uri().query().unwrap_or("");
+    let backend_url = build_websocket_backend_url(&proxy, &ctx.path, query_string);
 
     // Log the WebSocket connection attempt
     let start_time = std::time::Instant::now();
@@ -433,25 +452,35 @@ async fn handle_websocket_request_authenticated(
                     .as_bytes(),
             ),
         )
-        .body(Full::new(Bytes::from("")))
+        .body(ProxyBody::empty())
         .unwrap();
 
+    // Collect client headers to forward to backend
+    let client_headers = collect_forwardable_headers(&parts.headers);
+
     // Spawn the WebSocket proxying task
-    let proxy_id = proxy.id.clone();
+    let proxy_clone = proxy.clone();
+    let env_config = state.env_config.clone();
     let backend_url_for_spawn = backend_url.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Err(e) =
-                    handle_websocket_proxying(upgraded, &backend_url_for_spawn, &proxy_id).await
+                if let Err(e) = handle_websocket_proxying(
+                    upgraded,
+                    &backend_url_for_spawn,
+                    &proxy_clone,
+                    &env_config,
+                    &client_headers,
+                )
+                .await
                 {
-                    error!("WebSocket proxying error for {}: {}", proxy_id, e);
+                    error!("WebSocket proxying error for {}: {}", proxy_clone.id, e);
                 }
             }
             Err(e) => {
                 error!(
                     "Failed to upgrade WebSocket connection for {}: {}",
-                    proxy_id, e
+                    proxy_clone.id, e
                 );
             }
         }
@@ -465,27 +494,281 @@ async fn handle_websocket_request_authenticated(
     Ok(upgrade_response)
 }
 
+/// Collect headers from the client request that should be forwarded to the backend WebSocket.
+/// Hop-by-hop headers and WebSocket handshake headers are excluded.
+fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
+    /// Headers that must not be forwarded (hop-by-hop + WS handshake).
+    const SKIP_HEADERS: &[&str] = &[
+        "connection",
+        "upgrade",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-accept",
+        "host",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+    ];
+
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_lower = name.as_str().to_lowercase();
+            if SKIP_HEADERS.contains(&name_lower.as_str()) {
+                return None;
+            }
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Build a WebSocket backend URL with the proper ws:// or wss:// scheme,
+/// respecting strip_listen_path, backend_path, and query string.
+fn build_websocket_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
+    let scheme = match proxy.backend_protocol {
+        BackendProtocol::Ws => "ws",
+        BackendProtocol::Wss => "wss",
+        _ => "ws", // fallback, should not happen
+    };
+
+    let remaining_path = if proxy.strip_listen_path {
+        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
+    } else {
+        incoming_path
+    };
+
+    let backend_path = proxy.backend_path.as_deref().unwrap_or("");
+    let full_path = format!("{}{}", backend_path, remaining_path);
+    let full_path = if full_path.is_empty() {
+        "/".to_string()
+    } else if !full_path.starts_with('/') {
+        format!("/{}", full_path)
+    } else {
+        full_path
+    };
+
+    let base = format!(
+        "{}://{}:{}{}",
+        scheme, proxy.backend_host, proxy.backend_port, full_path
+    );
+
+    if query_string.is_empty() {
+        base
+    } else {
+        format!("{}?{}", base, query_string)
+    }
+}
+
+/// Build a rustls TLS connector for WebSocket backends that respects
+/// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
+fn build_websocket_tls_connector(
+    proxy: &Proxy,
+    env_config: &crate::config::EnvConfig,
+) -> Option<tokio_tungstenite::Connector> {
+    // Only build a TLS connector for wss:// backends
+    if proxy.backend_protocol != BackendProtocol::Wss {
+        return None;
+    }
+
+    // Determine if we should skip server cert verification
+    let skip_verify = env_config.backend_tls_no_verify || !proxy.backend_tls_verify_server_cert;
+
+    // Build root certificate store
+    let mut root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Add custom CA bundle (proxy-level takes priority over global)
+    let ca_path = proxy
+        .backend_tls_server_ca_cert_path
+        .as_ref()
+        .or(env_config.backend_tls_ca_bundle_path.as_ref());
+    if let Some(ca_path) = ca_path {
+        match std::fs::read(ca_path) {
+            Ok(ca_pem) => {
+                let mut cursor = std::io::Cursor::new(ca_pem);
+                let certs = rustls_pemfile::certs(&mut cursor);
+                for cert in certs.flatten() {
+                    if let Err(e) = root_store.add(cert) {
+                        warn!("Failed to add CA certificate for WebSocket TLS: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to read CA bundle '{}' for WebSocket TLS: {}",
+                    ca_path, e
+                );
+            }
+        }
+    }
+
+    // Build client config
+    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+
+    // Add client certificate for mTLS (proxy-level overrides take priority)
+    let cert_path = proxy
+        .backend_tls_client_cert_path
+        .as_ref()
+        .or(env_config.backend_tls_client_cert_path.as_ref());
+    let key_path = proxy
+        .backend_tls_client_key_path
+        .as_ref()
+        .or(env_config.backend_tls_client_key_path.as_ref());
+
+    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        match (std::fs::read(cert_path), std::fs::read(key_path)) {
+            (Ok(cert_pem), Ok(key_pem)) => {
+                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+                    .flatten()
+                    .collect();
+                let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
+                    .ok()
+                    .flatten();
+                match key {
+                    Some(key) => match builder.clone().with_client_auth_cert(certs, key) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            warn!("Failed to configure WebSocket mTLS client cert: {}", e);
+                            builder.with_no_client_auth()
+                        }
+                    },
+                    None => {
+                        warn!("No private key found in '{}' for WebSocket mTLS", key_path);
+                        builder.with_no_client_auth()
+                    }
+                }
+            }
+            _ => {
+                warn!("Failed to read client cert/key for WebSocket mTLS");
+                builder.with_no_client_auth()
+            }
+        }
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // Disable server certificate verification if configured
+    if skip_verify {
+        warn!(
+            "WebSocket backend TLS certificate verification DISABLED for proxy {}",
+            proxy.id
+        );
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerifier));
+    }
+
+    Some(tokio_tungstenite::Connector::Rustls(Arc::new(
+        client_config,
+    )))
+}
+
+/// A certificate verifier that accepts all server certificates (for testing/dev).
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Handle actual WebSocket proxying after connection upgrade
 async fn handle_websocket_proxying(
     upgraded: Upgraded,
     backend_url: &str,
-    proxy_id: &str,
+    proxy: &Proxy,
+    env_config: &crate::config::EnvConfig,
+    client_headers: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         "Starting WebSocket proxying for {} to backend: {}",
-        proxy_id, backend_url
+        proxy.id, backend_url
     );
+
+    // WebSocket configuration with frame/message size limits
+    let ws_config = WebSocketConfig {
+        max_frame_size: Some(16 << 20),   // 16 MiB max frame size
+        max_message_size: Some(64 << 20), // 64 MiB max message size
+        ..Default::default()
+    };
 
     // Convert the upgraded connection to a WebSocket stream
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
         tokio_tungstenite::tungstenite::protocol::Role::Server,
-        None,
+        Some(ws_config),
     )
     .await;
 
-    // Connect to backend WebSocket server
-    let (backend_ws_stream, backend_response) = connect_async(backend_url).await?;
+    // Build a tungstenite HTTP request with forwarded client headers
+    let mut ws_request = backend_url.into_client_request()?;
+    for (name, value) in client_headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            ws_request.headers_mut().insert(header_name, header_value);
+        }
+    }
+
+    // Build TLS connector that respects proxy-level settings
+    let connector = build_websocket_tls_connector(proxy, env_config);
+
+    // Connect to backend with timeout
+    let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let connect_future =
+        connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
+
+    let (backend_ws_stream, backend_response) =
+        match tokio::time::timeout(connect_timeout, connect_future).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(format!(
+                    "WebSocket backend connect timeout ({}ms) for proxy {}",
+                    proxy.backend_connect_timeout_ms, proxy.id
+                )
+                .into());
+            }
+        };
+
     info!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
 
@@ -599,7 +882,7 @@ async fn handle_websocket_proxying(
         }
     }
 
-    info!("WebSocket proxy connection closed for {}", proxy_id);
+    info!("WebSocket proxy connection closed for {}", proxy.id);
     Ok(())
 }
 
@@ -774,7 +1057,7 @@ pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
     let method = req.method().to_string();
@@ -1072,7 +1355,7 @@ pub async fn handle_proxy_request(
                 }
 
                 return Ok(resp_builder
-                    .body(Full::new(Bytes::from(grpc_resp.body)))
+                    .body(ProxyBody::full(Bytes::from(grpc_resp.body)))
                     .unwrap_or_else(|_| {
                         grpc_proxy::build_grpc_error_response(
                             grpc_proxy::grpc_status::UNAVAILABLE,
@@ -1100,15 +1383,18 @@ pub async fn handle_proxy_request(
     }
 
     // Resolve upstream target if load balancing is configured
-    let upstream_target: Option<UpstreamTarget> = if let Some(upstream_id) = &proxy.upstream_id {
+    let (upstream_target, upstream_is_fallback) = if let Some(upstream_id) = &proxy.upstream_id {
         let hash_key = ctx.client_ip.clone(); // Default hash key for consistent hashing
-        state.load_balancer_cache.select_target(
+        match state.load_balancer_cache.select_target(
             upstream_id,
             &hash_key,
             Some(&state.health_checker.unhealthy_targets),
-        )
+        ) {
+            Some(selection) => (Some(selection.target), selection.is_fallback),
+            None => (None, false),
+        }
     } else {
-        None
+        (None, false)
     };
 
     // Circuit breaker check
@@ -1149,13 +1435,30 @@ pub async fn handle_proxy_request(
             .record_connection_start(upstream_id, target);
     }
 
+    // Determine response body mode: stream by default, buffer when required.
+    // A plugin that needs the full body (e.g., response body transformation)
+    // forces buffering regardless of the proxy configuration.
+    let should_stream = match proxy.response_body_mode {
+        ResponseBodyMode::Buffer => false,
+        ResponseBodyMode::Stream => !plugins.iter().any(|p| p.requires_response_body_buffering()),
+    };
+
     // Perform the backend request with retry logic
     let backend_resp = if let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_url = backend_url.clone();
-        let mut result =
-            proxy_to_backend(&state, &proxy, &current_url, &method, proxy_headers, req).await;
+        let mut result = proxy_to_backend(
+            &state,
+            &proxy,
+            &current_url,
+            &method,
+            proxy_headers,
+            req,
+            upstream_target.as_ref(),
+            should_stream,
+        )
+        .await;
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
             let delay = retry::retry_delay(retry_config, attempt);
@@ -1186,13 +1489,33 @@ pub async fn handle_proxy_request(
                 current_url, attempt, retry_config.max_retries, result.connection_error
             );
 
-            // Build a minimal request for retry (body was consumed on first attempt)
-            result =
-                proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers).await;
+            // Build a minimal request for retry (body was consumed on first attempt).
+            // The final retry attempt uses streaming if configured.
+            let is_last_attempt = attempt >= retry_config.max_retries;
+            result = proxy_to_backend_retry(
+                &state,
+                &proxy,
+                &current_url,
+                &method,
+                proxy_headers,
+                current_target.as_ref(),
+                should_stream && is_last_attempt,
+            )
+            .await;
         }
         result
     } else {
-        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await
+        proxy_to_backend(
+            &state,
+            &proxy,
+            &backend_url,
+            &method,
+            proxy_headers,
+            req,
+            upstream_target.as_ref(),
+            should_stream,
+        )
+        .await
     };
     let response_status = backend_resp.status_code;
     let response_body = backend_resp.body;
@@ -1216,16 +1539,20 @@ pub async fn handle_proxy_request(
         if let Some(upstream) = config.upstreams.iter().find(|u| u.id == *upstream_id)
             && let Some(hc) = &upstream.health_checks
         {
-            state
-                .health_checker
-                .report_response(target, response_status, hc.passive.as_ref());
+            state.health_checker.report_response(
+                target,
+                response_status,
+                backend_resp.connection_error,
+                hc.passive.as_ref(),
+            );
         }
     }
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
-    // after_proxy hooks
+    // after_proxy hooks (these only modify headers, not the body,
+    // so they are compatible with both streaming and buffered modes)
     for plugin in &plugins {
         let _ = plugin
             .after_proxy(&mut ctx, response_status, &mut response_headers)
@@ -1270,6 +1597,22 @@ pub async fn handle_proxy_request(
         resp_builder = resp_builder.header(k.as_str(), v.as_str());
     }
 
+    // Add gateway error categorization headers so clients and ops teams
+    // can distinguish different failure modes:
+    //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
+    //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
+    if backend_resp.connection_error {
+        resp_builder = resp_builder.header("X-Gateway-Error", "connection_failure");
+    } else if response_status == 504 {
+        resp_builder = resp_builder.header("X-Gateway-Error", "backend_timeout");
+    } else if response_status >= 500 {
+        resp_builder = resp_builder.header("X-Gateway-Error", "backend_error");
+    }
+
+    if upstream_is_fallback {
+        resp_builder = resp_builder.header("X-Gateway-Upstream-Status", "degraded");
+    }
+
     // Advertise HTTP/3 availability via Alt-Svc header
     if state.enable_http3 {
         resp_builder = resp_builder.header(
@@ -1278,14 +1621,18 @@ pub async fn handle_proxy_request(
         );
     }
 
-    Ok(resp_builder
-        .body(Full::new(Bytes::from(response_body)))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("Internal Server Error")))
-                .unwrap()
-        }))
+    // Build response body: either stream from backend or return buffered data
+    let body = match response_body {
+        ResponseBody::Streaming(resp) => ProxyBody::streaming(resp),
+        ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
+    };
+
+    Ok(resp_builder.body(body).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(ProxyBody::from_string("Internal Server Error"))
+            .unwrap()
+    }))
 }
 
 /// Find the matching proxy using longest prefix match.
@@ -1393,28 +1740,26 @@ async fn proxy_to_backend_retry(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
+    upstream_target: Option<&UpstreamTarget>,
+    stream_response: bool,
 ) -> retry::BackendResponse {
-    // Resolve backend hostname
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await;
+    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
+    // always served from the warmed cache — never hitting DNS on the hot path.
+    // For both single-backend and load-balanced proxies, the client transparently
+    // resolves hostnames through the DNS cache.
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
 
-    let client = match state
-        .connection_pool
-        .get_client(proxy, resolved_ip.ok())
-        .await
-    {
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool for retry: {}", e);
             return retry::BackendResponse {
                 status_code: 502,
-                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                ),
                 headers: HashMap::new(),
                 connection_error: true,
             };
@@ -1440,7 +1785,9 @@ async fn proxy_to_backend_retry(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                    // Use upstream target host when load balancing, so SNI-based
+                    // ingress routers see the correct Host header for the target.
+                    req_builder = req_builder.header("Host", effective_host);
                 }
             }
             "connection" | "transfer-encoding" => continue,
@@ -1459,12 +1806,21 @@ async fn proxy_to_backend_retry(
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());
                 }
             }
-            let body = response.bytes().await.unwrap_or_default().to_vec();
-            retry::BackendResponse {
-                status_code: status,
-                body,
-                headers: resp_headers,
-                connection_error: false,
+            if stream_response {
+                retry::BackendResponse {
+                    status_code: status,
+                    body: ResponseBody::Streaming(response),
+                    headers: resp_headers,
+                    connection_error: false,
+                }
+            } else {
+                let body = response.bytes().await.unwrap_or_default().to_vec();
+                retry::BackendResponse {
+                    status_code: status,
+                    body: ResponseBody::Buffered(body),
+                    headers: resp_headers,
+                    connection_error: false,
+                }
             }
         }
         Err(e) => {
@@ -1472,7 +1828,9 @@ async fn proxy_to_backend_retry(
             let is_connect = e.is_connect() || e.is_timeout();
             retry::BackendResponse {
                 status_code: 502,
-                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                ),
                 headers: HashMap::new(),
                 connection_error: is_connect,
             }
@@ -1481,6 +1839,7 @@ async fn proxy_to_backend_retry(
 }
 
 /// Proxy the request to the backend.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
     proxy: &Proxy,
@@ -1488,35 +1847,35 @@ async fn proxy_to_backend(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
+    upstream_target: Option<&UpstreamTarget>,
+    stream_response: bool,
 ) -> retry::BackendResponse {
-    // Resolve backend hostname
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await;
+    // All reqwest clients use our DnsCacheResolver, so DNS resolution is
+    // always served from the warmed cache — never hitting DNS on the hot path.
+    // For both single-backend and load-balanced proxies, the client transparently
+    // resolves hostnames through the DNS cache.
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
 
-    // Handle HTTP/3 backend requests differently
+    // Handle HTTP/3 backend requests differently (always buffered — h3 crate
+    // doesn't expose a streaming body API compatible with reqwest::Response)
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
         let (status, body, hdrs) =
             proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req).await;
         return retry::BackendResponse {
             status_code: status,
-            body,
+            body: ResponseBody::Buffered(body),
             headers: hdrs,
             connection_error: false,
         };
     }
 
-    // Get client from connection pool for HTTP/1.1 and HTTP/2
-    let client = match state
-        .connection_pool
-        .get_client(proxy, resolved_ip.ok())
-        .await
-    {
+    // Get client from connection pool for HTTP/1.1 and HTTP/2.
+    // The client uses our DnsCacheResolver for transparent DNS cache lookups.
+    // All upstream targets share one reqwest::Client since it handles
+    // per-host pooling and SNI internally.
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
@@ -1554,7 +1913,9 @@ async fn proxy_to_backend(
                 if proxy.preserve_host_header {
                     req_builder = req_builder.header("Host", v.as_str());
                 } else {
-                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                    // Use upstream target host when load balancing, so SNI-based
+                    // ingress routers see the correct Host header for the target.
+                    req_builder = req_builder.header("Host", effective_host);
                 }
             }
             "connection" | "transfer-encoding" => continue, // hop-by-hop
@@ -1585,7 +1946,9 @@ async fn proxy_to_backend(
         {
             return retry::BackendResponse {
                 status_code: 413,
-                body: r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                ),
                 headers: HashMap::new(),
                 connection_error: false,
             };
@@ -1609,8 +1972,9 @@ async fn proxy_to_backend(
                 Err(_) => {
                     return retry::BackendResponse {
                         status_code: 413,
-                        body:
+                        body: ResponseBody::Buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
                         headers: HashMap::new(),
                         connection_error: false,
                     };
@@ -1660,35 +2024,57 @@ async fn proxy_to_backend(
                     );
                     return retry::BackendResponse {
                         status_code: 502,
-                        body: r#"{"error":"Backend response body exceeds maximum size"}"#
-                            .as_bytes()
-                            .to_vec(),
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend response body exceeds maximum size"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
                         headers: HashMap::new(),
                         connection_error: false,
                     };
                 }
 
-                // Stream-collect with size limit using chunk_with_limit
+                // When streaming is requested and Content-Length is present and within
+                // limits, we can safely stream. If there's no Content-Length we must
+                // buffer to enforce the size limit.
+                if stream_response && content_length.is_some() {
+                    return retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::Streaming(response),
+                        headers: resp_headers,
+                        connection_error: false,
+                    };
+                }
+
+                // Buffer: stream-collect with size limit
                 let max_size = state.max_response_body_size_bytes;
                 match collect_response_with_limit(response, max_size).await {
                     Ok((resp_body, _)) => retry::BackendResponse {
                         status_code: status,
-                        body: resp_body,
+                        body: ResponseBody::Buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
-                        body: err_body,
+                        body: ResponseBody::Buffered(err_body),
                         headers: HashMap::new(),
                         connection_error: false,
                     },
+                }
+            } else if stream_response {
+                // No size limit and streaming requested — pass through directly
+                retry::BackendResponse {
+                    status_code: status,
+                    body: ResponseBody::Streaming(response),
+                    headers: resp_headers,
+                    connection_error: false,
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
                 retry::BackendResponse {
                     status_code: status,
-                    body,
+                    body: ResponseBody::Buffered(body),
                     headers: resp_headers,
                     connection_error: false,
                 }
@@ -1699,7 +2085,9 @@ async fn proxy_to_backend(
             let is_connect = e.is_connect() || e.is_timeout();
             retry::BackendResponse {
                 status_code: 502,
-                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                ),
                 headers: HashMap::new(),
                 connection_error: is_connect,
             }
@@ -1756,11 +2144,11 @@ fn record_request(state: &ProxyState, status: u16) {
     record_status(state, status);
 }
 
-fn build_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(ProxyBody::from_string(body))
         .unwrap()
 }
 
@@ -1768,7 +2156,7 @@ fn build_reject_response(
     status: StatusCode,
     body: &str,
     headers: &HashMap<String, String>,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let mut resp = build_response(status, body);
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (

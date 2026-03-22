@@ -147,7 +147,7 @@ Added high-performance router cache that keeps route matching off the hot reques
 
 - **Background refresh** at 75% TTL — proactively re-resolves entries before expiration
 - **Startup warmup awaited** — resolves backend, upstream, and plugin endpoint hostnames (deduplicated)
-- **Shared DNS cache for plugins** — `GatewayDnsResolver` bridges the gateway's DNS cache into plugin HTTP clients via reqwest's `Resolve` trait
+- **Shared DNS cache for plugins** — `DnsCacheResolver` bridges the gateway's DNS cache into plugin HTTP clients via reqwest's `Resolve` trait
 - **Plugin `warmup_hostnames()` trait method** — plugins declare endpoint hostnames for pre-resolution at startup
 - 7 new tests in `tests/dns_tests.rs`
 

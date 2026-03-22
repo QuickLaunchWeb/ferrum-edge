@@ -11,6 +11,18 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+/// Result of a target selection, indicating whether the selection was from
+/// healthy targets or a degraded-mode fallback (all targets were unhealthy).
+#[derive(Debug, Clone)]
+pub struct TargetSelection {
+    pub target: UpstreamTarget,
+    /// True when all targets were marked unhealthy and this selection is a
+    /// best-effort fallback. Callers should propagate this as an
+    /// `X-Gateway-Upstream-Status: degraded` response header so clients
+    /// and ops teams can distinguish degraded-mode routing from normal routing.
+    pub is_fallback: bool,
+}
+
 /// Load balancer cache, rebuilt atomically on config change.
 pub struct LoadBalancerCache {
     balancers: ArcSwap<HashMap<String, LoadBalancer>>,
@@ -55,12 +67,15 @@ impl LoadBalancerCache {
     }
 
     /// Select a target from the upstream, filtering out unhealthy targets.
+    ///
+    /// Returns a [`TargetSelection`] indicating whether the target came from
+    /// the healthy pool or is a degraded-mode fallback (all targets unhealthy).
     pub fn select_target(
         &self,
         upstream_id: &str,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, ()>>,
-    ) -> Option<UpstreamTarget> {
+        unhealthy: Option<&DashMap<String, u64>>,
+    ) -> Option<TargetSelection> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
         balancer.select(ctx_key, unhealthy)
@@ -72,7 +87,7 @@ impl LoadBalancerCache {
         upstream_id: &str,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
@@ -160,7 +175,7 @@ impl LoadBalancer {
 
     fn healthy_targets(
         &self,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Vec<(usize, &UpstreamTarget)> {
         self.targets
             .iter()
@@ -178,18 +193,21 @@ impl LoadBalancer {
     fn select(
         &self,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, ()>>,
-    ) -> Option<UpstreamTarget> {
+        unhealthy: Option<&DashMap<String, u64>>,
+    ) -> Option<TargetSelection> {
         let healthy = self.healthy_targets(unhealthy);
         if healthy.is_empty() {
             // Fallback: try all targets if everything is unhealthy
             if self.targets.is_empty() {
                 return None;
             }
-            return self.select_from_all(ctx_key);
+            return self.select_from_all(ctx_key).map(|target| TargetSelection {
+                target,
+                is_fallback: true,
+            });
         }
 
-        match self.algorithm {
+        let target = match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 let target_idx = idx % healthy.len();
@@ -208,7 +226,12 @@ impl LoadBalancer {
                 let hash = hasher.finish() as usize;
                 Some(healthy[hash % healthy.len()].1.clone())
             }
-        }
+        };
+
+        target.map(|t| TargetSelection {
+            target: t,
+            is_fallback: false,
+        })
     }
 
     fn select_from_all(&self, ctx_key: &str) -> Option<UpstreamTarget> {
@@ -228,7 +251,7 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let exclude_key = target_key(exclude);
         let healthy: Vec<(usize, &UpstreamTarget)> = self
@@ -409,8 +432,9 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..300 {
-            let t = lb.select("", None).unwrap();
-            *counts.entry(t.host.clone()).or_insert(0) += 1;
+            let sel = lb.select("", None).unwrap();
+            assert!(!sel.is_fallback);
+            *counts.entry(sel.target.host.clone()).or_insert(0) += 1;
         }
 
         assert_eq!(counts.len(), 3);
@@ -426,8 +450,8 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..600 {
-            let t = lb.select("", None).unwrap();
-            *counts.entry(t.host.clone()).or_insert(0) += 1;
+            let sel = lb.select("", None).unwrap();
+            *counts.entry(sel.target.host.clone()).or_insert(0) += 1;
         }
 
         let heavy = counts.get("heavy").copied().unwrap_or(0);
@@ -443,8 +467,8 @@ mod tests {
 
         let first = lb.select("user-123", None).unwrap();
         for _ in 0..100 {
-            let t = lb.select("user-123", None).unwrap();
-            assert_eq!(t.host, first.host);
+            let sel = lb.select("user-123", None).unwrap();
+            assert_eq!(sel.target.host, first.target.host);
         }
     }
 
@@ -462,8 +486,8 @@ mod tests {
         }
 
         // Next selection should prefer host1
-        let t = lb.select("", None).unwrap();
-        assert_eq!(t.host, "host1");
+        let sel = lb.select("", None).unwrap();
+        assert_eq!(sel.target.host, "host1");
     }
 
     #[test]
@@ -471,13 +495,17 @@ mod tests {
         let targets = make_targets(3);
         let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-        let unhealthy: DashMap<String, ()> = DashMap::new();
-        unhealthy.insert("host0:8080".to_string(), ());
+        let unhealthy: DashMap<String, u64> = DashMap::new();
+        unhealthy.insert("host0:8080".to_string(), 0);
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
-            let t = lb.select("", Some(&unhealthy)).unwrap();
-            seen.insert(t.host.clone());
+            let sel = lb.select("", Some(&unhealthy)).unwrap();
+            assert!(
+                !sel.is_fallback,
+                "Should not be fallback when healthy targets exist"
+            );
+            seen.insert(sel.target.host.clone());
         }
 
         assert!(!seen.contains("host0"));
@@ -490,13 +518,17 @@ mod tests {
         let targets = make_targets(2);
         let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-        let unhealthy: DashMap<String, ()> = DashMap::new();
-        unhealthy.insert("host0:8080".to_string(), ());
-        unhealthy.insert("host1:8080".to_string(), ());
+        let unhealthy: DashMap<String, u64> = DashMap::new();
+        unhealthy.insert("host0:8080".to_string(), 0);
+        unhealthy.insert("host1:8080".to_string(), 0);
 
-        // Should still return a target (fallback)
-        let t = lb.select("", Some(&unhealthy));
-        assert!(t.is_some());
+        // Should still return a target (fallback) and mark it as degraded
+        let sel = lb.select("", Some(&unhealthy));
+        assert!(sel.is_some());
+        assert!(
+            sel.unwrap().is_fallback,
+            "All-unhealthy selection should be marked as fallback"
+        );
     }
 
     #[test]

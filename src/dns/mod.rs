@@ -13,40 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// reqwest-compatible DNS resolver that delegates to the gateway's `DnsCache`.
-///
-/// This bridges the gateway's DNS cache (with TTL, stale-while-revalidate,
-/// error caching, and background refresh) into reqwest's `Resolve` trait,
-/// so that plugin HTTP clients (http_logging, oauth2_auth, etc.) share the
-/// same cached DNS lookups as the proxy backend path.
-#[derive(Clone)]
-pub struct GatewayDnsResolver {
-    dns_cache: DnsCache,
-}
-
-impl GatewayDnsResolver {
-    pub fn new(dns_cache: DnsCache) -> Self {
-        Self { dns_cache }
-    }
-}
-
-impl reqwest::dns::Resolve for GatewayDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let cache = self.dns_cache.clone();
-        let hostname = name.as_str().to_string();
-        Box::pin(async move {
-            let ip = cache.resolve(&hostname, None, None).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
-                },
-            )?;
-            // Return port 0 — reqwest overrides with the URL's port
-            let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(SocketAddr::new(ip, 0)));
-            Ok(addrs)
-        })
-    }
-}
-
 /// Record type ordering for DNS queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRecordOrder {
@@ -680,4 +646,43 @@ fn parse_dns_order(order_str: Option<&str>) -> Vec<DnsRecordOrder> {
     }
 
     result
+}
+
+/// A custom DNS resolver for `reqwest` that delegates all hostname lookups
+/// to our [`DnsCache`]. This ensures that **all** `reqwest::Client` instances
+/// — for both single-backend and load-balanced proxies — transparently use
+/// the DNS cache with warmup, background refresh, and stale-while-revalidate.
+///
+/// By setting this as the `dns_resolver` on every `reqwest::Client`, DNS
+/// resolution is kept completely off the hot request path: the cache is
+/// pre-warmed at startup and continuously refreshed in the background.
+pub struct DnsCacheResolver {
+    cache: DnsCache,
+}
+
+impl DnsCacheResolver {
+    pub fn new(cache: DnsCache) -> Self {
+        Self { cache }
+    }
+}
+
+impl reqwest::dns::Resolve for DnsCacheResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let cache = self.cache.clone();
+        let hostname = name.as_str().to_string();
+
+        Box::pin(async move {
+            let ip = cache.resolve(&hostname, None, None).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::other(e.to_string()))
+                },
+            )?;
+
+            // reqwest expects an iterator of SocketAddr. The port is ignored
+            // (reqwest uses the port from the URL), but SocketAddr requires one.
+            let addr: SocketAddr = SocketAddr::new(ip, 0);
+            let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(addr));
+            Ok(addrs)
+        })
+    }
 }

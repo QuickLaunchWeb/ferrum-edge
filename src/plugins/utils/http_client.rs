@@ -43,7 +43,7 @@
 //! ```
 
 use crate::config::PoolConfig;
-use crate::dns::{DnsCache, GatewayDnsResolver};
+use crate::dns::{DnsCache, DnsCacheResolver};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ impl PluginHttpClient {
     /// - Gateway DNS cache (shared TTL, stale-while-revalidate, background refresh)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
     pub fn new(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
-        let resolver = GatewayDnsResolver::new(dns_cache);
+        let resolver = DnsCacheResolver::new(dns_cache);
 
         let mut builder = reqwest::Client::builder()
             .pool_max_idle_per_host(pool_config.max_idle_per_host)

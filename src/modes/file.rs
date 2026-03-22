@@ -80,7 +80,7 @@ pub async fn run(
         })
         .collect();
 
-    // Add upstream target hostnames
+    // Add upstream target hostnames for load-balanced proxies
     for upstream in &config.upstreams {
         for target in &upstream.targets {
             hostnames.push((target.host.clone(), None, None));
