@@ -76,6 +76,31 @@ base64 = "0.22"
 url = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
 
+# ── Build profiles ─────────────────────────────────────────────────────────
+# Dev: optimise for fast compile-edit-run cycles
+[profile.dev]
+opt-level = 0
+debug = true            # full debuginfo for local development
+incremental = true      # incremental compilation for faster rebuilds
+# Split debuginfo to speed up linking (macOS/Linux)
+split-debuginfo = "unpacked"
+
+# Release: optimise for runtime performance
+[profile.release]
+opt-level = 3
+lto = "thin"            # thin LTO: good optimisation without huge link times
+codegen-units = 16      # more parallelism during codegen (trade a tiny bit of perf)
+strip = true            # strip symbols — smaller binary
+incremental = false     # disable incremental for deterministic release builds
+
+# CI-specific: fast release builds for testing (not shipping)
+[profile.ci-release]
+inherits = "release"
+lto = "off"             # skip LTO entirely — biggest time saver
+codegen-units = 256     # maximise codegen parallelism
+strip = true
+opt-level = 2           # still optimised, but less aggressive
+
 [build-dependencies]
 tonic-build = "0.12"
 

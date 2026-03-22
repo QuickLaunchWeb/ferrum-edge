@@ -11,13 +11,22 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# Copy source code
+# ── Dependency caching layer ─────────────────────────────────────────────
+# Copy only manifests and build script first, so Docker can cache the
+# expensive dependency download + compile step across source changes.
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY src ./src
 COPY proto ./proto
 
-# Build release binary
-RUN cargo build --release
+# Create a dummy main.rs to build dependencies only
+RUN mkdir src && \
+    echo 'fn main() { println!("dummy"); }' > src/main.rs && \
+    cargo build --release 2>/dev/null || true && \
+    rm -rf src
+
+# ── Build the real binary ───────────────────────────────────────────────
+COPY src ./src
+# Touch main.rs so cargo knows it changed (not the dummy)
+RUN touch src/main.rs && cargo build --release
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

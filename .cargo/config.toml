@@ -1,0 +1,38 @@
+# ── Local development build configuration ────────────────────────────────
+#
+# These settings speed up compile-edit-run cycles on your workstation.
+# CI workflows set their own env vars so these are primarily for localhost.
+
+# ── Linker optimisations (optional) ──────────────────────────────────────
+# Using a faster linker can cut link times by 2-5x. Uncomment the section
+# that matches your platform after installing the required linker.
+#
+# macOS — install lld: `brew install llvm` then add to PATH
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#
+# Linux — install mold: `sudo apt-get install mold` (fastest linker)
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# [target.aarch64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# ── sccache (optional) ──────────────────────────────────────────────────
+# sccache caches compiled crates across branches and clean builds.
+# Install: cargo install sccache
+# Then uncomment the next two lines, or set RUSTC_WRAPPER=sccache in your
+# shell profile (~/.zshrc / ~/.bashrc).
+#
+# [env]
+# RUSTC_WRAPPER = "sccache"
+
+# ── Network settings ────────────────────────────────────────────────────
+[net]
+# Speed up cargo by using git CLI for fetching (uses your SSH agent)
+git-fetch-with-cli = true
