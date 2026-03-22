@@ -126,6 +126,13 @@ impl Plugin for MyPlugin {
         // 9000-9999: logging
         500  // Example: runs after CORS (100), before auth (1000+)
     }
+
+    // If your plugin makes outbound HTTP calls to a configured endpoint,
+    // override warmup_hostnames() so the endpoint is pre-resolved at startup
+    // via the gateway's shared DNS cache:
+    fn warmup_hostnames(&self) -> Vec<String> {
+        vec!["my-endpoint.example.com".to_string()]
+    }
 }
 ```
 

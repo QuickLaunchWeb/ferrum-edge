@@ -13,6 +13,40 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// reqwest-compatible DNS resolver that delegates to the gateway's `DnsCache`.
+///
+/// This bridges the gateway's DNS cache (with TTL, stale-while-revalidate,
+/// error caching, and background refresh) into reqwest's `Resolve` trait,
+/// so that plugin HTTP clients (http_logging, oauth2_auth, etc.) share the
+/// same cached DNS lookups as the proxy backend path.
+#[derive(Clone)]
+pub struct GatewayDnsResolver {
+    dns_cache: DnsCache,
+}
+
+impl GatewayDnsResolver {
+    pub fn new(dns_cache: DnsCache) -> Self {
+        Self { dns_cache }
+    }
+}
+
+impl reqwest::dns::Resolve for GatewayDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let cache = self.dns_cache.clone();
+        let hostname = name.as_str().to_string();
+        Box::pin(async move {
+            let ip = cache.resolve(&hostname, None, None).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
+                },
+            )?;
+            // Return port 0 — reqwest overrides with the URL's port
+            let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(SocketAddr::new(ip, 0)));
+            Ok(addrs)
+        })
+    }
+}
+
 /// Record type ordering for DNS queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRecordOrder {
@@ -448,11 +482,28 @@ impl DnsCache {
     }
 
     /// Warmup: resolve all hostnames from the config at startup.
+    ///
+    /// Hostnames are deduplicated before resolution — if multiple proxies or
+    /// plugins share the same hostname, only one DNS lookup is performed.
+    /// Each unique hostname is resolved concurrently.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
-        info!("DNS warmup: resolving {} hostnames", hostnames.len());
+        // Deduplicate by hostname, keeping the first override/TTL seen for each.
+        // Hostnames with a static override still go through resolve() to populate
+        // the cache, but they won't trigger actual DNS queries.
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<_> = hostnames
+            .into_iter()
+            .filter(|(host, _, _)| seen.insert(host.clone()))
+            .collect();
+
+        info!(
+            "DNS warmup: resolving {} unique hostnames ({} after dedup)",
+            seen.len(),
+            unique.len()
+        );
         let mut handles = Vec::new();
 
-        for (host, override_ip, ttl) in hostnames {
+        for (host, override_ip, ttl) in unique {
             let cache = self.clone();
             handles.push(tokio::spawn(async move {
                 match cache.resolve(&host, override_ip.as_deref(), ttl).await {

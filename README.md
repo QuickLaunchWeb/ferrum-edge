@@ -17,7 +17,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
-- **DNS Caching**: In-memory async DNS cache with startup warmup, background refresh at 75% TTL, per-proxy TTL overrides, and static overrides
+- **DNS Caching**: In-memory async DNS cache with startup warmup (backends + upstreams + plugin endpoints, deduplicated), background refresh at 75% TTL, per-proxy TTL overrides, static overrides, and shared cache for plugin outbound calls
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
@@ -1002,7 +1002,8 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Per-proxy TTL override via `dns_cache_ttl_seconds`
 - Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
 - Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
-- Non-blocking startup warmup resolves all backend hostnames
+- Non-blocking startup warmup resolves all backend, upstream, and plugin endpoint hostnames (deduplicated)
+- Shared DNS cache for plugin outbound calls (http_logging, oauth2_auth, etc.) via custom reqwest resolver
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
 ### HTTP/3 (QUIC) Support

@@ -110,7 +110,7 @@ impl ProxyState {
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
         let plugin_http_client =
-            crate::plugins::PluginHttpClient::from_pool_config(&global_pool_config);
+            crate::plugins::PluginHttpClient::new(&global_pool_config, dns_cache.clone());
         let plugin_cache = Arc::new(PluginCache::with_http_client(&config, plugin_http_client));
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));

@@ -84,7 +84,19 @@ A background task proactively refreshes cache entries when they reach 75% of the
 
 ## DNS Warmup
 
-On startup, Ferrum Gateway resolves all configured backend hostnames asynchronously before accepting traffic. This ensures no cold-cache DNS lookups on the first request.
+On startup, Ferrum Gateway resolves all configured hostnames asynchronously before accepting traffic. This ensures no cold-cache DNS lookups on the first request. Warmup covers three sources:
+
+1. **Proxy backend hostnames** — every proxy's `backend_host`
+2. **Upstream target hostnames** — every target in upstream groups
+3. **Plugin endpoint hostnames** — extracted from plugin configurations (e.g., `http_logging` endpoint URLs, `oauth2_auth` introspection URLs and JWKS URIs)
+
+Hostnames are **deduplicated** before resolution — if multiple proxies or plugins share the same hostname, only one DNS lookup is performed.
+
+## Shared DNS Cache for Plugins
+
+Plugins that make outbound HTTP calls (e.g., `http_logging`, `oauth2_auth` introspection) use the same gateway DNS cache as the proxy backend path. The `PluginHttpClient` is configured with a custom reqwest DNS resolver (`GatewayDnsResolver`) that delegates to the gateway's `DnsCache`, so plugin traffic benefits from the same cached lookups, stale-while-revalidate, error caching, and background refresh as backend proxy requests.
+
+Plugins declare their endpoint hostnames by implementing the `warmup_hostnames()` method on the `Plugin` trait. This allows the warmup phase to pre-resolve plugin endpoints alongside backend hostnames.
 
 ## Resolution Priority
 

@@ -72,6 +72,40 @@ impl PluginCache {
         }
     }
 
+    /// Collect all hostnames that plugins will send traffic to.
+    ///
+    /// Iterates all cached plugin instances (global + per-proxy) and calls
+    /// `warmup_hostnames()` on each. Returns deduplicated hostnames suitable
+    /// for feeding into `DnsCache::warmup()`.
+    pub fn collect_warmup_hostnames(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        // Collect from global plugins
+        let globals = self.global_plugins.load();
+        for plugin in globals.as_ref() {
+            for host in plugin.warmup_hostnames() {
+                if seen.insert(host.clone()) {
+                    result.push(host);
+                }
+            }
+        }
+
+        // Collect from per-proxy plugins
+        let proxy_map = self.proxy_plugins.load();
+        for plugins in proxy_map.values() {
+            for plugin in plugins {
+                for host in plugin.warmup_hostnames() {
+                    if seen.insert(host.clone()) {
+                        result.push(host);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Number of proxy entries in the cache (for testing).
     #[allow(dead_code)]
     pub fn proxy_count(&self) -> usize {

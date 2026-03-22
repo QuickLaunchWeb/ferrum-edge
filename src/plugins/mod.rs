@@ -189,6 +189,19 @@ pub trait Plugin: Send + Sync {
 
     /// Called for transaction logging.
     async fn log(&self, _summary: &TransactionSummary) {}
+
+    /// Returns hostnames that this plugin will send traffic to.
+    ///
+    /// Used during DNS warmup to pre-resolve plugin endpoint hostnames
+    /// alongside proxy backend hostnames, avoiding cold-cache DNS lookups
+    /// on the first request through the plugin.
+    ///
+    /// Default implementation returns an empty list (most plugins make no
+    /// outbound network calls). Override this if your plugin has a configured
+    /// endpoint URL (e.g., http_logging, oauth2_auth introspection).
+    fn warmup_hostnames(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Create a plugin instance from its name and configuration.

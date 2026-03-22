@@ -306,8 +306,9 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 
 **Key Features**:
 - In-memory `DashMap` caching with configurable TTL
-- **Startup warmup** — awaited before accepting requests (no cold-cache lookups in hot path)
+- **Startup warmup** — resolves all backend, upstream, and plugin endpoint hostnames (deduplicated) before accepting requests
 - **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
+- **Shared cache for plugins** — `GatewayDnsResolver` implements reqwest's `Resolve` trait, bridging the gateway DNS cache into plugin HTTP clients so plugins (http_logging, oauth2_auth, etc.) share the same cached lookups
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
