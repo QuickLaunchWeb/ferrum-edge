@@ -17,13 +17,21 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
-- **DNS Caching**: In-memory async DNS cache with startup warmup, background refresh at 75% TTL, per-proxy TTL overrides, and static overrides
+- **Load Balancing**: Five algorithms (round robin, weighted round robin, least connections, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
+- **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
+- **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
+- **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets + plugin endpoints, deduplicated), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients including plugin outbound calls, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Client IP Resolution**: Secure originating IP detection via trusted proxy configuration with `X-Forwarded-For` right-to-left walk and optional authoritative header support (e.g., `CF-Connecting-IP`)
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
 - **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
+- **Load Balancing**: Five algorithms (RoundRobin, Weighted, LeastConnections, ConsistentHash, Random) with unhealthy target filtering
+- **Health Checking**: Active HTTP probes and passive status monitoring with configurable thresholds
+- **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
+- **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
+- **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
 
 ## Operating Modes
 
@@ -115,7 +123,7 @@ Ferrum Gateway supports a configurable read-only mode for the Admin API, providi
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/ferrum-gateway.git
+git clone https://github.com/QuickLaunchWeb/ferrum-gateway.git
 cd ferrum-gateway
 
 # Build in release mode
@@ -126,20 +134,20 @@ cargo build --release
 
 ### From Release Binaries
 
-Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/your-org/ferrum-gateway/releases) page:
+Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-gateway/releases) page:
 
 ```bash
 # Download the latest release for your platform
 # Linux x86_64
-wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
+wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
 chmod +x ferrum-gateway-linux-x86_64
 
 # macOS x86_64 (Intel)
-wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
+wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
 chmod +x ferrum-gateway-macos-x86_64
 
 # macOS ARM64 (Apple Silicon)
-wget https://github.com/your-org/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
+wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
 chmod +x ferrum-gateway-macos-aarch64
 
 # Verify checksum
@@ -150,7 +158,7 @@ sha256sum -c ferrum-gateway-linux-x86_64.sha256
 
 ```bash
 # Pull and run the latest Docker image
-docker pull your-registry/ferrum-gateway:latest
+docker pull ghcr.io/quicklaunchweb/ferrum-gateway:latest
 
 docker run -d \
   --name ferrum-gateway \
@@ -161,7 +169,7 @@ docker run -d \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
   -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
   -v ferrum_data:/data \
-  your-registry/ferrum-gateway:latest
+  ghcr.io/quicklaunchweb/ferrum-gateway:latest
 ```
 
 See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
@@ -289,7 +297,7 @@ git tag -a v0.2.0 -m "Release version 0.2.0"
 git push origin v0.2.0
 
 # Binaries automatically available at:
-# https://github.com/your-org/ferrum-gateway/releases/tag/v0.2.0
+# https://github.com/QuickLaunchWeb/ferrum-gateway/releases/tag/v0.2.0
 ```
 
 See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets configuration, and customization.
@@ -379,6 +387,8 @@ proxies:
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 30000
     backend_write_timeout_ms: 30000
+    # Response body mode: "stream" (default) or "buffer"
+    # response_body_mode: stream
     # Connection pooling settings (optional - override global defaults)
     pool_max_idle_per_host: 25          # Override global default (10)
     pool_idle_timeout_seconds: 120      # Override global default (90)
@@ -578,6 +588,7 @@ When using Database or CP modes, Ferrum auto-creates the following tables on sta
 - **`consumers`**: API consumer/user definitions
 - **`plugin_configs`**: Plugin configurations (global or per-proxy scoped)
 - **`proxy_plugins`**: Many-to-many linking proxies to plugin configs
+- **`upstreams`**: Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
 
 ## Admin API
 
@@ -669,6 +680,57 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/plugins/config
 ```
 
+#### Upstreams
+
+```bash
+# List all upstreams
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
+
+# Create an upstream (load-balanced backend group)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-backend-pool",
+    "targets": [
+      {"host": "backend1.example.com", "port": 8080, "weight": 5},
+      {"host": "backend2.example.com", "port": 8080, "weight": 3}
+    ],
+    "algorithm": "weighted_round_robin",
+    "health_checks": {
+      "active": {
+        "http_path": "/health",
+        "interval_seconds": 10,
+        "healthy_threshold": 3,
+        "unhealthy_threshold": 3
+      }
+    }
+  }' \
+  http://localhost:9000/upstreams
+
+# Get an upstream
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
+
+# Update an upstream
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-backend-pool",
+    "targets": [
+      {"host": "backend1.example.com", "port": 8080, "weight": 5},
+      {"host": "backend3.example.com", "port": 8080, "weight": 2}
+    ],
+    "algorithm": "round_robin"
+  }' \
+  http://localhost:9000/upstreams/{upstream_id}
+
+# Delete an upstream
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
+```
+
+Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`.
+
+To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`.
+
 #### Metrics
 
 ```bash
@@ -718,13 +780,13 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 
 | Priority | Band | Plugins |
 |----------|------|---------|
-| 100 | Early | `cors` |
-| 1000–1300 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth` |
+| 100 | Early | `cors`, `ip_restriction`, `bot_detection` |
+| 1000-1400 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
 | 2000 | Authorization | `access_control` |
 | 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
-| 3000 | Transform | `request_transformer` |
+| 3000 | Transform | `request_transformer`, `body_validator`, `request_termination` |
 | 4000 | Response | `response_transformer` |
-| 9000–9200 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger` |
+| 9000-9400 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing` |
 
 Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 
@@ -752,19 +814,31 @@ config: {}
 
 #### `http_logging`
 
-Sends the transaction summary as JSON to an external HTTP endpoint.
+Sends transaction summaries as JSON to an external HTTP endpoint. Entries are buffered and sent in batches (as a JSON array) to reduce per-request HTTP overhead. A background task handles flushing, retries, and delivery — the proxy hot path only performs a non-blocking channel write.
 
 **Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `endpoint_url` | String | URL to POST transaction logs to |
-| `authorization_header` | String (optional) | Authorization header value for the logging endpoint |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `endpoint_url` | String | `""` | URL to POST transaction logs to |
+| `authorization_header` | String | *(none)* | Authorization header value for the logging endpoint |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. After all retries are exhausted, the batch is discarded to keep memory usage bounded.
 
 ```yaml
 plugin_name: http_logging
 config:
   endpoint_url: "https://logging-service.example.com/ingest"
   authorization_header: "Bearer log-token-123"
+  batch_size: 50
+  flush_interval_ms: 1000
+  max_retries: 3
+  retry_delay_ms: 1000
+  buffer_capacity: 10000
 ```
 
 #### `transaction_debugger`
@@ -921,6 +995,88 @@ Enforces request rate limits per time window. Supports limiting by client IP add
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
+#### `hmac_auth`
+
+Authenticates requests using HMAC signatures.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `secret` | String | Shared secret for HMAC computation |
+| `algorithm` | String | Hash algorithm (e.g., `sha256`) |
+| `header` | String | Header containing the HMAC signature |
+
+#### `ip_restriction`
+
+Restricts access based on client IP address or CIDR range.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `allow` | String[] | Allowed IP addresses or CIDR ranges |
+| `deny` | String[] | Denied IP addresses or CIDR ranges |
+
+#### `bot_detection`
+
+Detects and blocks bot traffic based on User-Agent patterns.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `block_mode` | String | Action on detection: `block` or `log` |
+
+#### `body_validator`
+
+Validates JSON or XML request bodies against schemas.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `schema` | Object | JSON Schema or XML schema for validation |
+| `content_types` | String[] | Content types to validate |
+
+#### `request_termination`
+
+Returns a predefined response without proxying to the backend. Useful for maintenance mode or stubbing endpoints.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `status_code` | u16 | HTTP status code to return |
+| `body` | String | Response body |
+| `content_type` | String | Response Content-Type header |
+| `message` | String | Error message |
+
+#### `correlation_id`
+
+Generates and propagates correlation IDs for request tracing across services.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `header_name` | String | Header name for correlation ID (default: `X-Correlation-ID`) |
+| `generator` | String | ID generation strategy (e.g., `uuid`) |
+| `echo_downstream` | bool | Include correlation ID in response headers |
+
+#### `prometheus_metrics`
+
+Exports gateway metrics in Prometheus exposition format.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `path` | String | Metrics endpoint path (default: `/metrics`) |
+
+#### `otel_tracing`
+
+Integrates with OpenTelemetry for distributed tracing.
+
+**Config**:
+| Parameter | Type | Description |
+|---|---|---|
+| `endpoint` | String | OTLP collector endpoint |
+| `service_name` | String | Service name for traces |
+
 ## Proxying Behavior
 
 ### Routing
@@ -1007,7 +1163,8 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Per-proxy TTL override via `dns_cache_ttl_seconds`
 - Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
 - Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
-- Non-blocking startup warmup resolves all backend hostnames
+- Non-blocking startup warmup resolves all backend, upstream, and plugin endpoint hostnames (deduplicated)
+- Shared DNS cache for plugin outbound calls (http_logging, oauth2_auth, etc.) via custom reqwest resolver
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
 ### HTTP/3 (QUIC) Support
@@ -1149,7 +1306,9 @@ Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API
 | `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` are correct |
 | `401 Unauthorized on Admin API` | Check that your JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
 | `404 Not Found on proxy request` | Verify the request path matches a configured `listen_path` prefix |
-| `502 Bad Gateway` | Backend is unreachable; check `backend_host`, `backend_port`, DNS, and timeouts |
+| `502 Bad Gateway` | Backend is unreachable; check `X-Gateway-Error` header for details (`connection_failure` vs `backend_error`); verify `backend_host`, `backend_port`, DNS, and timeouts |
+| `504 Gateway Timeout` | Backend did not respond in time; `X-Gateway-Error: backend_timeout` is set; check `backend_read_timeout_ms` |
+| `X-Gateway-Upstream-Status: degraded` | All upstream targets are unhealthy; requests are routed via fallback — check health check configuration |
 | `429 Too Many Requests` | Rate limit exceeded; check `rate_limiting` plugin config |
 | DP not receiving config | Verify `FERRUM_DP_GRPC_AUTH_TOKEN` is a valid JWT signed with `FERRUM_CP_GRPC_JWT_SECRET` |
 

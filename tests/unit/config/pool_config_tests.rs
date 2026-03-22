@@ -34,6 +34,10 @@ fn create_test_proxy() -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

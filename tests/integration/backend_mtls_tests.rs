@@ -41,6 +41,10 @@ fn create_test_mtls_proxy() -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -152,13 +156,17 @@ async fn test_backend_mtls_global_config() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config);
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without specific mTLS config (should use global)
     let proxy = create_test_mtls_proxy();
 
     // Test that we can create a client (this will try to load the certificates)
-    let result = pool.get_client(&proxy, None).await;
+    let result = pool.get_client(&proxy).await;
 
     // Note: This test verifies that the mTLS configuration is properly integrated
     // In a real scenario, the actual TLS handshake would fail with our test cert,
@@ -205,7 +213,11 @@ async fn test_backend_mtls_proxy_specific_override() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config);
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy with specific mTLS config (should override global)
     let mut proxy = create_test_mtls_proxy();
@@ -213,7 +225,7 @@ async fn test_backend_mtls_proxy_specific_override() {
     proxy.backend_tls_client_key_path = Some(proxy_key_file.path().to_string_lossy().to_string());
 
     // Test that we can create a client (this will try to load the proxy-specific certificates)
-    let result = pool.get_client(&proxy, None).await;
+    let result = pool.get_client(&proxy).await;
 
     match result {
         Ok(_client) => {
@@ -249,13 +261,17 @@ async fn test_backend_mtls_no_certificates() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config);
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
 
     // Test that we can create a client without mTLS
-    let result = pool.get_client(&proxy, None).await;
+    let result = pool.get_client(&proxy).await;
 
     match result {
         Ok(_client) => {
@@ -280,13 +296,17 @@ async fn test_backend_mtls_partial_config() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config);
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
 
     // Test that we can create a client (should not apply mTLS due to missing key)
-    let result = pool.get_client(&proxy, None).await;
+    let result = pool.get_client(&proxy).await;
 
     match result {
         Ok(_client) => {
@@ -316,13 +336,17 @@ async fn test_backend_ca_bundle_global_config() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config);
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without specific mTLS config (should use global CA bundle)
     let proxy = create_test_mtls_proxy();
 
     // Test that we can create a client (this will try to load the CA bundle)
-    let result = pool.get_client(&proxy, None).await;
+    let result = pool.get_client(&proxy).await;
 
     // Note: This test verifies that the CA bundle configuration is properly integrated
     // The actual TLS verification will depend on the CA bundle validity

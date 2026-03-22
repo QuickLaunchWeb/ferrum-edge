@@ -67,6 +67,10 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -78,9 +82,11 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         .map(|i| create_test_proxy(&format!("proxy-{}", i), &format!("/api-{}", i)))
         .collect();
     GatewayConfig {
+        version: "1".to_string(),
         proxies,
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     }
 }

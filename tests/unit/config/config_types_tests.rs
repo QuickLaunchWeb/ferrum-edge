@@ -4,6 +4,7 @@ use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Pr
 #[test]
 fn test_unique_listen_paths_valid() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 id: "1".into(),
@@ -33,6 +34,10 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -64,12 +69,17 @@ fn test_unique_listen_paths_valid() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     assert!(config.validate_unique_listen_paths().is_ok());
@@ -78,6 +88,7 @@ fn test_unique_listen_paths_valid() {
 #[test]
 fn test_unique_listen_paths_duplicate() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 id: "1".into(),
@@ -107,6 +118,10 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -138,12 +153,17 @@ fn test_unique_listen_paths_duplicate() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     assert!(config.validate_unique_listen_paths().is_err());
@@ -152,6 +172,7 @@ fn test_unique_listen_paths_duplicate() {
 #[test]
 fn test_route_table_sorted_by_length() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 id: "short".into(),
@@ -181,6 +202,10 @@ fn test_route_table_sorted_by_length() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -212,6 +237,10 @@ fn test_route_table_sorted_by_length() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -243,12 +272,17 @@ fn test_route_table_sorted_by_length() {
                 pool_http2_keep_alive_interval_seconds: Some(15),
                 pool_http2_keep_alive_timeout_seconds: Some(5),
                 pool_tcp_keepalive_seconds: Some(10),
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: Default::default(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
 

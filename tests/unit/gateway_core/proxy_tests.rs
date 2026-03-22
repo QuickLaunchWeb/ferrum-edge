@@ -31,6 +31,10 @@ fn test_proxy() -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -69,6 +73,7 @@ fn test_build_backend_url_with_query() {
 #[test]
 fn test_longest_prefix_match() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             Proxy {
                 listen_path: "/api".into(),
@@ -83,6 +88,7 @@ fn test_longest_prefix_match() {
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     let matched = find_matching_proxy(&config, "/api/v1/users");
@@ -93,12 +99,14 @@ fn test_longest_prefix_match() {
 #[test]
 fn test_no_match() {
     let config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![Proxy {
             listen_path: "/api".into(),
             ..test_proxy()
         }],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
     let matched = find_matching_proxy(&config, "/other/path");

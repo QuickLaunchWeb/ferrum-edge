@@ -130,6 +130,10 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -172,6 +176,7 @@ async fn test_cp_dp_grpc_config_sync() {
 
     // Create initial config with one proxy
     let initial_config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![create_test_proxy("proxy-func-1", "/api/v1", 3001)],
         consumers: vec![Consumer {
             id: "consumer-1".into(),
@@ -182,6 +187,7 @@ async fn test_cp_dp_grpc_config_sync() {
             updated_at: Utc::now(),
         }],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
 
@@ -248,12 +254,14 @@ async fn test_cp_dp_grpc_config_sync() {
     // Update config on CP and broadcast to DP
     println!("Updating config on CP (adding another proxy)...");
     let updated_config = GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             create_test_proxy("proxy-func-1", "/api/v1", 3001),
             create_test_proxy("proxy-func-2", "/api/v2", 3002),
         ],
         consumers: vec![],
         plugin_configs: vec![],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     };
 

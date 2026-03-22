@@ -1,14 +1,21 @@
 mod admin;
+mod circuit_breaker;
 mod config;
+mod config_delta;
 mod connection_pool;
 mod consumer_index;
+#[path = "../custom_plugins/mod.rs"]
+mod custom_plugins;
 mod dns;
 mod grpc;
+mod health_check;
 mod http3;
+mod load_balancer;
 mod modes;
 mod plugin_cache;
 mod plugins;
 mod proxy;
+mod retry;
 mod router_cache;
 mod tls;
 
@@ -81,6 +88,7 @@ async fn main() {
         OperatingMode::File => modes::file::run(env_config, shutdown_tx).await,
         OperatingMode::ControlPlane => modes::control_plane::run(env_config, shutdown_tx).await,
         OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
+        OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
     };
 
     if let Err(e) = result {

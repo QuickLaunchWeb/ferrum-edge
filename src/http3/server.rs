@@ -231,7 +231,7 @@ async fn handle_h3_request(
 
     // Resolve real client IP using trusted proxy configuration
     if !state.trusted_proxies.is_empty() {
-        let resolved = if let Some(ref real_ip_header) = state.real_ip_header {
+        let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
             let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
             if let Some(val) = header_val {
                 let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
@@ -291,7 +291,7 @@ async fn handle_h3_request(
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
     // Execute on_request_received hooks
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         match plugin.on_request_received(&mut ctx).await {
             PluginResult::Reject {
                 status_code,
@@ -359,7 +359,7 @@ async fn handle_h3_request(
     }
 
     // Authorization phase
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         if plugin.name() == "access_control" {
             match plugin.authorize(&mut ctx).await {
                 PluginResult::Reject {
@@ -384,7 +384,7 @@ async fn handle_h3_request(
 
     // before_proxy hooks
     let mut proxy_headers = ctx.headers.clone();
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
             PluginResult::Reject {
                 status_code,
@@ -459,7 +459,7 @@ async fn handle_h3_request(
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
     // after_proxy hooks
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         let _ = plugin
             .after_proxy(&mut ctx, response_status, &mut response_headers)
             .await;
@@ -488,7 +488,7 @@ async fn handle_h3_request(
     };
 
     // Log phase
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         plugin.log(&summary).await;
     }
 
@@ -522,22 +522,8 @@ async fn proxy_to_backend_h3(
     body_bytes: Vec<u8>,
     client_ip: &str,
 ) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
-    // Resolve backend hostname
-    let resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await;
-
-    // Get client from connection pool
-    let client = match state
-        .connection_pool
-        .get_client(proxy, resolved_ip.ok())
-        .await
-    {
+    // Get client from connection pool (uses DnsCacheResolver for DNS lookups)
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);

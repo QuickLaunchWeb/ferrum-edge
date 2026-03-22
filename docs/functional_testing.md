@@ -49,13 +49,13 @@ Located in `tests/functional/functional_cp_dp_test.rs`, this file contains highe
 **Running (Ignored by Default):**
 ```bash
 # Run all functional tests
-cargo test --test functional_cp_dp_test -- --ignored
+cargo test --test functional_tests functional_cp_dp -- --ignored
 
 # Run specific test
-cargo test --test functional_cp_dp_test test_database_connection_with_tls_config -- --ignored
+cargo test --test functional_tests functional_cp_dp -- test_database_connection_with_tls_config -- --ignored
 
 # Run with output
-cargo test --test functional_cp_dp_test -- --ignored --nocapture
+cargo test --test functional_tests functional_cp_dp -- --ignored --nocapture
 ```
 
 ## Database TLS Support

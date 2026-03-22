@@ -1,6 +1,6 @@
 use crate::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig,
-    PluginScope, Proxy,
+    AuthMode, BackendProtocol, Consumer, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
+    PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use chrono::Utc;
 use sqlx::Row;
@@ -126,74 +126,27 @@ impl DatabaseStore {
         Ok(url)
     }
 
-    /// Run schema migrations.
+    /// Run versioned schema migrations using the MigrationRunner.
+    ///
+    /// This replaces the old inline `CREATE TABLE IF NOT EXISTS` approach with
+    /// a tracked, versioned migration system. Existing databases are automatically
+    /// detected and bootstrapped into the new system.
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
-        let create_proxies = r#"
-            CREATE TABLE IF NOT EXISTS proxies (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                listen_path TEXT NOT NULL UNIQUE,
-                backend_protocol TEXT NOT NULL DEFAULT 'http',
-                backend_host TEXT NOT NULL,
-                backend_port INTEGER NOT NULL DEFAULT 80,
-                backend_path TEXT,
-                strip_listen_path INTEGER NOT NULL DEFAULT 1,
-                preserve_host_header INTEGER NOT NULL DEFAULT 0,
-                backend_connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
-                backend_read_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                backend_write_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                backend_tls_client_cert_path TEXT,
-                backend_tls_client_key_path TEXT,
-                backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
-                backend_tls_server_ca_cert_path TEXT,
-                dns_override TEXT,
-                dns_cache_ttl_seconds INTEGER,
-                auth_mode TEXT NOT NULL DEFAULT 'single',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        "#;
+        use crate::config::migrations::MigrationRunner;
 
-        let create_consumers = r#"
-            CREATE TABLE IF NOT EXISTS consumers (
-                id TEXT PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE,
-                custom_id TEXT,
-                credentials TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        "#;
+        let runner = MigrationRunner::new(self.pool.clone(), self.db_type.clone());
+        let applied = runner.run_pending().await?;
 
-        let create_plugin_configs = r#"
-            CREATE TABLE IF NOT EXISTS plugin_configs (
-                id TEXT PRIMARY KEY,
-                plugin_name TEXT NOT NULL,
-                config TEXT NOT NULL DEFAULT '{}',
-                scope TEXT NOT NULL DEFAULT 'global',
-                proxy_id TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        "#;
-
-        let create_proxy_plugins = r#"
-            CREATE TABLE IF NOT EXISTS proxy_plugins (
-                proxy_id TEXT NOT NULL,
-                plugin_config_id TEXT NOT NULL,
-                PRIMARY KEY (proxy_id, plugin_config_id)
-            )
-        "#;
-
-        sqlx::query(create_proxies).execute(&self.pool).await?;
-        sqlx::query(create_consumers).execute(&self.pool).await?;
-        sqlx::query(create_plugin_configs)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query(create_proxy_plugins)
-            .execute(&self.pool)
-            .await?;
+        if applied.is_empty() {
+            info!("Database schema is up to date");
+        } else {
+            for m in &applied {
+                info!(
+                    "Applied migration V{}: {} ({}ms)",
+                    m.version, m.name, m.execution_time_ms
+                );
+            }
+        }
 
         Ok(())
     }
@@ -203,11 +156,14 @@ impl DatabaseStore {
         let proxies = self.load_proxies().await?;
         let consumers = self.load_consumers().await?;
         let plugin_configs = self.load_plugin_configs().await?;
+        let upstreams = self.load_upstreams().await?;
 
         let config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
             consumers,
             plugin_configs,
+            upstreams,
             loaded_at: Utc::now(),
         };
 
@@ -287,6 +243,11 @@ impl DatabaseStore {
                     .map(|v| v as u64),
                 auth_mode: parse_auth_mode(&auth_mode_str),
                 plugins,
+                // Load balancing
+                upstream_id: row.try_get::<String, _>("upstream_id").ok(),
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: crate::config::types::ResponseBodyMode::default(),
                 // Connection pooling settings - None to use global defaults
                 pool_max_idle_per_host: None,
                 pool_idle_timeout_seconds: None,
@@ -360,7 +321,7 @@ impl DatabaseStore {
 
     pub async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
         sqlx::query(
-            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, auth_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, auth_mode, upstream_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
@@ -375,6 +336,7 @@ impl DatabaseStore {
         .bind(proxy.backend_read_timeout_ms as i64)
         .bind(proxy.backend_write_timeout_ms as i64)
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
+        .bind(&proxy.upstream_id)
         .bind(proxy.created_at.to_rfc3339())
         .bind(proxy.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -385,7 +347,7 @@ impl DatabaseStore {
 
     pub async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
         sqlx::query(
-            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, auth_mode=?, updated_at=? WHERE id=?"
+            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, auth_mode=?, upstream_id=?, updated_at=? WHERE id=?"
         )
         .bind(&proxy.name)
         .bind(&proxy.listen_path)
@@ -399,6 +361,7 @@ impl DatabaseStore {
         .bind(proxy.backend_read_timeout_ms as i64)
         .bind(proxy.backend_write_timeout_ms as i64)
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
+        .bind(&proxy.upstream_id)
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
         .execute(&self.pool)
@@ -522,6 +485,110 @@ impl DatabaseStore {
     pub async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
         let configs = self.load_plugin_configs().await?;
         Ok(configs.into_iter().find(|c| c.id == id))
+    }
+
+    // ---- Upstream CRUD ----
+
+    async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut upstreams = Vec::new();
+        for row in rows {
+            let targets_str: String = row.try_get("targets").unwrap_or("[]".into());
+            let targets: Vec<UpstreamTarget> =
+                serde_json::from_str(&targets_str).unwrap_or_default();
+
+            let algo_str: String = row.try_get("algorithm").unwrap_or("round_robin".into());
+            let algorithm: LoadBalancerAlgorithm =
+                serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
+
+            let health_checks: Option<HealthCheckConfig> = row
+                .try_get::<String, _>("health_checks")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+
+            upstreams.push(Upstream {
+                id: row.try_get("id")?,
+                name: row.try_get("name").ok(),
+                targets,
+                algorithm,
+                hash_on: row.try_get("hash_on").ok(),
+                health_checks,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+
+        Ok(upstreams)
+    }
+
+    pub async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        let targets_json = serde_json::to_string(&upstream.targets)?;
+        let algo_json = serde_json::to_string(&upstream.algorithm)?;
+        // algo_json is quoted like "\"round_robin\"", strip the quotes
+        let algo_str = algo_json.trim_matches('"');
+        let health_checks_json = upstream
+            .health_checks
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        sqlx::query(
+            "INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&upstream.id)
+        .bind(&upstream.name)
+        .bind(&targets_json)
+        .bind(algo_str)
+        .bind(&upstream.hash_on)
+        .bind(&health_checks_json)
+        .bind(upstream.created_at.to_rfc3339())
+        .bind(upstream.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        let targets_json = serde_json::to_string(&upstream.targets)?;
+        let algo_json = serde_json::to_string(&upstream.algorithm)?;
+        let algo_str = algo_json.trim_matches('"');
+        let health_checks_json = upstream
+            .health_checks
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        sqlx::query(
+            "UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, health_checks=?, updated_at=? WHERE id=?"
+        )
+        .bind(&upstream.name)
+        .bind(&targets_json)
+        .bind(algo_str)
+        .bind(&upstream.hash_on)
+        .bind(&health_checks_json)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&upstream.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let result = sqlx::query("DELETE FROM upstreams WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
+        let upstreams = self.load_upstreams().await?;
+        Ok(upstreams.into_iter().find(|u| u.id == id))
     }
 
     pub async fn check_listen_path_unique(

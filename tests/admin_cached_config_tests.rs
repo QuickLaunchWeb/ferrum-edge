@@ -91,6 +91,10 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         pool_tcp_keepalive_seconds: None,
         pool_http2_keep_alive_interval_seconds: None,
         pool_http2_keep_alive_timeout_seconds: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -99,6 +103,7 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
 /// Create a sample GatewayConfig with known test data.
 fn create_test_gateway_config() -> GatewayConfig {
     GatewayConfig {
+        version: "1".to_string(),
         proxies: vec![
             create_test_proxy("proxy-1", "/api/v1", "backend1.example.com", 8080),
             create_test_proxy("proxy-2", "/api/v2", "backend2.example.com", 9090),
@@ -121,6 +126,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
+        upstreams: vec![],
         loaded_at: Utc::now(),
     }
 }
