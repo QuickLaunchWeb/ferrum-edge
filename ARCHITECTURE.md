@@ -139,14 +139,17 @@ The configuration system provides flexible configuration management through mult
 - Per-proxy configuration overrides
 - Configuration validation and defaults
 
-### **2. Proxy Engine (`src/proxy/` + `src/router_cache.rs`)**
+### **2. Proxy Engine (`src/proxy/` + `src/router_cache.rs` + `src/plugin_cache.rs` + `src/consumer_index.rs`)**
 
 The proxy engine handles all request routing and processing with **consistent security for HTTP and WebSocket**:
 
 **Key Features**:
-- **Router cache** with pre-sorted route table and bounded path lookup cache (`src/router_cache.rs`)
+- **Router cache** with pre-sorted route table and bounded path lookup cache with random-sample eviction (`src/router_cache.rs`)
 - Longest prefix match routing with O(1) cache hits for repeated paths
 - Route table rebuilt atomically via ArcSwap on config changes — never on the hot request path
+- **Plugin cache** returns `Arc<Vec<...>>` for zero-allocation per-request plugin retrieval (`src/plugin_cache.rs`)
+- **Consumer index** with separate per-credential-type HashMaps for allocation-free O(1) auth lookups (`src/consumer_index.rs`)
+- **Load balancer cache** with pre-computed target keys and O(1) upstream index (`src/load_balancer.rs`)
 - Protocol translation (HTTP ↔ WebSocket)
 - HTTP/1.1 and HTTP/2 inbound support (auto-negotiated via ALPN on TLS connections)
 - Request/response transformation
@@ -338,6 +341,43 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
+
+## ⚡ Performance & Scalability
+
+The gateway is designed to scale to **10,000+ proxy/consumer resources** and **30,000+ plugin configurations** with minimal per-request overhead. All hot-path data structures use lock-free reads and pre-computed indexes.
+
+### **Per-Request Data Structure Complexity**
+
+| Component | Lookup | Lock Type | Notes |
+|-----------|--------|-----------|-------|
+| Route matching | O(1) cache hit / O(routes) fallback | Lock-free ArcSwap | DashMap path cache with random-sample eviction |
+| Plugin lookup | O(1) HashMap | Lock-free ArcSwap | Returns `Arc<Vec<...>>` — zero Vec allocation per request |
+| Consumer auth | O(1) per credential type | Lock-free ArcSwap | Separate indexes per type (no format!() allocation) |
+| Upstream lookup | O(1) HashMap | Lock-free ArcSwap | Pre-built index avoids linear scan |
+| Load balancer | O(1) round-robin / O(log n) consistent hash | Lock-free ArcSwap | Pre-computed target keys avoid format!() per request |
+| Circuit breaker | O(1) atomic loads | Lock-free DashMap | |
+| Health check state | O(1) DashMap | Lock-free DashMap | |
+
+### **Key Design Decisions for Scale**
+
+- **ArcSwap everywhere**: Config updates are atomic pointer swaps. Readers never block, even during config reload with 10k+ resources.
+- **Pre-computed indexes**: Plugin configs are indexed by `proxy_id` at build time (O(P+C) rebuild instead of O(P×C)). Consumer credentials are split into separate HashMaps per type. Load balancer target keys are pre-computed strings.
+- **Zero per-request allocation in plugin lookup**: `PluginCache::get_plugins()` returns `Arc<Vec<Arc<dyn Plugin>>>` — a single Arc clone, not N Arc clones + Vec allocation.
+- **Random-sample cache eviction**: RouterCache evicts ~25% of entries when full instead of clearing the entire cache, preventing thundering-herd O(routes) scans.
+- **No locks on the hot path**: All request-path reads use `ArcSwap::load()` (lock-free) or `DashMap` (per-bucket sharded locks). No `Mutex` or `RwLock` in the request pipeline.
+
+### **Config Rebuild Performance**
+
+When configuration changes (database poll, SIGHUP, or gRPC push), all caches are rebuilt atomically off the hot path:
+
+| Cache | Rebuild Complexity | Notes |
+|-------|-------------------|-------|
+| RouterCache | O(n log n) sort | Pre-sorted by listen_path length |
+| PluginCache | O(P + C) | Plugin configs pre-indexed by proxy_id |
+| ConsumerIndex | O(consumers × credentials) | ~3-5 index entries per consumer |
+| LoadBalancerCache | O(upstreams × targets) | Pre-computes target keys and hash rings |
+
+In-flight requests continue using the previous config snapshot via Arc reference counting — zero disruption during reload.
 
 ## 🔄 Request Flow
 

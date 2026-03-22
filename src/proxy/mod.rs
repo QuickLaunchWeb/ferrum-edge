@@ -377,7 +377,7 @@ async fn handle_websocket_request_authenticated(
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
     ctx: RequestContext,
-    plugins: Vec<Arc<dyn Plugin>>,
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -417,7 +417,7 @@ async fn handle_websocket_request_authenticated(
     };
 
     // Log the successful WebSocket connection (after auth)
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         plugin.log(&summary).await;
     }
 
@@ -1124,7 +1124,7 @@ pub async fn handle_proxy_request(
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
     // Execute on_request_received hooks
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         match plugin.on_request_received(&mut ctx).await {
             PluginResult::Reject {
                 status_code,
@@ -1200,7 +1200,7 @@ pub async fn handle_proxy_request(
     }
 
     // Authorization phase (access_control, rate_limiting by consumer, etc.)
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         match plugin.authorize(&mut ctx).await {
             PluginResult::Reject {
                 status_code,
@@ -1225,7 +1225,7 @@ pub async fn handle_proxy_request(
         &ctx.headers
     } else {
         owned_proxy_headers = ctx.headers.clone();
-        for plugin in &plugins {
+        for plugin in plugins.iter() {
             match plugin
                 .before_proxy(&mut ctx, &mut owned_proxy_headers)
                 .await
@@ -1302,7 +1302,7 @@ pub async fn handle_proxy_request(
                 }
 
                 // after_proxy hooks
-                for plugin in &plugins {
+                for plugin in plugins.iter() {
                     let _ = plugin
                         .after_proxy(&mut ctx, grpc_resp.status, &mut response_headers)
                         .await;
@@ -1333,7 +1333,7 @@ pub async fn handle_proxy_request(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         metadata: ctx.metadata.clone(),
                     };
-                    for plugin in &plugins {
+                    for plugin in plugins.iter() {
                         plugin.log(&summary).await;
                     }
                 }
@@ -1526,10 +1526,9 @@ pub async fn handle_proxy_request(
         cb.record_failure(response_status); // record_failure checks if status is a failure
     }
 
-    // Passive health check reporting
+    // Passive health check reporting (O(1) upstream lookup via index)
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        let config = state.config.load();
-        if let Some(upstream) = config.upstreams.iter().find(|u| u.id == *upstream_id)
+        if let Some(upstream) = state.load_balancer_cache.get_upstream(upstream_id)
             && let Some(hc) = &upstream.health_checks
         {
             state.health_checker.report_response(
@@ -1546,7 +1545,7 @@ pub async fn handle_proxy_request(
 
     // after_proxy hooks (these only modify headers, not the body,
     // so they are compatible with both streaming and buffered modes)
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         let _ = plugin
             .after_proxy(&mut ctx, response_status, &mut response_headers)
             .await;
@@ -1575,7 +1574,7 @@ pub async fn handle_proxy_request(
             metadata: ctx.metadata.clone(),
         };
 
-        for plugin in &plugins {
+        for plugin in plugins.iter() {
             plugin.log(&summary).await;
         }
     }

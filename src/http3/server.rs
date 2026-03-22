@@ -257,7 +257,7 @@ async fn handle_h3_request(
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
     // Execute on_request_received hooks
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         match plugin.on_request_received(&mut ctx).await {
             PluginResult::Reject {
                 status_code,
@@ -325,7 +325,7 @@ async fn handle_h3_request(
     }
 
     // Authorization phase
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         if plugin.name() == "access_control" {
             match plugin.authorize(&mut ctx).await {
                 PluginResult::Reject {
@@ -350,7 +350,7 @@ async fn handle_h3_request(
 
     // before_proxy hooks
     let mut proxy_headers = ctx.headers.clone();
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
             PluginResult::Reject {
                 status_code,
@@ -424,7 +424,7 @@ async fn handle_h3_request(
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
     // after_proxy hooks
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         let _ = plugin
             .after_proxy(&mut ctx, response_status, &mut response_headers)
             .await;
@@ -453,7 +453,7 @@ async fn handle_h3_request(
     };
 
     // Log phase
-    for plugin in &plugins {
+    for plugin in plugins.iter() {
         plugin.log(&summary).await;
     }
 
