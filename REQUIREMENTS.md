@@ -229,6 +229,11 @@ Define Rust structs (using `serde` for serialization/deserialization) for the co
     *   `/plugins` (GET: list names of available plugin types)
     *   `/plugins/config` (GET: list all configs, POST: create global or proxy-scoped config)
     *   `/plugins/config/{config_id}` (GET: read, PUT: update, DELETE: delete)
+    *   `/upstreams` (GET: list, POST: create)
+    *   `/upstreams/{upstream_id}` (GET: read, PUT: update, DELETE: delete)
+        *   POST/PUT operations MUST validate that at least one target is provided. Return `400 Bad Request` if no targets are specified.
+        *   Upstreams define load-balanced backend groups with configurable algorithms (`round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`) and optional health checks (active and/or passive).
+        *   Proxies reference an upstream via `upstream_id`, which overrides the proxy's `backend_host`/`backend_port` with upstream target selection.
     *   `/admin/metrics` (GET, Authenticated): Returns a JSON object containing runtime metrics:
         *   `mode`: Current `FERRUM_MODE`.
         *   `config_last_updated_at`: ISO8601 timestamp of last config load/update.

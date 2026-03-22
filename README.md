@@ -578,6 +578,7 @@ When using Database or CP modes, Ferrum auto-creates the following tables on sta
 - **`consumers`**: API consumer/user definitions
 - **`plugin_configs`**: Plugin configurations (global or per-proxy scoped)
 - **`proxy_plugins`**: Many-to-many linking proxies to plugin configs
+- **`upstreams`**: Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
 
 ## Admin API
 
@@ -668,6 +669,57 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   }' \
   http://localhost:9000/plugins/config
 ```
+
+#### Upstreams
+
+```bash
+# List all upstreams
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
+
+# Create an upstream (load-balanced backend group)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-backend-pool",
+    "targets": [
+      {"host": "backend1.example.com", "port": 8080, "weight": 5},
+      {"host": "backend2.example.com", "port": 8080, "weight": 3}
+    ],
+    "algorithm": "weighted_round_robin",
+    "health_checks": {
+      "active": {
+        "http_path": "/health",
+        "interval_seconds": 10,
+        "healthy_threshold": 3,
+        "unhealthy_threshold": 3
+      }
+    }
+  }' \
+  http://localhost:9000/upstreams
+
+# Get an upstream
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
+
+# Update an upstream
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-backend-pool",
+    "targets": [
+      {"host": "backend1.example.com", "port": 8080, "weight": 5},
+      {"host": "backend3.example.com", "port": 8080, "weight": 2}
+    ],
+    "algorithm": "round_robin"
+  }' \
+  http://localhost:9000/upstreams/{upstream_id}
+
+# Delete an upstream
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
+```
+
+Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`.
+
+To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`.
 
 #### Metrics
 
