@@ -24,8 +24,15 @@ pub struct TargetSelection {
 }
 
 /// Load balancer cache, rebuilt atomically on config change.
+///
+/// Individual `LoadBalancer` instances are wrapped in `Arc` so that
+/// incremental updates can clone the HashMap cheaply (just Arc pointer
+/// copies) and only allocate new `LoadBalancer` instances for changed
+/// upstreams. Unchanged upstreams keep their exact same instance —
+/// round-robin counters, WRR weights, active connection counts, and
+/// consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
-    balancers: ArcSwap<HashMap<String, LoadBalancer>>,
+    balancers: ArcSwap<HashMap<String, Arc<LoadBalancer>>>,
     /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
     upstreams: ArcSwap<HashMap<String, Arc<Upstream>>>,
 }
@@ -47,16 +54,16 @@ impl LoadBalancerCache {
         self.upstreams.store(Arc::new(upstreams));
     }
 
-    fn build_balancers(config: &GatewayConfig) -> HashMap<String, LoadBalancer> {
+    fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
         let mut map = HashMap::with_capacity(config.upstreams.len());
         for upstream in &config.upstreams {
             map.insert(
                 upstream.id.clone(),
-                LoadBalancer::new(
+                Arc::new(LoadBalancer::new(
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
-                ),
+                )),
             );
         }
         map
@@ -72,13 +79,12 @@ impl LoadBalancerCache {
 
     /// Incrementally update only the changed upstreams.
     ///
-    /// Unchanged upstreams keep their existing `LoadBalancer` instances,
-    /// preserving round-robin counters, WRR weights, and active connection
-    /// counts. Only added/modified upstreams get new balancer instances.
-    ///
-    /// `full_new_config` is needed to enumerate which upstreams should exist
-    /// in the final state (we rebuild the map from scratch but reuse existing
-    /// `LoadBalancer` instances for unchanged upstreams via `Arc` swapping).
+    /// Clones the current `HashMap<String, Arc<LoadBalancer>>` (cheap — just
+    /// Arc pointer copies for all 10k entries), then:
+    /// - Removes deleted upstreams
+    /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams
+    /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
+    ///   round-robin counters, WRR weights, active connection counts, and hash rings
     pub fn apply_delta(
         &self,
         full_new_config: &GatewayConfig,
@@ -90,48 +96,24 @@ impl LoadBalancerCache {
             return;
         }
 
-        // Build the set of upstream IDs that need new LoadBalancer instances
-        let changed_ids: std::collections::HashSet<&str> = added
-            .iter()
-            .chain(modified.iter())
-            .map(|u| u.id.as_str())
-            .chain(removed_ids.iter().map(|s| s.as_str()))
-            .collect();
+        // Clone the current map — O(n) Arc pointer copies, no LoadBalancer cloning
+        let mut new_balancers = self.balancers.load().as_ref().clone();
 
-        // Take ownership of the old balancers map so we can move entries out
-        let old_balancers = self.balancers.load();
-        let mut new_balancers = HashMap::with_capacity(full_new_config.upstreams.len());
+        // Remove deleted upstreams
+        for id in removed_ids {
+            new_balancers.remove(id);
+        }
 
-        for upstream in &full_new_config.upstreams {
-            if changed_ids.contains(upstream.id.as_str()) {
-                // Changed upstream — create a fresh LoadBalancer
-                new_balancers.insert(
-                    upstream.id.clone(),
-                    LoadBalancer::new(
-                        upstream.algorithm,
-                        &upstream.targets,
-                        upstream.hash_on.clone(),
-                    ),
-                );
-            } else if let Some(existing) = old_balancers.get(&upstream.id) {
-                // Unchanged upstream — we can't move out of Arc<HashMap>, but
-                // the old map will be dropped once all readers finish. Build a
-                // new LB for unchanged upstreams too — this is O(upstreams)
-                // but only happens when *something* changed, and the cost is
-                // dominated by the changed entries in practice.
-                //
-                // TODO: If preserving RR counters for unchanged upstreams
-                // matters, switch balancers to Arc<LoadBalancer> for move semantics.
-                let _ = existing; // acknowledge we read it
-                new_balancers.insert(
-                    upstream.id.clone(),
-                    LoadBalancer::new(
-                        upstream.algorithm,
-                        &upstream.targets,
-                        upstream.hash_on.clone(),
-                    ),
-                );
-            }
+        // Create fresh LoadBalancer instances only for added/modified upstreams
+        for upstream in added.iter().chain(modified.iter()) {
+            new_balancers.insert(
+                upstream.id.clone(),
+                Arc::new(LoadBalancer::new(
+                    upstream.algorithm,
+                    &upstream.targets,
+                    upstream.hash_on.clone(),
+                )),
+            );
         }
 
         // Upstream index is cheap to rebuild (just Arc<Upstream> clones)
