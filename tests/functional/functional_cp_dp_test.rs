@@ -39,6 +39,7 @@ fn create_test_env_config() -> EnvConfig {
     EnvConfig {
         mode: OperatingMode::File,
         log_level: "debug".into(),
+        enable_streaming_latency_tracking: false,
         proxy_http_port: 8002,
         proxy_https_port: 8443,
         proxy_tls_cert_path: None,

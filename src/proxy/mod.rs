@@ -1885,16 +1885,19 @@ pub async fn handle_proxy_request(
     }
 
     // Build response body: either stream from backend or return buffered data.
-    // For streaming responses, use a tracked body that records the final transfer
-    // time via a shared atomic — a deferred task reads it after the read timeout
-    // to emit a supplementary log with accurate backend_total_ms.
+    // When FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true, streaming responses are
+    // wrapped with a TrackedBody that records the final transfer time via a shared
+    // atomic. A deferred task reads it after read_timeout + 5s to emit a
+    // supplementary log with accurate backend_total_ms.
+    // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
-        ResponseBody::Streaming(resp) => {
+        ResponseBody::Streaming(resp)
+            if state.env_config.enable_streaming_latency_tracking =>
+        {
             let (tracked_body, metrics) = ProxyBody::streaming_tracked(resp, backend_start);
 
             // Spawn a lightweight deferred task to log the final streaming latency.
             // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-            // No string cloning — only the proxy_id and minimal context are captured.
             let deferred_proxy_id = proxy.id.clone();
             let deferred_backend_url = strip_query_params(&backend_url);
             let read_timeout_ms = proxy.backend_read_timeout_ms;
@@ -1921,6 +1924,7 @@ pub async fn handle_proxy_request(
 
             tracked_body
         }
+        ResponseBody::Streaming(resp) => ProxyBody::streaming(resp),
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 

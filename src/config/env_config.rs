@@ -36,6 +36,11 @@ impl OperatingMode {
 pub struct EnvConfig {
     pub mode: OperatingMode,
     pub log_level: String,
+    /// When true, streaming responses are wrapped with a lightweight tracker
+    /// that records the final transfer time via a deferred task. Adds one
+    /// `Arc<StreamingMetrics>` + one `tokio::spawn` per streaming request.
+    /// Default: false (maximum throughput).
+    pub enable_streaming_latency_tracking: bool,
 
     // Proxy traffic ports
     pub proxy_http_port: u16,
@@ -174,6 +179,7 @@ impl Default for EnvConfig {
         Self {
             mode: OperatingMode::File,
             log_level: "error".into(),
+            enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
             proxy_tls_cert_path: None,
@@ -249,6 +255,11 @@ impl EnvConfig {
         let config = Self {
             mode: mode.clone(),
             log_level: env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into()),
+            enable_streaming_latency_tracking: env::var(
+                "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING",
+            )
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false),
 
             proxy_http_port: parse_env_u16("FERRUM_PROXY_HTTP_PORT", 8000),
             proxy_https_port: parse_env_u16("FERRUM_PROXY_HTTPS_PORT", 8443),

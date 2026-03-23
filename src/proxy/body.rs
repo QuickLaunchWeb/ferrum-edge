@@ -21,6 +21,8 @@ pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 pub enum ProxyBody {
     /// Complete body already in memory.
     Full(Full<Bytes>),
+    /// Streaming body passed through without tracking (zero overhead).
+    Stream(Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>),
     /// Streaming body with lightweight completion tracking.
     /// Records the timestamp of the last frame via a shared atomic —
     /// no closures, no string cloning, no per-request allocations beyond
@@ -141,6 +143,18 @@ impl ProxyBody {
         Self::Full(Full::default())
     }
 
+    /// Create a streaming body from a reqwest response (no tracking overhead).
+    pub fn streaming(response: reqwest::Response) -> Self {
+        use futures_util::StreamExt;
+
+        let stream = response.bytes_stream().map(|result| {
+            result
+                .map(Frame::data)
+                .map_err(|e| Box::new(e) as ProxyBodyError)
+        });
+        Self::Stream(Box::pin(StreamBody::new(stream)))
+    }
+
     /// Create a streaming body with lightweight completion tracking.
     ///
     /// Returns the body and a shared `Arc<StreamingMetrics>` that a deferred
@@ -178,6 +192,7 @@ impl http_body::Body for ProxyBody {
             ProxyBody::Full(body) => Pin::new(body)
                 .poll_frame(cx)
                 .map(|opt| opt.map(|result| result.map_err(|never| match never {}))),
+            ProxyBody::Stream(body) => body.as_mut().poll_frame(cx),
             ProxyBody::Tracked(body) => Pin::new(body).poll_frame(cx),
         }
     }
@@ -185,6 +200,7 @@ impl http_body::Body for ProxyBody {
     fn is_end_stream(&self) -> bool {
         match self {
             ProxyBody::Full(body) => body.is_end_stream(),
+            ProxyBody::Stream(body) => body.is_end_stream(),
             ProxyBody::Tracked(body) => body.inner.is_end_stream(),
         }
     }
@@ -192,6 +208,7 @@ impl http_body::Body for ProxyBody {
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
             ProxyBody::Full(body) => body.size_hint(),
+            ProxyBody::Stream(body) => body.size_hint(),
             ProxyBody::Tracked(body) => body.inner.size_hint(),
         }
     }

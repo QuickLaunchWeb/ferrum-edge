@@ -274,6 +274,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | `0.0.0.0:50051` | CP gRPC server listen address |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode) | CP gRPC URL for DP to connect to |
 | `FERRUM_BACKEND_TLS_NO_VERIFY` | `false` | Skip backend TLS verification (testing only) |
+| `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.

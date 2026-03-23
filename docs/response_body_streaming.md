@@ -153,7 +153,7 @@ See [docs/size_limits.md](size_limits.md) for the full size limit enforcement ar
 
 ### HTTP/1.1 and HTTP/2
 
-Both protocols support streaming. The gateway uses `ProxyBody::Tracked` which wraps the backend response's byte stream with lightweight completion tracking via `StreamingMetrics`.
+Both protocols support streaming. By default, streaming responses use `ProxyBody::Stream` — a zero-overhead passthrough with no per-frame tracking. When `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`, the gateway uses `ProxyBody::Tracked` instead, which wraps the byte stream with lightweight completion tracking via `StreamingMetrics` (one atomic store per frame, plus one deferred `tokio::spawn` per streaming request).
 
 ### HTTP/3 (QUIC)
 
@@ -174,16 +174,18 @@ The streaming architecture is built on the `ProxyBody` enum in `src/proxy/body.r
 ```rust
 pub enum ProxyBody {
     Full(Full<Bytes>),     // Buffered: complete body in memory
-    Tracked(TrackedBody),  // Streaming: chunks forwarded with completion tracking
+    Stream(Pin<Box<...>>), // Streaming: zero-overhead passthrough (default)
+    Tracked(TrackedBody),  // Streaming: with completion tracking (opt-in)
 }
 ```
 
-`ProxyBody` implements `http_body::Body`, so it is transparent to hyper's response machinery. The `Full` variant is zero-cost (no allocation beyond the data). The `Tracked` variant wraps a streaming body with a shared `Arc<StreamingMetrics>` that records the last-frame timestamp via a single atomic store per frame — enabling accurate backend total latency measurement without closures or string cloning on the hot path.
+`ProxyBody` implements `http_body::Body`, so it is transparent to hyper's response machinery. The `Full` variant is zero-cost (no allocation beyond the data). The `Stream` variant is a simple passthrough with no per-frame tracking overhead — used by default. The `Tracked` variant wraps a streaming body with a shared `Arc<StreamingMetrics>` that records the last-frame timestamp via a single atomic store per frame — enabling accurate backend total latency measurement. It is only used when `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`.
 
 Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
+- `ProxyBody::streaming(response)` — Create a streaming body with zero tracking overhead
 - `ProxyBody::streaming_tracked(response, baseline)` — Create a streaming body with completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`
 
 ## When to Use Buffer Mode

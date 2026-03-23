@@ -96,6 +96,7 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
     ferrum_gateway::config::EnvConfig {
         mode: ferrum_gateway::config::env_config::OperatingMode::File,
         log_level: "info".into(),
+        enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,
         proxy_https_port: 8443,
         proxy_tls_cert_path: None,

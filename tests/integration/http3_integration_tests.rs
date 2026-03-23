@@ -103,6 +103,7 @@ fn create_http3_test_env_config() -> EnvConfig {
     EnvConfig {
         mode: ferrum_gateway::config::OperatingMode::File,
         log_level: "debug".to_string(),
+        enable_streaming_latency_tracking: false,
         proxy_http_port: 8080,
         proxy_https_port: 8443,
         proxy_tls_cert_path: None,
