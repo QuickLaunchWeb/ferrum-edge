@@ -1884,9 +1884,43 @@ pub async fn handle_proxy_request(
         resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
     }
 
-    // Build response body: either stream from backend or return buffered data
+    // Build response body: either stream from backend or return buffered data.
+    // For streaming responses, use a tracked body that records the final transfer
+    // time via a shared atomic — a deferred task reads it after the read timeout
+    // to emit a supplementary log with accurate backend_total_ms.
     let body = match response_body {
-        ResponseBody::Streaming(resp) => ProxyBody::streaming(resp),
+        ResponseBody::Streaming(resp) => {
+            let (tracked_body, metrics) = ProxyBody::streaming_tracked(resp, backend_start);
+
+            // Spawn a lightweight deferred task to log the final streaming latency.
+            // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
+            // No string cloning — only the proxy_id and minimal context are captured.
+            let deferred_proxy_id = proxy.id.clone();
+            let deferred_backend_url = strip_query_params(&backend_url);
+            let read_timeout_ms = proxy.backend_read_timeout_ms;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
+                let completed = metrics.completed();
+                let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                if completed {
+                    debug!(
+                        proxy_id = %deferred_proxy_id,
+                        backend_url = %deferred_backend_url,
+                        backend_total_ms = total_ms,
+                        "Streaming response completed"
+                    );
+                } else {
+                    warn!(
+                        proxy_id = %deferred_proxy_id,
+                        backend_url = %deferred_backend_url,
+                        backend_last_frame_ms = total_ms,
+                        "Streaming response incomplete (client disconnect or timeout)"
+                    );
+                }
+            });
+
+            tracked_body
+        }
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 
