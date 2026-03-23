@@ -106,7 +106,7 @@ src/
 ├── proxy/                     # Reverse proxy core
 │   ├── mod.rs                 # ProxyState, handle_proxy_request, URL building
 │   ├── handler.rs             # HTTP request/response processing, plugin lifecycle
-│   ├── body.rs                # ProxyBody sum type (Full vs Stream)
+│   ├── body.rs                # ProxyBody sum type (Full vs Tracked) with StreamingMetrics
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
 │   └── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
 ├── plugins/                   # Plugin system (20 plugins)
