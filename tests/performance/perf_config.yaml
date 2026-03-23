@@ -38,7 +38,6 @@ proxies:
     backend_tls_verify_server_cert: true
     auth_mode: single
     pool_max_idle_per_host: 200
-    pool_idle_timeout_seconds: 180
     plugins: []
 
   - id: "proxy-data"
