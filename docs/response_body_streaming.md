@@ -97,14 +97,12 @@ impl Plugin for MyPlugin {
 
 By default this method returns `false`. When any plugin attached to a proxy returns `true`, the gateway buffers the response regardless of `response_body_mode`.
 
-This is evaluated before the backend request is made:
+This is **pre-computed at config load time** in `PluginCache` and looked up per-request via O(1) HashMap access, avoiding per-request iteration over the plugin list:
 
 ```rust
 let should_stream = match proxy.response_body_mode {
     ResponseBodyMode::Buffer => false,
-    ResponseBodyMode::Stream => {
-        !plugins.iter().any(|p| p.requires_response_body_buffering())
-    }
+    ResponseBodyMode::Stream => !state.plugin_cache.requires_response_body_buffering(&proxy.id),
 };
 ```
 

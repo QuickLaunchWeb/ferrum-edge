@@ -82,10 +82,9 @@ pub struct ProxyState {
     pub health_checker: Arc<HealthChecker>,
     /// Circuit breaker cache for proxy-level circuit breaking.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
-    /// Whether HTTP/3 is enabled (used for Alt-Svc header advertisement)
-    pub enable_http3: bool,
-    /// The HTTPS port (shared by HTTP/3 QUIC listener)
-    pub proxy_https_port: u16,
+    /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
+    /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
+    pub alt_svc_header: Option<String>,
     /// Environment config for backend TLS settings (WebSocket, etc.)
     pub env_config: Arc<crate::config::EnvConfig>,
     // Size limits
@@ -104,8 +103,11 @@ impl ProxyState {
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
     ) -> Self {
-        let enable_http3 = env_config.enable_http3;
-        let proxy_https_port = env_config.proxy_https_port;
+        let alt_svc_header = if env_config.enable_http3 {
+            Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
+        } else {
+            None
+        };
         let max_header_size_bytes = env_config.max_header_size_bytes;
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
         let max_body_size_bytes = env_config.max_body_size_bytes;
@@ -159,8 +161,7 @@ impl ProxyState {
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
-            enable_http3,
-            proxy_https_port,
+            alt_svc_header,
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
@@ -1221,30 +1222,33 @@ pub async fn handle_proxy_request(
     // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
-    // Execute on_request_received hooks
-    for plugin in plugins.iter() {
-        match plugin.on_request_received(&mut ctx).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => {
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
+    // Execute on_request_received hooks (skip iteration when no plugins configured)
+    if !plugins.is_empty() {
+        for plugin in plugins.iter() {
+            match plugin.on_request_received(&mut ctx).await {
+                PluginResult::Reject {
                     status_code,
-                    start_time,
-                    "on_request_received",
-                )
-                .await;
-                record_request(&state, status_code);
-                return Ok(build_reject_response(
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &body,
-                    &headers,
-                ));
+                    body,
+                    headers,
+                } => {
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        status_code,
+                        start_time,
+                        "on_request_received",
+                    )
+                    .await;
+                    record_request(&state, status_code);
+                    return Ok(build_reject_response(
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        &headers,
+                    ));
+                }
+                PluginResult::Continue => {}
             }
-            PluginResult::Continue => {}
         }
     }
 
@@ -1323,27 +1327,31 @@ pub async fn handle_proxy_request(
     }
 
     // Authorization phase (access_control, rate_limiting by consumer, etc.)
-    for plugin in plugins.iter() {
-        match plugin.authorize(&mut ctx).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => {
-                log_rejected_request(&plugins, &ctx, status_code, start_time, "authorize").await;
-                record_request(&state, status_code);
-                return Ok(build_reject_response(
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
-                    &body,
-                    &headers,
-                ));
+    if !plugins.is_empty() {
+        for plugin in plugins.iter() {
+            match plugin.authorize(&mut ctx).await {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
+                    log_rejected_request(&plugins, &ctx, status_code, start_time, "authorize")
+                        .await;
+                    record_request(&state, status_code);
+                    return Ok(build_reject_response(
+                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                        &body,
+                        &headers,
+                    ));
+                }
+                PluginResult::Continue => {}
             }
-            PluginResult::Continue => {}
         }
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them
-    let needs_header_clone = plugins.iter().any(|p| p.modifies_request_headers());
+    let needs_header_clone =
+        !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
     let mut owned_proxy_headers;
     let proxy_headers: &HashMap<String, String> = if needs_header_clone {
         owned_proxy_headers = ctx.headers.clone();
@@ -1585,7 +1593,9 @@ pub async fn handle_proxy_request(
     // forces buffering regardless of the proxy configuration.
     let should_stream = match proxy.response_body_mode {
         ResponseBodyMode::Buffer => false,
-        ResponseBodyMode::Stream => !plugins.iter().any(|p| p.requires_response_body_buffering()),
+        ResponseBodyMode::Stream => !state
+            .plugin_cache
+            .requires_response_body_buffering(&proxy.id),
     };
 
     // Perform the backend request with retry logic
@@ -1705,10 +1715,12 @@ pub async fn handle_proxy_request(
 
     // after_proxy hooks (these only modify headers, not the body,
     // so they are compatible with both streaming and buffered modes)
-    for plugin in plugins.iter() {
-        let _ = plugin
-            .after_proxy(&mut ctx, response_status, &mut response_headers)
-            .await;
+    if !plugins.is_empty() {
+        for plugin in plugins.iter() {
+            let _ = plugin
+                .after_proxy(&mut ctx, response_status, &mut response_headers)
+                .await;
+        }
     }
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -1773,12 +1785,9 @@ pub async fn handle_proxy_request(
         resp_builder = resp_builder.header("X-Gateway-Upstream-Status", "degraded");
     }
 
-    // Advertise HTTP/3 availability via Alt-Svc header
-    if state.enable_http3 {
-        resp_builder = resp_builder.header(
-            "alt-svc",
-            format!("h3=\":{}\"; ma=86400", state.proxy_https_port),
-        );
+    // Advertise HTTP/3 availability via pre-computed Alt-Svc header
+    if let Some(ref alt_svc) = state.alt_svc_header {
+        resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
     }
 
     // Build response body: either stream from backend or return buffered data
@@ -2349,6 +2358,7 @@ fn collect_response_headers(
     source: &reqwest::header::HeaderMap,
     target: &mut HashMap<String, String>,
 ) {
+    target.reserve(source.keys_len());
     for (k, v) in source {
         if let Ok(vs) = v.to_str() {
             let key = k.as_str().to_string();
