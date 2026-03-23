@@ -161,10 +161,12 @@ impl LoadBalancerCache {
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {
-            let key = target_key(target);
+            // Use pre-computed target_keys when possible to avoid format!() allocation
+            let key = balancer.find_target_key(target);
+            let key_str = key.unwrap_or_else(|| target_key(target));
             balancer
                 .active_connections
-                .entry(key)
+                .entry(key_str)
                 .or_insert_with(|| AtomicI64::new(0))
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -174,9 +176,18 @@ impl LoadBalancerCache {
     pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {
-            let key = target_key(target);
-            if let Some(count) = balancer.active_connections.get(&key) {
-                count.fetch_sub(1, Ordering::Relaxed);
+            let key = balancer.find_target_key(target);
+            let key_ref = key.as_deref().unwrap_or("");
+            // Try to find with pre-computed key first
+            if !key_ref.is_empty() {
+                if let Some(count) = balancer.active_connections.get(key_ref) {
+                    count.fetch_sub(1, Ordering::Relaxed);
+                }
+            } else {
+                let fallback = target_key(target);
+                if let Some(count) = balancer.active_connections.get(&fallback) {
+                    count.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -200,15 +211,13 @@ struct LoadBalancer {
     active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
     hash_ring: Vec<(u64, usize)>,
-    /// Hash on field (e.g., "ip", "header:X-User-Id", "consumer").
-    hash_on: Option<String>,
 }
 
 impl LoadBalancer {
     fn new(
         algorithm: LoadBalancerAlgorithm,
         targets: &[UpstreamTarget],
-        hash_on: Option<String>,
+        _hash_on: Option<String>,
     ) -> Self {
         let wrr_weights: Vec<AtomicI64> = targets.iter().map(|_| AtomicI64::new(0)).collect();
         // Pre-compute target keys once at build time, not per-request
@@ -237,8 +246,17 @@ impl LoadBalancer {
             wrr_weights,
             active_connections: DashMap::new(),
             hash_ring,
-            hash_on,
         }
+    }
+
+    /// Find the pre-computed target key for a target, avoiding allocation.
+    fn find_target_key(&self, target: &UpstreamTarget) -> Option<String> {
+        for (i, t) in self.targets.iter().enumerate() {
+            if t.host == target.host && t.port == target.port {
+                return Some(self.target_keys[i].clone());
+            }
+        }
+        None
     }
 
     fn healthy_targets(
@@ -428,18 +446,13 @@ impl LoadBalancer {
             return None;
         }
 
-        let key = match &self.hash_on {
-            Some(_) => ctx_key.to_string(),
-            None => ctx_key.to_string(),
-        };
+        // ctx_key is typically the client IP; hash_on is reserved for future use
+        // (e.g. hash on specific header or consumer ID)
+        let key = ctx_key;
 
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-
-        // Create set of valid original indices
-        let valid_indices: std::collections::HashSet<usize> =
-            candidates.iter().map(|(idx, _)| *idx).collect();
 
         // Binary search on the ring
         let pos = match self.hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
@@ -447,11 +460,12 @@ impl LoadBalancer {
             Err(p) => p % self.hash_ring.len().max(1),
         };
 
-        // Walk the ring from pos to find a valid (healthy) target
+        // Walk the ring from pos to find a valid (healthy) target.
+        // Use linear scan of candidates slice instead of HashSet (faster for typical small counts).
         for i in 0..self.hash_ring.len() {
             let ring_idx = (pos + i) % self.hash_ring.len();
             let target_idx = self.hash_ring[ring_idx].1;
-            if valid_indices.contains(&target_idx) {
+            if candidates.iter().any(|(idx, _)| *idx == target_idx) {
                 return Some(self.targets[target_idx].clone());
             }
         }

@@ -221,15 +221,25 @@ impl ConnectionPool {
     /// entry because `reqwest::Client` handles per-host connection pooling
     /// internally — different target hostnames in the URL get separate TCP
     /// connections and TLS sessions (with correct SNI) automatically.
+    /// Create pool key for caching clients.
+    ///
+    /// Only includes fields that affect connection *behavior* — host, port,
+    /// protocol, pool size, and DNS override.  `idle_timeout_seconds` is
+    /// intentionally excluded: it controls when idle connections are reaped
+    /// but does not change how connections are created or used, so proxies
+    /// with different idle timeouts can safely share a `reqwest::Client`
+    /// (which has its own internal connection pool keyed by URL).  Including
+    /// idle_timeout would cause unnecessary pool fragmentation — e.g., 50
+    /// proxies with slightly different timeouts hitting the same backend
+    /// would create 50 separate clients instead of 1.
     fn create_pool_key(&self, proxy: &Proxy, config: &PoolConfig) -> String {
         let override_str = proxy.dns_override.as_deref().unwrap_or_default();
         format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}",
             proxy.backend_host,
             proxy.backend_port,
             proxy.backend_protocol as u8,
             config.max_idle_per_host,
-            config.idle_timeout_seconds,
             override_str
         )
     }
