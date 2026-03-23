@@ -668,6 +668,96 @@ impl DatabaseStore {
         Ok(rows.is_empty())
     }
 
+    /// Check if a proxy name is unique (when present).
+    /// Returns `true` if the name is unique (no conflicts found).
+    pub async fn check_proxy_name_unique(
+        &self,
+        name: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
+            sqlx::query("SELECT id FROM proxies WHERE name = ? AND id != ?")
+                .bind(name)
+                .bind(eid)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query("SELECT id FROM proxies WHERE name = ?")
+                .bind(name)
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok(rows.is_empty())
+    }
+
+    /// Check if an upstream name is unique (when present).
+    /// Returns `true` if the name is unique (no conflicts found).
+    pub async fn check_upstream_name_unique(
+        &self,
+        name: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
+            sqlx::query("SELECT id FROM upstreams WHERE name = ? AND id != ?")
+                .bind(name)
+                .bind(eid)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query("SELECT id FROM upstreams WHERE name = ?")
+                .bind(name)
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok(rows.is_empty())
+    }
+
+    /// Check if a keyauth API key is unique across all consumers.
+    /// Returns `true` if the key is unique (no conflicts found).
+    ///
+    /// Since the API key is stored inside the credentials JSON blob,
+    /// this loads all consumers and checks in application code.
+    pub async fn check_keyauth_key_unique(
+        &self,
+        api_key: &str,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
+            .fetch_all(&self.pool)
+            .await?;
+
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            if let Some(eid) = exclude_consumer_id
+                && id == eid
+            {
+                continue;
+            }
+            let creds_str: String = row.try_get("credentials").unwrap_or_default();
+            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str)
+                && let Some(key) = creds
+                    .get("keyauth")
+                    .and_then(|k| k.get("key"))
+                    .and_then(|k| k.as_str())
+                && key == api_key
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Check if an upstream with the given ID exists.
+    /// Returns `true` if the upstream exists.
+    pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query("SELECT id FROM upstreams WHERE id = ?")
+            .bind(upstream_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     pub fn pool(&self) -> &AnyPool {
         &self.pool
     }

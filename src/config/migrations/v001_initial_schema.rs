@@ -33,7 +33,7 @@ impl V001InitialSchema {
         let create_upstreams = r#"
             CREATE TABLE IF NOT EXISTS upstreams (
                 id TEXT PRIMARY KEY,
-                name TEXT,
+                name TEXT UNIQUE,
                 targets TEXT NOT NULL DEFAULT '[]',
                 algorithm TEXT NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
@@ -58,7 +58,7 @@ impl V001InitialSchema {
         let create_proxies = r#"
             CREATE TABLE IF NOT EXISTS proxies (
                 id TEXT PRIMARY KEY,
-                name TEXT,
+                name TEXT UNIQUE,
                 listen_path TEXT NOT NULL UNIQUE,
                 backend_protocol TEXT NOT NULL DEFAULT 'http',
                 backend_host TEXT NOT NULL,

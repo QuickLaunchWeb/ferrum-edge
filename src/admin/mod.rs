@@ -422,7 +422,7 @@ async fn handle_create_proxy(
     proxy.created_at = Utc::now();
     proxy.updated_at = Utc::now();
 
-    // Check uniqueness
+    // Check listen_path uniqueness
     match db.check_listen_path_unique(&proxy.listen_path, None).await {
         Ok(true) => {}
         Ok(false) => {
@@ -436,6 +436,44 @@ async fn handle_create_proxy(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": format!("Database error: {}", e)}),
             ));
+        }
+    }
+
+    // Check proxy name uniqueness (when present)
+    if let Some(ref name) = proxy.name {
+        match db.check_proxy_name_unique(name, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!("Proxy name '{}' already exists", name)}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
+    // Validate upstream_id references an existing upstream
+    if let Some(ref uid) = proxy.upstream_id {
+        match db.check_upstream_exists(uid).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("upstream_id '{}' does not exist", uid)}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
         }
     }
 
@@ -544,7 +582,7 @@ async fn handle_update_proxy(
     proxy.id = id.to_string();
     proxy.updated_at = Utc::now();
 
-    // Check uniqueness (excluding self)
+    // Check listen_path uniqueness (excluding self)
     match db
         .check_listen_path_unique(&proxy.listen_path, Some(id))
         .await
@@ -561,6 +599,44 @@ async fn handle_update_proxy(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": format!("{}", e)}),
             ));
+        }
+    }
+
+    // Check proxy name uniqueness excluding self (when present)
+    if let Some(ref name) = proxy.name {
+        match db.check_proxy_name_unique(name, Some(id)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!("Proxy name '{}' already exists", name)}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
+    // Validate upstream_id references an existing upstream
+    if let Some(ref uid) = proxy.upstream_id {
+        match db.check_upstream_exists(uid).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("upstream_id '{}' does not exist", uid)}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
         }
     }
 
@@ -715,6 +791,27 @@ async fn handle_create_consumer(
         ));
     }
 
+    // Check keyauth API key uniqueness (if present in credentials)
+    if let Some(key_creds) = consumer.credentials.get("keyauth")
+        && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+    {
+        match db.check_keyauth_key_unique(key, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A consumer with this API key already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
     match db.create_consumer(&consumer).await {
         Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(consumer))),
         Err(e) => {
@@ -817,6 +914,27 @@ async fn handle_update_consumer(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": e}),
         ));
+    }
+
+    // Check keyauth API key uniqueness excluding self (if present)
+    if let Some(key_creds) = consumer.credentials.get("keyauth")
+        && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+    {
+        match db.check_keyauth_key_unique(key, Some(id)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A consumer with this API key already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
     }
 
     match db.update_consumer(&consumer).await {
@@ -922,6 +1040,27 @@ async fn handle_update_credentials(
                     obj.remove("password");
                 }
             }
+            // Check keyauth API key uniqueness before updating
+            if cred_type == "keyauth"
+                && let Some(key) = hashed_cred.get("key").and_then(|k| k.as_str())
+            {
+                match db.check_keyauth_key_unique(key, Some(consumer_id)).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(json_response(
+                            StatusCode::CONFLICT,
+                            &json!({"error": "A consumer with this API key already exists"}),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": format!("Database error: {}", e)}),
+                        ));
+                    }
+                }
+            }
+
             consumer
                 .credentials
                 .insert(cred_type.to_string(), hashed_cred);
@@ -1279,6 +1418,25 @@ async fn handle_create_upstream(
         ));
     }
 
+    // Check upstream name uniqueness (when present)
+    if let Some(ref name) = upstream.name {
+        match db.check_upstream_name_unique(name, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!("Upstream name '{}' already exists", name)}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
     match db.create_upstream(&upstream).await {
         Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(upstream))),
         Err(e) => Ok(json_response(
@@ -1368,6 +1526,25 @@ async fn handle_update_upstream(
             StatusCode::BAD_REQUEST,
             &json!({"error": "At least one target is required"}),
         ));
+    }
+
+    // Check upstream name uniqueness excluding self (when present)
+    if let Some(ref name) = upstream.name {
+        match db.check_upstream_name_unique(name, Some(id)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!("Upstream name '{}' already exists", name)}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
     }
 
     match db.update_upstream(&upstream).await {

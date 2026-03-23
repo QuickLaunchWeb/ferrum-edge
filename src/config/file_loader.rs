@@ -93,6 +93,62 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
+    // Validate consumer credential (keyauth API key) uniqueness
+    if let Err(dupes) = config.validate_unique_consumer_credentials() {
+        for msg in &dupes {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} duplicate consumer credential(s) found. \
+             Each consumer must have a unique keyauth API key.",
+            dupes.len()
+        );
+    }
+
+    // Validate upstream name uniqueness
+    if let Err(dupes) = config.validate_unique_upstream_names() {
+        for msg in &dupes {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} duplicate upstream name(s) found",
+            dupes.len()
+        );
+    }
+
+    // Validate proxy name uniqueness
+    if let Err(dupes) = config.validate_unique_proxy_names() {
+        for msg in &dupes {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} duplicate proxy name(s) found",
+            dupes.len()
+        );
+    }
+
+    // Validate upstream references exist
+    if let Err(errors) = config.validate_upstream_references() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid upstream reference(s) found",
+            errors.len()
+        );
+    }
+
+    // Validate plugin name uniqueness per proxy
+    if let Err(errors) = config.validate_unique_plugins_per_proxy() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} duplicate plugin(s) per proxy found",
+            errors.len()
+        );
+    }
+
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
         config.version,

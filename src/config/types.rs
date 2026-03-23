@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Load balancing algorithm for distributing requests across upstream targets.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -522,6 +522,149 @@ impl GatewayConfig {
             Ok(())
         } else {
             Err(duplicates)
+        }
+    }
+
+    /// Validate that consumer keyauth API keys are unique across all consumers.
+    ///
+    /// If two consumers share the same API key, the ConsumerIndex silently
+    /// overwrites one, causing the wrong consumer to be authenticated.
+    pub fn validate_unique_consumer_credentials(&self) -> Result<(), Vec<String>> {
+        let mut seen_keyauth: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for consumer in &self.consumers {
+            if let Some(key_creds) = consumer.credentials.get("keyauth")
+                && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+                && let Some(existing_id) = seen_keyauth.insert(key, &consumer.id)
+            {
+                // Do NOT include the API key value in the error message for security
+                duplicates.push(format!(
+                    "Duplicate keyauth API key in consumer '{}' (conflicts with consumer '{}')",
+                    consumer.id, existing_id
+                ));
+            }
+        }
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Validate that upstream names are unique when present.
+    ///
+    /// The `name` field is optional — multiple upstreams with `None` names
+    /// are allowed. Only non-empty names must be unique.
+    pub fn validate_unique_upstream_names(&self) -> Result<(), Vec<String>> {
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for upstream in &self.upstreams {
+            if let Some(ref name) = upstream.name
+                && let Some(existing_id) = seen.insert(name.as_str(), &upstream.id)
+            {
+                duplicates.push(format!(
+                    "Duplicate upstream name '{}' in upstream '{}' (conflicts with '{}')",
+                    name, upstream.id, existing_id
+                ));
+            }
+        }
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Validate that proxy names are unique when present.
+    ///
+    /// The `name` field is optional — multiple proxies with `None` names
+    /// are allowed. Only non-empty names must be unique.
+    pub fn validate_unique_proxy_names(&self) -> Result<(), Vec<String>> {
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for proxy in &self.proxies {
+            if let Some(ref name) = proxy.name
+                && let Some(existing_id) = seen.insert(name.as_str(), &proxy.id)
+            {
+                duplicates.push(format!(
+                    "Duplicate proxy name '{}' in proxy '{}' (conflicts with '{}')",
+                    name, proxy.id, existing_id
+                ));
+            }
+        }
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Validate that proxy upstream_id references point to existing upstreams.
+    ///
+    /// In database mode the DB enforces this via foreign key constraints.
+    /// In file mode there's no DB, so this catches dangling references
+    /// at config load time.
+    pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
+        let upstream_ids: HashSet<&str> = self.upstreams.iter().map(|u| u.id.as_str()).collect();
+        let mut errors = Vec::new();
+
+        for proxy in &self.proxies {
+            if let Some(ref uid) = proxy.upstream_id
+                && !upstream_ids.contains(uid.as_str())
+            {
+                errors.push(format!(
+                    "Proxy '{}' references non-existent upstream_id '{}'",
+                    proxy.id, uid
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate that each proxy has at most one plugin of each type.
+    ///
+    /// If a proxy has two plugin configs with the same `plugin_name`, the
+    /// PluginCache silently uses last-one-wins. This validation catches
+    /// that misconfiguration at load time.
+    pub fn validate_unique_plugins_per_proxy(&self) -> Result<(), Vec<String>> {
+        let plugin_name_by_id: HashMap<&str, &str> = self
+            .plugin_configs
+            .iter()
+            .map(|pc| (pc.id.as_str(), pc.plugin_name.as_str()))
+            .collect();
+
+        let mut errors = Vec::new();
+
+        for proxy in &self.proxies {
+            let mut seen_names: HashMap<&str, &str> = HashMap::new();
+            for assoc in &proxy.plugins {
+                if let Some(&plugin_name) = plugin_name_by_id.get(assoc.plugin_config_id.as_str())
+                    && let Some(existing_config_id) =
+                        seen_names.insert(plugin_name, &assoc.plugin_config_id)
+                {
+                    errors.push(format!(
+                        "Proxy '{}' has duplicate plugin '{}' (config IDs '{}' and '{}')",
+                        proxy.id, plugin_name, existing_config_id, assoc.plugin_config_id
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 
