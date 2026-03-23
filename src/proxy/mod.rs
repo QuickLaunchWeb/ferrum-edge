@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{
     WebSocketStream, connect_async_tls_with_config, tungstenite::handshake::derive_accept_key,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::PoolConfig;
@@ -395,10 +395,31 @@ async fn handle_connection(
         async move { handle_proxy_request(req, state, addr, false).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
-        debug!("Connection error: {}", e);
+        let err_string = e.to_string();
+        if is_client_disconnect_error(&err_string) {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                error_kind = "client_disconnect",
+                error = %e,
+                "Client disconnected before response completed"
+            );
+        } else {
+            debug!(error = %e, "Connection error");
+        }
     }
 
     Ok(())
+}
+
+/// Check if a hyper connection error indicates a client disconnect.
+fn is_client_disconnect_error(err: &str) -> bool {
+    err.contains("connection reset")
+        || err.contains("broken pipe")
+        || err.contains("connection abort")
+        || err.contains("not connected")
+        || err.contains("early eof")
+        || err.contains("incomplete message")
+        || err.contains("connection closed before")
 }
 
 /// Set TCP keepalive on a stream to detect dead connections.
@@ -459,8 +480,11 @@ async fn handle_websocket_request_authenticated(
             Ok(stream) => stream,
             Err(e) => {
                 error!(
-                    "WebSocket backend connection failed for authenticated {}: {}",
-                    proxy.id, e
+                    proxy_id = %proxy.id,
+                    backend_url = %backend_url,
+                    error_kind = "connect_failure",
+                    error = %e,
+                    "WebSocket backend connection failed"
                 );
                 state.request_count.fetch_add(1, Ordering::Relaxed);
                 record_status(&state, 502);
@@ -495,6 +519,7 @@ async fn handle_websocket_request_authenticated(
         latency_backend_ttfb_ms: 0.0,
         latency_backend_total_ms: 0.0,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        client_disconnected: false,
         metadata: ctx.metadata.clone(),
     };
 
@@ -800,6 +825,13 @@ async fn connect_websocket_backend(
         match tokio::time::timeout(connect_timeout, connect_future).await {
             Ok(result) => result?,
             Err(_) => {
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_url = %backend_url,
+                    timeout_ms = proxy.backend_connect_timeout_ms,
+                    error_kind = "connect_timeout",
+                    "WebSocket backend connect timeout"
+                );
                 return Err(format!(
                     "WebSocket backend connect timeout ({}ms) for proxy {}",
                     proxy.backend_connect_timeout_ms, proxy.id
@@ -808,7 +840,7 @@ async fn connect_websocket_backend(
             }
         };
 
-    info!("Connected to backend WebSocket server: {}", backend_url);
+    debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
 
     Ok(backend_ws_stream)
@@ -839,42 +871,42 @@ async fn run_websocket_proxy(
 
     // Forward messages from client to backend
     let client_to_backend = async move {
-        info!("Starting client -> backend message forwarding");
+        debug!("Starting client -> backend message forwarding");
         while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    debug!("Client -> Backend: Text({})", text);
+                    trace!("Client -> Backend: Text message");
                     if let Err(e) = backend_sink.send(Message::Text(text)).await {
                         error!("Failed to send text to backend: {}", e);
                         break;
                     }
                 }
                 Ok(Message::Binary(data)) => {
-                    debug!("Client -> Backend: Binary({} bytes)", data.len());
+                    trace!(bytes = data.len(), "Client -> Backend: Binary message");
                     if let Err(e) = backend_sink.send(Message::Binary(data)).await {
                         error!("Failed to send binary to backend: {}", e);
                         break;
                     }
                 }
                 Ok(Message::Ping(data)) => {
-                    debug!("Client -> Backend: Ping");
+                    trace!("Client -> Backend: Ping");
                     if let Err(e) = backend_sink.send(Message::Ping(data)).await {
                         error!("Failed to send ping to backend: {}", e);
                         break;
                     }
                 }
                 Ok(Message::Close(close_frame)) => {
-                    info!("Client sent close frame");
+                    debug!("Client sent close frame");
                     if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
                         error!("Failed to send close to backend: {}", e);
                     }
                     break;
                 }
                 Ok(Message::Pong(_data)) => {
-                    debug!("Client -> Backend: Pong");
+                    trace!("Client -> Backend: Pong");
                 }
                 Ok(Message::Frame(_)) => {
-                    debug!("Client -> Backend: Frame");
+                    trace!("Client -> Backend: Frame");
                 }
                 Err(e) => {
                     error!("Error receiving from client: {}", e);
@@ -882,47 +914,47 @@ async fn run_websocket_proxy(
                 }
             }
         }
-        info!("Client -> backend forwarding completed");
+        debug!("Client -> backend forwarding completed");
     };
 
     // Forward messages from backend to client
     let backend_to_client = async move {
-        info!("Starting backend -> client message forwarding");
+        debug!("Starting backend -> client message forwarding");
         while let Some(msg) = backend_stream.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    debug!("Backend -> Client: Text({})", text);
+                    trace!("Backend -> Client: Text message");
                     if let Err(e) = ws_sink.send(Message::Text(text)).await {
                         error!("Failed to send text to client: {}", e);
                         break;
                     }
                 }
                 Ok(Message::Binary(data)) => {
-                    debug!("Backend -> Client: Binary({} bytes)", data.len());
+                    trace!(bytes = data.len(), "Backend -> Client: Binary message");
                     if let Err(e) = ws_sink.send(Message::Binary(data)).await {
                         error!("Failed to send binary to client: {}", e);
                         break;
                     }
                 }
                 Ok(Message::Ping(data)) => {
-                    debug!("Backend -> Client: Ping");
+                    trace!("Backend -> Client: Ping");
                     if let Err(e) = ws_sink.send(Message::Ping(data)).await {
                         error!("Failed to send ping to client: {}", e);
                         break;
                     }
                 }
                 Ok(Message::Close(close_frame)) => {
-                    info!("Backend sent close frame");
+                    debug!("Backend sent close frame");
                     if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
                         error!("Failed to send close to client: {}", e);
                     }
                     break;
                 }
                 Ok(Message::Pong(_data)) => {
-                    debug!("Backend -> Client: Pong");
+                    trace!("Backend -> Client: Pong");
                 }
                 Ok(Message::Frame(_)) => {
-                    debug!("Backend -> Client: Frame");
+                    trace!("Backend -> Client: Frame");
                 }
                 Err(e) => {
                     error!("Error receiving from backend: {}", e);
@@ -930,20 +962,20 @@ async fn run_websocket_proxy(
                 }
             }
         }
-        info!("Backend -> client forwarding completed");
+        debug!("Backend -> client forwarding completed");
     };
 
     // Wait for either direction to complete
     tokio::select! {
         _ = client_to_backend => {
-            info!("Client to backend stream completed first");
+            debug!("Client to backend stream completed first");
         }
         _ = backend_to_client => {
-            info!("Backend to client stream completed first");
+            debug!("Backend to client stream completed first");
         }
     }
 
-    info!("WebSocket proxy connection closed for {}", proxy_id);
+    debug!("WebSocket proxy connection closed for {}", proxy_id);
     Ok(())
 }
 
@@ -1047,7 +1079,21 @@ async fn handle_tls_connection(
         async move { handle_proxy_request(req, state, addr, true).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
-        error!("HTTP connection error over TLS: {}", e);
+        let err_string = e.to_string();
+        if is_client_disconnect_error(&err_string) {
+            debug!(
+                remote_addr = %remote_addr.ip(),
+                error_kind = "client_disconnect",
+                error = %e,
+                "Client disconnected before response completed (TLS)"
+            );
+        } else {
+            error!(
+                remote_addr = %remote_addr.ip(),
+                error = %e,
+                "HTTP connection error over TLS"
+            );
+        }
     }
 
     Ok(())
@@ -1099,6 +1145,7 @@ pub async fn log_rejected_request(
         latency_backend_ttfb_ms: -1.0,
         latency_backend_total_ms: -1.0,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        client_disconnected: false,
         metadata,
     };
 
@@ -1208,6 +1255,7 @@ pub async fn handle_proxy_request(
     let proxy = match matched_proxy {
         Some(p) => p,
         None => {
+            debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
             state.request_count.fetch_add(1, Ordering::Relaxed);
             record_status(&state, 404);
             return Ok(build_response(
@@ -1218,6 +1266,7 @@ pub async fn handle_proxy_request(
     };
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+    debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
     // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
@@ -1491,6 +1540,7 @@ pub async fn handle_proxy_request(
                         latency_backend_ttfb_ms: backend_total_ms,
                         latency_backend_total_ms: backend_total_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        client_disconnected: false,
                         metadata: ctx.metadata.clone(),
                     };
                     for plugin in plugins.iter() {
@@ -1543,8 +1593,30 @@ pub async fn handle_proxy_request(
             &hash_key,
             Some(&state.health_checker.unhealthy_targets),
         ) {
-            Some(selection) => (Some(selection.target), selection.is_fallback),
-            None => (None, false),
+            Some(selection) => {
+                if selection.is_fallback {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        upstream_id = %upstream_id,
+                        target_host = %selection.target.host,
+                        target_port = selection.target.port,
+                        "All upstream targets unhealthy, using fallback target"
+                    );
+                } else {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        upstream_id = %upstream_id,
+                        target_host = %selection.target.host,
+                        target_port = selection.target.port,
+                        "Upstream target selected"
+                    );
+                }
+                (Some(selection.target), selection.is_fallback)
+            }
+            None => {
+                warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
+                (None, false)
+            }
         }
     } else {
         (None, false)
@@ -1558,6 +1630,7 @@ pub async fn handle_proxy_request(
         {
             Ok(cb) => Some(cb),
             Err(_) => {
+                warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
                 log_rejected_request(&plugins, &ctx, 503, start_time, "circuit_breaker_open").await;
                 record_request(&state, 503);
                 return Ok(build_response(
@@ -1641,9 +1714,12 @@ pub async fn handle_proxy_request(
                 current_target = Some(next);
             }
 
-            debug!(
-                "Retrying request to {} (attempt {}/{}, connection_error={})",
-                current_url, attempt, retry_config.max_retries, result.connection_error
+            warn!(
+                proxy_id = %proxy.id,
+                attempt = attempt,
+                max_retries = retry_config.max_retries,
+                connection_error = result.connection_error,
+                "Retrying backend request"
             );
 
             // Build a minimal request for retry (body was consumed on first attempt).
@@ -1681,6 +1757,13 @@ pub async fn handle_proxy_request(
     let response_status = backend_resp.status_code;
     let response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
+
+    debug!(
+        proxy_id = %proxy.id,
+        status = response_status,
+        connection_error = backend_resp.connection_error,
+        "Backend response received"
+    );
 
     // End connection tracking for least-connections
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
@@ -1743,6 +1826,7 @@ pub async fn handle_proxy_request(
             latency_backend_ttfb_ms: backend_ttfb_ms,
             latency_backend_total_ms: backend_total_ms,
             request_user_agent: ctx.headers.get("user-agent").cloned(),
+            client_disconnected: false,
             metadata: ctx.metadata.clone(),
         };
 
@@ -1999,15 +2083,29 @@ async fn proxy_to_backend_retry(
             }
         }
         Err(e) => {
-            error!("Backend retry request failed: {}", e);
-            let is_connect = e.is_connect() || e.is_timeout();
+            let is_connect = e.is_connect();
+            let is_timeout = e.is_timeout();
+            let error_kind = if is_connect {
+                "connect_failure"
+            } else if is_timeout {
+                "read_timeout"
+            } else {
+                "request_error"
+            };
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %backend_url,
+                error_kind = error_kind,
+                error = %e,
+                "Backend retry request failed"
+            );
             retry::BackendResponse {
                 status_code: 502,
                 body: ResponseBody::Buffered(
                     r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
-                connection_error: is_connect,
+                connection_error: is_connect || is_timeout,
             }
         }
     }
@@ -2192,8 +2290,21 @@ async fn proxy_to_backend(
             match original_req.into_body().collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
                 Err(e) => {
-                    warn!("Failed to read request body: {}", e);
-                    Vec::new()
+                    error!(
+                        proxy_id = %proxy.id,
+                        backend_url = %backend_url,
+                        error_kind = "client_disconnect",
+                        error = %e,
+                        "Client disconnected while sending request body"
+                    );
+                    return retry::BackendResponse {
+                        status_code: 499,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: true,
+                    };
                 }
             }
         };
@@ -2285,15 +2396,29 @@ async fn proxy_to_backend(
             }
         }
         Err(e) => {
-            error!("Backend request failed: {}", e);
-            let is_connect = e.is_connect() || e.is_timeout();
+            let is_connect = e.is_connect();
+            let is_timeout = e.is_timeout();
+            let error_kind = if is_connect {
+                "connect_failure"
+            } else if is_timeout {
+                "read_timeout"
+            } else {
+                "request_error"
+            };
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %backend_url,
+                error_kind = error_kind,
+                error = %e,
+                "Backend request failed"
+            );
             retry::BackendResponse {
                 status_code: 502,
                 body: ResponseBody::Buffered(
                     r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
-                connection_error: is_connect,
+                connection_error: is_connect || is_timeout,
             }
         }
     }
@@ -2423,14 +2548,20 @@ async fn proxy_to_backend_http3(
     original_req: Request<Incoming>,
     client_ip: &str,
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
-    info!("Proxying request to HTTP/3 backend: {}", backend_url);
+    debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
     // Create HTTP/3 client with TLS configuration
     let tls_config = state.connection_pool.get_tls_config_for_backend(proxy);
     let http3_client = match Http3Client::new(tls_config) {
         Ok(client) => client,
         Err(e) => {
-            error!("Failed to create HTTP/3 client: {}", e);
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %backend_url,
+                error_kind = "client_creation",
+                error = %e,
+                "Failed to create HTTP/3 client"
+            );
             let body = r#"{"error":"HTTP/3 client creation failed"}"#;
             return (502, body.as_bytes().to_vec(), HashMap::new());
         }
@@ -2465,7 +2596,13 @@ async fn proxy_to_backend_http3(
         match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
-                error!("Failed to read request body: {}", e);
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_url = %backend_url,
+                    error_kind = "client_disconnect",
+                    error = %e,
+                    "Client disconnected while sending request body (HTTP/3)"
+                );
                 Bytes::new()
             }
         }
@@ -2514,11 +2651,25 @@ async fn proxy_to_backend_http3(
         .await
     {
         Ok(response) => {
-            info!("HTTP/3 backend request successful");
+            debug!(proxy_id = %proxy.id, status = response.0, "HTTP/3 backend request successful");
             (response.0, response.1, response.2)
         }
         Err(e) => {
-            error!("HTTP/3 backend request failed: {}", e);
+            let error_kind =
+                if e.to_string().contains("timeout") || e.to_string().contains("timed out") {
+                    "read_timeout"
+                } else if e.to_string().contains("connect") || e.to_string().contains("refused") {
+                    "connect_failure"
+                } else {
+                    "request_error"
+                };
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %backend_url,
+                error_kind = error_kind,
+                error = %e,
+                "HTTP/3 backend request failed"
+            );
             (
                 502,
                 r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
