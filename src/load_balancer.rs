@@ -470,12 +470,17 @@ impl LoadBalancer {
             Err(p) => p % self.hash_ring.len().max(1),
         };
 
+        // Build a set of candidate target indices for O(1) membership check.
+        // This avoids O(candidates) inner scan per ring position, turning the
+        // worst case from O(ring_size × candidates) to O(ring_size).
+        let candidate_set: std::collections::HashSet<usize> =
+            candidates.iter().map(|(idx, _)| *idx).collect();
+
         // Walk the ring from pos to find a valid (healthy) target.
-        // Use linear scan of candidates slice instead of HashSet (faster for typical small counts).
         for i in 0..self.hash_ring.len() {
             let ring_idx = (pos + i) % self.hash_ring.len();
             let target_idx = self.hash_ring[ring_idx].1;
-            if candidates.iter().any(|(idx, _)| *idx == target_idx) {
+            if candidate_set.contains(&target_idx) {
                 return Some(self.targets[target_idx].clone());
             }
         }

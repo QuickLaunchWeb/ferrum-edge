@@ -23,12 +23,15 @@ struct RouteEntry {
 ///
 /// The route table is rebuilt atomically (via ArcSwap) whenever configuration changes,
 /// keeping the rebuild off the hot request path. Repeated path lookups hit a DashMap
-/// cache for O(1) performance.
+/// cache for O(1) performance. Negative lookups (no route matched) are also cached
+/// to prevent O(n) rescans from scanner traffic.
 pub struct RouterCache {
     /// Pre-sorted route entries (longest listen_path first) for early-exit prefix scan.
     route_table: ArcSwap<Vec<RouteEntry>>,
     /// Bounded cache: request path → matched proxy for O(1) repeated lookups.
-    path_cache: DashMap<String, Arc<Proxy>>,
+    /// `None` entries represent negative cache (no route matched this path),
+    /// preventing O(n) rescans from scanner/bot traffic.
+    path_cache: DashMap<String, Option<Arc<Proxy>>>,
     /// Maximum entries in path_cache before eviction.
     max_cache_entries: usize,
     /// Monotonic counter used for random-sample eviction (avoids clearing entire cache).
@@ -67,33 +70,43 @@ impl RouterCache {
 
     /// Find the matching proxy for a request path.
     ///
-    /// 1. O(1) DashMap cache lookup for repeated paths
+    /// 1. O(1) DashMap cache lookup for repeated paths (including negative cache)
     /// 2. Falls back to pre-sorted route table scan (first match = longest prefix)
-    /// 3. Caches the result for future O(1) hits
+    /// 3. Caches the result (including misses) for future O(1) hits
     pub fn find_proxy(&self, path: &str) -> Option<Arc<Proxy>> {
-        // Fast path: check the path cache
+        // Fast path: check the path cache (includes negative entries)
         if let Some(entry) = self.path_cache.get(path) {
-            return Some(Arc::clone(entry.value()));
+            return entry.value().clone();
         }
 
         // Slow path: scan pre-sorted route table (longest listen_path first)
         let table = self.route_table.load();
         let result = table
             .iter()
-            .find(|entry| path.starts_with(&entry.listen_path))
+            .find(|entry| {
+                // Path must match the listen_path exactly or the listen_path must
+                // be followed by '/' or '?' to respect path boundaries.
+                // This prevents "/api" from matching "/api-internal".
+                if path == entry.listen_path {
+                    true
+                } else if path.starts_with(&entry.listen_path) {
+                    entry.listen_path.ends_with('/')
+                        || path.as_bytes().get(entry.listen_path.len()) == Some(&b'/')
+                        || path.as_bytes().get(entry.listen_path.len()) == Some(&b'?')
+                } else {
+                    false
+                }
+            })
             .map(|entry| Arc::clone(&entry.proxy));
 
-        // Cache the result (including None → we skip caching misses to avoid
-        // unbounded growth from random paths / scanners)
-        if let Some(ref proxy) = result {
-            // Bound memory: if cache is too large, evict ~25% of entries using
-            // random sampling instead of clearing everything. This avoids a
-            // thundering herd of O(n) route scans after eviction.
-            if self.path_cache.len() >= self.max_cache_entries {
-                self.evict_sample();
-            }
-            self.path_cache.insert(path.to_string(), Arc::clone(proxy));
+        // Cache both hits AND misses. Negative cache entries (None) prevent
+        // O(n) rescans for repeated scanner/bot traffic hitting non-existent
+        // paths. Bounded by max_cache_entries with eviction.
+        if self.path_cache.len() >= self.max_cache_entries {
+            self.evict_sample();
         }
+        self.path_cache
+            .insert(path.to_string(), result.as_ref().map(Arc::clone));
 
         result
     }
@@ -169,6 +182,11 @@ impl RouterCache {
         // priority over a shorter cached match).
         let before = self.path_cache.len();
         self.path_cache.retain(|cached_path, _| {
+            // Evict both positive and negative cache entries affected by changed routes.
+            // A cached path "/api/v2/users" is invalidated if any affected listen_path
+            // (e.g. "/api/v2") is a prefix of it, OR vice versa. This correctly
+            // invalidates negative cache entries too (a new route could match a
+            // previously unmatched path).
             !affected_listen_paths.iter().any(|lp| {
                 cached_path.starts_with(lp.as_str()) || lp.starts_with(cached_path.as_str())
             })

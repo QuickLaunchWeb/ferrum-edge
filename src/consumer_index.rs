@@ -73,9 +73,9 @@ impl ConsumerIndex {
 
     /// Incrementally update the consumer index by applying only the changes.
     ///
-    /// Clones the current maps, removes deleted consumers' index entries,
-    /// and inserts/overwrites added or modified consumers. Untouched
-    /// consumers keep their existing Arc references — no reallocation.
+    /// Uses O(1) HashMap removal by pre-indexing old credential keys instead of
+    /// O(n) `.retain()` loops per consumer. This keeps delta application fast even
+    /// at 100k+ consumers with thousands of modifications per reload.
     pub fn apply_delta(&self, added: &[Consumer], removed_ids: &[String], modified: &[Consumer]) {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
             return;
@@ -87,31 +87,75 @@ impl ConsumerIndex {
         let mut identity = self.identity_index.load().as_ref().clone();
         let mut all: Vec<Arc<Consumer>> = self.all_consumers.load().as_ref().clone();
 
-        // Remove deleted consumers from all indexes
-        if !removed_ids.is_empty() {
-            let removed_set: std::collections::HashSet<&str> =
-                removed_ids.iter().map(|s| s.as_str()).collect();
+        // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
+        let ids_to_remove: std::collections::HashSet<&str> = removed_ids
+            .iter()
+            .map(|s| s.as_str())
+            .chain(modified.iter().map(|c| c.id.as_str()))
+            .collect();
 
-            // Remove from all-consumers list
-            all.retain(|c| !removed_set.contains(c.id.as_str()));
+        if !ids_to_remove.is_empty() {
+            // Build a reverse index: consumer_id → old credential keys, so we can
+            // do O(1) HashMap::remove instead of O(n) retain loops.
+            // Scan the all-consumers list once to find old entries for removed/modified IDs.
+            let mut old_keyauth_keys: Vec<String> = Vec::new();
+            let mut old_basic_keys: Vec<String> = Vec::new();
+            let mut old_identity_keys: Vec<String> = Vec::new();
 
-            // Remove from credential indexes (need to find their keys)
-            keyauth.retain(|_, c| !removed_set.contains(c.id.as_str()));
-            basic.retain(|_, c| !removed_set.contains(c.id.as_str()));
-            identity.retain(|_, c| !removed_set.contains(c.id.as_str()));
+            for consumer in all.iter() {
+                if !ids_to_remove.contains(consumer.id.as_str()) {
+                    continue;
+                }
+                // Collect old keyauth credential key
+                if let Some(key_creds) = consumer.credentials.get("keyauth")
+                    && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+                {
+                    old_keyauth_keys.push(key.to_string());
+                }
+                // Collect old basicauth username
+                if consumer.credentials.contains_key("basicauth") {
+                    old_basic_keys.push(consumer.username.clone());
+                }
+                // Collect old identity keys (username, id, custom_id)
+                old_identity_keys.push(consumer.username.clone());
+                old_identity_keys.push(consumer.id.clone());
+                if let Some(ref custom_id) = consumer.custom_id {
+                    old_identity_keys.push(custom_id.clone());
+                }
+            }
+
+            // O(1) removals from credential indexes using collected keys
+            for key in &old_keyauth_keys {
+                // Only remove if the entry actually belongs to a consumer being removed
+                if let Some(existing) = keyauth.get(key)
+                    && ids_to_remove.contains(existing.id.as_str())
+                {
+                    keyauth.remove(key);
+                }
+            }
+            for key in &old_basic_keys {
+                if let Some(existing) = basic.get(key)
+                    && ids_to_remove.contains(existing.id.as_str())
+                {
+                    basic.remove(key);
+                }
+            }
+            for key in &old_identity_keys {
+                if let Some(existing) = identity.get(key)
+                    && ids_to_remove.contains(existing.id.as_str())
+                {
+                    identity.remove(key);
+                }
+            }
+
+            // Remove from all-consumers list (single pass with HashSet lookup)
+            all.retain(|c| !ids_to_remove.contains(c.id.as_str()));
         }
 
-        // Upsert added and modified consumers
+        // Insert added and modified consumers
         for consumer in added.iter().chain(modified.iter()) {
             let arc_consumer = Arc::new(consumer.clone());
 
-            // For modified: remove old entries first (username/custom_id may have changed)
-            all.retain(|c| c.id != consumer.id);
-            keyauth.retain(|_, c| c.id != consumer.id);
-            basic.retain(|_, c| c.id != consumer.id);
-            identity.retain(|_, c| c.id != consumer.id);
-
-            // Insert new entries
             all.push(Arc::clone(&arc_consumer));
 
             if let Some(key_creds) = consumer.credentials.get("keyauth")
