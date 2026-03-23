@@ -89,6 +89,9 @@ impl GrpcConnectionPool {
         pool
     }
 
+    /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
+    /// Adding fields causes pool fragmentation and P95 latency regressions.
+    /// See `ConnectionPool::create_pool_key` for detailed rationale.
     fn pool_key(proxy: &Proxy) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
         format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)

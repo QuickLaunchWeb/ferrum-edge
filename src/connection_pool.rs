@@ -222,6 +222,11 @@ impl ConnectionPool {
     /// connections and TLS sessions (with correct SNI) automatically.
     /// Create pool key for caching clients.
     ///
+    /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
+    /// Adding fields causes pool fragmentation: N proxies with different values
+    /// create N separate reqwest::Client instances instead of sharing one,
+    /// which destroys connection reuse and causes P95 latency regressions.
+    ///
     /// Only includes fields that affect connection *behavior* — host, port,
     /// protocol, pool size, and DNS override.  `idle_timeout_seconds` is
     /// intentionally excluded: it controls when idle connections are reaped
