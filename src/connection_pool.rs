@@ -257,7 +257,7 @@ impl ConnectionPool {
     /// Start background cleanup task for idle connections
     fn start_cleanup_task(&self) {
         let pools = self.pools.clone();
-        let idle_timeout_ms = self.global_config.idle_timeout_seconds * 1000;
+        let idle_timeout_ms = self.global_config.idle_timeout_seconds.saturating_mul(1000);
         let interval = self.cleanup_interval;
 
         tokio::spawn(async move {
@@ -289,9 +289,13 @@ impl ConnectionPool {
     /// Get pool statistics for monitoring
     #[allow(dead_code)]
     pub fn get_stats(&self) -> PoolStats {
+        let mut entries_per_host = std::collections::HashMap::new();
+        for entry in self.pools.iter() {
+            entries_per_host.insert(entry.key().clone(), 1usize);
+        }
         PoolStats {
             total_pools: self.pools.len(),
-            entries_per_host: std::collections::HashMap::new(),
+            entries_per_host,
             max_idle_per_host: self.global_config.max_idle_per_host,
             idle_timeout_seconds: self.global_config.idle_timeout_seconds,
         }
@@ -300,13 +304,82 @@ impl ConnectionPool {
     /// Get TLS configuration for HTTP/3 backend connections.
     ///
     /// Configures ALPN with `h3` protocol and ensures TLS 1.3 is available
-    /// (required for QUIC/HTTP/3).
-    pub fn get_tls_config_for_backend(&self, _proxy: &Proxy) -> Arc<rustls::ClientConfig> {
-        let mut client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            ))
-            .with_no_client_auth();
+    /// (required for QUIC/HTTP/3). Respects proxy-specific TLS settings
+    /// for custom CA bundles and mTLS client certificates.
+    pub fn get_tls_config_for_backend(&self, proxy: &Proxy) -> Arc<rustls::ClientConfig> {
+        use rustls_pemfile::certs;
+        use std::io::BufReader;
+
+        // Build root certificate store, using proxy CA or system roots
+        let mut root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        // Add proxy-specific CA certificate if configured
+        if let Some(ref ca_path) = proxy.backend_tls_server_ca_cert_path
+            && let Ok(ca_file) = std::fs::File::open(ca_path)
+        {
+            let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+                .filter_map(|r| r.ok())
+                .collect();
+            let (added, _) = root_store.add_parsable_certificates(ca_certs);
+            if added > 0 {
+                tracing::debug!(
+                    "Added {} CA certificates from {} for HTTP/3 backend",
+                    added,
+                    ca_path
+                );
+            }
+        }
+
+        // Build client config with optional mTLS
+        let mut client_config = if let (Some(cert_path), Some(key_path)) = (
+            &proxy.backend_tls_client_cert_path,
+            &proxy.backend_tls_client_key_path,
+        ) {
+            // mTLS: load client certificate and key
+            match (
+                std::fs::File::open(cert_path),
+                std::fs::File::open(key_path),
+            ) {
+                (Ok(cert_file), Ok(key_file)) => {
+                    let client_certs: Vec<_> = certs(&mut BufReader::new(cert_file))
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    let client_keys: Vec<_> =
+                        rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_file))
+                            .filter_map(|r| r.ok())
+                            .collect();
+                    if let Some(key) = client_keys.into_iter().next() {
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_client_auth_cert(client_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
+                            .unwrap_or_else(|e| {
+                                tracing::warn!("Failed to configure mTLS for HTTP/3: {}, falling back to no client auth", e);
+                                rustls::ClientConfig::builder()
+                                    .with_root_certificates(rustls::RootCertStore::from_iter(
+                                        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                                    ))
+                                    .with_no_client_auth()
+                            })
+                    } else {
+                        tracing::warn!("No private keys found in {} for HTTP/3 mTLS", key_path);
+                        rustls::ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_no_client_auth()
+                    }
+                }
+                _ => {
+                    tracing::warn!("Failed to open mTLS certificate files for HTTP/3");
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth()
+                }
+            }
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
 
         // HTTP/3 requires ALPN protocol "h3"
         client_config.alpn_protocols = vec![b"h3".to_vec()];

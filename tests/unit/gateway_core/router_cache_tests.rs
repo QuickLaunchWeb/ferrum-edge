@@ -347,13 +347,20 @@ fn test_cache_stores_different_paths() {
 
 #[test]
 fn test_cache_miss_not_cached() {
-    // Misses (None) should NOT be cached to avoid unbounded growth from scanners
+    // Misses (None) ARE cached as negative entries to prevent O(n) rescans
+    // from scanner/bot traffic. The cache is bounded by max_cache_entries.
     let config = test_config(vec![test_proxy("api", "/api")]);
     let cache = RouterCache::new(&config, 100);
 
     let result = cache.find_proxy("/other/path");
     assert!(result.is_none());
-    assert_eq!(cache.cache_len(), 0);
+    // Negative entry is cached
+    assert_eq!(cache.cache_len(), 1);
+
+    // Second lookup hits the negative cache (O(1) instead of O(n) rescan)
+    let result2 = cache.find_proxy("/other/path");
+    assert!(result2.is_none());
+    assert_eq!(cache.cache_len(), 1);
 }
 
 #[test]

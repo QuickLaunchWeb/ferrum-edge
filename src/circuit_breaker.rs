@@ -215,6 +215,14 @@ impl CircuitBreakerCache {
         cb.can_execute()?;
         Ok(cb)
     }
+
+    /// Remove circuit breakers for proxies that no longer exist in config.
+    /// Prevents unbounded memory growth when proxies are frequently added/deleted.
+    pub fn prune(&self, removed_proxy_ids: &[String]) {
+        for id in removed_proxy_ids {
+            self.breakers.remove(id);
+        }
+    }
 }
 
 fn now_epoch_ms() -> u64 {

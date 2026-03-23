@@ -20,12 +20,18 @@ fn target_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
+/// Maximum entries in the recent_failures DashMap per target.
+/// Prevents unbounded memory growth during cascading failure scenarios
+/// where failure rate vastly exceeds the window cleanup rate.
+const MAX_RECENT_FAILURES_PER_TARGET: usize = 1000;
+
 /// Health state for a single target.
 struct TargetHealth {
     consecutive_successes: AtomicU32,
     consecutive_failures: AtomicU32,
     /// Recent failure timestamps (epoch ms) for passive windowed counting.
     /// Key is a monotonic counter, value is the timestamp.
+    /// Bounded to MAX_RECENT_FAILURES_PER_TARGET entries.
     recent_failures: dashmap::DashMap<u64, u64>,
     failure_counter: AtomicU64,
 }
@@ -164,6 +170,21 @@ impl HealthChecker {
             state
                 .recent_failures
                 .retain(|_, &mut ts| ts >= window_start);
+
+            // Hard cap: if failure rate exceeds cleanup rate (cascading failure),
+            // evict oldest entries to prevent unbounded memory growth.
+            if state.recent_failures.len() > MAX_RECENT_FAILURES_PER_TARGET {
+                let excess = state.recent_failures.len() - MAX_RECENT_FAILURES_PER_TARGET;
+                let mut to_remove: Vec<u64> = state
+                    .recent_failures
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .collect();
+                to_remove.sort_unstable();
+                for key in to_remove.into_iter().take(excess) {
+                    state.recent_failures.remove(&key);
+                }
+            }
 
             let failures_in_window = state.recent_failures.len() as u32;
             if failures_in_window >= config.unhealthy_threshold

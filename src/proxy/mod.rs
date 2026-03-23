@@ -246,6 +246,11 @@ impl ProxyState {
             &delta.modified_upstreams,
         );
 
+        // --- CircuitBreakerCache: prune breakers for deleted proxies ---
+        if !delta.removed_proxy_ids.is_empty() {
+            self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
+        }
+
         // Swap the canonical config last (readers may still be using old caches
         // via ArcSwap snapshots until they finish their current request)
         self.config.store(Arc::new(new_config));
@@ -1056,12 +1061,13 @@ pub async fn handle_proxy_request(
         let header_size = name.as_str().len() + value.len();
         if header_size > state.max_single_header_size_bytes {
             record_request(&state, 431);
+            // Escape header name to prevent JSON injection from client-controlled data
+            let escaped_name = name.as_str().replace('\\', "\\\\").replace('"', "\\\"");
             return Ok(build_response(
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                 &format!(
                     r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
-                    name.as_str(),
-                    state.max_single_header_size_bytes
+                    escaped_name, state.max_single_header_size_bytes
                 ),
             ));
         }
@@ -1839,14 +1845,22 @@ async fn proxy_to_backend_retry(
         other => match reqwest::Method::from_bytes(other.as_bytes()) {
             Ok(m) => m,
             Err(_) => {
-                warn!("Unsupported HTTP method: {}, forwarding as-is", other);
-                reqwest::Method::GET
+                warn!("Invalid HTTP method on retry: {}", other);
+                return retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                };
             }
         },
     };
 
     let mut req_builder = client.request(req_method, backend_url);
 
+    // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -1858,7 +1872,15 @@ async fn proxy_to_backend_retry(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
-            "connection" | "transfer-encoding" => continue,
+            // Hop-by-hop headers per RFC 7230 Section 6.1
+            "connection"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -1989,15 +2011,22 @@ async fn proxy_to_backend(
         other => match reqwest::Method::from_bytes(other.as_bytes()) {
             Ok(m) => m,
             Err(_) => {
-                warn!("Unsupported HTTP method: {}, forwarding as-is", other);
-                reqwest::Method::GET
+                warn!("Invalid HTTP method: {}", other);
+                return retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                };
             }
         },
     };
 
     let mut req_builder = client.request(req_method, backend_url);
 
-    // Forward headers
+    // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -2009,7 +2038,15 @@ async fn proxy_to_backend(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
-            "connection" | "transfer-encoding" => continue, // hop-by-hop
+            // Hop-by-hop headers per RFC 7230 Section 6.1
+            "connection"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
