@@ -360,7 +360,12 @@ impl EnvConfig {
 
             // Client IP resolution
             trusted_proxies: env::var("FERRUM_TRUSTED_PROXIES").unwrap_or_default(),
-            real_ip_header: env::var("FERRUM_REAL_IP_HEADER").ok(),
+            // Pre-lowercase at load time so the hot path avoids per-request
+            // to_lowercase() allocation when looking up this header in ctx.headers
+            // (which stores hyper's already-lowercased header names).
+            real_ip_header: env::var("FERRUM_REAL_IP_HEADER")
+                .ok()
+                .map(|h| h.to_lowercase()),
         };
 
         config.validate()?;

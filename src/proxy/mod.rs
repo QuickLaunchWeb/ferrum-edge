@@ -320,6 +320,7 @@ impl ProxyState {
             });
         }
 
+        // Clear cached pool keys when proxy settings change
         // Swap the canonical config last (readers may still be using old caches
         // via ArcSwap snapshots until they finish their current request)
         self.config.store(Arc::new(new_config));
@@ -1194,8 +1195,10 @@ pub async fn handle_proxy_request(
         }
         total_header_size += header_size;
         if let Ok(v) = value.to_str() {
-            ctx.headers
-                .insert(name.as_str().to_lowercase(), v.to_string());
+            // hyper's HeaderName is already lowercase-normalized, so
+            // name.as_str() returns a lowercase &str — skip to_lowercase()
+            // to avoid a per-header String allocation on the hot path.
+            ctx.headers.insert(name.as_str().to_owned(), v.to_owned());
         }
     }
     if total_header_size > state.max_header_size_bytes {
@@ -1212,7 +1215,8 @@ pub async fn handle_proxy_request(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
+            // real_ip_header is pre-lowercased at config load time — no allocation needed
+            let header_val = ctx.headers.get(real_ip_header.as_str());
             if let Some(val) = header_val {
                 // Validate the direct connection is from a trusted proxy before
                 // trusting this header
@@ -2507,11 +2511,18 @@ fn strip_query_params(url: &str) -> String {
 }
 
 fn record_status(state: &ProxyState, status: u16) {
-    state
-        .status_counts
-        .entry(status)
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+    // Fast path: get() uses a read lock (shared), which is much cheaper than
+    // entry() which always takes a write lock. Since status codes are a small
+    // fixed set, the entry almost always exists after the first request.
+    if let Some(counter) = state.status_counts.get(&status) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    } else {
+        state
+            .status_counts
+            .entry(status)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn record_request(state: &ProxyState, status: u16) {

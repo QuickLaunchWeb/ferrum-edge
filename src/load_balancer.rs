@@ -161,19 +161,18 @@ impl LoadBalancerCache {
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {
-            // Use pre-computed target_keys via O(1) index lookup to avoid format!() allocation.
-            // Only fall back to format!() if target isn't in the index (shouldn't happen).
-            if let Some(key) = balancer.find_target_key(target) {
+            let key = balancer.find_target_key(target).unwrap_or("");
+            if key.is_empty() {
+                return;
+            }
+            // Fast path: get() uses a shared read lock. entry() takes a write
+            // lock and clones the key — avoid it when the counter already exists.
+            if let Some(counter) = balancer.active_connections.get(key) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            } else {
                 balancer
                     .active_connections
                     .entry(key.to_owned())
-                    .or_insert_with(|| AtomicI64::new(0))
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                let fallback_key = target_key(target);
-                balancer
-                    .active_connections
-                    .entry(fallback_key)
                     .or_insert_with(|| AtomicI64::new(0))
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -184,27 +183,14 @@ impl LoadBalancerCache {
     pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {
-            // Use pre-computed target_keys via O(1) index lookup to avoid format!() allocation.
-            let key_ref = balancer.find_target_key(target).unwrap_or("");
-            let lookup_key = if !key_ref.is_empty() {
-                key_ref
-            } else {
-                // Shouldn't happen — fall back to format for safety
-                ""
-            };
-            if !lookup_key.is_empty() {
-                if let Some(count) = balancer.active_connections.get(lookup_key) {
-                    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    });
-                }
-            } else {
-                let fallback = target_key(target);
-                if let Some(count) = balancer.active_connections.get(&fallback) {
-                    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    });
-                }
+            let key = balancer.find_target_key(target).unwrap_or("");
+            if key.is_empty() {
+                return;
+            }
+            if let Some(count) = balancer.active_connections.get(key) {
+                let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    if v > 0 { Some(v - 1) } else { None }
+                });
             }
         }
     }
@@ -277,12 +263,16 @@ impl LoadBalancer {
         }
     }
 
-    /// Find the pre-computed target key for a target via O(1) index lookup.
-    /// Returns a borrowed reference to avoid per-request String allocation.
+    /// Find the pre-computed target key for a target without allocating.
+    /// Uses a linear scan of the (typically 2-5 element) targets vec, which is
+    /// faster than a HashMap lookup that requires cloning the host String.
     fn find_target_key(&self, target: &UpstreamTarget) -> Option<&str> {
-        self.target_index
-            .get(&(target.host.clone(), target.port))
-            .map(|&i| self.target_keys[i].as_str())
+        for (i, t) in self.targets.iter().enumerate() {
+            if t.host == target.host && t.port == target.port {
+                return Some(self.target_keys[i].as_str());
+            }
+        }
+        None
     }
 
     /// Build a bitmask of healthy target indices. Avoids per-request Vec allocation.
