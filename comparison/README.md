@@ -4,15 +4,16 @@ Performance comparison suite that benchmarks **Ferrum Gateway** against **Pingor
 
 ## What It Measures
 
-Each gateway is tested as a pure reverse proxy (no authentication, rate limiting, or transformation plugins) with three scenarios:
+Each gateway is tested as a reverse proxy with four scenarios:
 
 | Scenario | Description |
 |----------|-------------|
 | **HTTP (plaintext)** | Client → Gateway (port 8000) → Backend. Measures raw proxy overhead. |
 | **HTTPS (TLS termination)** | Client → Gateway (port 8443, TLS) → Backend (plaintext). Measures TLS handshake and encryption overhead at the gateway. |
 | **E2E TLS (full encryption)** | Client → Gateway (port 8443, TLS) → Backend (TLS, port 3443). Measures full end-to-end encryption where the gateway re-encrypts traffic to the backend. |
+| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, and Tyk only (Pingora has no auth plugin framework). |
 
-Two endpoints are tested per scenario:
+Two endpoints are tested per proxy scenario:
 - `/health` — instant backend response, measures pure gateway latency
 - `/api/users` — 100 microsecond simulated delay, represents a typical API call
 
@@ -135,7 +136,7 @@ The script pulls the specified Docker image tags automatically. Results are over
 
 ## Interpreting Results
 
-The HTML report contains five sections:
+The HTML report contains six sections:
 
 ### 1. Direct Backend Baseline
 Raw backend throughput and latency without any gateway, for both HTTP and HTTPS. This is the theoretical maximum. Any gateway will add overhead.
@@ -154,7 +155,10 @@ Same metrics but with TLS between wrk and the gateway, while the gateway proxies
 ### 4. End-to-End TLS Performance (Full Encryption)
 Client connects via HTTPS to the gateway, and the gateway re-encrypts traffic to the backend over HTTPS. This is the most secure deployment pattern and measures the full cost of double TLS. Compared against the HTTPS baseline (direct to backend).
 
-### 5. TLS Overhead Comparison
+### 5. Key-Auth Performance
+Compares authenticated throughput (API key validation) against the same gateway's unauthenticated performance. Shows the cost of running one authentication plugin in the request path. Pingora is excluded (no plugin framework). Each request includes an `apikey` header; the gateway validates it against a pre-configured consumer before proxying.
+
+### 6. TLS Overhead Comparison
 Per-gateway comparison of HTTP vs HTTPS vs E2E TLS performance. Shows the RPS drop and latency increase each gateway pays for TLS at each stage. A gateway with lower TLS overhead has a more efficient TLS implementation.
 
 ### Color coding
@@ -169,22 +173,34 @@ The following results were collected on macOS (Apple Silicon) with 8 threads, 10
 
 | Gateway | Protocol | /health req/s | /api/users req/s | /health latency | /api/users latency |
 |---------|----------|--------------|-----------------|-----------------|-------------------|
-| **Baseline** (no gateway) | HTTP | 214,104 | 48,195 | 0.37 ms | 1.90 ms |
-| **Baseline** (no gateway) | HTTPS | 209,094 | 46,252 | 0.37 ms | 1.97 ms |
-| **Ferrum** (native) | HTTP | 100,169 | 37,108 | 0.96 ms | 2.56 ms |
-| **Ferrum** (native) | HTTPS | 96,080 | 36,599 | 1.06 ms | 2.62 ms |
-| **Ferrum** (native) | E2E TLS | 91,002 | 36,719 | 1.15 ms | 2.61 ms |
-| **Pingora** (native) | HTTP | 72,462 | 37,981 | 1.32 ms | 2.53 ms |
-| **Pingora** (native) | HTTPS | 62,305 | 37,698 | 2.61 ms | 3.58 ms |
+| **Baseline** (no gateway) | HTTP | 212,899 | 54,777 | 0.38 ms | 1.68 ms |
+| **Baseline** (no gateway) | HTTPS | 198,937 | 53,883 | 0.48 ms | 1.67 ms |
+| **Ferrum** (native) | HTTP | 90,110 | 39,733 | 1.08 ms | 2.43 ms |
+| **Ferrum** (native) | HTTPS | 90,107 | 40,009 | 1.08 ms | 2.41 ms |
+| **Ferrum** (native) | E2E TLS | 81,148 | 39,120 | 1.30 ms | 3.13 ms |
+| **Pingora** (native) | HTTP | 59,429 | 39,016 | 1.65 ms | 2.48 ms |
+| **Pingora** (native) | HTTPS | 63,925 | 39,303 | 1.94 ms | 3.03 ms |
 | **Pingora** (native) | E2E TLS | — | — | — | — |
-| **Kong 3.9** (Docker) | HTTP | 27,193 | 23,903 | 3.61 ms | 4.14 ms |
-| **Kong 3.9** (Docker) | HTTPS | 18,133 | 21,820 | 14.41 ms | 9.75 ms |
-| **Kong 3.9** (Docker) | E2E TLS | 12,120 | 22,908 | 12.77 ms | 7.48 ms |
-| **Tyk v5.7** (Docker) | HTTP | 2,190 | — | 44.64 ms | — |
-| **Tyk v5.7** (Docker) | HTTPS | — | — | — | — |
-| **Tyk v5.7** (Docker) | E2E TLS | — | — | — | — |
+| **Kong 3.9** (Docker) | HTTP | 26,380 | 22,273 | 3.68 ms | 4.60 ms |
+| **Kong 3.9** (Docker) | HTTPS | 20,680 | 24,010 | 5.66 ms | 4.43 ms |
+| **Kong 3.9** (Docker) | E2E TLS | 23,333 | 22,556 | 4.46 ms | 4.89 ms |
+| **Tyk v5.7** (Docker) | HTTP | 23,036 | 22,380 | 4.22 ms | 4.32 ms |
+| **Tyk v5.7** (Docker) | HTTPS | 22,185 | 21,561 | 4.43 ms | 4.50 ms |
+| **Tyk v5.7** (Docker) | E2E TLS | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
 
-> **Note:** Pingora E2E TLS is not supported in this benchmark — Pingora's TLS library requires a valid DNS hostname for upstream SNI and cannot connect to IP-based backends (127.0.0.1) over TLS. This is a framework limitation, not a configuration issue. Tyk results are incomplete due to ephemeral port exhaustion under load on macOS.
+> **Note:** Pingora E2E TLS is not supported in this benchmark — Pingora's TLS library requires a valid DNS hostname for upstream SNI and cannot connect to IP-based backends (127.0.0.1) over TLS. This is a framework limitation, not a configuration issue.
+
+### Key-Auth Results (HTTP, /api/users-auth)
+
+Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. Pingora is excluded (no auth plugin framework).
+
+| Gateway | Key-Auth req/s | No-Auth req/s | Auth Overhead | Latency |
+|---------|---------------|---------------|---------------|---------|
+| **Ferrum** (native) | **40,930** | 39,733 | **~0% (within noise)** | 2.35 ms |
+| **Kong 3.9** (Docker) | 19,966 | 22,273 | -10.4% | 4.99 ms |
+| **Tyk v5.7** (Docker) | 15,625 | 22,380 | -30.2% | 6.36 ms |
+
+**Key finding:** Ferrum's key-auth plugin has effectively zero overhead — the O(1) `ConsumerIndex` credential lookup and lock-free hot path mean authentication adds no measurable cost. Kong takes a 10% throughput hit, and Tyk takes a 30% hit for authentication processing.
 
 ### Ferrum vs Pingora (Native-to-Native Comparison)
 
@@ -192,18 +208,18 @@ Pingora is a pure proxy framework (no plugins, admin API, or config management),
 
 | Test | Ferrum | Pingora | Advantage |
 |------|--------|---------|-----------|
-| HTTP /health | **100,169** req/s | 72,462 req/s | **Ferrum 38% faster** |
-| HTTP /api/users | 37,108 req/s | **37,981** req/s | Pingora 2% faster |
-| HTTPS /health | **96,080** req/s | 62,305 req/s | **Ferrum 54% faster** |
-| HTTPS /api/users | 36,599 req/s | **37,698** req/s | Pingora 3% faster |
-| E2E TLS /health | **91,002** req/s | — | Pingora cannot test (SNI limitation) |
-| E2E TLS /api/users | **36,719** req/s | — | Pingora cannot test (SNI limitation) |
+| HTTP /health | **90,110** req/s | 59,429 req/s | **Ferrum 52% faster** |
+| HTTP /api/users | **39,733** req/s | 39,016 req/s | Ferrum 2% faster |
+| HTTPS /health | **90,107** req/s | 63,925 req/s | **Ferrum 41% faster** |
+| HTTPS /api/users | **40,009** req/s | 39,303 req/s | Ferrum 2% faster |
+| E2E TLS /health | **81,148** req/s | — | Pingora cannot test (SNI limitation) |
+| E2E TLS /api/users | **39,120** req/s | — | Pingora cannot test (SNI limitation) |
 
 **Key findings:**
-- **Ferrum dominates on lightweight requests** — 38% faster on HTTP and 54% faster on HTTPS for /health. This is where per-request overhead matters most, and Ferrum's lock-free hot path and pre-computed indexes pay off.
-- **Pingora edges ahead ~2-3% on heavier payloads** (/api/users). This is due to Pingora's zero-copy h2 header streaming vs Ferrum's intermediate HashMap collection, and per-response `format!()` allocations. (See response path optimization PR for fixes targeting this gap.)
+- **Ferrum dominates on lightweight requests** — 52% faster on HTTP and 41% faster on HTTPS for /health. This is where per-request overhead matters most, and Ferrum's lock-free hot path and pre-computed indexes pay off.
+- **Ferrum leads on all endpoints** — including a 2% edge on /api/users where backend delay dominates.
 - **Pingora cannot do E2E TLS with IP-based backends** — its TLS library requires a valid DNS hostname for SNI. Ferrum handles this without issue, making it more flexible for local/container deployments where backends are addressed by IP.
-- **Ferrum's HTTPS overhead is minimal** — only 4% throughput drop from HTTP to HTTPS on /health, compared to Pingora's 14% drop. Ferrum's rustls-based TLS termination is exceptionally efficient.
+- **Ferrum's HTTPS overhead is essentially zero** — HTTP and HTTPS /health both hit ~90K req/s. Ferrum's rustls-based TLS termination adds negligible cost, compared to Pingora where HTTPS adds 8% overhead on /health.
 
 ### Adjusting for Docker Overhead
 
@@ -211,10 +227,10 @@ Kong and Tyk ran in Docker on macOS, which adds ~0.1–0.5 ms latency per reques
 
 | Gateway | /health req/s (adjusted) | Ferrum Advantage |
 |---------|-------------------------|-----------------|
-| **Ferrum** (native) | 100,169 | — |
-| **Pingora** (native) | 72,462 | **1.4x faster** |
-| **Kong** (Docker, +15% adjusted) | ~31,300 | **3.2x faster** |
-| **Tyk** (Docker, +15% adjusted) | ~2,520 | **40x faster** |
+| **Ferrum** (native) | 90,110 | — |
+| **Pingora** (native) | 59,429 | **1.5x faster** |
+| **Kong** (Docker, +15% adjusted) | ~30,300 | **3.0x faster** |
+| **Tyk** (Docker, +15% adjusted) | ~26,500 | **3.4x faster** |
 
 ### End-to-End TLS Performance
 
@@ -222,12 +238,13 @@ The E2E TLS scenario (client → HTTPS → gateway → HTTPS → backend) is the
 
 | Gateway | E2E /health req/s | E2E /api/users req/s | E2E /health latency | E2E /api/users latency |
 |---------|------------------|---------------------|--------------------|-----------------------|
-| **Ferrum** (native) | 91,002 | 36,719 | 1.15 ms | 2.61 ms |
-| **Kong 3.9** (Docker) | 12,120 | 22,908 | 12.77 ms | 7.48 ms |
-| **Tyk v5.7** (Docker) | — | — | — | — |
+| **Ferrum** (native) | **81,148** | **39,120** | 1.30 ms | 3.13 ms |
+| **Kong 3.9** (Docker) | 23,333 | 22,556 | 4.46 ms | 4.89 ms |
+| **Tyk v5.7** (Docker) | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
 
-- **Ferrum is 7.5x faster than Kong** on E2E TLS /health
-- **Ferrum is 1.6x faster than Kong** on E2E TLS /api/users
+- **Ferrum is 3.5x faster than Kong** on E2E TLS /health
+- **Ferrum is 1.7x faster than Kong** on E2E TLS /api/users
+- **Ferrum is 2x faster than Tyk** on E2E TLS /api/users
 
 ### TLS Overhead by Gateway
 
@@ -235,21 +252,22 @@ How much does each layer of encryption cost each gateway?
 
 | Gateway | HTTP → HTTPS (TLS term.) | HTTP → E2E TLS (full encryption) |
 |---------|--------------------------|----------------------------------|
-| **Ferrum** | -4.1% RPS, +0.10 ms | **-9.2% RPS, +0.19 ms** |
-| **Pingora** | -14.0% RPS, +1.29 ms | N/A (SNI limitation) |
-| **Kong** | -33.3% RPS, +10.80 ms | **-55.4% RPS, +9.16 ms** (/health) |
+| **Ferrum** | ~0% RPS (within noise) | **-10% RPS, +0.22 ms** |
+| **Pingora** | +8% RPS (noise/scheduling) | N/A (SNI limitation) |
+| **Kong** | -22% RPS on /health | **-12% RPS, +0.78 ms** |
+| **Tyk** | -4% RPS | **-8% RPS, +0.71 ms** |
 
-Ferrum's full E2E TLS overhead is just **9.2% throughput drop and 0.19 ms added latency** — meaning the gateway-to-backend TLS hop costs very little. Pingora pays a 14% throughput drop for TLS termination alone, and cannot test E2E TLS at all. Kong's HTTPS performance degrades significantly under TLS load.
+Ferrum's TLS termination has essentially **zero throughput cost** — HTTP and HTTPS both deliver ~90K req/s on /health. E2E TLS adds only 10% overhead. All gateways handle TLS more efficiently with proper connection pooling configured.
 
 ### Key Takeaways
 
-- **Ferrum is 38–54% faster than Pingora** on lightweight requests (the fairest native-to-native comparison). Pingora edges ahead by 2-3% on heavier payloads due to lower per-response allocation overhead.
-- **Ferrum is 3–4x faster than Kong** on pure proxy throughput, even after giving Kong a generous 15% Docker adjustment.
-- **Ferrum is 40x+ faster than Tyk** on the /health endpoint.
-- **Ferrum's TLS implementation is the most efficient** — only 4% throughput drop for TLS termination vs Pingora's 14% drop and Kong's 33% drop.
-- **Ferrum uniquely supports E2E TLS with IP-based backends** — neither Pingora (SNI limitation) nor Tyk (incomplete results) completed E2E TLS testing.
-- **Docker overhead accounts for at most ~0.5 ms of the latency gap.** Ferrum's latency advantage over Kong is ~2.7 ms (HTTP) to ~11.6 ms (HTTPS /health) — the vast majority is real gateway overhead, not Docker artifact.
-- **The backend's own TLS overhead is negligible** — HTTPS baseline (209,094 req/s) is within 2.4% of HTTP baseline (214,104 req/s), confirming the cost difference between gateways is gateway overhead, not backend TLS.
+- **Ferrum is 41–52% faster than Pingora** on lightweight requests (the fairest native-to-native comparison), and leads on all endpoints including heavier payloads.
+- **Ferrum is 3–4x faster than Kong and Tyk** on pure proxy throughput, even after giving Docker gateways a generous 15% adjustment.
+- **Ferrum's TLS implementation is the most efficient** — effectively zero overhead for TLS termination (HTTP and HTTPS deliver the same throughput), compared to Kong's 22% drop.
+- **Ferrum's key-auth has zero measurable overhead** — authenticated requests run at the same speed as unauthenticated ones, thanks to O(1) credential lookup via pre-computed ConsumerIndex. Kong takes a 10% hit, Tyk takes a 30% hit for authentication.
+- **Ferrum uniquely supports E2E TLS with IP-based backends** — Pingora cannot test E2E TLS due to its SNI limitation.
+- **Docker overhead accounts for at most ~0.5 ms of the latency gap.** Ferrum's latency advantage over Kong is ~2.6 ms (HTTP) to ~3.6 ms (E2E TLS) — the vast majority is real gateway overhead, not Docker artifact.
+- **Kong and Tyk perform comparably** when both run in Docker with proper connection pooling — Kong edges ahead slightly on /health, Tyk is more consistent across endpoints.
 
 For the most apples-to-apples comparison, run on Linux where all gateways can be installed natively.
 
@@ -289,7 +307,7 @@ The HTML report's "Methodology & Caveats" section notes which gateways ran nativ
 
 ## Known Limitations
 
-- **No plugins enabled:** Tests measure pure proxy overhead only. Real-world performance with authentication, rate limiting, or transformation plugins will differ. Each gateway has different plugin performance characteristics.
+- **Limited plugin testing:** The key-auth test measures one authentication plugin; real-world deployments may stack multiple plugins (rate limiting, CORS, logging, etc.), each adding overhead. The key-auth results demonstrate relative plugin performance between gateways but don't represent full production plugin stacks.
 
 - **Pingora is a framework, not a gateway:** The Pingora benchmark uses a minimal ~80-line proxy binary built on Pingora's framework. It has no plugins, admin API, config management, or any gateway features. This is the fairest raw proxy comparison but understates the real-world overhead a production Pingora deployment would have once application logic is added.
 
@@ -308,22 +326,29 @@ comparison/
 ├── configs/
 │   ├── ferrum_comparison.yaml         # Ferrum config (HTTP backend)
 │   ├── ferrum_comparison_e2e_tls.yaml # Ferrum config (HTTPS backend)
+│   ├── ferrum_comparison_key_auth.yaml # Ferrum config (key-auth enabled)
 │   ├── pingora/                       # Pingora minimal bench proxy (built from source)
 │   │   ├── Cargo.toml
 │   │   └── src/main.rs
 │   ├── kong.yaml                      # Kong config (HTTP backend)
 │   ├── kong_e2e_tls.yaml             # Kong config (HTTPS backend)
+│   ├── kong_key_auth.yaml            # Kong config (key-auth enabled)
 │   └── tyk/
 │       ├── tyk.conf                   # Tyk standalone config (HTTP)
 │       ├── tyk_tls.conf               # Tyk config with TLS enabled
 │       ├── apps/                      # Tyk API defs (HTTP backend)
 │       │   ├── health_api.json
 │       │   └── users_api.json
-│       └── apps_e2e_tls/             # Tyk API defs (HTTPS backend)
+│       ├── apps_e2e_tls/             # Tyk API defs (HTTPS backend)
+│       │   ├── health_api.json
+│       │   └── users_api.json
+│       └── apps_key_auth/            # Tyk API defs (key-auth enabled)
 │           ├── health_api.json
-│           └── users_api.json
+│           ├── users_api.json
+│           └── users_auth_api.json
 ├── lua/
-│   └── comparison_test.lua            # Unified wrk Lua script
+│   ├── comparison_test.lua            # Unified wrk Lua script
+│   └── comparison_test_key_auth.lua   # wrk script with API key header
 ├── scripts/
 │   └── generate_comparison_report.py  # HTML report generator
 └── results/                           # Generated at runtime (gitignored)

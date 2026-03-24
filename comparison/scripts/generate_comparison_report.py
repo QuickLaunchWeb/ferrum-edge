@@ -146,6 +146,70 @@ def discover_results(results_dir):
     return data
 
 
+def discover_key_auth_results(results_dir):
+    """Scan for key-auth result files: {gateway}_key_auth_api_users_results.txt
+
+    Returns dict[gateway] = metrics
+    """
+    data = {}
+    for fname in sorted(os.listdir(results_dir)):
+        if not fname.endswith("_key_auth_api_users_results.txt"):
+            continue
+        gw = fname.replace("_key_auth_api_users_results.txt", "")
+        if gw in GATEWAYS:
+            data[gw] = parse_wrk_output(os.path.join(results_dir, fname))
+    return data
+
+
+def _build_key_auth_table(key_auth_data, no_auth_data):
+    """Build comparison table for key-auth vs no-auth performance."""
+    gws = [g for g in GATEWAYS if g != "baseline" and g in key_auth_data]
+    if not gws:
+        return "<p>No key-auth results available.</p>"
+
+    html = """<table>
+<thead><tr>
+  <th>Gateway</th><th>Key-Auth RPS</th><th>No-Auth RPS</th><th>Auth Overhead</th>
+  <th>Avg Latency</th><th>P50</th><th>P99</th><th>Errors</th>
+</tr></thead><tbody>\n"""
+
+    rps_vals = [(key_auth_data[gw].get("rps"), False) for gw in gws]
+    rps_best, rps_worst = _best_worst(rps_vals)
+
+    for i, gw in enumerate(gws):
+        m = key_auth_data[gw]
+        rps = m.get("rps")
+
+        # Compare against no-auth HTTP /api/users
+        no_auth_rps = no_auth_data.get(gw, {}).get("http", {}).get("users", {}).get("rps")
+        overhead = ""
+        if no_auth_rps and rps:
+            pct = ((no_auth_rps - rps) / no_auth_rps) * 100
+            if pct > 0:
+                overhead = f'<span class="overhead-bad">-{pct:.1f}%</span>'
+            else:
+                overhead = f'<span class="overhead-good">+{abs(pct):.1f}%</span>'
+
+        css = ""
+        if i == rps_best:
+            css = ' class="best"'
+        elif i == rps_worst:
+            css = ' class="worst"'
+
+        html += f"<tr><td><strong>{GATEWAY_LABELS.get(gw, gw)}</strong></td>"
+        html += f"<td{css}>{_fmt(rps, '', 0)}</td>"
+        html += f"<td>{_fmt(no_auth_rps, '', 0)}</td>"
+        html += f"<td>{overhead}</td>"
+        html += f"<td>{_fmt(m.get('latency_avg_ms'), ' ms')}</td>"
+        html += f"<td>{_fmt(m.get('latency_p50_ms'), ' ms')}</td>"
+        html += f"<td>{_fmt(m.get('latency_p99_ms'), ' ms')}</td>"
+        html += f"<td>{_fmt(m.get('error_count', 0), '', 0)}</td>"
+        html += "</tr>\n"
+
+    html += "</tbody></table>"
+    return html
+
+
 # ---------------------------------------------------------------------------
 # HTML report generation
 # ---------------------------------------------------------------------------
@@ -314,6 +378,7 @@ def generate_report(results_dir, output_path, meta=None):
     """Generate the full HTML comparison report."""
     global GATEWAY_LABELS
     data = discover_results(results_dir)
+    key_auth_data = discover_key_auth_results(results_dir)
     if not data:
         print(f"No result files found in {results_dir}", file=sys.stderr)
         sys.exit(1)
@@ -438,6 +503,12 @@ def generate_report(results_dir, output_path, meta=None):
   <h3>/api/users endpoint</h3>
   {_build_table(data, 'e2e_tls', 'users', bl_https_users)}
 </div>
+
+{"" if not key_auth_data else f'''<div class="section">
+  <h2>Key-Auth Performance (HTTP, /api/users-auth)</h2>
+  <p>API key authentication enabled. Each request includes an <code>apikey</code> header validated by the gateway before proxying to the backend <code>/api/users</code> endpoint. Compares authenticated throughput against the same gateway&#39;s unauthenticated HTTP /api/users performance.</p>
+  {_build_key_auth_table(key_auth_data, data)}
+</div>'''}
 
 <div class="section">
   <h2>TLS Overhead Comparison (HTTP vs HTTPS vs E2E TLS per Gateway)</h2>
