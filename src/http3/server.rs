@@ -28,6 +28,7 @@ pub async fn start_http3_listener(
     tls_config: Arc<rustls::ServerConfig>,
     h3_config: Http3ServerConfig,
     tls_policy: &TlsPolicy,
+    client_ca_bundle_path: Option<String>,
 ) -> Result<(), anyhow::Error> {
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
     // Filter cipher suites to TLS 1.3 only and force TLS 1.3 protocol version.
@@ -75,11 +76,28 @@ pub async fn start_http3_listener(
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| anyhow::anyhow!("Failed to set TLS 1.3 for HTTP/3: {}", e))?;
 
-    // Reuse the cert chain and key from the original config
-    // We need to clone the certified key from the original config
-    let mut server_tls_config = h3_builder
-        .with_no_client_auth()
-        .with_cert_resolver(tls_config.cert_resolver.clone());
+    // Reuse the cert chain and key from the original config.
+    // Carry forward mTLS (client cert verification) if configured.
+    let mut server_tls_config = if let Some(ref ca_path) = client_ca_bundle_path {
+        match crate::tls::build_client_cert_verifier(ca_path) {
+            Ok(verifier) => h3_builder
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(tls_config.cert_resolver.clone()),
+            Err(e) => {
+                warn!(
+                    "Failed to build client cert verifier for HTTP/3, disabling mTLS: {}",
+                    e
+                );
+                h3_builder
+                    .with_no_client_auth()
+                    .with_cert_resolver(tls_config.cert_resolver.clone())
+            }
+        }
+    } else {
+        h3_builder
+            .with_no_client_auth()
+            .with_cert_resolver(tls_config.cert_resolver.clone())
+    };
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
     // 0-RTT is disabled for security: early data is replayable, which is dangerous
@@ -501,7 +519,7 @@ async fn handle_h3_request(
         request_path: path,
         matched_proxy_id: Some(proxy.id.clone()),
         matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url)),
+        backend_target_url: Some(strip_query_params(&backend_url).to_string()),
         response_status_code: response_status,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: gateway_processing_ms,
@@ -727,8 +745,8 @@ async fn send_h3_reject_response(
     Ok(())
 }
 
-fn strip_query_params(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
+fn strip_query_params(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 fn record_request(state: &ProxyState, status: u16) {

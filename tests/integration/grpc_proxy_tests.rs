@@ -82,8 +82,6 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         db_type: None,
         db_url: None,
         db_poll_interval: 30,
-        db_poll_check_interval: 5,
-        db_incremental_polling: true,
         db_tls_enabled: false,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,

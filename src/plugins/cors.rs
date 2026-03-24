@@ -114,7 +114,7 @@ impl CorsPlugin {
         }
         match &self.allowed_origins {
             AllowedOrigins::Wildcard => true,
-            AllowedOrigins::List(origins) => origins.iter().any(|o| o == origin),
+            AllowedOrigins::List(origins) => origins.iter().any(|o| o.eq_ignore_ascii_case(origin)),
         }
     }
 

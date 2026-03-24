@@ -61,12 +61,6 @@ pub struct EnvConfig {
     pub db_type: Option<String>,
     pub db_url: Option<String>,
     pub db_poll_interval: u64,
-    /// Seconds between DB connectivity checks (parsed from env, reserved for incremental polling)
-    #[allow(dead_code)]
-    pub db_poll_check_interval: u64,
-    /// Enable incremental (delta) DB polling (parsed from env, reserved for incremental polling)
-    #[allow(dead_code)]
-    pub db_incremental_polling: bool,
     pub db_tls_enabled: bool,
     pub db_tls_ca_cert_path: Option<String>,
     pub db_tls_client_cert_path: Option<String>,
@@ -192,8 +186,6 @@ impl Default for EnvConfig {
             db_type: None,
             db_url: None,
             db_poll_interval: 30,
-            db_poll_check_interval: 5,
-            db_incremental_polling: true,
             db_tls_enabled: false,
             db_tls_ca_cert_path: None,
             db_tls_client_cert_path: None,
@@ -272,10 +264,6 @@ impl EnvConfig {
             db_type: env::var("FERRUM_DB_TYPE").ok(),
             db_url: env::var("FERRUM_DB_URL").ok(),
             db_poll_interval: parse_env_u64("FERRUM_DB_POLL_INTERVAL", 30),
-            db_poll_check_interval: parse_env_u64("FERRUM_DB_POLL_CHECK_INTERVAL", 5),
-            db_incremental_polling: env::var("FERRUM_DB_INCREMENTAL_POLLING")
-                .map(|v| v == "true")
-                .unwrap_or(true),
             db_tls_enabled: env::var("FERRUM_DB_TLS_ENABLED").unwrap_or_default() == "true",
             db_tls_ca_cert_path: env::var("FERRUM_DB_TLS_CA_CERT_PATH").ok(),
             db_tls_client_cert_path: env::var("FERRUM_DB_TLS_CLIENT_CERT_PATH").ok(),

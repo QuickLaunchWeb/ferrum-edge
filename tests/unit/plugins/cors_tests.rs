@@ -465,18 +465,17 @@ async fn test_case_sensitivity_of_origins() {
         "allowed_origins": ["https://example.com"]
     }));
 
-    // Origins are case-sensitive per spec — mismatched case should return 403
+    // Origins are compared case-insensitively — mismatched case should be allowed
     let mut ctx = make_cors_ctx("GET", "https://Example.com");
     let result = plugin.on_request_received(&mut ctx).await;
-    match result {
-        PluginResult::Reject {
-            status_code, body, ..
-        } => {
-            assert_eq!(status_code, 403);
-            assert_eq!(body, "CORS origin not allowed");
-        }
-        _ => panic!("Expected 403 Reject for case-mismatched origin"),
-    }
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "Expected Continue for case-mismatched origin (case-insensitive comparison)"
+    );
+    assert_eq!(
+        ctx.metadata.get("cors_origin").map(|s| s.as_str()),
+        Some("https://Example.com"),
+    );
 }
 
 #[tokio::test]

@@ -8,12 +8,6 @@ use super::proto::config_sync_client::ConfigSyncClient;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
-/// Connect to the Control Plane and receive config updates.
-#[allow(dead_code)]
-pub async fn start_dp_client(cp_url: String, auth_token: String, proxy_state: ProxyState) {
-    start_dp_client_with_shutdown(cp_url, auth_token, proxy_state, None).await;
-}
-
 /// Connect to the Control Plane with an optional shutdown signal.
 pub async fn start_dp_client_with_shutdown(
     cp_url: String,

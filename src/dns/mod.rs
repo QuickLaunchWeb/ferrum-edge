@@ -109,6 +109,9 @@ pub struct DnsCache {
     stale_ttl: Duration,
     error_ttl: Duration,
     max_cache_size: usize,
+    /// Tracks hostnames currently being refreshed in the background
+    /// to prevent duplicate refresh tasks under concurrent load.
+    refreshing: Arc<DashMap<String, ()>>,
 }
 
 impl DnsCache {
@@ -127,6 +130,7 @@ impl DnsCache {
             stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
             error_ttl: Duration::from_secs(config.error_ttl_seconds),
             max_cache_size: config.max_cache_size,
+            refreshing: Arc::new(DashMap::new()),
         }
     }
 
@@ -166,18 +170,27 @@ impl DnsCache {
 
             // Stale but within stale window — return stale data, trigger background refresh
             if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
-                let cache = self.clone();
                 let host = hostname.to_string();
-                let ttl = per_proxy_ttl;
-                tokio::spawn(async move {
-                    if let Err(e) = cache.refresh_entry(&host, ttl).await {
-                        warn!("DNS stale refresh failed for {}: {}", host, e);
-                    }
-                });
-                debug!(
-                    "DNS serving stale entry for {} (background refresh triggered)",
-                    hostname
-                );
+                // Deduplicate: only spawn a refresh if one isn't already in progress
+                if self.refreshing.insert(host.clone(), ()).is_none() {
+                    let cache = self.clone();
+                    let ttl = per_proxy_ttl;
+                    tokio::spawn(async move {
+                        if let Err(e) = cache.refresh_entry(&host, ttl).await {
+                            warn!("DNS stale refresh failed for {}: {}", host, e);
+                        }
+                        cache.refreshing.remove(&host);
+                    });
+                    debug!(
+                        "DNS serving stale entry for {} (background refresh triggered)",
+                        hostname
+                    );
+                } else {
+                    debug!(
+                        "DNS serving stale entry for {} (refresh already in progress)",
+                        hostname
+                    );
+                }
                 return Ok(entry.addresses[0]);
             }
 

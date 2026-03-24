@@ -97,21 +97,6 @@ impl TlsPolicy {
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
         })
     }
-
-    /// Create a default policy (TLS 1.2+1.3, all secure suites, server cipher order).
-    pub fn default_policy() -> Self {
-        let base_provider = rustls::crypto::ring::default_provider();
-        let provider = CryptoProvider {
-            cipher_suites: default_cipher_suites(),
-            kx_groups: default_kx_groups(),
-            ..base_provider
-        };
-        Self {
-            protocol_versions: vec![&rustls::version::TLS12, &rustls::version::TLS13],
-            crypto_provider: Arc::new(provider),
-            prefer_server_cipher_order: true,
-        }
-    }
 }
 
 /// Default secure cipher suites (TLS 1.3 + TLS 1.2 AEAD-only).
@@ -219,21 +204,6 @@ fn parse_kx_groups(
     Ok(groups)
 }
 
-/// Load TLS server configuration from cert and key files.
-#[allow(dead_code)]
-pub fn load_tls_config(
-    cert_path: &str,
-    key_path: &str,
-) -> Result<Arc<ServerConfig>, anyhow::Error> {
-    load_tls_config_with_client_auth(
-        cert_path,
-        key_path,
-        None,
-        false,
-        &TlsPolicy::default_policy(),
-    )
-}
-
 /// Load TLS server configuration with optional client certificate verification
 /// and TLS hardening policy.
 pub fn load_tls_config_with_client_auth(
@@ -318,4 +288,29 @@ pub fn load_tls_config_with_client_auth(
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
+}
+
+/// Build a client certificate verifier from a CA bundle file.
+/// Used by the HTTP/3 listener to carry forward mTLS from the main TLS config.
+pub fn build_client_cert_verifier(
+    ca_bundle_path: &str,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, anyhow::Error> {
+    let ca_file = File::open(ca_bundle_path)?;
+    let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut client_auth_roots = rustls::RootCertStore::empty();
+    let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
+
+    if added == 0 {
+        return Err(anyhow::anyhow!(
+            "No valid client CA certificates found in {}",
+            ca_bundle_path
+        ));
+    }
+
+    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))
 }

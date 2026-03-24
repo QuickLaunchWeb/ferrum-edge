@@ -65,8 +65,8 @@ impl ConsumerIndex {
         idx.get(identity).cloned()
     }
 
-    /// Returns the full consumer list for plugins that need to iterate
-    /// (e.g. jwt_auth trying multiple secrets).
+    /// Returns the full consumer list for custom plugins that need to iterate.
+    #[allow(dead_code)] // Public API used by custom plugins
     pub fn consumers(&self) -> Arc<Vec<Arc<Consumer>>> {
         self.all_consumers.load_full()
     }

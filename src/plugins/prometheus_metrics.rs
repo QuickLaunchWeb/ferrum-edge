@@ -120,10 +120,14 @@ impl MetricsRegistry {
             .or_insert_with(HistogramBuckets::new)
             .observe(summary.latency_total_ms);
 
-        self.backend_duration_buckets
-            .entry(proxy_id)
-            .or_insert_with(HistogramBuckets::new)
-            .observe(summary.latency_backend_total_ms);
+        // Guard against sentinel value (-1.0) used for streaming responses
+        // where total backend latency is unknown at log time.
+        if summary.latency_backend_total_ms >= 0.0 {
+            self.backend_duration_buckets
+                .entry(proxy_id)
+                .or_insert_with(HistogramBuckets::new)
+                .observe(summary.latency_backend_total_ms);
+        }
     }
 
     /// Render metrics in Prometheus exposition format.
