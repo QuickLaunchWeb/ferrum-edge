@@ -501,9 +501,9 @@ proxies:
 
 **States:**
 
-- **Closed** (normal) — Requests pass through. Failures are counted.
-- **Open** — After `failure_threshold` failures, the circuit opens. All requests immediately return `503 Service Unavailable`.
-- **Half-Open** — After `timeout_seconds`, the circuit allows `half_open_max_requests` probe requests. If they succeed (`success_threshold` times), the circuit closes. If they fail, it reopens.
+- **Closed** (normal) — Requests pass through. Responses with status codes in `failure_status_codes` increment the failure counter; all other responses reset it to zero. When the failure counter reaches `failure_threshold`, the circuit opens.
+- **Open** — All requests immediately return `503 Service Unavailable` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
+- **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
 
 ## Configuration Reference
 

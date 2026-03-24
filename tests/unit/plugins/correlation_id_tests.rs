@@ -38,12 +38,28 @@ fn test_modifies_request_headers() {
 
 // ── Default configuration ───────────────────────────────────────────
 
-#[test]
-fn test_default_config_uses_x_request_id_header() {
-    // Default header_name should be "x-request-id"
-    // We verify indirectly by checking that on_request_received inserts into that header
-    let _plugin = CorrelationId::new(&json!({}));
-    // Plugin created successfully with defaults
+#[tokio::test]
+async fn test_default_config_uses_x_request_id_header() {
+    // Default header_name should be "x-request-id" — verify by running the plugin
+    // and checking that it inserts the correlation ID into the correct header
+    let plugin = CorrelationId::new(&json!({}));
+    let mut ctx = make_ctx();
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+
+    // The default header is "x-request-id" — verify it was inserted
+    assert!(
+        ctx.headers.contains_key("x-request-id"),
+        "Default config should insert x-request-id header"
+    );
+    // The value should be a valid UUID
+    let id = ctx.headers.get("x-request-id").unwrap();
+    assert!(
+        uuid::Uuid::parse_str(id).is_ok(),
+        "Correlation ID should be a valid UUID, got: {}",
+        id
+    );
 }
 
 #[tokio::test]

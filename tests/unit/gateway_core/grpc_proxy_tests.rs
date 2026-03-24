@@ -196,6 +196,17 @@ fn test_backend_protocol_grpcs_deserialize() {
 
 #[tokio::test]
 async fn test_grpc_connection_pool_creation() {
-    // Verify the pool can be created without panicking (requires tokio runtime for cleanup task)
-    let _pool = grpc_proxy::GrpcConnectionPool::default();
+    let pool = grpc_proxy::GrpcConnectionPool::default();
+    // Pool should be functional after creation — attempting to get a sender for
+    // a non-existent backend should fail with a connection error, not a panic.
+    let mut proxy = test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = 1; // intentionally unreachable port
+    let dns = ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
+    let result = pool.get_sender(&proxy, &dns).await;
+    // Connection should fail (unreachable port), but not panic
+    assert!(
+        result.is_err(),
+        "Connection to unreachable port should fail"
+    );
 }

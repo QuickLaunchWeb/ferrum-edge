@@ -135,7 +135,7 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | listen_path, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides |
+| `Proxy` | A route + backend target | listen_path, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode |
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
@@ -226,7 +226,9 @@ tests/
 
 - **Supported databases**: PostgreSQL, MySQL, SQLite (via sqlx)
 - **Migrations**: Located in `src/config/migrations/`. Run via `FERRUM_MODE=migrate`.
-- **Schema relationships**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies. Consumers have credentials keyed by auth type.
+- **Schema relationships**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type.
+- **Transactions**: All multi-step CRUD operations (create/update/delete proxy, delete plugin_config, delete upstream, cleanup orphaned upstream) are wrapped in `sqlx::Transaction` to prevent partial updates on crash or concurrent access.
+- **Full proxy persistence**: All Proxy struct fields are persisted in the database, including `circuit_breaker` (JSON), `retry` (JSON), `response_body_mode`, and all `pool_*` override fields.
 - **Polling**: Database mode polls for changes at `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30s). Incremental polling uses `updated_at` timestamps.
 
 ### PR Checklist

@@ -15,8 +15,13 @@ fn default_dns_config(ttl: u64, overrides: HashMap<String, String>) -> DnsConfig
 #[tokio::test]
 async fn test_dns_cache_creation() {
     let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
-    // Should be able to create a cache
-    let _ = cache;
+    // Cache should be functional after creation — verify by resolving a loopback IP
+    let result = cache.resolve("127.0.0.1", None, None).await;
+    assert!(
+        result.is_ok(),
+        "Newly created cache should resolve IPs immediately"
+    );
+    assert_eq!(result.unwrap().to_string(), "127.0.0.1");
 }
 
 #[tokio::test]

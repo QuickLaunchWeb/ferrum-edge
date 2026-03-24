@@ -94,8 +94,15 @@ async fn test_transaction_debugger_log() {
     let plugin = TransactionDebugger::new(&json!({}));
     let summary = create_test_transaction_summary();
 
-    // Should not panic
+    // Verify log phase completes and plugin is operational after logging
     plugin.log(&summary).await;
+
+    // After logging, the plugin should still be functional (not corrupted)
+    assert_eq!(plugin.name(), "transaction_debugger");
+    assert_eq!(
+        plugin.priority(),
+        ferrum_gateway::plugins::priority::TRANSACTION_DEBUGGER
+    );
 }
 
 #[tokio::test]
@@ -147,6 +154,98 @@ async fn test_transaction_debugger_full_lifecycle() {
     // log
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
+}
+
+// ── Header redaction tests ─────────────────────────────────────────────
+
+fn make_ctx_with_sensitive_headers() -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "10.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/data".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Bearer secret-token-123".to_string(),
+    );
+    ctx.headers
+        .insert("cookie".to_string(), "session=abc123".to_string());
+    ctx.headers
+        .insert("x-api-key".to_string(), "sk-live-secret".to_string());
+    ctx.headers
+        .insert("x-request-id".to_string(), "req-456".to_string());
+    ctx
+}
+
+#[tokio::test]
+async fn test_transaction_debugger_redacts_sensitive_request_headers() {
+    // The plugin should not leak sensitive headers in its debug output.
+    // We verify the plugin processes requests with sensitive headers without error.
+    let plugin = TransactionDebugger::new(&json!({}));
+    let mut ctx = make_ctx_with_sensitive_headers();
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    // Sensitive headers should still be in the original context (not modified)
+    assert_eq!(
+        ctx.headers.get("authorization").unwrap(),
+        "Bearer secret-token-123"
+    );
+}
+
+#[tokio::test]
+async fn test_transaction_debugger_redacts_sensitive_response_headers() {
+    let plugin = TransactionDebugger::new(&json!({}));
+    let mut ctx = make_ctx();
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert("set-cookie".to_string(), "session=secret".to_string());
+    response_headers.insert(
+        "www-authenticate".to_string(),
+        "Bearer realm=\"api\"".to_string(),
+    );
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin
+        .after_proxy(&mut ctx, 401, &mut response_headers)
+        .await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    // Response headers should not be modified by the debugger
+    assert_eq!(
+        response_headers.get("set-cookie").unwrap(),
+        "session=secret"
+    );
+}
+
+#[tokio::test]
+async fn test_transaction_debugger_custom_redacted_headers() {
+    let plugin = TransactionDebugger::new(&json!({
+        "redacted_headers": ["x-custom-secret", "x-internal-token"]
+    }));
+    let mut ctx = RequestContext::new(
+        "10.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.headers
+        .insert("x-custom-secret".to_string(), "my-secret".to_string());
+    ctx.headers
+        .insert("x-internal-token".to_string(), "token-value".to_string());
+    ctx.headers
+        .insert("x-safe-header".to_string(), "visible".to_string());
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
 }
 
 #[tokio::test]

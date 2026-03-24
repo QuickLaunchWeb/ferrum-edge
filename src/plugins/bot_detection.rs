@@ -13,6 +13,9 @@ pub struct BotDetection {
     blocked_patterns: Vec<String>,
     allow_list: Vec<String>,
     custom_response_code: u16,
+    /// Whether to allow requests with no User-Agent header.
+    /// Defaults to true so health checks (which often omit User-Agent) pass.
+    allow_missing_user_agent: bool,
 }
 
 impl BotDetection {
@@ -41,10 +44,13 @@ impl BotDetection {
             .filter(|&c| (100..=599).contains(&c))
             .unwrap_or(403);
 
+        let allow_missing_user_agent = config["allow_missing_user_agent"].as_bool().unwrap_or(true);
+
         Self {
             blocked_patterns,
             allow_list,
             custom_response_code,
+            allow_missing_user_agent,
         }
     }
 }
@@ -81,7 +87,12 @@ impl Plugin for BotDetection {
         let user_agent = match ctx.headers.get("user-agent") {
             Some(ua) => ua.to_lowercase(),
             None => {
-                // No user-agent header — reject as suspicious
+                // No user-agent header — allow or reject based on configuration.
+                // Health checks, load balancers, and internal services often omit
+                // User-Agent. Default is to allow missing User-Agent.
+                if self.allow_missing_user_agent {
+                    return PluginResult::Continue;
+                }
                 return PluginResult::Reject {
                     status_code: self.custom_response_code,
                     body: r#"{"error":"Forbidden"}"#.to_string(),

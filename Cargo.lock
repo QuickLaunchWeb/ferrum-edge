@@ -661,6 +661,7 @@ dependencies = [
  "prost",
  "quinn",
  "rand 0.8.5",
+ "regex",
  "reqwest",
  "rustls",
  "rustls-pemfile",
