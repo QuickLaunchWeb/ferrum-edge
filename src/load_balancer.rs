@@ -161,14 +161,21 @@ impl LoadBalancerCache {
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {
-            // Use pre-computed target_keys when possible to avoid format!() allocation
-            let key = balancer.find_target_key(target);
-            let key_str = key.unwrap_or_else(|| target_key(target));
-            balancer
-                .active_connections
-                .entry(key_str)
-                .or_insert_with(|| AtomicI64::new(0))
-                .fetch_add(1, Ordering::Relaxed);
+            let key = balancer.find_target_key(target).unwrap_or("");
+            if key.is_empty() {
+                return;
+            }
+            // Fast path: get() uses a shared read lock. entry() takes a write
+            // lock and clones the key — avoid it when the counter already exists.
+            if let Some(counter) = balancer.active_connections.get(key) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            } else {
+                balancer
+                    .active_connections
+                    .entry(key.to_owned())
+                    .or_insert_with(|| AtomicI64::new(0))
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -176,22 +183,14 @@ impl LoadBalancerCache {
     pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {
-            let key = balancer.find_target_key(target);
-            let key_ref = key.as_deref().unwrap_or("");
-            // Try to find with pre-computed key first
-            if !key_ref.is_empty() {
-                if let Some(count) = balancer.active_connections.get(key_ref) {
-                    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    });
-                }
-            } else {
-                let fallback = target_key(target);
-                if let Some(count) = balancer.active_connections.get(&fallback) {
-                    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    });
-                }
+            let key = balancer.find_target_key(target).unwrap_or("");
+            if key.is_empty() {
+                return;
+            }
+            if let Some(count) = balancer.active_connections.get(key) {
+                let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    if v > 0 { Some(v - 1) } else { None }
+                });
             }
         }
     }
@@ -255,16 +254,43 @@ impl LoadBalancer {
         }
     }
 
-    /// Find the pre-computed target key for a target, avoiding allocation.
-    fn find_target_key(&self, target: &UpstreamTarget) -> Option<String> {
+    /// Find the pre-computed target key for a target without allocating.
+    /// Uses a linear scan of the (typically 2-5 element) targets vec, which is
+    /// faster than a HashMap lookup that requires cloning the host String.
+    fn find_target_key(&self, target: &UpstreamTarget) -> Option<&str> {
         for (i, t) in self.targets.iter().enumerate() {
             if t.host == target.host && t.port == target.port {
-                return Some(self.target_keys[i].clone());
+                return Some(self.target_keys[i].as_str());
             }
         }
         None
     }
 
+    /// Build a bitmask of healthy target indices. Avoids per-request Vec allocation.
+    /// Returns (bitmask, count). Bit `i` is set if target `i` is healthy.
+    /// Supports up to 64 targets without heap allocation; >64 falls back to Vec.
+    fn healthy_mask(&self, unhealthy: Option<&DashMap<String, u64>>) -> (u64, usize) {
+        let mut mask: u64 = 0;
+        let mut count = 0;
+        for (i, _) in self.targets.iter().enumerate() {
+            let is_healthy = if let Some(unhealthy_set) = unhealthy {
+                !unhealthy_set.contains_key(&self.target_keys[i])
+            } else {
+                true
+            };
+            if is_healthy && i < 64 {
+                mask |= 1u64 << i;
+                count += 1;
+            } else if is_healthy {
+                count += 1;
+            }
+        }
+        (mask, count)
+    }
+
+    /// Collect healthy targets into a Vec. Used only by algorithms that need
+    /// a slice (WRR, least-connections). For RR/Random/ConsistentHash, prefer
+    /// mask-based selection to avoid this allocation entirely.
     fn healthy_targets(
         &self,
         unhealthy: Option<&DashMap<String, u64>>,
@@ -282,13 +308,31 @@ impl LoadBalancer {
             .collect()
     }
 
+    /// Select the Nth healthy target by scanning the mask, avoiding Vec allocation.
+    fn nth_healthy(&self, mask: u64, healthy_count: usize, n: usize) -> Option<UpstreamTarget> {
+        if healthy_count == 0 {
+            return None;
+        }
+        let target_n = n % healthy_count;
+        let mut seen = 0;
+        for i in 0..self.targets.len().min(64) {
+            if mask & (1u64 << i) != 0 {
+                if seen == target_n {
+                    return Some(self.targets[i].clone());
+                }
+                seen += 1;
+            }
+        }
+        None
+    }
+
     fn select(
         &self,
         ctx_key: &str,
         unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<TargetSelection> {
-        let healthy = self.healthy_targets(unhealthy);
-        if healthy.is_empty() {
+        let (mask, healthy_count) = self.healthy_mask(unhealthy);
+        if healthy_count == 0 {
             // Fallback: try all targets if everything is unhealthy
             if self.targets.is_empty() {
                 return None;
@@ -302,21 +346,25 @@ impl LoadBalancer {
         let target = match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                let target_idx = idx % healthy.len();
-                Some(healthy[target_idx].1.clone())
+                self.nth_healthy(mask, healthy_count, idx)
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
-            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
+            LoadBalancerAlgorithm::WeightedRoundRobin => {
+                let healthy = self.healthy_targets(unhealthy);
+                self.select_wrr(&healthy)
+            }
+            LoadBalancerAlgorithm::LeastConnections => {
+                let healthy = self.healthy_targets(unhealthy);
+                self.select_least_connections(&healthy)
+            }
             LoadBalancerAlgorithm::ConsistentHashing => {
-                self.select_consistent_hash(ctx_key, &healthy)
+                self.select_consistent_hash(ctx_key, mask, healthy_count)
             }
             LoadBalancerAlgorithm::Random => {
-                // Use a simple counter-based pseudo-random to avoid rand dependency
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
                 let mut hasher = DefaultHasher::new();
                 idx.hash(&mut hasher);
                 let hash = hasher.finish() as usize;
-                Some(healthy[hash % healthy.len()].1.clone())
+                self.nth_healthy(mask, healthy_count, hash)
             }
         };
 
@@ -327,15 +375,31 @@ impl LoadBalancer {
     }
 
     fn select_from_all(&self, ctx_key: &str) -> Option<UpstreamTarget> {
-        let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+        if self.targets.is_empty() {
+            return None;
+        }
         match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(all[idx % all.len()].1.clone())
+                Some(self.targets[idx % self.targets.len()].clone())
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&all),
-            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&all),
-            LoadBalancerAlgorithm::ConsistentHashing => self.select_consistent_hash(ctx_key, &all),
+            LoadBalancerAlgorithm::WeightedRoundRobin => {
+                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                self.select_wrr(&all)
+            }
+            LoadBalancerAlgorithm::LeastConnections => {
+                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                self.select_least_connections(&all)
+            }
+            LoadBalancerAlgorithm::ConsistentHashing => {
+                // All targets healthy — full mask
+                let full_mask = if self.targets.len() >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << self.targets.len()) - 1
+                };
+                self.select_consistent_hash(ctx_key, full_mask, self.targets.len())
+            }
         }
     }
 
@@ -345,11 +409,28 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
-        let exclude_key = target_key(exclude);
+        // Find the exclude target's index via linear scan (avoids host.clone() allocation)
+        let exclude_idx = self
+            .targets
+            .iter()
+            .position(|t| t.host == exclude.host && t.port == exclude.port);
+
+        // Build healthy targets excluding the specified target
         let healthy: Vec<(usize, &UpstreamTarget)> = self
-            .healthy_targets(unhealthy)
-            .into_iter()
-            .filter(|(i, _)| self.target_keys[*i] != exclude_key)
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                // Exclude the specified target
+                if exclude_idx.is_some_and(|ei| ei == *i) {
+                    return false;
+                }
+                if let Some(unhealthy_set) = unhealthy {
+                    !unhealthy_set.contains_key(&self.target_keys[*i])
+                } else {
+                    true
+                }
+            })
             .collect();
 
         if healthy.is_empty() {
@@ -358,7 +439,7 @@ impl LoadBalancer {
                 .targets
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| self.target_keys[*i] != exclude_key)
+                .filter(|(i, _)| exclude_idx.is_none_or(|ei| ei != *i))
                 .collect();
             if fallback.is_empty() {
                 return None;
@@ -375,7 +456,14 @@ impl LoadBalancer {
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
             LoadBalancerAlgorithm::ConsistentHashing => {
-                self.select_consistent_hash(ctx_key, &healthy)
+                // Build mask from the healthy vec for consistent hash
+                let mut mask: u64 = 0;
+                for &(i, _) in &healthy {
+                    if i < 64 {
+                        mask |= 1u64 << i;
+                    }
+                }
+                self.select_consistent_hash(ctx_key, mask, healthy.len())
             }
         }
     }
@@ -447,21 +535,19 @@ impl LoadBalancer {
     }
 
     /// Consistent hash: find the target on the hash ring closest to the hash of ctx_key.
+    /// Uses a bitmask for O(1) candidate membership check instead of allocating a HashSet.
     fn select_consistent_hash(
         &self,
         ctx_key: &str,
-        candidates: &[(usize, &UpstreamTarget)],
+        candidate_mask: u64,
+        candidate_count: usize,
     ) -> Option<UpstreamTarget> {
-        if candidates.is_empty() {
+        if candidate_count == 0 {
             return None;
         }
 
-        // ctx_key is typically the client IP; hash_on is reserved for future use
-        // (e.g. hash on specific header or consumer ID)
-        let key = ctx_key;
-
         let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
+        ctx_key.hash(&mut hasher);
         let hash = hasher.finish();
 
         // Binary search on the ring
@@ -470,23 +556,18 @@ impl LoadBalancer {
             Err(p) => p % self.hash_ring.len().max(1),
         };
 
-        // Build a set of candidate target indices for O(1) membership check.
-        // This avoids O(candidates) inner scan per ring position, turning the
-        // worst case from O(ring_size × candidates) to O(ring_size).
-        let candidate_set: std::collections::HashSet<usize> =
-            candidates.iter().map(|(idx, _)| *idx).collect();
-
         // Walk the ring from pos to find a valid (healthy) target.
+        // Uses bitmask for O(1) membership check — no per-request HashSet allocation.
         for i in 0..self.hash_ring.len() {
             let ring_idx = (pos + i) % self.hash_ring.len();
             let target_idx = self.hash_ring[ring_idx].1;
-            if candidate_set.contains(&target_idx) {
+            if target_idx < 64 && candidate_mask & (1u64 << target_idx) != 0 {
                 return Some(self.targets[target_idx].clone());
             }
         }
 
-        // Shouldn't happen if candidates is non-empty
-        Some(candidates[0].1.clone())
+        // Fallback: return first healthy target
+        self.nth_healthy(candidate_mask, candidate_count, 0)
     }
 }
 

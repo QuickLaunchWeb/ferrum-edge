@@ -320,6 +320,7 @@ impl ProxyState {
             });
         }
 
+        // Clear cached pool keys when proxy settings change
         // Swap the canonical config last (readers may still be using old caches
         // via ArcSwap snapshots until they finish their current request)
         self.config.store(Arc::new(new_config));
@@ -1171,7 +1172,9 @@ pub async fn handle_proxy_request(
 
     let socket_ip = remote_addr.ip().to_string();
 
-    // Build request context (client_ip resolved below after headers are parsed)
+    // Build request context — pass cloned socket_ip to ctx (client_ip may be
+    // overwritten by trusted-proxy resolution below). method and path keep
+    // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
 
     // Validate and extract headers with size limits
@@ -1192,8 +1195,10 @@ pub async fn handle_proxy_request(
         }
         total_header_size += header_size;
         if let Ok(v) = value.to_str() {
-            ctx.headers
-                .insert(name.as_str().to_lowercase(), v.to_string());
+            // hyper's HeaderName is already lowercase-normalized, so
+            // name.as_str() returns a lowercase &str — skip to_lowercase()
+            // to avoid a per-header String allocation on the hot path.
+            ctx.headers.insert(name.as_str().to_owned(), v.to_owned());
         }
     }
     if total_header_size > state.max_header_size_bytes {
@@ -1210,7 +1215,8 @@ pub async fn handle_proxy_request(
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
+            // real_ip_header is pre-lowercased at config load time — no allocation needed
+            let header_val = ctx.headers.get(real_ip_header.as_str());
             if let Some(val) = header_val {
                 // Validate the direct connection is from a trusted proxy before
                 // trusting this header
@@ -1400,17 +1406,16 @@ pub async fn handle_proxy_request(
         }
     }
 
-    // before_proxy hooks — only clone headers if at least one plugin modifies them
+    // before_proxy hooks — only clone headers if at least one plugin modifies them.
+    // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
+    // an expensive per-request HashMap clone on the hot path.
     let needs_header_clone =
         !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
-    let mut owned_proxy_headers;
-    let proxy_headers: &HashMap<String, String> = if needs_header_clone {
-        owned_proxy_headers = ctx.headers.clone();
+    let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
+    if needs_header_clone {
+        let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
-            match plugin
-                .before_proxy(&mut ctx, &mut owned_proxy_headers)
-                .await
-            {
+            match plugin.before_proxy(&mut ctx, &mut cloned).await {
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -1429,21 +1434,20 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
-        &owned_proxy_headers
+        owned_proxy_headers = Some(cloned);
     } else if !plugins.is_empty() {
         // Run before_proxy hooks that don't modify headers (e.g., body_validator).
-        // Pass ctx.headers so plugins can read (but not modify) the real headers.
-        owned_proxy_headers = ctx.headers.clone();
+        // No plugin modifies headers, so swap headers out of ctx temporarily to
+        // satisfy the borrow checker without cloning — zero allocation hot path.
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
         for plugin in plugins.iter() {
-            match plugin
-                .before_proxy(&mut ctx, &mut owned_proxy_headers)
-                .await
-            {
+            match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
                 PluginResult::Reject {
                     status_code,
                     body,
                     headers,
                 } => {
+                    ctx.headers = tmp_headers;
                     log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
                         .await;
                     record_request(&state, status_code);
@@ -1457,10 +1461,10 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
-        &ctx.headers
-    } else {
-        &ctx.headers
-    };
+        ctx.headers = tmp_headers;
+    }
+    let proxy_headers: &HashMap<String, String> =
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
     // This check happens AFTER authentication and authorization plugins have run
@@ -2507,11 +2511,18 @@ fn strip_query_params(url: &str) -> String {
 }
 
 fn record_status(state: &ProxyState, status: u16) {
-    state
-        .status_counts
-        .entry(status)
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+    // Fast path: get() uses a read lock (shared), which is much cheaper than
+    // entry() which always takes a write lock. Since status codes are a small
+    // fixed set, the entry almost always exists after the first request.
+    if let Some(counter) = state.status_counts.get(&status) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    } else {
+        state
+            .status_counts
+            .entry(status)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn record_request(state: &ProxyState, status: u16) {
