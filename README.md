@@ -849,13 +849,16 @@ config:
 
 #### `transaction_debugger`
 
-Logs verbose request/response details to stdout. Enable per-proxy only for debugging.
+Logs verbose request/response details to stdout. Sensitive headers (Authorization, Cookie, X-API-Key, etc.) are automatically redacted in debug output. Enable per-proxy only for debugging.
 
 **Config**:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `log_request_body` | bool | `false` | Log incoming request body |
 | `log_response_body` | bool | `false` | Log backend response body |
+| `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
+
+**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
 #### `jwt_auth`
 
@@ -1024,22 +1027,30 @@ Restricts access based on client IP address or CIDR range.
 
 #### `bot_detection`
 
-Detects and blocks bot traffic based on User-Agent patterns.
+Detects and blocks bot traffic based on User-Agent patterns. By default, missing User-Agent headers are allowed (for health checks and load balancer probes).
 
 **Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `block_mode` | String | Action on detection: `block` or `log` |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `blocked_patterns` | String[] | `["curl","wget","python-requests",...]` | User-Agent substrings to block (case-insensitive) |
+| `allow_list` | String[] | `[]` | User-Agent substrings to always allow (checked before blocked_patterns) |
+| `allow_missing_user_agent` | bool | `true` | Allow requests with no User-Agent header (health checks, LB probes) |
+| `custom_response_code` | u16 | `403` | HTTP status code returned for blocked requests |
 
 #### `body_validator`
 
-Validates JSON or XML request bodies against schemas.
+Validates JSON and XML request bodies against schemas. Supports comprehensive JSON Schema validation including type checking, string/numeric constraints, array/object validation, composition operators, and format validation.
 
 **Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `schema` | Object | JSON Schema or XML schema for validation |
-| `content_types` | String[] | Content types to validate |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `json_schema` | Object | — | JSON Schema for validation (supports `type`, `required`, `properties`, `additionalProperties`, `minLength`/`maxLength`, `pattern`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`, `enum`, `const`, `items`, `minItems`/`maxItems`, `uniqueItems`, `allOf`/`anyOf`/`oneOf`/`not`, `format`) |
+| `required_fields` | String[] | `[]` | Simple required field names (alternative to JSON Schema `required`) |
+| `validate_xml` | bool | `false` | Enable XML well-formedness validation |
+| `required_xml_elements` | String[] | `[]` | Required XML element names |
+| `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
+
+**Supported `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 
 #### `request_termination`
 

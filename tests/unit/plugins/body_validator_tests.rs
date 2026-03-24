@@ -262,3 +262,536 @@ async fn test_xml_get_request_skipped() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  JSON Schema Validation Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+fn make_json_ctx(body: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/json".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    ctx
+}
+
+fn json_schema_plugin(schema: serde_json::Value) -> BodyValidator {
+    BodyValidator::new(&serde_json::json!({
+        "json_schema": schema
+    }))
+}
+
+// ─── Type validation ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_type_object_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_json_ctx(r#"{"key": "value"}"#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_type_object_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_json_ctx(r#"[1, 2, 3]"#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_type_string_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string"}));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_type_integer_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "integer"}));
+    let mut ctx = make_json_ctx("42");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_type_integer_rejects_float() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "integer"}));
+    let mut ctx = make_json_ctx("3.14");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── String constraints ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_min_length_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "minLength": 3}));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_min_length_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "minLength": 10}));
+    let mut ctx = make_json_ctx(r#""hi""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_max_length_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 5}));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_max_length_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 3}));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_pattern_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "pattern": "^[a-z]+$"}));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_pattern_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "pattern": "^[a-z]+$"}));
+    let mut ctx = make_json_ctx(r#""Hello123""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── Numeric constraints ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_minimum_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "minimum": 0}));
+    let mut ctx = make_json_ctx("5");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_minimum_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "minimum": 10}));
+    let mut ctx = make_json_ctx("5");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_maximum_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "maximum": 100}));
+    let mut ctx = make_json_ctx("50");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_maximum_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "maximum": 10}));
+    let mut ctx = make_json_ctx("50");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_exclusive_minimum() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "exclusiveMinimum": 5}));
+    let mut ctx = make_json_ctx("5");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_exclusive_maximum() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "number", "exclusiveMaximum": 10}));
+    let mut ctx = make_json_ctx("10");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── Enum constraint ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_enum_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"enum": ["red", "green", "blue"]}));
+    let mut ctx = make_json_ctx(r#""green""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_enum_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"enum": ["red", "green", "blue"]}));
+    let mut ctx = make_json_ctx(r#""yellow""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── Array constraints ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_array_items_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "array",
+        "items": {"type": "integer"}
+    }));
+    let mut ctx = make_json_ctx("[1, 2, 3]");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_array_items_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "array",
+        "items": {"type": "integer"}
+    }));
+    let mut ctx = make_json_ctx(r#"[1, "two", 3]"#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_min_items_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "minItems": 2}));
+    let mut ctx = make_json_ctx("[1, 2, 3]");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_min_items_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "minItems": 5}));
+    let mut ctx = make_json_ctx("[1, 2]");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_max_items_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "maxItems": 3}));
+    let mut ctx = make_json_ctx("[1, 2]");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_max_items_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "maxItems": 2}));
+    let mut ctx = make_json_ctx("[1, 2, 3, 4]");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_unique_items_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
+    let mut ctx = make_json_ctx("[1, 2, 3]");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_unique_items_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
+    let mut ctx = make_json_ctx("[1, 2, 2, 3]");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── Object constraints ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_additional_properties_false() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "additionalProperties": false
+    }));
+    let mut ctx = make_json_ctx(r#"{"name": "test", "extra": 123}"#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_additional_properties_false_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "additionalProperties": false
+    }));
+    let mut ctx = make_json_ctx(r#"{"name": "test"}"#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_required_and_properties() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "required": ["name", "age"],
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "age": {"type": "integer", "minimum": 0, "maximum": 150}
+        }
+    }));
+    let mut ctx = make_json_ctx(r#"{"name": "Alice", "age": 30}"#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_required_missing() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "required": ["name", "age"]
+    }));
+    let mut ctx = make_json_ctx(r#"{"name": "Alice"}"#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_nested_property_validation() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "address": {
+                "type": "object",
+                "required": ["city"],
+                "properties": {
+                    "city": {"type": "string", "minLength": 1},
+                    "zip": {"type": "string", "pattern": "^[0-9]{5}$"}
+                }
+            }
+        }
+    }));
+    let mut ctx = make_json_ctx(r#"{"address": {"city": "NYC", "zip": "10001"}}"#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_nested_property_invalid_zip() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "address": {
+                "type": "object",
+                "properties": {
+                    "zip": {"type": "string", "pattern": "^[0-9]{5}$"}
+                }
+            }
+        }
+    }));
+    let mut ctx = make_json_ctx(r#"{"address": {"zip": "abc"}}"#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── Composition: allOf / anyOf / oneOf / not ─────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_all_of_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "allOf": [
+            {"type": "object", "required": ["name"]},
+            {"type": "object", "required": ["age"]}
+        ]
+    }));
+    let mut ctx = make_json_ctx(r#"{"name": "Alice", "age": 30}"#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_all_of_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "allOf": [
+            {"type": "object", "required": ["name"]},
+            {"type": "object", "required": ["age"]}
+        ]
+    }));
+    let mut ctx = make_json_ctx(r#"{"name": "Alice"}"#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_any_of_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "anyOf": [
+            {"type": "string"},
+            {"type": "integer"}
+        ]
+    }));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_any_of_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "anyOf": [
+            {"type": "string"},
+            {"type": "integer"}
+        ]
+    }));
+    let mut ctx = make_json_ctx("true");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_one_of_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "oneOf": [
+            {"type": "string"},
+            {"type": "integer"}
+        ]
+    }));
+    let mut ctx = make_json_ctx("42");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_one_of_multiple_match_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "oneOf": [
+            {"type": "number"},
+            {"type": "integer"}
+        ]
+    }));
+    // integer 42 matches both "number" and "integer" type schemas
+    let mut ctx = make_json_ctx("42");
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_not_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "not": {"type": "string"}
+    }));
+    let mut ctx = make_json_ctx("42");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_not_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "not": {"type": "string"}
+    }));
+    let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+// ─── Format validation ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_format_email_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "email"}));
+    let mut ctx = make_json_ctx(r#""user@example.com""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_format_email_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "email"}));
+    let mut ctx = make_json_ctx(r#""not-an-email""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_format_ipv4_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "ipv4"}));
+    let mut ctx = make_json_ctx(r#""192.168.1.1""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_format_ipv4_invalid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "ipv4"}));
+    let mut ctx = make_json_ctx(r#""999.999.999.999""#);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_format_uuid_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "uuid"}));
+    let mut ctx = make_json_ctx(r#""550e8400-e29b-41d4-a716-446655440000""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn test_json_schema_format_datetime_valid() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "date-time"}));
+    let mut ctx = make_json_ctx(r#""2024-01-15T10:30:00Z""#);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ─── Complex real-world schema ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_complex_api_payload() {
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "required": ["method", "params"],
+        "properties": {
+            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]},
+            "params": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": {"type": "string", "minLength": 1},
+                    "timeout": {"type": "integer", "minimum": 0, "maximum": 30000},
+                    "headers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "value"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "value": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }));
+    let mut ctx = make_json_ctx(
+        r#"{"method": "POST", "params": {"url": "/api/data", "timeout": 5000, "headers": [{"name": "X-Custom", "value": "test"}]}}"#,
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}

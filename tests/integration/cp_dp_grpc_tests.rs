@@ -109,8 +109,6 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         db_type: None,
         db_url: None,
         db_poll_interval: 30,
-        db_poll_check_interval: 5,
-        db_incremental_polling: true,
         db_tls_enabled: false,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,
@@ -430,7 +428,7 @@ async fn test_dp_handles_malformed_config() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_preserves_config_after_cp_shutdown() {
     // This test verifies that when the CP goes down, the DP preserves its cached config
-    // and the start_dp_client loop keeps running (doesn't crash).
+    // and the start_dp_client_with_shutdown loop keeps running (doesn't crash).
 
     // Start CP server with initial config
     let cp_config = create_test_config(2);
@@ -440,12 +438,12 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
     let token = create_test_token();
 
-    // Use start_dp_client which has auto-reconnect logic
+    // Use start_dp_client_with_shutdown which has auto-reconnect logic
     let ps = proxy_state.clone();
     let url_clone = cp_url.clone();
     let token_clone = token.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::start_dp_client(url_clone, token_clone, ps).await;
+        dp_client::start_dp_client_with_shutdown(url_clone, token_clone, ps, None).await;
     });
 
     // Wait for initial config

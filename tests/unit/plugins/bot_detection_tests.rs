@@ -231,10 +231,22 @@ async fn test_allow_list_with_custom_patterns() {
 }
 
 // ── Missing user-agent header ───────────────────────────────────────────
+// Default behavior: allow missing User-Agent (for health checks / LB probes)
 
 #[tokio::test]
-async fn test_missing_user_agent_rejected() {
+async fn test_missing_user_agent_allowed_by_default() {
+    // Default: allow_missing_user_agent = true (health checks, load balancers, internal services)
     let plugin = BotDetection::new(&json!({}));
+    let mut ctx = make_ctx_without_ua();
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_missing_user_agent_rejected_when_configured() {
+    let plugin = BotDetection::new(&json!({
+        "allow_missing_user_agent": false
+    }));
     let mut ctx = make_ctx_without_ua();
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
@@ -243,6 +255,7 @@ async fn test_missing_user_agent_rejected() {
 #[tokio::test]
 async fn test_missing_user_agent_uses_custom_response_code() {
     let plugin = BotDetection::new(&json!({
+        "allow_missing_user_agent": false,
         "custom_response_code": 429
     }));
     let mut ctx = make_ctx_without_ua();
@@ -252,7 +265,9 @@ async fn test_missing_user_agent_uses_custom_response_code() {
 
 #[tokio::test]
 async fn test_missing_user_agent_returns_forbidden_body() {
-    let plugin = BotDetection::new(&json!({}));
+    let plugin = BotDetection::new(&json!({
+        "allow_missing_user_agent": false
+    }));
     let mut ctx = make_ctx_without_ua();
     let result = plugin.on_request_received(&mut ctx).await;
     match result {

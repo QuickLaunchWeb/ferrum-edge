@@ -1,8 +1,10 @@
 use crate::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
-    PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
+    AuthMode, BackendProtocol, CircuitBreakerConfig, Consumer, GatewayConfig, HealthCheckConfig,
+    LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
+    RetryConfig, Upstream, UpstreamTarget,
 };
 use chrono::Utc;
+use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use tracing::{debug, error, info, warn};
@@ -15,12 +17,6 @@ pub struct DatabaseStore {
 }
 
 impl DatabaseStore {
-    /// Connect to the database and run migrations.
-    #[allow(dead_code)]
-    pub async fn connect(db_type: &str, db_url: &str) -> Result<Self, anyhow::Error> {
-        Self::connect_with_tls_config(db_type, db_url, false, None, None, None, false).await
-    }
-
     /// Connect to the database with optional TLS configuration and run migrations.
     pub async fn connect_with_tls_config(
         db_type: &str,
@@ -48,17 +44,21 @@ impl DatabaseStore {
             db_url.to_string()
         };
 
+        let is_sqlite = db_type == "sqlite";
         let pool = AnyPoolOptions::new()
             .max_connections(10)
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    // Enable foreign key enforcement on every SQLite connection
+                    // (PRAGMA is per-connection, not persistent across pool connections)
+                    if is_sqlite {
+                        conn.execute("PRAGMA foreign_keys = ON").await?;
+                    }
+                    Ok(())
+                })
+            })
             .connect(&final_url)
             .await?;
-
-        // Enable foreign key enforcement for SQLite (off by default)
-        if db_type == "sqlite" {
-            sqlx::query("PRAGMA foreign_keys = ON")
-                .execute(&pool)
-                .await?;
-        }
 
         let store = Self {
             pool,
@@ -251,8 +251,25 @@ impl DatabaseStore {
     // ---- CRUD for Admin API ----
 
     pub async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        let circuit_breaker_json = proxy
+            .circuit_breaker
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let retry_json = proxy
+            .retry
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let response_body_mode_str = match proxy.response_body_mode {
+            ResponseBodyMode::Buffer => "buffer",
+            ResponseBodyMode::Stream => "stream",
+        };
+
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
-            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, auth_mode, upstream_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
@@ -266,11 +283,27 @@ impl DatabaseStore {
         .bind(proxy.backend_connect_timeout_ms as i64)
         .bind(proxy.backend_read_timeout_ms as i64)
         .bind(proxy.backend_write_timeout_ms as i64)
+        .bind(&proxy.backend_tls_client_cert_path)
+        .bind(&proxy.backend_tls_client_key_path)
+        .bind(if proxy.backend_tls_verify_server_cert { 1i32 } else { 0 })
+        .bind(&proxy.backend_tls_server_ca_cert_path)
+        .bind(&proxy.dns_override)
+        .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
         .bind(&proxy.upstream_id)
+        .bind(&circuit_breaker_json)
+        .bind(&retry_json)
+        .bind(response_body_mode_str)
+        .bind(proxy.pool_max_idle_per_host.map(|v| v as i64))
+        .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
+        .bind(proxy.pool_enable_http_keep_alive.map(|v| if v { 1i32 } else { 0 }))
+        .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+        .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
+        .bind(proxy.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
+        .bind(proxy.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
         .bind(proxy.created_at.to_rfc3339())
         .bind(proxy.updated_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         // Persist plugin associations in the junction table
@@ -278,16 +311,35 @@ impl DatabaseStore {
             sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
                 .bind(&proxy.id)
                 .bind(&assoc.plugin_config_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
+
+        tx.commit().await?;
 
         Ok(())
     }
 
     pub async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        let circuit_breaker_json = proxy
+            .circuit_breaker
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let retry_json = proxy
+            .retry
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let response_body_mode_str = match proxy.response_body_mode {
+            ResponseBodyMode::Buffer => "buffer",
+            ResponseBodyMode::Stream => "stream",
+        };
+
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
-            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, auth_mode=?, upstream_id=?, updated_at=? WHERE id=?"
+            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, updated_at=? WHERE id=?"
         )
         .bind(&proxy.name)
         .bind(&proxy.listen_path)
@@ -300,65 +352,93 @@ impl DatabaseStore {
         .bind(proxy.backend_connect_timeout_ms as i64)
         .bind(proxy.backend_read_timeout_ms as i64)
         .bind(proxy.backend_write_timeout_ms as i64)
+        .bind(&proxy.backend_tls_client_cert_path)
+        .bind(&proxy.backend_tls_client_key_path)
+        .bind(if proxy.backend_tls_verify_server_cert { 1i32 } else { 0 })
+        .bind(&proxy.backend_tls_server_ca_cert_path)
+        .bind(&proxy.dns_override)
+        .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
         .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
         .bind(&proxy.upstream_id)
+        .bind(&circuit_breaker_json)
+        .bind(&retry_json)
+        .bind(response_body_mode_str)
+        .bind(proxy.pool_max_idle_per_host.map(|v| v as i64))
+        .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
+        .bind(proxy.pool_enable_http_keep_alive.map(|v| if v { 1i32 } else { 0 }))
+        .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+        .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
+        .bind(proxy.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
+        .bind(proxy.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         // Update plugin associations: remove old, insert new
         sqlx::query("DELETE FROM proxy_plugins WHERE proxy_id = ?")
             .bind(&proxy.id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         for assoc in &proxy.plugins {
             sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
                 .bind(&proxy.id)
                 .bind(&assoc.plugin_config_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
+
+        tx.commit().await?;
 
         Ok(())
     }
 
     pub async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let mut tx = self.pool.begin().await?;
+
         // Look up the proxy's upstream_id before deleting so we can cascade-delete
         // the upstream if it becomes orphaned.
         let upstream_id: Option<String> =
             sqlx::query("SELECT upstream_id FROM proxies WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?
                 .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query("DELETE FROM proxy_plugins WHERE proxy_id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         let result = sqlx::query("DELETE FROM proxies WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             return Ok(false);
         }
 
         // If the proxy had an upstream, check if it's now orphaned and delete it
-        if let Some(ref uid) = upstream_id
-            && !self.is_upstream_referenced(uid).await?
-        {
-            info!("Cascade-deleting orphaned upstream {}", uid);
-            sqlx::query("DELETE FROM upstreams WHERE id = ?")
-                .bind(uid)
-                .execute(&self.pool)
-                .await?;
+        if let Some(ref uid) = upstream_id {
+            let ref_rows: Vec<AnyRow> =
+                sqlx::query("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1")
+                    .bind(uid)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            if ref_rows.is_empty() {
+                info!("Cascade-deleting orphaned upstream {}", uid);
+                sqlx::query("DELETE FROM upstreams WHERE id = ?")
+                    .bind(uid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
+
+        tx.commit().await?;
 
         Ok(true)
     }
@@ -498,15 +578,20 @@ impl DatabaseStore {
     }
 
     pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let mut tx = self.pool.begin().await?;
+
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query("DELETE FROM proxy_plugins WHERE plugin_config_id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         let result = sqlx::query("DELETE FROM plugin_configs WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
+
         Ok(result.rows_affected() > 0)
     }
 
@@ -593,8 +678,19 @@ impl DatabaseStore {
 
     /// Delete an upstream only if it is not referenced by any proxy.
     /// Returns `Err` if the upstream is still in use.
+    /// Uses a transaction to prevent race conditions between the reference
+    /// check and the delete.
     pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
-        if self.is_upstream_referenced(id).await? {
+        let mut tx = self.pool.begin().await?;
+
+        // Check reference within the transaction to prevent races
+        let ref_rows: Vec<AnyRow> =
+            sqlx::query("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1")
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?;
+        if !ref_rows.is_empty() {
+            tx.rollback().await?;
             anyhow::bail!(
                 "Upstream {} is referenced by one or more proxies and cannot be deleted",
                 id
@@ -603,36 +699,42 @@ impl DatabaseStore {
 
         let result = sqlx::query("DELETE FROM upstreams WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(result.rows_affected() > 0)
-    }
 
-    /// Check if any proxy references this upstream via upstream_id.
-    pub async fn is_upstream_referenced(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
-        let rows: Vec<AnyRow> = sqlx::query("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1")
-            .bind(upstream_id)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(!rows.is_empty())
+        tx.commit().await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// When a proxy changes its upstream_id, clean up the old upstream if it
     /// became orphaned (no other proxies reference it).
+    /// Uses a transaction to prevent race conditions between check and delete.
     pub async fn cleanup_orphaned_upstream(
         &self,
         old_upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
-        if !self.is_upstream_referenced(old_upstream_id).await? {
+        let mut tx = self.pool.begin().await?;
+
+        let ref_rows: Vec<AnyRow> =
+            sqlx::query("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1")
+                .bind(old_upstream_id)
+                .fetch_all(&mut *tx)
+                .await?;
+
+        if ref_rows.is_empty() {
             info!(
                 "Cleaning up orphaned upstream {} after proxy reassignment",
                 old_upstream_id
             );
             sqlx::query("DELETE FROM upstreams WHERE id = ?")
                 .bind(old_upstream_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
+
+        tx.commit().await?;
+
         Ok(())
     }
 
@@ -835,16 +937,50 @@ fn row_to_proxy(
         auth_mode: parse_auth_mode(&auth_mode_str),
         plugins,
         upstream_id: row.try_get::<String, _>("upstream_id").ok(),
-        circuit_breaker: None,
-        retry: None,
-        response_body_mode: crate::config::types::ResponseBodyMode::default(),
-        pool_max_idle_per_host: None,
-        pool_idle_timeout_seconds: None,
-        pool_enable_http_keep_alive: None,
-        pool_enable_http2: None,
-        pool_tcp_keepalive_seconds: None,
-        pool_http2_keep_alive_interval_seconds: None,
-        pool_http2_keep_alive_timeout_seconds: None,
+        circuit_breaker: row
+            .try_get::<String, _>("circuit_breaker")
+            .ok()
+            .and_then(|s| serde_json::from_str::<CircuitBreakerConfig>(&s).ok()),
+        retry: row
+            .try_get::<String, _>("retry")
+            .ok()
+            .and_then(|s| serde_json::from_str::<RetryConfig>(&s).ok()),
+        response_body_mode: row
+            .try_get::<String, _>("response_body_mode")
+            .ok()
+            .map(|s| match s.as_str() {
+                "buffer" => ResponseBodyMode::Buffer,
+                _ => ResponseBodyMode::Stream,
+            })
+            .unwrap_or_default(),
+        pool_max_idle_per_host: row
+            .try_get::<i64, _>("pool_max_idle_per_host")
+            .ok()
+            .map(|v| v as usize),
+        pool_idle_timeout_seconds: row
+            .try_get::<i64, _>("pool_idle_timeout_seconds")
+            .ok()
+            .map(|v| v as u64),
+        pool_enable_http_keep_alive: row
+            .try_get::<i32, _>("pool_enable_http_keep_alive")
+            .ok()
+            .map(|v| v != 0),
+        pool_enable_http2: row
+            .try_get::<i32, _>("pool_enable_http2")
+            .ok()
+            .map(|v| v != 0),
+        pool_tcp_keepalive_seconds: row
+            .try_get::<i64, _>("pool_tcp_keepalive_seconds")
+            .ok()
+            .map(|v| v as u64),
+        pool_http2_keep_alive_interval_seconds: row
+            .try_get::<i64, _>("pool_http2_keep_alive_interval_seconds")
+            .ok()
+            .map(|v| v as u64),
+        pool_http2_keep_alive_timeout_seconds: row
+            .try_get::<i64, _>("pool_http2_keep_alive_timeout_seconds")
+            .ok()
+            .map(|v| v as u64),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

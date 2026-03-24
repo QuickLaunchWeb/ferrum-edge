@@ -238,6 +238,9 @@ fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
                 .ok()?
         };
 
+        if left.len() + right.len() > 8 {
+            return None;
+        }
         let zeros_needed = 8 - left.len() - right.len();
         let mut result = [0u16; 8];
         for (i, &v) in left.iter().enumerate() {

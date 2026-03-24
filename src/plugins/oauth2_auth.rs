@@ -351,7 +351,13 @@ impl Plugin for OAuth2Auth {
                     headers: HashMap::new(),
                 }
             }
-            _ => {
+            other => {
+                if other != "jwks" {
+                    warn!(
+                        "OAuth2: unrecognized validation_mode '{}', defaulting to JWKS",
+                        other,
+                    );
+                }
                 // JWKS mode: validate JWT using the IdP's public keys
                 debug!(
                     "OAuth2 JWKS validation mode, jwks_uri: {:?}",

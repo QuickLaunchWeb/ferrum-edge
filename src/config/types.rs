@@ -162,7 +162,7 @@ pub struct Upstream {
 }
 
 /// Circuit breaker configuration for a proxy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,

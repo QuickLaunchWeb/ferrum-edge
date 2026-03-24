@@ -267,30 +267,7 @@ impl LoadBalancer {
     }
 
     /// Build a bitmask of healthy target indices. Avoids per-request Vec allocation.
-    /// Returns (bitmask, count). Bit `i` is set if target `i` is healthy.
-    /// Supports up to 64 targets without heap allocation; >64 falls back to Vec.
-    fn healthy_mask(&self, unhealthy: Option<&DashMap<String, u64>>) -> (u64, usize) {
-        let mut mask: u64 = 0;
-        let mut count = 0;
-        for (i, _) in self.targets.iter().enumerate() {
-            let is_healthy = if let Some(unhealthy_set) = unhealthy {
-                !unhealthy_set.contains_key(&self.target_keys[i])
-            } else {
-                true
-            };
-            if is_healthy && i < 64 {
-                mask |= 1u64 << i;
-                count += 1;
-            } else if is_healthy {
-                count += 1;
-            }
-        }
-        (mask, count)
-    }
-
-    /// Collect healthy targets into a Vec. Used only by algorithms that need
-    /// a slice (WRR, least-connections). For RR/Random/ConsistentHash, prefer
-    /// mask-based selection to avoid this allocation entirely.
+    /// Collect healthy targets into a Vec for selection by any algorithm.
     fn healthy_targets(
         &self,
         unhealthy: Option<&DashMap<String, u64>>,
@@ -308,31 +285,13 @@ impl LoadBalancer {
             .collect()
     }
 
-    /// Select the Nth healthy target by scanning the mask, avoiding Vec allocation.
-    fn nth_healthy(&self, mask: u64, healthy_count: usize, n: usize) -> Option<UpstreamTarget> {
-        if healthy_count == 0 {
-            return None;
-        }
-        let target_n = n % healthy_count;
-        let mut seen = 0;
-        for i in 0..self.targets.len().min(64) {
-            if mask & (1u64 << i) != 0 {
-                if seen == target_n {
-                    return Some(self.targets[i].clone());
-                }
-                seen += 1;
-            }
-        }
-        None
-    }
-
     fn select(
         &self,
         ctx_key: &str,
         unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<TargetSelection> {
-        let (mask, healthy_count) = self.healthy_mask(unhealthy);
-        if healthy_count == 0 {
+        let healthy = self.healthy_targets(unhealthy);
+        if healthy.is_empty() {
             // Fallback: try all targets if everything is unhealthy
             if self.targets.is_empty() {
                 return None;
@@ -346,25 +305,19 @@ impl LoadBalancer {
         let target = match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                self.nth_healthy(mask, healthy_count, idx)
+                Some(healthy[idx % healthy.len()].1.clone())
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                let healthy = self.healthy_targets(unhealthy);
-                self.select_wrr(&healthy)
-            }
-            LoadBalancerAlgorithm::LeastConnections => {
-                let healthy = self.healthy_targets(unhealthy);
-                self.select_least_connections(&healthy)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
+            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
             LoadBalancerAlgorithm::ConsistentHashing => {
-                self.select_consistent_hash(ctx_key, mask, healthy_count)
+                self.select_consistent_hash(ctx_key, &healthy)
             }
             LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
                 let mut hasher = DefaultHasher::new();
                 idx.hash(&mut hasher);
                 let hash = hasher.finish() as usize;
-                self.nth_healthy(mask, healthy_count, hash)
+                Some(healthy[hash % healthy.len()].1.clone())
             }
         };
 
@@ -392,13 +345,8 @@ impl LoadBalancer {
                 self.select_least_connections(&all)
             }
             LoadBalancerAlgorithm::ConsistentHashing => {
-                // All targets healthy — full mask
-                let full_mask = if self.targets.len() >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << self.targets.len()) - 1
-                };
-                self.select_consistent_hash(ctx_key, full_mask, self.targets.len())
+                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                self.select_consistent_hash(ctx_key, &all)
             }
         }
     }
@@ -456,14 +404,7 @@ impl LoadBalancer {
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
             LoadBalancerAlgorithm::ConsistentHashing => {
-                // Build mask from the healthy vec for consistent hash
-                let mut mask: u64 = 0;
-                for &(i, _) in &healthy {
-                    if i < 64 {
-                        mask |= 1u64 << i;
-                    }
-                }
-                self.select_consistent_hash(ctx_key, mask, healthy.len())
+                self.select_consistent_hash(ctx_key, &healthy)
             }
         }
     }
@@ -539,10 +480,9 @@ impl LoadBalancer {
     fn select_consistent_hash(
         &self,
         ctx_key: &str,
-        candidate_mask: u64,
-        candidate_count: usize,
+        candidates: &[(usize, &UpstreamTarget)],
     ) -> Option<UpstreamTarget> {
-        if candidate_count == 0 {
+        if candidates.is_empty() {
             return None;
         }
 
@@ -557,17 +497,16 @@ impl LoadBalancer {
         };
 
         // Walk the ring from pos to find a valid (healthy) target.
-        // Uses bitmask for O(1) membership check — no per-request HashSet allocation.
         for i in 0..self.hash_ring.len() {
             let ring_idx = (pos + i) % self.hash_ring.len();
             let target_idx = self.hash_ring[ring_idx].1;
-            if target_idx < 64 && candidate_mask & (1u64 << target_idx) != 0 {
+            if candidates.iter().any(|&(ci, _)| ci == target_idx) {
                 return Some(self.targets[target_idx].clone());
             }
         }
 
-        // Fallback: return first healthy target
-        self.nth_healthy(candidate_mask, candidate_count, 0)
+        // Fallback: return first candidate
+        Some(candidates[0].1.clone())
     }
 }
 

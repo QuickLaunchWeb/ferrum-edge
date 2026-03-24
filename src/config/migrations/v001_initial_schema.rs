@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints_indexes"
+        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields"
     }
 }
 
@@ -77,6 +77,16 @@ impl V001InitialSchema {
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode TEXT NOT NULL DEFAULT 'single',
                 upstream_id TEXT REFERENCES upstreams(id) ON DELETE RESTRICT,
+                circuit_breaker TEXT,
+                retry TEXT,
+                response_body_mode TEXT NOT NULL DEFAULT 'stream',
+                pool_max_idle_per_host INTEGER,
+                pool_idle_timeout_seconds INTEGER,
+                pool_enable_http_keep_alive INTEGER,
+                pool_enable_http2 INTEGER,
+                pool_tcp_keepalive_seconds INTEGER,
+                pool_http2_keep_alive_interval_seconds INTEGER,
+                pool_http2_keep_alive_timeout_seconds INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::admin::jwt_auth::create_jwt_manager_from_env;
+use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::file_loader;
 use crate::dns::{DnsCache, DnsConfig};
@@ -187,8 +189,91 @@ pub async fn run(
         }
     });
 
-    // Start separate listeners for HTTP and HTTPS
+    // Start Admin API (read-only in file mode)
+    let jwt_manager = match create_jwt_manager_from_env() {
+        Ok(jm) => jm,
+        Err(e) => {
+            warn!(
+                "Admin JWT not configured ({}), admin endpoints will reject requests",
+                e
+            );
+            // Create a dummy JWT manager that will reject all requests
+            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
+                secret: "file-mode-no-jwt-configured".to_string(),
+                ..Default::default()
+            })
+        }
+    };
+    let admin_state = AdminState {
+        db: None,
+        jwt_manager,
+        proxy_state: Some(proxy_state.clone()),
+        cached_config: Some(proxy_state.config.clone()),
+        mode: "file".to_string(),
+        read_only: true,
+    };
+
     let mut handles = Vec::new();
+
+    // Admin HTTP listener
+    let admin_http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_http_port).parse()?;
+    let admin_http_state = admin_state.clone();
+    let admin_http_shutdown = shutdown_tx.subscribe();
+    let admin_http_handle = tokio::spawn(async move {
+        info!("Starting admin HTTP listener on {}", admin_http_addr);
+        if let Err(e) =
+            admin::start_admin_listener(admin_http_addr, admin_http_state, admin_http_shutdown)
+                .await
+        {
+            error!("Admin HTTP listener error: {}", e);
+        }
+    });
+    handles.push(admin_http_handle);
+
+    // Admin HTTPS listener (if TLS is configured for admin)
+    if let (Some(admin_cert), Some(admin_key)) = (
+        &env_config.admin_tls_cert_path,
+        &env_config.admin_tls_key_path,
+    ) {
+        let admin_tls_policy = TlsPolicy::from_env_config(&env_config)?;
+        let admin_client_ca = env_config.admin_tls_client_ca_bundle_path.as_deref();
+        match tls::load_tls_config_with_client_auth(
+            admin_cert,
+            admin_key,
+            admin_client_ca,
+            env_config.admin_tls_no_verify,
+            &admin_tls_policy,
+        ) {
+            Ok(admin_tls_config) => {
+                let admin_https_addr: SocketAddr =
+                    format!("0.0.0.0:{}", env_config.admin_https_port).parse()?;
+                let admin_https_state = admin_state.clone();
+                let admin_https_shutdown = shutdown_tx.subscribe();
+                let admin_https_handle = tokio::spawn(async move {
+                    info!("Starting admin HTTPS listener on {}", admin_https_addr);
+                    if let Err(e) = admin::start_admin_listener_with_tls(
+                        admin_https_addr,
+                        admin_https_state,
+                        admin_https_shutdown,
+                        Some(admin_tls_config),
+                    )
+                    .await
+                    {
+                        error!("Admin HTTPS listener error: {}", e);
+                    }
+                });
+                handles.push(admin_https_handle);
+            }
+            Err(e) => {
+                warn!(
+                    "Admin TLS configuration failed, HTTPS admin disabled: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Start separate listeners for HTTP and HTTPS proxy
 
     // HTTP listener (always enabled)
     let http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.proxy_http_port).parse()?;
@@ -233,6 +318,7 @@ pub async fn run(
             let h3_shutdown = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
+            let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener(
@@ -242,6 +328,7 @@ pub async fn run(
                     tls_config,
                     h3_config,
                     &h3_tls_policy,
+                    h3_client_ca,
                 )
                 .await
                 {

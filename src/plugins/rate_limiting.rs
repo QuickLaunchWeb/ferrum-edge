@@ -213,17 +213,6 @@ impl RateLimiting {
         }
     }
 
-    fn get_key(&self, ctx: &RequestContext) -> String {
-        match self.limit_by.as_str() {
-            "consumer" => ctx
-                .identified_consumer
-                .as_ref()
-                .map(|c| format!("consumer:{}", c.username))
-                .unwrap_or_else(|| format!("ip:{}", ctx.client_ip)),
-            _ => format!("ip:{}", ctx.client_ip),
-        }
-    }
-
     /// Evict entries whose rate windows have had no recent activity.
     /// Called periodically to prevent unbounded memory growth.
     fn evict_stale_entries(&self) {
@@ -277,24 +266,23 @@ impl Plugin for RateLimiting {
         // Phase 1: always enforce IP-based limits early (before auth).
         // This protects auth endpoints from brute-force regardless of limit_by mode.
         let ip_key = format!("ip:{}", ctx.client_ip);
-        if self.limit_by == "ip" {
-            self.check_rate(&ip_key)
-        } else {
-            // In consumer mode, still do IP limiting in phase 1 as a safety net
-            // for unauthenticated requests. The consumer-specific limit is checked
-            // later in authorize (phase 3) after the consumer is identified.
-            PluginResult::Continue
-        }
+        self.check_rate(&ip_key)
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Phase 3: enforce consumer-based limits after authentication has identified
-        // the consumer. Only runs when limit_by is "consumer".
+        // the consumer. Only runs when limit_by is "consumer" and a consumer was found.
+        // IP-based limiting already ran in phase 1 as a safety net.
         if self.limit_by != "consumer" {
             return PluginResult::Continue;
         }
 
-        let key = self.get_key(ctx);
-        self.check_rate(&key)
+        if let Some(consumer) = &ctx.identified_consumer {
+            let key = format!("consumer:{}", consumer.username);
+            self.check_rate(&key)
+        } else {
+            // No consumer identified — IP limit already applied in phase 1
+            PluginResult::Continue
+        }
     }
 }

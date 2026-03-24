@@ -705,7 +705,14 @@ async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes
     // Try database first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
-            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.consumers))),
+            Ok(config) => {
+                let redacted: Vec<_> = config
+                    .consumers
+                    .iter()
+                    .map(redact_consumer_credentials)
+                    .collect();
+                return Ok(json_response(StatusCode::OK, &json!(redacted)));
+            }
             Err(e) => {
                 warn!(
                     "Database unavailable for list consumers, falling back to cached config: {}",
@@ -717,10 +724,12 @@ async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(
-            StatusCode::OK,
-            &json!(config.consumers),
-        ))
+        let redacted: Vec<_> = config
+            .consumers
+            .iter()
+            .map(redact_consumer_credentials)
+            .collect();
+        Ok(json_response_with_stale(StatusCode::OK, &json!(redacted)))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -813,7 +822,10 @@ async fn handle_create_consumer(
     }
 
     match db.create_consumer(&consumer).await {
-        Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(consumer))),
+        Ok(_) => Ok(json_response(
+            StatusCode::CREATED,
+            &json!(redact_consumer_credentials(&consumer)),
+        )),
         Err(e) => {
             let msg = format!("{}", e);
             let status = if is_unique_constraint_violation(&msg) {
@@ -833,7 +845,12 @@ async fn handle_get_consumer(
     // Try database first
     if let Some(ref db) = state.db {
         match db.get_consumer(id).await {
-            Ok(Some(c)) => return Ok(json_response(StatusCode::OK, &json!(c))),
+            Ok(Some(c)) => {
+                return Ok(json_response(
+                    StatusCode::OK,
+                    &json!(redact_consumer_credentials(&c)),
+                ));
+            }
             Ok(None) => {
                 return Ok(json_response(
                     StatusCode::NOT_FOUND,
@@ -852,7 +869,10 @@ async fn handle_get_consumer(
     // Fallback: search in cached config
     if let Some(config) = state.cached_gateway_config() {
         match config.consumers.iter().find(|c| c.id == id) {
-            Some(consumer) => Ok(json_response_with_stale(StatusCode::OK, &json!(consumer))),
+            Some(consumer) => Ok(json_response_with_stale(
+                StatusCode::OK,
+                &json!(redact_consumer_credentials(consumer)),
+            )),
             None => Ok(json_response(
                 StatusCode::NOT_FOUND,
                 &json!({"error": "Consumer not found"}),
@@ -938,7 +958,10 @@ async fn handle_update_consumer(
     }
 
     match db.update_consumer(&consumer).await {
-        Ok(_) => Ok(json_response(StatusCode::OK, &json!(consumer))),
+        Ok(_) => Ok(json_response(
+            StatusCode::OK,
+            &json!(redact_consumer_credentials(&consumer)),
+        )),
         Err(e) => {
             let msg = format!("{}", e);
             let status = if is_unique_constraint_violation(&msg) {
@@ -1066,7 +1089,10 @@ async fn handle_update_credentials(
                 .insert(cred_type.to_string(), hashed_cred);
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
-                Ok(_) => Ok(json_response(StatusCode::OK, &json!(consumer))),
+                Ok(_) => Ok(json_response(
+                    StatusCode::OK,
+                    &json!(redact_consumer_credentials(&consumer)),
+                )),
                 Err(e) => Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({"error": format!("{}", e)}),
@@ -1680,6 +1706,19 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
     lower.contains("unique constraint")
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
+}
+
+/// Create a copy of the consumer with sensitive credential values redacted
+/// for safe inclusion in API responses.
+fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
+    let mut redacted = consumer.clone();
+    if let Some(basic) = redacted.credentials.get_mut("basicauth")
+        && let Some(obj) = basic.as_object_mut()
+        && obj.contains_key("password_hash")
+    {
+        obj.insert("password_hash".to_string(), json!("[REDACTED]"));
+    }
+    redacted
 }
 
 fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {

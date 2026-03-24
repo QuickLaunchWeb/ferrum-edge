@@ -115,10 +115,16 @@ impl CircuitBreaker {
         let state = self.state.load(Ordering::Acquire);
         match state {
             STATE_HALF_OPEN => {
+                // Decrement in-flight counter so new probe requests can be admitted
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |v| v.checked_sub(1),
+                );
                 let successes = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= self.config.success_threshold {
                     info!("Circuit breaker closing (recovered)");
-                    self.state.store(STATE_CLOSED, Ordering::Release);
+                    self.state.store(STATE_CLOSED, Ordering::SeqCst);
                     self.failure_count.store(0, Ordering::Relaxed);
                     self.success_count.store(0, Ordering::Relaxed);
                     self.half_open_in_flight.store(0, Ordering::Relaxed);
@@ -154,13 +160,24 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => {
+                // Decrement in-flight before reopening
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |v| v.checked_sub(1),
+                );
                 warn!("Circuit breaker reopening (probe failed)");
-                self.state.store(STATE_OPEN, Ordering::Release);
+                self.state.store(STATE_OPEN, Ordering::SeqCst);
                 self.success_count.store(0, Ordering::Relaxed);
                 self.half_open_in_flight.store(0, Ordering::Relaxed);
             }
             _ => {}
         }
+    }
+
+    /// Get the config for this circuit breaker.
+    pub fn config(&self) -> &CircuitBreakerConfig {
+        &self.config
     }
 
     /// Current state name (for metrics/logging).
@@ -194,15 +211,20 @@ impl CircuitBreakerCache {
     }
 
     /// Get or create a circuit breaker for a proxy.
+    /// If the config has changed, replaces the breaker with a fresh one.
     pub fn get_or_create(
         &self,
         proxy_id: &str,
         config: &CircuitBreakerConfig,
     ) -> Arc<CircuitBreaker> {
-        self.breakers
-            .entry(proxy_id.to_string())
-            .or_insert_with(|| Arc::new(CircuitBreaker::new(config.clone())))
-            .clone()
+        if let Some(existing) = self.breakers.get(proxy_id)
+            && existing.config() == config
+        {
+            return existing.clone();
+        }
+        let cb = Arc::new(CircuitBreaker::new(config.clone()));
+        self.breakers.insert(proxy_id.to_string(), cb.clone());
+        cb
     }
 
     /// Check if a request can proceed for a given proxy.

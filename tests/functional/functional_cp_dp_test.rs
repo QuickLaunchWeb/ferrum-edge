@@ -52,8 +52,6 @@ fn create_test_env_config() -> EnvConfig {
         db_type: Some("sqlite".into()),
         db_url: None,
         db_poll_interval: 5,
-        db_poll_check_interval: 1,
-        db_incremental_polling: true,
         db_tls_enabled: false,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,

@@ -513,7 +513,7 @@ async fn handle_websocket_request_authenticated(
         request_path: ctx.path.clone(),
         matched_proxy_id: Some(proxy.id.clone()),
         matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url)),
+        backend_target_url: Some(strip_query_params(&backend_url).to_string()),
         response_status_code: 101,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -1139,7 +1139,7 @@ pub async fn log_rejected_request(
         matched_proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
             let url = build_backend_url(p, &ctx.path, "");
-            strip_query_params(&url)
+            strip_query_params(&url).to_string()
         }),
         response_status_code: status_code,
         latency_total_ms: total_ms,
@@ -1518,9 +1518,16 @@ pub async fn handle_proxy_request(
 
                 // after_proxy hooks
                 for plugin in plugins.iter() {
-                    let _ = plugin
+                    if let PluginResult::Reject { status_code, .. } = plugin
                         .after_proxy(&mut ctx, grpc_resp.status, &mut response_headers)
-                        .await;
+                        .await
+                    {
+                        warn!(
+                            "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
+                            plugin.name(),
+                            status_code,
+                        );
+                    }
                 }
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -1539,7 +1546,7 @@ pub async fn handle_proxy_request(
                         request_path: path,
                         matched_proxy_id: Some(proxy.id.clone()),
                         matched_proxy_name: proxy.name.clone(),
-                        backend_target_url: Some(strip_query_params(&backend_url)),
+                        backend_target_url: Some(strip_query_params(&backend_url).to_string()),
                         response_status_code: grpc_resp.status,
                         latency_total_ms: total_ms,
                         latency_gateway_processing_ms: gateway_processing_ms,
@@ -1779,9 +1786,15 @@ pub async fn handle_proxy_request(
             .record_connection_end(upstream_id, target);
     }
 
-    // Record circuit breaker result
+    // Record circuit breaker result: successes reset failure counters (Closed state)
+    // and count toward recovery threshold (Half-Open state). Failures increment
+    // the failure counter and may trip the breaker.
     if let Some(cb) = &circuit_breaker {
-        cb.record_failure(response_status); // record_failure checks if status is a failure
+        if cb.config().failure_status_codes.contains(&response_status) {
+            cb.record_failure(response_status);
+        } else {
+            cb.record_success();
+        }
     }
 
     // Passive health check reporting (O(1) upstream lookup via index)
@@ -1813,9 +1826,16 @@ pub async fn handle_proxy_request(
     // so they are compatible with both streaming and buffered modes)
     if !plugins.is_empty() {
         for plugin in plugins.iter() {
-            let _ = plugin
+            if let PluginResult::Reject { status_code, .. } = plugin
                 .after_proxy(&mut ctx, response_status, &mut response_headers)
-                .await;
+                .await
+            {
+                warn!(
+                    "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
+                    plugin.name(),
+                    status_code,
+                );
+            }
         }
     }
 
@@ -1832,7 +1852,7 @@ pub async fn handle_proxy_request(
             request_path: path,
             matched_proxy_id: Some(proxy.id.clone()),
             matched_proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url)),
+            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
@@ -1901,7 +1921,7 @@ pub async fn handle_proxy_request(
             // Spawn a lightweight deferred task to log the final streaming latency.
             // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
             let deferred_proxy_id = proxy.id.clone();
-            let deferred_backend_url = strip_query_params(&backend_url);
+            let deferred_backend_url = strip_query_params(&backend_url).to_string();
             let read_timeout_ms = proxy.backend_read_timeout_ms;
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
@@ -2506,8 +2526,8 @@ async fn collect_response_with_limit(
     Ok((body, len))
 }
 
-fn strip_query_params(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).to_string()
+fn strip_query_params(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 fn record_status(state: &ProxyState, status: u16) {
