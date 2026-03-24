@@ -1,0 +1,73 @@
+---
+# Ferrum Gateway comparison benchmark configuration — key-auth enabled
+# Includes the same two keyless proxies plus one authenticated proxy
+
+proxies:
+  - id: "proxy-health"
+    name: "Health Check Proxy"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3001
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: true
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    plugins: []
+
+  - id: "proxy-users"
+    name: "Users API Proxy"
+    listen_path: "/api/users"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3001
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: true
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    pool_idle_timeout_seconds: 180
+    plugins: []
+
+  - id: "proxy-users-auth"
+    name: "Users API Proxy (Key Auth)"
+    listen_path: "/api/users-auth"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3001
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: true
+    backend_path: "/api/users"
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    pool_idle_timeout_seconds: 180
+    plugins:
+      - plugin_config_id: "plugin-keyauth-bench"
+
+consumers:
+  - id: "consumer-bench"
+    username: "benchuser"
+    custom_id: "benchmark"
+    credentials:
+      keyauth:
+        key: "test-api-key"
+
+plugin_configs:
+  - id: "plugin-keyauth-bench"
+    plugin_name: "key_auth"
+    config:
+      key_location: "header:apikey"
+    scope: proxy
+    proxy_id: "proxy-users-auth"
+    enabled: true

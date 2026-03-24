@@ -52,6 +52,7 @@ RESULTS_DIR="$COMP_DIR/results"
 CERTS_DIR="$PROJECT_ROOT/tests/certs"
 PERF_DIR="$PROJECT_ROOT/tests/performance"
 LUA_SCRIPT="$COMP_DIR/lua/comparison_test.lua"
+LUA_SCRIPT_KEY_AUTH="$COMP_DIR/lua/comparison_test_key_auth.lua"
 
 # Docker container names (prefixed for easy cleanup)
 KONG_CONTAINER="ferrum-bench-kong"
@@ -351,6 +352,38 @@ run_wrk() {
     fi
 }
 
+run_wrk_key_auth() {
+    local gateway="$1"
+    local port="$2"
+    local label="${gateway}/key_auth/api/users-auth"
+    local safe_endpoint="api_users"
+    local result_file="${RESULTS_DIR}/${gateway}_key_auth_${safe_endpoint}_results.txt"
+    local url="http://127.0.0.1:${port}/api/users-auth"
+
+    echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
+
+    # Warm-up (results discarded)
+    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT_KEY_AUTH" "$url" > /dev/null 2>&1 || true
+
+    # Measured run
+    if ! wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
+        --latency -s "$LUA_SCRIPT_KEY_AUTH" "$url" > "$result_file" 2>&1; then
+        log_warn "wrk failed for ${label} — see ${result_file}"
+        return 0
+    fi
+
+    # Print summary line
+    local rps
+    rps=$(grep "Requests/sec:" "$result_file" | awk '{print $2}' || echo "N/A")
+    local latency
+    latency=$(grep "Latency " "$result_file" | awk '{print $2}' || echo "N/A")
+    if [[ -z "$rps" ]]; then
+        log_warn "No results for ${label} (connection error?)"
+    else
+        echo -e "    ${GREEN}→ ${rps} req/s, ${latency} avg latency${NC}"
+    fi
+}
+
 # ===========================================================================
 # Ferrum Gateway
 # ===========================================================================
@@ -570,6 +603,7 @@ start_kong_native_http() {
     KONG_PROXY_ERROR_LOG=/dev/stderr \
     KONG_LOG_LEVEL=warn \
     KONG_PREFIX="/tmp/kong-bench" \
+    KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
     kong start > "$RESULTS_DIR/kong_http.log" 2>&1
 
     KONG_PID="native"
@@ -591,6 +625,7 @@ start_kong_native_https() {
     KONG_PROXY_ERROR_LOG=/dev/stderr \
     KONG_LOG_LEVEL=warn \
     KONG_PREFIX="/tmp/kong-bench" \
+    KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
     kong start > "$RESULTS_DIR/kong_https.log" 2>&1
 
     KONG_PID="native"
@@ -612,6 +647,7 @@ start_kong_native_e2e_tls() {
     KONG_PROXY_ERROR_LOG=/dev/stderr \
     KONG_LOG_LEVEL=warn \
     KONG_PREFIX="/tmp/kong-bench" \
+    KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
     kong start > "$RESULTS_DIR/kong_e2e_tls.log" 2>&1
 
     KONG_PID="native"
@@ -650,6 +686,7 @@ start_kong_docker_http() {
         -e KONG_PROXY_ACCESS_LOG=/dev/null \
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
+        -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}" > /dev/null
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (HTTP)" 20
@@ -682,6 +719,7 @@ start_kong_docker_https() {
         -e KONG_PROXY_ACCESS_LOG=/dev/null \
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
+        -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}" > /dev/null
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (HTTPS)" 20
@@ -714,6 +752,7 @@ start_kong_docker_e2e_tls() {
         -e KONG_PROXY_ACCESS_LOG=/dev/null \
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
+        -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}" > /dev/null
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20
@@ -943,6 +982,203 @@ test_tyk() {
 }
 
 # ===========================================================================
+# Key-Auth Tests (HTTP only, Ferrum + Kong + Tyk)
+# ===========================================================================
+
+prepare_kong_key_auth_config() {
+    local host
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        host="127.0.0.1"
+    else
+        host="$BACKEND_HOST"
+    fi
+    sed "s/BACKEND_HOST/$host/g" \
+        "$COMP_DIR/configs/kong_key_auth.yaml" > "$COMP_DIR/configs/.kong_runtime_key_auth.yaml"
+}
+
+prepare_tyk_key_auth_config() {
+    mkdir -p "$COMP_DIR/configs/.tyk_runtime_apps_key_auth"
+    for f in "$COMP_DIR/configs/tyk/apps_key_auth"/*.json; do
+        sed "s/BACKEND_HOST/$BACKEND_HOST/g" "$f" > "$COMP_DIR/configs/.tyk_runtime_apps_key_auth/$(basename "$f")"
+    done
+}
+
+test_ferrum_key_auth() {
+    log_info "Starting Ferrum Gateway (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    cd "$PROJECT_ROOT"
+    FERRUM_MODE=file \
+    FERRUM_FILE_CONFIG_PATH="$COMP_DIR/configs/ferrum_comparison_key_auth.yaml" \
+    FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+    FERRUM_POOL_ENABLE_HTTP2=false \
+    FERRUM_LOG_LEVEL=warn \
+    ./target/release/ferrum-gateway > "$RESULTS_DIR/ferrum_key_auth.log" 2>&1 &
+    FERRUM_PID=$!
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum (Key Auth)"
+
+    run_wrk_key_auth "ferrum" "$GATEWAY_HTTP_PORT"
+
+    kill "$FERRUM_PID" 2>/dev/null || true
+    wait "$FERRUM_PID" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    sleep 1
+}
+
+test_kong_key_auth() {
+    prepare_kong_key_auth_config
+
+    if [[ "$KONG_NATIVE" == "true" ]]; then
+        log_info "Starting Kong Gateway native (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+        kill_port "$GATEWAY_HTTP_PORT"
+
+        KONG_DATABASE=off \
+        KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime_key_auth.yaml" \
+        KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
+        KONG_ADMIN_LISTEN="off" \
+        KONG_PROXY_ACCESS_LOG=/dev/null \
+        KONG_PROXY_ERROR_LOG=/dev/stderr \
+        KONG_LOG_LEVEL=warn \
+        KONG_PREFIX="/tmp/kong-bench" \
+        KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
+        kong start > "$RESULTS_DIR/kong_key_auth.log" 2>&1
+
+        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong native (Key Auth)" 20
+        run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
+        stop_kong_native
+    else
+        log_info "Starting Kong Gateway Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+        docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
+        kill_port "$GATEWAY_HTTP_PORT"
+
+        local network_args=()
+        if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+            network_args+=(--network host)
+        else
+            network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+        fi
+
+        docker run -d --name "$KONG_CONTAINER" \
+            "${network_args[@]}" \
+            -v "$COMP_DIR/configs/.kong_runtime_key_auth.yaml:/etc/kong/kong.yml:ro" \
+            -e KONG_DATABASE=off \
+            -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
+            -e KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
+            -e KONG_ADMIN_LISTEN="off" \
+            -e KONG_PROXY_ACCESS_LOG=/dev/null \
+            -e KONG_PROXY_ERROR_LOG=/dev/stderr \
+            -e KONG_LOG_LEVEL=warn \
+            -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
+            "kong/kong-gateway:${KONG_VERSION}" > /dev/null
+
+        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20
+        run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
+        stop_kong_docker
+    fi
+}
+
+test_tyk_key_auth() {
+    prepare_tyk_key_auth_config
+
+    log_info "Starting Tyk Gateway (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+    fi
+
+    docker run -d --name "$TYK_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$TYK_CONF_DIR/tyk.conf:/opt/tyk-gateway/tyk.conf:ro" \
+        -v "$COMP_DIR/configs/.tyk_runtime_apps_key_auth:/etc/tyk/apps:ro" \
+        "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
+
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (Key Auth)" 20
+
+    # Create an API key for the authenticated endpoint
+    log_info "Creating Tyk API key..."
+    local tyk_key_resp
+    tyk_key_resp=$(curl -sf -X POST "http://127.0.0.1:$GATEWAY_HTTP_PORT/tyk/keys" \
+        -H "x-tyk-authorization: benchmark-secret" \
+        -H "Content-Type: application/json" \
+        -d '{
+            "alias": "benchuser",
+            "expires": 0,
+            "access_rights": {
+                "users-auth-api": {
+                    "api_id": "users-auth-api",
+                    "api_name": "Users Auth API",
+                    "versions": ["Default"]
+                }
+            }
+        }' 2>&1) || true
+
+    # Extract the generated key
+    local tyk_api_key
+    tyk_api_key=$(echo "$tyk_key_resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('key',''))" 2>/dev/null || echo "")
+
+    if [[ -z "$tyk_api_key" ]]; then
+        log_warn "Failed to create Tyk API key — response: $tyk_key_resp"
+        log_warn "Skipping Tyk key-auth benchmark"
+        stop_tyk
+        return 0
+    fi
+    log_ok "Tyk API key created"
+
+    # Override the lua script key with the Tyk-generated key
+    local tyk_lua="$COMP_DIR/lua/.tyk_key_auth_runtime.lua"
+    sed "s/test-api-key/$tyk_api_key/g" "$LUA_SCRIPT_KEY_AUTH" > "$tyk_lua"
+
+    # Run wrk with the Tyk-specific key
+    local label="tyk/key_auth/api/users-auth"
+    local result_file="${RESULTS_DIR}/tyk_key_auth_api_users_results.txt"
+    local url="http://127.0.0.1:${GATEWAY_HTTP_PORT}/api/users-auth"
+
+    echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
+    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$tyk_lua" "$url" > /dev/null 2>&1 || true
+    if ! wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
+        --latency -s "$tyk_lua" "$url" > "$result_file" 2>&1; then
+        log_warn "wrk failed for ${label} — see ${result_file}"
+    else
+        local rps
+        rps=$(grep "Requests/sec:" "$result_file" | awk '{print $2}' || echo "N/A")
+        local latency
+        latency=$(grep "Latency " "$result_file" | awk '{print $2}' || echo "N/A")
+        echo -e "    ${GREEN}→ ${rps} req/s, ${latency} avg latency${NC}"
+    fi
+
+    stop_tyk
+}
+
+test_key_auth() {
+    log_header "Testing Key-Auth Performance (HTTP)"
+
+    if ! should_skip "ferrum"; then
+        test_ferrum_key_auth
+    fi
+
+    if ! should_skip "kong"; then
+        test_kong_key_auth
+    fi
+
+    if ! should_skip "tyk"; then
+        # Tyk needs Redis running; start if not already up
+        if ! docker ps --filter name="$REDIS_CONTAINER" --format '{{.Names}}' | grep -q "$REDIS_CONTAINER"; then
+            prepare_tyk_config
+            start_redis
+        fi
+        test_tyk_key_auth
+        stop_redis
+    fi
+}
+
+# ===========================================================================
 # Baseline (direct backend)
 # ===========================================================================
 
@@ -1039,6 +1275,9 @@ main() {
     if ! should_skip "tyk"; then
         test_tyk
     fi
+
+    # Key-Auth tests (HTTP only, Ferrum + Kong + Tyk)
+    test_key_auth
 
     generate_report
 

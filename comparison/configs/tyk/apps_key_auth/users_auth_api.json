@@ -1,0 +1,25 @@
+{
+  "name": "Users Auth API",
+  "slug": "users-auth-api",
+  "api_id": "users-auth-api",
+  "org_id": "default",
+  "use_keyless": false,
+  "active": true,
+  "auth": {
+    "auth_header_name": "apikey"
+  },
+  "proxy": {
+    "listen_path": "/api/users-auth",
+    "target_url": "http://BACKEND_HOST:3001/api/users",
+    "strip_listen_path": true
+  },
+  "version_data": {
+    "not_versioned": true,
+    "default_version": "Default",
+    "versions": {
+      "Default": {
+        "name": "Default"
+      }
+    }
+  }
+}
