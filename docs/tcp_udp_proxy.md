@@ -179,6 +179,22 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 - DTLS handshake occurs when the first datagram arrives from a new client
 - The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP
 - Frontend DTLS uses separate certificates from TLS (set via `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`)
+- Frontend DTLS mTLS uses a separate trust store from TCP TLS mTLS (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` vs `FERRUM_TLS_CLIENT_CA_CERT_PATH`)
+
+### Trust Store Model
+
+The gateway uses separate trust stores for TCP and UDP encryption:
+
+| Trust Store | Env Variable | Scope | Purpose |
+|-------------|-------------|-------|---------|
+| Backend server CA (TCP + UDP) | `backend_tls_server_ca_cert_path` | Per-proxy | Verify backend's certificate. Falls back to system roots for TCP if unset. |
+| Backend client cert (TCP + UDP) | `backend_tls_client_cert_path` + `backend_tls_client_key_path` | Per-proxy | Gateway presents this cert to the backend (mTLS). |
+| Frontend TLS client CA (TCP) | `FERRUM_TLS_CLIENT_CA_CERT_PATH` | Gateway-wide | Verify TCP client certificates (frontend mTLS). |
+| Frontend DTLS client CA (UDP) | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | Gateway-wide | Verify DTLS client certificates (frontend mTLS). |
+| Frontend TLS server cert (TCP) | `FERRUM_TLS_CERT_PATH` + `FERRUM_TLS_KEY_PATH` | Gateway-wide | Gateway's TLS certificate for TCP frontend termination. |
+| Frontend DTLS server cert (UDP) | `FERRUM_DTLS_CERT_PATH` + `FERRUM_DTLS_KEY_PATH` | Gateway-wide | Gateway's DTLS certificate for UDP frontend termination. |
+
+The separation of TCP and UDP trust stores allows independent certificate rotation and different CA hierarchies for each protocol.
 
 ## Load Balancing
 
@@ -263,6 +279,7 @@ HTTP-specific plugins (auth, CORS, body transformer, request/response transforme
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners |
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
+| `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_TLS_CLIENT_CA_CERT_PATH` used for TCP. |
 
 ## Validation Rules
 

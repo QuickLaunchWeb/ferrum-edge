@@ -66,13 +66,57 @@ pub fn build_backend_dtls_config(
 /// Build a DTLS server config for frontend termination (client → gateway).
 ///
 /// Requires ECDSA P-256 or Ed25519 certificates (DTLS does not support RSA).
+///
+/// If `client_ca_cert_path` is provided, enables mutual TLS: the gateway will
+/// require clients to present a valid certificate signed by one of the CAs in
+/// the trust store. This uses a separate trust store from TCP frontend mTLS
+/// (`FERRUM_TLS_CLIENT_CA_CERT_PATH`), configured via `FERRUM_DTLS_CLIENT_CA_CERT_PATH`.
 pub fn build_frontend_dtls_config(
     cert_path: &str,
     key_path: &str,
+    client_ca_cert_path: Option<&str>,
 ) -> Result<DtlsConfig, anyhow::Error> {
     let cert = load_dtls_certificate(cert_path, key_path)?;
+
+    let (client_auth, client_cas) = if let Some(ca_path) = client_ca_cert_path {
+        let ca_data = std::fs::read(ca_path).map_err(|e| {
+            anyhow::anyhow!("Failed to read DTLS client CA cert {}: {}", ca_path, e)
+        })?;
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut &ca_data[..])
+                .filter_map(|r| r.ok())
+                .collect();
+        if certs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No valid certificates found in DTLS client CA file: {}",
+                ca_path
+            ));
+        }
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in certs {
+            root_store
+                .add(cert)
+                .map_err(|e| anyhow::anyhow!("Failed to add DTLS client CA cert: {}", e))?;
+        }
+        debug!(
+            ca_path = %ca_path,
+            "Frontend DTLS mTLS enabled: requiring and verifying client certificates"
+        );
+        (
+            webrtc_dtls::config::ClientAuthType::RequireAndVerifyClientCert,
+            root_store,
+        )
+    } else {
+        (
+            webrtc_dtls::config::ClientAuthType::NoClientCert,
+            rustls::RootCertStore::empty(),
+        )
+    };
+
     let config = DtlsConfig {
         certificates: vec![cert],
+        client_auth,
+        client_cas,
         ..Default::default()
     };
     Ok(config)

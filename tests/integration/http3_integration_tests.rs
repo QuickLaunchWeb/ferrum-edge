@@ -168,6 +168,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         real_ip_header: None,
         dtls_cert_path: None,
         dtls_key_path: None,
+        dtls_client_ca_cert_path: None,
     }
 }
 

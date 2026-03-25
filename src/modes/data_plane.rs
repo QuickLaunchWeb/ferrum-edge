@@ -93,6 +93,36 @@ pub async fn run(
         None
     };
 
+    // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
+    if let Some(ref tls_cfg) = tls_config {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_tls_config(Some(tls_cfg.clone()));
+    }
+
+    // Set DTLS cert/key for UDP proxies with frontend_tls (DTLS termination).
+    if let (Some(cert_path), Some(key_path)) =
+        (&env_config.dtls_cert_path, &env_config.dtls_key_path)
+    {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_dtls_cert_key(
+                cert_path.clone(),
+                key_path.clone(),
+                env_config.dtls_client_ca_cert_path.clone(),
+            );
+    }
+
+    // Re-reconcile to start any deferred frontend_tls / frontend DTLS listeners
+    if tls_config.is_some()
+        || (env_config.dtls_cert_path.is_some() && env_config.dtls_key_path.is_some())
+    {
+        let slm = proxy_state.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            slm.reconcile().await;
+        });
+    }
+
     // Start separate listeners for HTTP and HTTPS
     let mut handles = Vec::new();
 

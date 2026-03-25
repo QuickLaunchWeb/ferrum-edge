@@ -149,7 +149,11 @@ pub async fn run(
     {
         proxy_state
             .stream_listener_manager
-            .set_frontend_dtls_cert_key(cert_path.clone(), key_path.clone());
+            .set_frontend_dtls_cert_key(
+                cert_path.clone(),
+                key_path.clone(),
+                env_config.dtls_client_ca_cert_path.clone(),
+            );
     }
 
     // Re-reconcile to start any deferred frontend_tls / frontend DTLS listeners

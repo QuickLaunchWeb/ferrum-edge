@@ -44,6 +44,10 @@ pub struct StreamListenerManager {
     /// When a UDP proxy has `frontend_tls: true`, these paths are used to build
     /// the DTLS server config. Requires ECDSA P-256 or Ed25519 certificates.
     frontend_dtls_cert_key: arc_swap::ArcSwap<Option<(String, String)>>,
+    /// Optional DTLS client CA certificate path for frontend mTLS.
+    /// When set, the gateway requires and verifies client DTLS certificates
+    /// using this trust store (separate from TCP TLS client CA).
+    frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
 }
 
 impl StreamListenerManager {
@@ -62,6 +66,7 @@ impl StreamListenerManager {
             load_balancer_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
+            frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
         }
     }
 
@@ -77,9 +82,16 @@ impl StreamListenerManager {
     ///
     /// Call this after loading DTLS certificates, then call `reconcile()` to start
     /// any deferred DTLS frontend listeners.
-    pub fn set_frontend_dtls_cert_key(&self, cert_path: String, key_path: String) {
+    pub fn set_frontend_dtls_cert_key(
+        &self,
+        cert_path: String,
+        key_path: String,
+        client_ca_cert_path: Option<String>,
+    ) {
         self.frontend_dtls_cert_key
             .store(Arc::new(Some((cert_path, key_path))));
+        self.frontend_dtls_client_ca_path
+            .store(Arc::new(client_ca_cert_path));
     }
 
     /// Reconcile active listeners against the current config.
@@ -176,7 +188,13 @@ impl StreamListenerManager {
                     let paths = self.frontend_dtls_cert_key.load();
                     match paths.as_ref() {
                         Some((cert_path, key_path)) => {
-                            match crate::dtls::build_frontend_dtls_config(cert_path, key_path) {
+                            let client_ca = self.frontend_dtls_client_ca_path.load();
+                            let client_ca_ref = client_ca.as_deref();
+                            match crate::dtls::build_frontend_dtls_config(
+                                cert_path,
+                                key_path,
+                                client_ca_ref,
+                            ) {
                                 Ok(cfg) => Some(cfg),
                                 Err(e) => {
                                     warn!(

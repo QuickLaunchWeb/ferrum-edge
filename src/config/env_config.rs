@@ -165,6 +165,11 @@ pub struct EnvConfig {
     pub dtls_cert_path: Option<String>,
     /// Path to DTLS server private key (PEM) for frontend DTLS termination.
     pub dtls_key_path: Option<String>,
+    /// Path to CA certificate (PEM) for verifying DTLS client certificates (mTLS).
+    /// When set, the gateway requires and verifies client certificates for frontend
+    /// DTLS connections using this trust store. Separate from the TLS client CA used
+    /// for TCP frontend mTLS (`FERRUM_TLS_CLIENT_CA_CERT_PATH`).
+    pub dtls_client_ca_cert_path: Option<String>,
 
     // Client IP resolution
     /// Comma-separated trusted proxy CIDRs/IPs for X-Forwarded-For resolution.
@@ -236,6 +241,7 @@ impl Default for EnvConfig {
             stream_proxy_bind_address: "0.0.0.0".into(),
             dtls_cert_path: None,
             dtls_key_path: None,
+            dtls_client_ca_cert_path: None,
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 100,
@@ -347,6 +353,7 @@ impl EnvConfig {
                 .unwrap_or_else(|_| "0.0.0.0".into()),
             dtls_cert_path: env::var("FERRUM_DTLS_CERT_PATH").ok(),
             dtls_key_path: env::var("FERRUM_DTLS_KEY_PATH").ok(),
+            dtls_client_ca_cert_path: env::var("FERRUM_DTLS_CLIENT_CA_CERT_PATH").ok(),
 
             // HTTP/3 / QUIC
             enable_http3: env::var("FERRUM_ENABLE_HTTP3").unwrap_or_default() == "true",

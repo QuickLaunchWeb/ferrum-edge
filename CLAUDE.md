@@ -290,6 +290,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / Ed25519) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
+| `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
