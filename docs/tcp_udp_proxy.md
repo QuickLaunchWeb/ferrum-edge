@@ -259,7 +259,7 @@ UDP is connectionless, so the gateway tracks sessions by client source address (
 
 ## Compatible Plugins
 
-Only stream-compatible plugins are invoked for TCP/UDP connections:
+Each plugin declares which protocols it supports via `supported_protocols()`. Only plugins that declare `Tcp` or `Udp` support are invoked for stream connections — the gateway automatically skips HTTP-specific plugins (auth, CORS, body transformer, request/response transformer, etc.).
 
 | Plugin | Hook | Description |
 |--------|------|-------------|
@@ -267,10 +267,12 @@ Only stream-compatible plugins are invoked for TCP/UDP connections:
 | `rate_limiting` | `on_stream_connect` | Connection-level rate limiting |
 | `correlation_id` | `on_stream_connect` | Assign request ID to connection metadata |
 | `stdout_logging` | `on_stream_disconnect` | Log connection summary as JSON |
+| `http_logging` | `on_stream_disconnect` | Send connection summary to HTTP endpoint |
+| `transaction_debugger` | `on_stream_disconnect` | Log detailed connection debug info |
 | `prometheus_metrics` | `on_stream_disconnect` | Record connection metrics |
 | `otel_tracing` | `on_stream_disconnect` | Emit trace span for connection |
 
-HTTP-specific plugins (auth, CORS, body transformer, request/response transformer, etc.) are not invoked for stream connections.
+See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per-plugin protocol matrix.
 
 ## Environment Variables
 

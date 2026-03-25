@@ -838,6 +838,10 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 
 Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 
+### Protocol-Aware Plugin Filtering
+
+Each plugin declares which proxy protocols it supports (HTTP, gRPC, WebSocket, TCP, UDP). The gateway automatically skips plugins that don't apply to the current proxy's protocol — for example, CORS is never invoked on a TCP stream proxy, and auth plugins are skipped for raw UDP connections. Protocol-filtered plugin lists are pre-computed at config reload time for zero hot-path overhead. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full per-plugin protocol matrix.
+
 ### Global vs. Proxy Scope
 
 - **Global** plugins apply to all proxies

@@ -135,6 +135,16 @@ impl Plugin for MyPlugin {
         500  // Example: runs after CORS (100), before auth (1000+)
     }
 
+    // Declare which protocols this plugin supports.
+    // Default is HTTP_ONLY_PROTOCOLS. Use one of the predefined constants:
+    //   ALL_PROTOCOLS           — HTTP, gRPC, WebSocket, TCP, UDP
+    //   HTTP_FAMILY_PROTOCOLS   — HTTP, gRPC, WebSocket
+    //   HTTP_GRPC_PROTOCOLS     — HTTP, gRPC
+    //   HTTP_ONLY_PROTOCOLS     — HTTP only (default)
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        ALL_PROTOCOLS  // Example: this plugin works with all protocols
+    }
+
     // If your plugin makes outbound HTTP calls to a configured endpoint,
     // override warmup_hostnames() so the endpoint is pre-resolved at startup
     // via the gateway's shared DNS cache:
@@ -170,6 +180,47 @@ pub mod priority {
 ```
 
 The default priority is `5000` (the Custom band), which runs after all transforms but before logging. This is a safe default for plugins that don't have strong ordering requirements.
+
+## Protocol Support
+
+Each plugin declares which proxy protocols it supports via `supported_protocols()`. The gateway skips plugins that don't support the current proxy's protocol — for example, CORS is never invoked for a TCP stream proxy.
+
+TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that supports `Tcp` also supports TCP+TLS, and a plugin that supports `Udp` also supports UDP+DTLS.
+
+| Protocol | Description |
+|----------|-------------|
+| `Http` | HTTP/1.1, HTTP/2, HTTP/3 (includes HTTPS) |
+| `Grpc` | gRPC / gRPCs (HTTP/2-based RPC) |
+| `WebSocket` | WS / WSS |
+| `Tcp` | Raw TCP stream proxy (includes TLS termination/origination) |
+| `Udp` | Raw UDP datagram proxy (includes DTLS termination/origination) |
+
+### Per-Plugin Protocol Matrix
+
+| Plugin | Http | Grpc | WebSocket | Tcp | Udp | Rationale |
+|--------|:----:|:----:|:---------:|:---:|:---:|-----------|
+| `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
+| `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
+| `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
+| `oauth2_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
+| `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
+| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/body |
+| `body_validator` | ✓ | ✓ | | | | Validates request body |
+| `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
+| `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers |
+| `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
+| `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `transaction_debugger` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `prometheus_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Metrics for all protocols |
+| `otel_tracing` | ✓ | ✓ | ✓ | ✓ | ✓ | Tracing for all protocols |
+
+Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.
 
 ## gRPC Compatibility
 

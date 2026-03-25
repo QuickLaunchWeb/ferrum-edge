@@ -213,10 +213,11 @@ tests/
 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
 2. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-3. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
-4. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs`
-5. Add the module to `tests/unit/plugins/mod.rs`
-6. Update `FEATURES.md` and `README.md`
+3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, or `HTTP_ONLY_PROTOCOLS`
+4. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
+5. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs`
+6. Add the module to `tests/unit/plugins/mod.rs`
+7. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md` (protocol matrix)
 
 ### Adding a New Config Field
 

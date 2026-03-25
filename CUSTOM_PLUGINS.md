@@ -157,6 +157,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | Method | Default | Description |
 |--------|---------|-------------|
 | `fn priority(&self) -> u16` | `5000` | Execution order (lower = earlier). See priority bands below. |
+| `fn supported_protocols(&self) -> &'static [ProxyProtocol]` | `HTTP_ONLY_PROTOCOLS` | Which proxy protocols this plugin supports. Use `ALL_PROTOCOLS` for protocol-agnostic plugins, `HTTP_FAMILY_PROTOCOLS` for HTTP/gRPC/WebSocket, `HTTP_GRPC_PROTOCOLS` for HTTP/gRPC, or `HTTP_ONLY_PROTOCOLS` for HTTP only. |
 | `fn is_auth_plugin(&self) -> bool` | `false` | Set to `true` if your plugin participates in the authentication phase. |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Set to `true` if your plugin needs to inspect the response body. Disables streaming. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming). |
