@@ -4,7 +4,7 @@ A high-performance API Gateway and Reverse Proxy built in Rust, powered by `toki
 
 ## Overview
 
-Ferrum Gateway is a lightweight, extensible API gateway designed for modern microservice architectures. It provides dynamic routing, protocol flexibility (HTTP, WebSocket, gRPC), a robust plugin system with authentication, authorization, rate limiting, and request/response transformation capabilities. It supports multiple deployment topologies through its operating modes — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
+Ferrum Gateway is a lightweight, extensible API gateway designed for modern microservice architectures. It provides dynamic routing, protocol flexibility (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP with TLS and DTLS support), a robust plugin system with authentication, authorization, rate limiting, and request/response transformation capabilities. It supports multiple deployment topologies through its operating modes — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
 
 ## Features
 
@@ -114,7 +114,7 @@ Ferrum Gateway supports a configurable read-only mode for the Admin API, providi
 
 ## Prerequisites
 
-- **Rust** toolchain (latest stable, 1.75+)
+- **Rust** toolchain (latest stable, 1.85+)
 - **Database** (optional): PostgreSQL, MySQL, or SQLite (for database and CP modes)
 - **protoc** (Protocol Buffers compiler) for gRPC code generation
 
@@ -309,7 +309,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp` |
+| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
