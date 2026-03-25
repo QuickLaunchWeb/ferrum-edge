@@ -23,6 +23,7 @@ struct ListenerHandle {
     _join_handle: JoinHandle<()>,
     listen_port: u16,
     protocol: BackendProtocol,
+    frontend_tls: bool,
 }
 
 /// Manages the set of active TCP/UDP stream listeners.
@@ -109,8 +110,11 @@ impl StreamListenerManager {
                 None => {
                     to_remove.push(proxy_id.clone());
                 }
-                Some((port, protocol, _frontend_tls)) => {
-                    if handle.listen_port != *port || handle.protocol != *protocol {
+                Some((port, protocol, frontend_tls)) => {
+                    if handle.listen_port != *port
+                        || handle.protocol != *protocol
+                        || handle.frontend_tls != *frontend_tls
+                    {
                         to_remove.push(proxy_id.clone());
                     }
                 }
@@ -260,6 +264,7 @@ impl StreamListenerManager {
                     _join_handle: join_handle,
                     listen_port: *port,
                     protocol: *protocol,
+                    frontend_tls: *frontend_tls,
                 },
             );
         }
