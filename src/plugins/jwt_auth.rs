@@ -80,6 +80,10 @@ impl Plugin for JwtAuth {
         super::priority::JWT_AUTH
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,

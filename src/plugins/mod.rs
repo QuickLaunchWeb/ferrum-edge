@@ -32,6 +32,46 @@ use std::sync::Arc;
 use crate::config::types::{BackendProtocol, Consumer, Proxy};
 use crate::consumer_index::ConsumerIndex;
 
+/// Protocol categories that plugins can declare support for.
+///
+/// TLS/DTLS are transport-layer concerns — a plugin that works on TCP also
+/// works on TCP+TLS, and similarly for UDP+DTLS. So we use 5 variants, not 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProxyProtocol {
+    /// HTTP/1.1, HTTP/2, HTTP/3 (includes HTTPS — TLS is transport-layer)
+    Http,
+    /// gRPC / gRPCs (HTTP/2-based RPC)
+    Grpc,
+    /// WebSocket / WSS
+    WebSocket,
+    /// Raw TCP stream proxy (includes TLS termination/origination)
+    Tcp,
+    /// Raw UDP datagram proxy (includes DTLS termination/origination)
+    Udp,
+}
+
+/// All protocol variants, for plugins that support every protocol.
+pub const ALL_PROTOCOLS: &[ProxyProtocol] = &[
+    ProxyProtocol::Http,
+    ProxyProtocol::Grpc,
+    ProxyProtocol::WebSocket,
+    ProxyProtocol::Tcp,
+    ProxyProtocol::Udp,
+];
+
+/// HTTP-family protocols (HTTP, gRPC, WebSocket) — no raw stream support.
+pub const HTTP_FAMILY_PROTOCOLS: &[ProxyProtocol] = &[
+    ProxyProtocol::Http,
+    ProxyProtocol::Grpc,
+    ProxyProtocol::WebSocket,
+];
+
+/// HTTP + gRPC only (plugins that modify HTTP headers/body but not WebSocket frames).
+pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyProtocol::Grpc];
+
+/// HTTP-only (single protocol).
+pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
+
 /// Context passed through the plugin pipeline for a single request.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -282,15 +322,17 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// Returns `true` if this plugin supports stream proxy (TCP/UDP) connections.
+    /// Returns the set of proxy protocols this plugin supports.
     ///
-    /// Only stream-compatible plugins are invoked for TCP/UDP proxy connections.
-    /// Most HTTP-specific plugins (auth, CORS, body transformer, etc.) return
-    /// `false` (the default). Plugins like ip_restriction, rate_limiting,
-    /// stdout_logging, and prometheus_metrics opt in.
-    #[allow(dead_code)] // Called by stream proxy handlers when plugins are wired in
-    fn supports_stream_proxy(&self) -> bool {
-        false
+    /// The gateway uses this to filter plugins per proxy based on its protocol.
+    /// For example, CORS only applies to HTTP, while ip_restriction works on all
+    /// protocols. Plugins are skipped for protocols they don't support.
+    ///
+    /// Default is HTTP-only (backwards compatible for existing plugins).
+    /// Use the protocol constants (`ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, etc.)
+    /// for common patterns.
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        HTTP_ONLY_PROTOCOLS
     }
 
     /// Called when a new stream connection (TCP/UDP session) is established.

@@ -635,6 +635,10 @@ impl Plugin for BodyValidator {
         BODY_VALIDATOR_PRIORITY
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_GRPC_PROTOCOLS
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

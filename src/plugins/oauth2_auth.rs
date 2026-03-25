@@ -262,6 +262,10 @@ impl Plugin for OAuth2Auth {
         super::priority::OAUTH2_AUTH
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,

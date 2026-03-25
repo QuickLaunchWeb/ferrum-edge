@@ -254,8 +254,8 @@ impl Plugin for PrometheusMetrics {
         PROMETHEUS_METRICS_PRIORITY
     }
 
-    fn supports_stream_proxy(&self) -> bool {
-        true
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::ALL_PROTOCOLS
     }
 
     async fn log(&self, summary: &TransactionSummary) {

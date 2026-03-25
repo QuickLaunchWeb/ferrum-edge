@@ -143,8 +143,8 @@ impl Plugin for IpRestriction {
         IP_RESTRICTION_PRIORITY
     }
 
-    fn supports_stream_proxy(&self) -> bool {
-        true
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::ALL_PROTOCOLS
     }
 
     async fn on_stream_connect(&self, ctx: &super::StreamConnectionContext) -> super::PluginResult {

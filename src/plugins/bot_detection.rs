@@ -83,6 +83,10 @@ impl Plugin for BotDetection {
         BOT_DETECTION_PRIORITY
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let user_agent = match ctx.headers.get("user-agent") {
             Some(ua) => ua.to_lowercase(),

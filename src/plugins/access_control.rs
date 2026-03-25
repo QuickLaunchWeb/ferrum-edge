@@ -86,6 +86,10 @@ impl Plugin for AccessControl {
         super::priority::ACCESS_CONTROL
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Parse client IP once for all rule checks (integer ops from here on)
         let client_ip = parse_client_ip(&ctx.client_ip);

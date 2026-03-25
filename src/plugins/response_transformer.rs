@@ -62,6 +62,10 @@ impl Plugin for ResponseTransformer {
         super::priority::RESPONSE_TRANSFORMER
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_GRPC_PROTOCOLS
+    }
+
     async fn after_proxy(
         &self,
         _ctx: &mut RequestContext,

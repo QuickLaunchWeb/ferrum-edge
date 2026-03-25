@@ -268,8 +268,8 @@ impl Plugin for RateLimiting {
         super::priority::RATE_LIMITING
     }
 
-    fn supports_stream_proxy(&self) -> bool {
-        true
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::ALL_PROTOCOLS
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

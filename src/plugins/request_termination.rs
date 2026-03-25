@@ -107,6 +107,10 @@ impl Plugin for RequestTermination {
         REQUEST_TERMINATION_PRIORITY
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let should_terminate = match &self.trigger {
             Trigger::Always => true,

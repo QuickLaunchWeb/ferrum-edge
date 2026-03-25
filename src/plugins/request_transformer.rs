@@ -77,6 +77,10 @@ impl Plugin for RequestTransformer {
         super::priority::REQUEST_TRANSFORMER
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_GRPC_PROTOCOLS
+    }
+
     fn modifies_request_headers(&self) -> bool {
         true
     }

@@ -79,6 +79,10 @@ impl Plugin for TransactionDebugger {
         super::priority::TRANSACTION_DEBUGGER
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::ALL_PROTOCOLS
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let safe_headers = self.redact_headers(&ctx.headers);
         println!("[DEBUG] === Incoming Request ===");

@@ -6,7 +6,7 @@ use crate::config::types::{GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
 use crate::config::types::PluginConfig;
-use crate::plugins::{Plugin, PluginHttpClient, create_plugin_with_http_client};
+use crate::plugins::{Plugin, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client};
 
 /// Try to create a plugin, logging validation errors.
 ///
@@ -53,6 +53,53 @@ type PluginList = Arc<Vec<Arc<dyn Plugin>>>;
 type ProxyPluginMap = HashMap<String, PluginList>;
 /// Map from proxy_id to whether any plugin requires response body buffering.
 type BufferingMap = HashMap<String, bool>;
+/// Map from (proxy_id, protocol) to pre-filtered plugin list.
+type ProtocolPluginMap = HashMap<(String, ProxyProtocol), PluginList>;
+
+/// Filter a plugin list to only those supporting a given protocol.
+fn filter_for_protocol(
+    plugins: &[Arc<dyn Plugin>],
+    protocol: ProxyProtocol,
+) -> Arc<Vec<Arc<dyn Plugin>>> {
+    Arc::new(
+        plugins
+            .iter()
+            .filter(|p| p.supported_protocols().contains(&protocol))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Build protocol-filtered plugin maps from the full plugin map + global fallback.
+fn build_protocol_maps(
+    proxy_map: &ProxyPluginMap,
+    globals: &[Arc<dyn Plugin>],
+) -> (ProtocolPluginMap, HashMap<ProxyProtocol, PluginList>) {
+    let protocols = [
+        ProxyProtocol::Http,
+        ProxyProtocol::Grpc,
+        ProxyProtocol::WebSocket,
+        ProxyProtocol::Tcp,
+        ProxyProtocol::Udp,
+    ];
+
+    let mut proto_map = HashMap::with_capacity(proxy_map.len() * protocols.len());
+    for (proxy_id, plugins) in proxy_map {
+        for &proto in &protocols {
+            proto_map.insert(
+                (proxy_id.clone(), proto),
+                filter_for_protocol(plugins, proto),
+            );
+        }
+    }
+
+    let mut global_proto_map = HashMap::with_capacity(protocols.len());
+    for &proto in &protocols {
+        global_proto_map.insert(proto, filter_for_protocol(globals, proto));
+    }
+
+    (proto_map, global_proto_map)
+}
 
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
 ///
@@ -74,6 +121,11 @@ pub struct PluginCache {
     requires_buffering: ArcSwap<BufferingMap>,
     /// Whether global-only plugins require response body buffering (fallback).
     global_requires_buffering: ArcSwap<bool>,
+    /// Pre-computed per-protocol plugin lists: (proxy_id, protocol) → filtered plugins.
+    /// Avoids per-request filtering on the hot path.
+    protocol_plugins: ArcSwap<ProtocolPluginMap>,
+    /// Per-protocol global plugin fallback lists.
+    global_protocol_plugins: ArcSwap<HashMap<ProxyProtocol, PluginList>>,
     /// Shared HTTP client for plugins that make outbound network calls.
     http_client: PluginHttpClient,
 }
@@ -96,11 +148,14 @@ impl PluginCache {
     ) -> Result<Self, String> {
         let (proxy_map, globals, buffering_map, global_needs_buffering) =
             Self::build_cache(config, &http_client)?;
+        let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
         Ok(Self {
             proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
             global_plugins: ArcSwap::new(Arc::new(globals)),
             requires_buffering: ArcSwap::new(Arc::new(buffering_map)),
             global_requires_buffering: ArcSwap::new(Arc::new(global_needs_buffering)),
+            protocol_plugins: ArcSwap::new(Arc::new(proto_map)),
+            global_protocol_plugins: ArcSwap::new(Arc::new(global_proto_map)),
             http_client,
         })
     }
@@ -113,11 +168,15 @@ impl PluginCache {
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
         let (proxy_map, globals, buffering_map, global_needs_buffering) =
             Self::build_cache(config, &self.http_client)?;
+        let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
         self.proxy_plugins.store(Arc::new(proxy_map));
         self.global_plugins.store(Arc::new(globals));
         self.requires_buffering.store(Arc::new(buffering_map));
         self.global_requires_buffering
             .store(Arc::new(global_needs_buffering));
+        self.protocol_plugins.store(Arc::new(proto_map));
+        self.global_protocol_plugins
+            .store(Arc::new(global_proto_map));
         Ok(())
     }
 
@@ -238,9 +297,37 @@ impl PluginCache {
             }
         }
 
+        // Rebuild protocol-filtered maps for changed proxies
+        let mut new_proto_map: ProtocolPluginMap = self.protocol_plugins.load().as_ref().clone();
+        let protocols = [
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+            ProxyProtocol::Tcp,
+            ProxyProtocol::Udp,
+        ];
+        for id in removed_proxy_ids {
+            for &proto in &protocols {
+                new_proto_map.remove(&(id.clone(), proto));
+            }
+        }
+        for proxy in &config.proxies {
+            if proxy_ids_to_rebuild.contains(&proxy.id)
+                && let Some(plugins) = new_map.get(&proxy.id)
+            {
+                for &proto in &protocols {
+                    new_proto_map.insert(
+                        (proxy.id.clone(), proto),
+                        filter_for_protocol(plugins, proto),
+                    );
+                }
+            }
+        }
+
         // Atomic swap — readers see old or new, never a partial state
         self.proxy_plugins.store(Arc::new(new_map));
         self.requires_buffering.store(Arc::new(new_buffering));
+        self.protocol_plugins.store(Arc::new(new_proto_map));
         if rebuild_globals {
             self.global_plugins.store(Arc::new(new_globals.clone()));
             self.global_requires_buffering.store(Arc::new(
@@ -248,6 +335,13 @@ impl PluginCache {
                     .iter()
                     .any(|p| p.requires_response_body_buffering()),
             ));
+            // Rebuild global protocol maps
+            let mut new_global_proto = HashMap::with_capacity(protocols.len());
+            for &proto in &protocols {
+                new_global_proto.insert(proto, filter_for_protocol(&new_globals, proto));
+            }
+            self.global_protocol_plugins
+                .store(Arc::new(new_global_proto));
         }
     }
 
@@ -263,6 +357,32 @@ impl PluginCache {
             // Fallback to global-only plugins
             let globals = self.global_plugins.load();
             Arc::clone(globals.as_ref())
+        }
+    }
+
+    /// Get pre-resolved plugins for a proxy filtered by protocol. Lock-free O(1) lookup.
+    ///
+    /// Returns only plugins that declare support for the given protocol.
+    /// Pre-computed at config reload time — zero filtering cost per request.
+    #[allow(dead_code)] // Used by stream proxy handlers when protocol filtering is wired in
+    pub fn get_plugins_for_protocol(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        let map = self.protocol_plugins.load();
+        // Use a temporary owned key for lookup — the hash map requires owned keys
+        if let Some(plugins) = map.get(&(proxy_id.to_string(), protocol)) {
+            Arc::clone(plugins)
+        } else {
+            // Fallback to global protocol-filtered plugins
+            let globals = self.global_protocol_plugins.load();
+            if let Some(plugins) = globals.get(&protocol) {
+                Arc::clone(plugins)
+            } else {
+                // Should never happen, but return empty list
+                Arc::new(Vec::new())
+            }
         }
     }
 

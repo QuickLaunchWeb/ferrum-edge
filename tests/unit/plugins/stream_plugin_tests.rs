@@ -1,9 +1,12 @@
-//! Tests for stream proxy plugin compatibility.
+//! Tests for plugin protocol support declarations.
 //!
-//! Verifies that the correct plugins opt into stream proxy support
-//! and that stream-specific plugin hooks work correctly.
+//! Verifies that each plugin correctly declares which proxy protocols
+//! it supports via the `supported_protocols()` trait method.
 
-use ferrum_gateway::plugins::{Plugin, create_plugin};
+use ferrum_gateway::plugins::{
+    ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin,
+    ProxyProtocol, create_plugin,
+};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -12,9 +15,122 @@ fn make_plugin(name: &str, config: serde_json::Value) -> Option<Arc<dyn Plugin>>
     create_plugin(name, &config).ok().flatten()
 }
 
+#[tokio::test]
+async fn test_all_protocol_plugins() {
+    // Plugins that support ALL protocols (protocol-agnostic)
+    let plugins = vec![
+        ("ip_restriction", json!({"allow": ["10.0.0.0/8"]})),
+        ("rate_limiting", json!({"per_second": 100})),
+        ("stdout_logging", json!({})),
+        ("prometheus_metrics", json!({})),
+        ("correlation_id", json!({})),
+        (
+            "otel_tracing",
+            json!({"endpoint": "http://example.com/traces"}),
+        ),
+        (
+            "http_logging",
+            json!({"endpoint_url": "http://example.com/logs"}),
+        ),
+        ("transaction_debugger", json!({})),
+    ];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols, ALL_PROTOCOLS,
+            "Plugin {} should support all protocols, got {:?}",
+            name, protocols
+        );
+    }
+}
+
 #[test]
-fn test_stream_compatible_plugins() {
-    // Plugins that SHOULD support stream proxy
+fn test_http_family_plugins() {
+    // Plugins that support HTTP, gRPC, and WebSocket
+    let plugins = vec![
+        ("key_auth", json!({})),
+        ("basic_auth", json!({})),
+        ("access_control", json!({"allowed_consumers": ["admin"]})),
+        ("bot_detection", json!({})),
+        ("request_termination", json!({"status_code": 503})),
+    ];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols, HTTP_FAMILY_PROTOCOLS,
+            "Plugin {} should support HTTP family protocols, got {:?}",
+            name, protocols
+        );
+        // Verify it does NOT support TCP/UDP
+        assert!(
+            !protocols.contains(&ProxyProtocol::Tcp),
+            "Plugin {} should not support TCP",
+            name
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::Udp),
+            "Plugin {} should not support UDP",
+            name
+        );
+    }
+}
+
+#[test]
+fn test_http_grpc_plugins() {
+    // Plugins that support HTTP and gRPC only (modify headers/body)
+    let plugins = vec![
+        ("request_transformer", json!({})),
+        ("response_transformer", json!({})),
+        ("body_validator", json!({"schema": {}})),
+    ];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols, HTTP_GRPC_PROTOCOLS,
+            "Plugin {} should support HTTP+gRPC only, got {:?}",
+            name, protocols
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::WebSocket),
+            "Plugin {} should not support WebSocket",
+            name
+        );
+    }
+}
+
+#[test]
+fn test_http_only_plugins() {
+    // Plugins that only support HTTP
+    let plugins = vec![("cors", json!({"origins": ["*"]}))];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols, HTTP_ONLY_PROTOCOLS,
+            "Plugin {} should support HTTP only, got {:?}",
+            name, protocols
+        );
+    }
+}
+
+#[test]
+fn test_stream_compatible_plugins_support_tcp_udp() {
+    // Verify that stream-compatible plugins support both TCP and UDP
     let stream_plugins = vec![
         ("ip_restriction", json!({"allow": ["10.0.0.0/8"]})),
         ("rate_limiting", json!({"per_second": 100})),
@@ -26,35 +142,16 @@ fn test_stream_compatible_plugins() {
     for (name, config) in stream_plugins {
         let plugin = make_plugin(name, config);
         assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
         assert!(
-            plugin.unwrap().supports_stream_proxy(),
-            "Plugin {} should support stream proxy",
+            protocols.contains(&ProxyProtocol::Tcp),
+            "Plugin {} should support TCP",
             name
         );
-    }
-}
-
-#[test]
-fn test_http_only_plugins() {
-    // Plugins that should NOT support stream proxy
-    let http_only_plugins = vec![
-        ("cors", json!({"origins": ["*"]})),
-        ("key_auth", json!({})),
-        ("basic_auth", json!({})),
-        ("request_transformer", json!({})),
-        ("response_transformer", json!({})),
-        ("body_validator", json!({"schema": {}})),
-        ("request_termination", json!({"status_code": 503})),
-        ("access_control", json!({"allowed_consumers": ["admin"]})),
-        ("bot_detection", json!({})),
-    ];
-
-    for (name, config) in http_only_plugins {
-        let plugin = make_plugin(name, config);
-        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
         assert!(
-            !plugin.unwrap().supports_stream_proxy(),
-            "Plugin {} should NOT support stream proxy",
+            protocols.contains(&ProxyProtocol::Udp),
+            "Plugin {} should support UDP",
             name
         );
     }

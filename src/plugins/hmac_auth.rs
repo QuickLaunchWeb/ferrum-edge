@@ -105,6 +105,10 @@ impl Plugin for HmacAuth {
         super::priority::HMAC_AUTH
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::HTTP_FAMILY_PROTOCOLS
+    }
+
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,

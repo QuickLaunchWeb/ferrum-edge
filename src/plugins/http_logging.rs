@@ -77,6 +77,10 @@ impl Plugin for HttpLogging {
         super::priority::HTTP_LOGGING
     }
 
+    fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
+        super::ALL_PROTOCOLS
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         if self.sender.try_send(summary.clone()).is_err() {
             warn!("HTTP logging buffer full — dropping log entry");
