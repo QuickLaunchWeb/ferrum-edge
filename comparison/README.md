@@ -189,9 +189,9 @@ The following results were collected on macOS (Apple Silicon) with 8 threads, 10
 | **Tyk v5.7** (Docker) | HTTP | 23,036 | 22,380 | 4.22 ms | 4.32 ms |
 | **Tyk v5.7** (Docker) | HTTPS | 22,185 | 21,561 | 4.43 ms | 4.50 ms |
 | **Tyk v5.7** (Docker) | E2E TLS | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
-| **KrakenD 2.13** (Docker) | HTTP | 20,417 | 19,936 | — | — |
-| **KrakenD 2.13** (Docker) | HTTPS | 19,636 | — | — | — |
-| **KrakenD 2.13** (Docker) | E2E TLS | 20,826 | — | — | — |
+| **KrakenD 2.13** (Docker) | HTTP | 17,418 | 16,534 | 5.58 ms | 6.10 ms |
+| **KrakenD 2.13** (Docker) | HTTPS | 16,404 | 17,247 | 6.10 ms | 5.61 ms |
+| **KrakenD 2.13** (Docker) | E2E TLS | 17,458 | 17,035 | 5.92 ms | 5.80 ms |
 
 > **Note:** Pingora E2E TLS is not supported in this benchmark — Pingora's TLS library requires a valid DNS hostname for upstream SNI and cannot connect to IP-based backends (127.0.0.1) over TLS. This is a framework limitation, not a configuration issue.
 
@@ -232,15 +232,18 @@ KrakenD is a high-performance, stateless Go-based API gateway. It runs in Docker
 
 | Test | Ferrum | KrakenD | Advantage |
 |------|--------|---------|-----------|
-| HTTP /health | **96,520** req/s | 20,417 req/s | **Ferrum 4.7x faster** |
-| HTTP /api/users | **45,924** req/s | 19,936 req/s | **Ferrum 2.3x faster** |
-| HTTPS /health | **93,766** req/s | 19,636 req/s | **Ferrum 4.8x faster** |
-| E2E TLS /health | **86,792** req/s | 20,826 req/s | **Ferrum 4.2x faster** |
+| HTTP /health | **90,110** req/s (1.08 ms) | 17,418 req/s (5.58 ms) | **Ferrum 5.2x faster** |
+| HTTP /api/users | **39,733** req/s (2.43 ms) | 16,534 req/s (6.10 ms) | **Ferrum 2.4x faster** |
+| HTTPS /health | **90,107** req/s (1.08 ms) | 16,404 req/s (6.10 ms) | **Ferrum 5.5x faster** |
+| HTTPS /api/users | **40,009** req/s (2.41 ms) | 17,247 req/s (5.61 ms) | **Ferrum 2.3x faster** |
+| E2E TLS /health | **81,148** req/s (1.30 ms) | 17,458 req/s (5.92 ms) | **Ferrum 4.6x faster** |
+| E2E TLS /api/users | **39,120** req/s (3.13 ms) | 17,035 req/s (5.80 ms) | **Ferrum 2.3x faster** |
 
 **Key findings:**
-- **Ferrum is 4.2–4.8x faster than KrakenD** on lightweight /health requests across all TLS scenarios.
-- **KrakenD throughput is flat across protocols** (~20K req/s for HTTP, HTTPS, and E2E TLS), suggesting Docker networking overhead dominates its performance profile on macOS.
-- **KrakenD performs similarly to Kong and Tyk** — all three Docker-based gateways land in the 19–26K req/s range, while native Ferrum delivers 4–5x more throughput.
+- **Ferrum is 4.6–5.5x faster than KrakenD** on lightweight /health requests across all TLS scenarios, and 2.3–2.4x faster on heavier /api/users payloads.
+- **KrakenD latency is 5.6–6.1 ms** across all scenarios vs Ferrum's 1.1–3.1 ms — Ferrum adds 3–5 ms less overhead per request.
+- **KrakenD throughput is flat across protocols** (~17K req/s for HTTP, HTTPS, and E2E TLS), suggesting Docker networking overhead dominates its performance profile on macOS.
+- **KrakenD performs similarly to Kong and Tyk** — all three Docker-based gateways land in the 16–26K req/s range, while native Ferrum delivers 2–5x more throughput.
 
 ### Adjusting for Docker Overhead
 
@@ -252,7 +255,7 @@ Kong and Tyk ran in Docker on macOS, which adds ~0.1–0.5 ms latency per reques
 | **Pingora** (native) | 59,429 | **1.5x faster** |
 | **Kong** (Docker, +15% adjusted) | ~30,300 | **3.0x faster** |
 | **Tyk** (Docker, +15% adjusted) | ~26,500 | **3.4x faster** |
-| **KrakenD** (Docker, +15% adjusted) | ~23,500 | **3.8x faster** |
+| **KrakenD** (Docker, +15% adjusted) | ~20,000 | **4.5x faster** |
 
 ### End-to-End TLS Performance
 
@@ -263,10 +266,10 @@ The E2E TLS scenario (client → HTTPS → gateway → HTTPS → backend) is the
 | **Ferrum** (native) | **81,148** | **39,120** | 1.30 ms | 3.13 ms |
 | **Kong 3.9** (Docker) | 23,333 | 22,556 | 4.46 ms | 4.89 ms |
 | **Tyk v5.7** (Docker) | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
-| **KrakenD 2.13** (Docker) | 20,826 | — | — | — |
+| **KrakenD 2.13** (Docker) | 17,458 | 17,035 | 5.92 ms | 5.80 ms |
 
 - **Ferrum is 3.5x faster than Kong** on E2E TLS /health
-- **Ferrum is 4.2x faster than KrakenD** on E2E TLS /health
+- **Ferrum is 4.6x faster than KrakenD** on E2E TLS /health
 - **Ferrum is 1.7x faster than Kong** on E2E TLS /api/users
 - **Ferrum is 2x faster than Tyk** on E2E TLS /api/users
 
