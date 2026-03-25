@@ -103,7 +103,7 @@ def _latency_to_ms(s):
 # Result file discovery
 # ---------------------------------------------------------------------------
 
-GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk"]
+GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend"]
 PROTOCOLS = ["http", "https", "e2e_tls"]
 ENDPOINTS = ["health", "users"]
 
@@ -113,11 +113,13 @@ def _gateway_labels(meta):
     kong_native = meta.get("kong_native", False)
     kong_ver = meta.get("kong_version", "")
     tyk_ver = meta.get("tyk_version", "")
+    krakend_ver = meta.get("krakend_version", "")
     return {
         "baseline": "Direct Backend",
         "ferrum": "Ferrum Gateway (native)",
         "kong": f"Kong Gateway ({'native' if kong_native else 'Docker'})" if not kong_ver else f"Kong ({kong_ver})",
         "tyk": f"Tyk ({tyk_ver})" if tyk_ver else "Tyk Gateway (Docker)",
+        "krakend": f"KrakenD ({krakend_ver})" if krakend_ver else "KrakenD (Docker)",
     }
 
 
@@ -129,20 +131,32 @@ def discover_results(results_dir):
     """Scan results_dir for files matching the naming convention.
 
     Returns dict[gateway][protocol][endpoint] = metrics
+
+    Filenames: {gateway}_{protocol}_{endpoint}_results.txt
+    Handles multi-part protocol names like 'e2e_tls'.
     """
     data = {}
     for fname in sorted(os.listdir(results_dir)):
         if not fname.endswith("_results.txt"):
             continue
-        parts = fname.replace("_results.txt", "").split("_")
-        if len(parts) != 3:
-            continue
-        gw, proto, ep = parts
-        if gw not in GATEWAYS or proto not in PROTOCOLS or ep not in ENDPOINTS:
-            continue
-        data.setdefault(gw, {}).setdefault(proto, {})[ep] = parse_wrk_output(
-            os.path.join(results_dir, fname)
-        )
+        stem = fname.replace("_results.txt", "")
+        # Match known gateway prefix and endpoint suffix, protocol is everything between
+        matched = False
+        for gw in GATEWAYS:
+            if not stem.startswith(gw + "_"):
+                continue
+            rest = stem[len(gw) + 1:]  # strip "gateway_"
+            for ep in ENDPOINTS:
+                if rest.endswith("_" + ep):
+                    proto = rest[: -(len(ep) + 1)]  # strip "_endpoint"
+                    if proto in PROTOCOLS:
+                        data.setdefault(gw, {}).setdefault(proto, {})[ep] = parse_wrk_output(
+                            os.path.join(results_dir, fname)
+                        )
+                        matched = True
+                        break
+            if matched:
+                break
     return data
 
 
@@ -447,7 +461,7 @@ def generate_report(results_dir, output_path, meta=None):
 <div class="container">
 <div class="header">
   <h1>API Gateway Comparison Report</h1>
-  <p>Ferrum Gateway vs Kong vs Tyk &mdash; Performance Benchmark</p>
+  <p>Ferrum Gateway vs Kong vs Tyk vs KrakenD &mdash; Performance Benchmark</p>
   <p style="font-size:0.85em; opacity:0.7;">{now}</p>
 </div>
 
@@ -458,6 +472,7 @@ def generate_report(results_dir, output_path, meta=None):
   Connections: {meta.get('connections', '100')} &bull;
   Kong: {meta.get('kong_version', 'N/A')} &bull;
   Tyk: {meta.get('tyk_version', 'N/A')} &bull;
+  KrakenD: {meta.get('krakend_version', 'N/A')} &bull;
   OS: {meta.get('os', 'N/A')}
 </div>
 
@@ -521,6 +536,7 @@ def generate_report(results_dir, output_path, meta=None):
     <li><strong>Ferrum Gateway</strong> runs as a native binary on the host — zero container overhead.</li>
     <li><strong>Kong</strong> runs {"natively on the host (installed via package manager) — no container overhead." if meta.get("kong_native") else "inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s). To eliminate this overhead on Linux, install Kong natively via the official apt/yum packages."}</li>
     <li><strong>Tyk</strong> runs inside a Docker container (no official macOS binary; Linux-only native packages available via <a href="https://tyk.io/docs/apim/open-source/installation">packagecloud</a>). The same Docker overhead caveats as Kong apply. Additionally, Tyk requires Redis which also runs in a container.</li>
+    <li><strong>KrakenD</strong> runs inside a Docker container (Go-based, stateless gateway). The same Docker overhead caveats apply. KrakenD is configured with <code>no-op</code> encoding for raw response pass-through, matching the minimal-overhead proxy behavior of other gateways. Key-auth benchmarks are excluded because API key authentication requires KrakenD Enterprise Edition.</li>
     <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend), the most secure pattern.</li>
     <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
     <li>Each test includes a {meta.get("duration", "30s")} measured run preceded by a warm-up phase (results discarded).</li>

@@ -17,7 +17,8 @@
 #   WRK_CONNECTIONS=100     wrk concurrent connections
 #   KONG_VERSION=3.9        Kong Docker image tag
 #   TYK_VERSION=v5.7        Tyk Docker image tag
-#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk)
+#   KRAKEND_VERSION=2.13    KrakenD Docker image tag
+#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend)
 #   WARMUP_DURATION=5s      Warm-up duration before measured test
 # ===========================================================================
 
@@ -46,6 +47,7 @@ WRK_CONNECTIONS=${WRK_CONNECTIONS:-100}
 WARMUP_DURATION=${WARMUP_DURATION:-5s}
 KONG_VERSION=${KONG_VERSION:-3.9}
 TYK_VERSION=${TYK_VERSION:-v5.7}
+KRAKEND_VERSION=${KRAKEND_VERSION:-2.13}
 SKIP_GATEWAYS=${SKIP_GATEWAYS:-}
 
 RESULTS_DIR="$COMP_DIR/results"
@@ -57,6 +59,7 @@ LUA_SCRIPT_KEY_AUTH="$COMP_DIR/lua/comparison_test_key_auth.lua"
 # Docker container names (prefixed for easy cleanup)
 KONG_CONTAINER="ferrum-bench-kong"
 TYK_CONTAINER="ferrum-bench-tyk"
+KRAKEND_CONTAINER="ferrum-bench-krakend"
 REDIS_CONTAINER="ferrum-bench-redis"
 
 # PIDs to track
@@ -162,6 +165,7 @@ cleanup() {
 
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
+    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
     docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
 
     # Clean up Docker network and temporary config files
@@ -171,6 +175,9 @@ cleanup() {
     rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.krakend_runtime_http.json" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.krakend_runtime_https.json" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json" 2>/dev/null || true
 
     kill_port "$BACKEND_PORT"
     kill_port "$BACKEND_HTTPS_PORT"
@@ -185,8 +192,11 @@ trap cleanup EXIT
 # ===========================================================================
 
 needs_docker() {
-    # Docker is needed for Tyk (always) and Kong (unless native)
+    # Docker is needed for Tyk (always), KrakenD (always), and Kong (unless native)
     if ! should_skip "tyk"; then
+        return 0
+    fi
+    if ! should_skip "krakend"; then
         return 0
     fi
     if ! should_skip "kong" && [[ "$KONG_NATIVE" != "true" ]]; then
@@ -258,6 +268,13 @@ pull_images() {
         }
         log_info "Pulling redis:7-alpine..."
         docker pull redis:7-alpine --quiet || true
+    fi
+
+    if ! should_skip "krakend"; then
+        log_info "Pulling krakend:${KRAKEND_VERSION}..."
+        docker pull "krakend:${KRAKEND_VERSION}" --quiet || {
+            log_warn "Failed to pull KrakenD image. Will try to use cached version."
+        }
     fi
 }
 
@@ -982,7 +999,122 @@ test_tyk() {
 }
 
 # ===========================================================================
+# KrakenD Gateway
+# ===========================================================================
+
+prepare_krakend_config() {
+    # Replace BACKEND_HOST placeholder in KrakenD config files
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/krakend/krakend_http.json" > "$COMP_DIR/configs/.krakend_runtime_http.json"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/krakend/krakend_https.json" > "$COMP_DIR/configs/.krakend_runtime_https.json"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/krakend/krakend_e2e_tls.json" > "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json"
+}
+
+start_krakend_http() {
+    log_info "Starting KrakenD Gateway (HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+    fi
+
+    docker run -d --name "$KRAKEND_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.krakend_runtime_http.json:/etc/krakend/krakend.json:ro" \
+        "krakend:${KRAKEND_VERSION}" \
+        run -c /etc/krakend/krakend.json > /dev/null
+
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "KrakenD (HTTP)" 20
+}
+
+start_krakend_https() {
+    log_info "Starting KrakenD Gateway (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
+    docker run -d --name "$KRAKEND_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.krakend_runtime_https.json:/etc/krakend/krakend.json:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/krakend/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/krakend/tls/server.key:ro" \
+        "krakend:${KRAKEND_VERSION}" \
+        run -c /etc/krakend/krakend.json > /dev/null
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (HTTPS)" 20
+}
+
+start_krakend_e2e_tls() {
+    log_info "Starting KrakenD Gateway (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
+    docker run -d --name "$KRAKEND_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json:/etc/krakend/krakend.json:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/krakend/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/krakend/tls/server.key:ro" \
+        "krakend:${KRAKEND_VERSION}" \
+        run -c /etc/krakend/krakend.json > /dev/null
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (E2E TLS)" 20
+}
+
+stop_krakend() {
+    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    sleep 1
+}
+
+test_krakend() {
+    log_header "Testing KrakenD Gateway (${KRAKEND_VERSION})"
+
+    prepare_krakend_config
+
+    # HTTP tests
+    start_krakend_http
+    run_wrk "krakend" "http" "/health" "$GATEWAY_HTTP_PORT"
+    run_wrk "krakend" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    stop_krakend
+
+    # HTTPS tests (TLS termination — plaintext backend)
+    start_krakend_https
+    run_wrk "krakend" "https" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "krakend" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_krakend
+
+    # E2E TLS tests (TLS on both sides)
+    start_krakend_e2e_tls
+    run_wrk "krakend" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "krakend" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_krakend
+}
+
+# ===========================================================================
 # Key-Auth Tests (HTTP only, Ferrum + Kong + Tyk)
+# Note: KrakenD key-auth requires Enterprise Edition, so it is excluded.
 # ===========================================================================
 
 prepare_kong_key_auth_config() {
@@ -1216,6 +1348,7 @@ write_metadata() {
     "pingora_version": "$pingora_info",
     "kong_version": "$kong_info",
     "tyk_version": "Docker ${TYK_VERSION}",
+    "krakend_version": "Docker ${KRAKEND_VERSION}",
     "kong_native": $KONG_NATIVE,
     "os": "$(uname -s) $(uname -r) $(uname -m)",
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1236,16 +1369,16 @@ generate_report() {
 
 main() {
     echo -e "${BOLD}"
-    echo "  ╔═══════════════════════════════════════════════════════╗"
-    echo "  ║       API Gateway Comparison Benchmark Suite          ║"
-    echo "  ║       Ferrum  vs  Pingora  vs  Kong  vs  Tyk         ║"
-    echo "  ╚═══════════════════════════════════════════════════════╝"
+    echo "  ╔══════════════════════════════════════════════════════════════╗"
+    echo "  ║          API Gateway Comparison Benchmark Suite            ║"
+    echo "  ║    Ferrum  vs  Pingora  vs  Kong  vs  Tyk  vs  KrakenD    ║"
+    echo "  ╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  Duration: ${WRK_DURATION}  Threads: ${WRK_THREADS}  Connections: ${WRK_CONNECTIONS}"
     if [[ "$KONG_NATIVE" == "true" ]]; then
-        echo "  Kong: native ($(kong version 2>/dev/null || echo '?'))  Tyk: Docker ${TYK_VERSION}"
+        echo "  Kong: native ($(kong version 2>/dev/null || echo '?'))  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}"
     else
-        echo "  Kong: Docker ${KONG_VERSION}  Tyk: Docker ${TYK_VERSION}"
+        echo "  Kong: Docker ${KONG_VERSION}  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}"
     fi
     if [[ -n "$SKIP_GATEWAYS" ]]; then
         echo -e "  ${YELLOW}Skipping: ${SKIP_GATEWAYS}${NC}"
@@ -1276,7 +1409,11 @@ main() {
         test_tyk
     fi
 
-    # Key-Auth tests (HTTP only, Ferrum + Kong + Tyk)
+    if ! should_skip "krakend"; then
+        test_krakend
+    fi
+
+    # Key-Auth tests (HTTP only, Ferrum + Kong + Tyk; KrakenD key-auth requires Enterprise)
     test_key_auth
 
     generate_report
