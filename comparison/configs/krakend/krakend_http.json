@@ -1,0 +1,41 @@
+{
+  "$schema": "https://www.krakend.io/schema/krakend.json",
+  "version": 3,
+  "name": "Ferrum Benchmark - KrakenD HTTP",
+  "port": 8000,
+  "timeout": "5s",
+  "cache_ttl": "0s",
+  "max_idle_connections": 250,
+  "max_idle_connections_per_host": 250,
+  "disable_keep_alives": false,
+  "dialer_timeout": "1s",
+  "read_timeout": "5s",
+  "write_timeout": "5s",
+  "idle_timeout": "120s",
+  "endpoints": [
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "output_encoding": "no-op",
+      "backend": [
+        {
+          "host": ["http://BACKEND_HOST:3001"],
+          "url_pattern": "/health",
+          "encoding": "no-op"
+        }
+      ]
+    },
+    {
+      "endpoint": "/api/users",
+      "method": "GET",
+      "output_encoding": "no-op",
+      "backend": [
+        {
+          "host": ["http://BACKEND_HOST:3001"],
+          "url_pattern": "/api/users",
+          "encoding": "no-op"
+        }
+      ]
+    }
+  ]
+}
