@@ -162,7 +162,7 @@ impl PluginHttpClient {
     ///
     /// The returned client uses pooled connections — no per-call overhead.
     /// Prefer [`execute`] over calling `.send()` directly so that slow
-    /// outbound calls are automatically logged.
+    /// outbound calls are automatically logged with the destination URL.
     pub fn get(&self) -> &reqwest::Client {
         &self.client
     }
@@ -173,17 +173,24 @@ impl PluginHttpClient {
     /// exceeds the configured `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS`. The
     /// `label` identifies the caller in log output (e.g. "http_logging",
     /// "oauth2_introspection", "jwks_fetch", "otel_export").
+    ///
+    /// The destination URL is extracted from the request and included in the
+    /// slow-call warning so operators can identify which external endpoint is slow.
     pub async fn execute(
         &self,
         request: reqwest::RequestBuilder,
         label: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        // Build the request so we can extract the URL before sending.
+        let request = request.build()?;
+        let url = request.url().to_string();
         let start = std::time::Instant::now();
-        let result = request.send().await;
+        let result = self.client.execute(request).await;
         let elapsed = start.elapsed();
         if elapsed > self.slow_threshold {
             tracing::warn!(
                 plugin = label,
+                url = %url,
                 elapsed_ms = elapsed.as_millis() as u64,
                 threshold_ms = self.slow_threshold.as_millis() as u64,
                 "Slow plugin HTTP call"
