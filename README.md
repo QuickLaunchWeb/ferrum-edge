@@ -21,6 +21,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Load Balancing**: Five algorithms (round robin, weighted round robin, least connections, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
 - **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
 - **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
+- **Consumer Identity Forwarding**: Automatically injects `X-Consumer-Username` and `X-Consumer-Custom-Id` headers on requests forwarded to backends after successful authentication
 - **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets + plugin endpoints, deduplicated), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients including plugin outbound calls, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
@@ -881,6 +882,17 @@ Each plugin declares which proxy protocols it supports (HTTP, gRPC, WebSocket, T
 ### Multi-Authentication Mode
 
 When a proxy has `auth_mode: multi`, all attached authentication plugins execute sequentially. The first plugin that successfully identifies a consumer attaches that consumer's context. Subsequent auth plugins cannot overwrite it. After all auth plugins run, the Access Control plugin verifies that at least one consumer was identified.
+
+### Consumer Identity Headers
+
+When a request is successfully authenticated and a consumer is identified, the gateway automatically injects identity headers into the request forwarded to the backend:
+
+| Header | Value | Present |
+|--------|-------|---------|
+| `X-Consumer-Username` | The consumer's `username` field | Always (when authenticated) |
+| `X-Consumer-Custom-Id` | The consumer's `custom_id` field | Only when `custom_id` is set |
+
+These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket) after the authentication phase completes, allowing backend services to identify the caller without re-validating credentials.
 
 ### Available Plugins
 

@@ -344,3 +344,140 @@ plugin_configs: []
     echo1.abort();
     echo2.abort();
 }
+
+/// Start an HTTP server that echoes back request headers as JSON in the response body.
+async fn start_header_echo_server(port: u16) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind header echo server");
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+
+                // Parse headers from the raw HTTP request
+                let mut headers = serde_json::Map::new();
+                for line in request.lines().skip(1) {
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(": ") {
+                        headers.insert(
+                            key.to_lowercase(),
+                            serde_json::Value::String(value.to_string()),
+                        );
+                    }
+                }
+
+                let body = serde_json::to_string(&headers).unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_file_mode_consumer_identity_headers_forwarded() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    // Config with key_auth plugin and a consumer
+    let config_content = r#"
+proxies:
+  - id: "auth-proxy"
+    listen_path: "/auth-api"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 19994
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "key-auth-plugin"
+
+consumers:
+  - id: "consumer-1"
+    username: "test-user"
+    custom_id: "cust-42"
+    credentials:
+      keyauth:
+        key: "my-secret-api-key"
+
+plugin_configs:
+  - id: "key-auth-plugin"
+    proxy_id: "auth-proxy"
+    plugin_name: "key_auth"
+    scope: proxy
+    enabled: true
+    config:
+      key_location: "header:X-Api-Key"
+"#;
+
+    let mut config_file =
+        std::fs::File::create(&config_path).expect("Failed to create config file");
+    config_file
+        .write_all(config_content.as_bytes())
+        .expect("Failed to write config");
+    drop(config_file);
+
+    // Start header echo server
+    let echo_server = tokio::spawn(start_header_echo_server(19994));
+    sleep(Duration::from_millis(500)).await;
+
+    // Start gateway
+    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap(), 18084);
+    sleep(Duration::from_secs(3)).await;
+
+    let client = reqwest::Client::new();
+
+    // Test 1: Request without API key should be rejected (401)
+    let resp = client
+        .get("http://127.0.0.1:18084/auth-api/test")
+        .send()
+        .await
+        .expect("Request should complete");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "Request without API key should be rejected"
+    );
+
+    // Test 2: Request with valid API key should succeed and include consumer headers
+    let resp = client
+        .get("http://127.0.0.1:18084/auth-api/test")
+        .header("X-Api-Key", "my-secret-api-key")
+        .send()
+        .await
+        .expect("Authenticated request should complete");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Authenticated request should succeed"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("Response should be valid JSON");
+    assert_eq!(
+        body.get("x-consumer-username").and_then(|v| v.as_str()),
+        Some("test-user"),
+        "X-Consumer-Username header should be forwarded to backend"
+    );
+    assert_eq!(
+        body.get("x-consumer-custom-id").and_then(|v| v.as_str()),
+        Some("cust-42"),
+        "X-Consumer-Custom-Id header should be forwarded to backend"
+    );
+
+    // Cleanup
+    if let Ok(mut proc) = gateway_process {
+        let _ = proc.kill();
+    }
+    echo_server.abort();
+}

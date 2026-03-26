@@ -100,6 +100,8 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer`). Authorization plugins like `access_control` then decide *whether* that consumer is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
 
+After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller.
+
 ### Rate limiting runs after auth (priority 2900)
 
 Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated consumer identity**, not just by IP address. When `limit_by: "consumer"`, the plugin needs `ctx.identified_consumer` which is only available after the authenticate phase.

@@ -753,7 +753,15 @@ async fn handle_websocket_request_authenticated(
     };
 
     // Collect client headers to forward to backend
-    let client_headers = collect_forwardable_headers(&parts.headers);
+    let mut client_headers = collect_forwardable_headers(&parts.headers);
+
+    // Inject consumer identity headers for WebSocket connections
+    if let Some(ref consumer) = ctx.identified_consumer {
+        client_headers.push(("x-consumer-username".to_string(), consumer.username.clone()));
+        if let Some(ref custom_id) = consumer.custom_id {
+            client_headers.push(("x-consumer-custom-id".to_string(), custom_id.clone()));
+        }
+    }
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
@@ -1809,6 +1817,14 @@ pub async fn handle_proxy_request(
             }
         }
         ctx.headers = tmp_headers;
+    }
+    // Inject X-Consumer-Username header when a consumer has been authenticated
+    if let Some(ref consumer) = ctx.identified_consumer {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
+        if let Some(ref custom_id) = consumer.custom_id {
+            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
+        }
     }
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
