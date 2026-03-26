@@ -675,7 +675,7 @@ async fn handle_connection(
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move { handle_proxy_request(req, state, addr, false).await }
+        async move { handle_proxy_request(req, state, addr, false, None).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         let err_string = e.to_string();
@@ -1414,6 +1414,17 @@ async fn handle_tls_connection(
         }
     };
 
+    // Extract peer certificate (first in chain) before wrapping the stream.
+    // This is the only point where the ServerConnection is accessible — once
+    // wrapped in TokioIo, the TLS metadata is encapsulated and inaccessible.
+    // Arc-shared so HTTP/2 multiplexed requests avoid per-request cert cloning.
+    let client_cert_der: Option<Arc<Vec<u8>>> = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| Arc::new(cert.to_vec()));
+
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 
@@ -1431,7 +1442,8 @@ async fn handle_tls_connection(
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move { handle_proxy_request(req, state, addr, true).await }
+        let cert = client_cert_der.clone();
+        async move { handle_proxy_request(req, state, addr, true, cert).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         let err_string = e.to_string();
@@ -1518,6 +1530,7 @@ pub async fn handle_proxy_request(
     state: ProxyState,
     remote_addr: SocketAddr,
     is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
@@ -1531,6 +1544,7 @@ pub async fn handle_proxy_request(
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.tls_client_cert_der = tls_client_cert_der;
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
