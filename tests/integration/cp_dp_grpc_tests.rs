@@ -157,6 +157,7 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
+        dns_slow_threshold_ms: None,
         real_ip_header: None,
         dtls_cert_path: None,
         dtls_key_path: None,
@@ -177,6 +178,7 @@ fn create_test_proxy_state() -> ProxyState {
         stale_ttl_seconds: 3600,
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
+        slow_threshold_ms: None,
     });
     let env_config = create_test_env_config();
     ProxyState::new(GatewayConfig::default(), dns_cache, env_config).unwrap()

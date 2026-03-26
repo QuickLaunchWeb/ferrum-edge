@@ -51,6 +51,7 @@ pub async fn run(
         stale_ttl_seconds: env_config.dns_stale_ttl,
         error_ttl_seconds: env_config.dns_error_ttl,
         max_cache_size: env_config.dns_cache_max_size,
+        slow_threshold_ms: env_config.dns_slow_threshold_ms,
     });
 
     // DNS warmup — resolve all hostnames (proxy backends, upstream targets,

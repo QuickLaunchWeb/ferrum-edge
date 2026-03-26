@@ -481,6 +481,110 @@ async fn test_dns_config_default() {
     assert!(config.hosts_file_path.is_none());
     assert!(config.dns_order.is_none());
     assert!(config.global_overrides.is_empty());
+    assert!(
+        config.slow_threshold_ms.is_none(),
+        "Slow threshold should be disabled by default"
+    );
+}
+
+// ============================================================================
+// Slow resolution threshold tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_dns_slow_threshold_disabled_by_default() {
+    // With no threshold set, resolution should still work normally
+    let cache = DnsCache::new(DnsConfig {
+        slow_threshold_ms: None,
+        ..DnsConfig::default()
+    });
+
+    let result = cache.resolve("127.0.0.1", None, None).await;
+    assert!(
+        result.is_ok(),
+        "Resolution should work with threshold disabled"
+    );
+    assert_eq!(result.unwrap().to_string(), "127.0.0.1");
+}
+
+#[tokio::test]
+async fn test_dns_slow_threshold_does_not_affect_resolution_result() {
+    // With a very low threshold (0ms), every resolution triggers the warning
+    // but the result should still be correct
+    let cache = DnsCache::new(DnsConfig {
+        slow_threshold_ms: Some(0),
+        ..DnsConfig::default()
+    });
+
+    let result = cache.resolve("localhost", None, None).await;
+    assert!(
+        result.is_ok(),
+        "Resolution should succeed regardless of slow threshold"
+    );
+    let addr = result.unwrap();
+    assert!(addr.to_string() == "127.0.0.1" || addr.to_string() == "::1");
+}
+
+#[tokio::test]
+async fn test_dns_slow_threshold_high_value_no_warn() {
+    // With a very high threshold, no warning should be triggered
+    // (we can't assert on log output, but verify resolution works)
+    let cache = DnsCache::new(DnsConfig {
+        slow_threshold_ms: Some(60_000), // 60 seconds
+        ..DnsConfig::default()
+    });
+
+    let result = cache.resolve("localhost", None, None).await;
+    assert!(result.is_ok(), "Resolution should work with high threshold");
+}
+
+#[tokio::test]
+async fn test_dns_slow_threshold_with_cached_entries() {
+    // Slow threshold should only apply to actual DNS resolution (cache misses),
+    // not cache hits. Verify that cached entries still return instantly.
+    let cache = DnsCache::new(DnsConfig {
+        slow_threshold_ms: Some(0), // 0ms = warn on everything
+        ..DnsConfig::default()
+    });
+
+    // First call populates cache
+    let result1 = cache.resolve("localhost", None, None).await.unwrap();
+
+    // Second call serves from cache — timed_resolve is not called for cache hits
+    let result2 = cache.resolve("localhost", None, None).await.unwrap();
+    assert_eq!(result1, result2, "Cached result should match");
+}
+
+#[tokio::test]
+async fn test_dns_slow_threshold_with_overrides() {
+    // Per-proxy and global overrides bypass DNS resolution entirely,
+    // so slow threshold should never apply to them
+    let cache = DnsCache::new(DnsConfig {
+        slow_threshold_ms: Some(0),
+        ..DnsConfig::default()
+    });
+
+    // Per-proxy override returns immediately (no timed_resolve)
+    let result = cache.resolve("example.com", Some("10.0.0.1"), None).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().to_string(), "10.0.0.1");
+}
+
+#[tokio::test]
+async fn test_dns_slow_threshold_on_error() {
+    // Slow threshold should still apply even when resolution fails
+    let cache = DnsCache::new(DnsConfig {
+        slow_threshold_ms: Some(0),
+        ..DnsConfig::default()
+    });
+
+    let result = cache
+        .resolve("this-domain-absolutely-does-not-exist.invalid", None, None)
+        .await;
+    assert!(
+        result.is_err(),
+        "Resolution of non-existent domain should fail"
+    );
 }
 
 #[tokio::test]

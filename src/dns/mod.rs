@@ -65,6 +65,9 @@ pub struct DnsConfig {
     pub error_ttl_seconds: u64,
     /// Maximum number of entries in the DNS cache. Entries are evicted when this limit is reached.
     pub max_cache_size: usize,
+    /// Threshold in milliseconds above which DNS resolutions are logged as slow.
+    /// None = disabled (no slow resolution warnings). Default: None.
+    pub slow_threshold_ms: Option<u64>,
 }
 
 impl Default for DnsConfig {
@@ -79,6 +82,7 @@ impl Default for DnsConfig {
             stale_ttl_seconds: 3600,
             error_ttl_seconds: 1,
             max_cache_size: 10_000,
+            slow_threshold_ms: None,
         }
     }
 }
@@ -112,10 +116,19 @@ pub struct DnsCache {
     /// Tracks hostnames currently being refreshed in the background
     /// to prevent duplicate refresh tasks under concurrent load.
     refreshing: Arc<DashMap<String, ()>>,
+    /// Threshold above which DNS resolutions are logged as slow. None = disabled.
+    slow_threshold: Option<Duration>,
+    /// Pre-computed label describing which nameservers are in use (for slow resolution logs).
+    resolver_label: Arc<str>,
 }
 
 impl DnsCache {
     pub fn new(config: DnsConfig) -> Self {
+        let resolver_label: Arc<str> = match &config.resolver_addresses {
+            Some(addrs) => Arc::from(addrs.as_str()),
+            None => Arc::from("system"),
+        };
+
         let resolver = build_resolver(&config);
 
         let dns_order = parse_dns_order(config.dns_order.as_deref());
@@ -131,6 +144,8 @@ impl DnsCache {
             error_ttl: Duration::from_secs(config.error_ttl_seconds),
             max_cache_size: config.max_cache_size,
             refreshing: Arc::new(DashMap::new()),
+            slow_threshold: config.slow_threshold_ms.map(Duration::from_millis),
+            resolver_label,
         }
     }
 
@@ -201,7 +216,7 @@ impl DnsCache {
         }
 
         // 4. Perform actual DNS resolution
-        match self.do_resolve(hostname).await {
+        match self.timed_resolve(hostname).await {
             Ok((addrs, record_type)) if !addrs.is_empty() => {
                 let ttl = per_proxy_ttl
                     .map(Duration::from_secs)
@@ -242,7 +257,7 @@ impl DnsCache {
         hostname: &str,
         per_proxy_ttl: Option<u64>,
     ) -> Result<(), anyhow::Error> {
-        let (addrs, record_type) = self.do_resolve(hostname).await?;
+        let (addrs, record_type) = self.timed_resolve(hostname).await?;
         if addrs.is_empty() {
             anyhow::bail!("DNS refresh returned no addresses for {}", hostname);
         }
@@ -283,6 +298,33 @@ impl DnsCache {
             "DNS cached error for {} (ttl={:?})",
             hostname, self.error_ttl
         );
+    }
+
+    /// Wraps `do_resolve` with timing instrumentation. When the configured
+    /// slow threshold is exceeded, emits a warning log with the elapsed time.
+    /// When no threshold is configured, delegates directly to `do_resolve`
+    /// with zero overhead (no `Instant::now()` call).
+    async fn timed_resolve(
+        &self,
+        hostname: &str,
+    ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>), anyhow::Error> {
+        let threshold = match self.slow_threshold {
+            Some(t) => t,
+            None => return self.do_resolve(hostname).await,
+        };
+        let start = Instant::now();
+        let result = self.do_resolve(hostname).await;
+        let elapsed = start.elapsed();
+        if elapsed > threshold {
+            warn!(
+                "DNS slow resolution for {} took {:.1}ms (threshold: {}ms, nameservers: {})",
+                hostname,
+                elapsed.as_secs_f64() * 1000.0,
+                threshold.as_millis(),
+                self.resolver_label,
+            );
+        }
+        result
     }
 
     /// Perform DNS resolution using hickory-resolver with configurable record type ordering.
@@ -505,7 +547,7 @@ impl DnsCache {
 
                 // Refresh entries in the background
                 for (hostname, _ttl) in to_refresh {
-                    match cache.do_resolve(&hostname).await {
+                    match cache.timed_resolve(&hostname).await {
                         Ok((addrs, record_type)) if !addrs.is_empty() => {
                             let refresh_ttl = cache.valid_ttl_override.unwrap_or(cache.default_ttl);
                             cache.cache.insert(

@@ -351,6 +351,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DNS_VALID_TTL` | No | response TTL | Override TTL (seconds) for positive records |
 | `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
 | `FERRUM_DNS_ERROR_TTL` | No | `1` | TTL (seconds) for errors/empty responses |
+| `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH` | No | — | Path to CA bundle for backend TLS verification |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |

@@ -27,6 +27,7 @@ Ferrum Gateway includes a full-featured DNS resolver built on [hickory-resolver]
 | `FERRUM_DNS_STALE_TTL` | `u64` | `3600` | How long (seconds) stale cached data can be served while a background refresh is in progress. See [Stale-While-Revalidate](#stale-while-revalidate). |
 | `FERRUM_DNS_ERROR_TTL` | `u64` | `1` | TTL (seconds) for caching DNS errors and empty responses. Prevents hammering DNS for known-bad hostnames. |
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, oldest entries are removed. |
+| `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
 
 ### System-Level DNS Settings
 
@@ -156,6 +157,13 @@ FERRUM_DNS_ORDER="A"
 ```bash
 # Use a project-specific hosts file
 FERRUM_DNS_RESOLVER_HOSTS_FILE="/etc/ferrum/hosts"
+```
+
+### Slow Resolution Alerting
+
+```bash
+# Log a warning when any DNS resolution takes longer than 50ms
+FERRUM_DNS_SLOW_THRESHOLD_MS=50
 ```
 
 ### System Resolver Options

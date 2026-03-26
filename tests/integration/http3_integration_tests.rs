@@ -165,6 +165,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
+        dns_slow_threshold_ms: None,
         real_ip_header: None,
         dtls_cert_path: None,
         dtls_key_path: None,

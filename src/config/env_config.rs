@@ -111,6 +111,8 @@ pub struct EnvConfig {
     pub dns_error_ttl: u64,
     /// Maximum number of entries in the DNS cache. Default: 10000
     pub dns_cache_max_size: usize,
+    /// Threshold in milliseconds above which DNS resolutions are logged as slow. Default: disabled
+    pub dns_slow_threshold_ms: Option<u64>,
 
     /// Path to a PEM file containing trusted CA certificates for backend TLS verification
     pub backend_tls_ca_bundle_path: Option<String>,
@@ -236,6 +238,7 @@ impl Default for EnvConfig {
             dns_stale_ttl: 3600,
             dns_error_ttl: 1,
             dns_cache_max_size: 10_000,
+            dns_slow_threshold_ms: None,
             backend_tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -336,6 +339,9 @@ impl EnvConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            dns_slow_threshold_ms: env::var("FERRUM_DNS_SLOW_THRESHOLD_MS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
 
             // Global Backend mTLS
             backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),
