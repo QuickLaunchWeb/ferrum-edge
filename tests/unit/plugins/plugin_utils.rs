@@ -120,6 +120,7 @@ pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::Transaction
         request_user_agent: Some("test-agent".to_string()),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata: HashMap::new(),
     }
 }

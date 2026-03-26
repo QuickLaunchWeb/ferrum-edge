@@ -16,6 +16,7 @@ fn http_response(status_code: u16) -> BackendResponse {
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: None,
+        error_class: None,
     }
 }
 
@@ -26,6 +27,7 @@ fn connection_failure() -> BackendResponse {
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
+        error_class: Some(ferrum_gateway::retry::ErrorClass::ConnectionRefused),
     }
 }
 

@@ -10,6 +10,134 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::warn;
 
+/// Human-friendly classification of backend connection/communication errors.
+///
+/// Populated only when the gateway itself encounters an error reaching the
+/// backend — never when the backend returns a normal HTTP error response.
+/// Designed to help operators quickly identify the root cause of failed
+/// transactions without digging through raw error strings.
+///
+/// Serializes as a lowercase_snake_case string (e.g. `"connection_timeout"`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorClass {
+    /// TCP connect timed out before a connection was established.
+    ConnectionTimeout,
+    /// TCP connect was refused by the backend (port not listening, firewall RST).
+    ConnectionRefused,
+    /// TCP connection was reset by the backend (RST received mid-stream).
+    ConnectionReset,
+    /// TCP connection was closed cleanly by the backend before a response was sent.
+    ConnectionClosed,
+    /// DNS resolution failed — the backend hostname could not be resolved.
+    DnsLookupError,
+    /// TLS handshake failed (certificate error, protocol mismatch, etc.).
+    TlsError,
+    /// Backend read/write timed out — connection was established but the
+    /// response was not received within the configured timeout.
+    ReadWriteTimeout,
+    /// Client disconnected before the gateway could forward the request body.
+    ClientDisconnect,
+    /// HTTP/2 or HTTP/3 protocol-level error (stream reset, GOAWAY, etc.).
+    ProtocolError,
+    /// Backend response body exceeded the configured maximum size.
+    ResponseBodyTooLarge,
+    /// Request body exceeded the configured maximum size.
+    RequestBodyTooLarge,
+    /// Could not acquire or create an HTTP client from the connection pool.
+    ConnectionPoolError,
+    /// Catch-all for unclassified request errors.
+    RequestError,
+}
+
+impl std::fmt::Display for ErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionTimeout => write!(f, "connection_timeout"),
+            Self::ConnectionRefused => write!(f, "connection_refused"),
+            Self::ConnectionReset => write!(f, "connection_reset"),
+            Self::ConnectionClosed => write!(f, "connection_closed"),
+            Self::DnsLookupError => write!(f, "dns_lookup_error"),
+            Self::TlsError => write!(f, "tls_error"),
+            Self::ReadWriteTimeout => write!(f, "read_write_timeout"),
+            Self::ClientDisconnect => write!(f, "client_disconnect"),
+            Self::ProtocolError => write!(f, "protocol_error"),
+            Self::ResponseBodyTooLarge => write!(f, "response_body_too_large"),
+            Self::RequestBodyTooLarge => write!(f, "request_body_too_large"),
+            Self::ConnectionPoolError => write!(f, "connection_pool_error"),
+            Self::RequestError => write!(f, "request_error"),
+        }
+    }
+}
+
+/// Classify a `reqwest::Error` into an `ErrorClass` by inspecting its
+/// error chain and message. This is called on the error path only (not hot path).
+pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
+    // Check the error chain for specific std::io errors
+    let error_str = format!("{}", e);
+    let source_chain = format!("{:?}", e);
+
+    if e.is_connect() {
+        // Dig into the connect error to distinguish timeout, refused, TLS, DNS
+        if e.is_timeout() {
+            return ErrorClass::ConnectionTimeout;
+        }
+        if source_chain.contains("dns error")
+            || source_chain.contains("resolve")
+            || source_chain.contains("Name or service not known")
+            || source_chain.contains("No such host")
+            || source_chain.contains("no record found")
+            || source_chain.contains("failed to lookup address")
+        {
+            return ErrorClass::DnsLookupError;
+        }
+        if source_chain.contains("certificate")
+            || source_chain.contains("SSL")
+            || source_chain.contains("tls")
+            || source_chain.contains("TLS")
+            || source_chain.contains("AlertReceived")
+            || source_chain.contains("HandshakeFailure")
+            || source_chain.contains("InvalidCertificate")
+        {
+            return ErrorClass::TlsError;
+        }
+        if error_str.contains("refused")
+            || source_chain.contains("Connection refused")
+            || source_chain.contains("ConnectionRefused")
+        {
+            return ErrorClass::ConnectionRefused;
+        }
+        if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
+            return ErrorClass::ConnectionReset;
+        }
+        // Generic connect failure
+        return ErrorClass::ConnectionRefused;
+    }
+
+    if e.is_timeout() {
+        return ErrorClass::ReadWriteTimeout;
+    }
+
+    // Check for connection reset/closed during request/response
+    if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
+        return ErrorClass::ConnectionReset;
+    }
+    if source_chain.contains("broken pipe")
+        || source_chain.contains("BrokenPipe")
+        || source_chain.contains("connection closed")
+        || source_chain.contains("closed before")
+    {
+        return ErrorClass::ConnectionClosed;
+    }
+
+    // HTTP/2 specific errors
+    if source_chain.contains("h2") || source_chain.contains("GOAWAY") {
+        return ErrorClass::ProtocolError;
+    }
+
+    ErrorClass::RequestError
+}
+
 /// The response body, either fully buffered or still streaming from the backend.
 pub enum ResponseBody {
     /// Body has been fully collected into memory.
@@ -36,6 +164,10 @@ pub struct BackendResponse {
     /// Populated from the DNS cache before the request is sent. `None` when
     /// DNS resolution fails or the request never reaches the backend.
     pub backend_resolved_ip: Option<String>,
+    /// Human-friendly classification of the error when the gateway itself
+    /// failed to communicate with the backend. `None` for successful requests
+    /// and normal HTTP error responses from the backend.
+    pub error_class: Option<ErrorClass>,
 }
 
 impl BackendResponse {

@@ -814,6 +814,7 @@ async fn handle_websocket_request_authenticated(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata: ctx.metadata.clone(),
     };
 
@@ -1442,6 +1443,7 @@ pub async fn log_rejected_request(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata,
     };
 
@@ -1861,6 +1863,7 @@ pub async fn handle_proxy_request(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         response_streamed: false,
                         client_disconnected: false,
+                        error_class: None,
                         metadata: ctx.metadata.clone(),
                     };
                     for plugin in plugins.iter() {
@@ -2078,6 +2081,7 @@ pub async fn handle_proxy_request(
     let response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
+    let backend_error_class = backend_resp.error_class.clone();
 
     debug!(
         proxy_id = %proxy.id,
@@ -2172,6 +2176,7 @@ pub async fn handle_proxy_request(
             request_user_agent: ctx.headers.get("user-agent").cloned(),
             response_streamed: is_streaming_response,
             client_disconnected: false,
+            error_class: backend_error_class,
             metadata: ctx.metadata.clone(),
         };
 
@@ -2390,6 +2395,7 @@ async fn proxy_to_backend_retry(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
             };
         }
     };
@@ -2414,6 +2420,7 @@ async fn proxy_to_backend_retry(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 };
             }
         },
@@ -2471,6 +2478,7 @@ async fn proxy_to_backend_retry(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
@@ -2480,6 +2488,7 @@ async fn proxy_to_backend_retry(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             }
         }
@@ -2508,6 +2517,7 @@ async fn proxy_to_backend_retry(
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::classify_reqwest_error(&e)),
             }
         }
     }
@@ -2568,6 +2578,7 @@ async fn proxy_to_backend(
             headers: hdrs,
             connection_error: false,
             backend_resolved_ip: resolved_ip.clone(),
+            error_class: None,
         };
     }
 
@@ -2635,6 +2646,7 @@ async fn proxy_to_backend(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 };
             }
         },
@@ -2698,6 +2710,7 @@ async fn proxy_to_backend(
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
             };
         }
 
@@ -2725,6 +2738,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
                     };
                 }
             }
@@ -2747,6 +2761,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: true,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::ClientDisconnect),
                     };
                 }
             }
@@ -2790,6 +2805,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                     };
                 }
 
@@ -2803,6 +2819,7 @@ async fn proxy_to_backend(
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
                     };
                 }
 
@@ -2815,6 +2832,7 @@ async fn proxy_to_backend(
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
@@ -2822,6 +2840,7 @@ async fn proxy_to_backend(
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                     },
                 }
             } else if stream_response {
@@ -2832,6 +2851,7 @@ async fn proxy_to_backend(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
@@ -2841,6 +2861,7 @@ async fn proxy_to_backend(
                     headers: resp_headers,
                     connection_error: false,
                     backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
                 }
             }
         }
@@ -2869,6 +2890,7 @@ async fn proxy_to_backend(
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
                 backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::classify_reqwest_error(&e)),
             }
         }
     }
@@ -3032,6 +3054,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ConnectionPoolError),
             };
         }
     };
@@ -3055,6 +3078,7 @@ async fn proxy_to_backend_http2(
                     headers: HashMap::new(),
                     connection_error: true,
                     backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
                 };
             }
         };
@@ -3073,6 +3097,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
+                error_class: None,
             };
         }
     };
@@ -3103,6 +3128,7 @@ async fn proxy_to_backend_http2(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
+                    error_class: None,
                 };
             }
         },
@@ -3176,6 +3202,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ProtocolError),
             };
         }
         Err(_) => {
@@ -3190,6 +3217,7 @@ async fn proxy_to_backend_http2(
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
             };
         }
     };
@@ -3210,6 +3238,7 @@ async fn proxy_to_backend_http2(
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
+            error_class: None,
         }
     } else {
         // Buffer the full response body
@@ -3225,6 +3254,7 @@ async fn proxy_to_backend_http2(
                     headers: HashMap::new(),
                     connection_error: false,
                     backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ProtocolError),
                 };
             }
         };
@@ -3234,6 +3264,7 @@ async fn proxy_to_backend_http2(
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
+            error_class: None,
         }
     }
 }

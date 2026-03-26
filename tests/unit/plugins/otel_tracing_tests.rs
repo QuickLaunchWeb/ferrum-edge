@@ -45,6 +45,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         request_user_agent: None,
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata,
     }
 }

@@ -146,6 +146,11 @@ pub struct TransactionSummary {
     /// True when the client disconnected before receiving the full response.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub client_disconnected: bool,
+    /// Human-friendly classification of the error when the gateway itself
+    /// failed to communicate with the backend. `None` for successful requests
+    /// and normal HTTP error responses from the backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<crate::retry::ErrorClass>,
     pub metadata: HashMap<String, String>,
 }
 

@@ -33,6 +33,7 @@ fn make_summary(
         request_user_agent: Some("test-agent".to_string()),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata: HashMap::new(),
     }
 }

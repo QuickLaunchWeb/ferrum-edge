@@ -25,6 +25,7 @@ fn make_full_summary() -> TransactionSummary {
         request_user_agent: Some("curl/8.0".to_string()),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata: HashMap::new(),
     }
 }
@@ -103,6 +104,7 @@ fn test_backend_response_carries_resolved_ip() {
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: Some("10.244.1.42".to_string()),
+        error_class: None,
     };
 
     // Simulate what handle_proxy_request does: extract the IP and put it in the summary
@@ -124,6 +126,7 @@ fn test_backend_response_none_ip_on_connection_failure() {
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
+        error_class: Some(ferrum_gateway::retry::ErrorClass::ConnectionRefused),
     };
 
     assert!(resp.connection_error);
@@ -196,4 +199,118 @@ async fn test_dns_resolved_ip_would_appear_in_transaction_log() {
         ip.is_loopback(),
         "Resolved IP should be loopback for localhost"
     );
+}
+
+// ── Error class field ───────────────────────────────────────────────────
+
+#[test]
+fn test_summary_json_omits_error_class_when_none() {
+    let summary = make_full_summary();
+    let json = serde_json::to_string(&summary).unwrap();
+
+    assert!(
+        !json.contains("error_class"),
+        "JSON should omit error_class when None, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_summary_json_contains_error_class_when_present() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let mut summary = make_full_summary();
+    summary.error_class = Some(ErrorClass::ConnectionTimeout);
+    let json = serde_json::to_string(&summary).unwrap();
+
+    assert!(
+        json.contains(r#""error_class":"connection_timeout""#),
+        "JSON should contain error_class field, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_error_class_serializes_all_variants() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let cases = vec![
+        (ErrorClass::ConnectionTimeout, "connection_timeout"),
+        (ErrorClass::ConnectionRefused, "connection_refused"),
+        (ErrorClass::ConnectionReset, "connection_reset"),
+        (ErrorClass::ConnectionClosed, "connection_closed"),
+        (ErrorClass::DnsLookupError, "dns_lookup_error"),
+        (ErrorClass::TlsError, "tls_error"),
+        (ErrorClass::ReadWriteTimeout, "read_write_timeout"),
+        (ErrorClass::ClientDisconnect, "client_disconnect"),
+        (ErrorClass::ProtocolError, "protocol_error"),
+        (ErrorClass::ResponseBodyTooLarge, "response_body_too_large"),
+        (ErrorClass::RequestBodyTooLarge, "request_body_too_large"),
+        (ErrorClass::ConnectionPoolError, "connection_pool_error"),
+        (ErrorClass::RequestError, "request_error"),
+    ];
+
+    for (variant, expected_str) in cases {
+        // Test serde serialization
+        let json = serde_json::to_string(&variant).unwrap();
+        assert_eq!(
+            json,
+            format!("\"{}\"", expected_str),
+            "ErrorClass::{:?} should serialize to {:?}",
+            variant,
+            expected_str
+        );
+
+        // Test Display impl
+        assert_eq!(
+            variant.to_string(),
+            expected_str,
+            "ErrorClass::{:?} Display should be {:?}",
+            variant,
+            expected_str
+        );
+
+        // Test roundtrip deserialization
+        let deserialized: ErrorClass = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, variant);
+    }
+}
+
+#[test]
+fn test_summary_with_error_class_roundtrip() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let mut summary = make_full_summary();
+    summary.response_status_code = 502;
+    summary.error_class = Some(ErrorClass::TlsError);
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["error_class"], "tls_error");
+    assert_eq!(parsed["response_status_code"], 502);
+}
+
+#[test]
+fn test_backend_response_carries_error_class() {
+    use ferrum_gateway::retry::{BackendResponse, ErrorClass, ResponseBody};
+
+    let resp = BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(Vec::new()),
+        headers: HashMap::new(),
+        connection_error: true,
+        backend_resolved_ip: None,
+        error_class: Some(ErrorClass::ConnectionTimeout),
+    };
+
+    assert_eq!(resp.error_class, Some(ErrorClass::ConnectionTimeout));
+
+    // Simulate threading to TransactionSummary
+    let mut summary = make_full_summary();
+    summary.error_class = resp.error_class;
+    summary.response_status_code = resp.status_code;
+
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(json.contains("connection_timeout"));
 }

@@ -541,6 +541,7 @@ async fn handle_h3_request(
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
+        error_class: None,
         metadata: ctx.metadata.clone(),
     };
 
