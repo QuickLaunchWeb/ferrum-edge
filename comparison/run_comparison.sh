@@ -195,6 +195,7 @@ cleanup() {
     rm -f "$COMP_DIR/configs/.envoy_runtime_http.yaml" 2>/dev/null || true
     rm -f "$COMP_DIR/configs/.envoy_runtime_https.yaml" 2>/dev/null || true
     rm -f "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml" 2>/dev/null || true
 
     kill_port "$BACKEND_PORT"
     kill_port "$BACKEND_HTTPS_PORT"
@@ -1154,6 +1155,8 @@ prepare_envoy_config() {
     fi
     sed "s/BACKEND_HOST/$host/g" \
         "$COMP_DIR/configs/envoy/envoy_http.yaml" > "$COMP_DIR/configs/.envoy_runtime_http.yaml"
+    sed "s/BACKEND_HOST/$host/g" \
+        "$COMP_DIR/configs/envoy/envoy_key_auth.yaml" > "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml"
     # For native: rewrite TLS cert paths to local filesystem
     if [[ "$ENVOY_NATIVE" == "true" ]]; then
         sed "s/BACKEND_HOST/$host/g; s|/etc/envoy/tls/server.crt|$CERTS_DIR/server.crt|g; s|/etc/envoy/tls/server.key|$CERTS_DIR/server.key|g" \
@@ -1355,7 +1358,7 @@ test_envoy() {
 }
 
 # ===========================================================================
-# Key-Auth Tests (HTTP only, Ferrum + Kong + Tyk)
+# Key-Auth Tests (HTTP only, Ferrum + Kong + Tyk + Envoy)
 # Note: KrakenD key-auth requires Enterprise Edition, so it is excluded.
 # ===========================================================================
 
@@ -1530,6 +1533,44 @@ test_tyk_key_auth() {
     stop_tyk
 }
 
+test_envoy_key_auth() {
+    prepare_envoy_config
+
+    if [[ "$ENVOY_NATIVE" == "true" ]]; then
+        log_info "Starting Envoy Proxy native (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+        kill_port "$GATEWAY_HTTP_PORT"
+        kill_port 9901
+
+        envoy -c "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml" --log-level warning \
+            > "$RESULTS_DIR/envoy_key_auth.log" 2>&1 &
+        ENVOY_NATIVE_PID=$!
+
+        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy native (Key Auth)" 20
+        run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
+        stop_envoy_native
+    else
+        log_info "Starting Envoy Proxy Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+        docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
+        kill_port "$GATEWAY_HTTP_PORT"
+
+        local network_args=()
+        if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+            network_args+=(--network host)
+        else
+            network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
+        fi
+
+        docker run -d --name "$ENVOY_CONTAINER" \
+            "${network_args[@]}" \
+            -v "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml:/etc/envoy/envoy.yaml:ro" \
+            "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+
+        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20
+        run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
+        stop_envoy_docker
+    fi
+}
+
 test_key_auth() {
     log_header "Testing Key-Auth Performance (HTTP)"
 
@@ -1549,6 +1590,10 @@ test_key_auth() {
         fi
         test_tyk_key_auth
         stop_redis
+    fi
+
+    if ! should_skip "envoy"; then
+        test_envoy_key_auth
     fi
 }
 

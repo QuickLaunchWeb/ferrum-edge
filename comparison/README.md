@@ -11,7 +11,7 @@ Each gateway is tested as a reverse proxy with four scenarios:
 | **HTTP (plaintext)** | Client → Gateway (port 8000) → Backend. Measures raw proxy overhead. |
 | **HTTPS (TLS termination)** | Client → Gateway (port 8443, TLS) → Backend (plaintext). Measures TLS handshake and encryption overhead at the gateway. |
 | **E2E TLS (full encryption)** | Client → Gateway (port 8443, TLS) → Backend (TLS, port 3443). Measures full end-to-end encryption where the gateway re-encrypts traffic to the backend. |
-| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, and Tyk only (Pingora has no auth plugin framework; KrakenD key-auth requires Enterprise Edition). |
+| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (Pingora has no auth plugin framework; KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
 
 Two endpoints are tested per proxy scenario:
 - `/health` — instant backend response, measures pure gateway latency
@@ -223,15 +223,20 @@ The following results were collected on macOS (Apple Silicon) with 8 threads, 10
 
 ### Key-Auth Results (HTTP, /api/users-auth)
 
-Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. Pingora is excluded (no auth plugin framework). KrakenD is excluded (key-auth requires Enterprise Edition).
+Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. Pingora is excluded (no auth plugin framework). KrakenD is excluded (key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation.
 
 | Gateway | Key-Auth req/s | No-Auth req/s | Auth Overhead | Latency |
 |---------|---------------|---------------|---------------|---------|
-| **Ferrum** (native) | **40,930** | 39,733 | **~0% (within noise)** | 2.35 ms |
+| **Ferrum** (native) | **44,478** | 46,020 | **~0% (within noise)** | 2.14 ms |
+| **Envoy 1.37** (native, Lua) | 43,912 | 48,273 | -9.0% | 2.19 ms |
 | **Kong 3.9** (Docker) | 19,966 | 22,273 | -10.4% | 4.99 ms |
 | **Tyk v5.7** (Docker) | 15,625 | 22,380 | -30.2% | 6.36 ms |
 
-**Key finding:** Ferrum's key-auth plugin has effectively zero overhead — the O(1) `ConsumerIndex` credential lookup and lock-free hot path mean authentication adds no measurable cost. Kong takes a 10% throughput hit, and Tyk takes a 30% hit for authentication processing.
+**Key findings:**
+- **Ferrum and Envoy key-auth throughput are nearly identical** — 44.5K vs 43.9K req/s (1.3% difference, within noise). Both are high-performance native proxies.
+- **Ferrum's key-auth has effectively zero overhead** — the O(1) `ConsumerIndex` credential lookup and lock-free hot path mean authentication adds no measurable cost vs unauthenticated requests.
+- **Envoy's Lua filter adds ~9% overhead** — dropping from 48K to 44K req/s. The Lua VM execution cost is modest but measurable compared to Ferrum's compiled Rust plugin.
+- Kong takes a 10% throughput hit and Tyk takes a 30% hit for authentication processing (both in Docker, so actual native overhead may differ).
 
 ### Ferrum vs Pingora (Native-to-Native Comparison)
 
@@ -447,7 +452,8 @@ comparison/
 │   └── envoy/
 │       ├── envoy_http.yaml            # Envoy config (HTTP proxy, plaintext backend)
 │       ├── envoy_https.yaml           # Envoy config (HTTPS listener, plaintext backend)
-│       └── envoy_e2e_tls.yaml         # Envoy config (HTTPS listener, HTTPS backend)
+│       ├── envoy_e2e_tls.yaml         # Envoy config (HTTPS listener, HTTPS backend)
+│       └── envoy_key_auth.yaml        # Envoy config (HTTP proxy, Lua key-auth filter)
 ├── lua/
 │   ├── comparison_test.lua            # Unified wrk Lua script
 │   └── comparison_test_key_auth.lua   # wrk script with API key header
