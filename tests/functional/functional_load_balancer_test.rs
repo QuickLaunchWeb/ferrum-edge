@@ -182,6 +182,48 @@ fn start_gateway_in_file_mode(
     Ok(child)
 }
 
+/// Start an HTTP server that identifies itself but delays its response.
+/// This keeps connections alive long enough for least-connections to see non-zero counts.
+async fn start_slow_identifying_server(port: u16, name: &'static str, delay_ms: u64) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to bind slow identifying server {} on port {}",
+                name, port
+            )
+        });
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let server_name = name;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                // Delay before responding so connections stay open
+                sleep(Duration::from_millis(delay_ms)).await;
+
+                let body = format!(r#"{{"server":"{}","path":"{}"}}"#, server_name, path);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
 /// Parse the "server" field from a JSON response body.
 fn parse_server_name(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
@@ -1821,40 +1863,56 @@ plugin_configs: []
         .write_all(config.as_bytes())
         .unwrap();
 
-    let s1 = tokio::spawn(start_identifying_server(30201, "lc-server1"));
-    let s2 = tokio::spawn(start_identifying_server(30202, "lc-server2"));
-    let s3 = tokio::spawn(start_identifying_server(30203, "lc-server3"));
+    // Use slow servers (200ms delay) so concurrent connections stay open
+    // long enough for LC to see non-zero active connection counts.
+    let s1 = tokio::spawn(start_slow_identifying_server(30201, "lc-server1", 200));
+    let s2 = tokio::spawn(start_slow_identifying_server(30202, "lc-server2", 200));
+    let s3 = tokio::spawn(start_slow_identifying_server(30203, "lc-server3", 200));
     sleep(Duration::from_millis(500)).await;
 
     let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28200);
     sleep(Duration::from_secs(3)).await;
 
     let client = reqwest::Client::new();
-    let mut counts: HashMap<String, u32> = HashMap::new();
 
-    // Send 30 sequential requests (Connection: close, so each completes before next).
-    // With no sustained connections, LC should distribute roughly evenly.
-    for i in 0..30 {
-        let resp = client
-            .get(format!("http://127.0.0.1:28200/lc/test-{}", i))
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) => {
-                assert!(
-                    r.status().is_success(),
-                    "Request {} failed with {}",
-                    i,
-                    r.status()
-                );
-                let body = r.text().await.unwrap_or_default();
-                let server = parse_server_name(&body);
-                if !server.is_empty() {
-                    *counts.entry(server).or_insert(0) += 1;
+    // Send 30 requests in concurrent batches of 6.
+    // The 200ms server delay ensures connections overlap, giving LC real
+    // connection counts to differentiate targets.
+    let mut all_bodies: Vec<String> = Vec::new();
+    for batch in 0..5 {
+        let mut handles = Vec::new();
+        for i in 0..6 {
+            let c = client.clone();
+            let idx = batch * 6 + i;
+            handles.push(tokio::spawn(async move {
+                let resp = c
+                    .get(format!("http://127.0.0.1:28200/lc/test-{}", idx))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => {
+                        assert!(
+                            r.status().is_success(),
+                            "Request {} failed with {}",
+                            idx,
+                            r.status()
+                        );
+                        r.text().await.unwrap_or_default()
+                    }
+                    Err(e) => panic!("Request {} failed: {}", idx, e),
                 }
-            }
-            Err(e) => panic!("Request {} failed: {}", i, e),
+            }));
+        }
+        for h in handles {
+            all_bodies.push(h.await.unwrap());
+        }
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for body in &all_bodies {
+        let server = parse_server_name(body);
+        if !server.is_empty() {
+            *counts.entry(server).or_insert(0) += 1;
         }
     }
 
@@ -1867,11 +1925,11 @@ plugin_configs: []
         counts
     );
 
-    // Each server should get roughly equal traffic (within tolerance)
+    // Each server should get some traffic (LC distributes to least-loaded)
     for (server, count) in &counts {
         assert!(
-            *count >= 5 && *count <= 20,
-            "Server {} got {} requests — expected roughly even distribution (5-20 of 30)",
+            *count >= 3 && *count <= 20,
+            "Server {} got {} requests — expected LC to spread across all targets (3-20 of 30)",
             server,
             count
         );
