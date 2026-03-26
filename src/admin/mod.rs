@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use crate::config::types::{
+    Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
+};
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
@@ -420,9 +422,31 @@ async fn handle_create_proxy(
 
     if proxy.id.is_empty() {
         proxy.id = Uuid::new_v4().to_string();
+    } else if let Err(msg) = validate_resource_id(&proxy.id) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": msg}),
+        ));
     }
     proxy.created_at = Utc::now();
     proxy.updated_at = Utc::now();
+
+    // Check ID uniqueness
+    match db.get_proxy(&proxy.id).await {
+        Ok(Some(_)) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!("Proxy with ID '{}' already exists", proxy.id)}),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Database error: {}", e)}),
+            ));
+        }
+    }
 
     // Check listen_path uniqueness
     match db.check_listen_path_unique(&proxy.listen_path, None).await {
@@ -774,6 +798,11 @@ async fn handle_create_consumer(
 
     if consumer.id.is_empty() {
         consumer.id = Uuid::new_v4().to_string();
+    } else if let Err(msg) = validate_resource_id(&consumer.id) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": msg}),
+        ));
     }
 
     // Validate username is non-empty
@@ -793,6 +822,23 @@ async fn handle_create_consumer(
 
     consumer.created_at = Utc::now();
     consumer.updated_at = Utc::now();
+
+    // Check ID uniqueness
+    match db.get_consumer(&consumer.id).await {
+        Ok(Some(_)) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!("Consumer with ID '{}' already exists", consumer.id)}),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Database error: {}", e)}),
+            ));
+        }
+    }
 
     // Hash any secrets in credentials
     if let Err(e) = hash_consumer_secrets(&mut consumer) {
@@ -1229,6 +1275,28 @@ async fn handle_create_plugin_config(
 
     if pc.id.is_empty() {
         pc.id = Uuid::new_v4().to_string();
+    } else if let Err(msg) = validate_resource_id(&pc.id) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": msg}),
+        ));
+    }
+
+    // Check ID uniqueness
+    match db.get_plugin_config(&pc.id).await {
+        Ok(Some(_)) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!("PluginConfig with ID '{}' already exists", pc.id)}),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Database error: {}", e)}),
+            ));
+        }
     }
 
     // Validate plugin name is a known plugin
@@ -1435,9 +1503,31 @@ async fn handle_create_upstream(
 
     if upstream.id.is_empty() {
         upstream.id = Uuid::new_v4().to_string();
+    } else if let Err(msg) = validate_resource_id(&upstream.id) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": msg}),
+        ));
     }
     upstream.created_at = Utc::now();
     upstream.updated_at = Utc::now();
+
+    // Check ID uniqueness
+    match db.get_upstream(&upstream.id).await {
+        Ok(Some(_)) => {
+            return Ok(json_response(
+                StatusCode::CONFLICT,
+                &json!({"error": format!("Upstream with ID '{}' already exists", upstream.id)}),
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Database error: {}", e)}),
+            ));
+        }
+    }
 
     if upstream.targets.is_empty() {
         return Ok(json_response(

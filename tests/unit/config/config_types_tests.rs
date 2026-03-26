@@ -1,7 +1,7 @@
 use chrono::Utc;
 use ferrum_gateway::config::types::{
     AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy,
-    Upstream, UpstreamTarget,
+    Upstream, UpstreamTarget, validate_resource_id,
 };
 use std::collections::HashMap;
 
@@ -494,4 +494,121 @@ fn test_unique_plugins_per_proxy_duplicate() {
     let err = config.validate_unique_plugins_per_proxy().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("duplicate plugin 'rate_limiting'"));
+}
+
+// ---- Resource ID validation tests ----
+
+#[test]
+fn test_validate_resource_id_valid_uuid() {
+    assert!(validate_resource_id("f47ac10b-58cc-4372-a567-0e02b2c3d479").is_ok());
+}
+
+#[test]
+fn test_validate_resource_id_valid_slug() {
+    assert!(validate_resource_id("proxy-httpbin").is_ok());
+    assert!(validate_resource_id("consumer.alice").is_ok());
+    assert!(validate_resource_id("upstream_backend-v2").is_ok());
+    assert!(validate_resource_id("a").is_ok());
+    assert!(validate_resource_id("A1").is_ok());
+}
+
+#[test]
+fn test_validate_resource_id_empty() {
+    let err = validate_resource_id("").unwrap_err();
+    assert!(err.contains("must not be empty"));
+}
+
+#[test]
+fn test_validate_resource_id_too_long() {
+    let long_id = "a".repeat(255);
+    let err = validate_resource_id(&long_id).unwrap_err();
+    assert!(err.contains("at most 254"));
+}
+
+#[test]
+fn test_validate_resource_id_max_length_ok() {
+    let id = "a".repeat(254);
+    assert!(validate_resource_id(&id).is_ok());
+}
+
+#[test]
+fn test_validate_resource_id_invalid_start() {
+    assert!(validate_resource_id("-proxy").is_err());
+    assert!(validate_resource_id(".proxy").is_err());
+    assert!(validate_resource_id("_proxy").is_err());
+}
+
+#[test]
+fn test_validate_resource_id_invalid_chars() {
+    assert!(validate_resource_id("proxy httpbin").is_err()); // space
+    assert!(validate_resource_id("proxy/httpbin").is_err()); // slash
+    assert!(validate_resource_id("proxy@httpbin").is_err()); // at
+    assert!(validate_resource_id("proxy!").is_err()); // exclamation
+}
+
+// ---- Resource ID format validation on GatewayConfig ----
+
+#[test]
+fn test_validate_resource_ids_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("proxy-1", "/api")];
+    config.consumers = vec![make_consumer("consumer-1", "alice")];
+    config.upstreams = vec![make_upstream("upstream-1")];
+    assert!(config.validate_resource_ids().is_ok());
+}
+
+#[test]
+fn test_validate_resource_ids_invalid_proxy_id() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("invalid id!", "/api")];
+    let err = config.validate_resource_ids().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Proxy ID"));
+}
+
+#[test]
+fn test_validate_resource_ids_invalid_consumer_id() {
+    let mut config = empty_config();
+    config.consumers = vec![make_consumer("bad id", "alice")];
+    let err = config.validate_resource_ids().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Consumer ID"));
+}
+
+// ---- Resource ID uniqueness tests ----
+
+#[test]
+fn test_validate_unique_resource_ids_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/web")];
+    config.consumers = vec![make_consumer("c1", "alice"), make_consumer("c2", "bob")];
+    assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+#[test]
+fn test_validate_unique_resource_ids_duplicate_proxy() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p1", "/web")];
+    let err = config.validate_unique_resource_ids().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate proxy ID 'p1'"));
+}
+
+#[test]
+fn test_validate_unique_resource_ids_duplicate_consumer() {
+    let mut config = empty_config();
+    config.consumers = vec![make_consumer("c1", "alice"), make_consumer("c1", "bob")];
+    let err = config.validate_unique_resource_ids().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate consumer ID 'c1'"));
+}
+
+#[test]
+fn test_validate_unique_resource_ids_same_id_different_types_ok() {
+    // Same ID across different resource types is fine
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("shared-id", "/api")];
+    config.consumers = vec![make_consumer("shared-id", "alice")];
+    config.upstreams = vec![make_upstream("shared-id")];
+    assert!(config.validate_unique_resource_ids().is_ok());
 }

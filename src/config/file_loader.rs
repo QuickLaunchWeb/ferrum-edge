@@ -70,6 +70,28 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         serde_json::from_value(value)?
     };
 
+    // Validate resource ID format
+    if let Err(errors) = config.validate_resource_ids() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid resource ID(s) found",
+            errors.len()
+        );
+    }
+
+    // Validate resource ID uniqueness
+    if let Err(dupes) = config.validate_unique_resource_ids() {
+        for msg in &dupes {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} duplicate resource ID(s) found",
+            dupes.len()
+        );
+    }
+
     // Validate listen_path uniqueness
     if let Err(dupes) = config.validate_unique_listen_paths() {
         for msg in &dupes {

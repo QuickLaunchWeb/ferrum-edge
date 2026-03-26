@@ -803,8 +803,12 @@ components:
       properties:
         id:
           type: [string, "null"]
-          format: uuid
-          description: Unique identifier (auto-generated if omitted on create)
+          description: >-
+            Unique identifier (UUID auto-generated if omitted or empty on create).
+            Custom IDs must start with an alphanumeric character and contain only
+            alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
         name:
           type: [string, "null"]
 
@@ -999,7 +1003,12 @@ components:
       properties:
         id:
           type: [string, "null"]
-          format: uuid
+          description: >-
+            Unique identifier (UUID auto-generated if omitted or empty on create).
+            Custom IDs must start with an alphanumeric character and contain only
+            alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
         username:
           type: [string, "null"]
           description: Unique consumer username
@@ -1043,7 +1052,12 @@ components:
       properties:
         id:
           type: [string, "null"]
-          format: uuid
+          description: >-
+            Unique identifier (UUID auto-generated if omitted or empty on create).
+            Custom IDs must start with an alphanumeric character and contain only
+            alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
         plugin_name:
           type: [string, "null"]
           description: Plugin type name (must be one of the available plugins)
@@ -1188,7 +1202,12 @@ components:
       properties:
         id:
           type: [string, "null"]
-          format: uuid
+          description: >-
+            Unique identifier (UUID auto-generated if omitted or empty on create).
+            Custom IDs must start with an alphanumeric character and contain only
+            alphanumeric characters, dots, underscores, or hyphens (max 254 chars).
+          pattern: "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          maxLength: 254
         name:
           type: [string, "null"]
 

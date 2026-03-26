@@ -1,6 +1,45 @@
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+
+/// Maximum length for resource IDs.
+const MAX_ID_LENGTH: usize = 254;
+
+/// Regex pattern for valid resource IDs.
+/// Must start with alphanumeric, followed by alphanumeric, dots, underscores, or hyphens.
+static ID_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$").expect("invalid ID regex"));
+
+/// Validate a resource ID format.
+///
+/// Valid IDs must:
+/// - Be non-empty and at most 254 characters
+/// - Start with an alphanumeric character
+/// - Contain only alphanumeric characters, dots, underscores, or hyphens
+///
+/// Returns `Ok(())` if valid, or `Err(message)` describing the violation.
+pub fn validate_resource_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("ID must not be empty".to_string());
+    }
+    if id.len() > MAX_ID_LENGTH {
+        return Err(format!(
+            "ID must be at most {} characters, got {}",
+            MAX_ID_LENGTH,
+            id.len()
+        ));
+    }
+    if !ID_REGEX.is_match(id) {
+        return Err(format!(
+            "ID '{}' is invalid: must start with an alphanumeric character and contain only \
+             alphanumeric characters, dots, underscores, or hyphens",
+            id
+        ));
+    }
+    Ok(())
+}
 
 /// Load balancing algorithm for distributing requests across upstream targets.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -721,6 +760,84 @@ impl GatewayConfig {
                         proxy.id, plugin_name, existing_config_id, assoc.plugin_config_id
                     ));
                 }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate that all resource IDs are well-formed.
+    ///
+    /// Checks every proxy, consumer, plugin_config, and upstream ID against
+    /// the `validate_resource_id` format rules.
+    pub fn validate_resource_ids(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        for proxy in &self.proxies {
+            if let Err(msg) = validate_resource_id(&proxy.id) {
+                errors.push(format!("Proxy ID: {}", msg));
+            }
+        }
+        for consumer in &self.consumers {
+            if let Err(msg) = validate_resource_id(&consumer.id) {
+                errors.push(format!("Consumer ID: {}", msg));
+            }
+        }
+        for pc in &self.plugin_configs {
+            if let Err(msg) = validate_resource_id(&pc.id) {
+                errors.push(format!("PluginConfig ID: {}", msg));
+            }
+        }
+        for upstream in &self.upstreams {
+            if let Err(msg) = validate_resource_id(&upstream.id) {
+                errors.push(format!("Upstream ID: {}", msg));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate that all resource IDs are unique within their type.
+    ///
+    /// In database mode the DB PRIMARY KEY constraint enforces this.
+    /// In file mode there's no DB, so this catches duplicate IDs at
+    /// config load time.
+    pub fn validate_unique_resource_ids(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        let mut seen_proxy_ids: HashSet<&str> = HashSet::new();
+        for proxy in &self.proxies {
+            if !seen_proxy_ids.insert(&proxy.id) {
+                errors.push(format!("Duplicate proxy ID '{}'", proxy.id));
+            }
+        }
+
+        let mut seen_consumer_ids: HashSet<&str> = HashSet::new();
+        for consumer in &self.consumers {
+            if !seen_consumer_ids.insert(&consumer.id) {
+                errors.push(format!("Duplicate consumer ID '{}'", consumer.id));
+            }
+        }
+
+        let mut seen_plugin_ids: HashSet<&str> = HashSet::new();
+        for pc in &self.plugin_configs {
+            if !seen_plugin_ids.insert(&pc.id) {
+                errors.push(format!("Duplicate plugin_config ID '{}'", pc.id));
+            }
+        }
+
+        let mut seen_upstream_ids: HashSet<&str> = HashSet::new();
+        for upstream in &self.upstreams {
+            if !seen_upstream_ids.insert(&upstream.id) {
+                errors.push(format!("Duplicate upstream ID '{}'", upstream.id));
             }
         }
 
