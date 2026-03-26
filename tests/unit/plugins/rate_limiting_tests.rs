@@ -2,6 +2,7 @@
 
 use ferrum_gateway::plugins::{Plugin, PluginResult, rate_limiting::RateLimiting};
 use serde_json::json;
+use std::collections::HashMap;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_context,
@@ -534,4 +535,262 @@ async fn test_rate_limiting_window_6s_uses_sliding_window() {
 
     let result = plugin.on_request_received(&mut ctx).await;
     assert_reject(result, Some(429));
+}
+
+// ─── Expose Headers Tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_expose_headers_disabled_by_default() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip"
+    });
+    let plugin = RateLimiting::new(&config);
+    assert!(!plugin.modifies_request_headers());
+}
+
+#[tokio::test]
+async fn test_expose_headers_enabled() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+    assert!(plugin.modifies_request_headers());
+}
+
+#[tokio::test]
+async fn test_expose_headers_on_success_response() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let mut ctx = create_test_context();
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+
+    // Rate info should be stored in metadata
+    assert_eq!(ctx.metadata.get("ratelimit_limit").unwrap(), "5");
+    assert_eq!(ctx.metadata.get("ratelimit_remaining").unwrap(), "4");
+    assert_eq!(ctx.metadata.get("ratelimit_window").unwrap(), "60");
+    assert_eq!(
+        ctx.metadata.get("ratelimit_identity").unwrap(),
+        "ip:127.0.0.1"
+    );
+
+    // after_proxy should inject headers into response
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_continue(result);
+
+    assert_eq!(response_headers.get("x-ratelimit-limit").unwrap(), "5");
+    assert_eq!(response_headers.get("x-ratelimit-remaining").unwrap(), "4");
+    assert_eq!(response_headers.get("x-ratelimit-window").unwrap(), "60");
+    assert_eq!(
+        response_headers.get("x-ratelimit-identity").unwrap(),
+        "ip:127.0.0.1"
+    );
+}
+
+#[tokio::test]
+async fn test_expose_headers_on_success_request_to_backend() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let mut ctx = create_test_context();
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+
+    // before_proxy should inject headers into request to backend
+    let mut request_headers: HashMap<String, String> = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert_continue(result);
+
+    assert_eq!(request_headers.get("x-ratelimit-limit").unwrap(), "5");
+    assert_eq!(request_headers.get("x-ratelimit-remaining").unwrap(), "4");
+    assert_eq!(
+        request_headers.get("x-ratelimit-identity").unwrap(),
+        "ip:127.0.0.1"
+    );
+}
+
+#[tokio::test]
+async fn test_expose_headers_on_rejection() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+
+    // Use up the limit
+    let mut ctx = create_test_context();
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+
+    // Next request should be rejected WITH rate limit headers
+    let mut ctx2 = create_test_context();
+    let result = plugin.on_request_received(&mut ctx2).await;
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "1");
+            assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "0");
+            assert_eq!(headers.get("x-ratelimit-window").unwrap(), "60");
+            assert_eq!(headers.get("x-ratelimit-identity").unwrap(), "ip:127.0.0.1");
+        }
+        _ => panic!("Expected Reject, got {:?}", result),
+    }
+}
+
+#[tokio::test]
+async fn test_expose_headers_disabled_no_headers_on_rejection() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let mut ctx = create_test_context();
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut ctx2 = create_test_context();
+    let result = plugin.on_request_received(&mut ctx2).await;
+    match result {
+        PluginResult::Reject { headers, .. } => {
+            assert!(
+                headers.is_empty(),
+                "Headers should be empty when expose_headers is false"
+            );
+        }
+        _ => panic!("Expected Reject"),
+    }
+}
+
+#[tokio::test]
+async fn test_expose_headers_disabled_no_headers_on_success() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let mut ctx = create_test_context();
+    plugin.on_request_received(&mut ctx).await;
+
+    // No metadata should be stored
+    assert!(!ctx.metadata.contains_key("ratelimit_limit"));
+
+    // after_proxy should not inject anything
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert!(response_headers.is_empty());
+}
+
+#[tokio::test]
+async fn test_expose_headers_consumer_identity() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "consumer",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let consumer = create_test_consumer();
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(consumer);
+
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+
+    // Identity should reflect consumer, not IP
+    assert_eq!(
+        ctx.metadata.get("ratelimit_identity").unwrap(),
+        "consumer:testuser"
+    );
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("x-ratelimit-identity").unwrap(),
+        "consumer:testuser"
+    );
+}
+
+#[tokio::test]
+async fn test_expose_headers_remaining_decrements() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+
+    // Request 1: remaining should be 4
+    let mut ctx1 = create_test_context();
+    plugin.on_request_received(&mut ctx1).await;
+    assert_eq!(ctx1.metadata.get("ratelimit_remaining").unwrap(), "4");
+
+    // Request 2: remaining should be 3
+    let mut ctx2 = create_test_context();
+    plugin.on_request_received(&mut ctx2).await;
+    assert_eq!(ctx2.metadata.get("ratelimit_remaining").unwrap(), "3");
+
+    // Request 3: remaining should be 2
+    let mut ctx3 = create_test_context();
+    plugin.on_request_received(&mut ctx3).await;
+    assert_eq!(ctx3.metadata.get("ratelimit_remaining").unwrap(), "2");
+}
+
+#[tokio::test]
+async fn test_expose_headers_reports_tightest_window() {
+    // per-second limit of 3 and per-minute limit of 100.
+    // After 2 requests, per-second remaining=1 is tighter than per-minute remaining=98.
+    let config = json!({
+        "requests_per_second": 3,
+        "requests_per_minute": 100,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = RateLimiting::new(&config);
+
+    let mut ctx1 = create_test_context();
+    plugin.on_request_received(&mut ctx1).await;
+
+    let mut ctx2 = create_test_context();
+    plugin.on_request_received(&mut ctx2).await;
+
+    // Tightest window should be per-second (remaining=1 < remaining=98)
+    assert_eq!(ctx2.metadata.get("ratelimit_limit").unwrap(), "3");
+    assert_eq!(ctx2.metadata.get("ratelimit_remaining").unwrap(), "1");
+    assert_eq!(ctx2.metadata.get("ratelimit_window").unwrap(), "1");
 }
