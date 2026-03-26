@@ -108,6 +108,8 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
 - `limit_by: "consumer"` — enforces consumer-based limits in `authorize` (phase 3, after auth). If no consumer is identified (unauthenticated request), falls back to IP-based keying.
 
+**Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, and `x-ratelimit-identity` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed.
+
 ### Transforms after auth (3000+)
 
 Request transformers run after authentication and authorization, so they only modify requests that are already permitted. This prevents wasted transformation work on requests that will be rejected.

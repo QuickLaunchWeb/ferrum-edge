@@ -25,7 +25,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Client IP Resolution**: Secure originating IP detection via trusted proxy configuration with `X-Forwarded-For` right-to-left walk and optional authoritative header support (e.g., `CF-Connecting-IP`)
-- **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
+- **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows and optional `x-ratelimit-*` header exposure
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
 - **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
 - **Load Balancing**: Five algorithms (RoundRobin, Weighted, LeastConnections, ConsistentHash, Random) with unhealthy target filtering
@@ -1069,6 +1069,7 @@ Enforces request rate limits per time window. Supports limiting by client IP add
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `limit_by` | String | `ip` | Rate limit key: `ip` (client IP) or `consumer` (authenticated consumer username) |
+| `expose_headers` | bool | `false` | When `true`, inject `x-ratelimit-*` headers on upstream requests and downstream responses |
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
@@ -1078,6 +1079,17 @@ Enforces request rate limits per time window. Supports limiting by client IP add
 - `limit_by: "consumer"` — Enforces limits in the `authorize` phase (after authentication), keyed by the authenticated consumer's username. If no consumer is identified, falls back to client IP as the key.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
+
+**Rate limit headers** (when `expose_headers: true`):
+
+| Header | Description |
+|---|---|
+| `x-ratelimit-limit` | Configured request limit for the tightest window |
+| `x-ratelimit-remaining` | Requests remaining in that window |
+| `x-ratelimit-window` | Window name (e.g., `per_minute`, `per_hour`) |
+| `x-ratelimit-identity` | Rate limit key — `consumer:<username>` or `ip:<address>` |
+
+Headers are added to both upstream requests (visible to backends in `before_proxy`) and downstream responses (visible to clients in `after_proxy`). On `429` rejections, headers are included in the error response with `remaining: 0`. When multiple windows are configured, the tightest window (lowest remaining) is reported.
 
 #### `hmac_auth`
 

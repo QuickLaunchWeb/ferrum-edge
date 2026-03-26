@@ -50,6 +50,10 @@ impl SlidingWindow {
             false
         }
     }
+
+    fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.timestamps.len() as u64)
+    }
 }
 
 /// Token bucket rate limiter. O(1) memory and O(1) per check regardless of TPS.
@@ -102,6 +106,10 @@ impl TokenBucket {
             false
         }
     }
+
+    fn remaining(&self) -> u64 {
+        self.tokens.max(0.0) as u64
+    }
 }
 
 /// A rate window that automatically picks the best algorithm.
@@ -141,6 +149,22 @@ impl RateWindow {
         }
     }
 
+    /// Returns the number of requests remaining before this window rejects.
+    fn remaining(&self) -> u64 {
+        match self {
+            RateWindow::Sliding(sw) => sw.remaining(),
+            RateWindow::Bucket(tb) => tb.remaining(),
+        }
+    }
+
+    /// Returns the configured limit for this window.
+    fn limit(&self) -> u64 {
+        match self {
+            RateWindow::Sliding(sw) => sw.limit,
+            RateWindow::Bucket(tb) => tb.capacity as u64,
+        }
+    }
+
     /// Returns true if this window has had recent activity.
     fn has_recent_activity(&self, now: Instant) -> bool {
         match self {
@@ -165,6 +189,9 @@ struct WindowSpec {
 
 pub struct RateLimiting {
     limit_by: String,
+    /// When true, inject `x-ratelimit-*` headers on requests (to backend) and
+    /// responses (to client) so both sides can see current rate-limit state.
+    expose_headers: bool,
     /// Window specifications used to create RateWindows per key.
     window_specs: Vec<WindowSpec>,
     // key -> windows
@@ -174,6 +201,7 @@ pub struct RateLimiting {
 impl RateLimiting {
     pub fn new(config: &Value) -> Self {
         let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
+        let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
 
         let window_specs = if let Some(window_seconds) = config["window_seconds"].as_u64() {
             let max_requests = config["max_requests"].as_u64().unwrap_or(10);
@@ -214,6 +242,7 @@ impl RateLimiting {
 
         Self {
             limit_by,
+            expose_headers,
             window_specs,
             state: Arc::new(DashMap::new()),
         }
@@ -231,7 +260,7 @@ impl RateLimiting {
             .retain(|_, windows| windows.iter().any(|w| w.has_recent_activity(now)));
     }
 
-    fn check_rate(&self, key: &str) -> PluginResult {
+    fn check_rate(&self, key: &str, ctx: &mut RequestContext) -> PluginResult {
         // Periodically evict stale entries to bound memory usage
         self.evict_stale_entries();
 
@@ -243,14 +272,57 @@ impl RateLimiting {
                 .collect()
         });
 
-        for window in entry.value_mut().iter_mut() {
+        let mut rejected_spec_idx: Option<usize> = None;
+        for (i, window) in entry.value_mut().iter_mut().enumerate() {
             if !window.check_and_increment() {
-                warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
-                return PluginResult::Reject {
-                    status_code: 429,
-                    body: r#"{"error":"Rate limit exceeded"}"#.into(),
-                    headers: HashMap::new(),
-                };
+                rejected_spec_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = rejected_spec_idx {
+            warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
+            let mut headers = HashMap::new();
+            if self.expose_headers {
+                headers.insert(
+                    "x-ratelimit-limit".to_string(),
+                    specs[idx].limit.to_string(),
+                );
+                headers.insert("x-ratelimit-remaining".to_string(), "0".to_string());
+                headers.insert(
+                    "x-ratelimit-window".to_string(),
+                    specs[idx].duration.as_secs().to_string(),
+                );
+                headers.insert("x-ratelimit-identity".to_string(), key.to_string());
+            }
+            return PluginResult::Reject {
+                status_code: 429,
+                body: r#"{"error":"Rate limit exceeded"}"#.into(),
+                headers,
+            };
+        }
+
+        // Store rate info in metadata for header injection in before_proxy / after_proxy
+        if self.expose_headers {
+            // Find the tightest window (lowest remaining) for header reporting
+            if let Some((i, window)) = entry
+                .value()
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, w)| w.remaining())
+            {
+                ctx.metadata
+                    .insert("ratelimit_limit".to_string(), window.limit().to_string());
+                ctx.metadata.insert(
+                    "ratelimit_remaining".to_string(),
+                    window.remaining().to_string(),
+                );
+                ctx.metadata.insert(
+                    "ratelimit_window".to_string(),
+                    specs[i].duration.as_secs().to_string(),
+                );
+                ctx.metadata
+                    .insert("ratelimit_identity".to_string(), key.to_string());
             }
         }
 
@@ -272,11 +344,15 @@ impl Plugin for RateLimiting {
         super::ALL_PROTOCOLS
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        self.expose_headers
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Phase 1: always enforce IP-based limits early (before auth).
         // This protects auth endpoints from brute-force regardless of limit_by mode.
         let ip_key = format!("ip:{}", ctx.client_ip);
-        self.check_rate(&ip_key)
+        self.check_rate(&ip_key, ctx)
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -289,10 +365,53 @@ impl Plugin for RateLimiting {
 
         if let Some(consumer) = &ctx.identified_consumer {
             let key = format!("consumer:{}", consumer.username);
-            self.check_rate(&key)
+            self.check_rate(&key, ctx)
         } else {
             // No consumer identified — IP limit already applied in phase 1
             PluginResult::Continue
+        }
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.expose_headers {
+            return PluginResult::Continue;
+        }
+        inject_rate_limit_headers_from_metadata(&ctx.metadata, headers);
+        PluginResult::Continue
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.expose_headers {
+            return PluginResult::Continue;
+        }
+        inject_rate_limit_headers_from_metadata(&ctx.metadata, response_headers);
+        PluginResult::Continue
+    }
+}
+
+/// Copy rate-limit metadata into a headers map.
+fn inject_rate_limit_headers_from_metadata(
+    metadata: &HashMap<String, String>,
+    headers: &mut HashMap<String, String>,
+) {
+    static KEYS: &[(&str, &str)] = &[
+        ("ratelimit_limit", "x-ratelimit-limit"),
+        ("ratelimit_remaining", "x-ratelimit-remaining"),
+        ("ratelimit_window", "x-ratelimit-window"),
+        ("ratelimit_identity", "x-ratelimit-identity"),
+    ];
+    for &(meta_key, header_name) in KEYS {
+        if let Some(val) = metadata.get(meta_key) {
+            headers.insert(header_name.to_string(), val.clone());
         }
     }
 }
