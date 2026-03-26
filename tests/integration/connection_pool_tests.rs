@@ -10,6 +10,7 @@ fn create_test_proxy() -> Proxy {
     Proxy {
         id: "test".to_string(),
         name: None,
+        hosts: vec![],
         listen_path: "/test".to_string(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),

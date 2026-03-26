@@ -11,6 +11,7 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
     Proxy {
         id: id.to_string(),
         name: Some(format!("Proxy {}", id)),
+        hosts: vec![],
         listen_path: listen_path.to_string(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),

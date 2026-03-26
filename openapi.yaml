@@ -1072,6 +1072,17 @@ components:
           examples:
             - /api/v1
             - /users
+        hosts:
+          type: array
+          items:
+            type: string
+          default: []
+          description: >-
+            Optional list of hostnames this proxy matches. Empty means match all
+            hosts. Supports exact hostnames and wildcard prefixes (e.g.,
+            '*.example.com').
+          examples:
+            - ["api.example.com", "*.internal.example.com"]
         backend_protocol:
           $ref: "#/components/schemas/BackendProtocol"
         backend_host:

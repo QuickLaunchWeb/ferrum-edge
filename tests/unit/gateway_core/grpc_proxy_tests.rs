@@ -7,6 +7,7 @@ fn test_proxy() -> Proxy {
     Proxy {
         id: "grpc-test".into(),
         name: Some("gRPC Test Proxy".into()),
+        hosts: vec![],
         listen_path: "/grpc".into(),
         backend_protocol: BackendProtocol::Grpc,
         backend_host: "grpc-backend.example.com".into(),

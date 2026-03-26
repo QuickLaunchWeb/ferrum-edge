@@ -9,6 +9,7 @@ fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
     Proxy {
         id: id.into(),
         name: None,
+        hosts: vec![],
         listen_path: String::new(),
         backend_protocol: protocol,
         backend_host: "localhost".into(),
@@ -50,6 +51,7 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.into(),
         name: None,
+        hosts: vec![],
         listen_path: listen_path.into(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),

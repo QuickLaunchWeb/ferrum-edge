@@ -66,6 +66,7 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
     Proxy {
         id: id.to_string(),
         name: Some(format!("Test Proxy {}", id)),
+        hosts: vec![],
         listen_path: listen_path.to_string(),
         backend_protocol: BackendProtocol::Http,
         backend_host: host.to_string(),

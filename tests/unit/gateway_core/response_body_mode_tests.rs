@@ -7,6 +7,7 @@ fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
         name: Some("Test Proxy".into()),
+        hosts: vec![],
         listen_path: "/api".into(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),

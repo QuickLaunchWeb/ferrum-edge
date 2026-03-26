@@ -123,7 +123,7 @@ src/
 ├── circuit_breaker.rs         # Three-state circuit breaker
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS
-├── router_cache.rs            # Pre-sorted route table with LPM path cache
+├── router_cache.rs            # Pre-sorted route table with host+path routing and LPM path cache
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
 ├── config_delta.rs            # Incremental config updates for CP/DP
@@ -139,7 +139,7 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | listen_path, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode |
+| `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode |
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |

@@ -545,13 +545,29 @@ async fn handle_create_proxy(
         }
     }
 
-    // Check listen_path uniqueness
-    match db.check_listen_path_unique(&proxy.listen_path, None).await {
+    // Validate and normalize host entries
+    for host in &mut proxy.hosts {
+        *host = host.to_lowercase();
+    }
+    for host in &proxy.hosts {
+        if let Err(msg) = crate::config::types::validate_host_entry(host) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": msg}),
+            ));
+        }
+    }
+
+    // Check host+listen_path uniqueness
+    match db
+        .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, None)
+        .await
+    {
         Ok(true) => {}
         Ok(false) => {
             return Ok(json_response(
                 StatusCode::CONFLICT,
-                &json!({"error": "listen_path already exists"}),
+                &json!({"error": "A proxy with overlapping hosts and listen_path already exists"}),
             ));
         }
         Err(e) => {
@@ -705,16 +721,29 @@ async fn handle_update_proxy(
     proxy.id = id.to_string();
     proxy.updated_at = Utc::now();
 
-    // Check listen_path uniqueness (excluding self)
+    // Validate and normalize host entries
+    for host in &mut proxy.hosts {
+        *host = host.to_lowercase();
+    }
+    for host in &proxy.hosts {
+        if let Err(msg) = crate::config::types::validate_host_entry(host) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": msg}),
+            ));
+        }
+    }
+
+    // Check host+listen_path uniqueness (excluding self)
     match db
-        .check_listen_path_unique(&proxy.listen_path, Some(id))
+        .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, Some(id))
         .await
     {
         Ok(true) => {}
         Ok(false) => {
             return Ok(json_response(
                 StatusCode::CONFLICT,
-                &json!({"error": "listen_path already exists"}),
+                &json!({"error": "A proxy with overlapping hosts and listen_path already exists"}),
             ));
         }
         Err(e) => {

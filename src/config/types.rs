@@ -12,6 +12,15 @@ const MAX_ID_LENGTH: usize = 254;
 static ID_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$").expect("invalid ID regex"));
 
+/// Regex for valid exact hostnames: lowercase letters, digits, dots, hyphens.
+static HOST_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$").expect("invalid host regex"));
+
+/// Regex for wildcard host patterns: *.domain.tld
+static WILDCARD_HOST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\*\.[a-z0-9]([a-z0-9.-]*[a-z0-9])?$").expect("invalid wildcard host regex")
+});
+
 /// Validate a resource ID format.
 ///
 /// Valid IDs must:
@@ -426,6 +435,11 @@ pub struct Proxy {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional list of hostnames this proxy matches on.
+    /// Empty means match all hosts (backward compatible catch-all).
+    /// Supports exact hostnames and single-level wildcard prefixes (e.g., "*.example.com").
+    #[serde(default)]
+    pub hosts: Vec<String>,
     pub listen_path: String,
     pub backend_protocol: BackendProtocol,
     pub backend_host: String,
@@ -573,22 +587,71 @@ fn default_config_version() -> String {
 }
 
 impl GatewayConfig {
-    /// Validate that all proxy listen_paths are unique.
+    /// Validate that all proxy (host, listen_path) combinations are unique.
+    ///
+    /// Two proxies may share the same `listen_path` if their `hosts` sets are
+    /// completely disjoint. A proxy with empty `hosts` (catch-all) conflicts
+    /// with any other proxy that has the same `listen_path` and also has empty
+    /// hosts. A specific host in one proxy's `hosts` conflicts if another proxy
+    /// with the same `listen_path` lists the same host or is a catch-all.
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
-        let mut seen = HashMap::new();
-        let mut duplicates = Vec::new();
-        for proxy in &self.proxies {
-            if let Some(existing) = seen.insert(&proxy.listen_path, &proxy.id) {
-                duplicates.push(format!(
-                    "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
-                    proxy.listen_path, proxy.id, existing
-                ));
+        let mut errors = Vec::new();
+
+        for (i, proxy_a) in self.proxies.iter().enumerate() {
+            for proxy_b in self.proxies.iter().skip(i + 1) {
+                if proxy_a.listen_path != proxy_b.listen_path {
+                    continue;
+                }
+                // Same listen_path — check if hosts overlap
+                if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                    if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
+                        errors.push(format!(
+                            "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
+                            proxy_a.listen_path, proxy_b.id, proxy_a.id
+                        ));
+                    } else {
+                        errors.push(format!(
+                            "Overlapping host+listen_path for '{}' in proxy '{}' (conflicts with '{}')",
+                            proxy_a.listen_path, proxy_b.id, proxy_a.id
+                        ));
+                    }
+                }
             }
         }
-        if duplicates.is_empty() {
+
+        if errors.is_empty() {
             Ok(())
         } else {
-            Err(duplicates)
+            Err(errors)
+        }
+    }
+
+    /// Validate host entries on all proxies.
+    ///
+    /// Each host must be either a valid lowercase hostname or a wildcard
+    /// pattern `*.domain.tld`. No scheme, no port, no path component.
+    pub fn validate_hosts(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            for host in &proxy.hosts {
+                if let Err(msg) = validate_host_entry(host) {
+                    errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Normalize all proxy host entries to lowercase.
+    pub fn normalize_hosts(&mut self) {
+        for proxy in &mut self.proxies {
+            for host in &mut proxy.hosts {
+                *host = host.to_lowercase();
+            }
         }
     }
 
@@ -935,4 +998,106 @@ fn default_write_timeout() -> u64 {
 
 fn default_udp_idle_timeout() -> u64 {
     60
+}
+
+/// Validate a single host entry.
+///
+/// Valid formats:
+/// - Exact hostname: `api.example.com` (lowercase, no scheme/port/path)
+/// - Wildcard: `*.example.com` (single-level wildcard prefix)
+pub fn validate_host_entry(host: &str) -> Result<(), String> {
+    if host.is_empty() {
+        return Err("host entry must not be empty".to_string());
+    }
+    if host.contains("://") {
+        return Err(format!(
+            "host '{}' must not contain a scheme (e.g., 'http://')",
+            host
+        ));
+    }
+    if host.contains(':') && !host.starts_with('*') {
+        return Err(format!("host '{}' must not contain a port number", host));
+    }
+    if host.contains('/') {
+        return Err(format!("host '{}' must not contain a path", host));
+    }
+    if host != host.to_lowercase() {
+        return Err(format!(
+            "host '{}' must be lowercase (got mixed case)",
+            host
+        ));
+    }
+    if host.starts_with("*.") {
+        if !WILDCARD_HOST_REGEX.is_match(host) {
+            return Err(format!(
+                "wildcard host '{}' is invalid: must be '*.domain.tld' format",
+                host
+            ));
+        }
+    } else if host.contains('*') {
+        return Err(format!(
+            "host '{}' has invalid wildcard: '*' is only allowed as prefix '*.domain'",
+            host
+        ));
+    } else if !HOST_REGEX.is_match(host) {
+        return Err(format!(
+            "host '{}' is invalid: must be a valid hostname (lowercase letters, digits, dots, hyphens)",
+            host
+        ));
+    }
+    Ok(())
+}
+
+/// Check whether two host lists overlap.
+///
+/// Empty hosts means "match all" (catch-all), which overlaps with everything.
+/// Otherwise, checks for any shared exact host or wildcard-to-exact match.
+pub fn hosts_overlap(a: &[String], b: &[String]) -> bool {
+    // Empty = catch-all, overlaps with everything
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+
+    let a_set: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let b_set: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+
+    // Check exact overlaps
+    if a_set.intersection(&b_set).next().is_some() {
+        return true;
+    }
+
+    // Check wildcard-to-exact and wildcard-to-wildcard overlaps
+    for host_a in a {
+        for host_b in b {
+            if wildcard_matches(host_a, host_b) || wildcard_matches(host_b, host_a) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a wildcard pattern matches a hostname.
+/// `*.example.com` matches `foo.example.com` but not `example.com` or `a.b.example.com`.
+pub fn wildcard_matches(pattern: &str, hostname: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        // Don't match the base domain itself
+        if hostname == suffix {
+            return false;
+        }
+        // Must end with .suffix and have exactly one label before it
+        if let Some(prefix) = hostname.strip_suffix(suffix) {
+            // prefix should be "something." with no additional dots
+            if prefix.ends_with('.')
+                && !prefix[..prefix.len() - 1].is_empty()
+                && !prefix[..prefix.len() - 1].contains('.')
+            {
+                return true;
+            }
+        }
+        false
+    } else {
+        pattern == hostname
+    }
 }

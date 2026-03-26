@@ -14,6 +14,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Connection Pooling**: Lock-free connection reuse with per-proxy pool keys, AtomicU64 cleanup, HTTP/2 via ALPN (no forced h2c)
 - **Router Cache**: Pre-sorted route table with bounded O(1) path cache; rebuilt atomically on config changes, never on hot path
 - **Longest Prefix Match Routing**: Efficient route matching with wildcard path-suffix forwarding and unique `listen_path` enforcement
+- **Host-Based Routing**: Optional per-proxy hostname matching with exact and wildcard prefix support (e.g., `*.example.com`)
 - **Dynamic Configuration**: Zero-downtime configuration reloads via DB polling, SIGHUP signals, or CP push
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
@@ -1222,6 +1223,8 @@ Integrates with OpenTelemetry for distributed tracing.
 ### Routing
 
 Ferrum uses **longest prefix matching** on `listen_path` values. All paths must be unique. If no proxy matches, the gateway returns `404 Not Found`.
+
+Proxies may optionally specify a `hosts` list to restrict matching to specific hostnames. Exact hostnames and wildcard prefixes (e.g., `*.example.com`) are supported. An empty `hosts` list (the default) matches all hosts.
 
 ### Path Forwarding
 

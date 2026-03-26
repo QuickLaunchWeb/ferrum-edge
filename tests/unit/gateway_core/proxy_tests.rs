@@ -7,6 +7,7 @@ fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
         name: Some("Test Proxy".into()),
+        hosts: vec![],
         listen_path: "/api/v1".into(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "backend.example.com".into(),
@@ -96,7 +97,7 @@ fn test_longest_prefix_match() {
         loaded_at: Utc::now(),
     };
     let router = RouterCache::new(&config, 10000);
-    let matched = router.find_proxy("/api/v1/users");
+    let matched = router.find_proxy(None, "/api/v1/users");
     assert!(matched.is_some());
     assert_eq!(matched.unwrap().id, "long");
 }
@@ -115,6 +116,6 @@ fn test_no_match() {
         loaded_at: Utc::now(),
     };
     let router = RouterCache::new(&config, 10000);
-    let matched = router.find_proxy("/other/path");
+    let matched = router.find_proxy(None, "/other/path");
     assert!(matched.is_none());
 }

@@ -30,6 +30,7 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
         name: Some(format!("gRPC Test Proxy {}", id)),
+        hosts: vec![],
         listen_path: listen_path.to_string(),
         backend_protocol: BackendProtocol::Grpc,
         backend_host: "127.0.0.1".to_string(),

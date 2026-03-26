@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat"
+        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat_hosts"
     }
 }
 
@@ -99,7 +99,8 @@ impl V001InitialSchema {
             CREATE TABLE IF NOT EXISTS proxies (
                 id VARCHAR(255) PRIMARY KEY,
                 name VARCHAR(255) UNIQUE,
-                listen_path VARCHAR(500) NOT NULL UNIQUE,
+                hosts TEXT NOT NULL,
+                listen_path VARCHAR(500) NOT NULL,
                 backend_protocol VARCHAR(20) NOT NULL DEFAULT 'http',
                 backend_host VARCHAR(255) NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
@@ -140,7 +141,8 @@ impl V001InitialSchema {
             CREATE TABLE IF NOT EXISTS proxies (
                 id TEXT PRIMARY KEY,
                 name TEXT UNIQUE,
-                listen_path TEXT NOT NULL UNIQUE,
+                hosts TEXT NOT NULL DEFAULT '[]',
+                listen_path TEXT NOT NULL,
                 backend_protocol TEXT NOT NULL DEFAULT 'http',
                 backend_host TEXT NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,

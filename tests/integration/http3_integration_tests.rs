@@ -52,6 +52,7 @@ fn create_http3_test_proxy() -> Proxy {
     Proxy {
         id: "http3-test-proxy".to_string(),
         name: Some("HTTP/3 Test Proxy".to_string()),
+        hosts: vec![],
         listen_path: "/http3-test".to_string(),
         backend_protocol: BackendProtocol::H3,
         backend_host: "facebook.com".to_string(),

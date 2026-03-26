@@ -9,6 +9,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
     Proxy {
         id: id.to_string(),
         name: None,
+        hosts: vec![],
         listen_path: listen_path.to_string(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),

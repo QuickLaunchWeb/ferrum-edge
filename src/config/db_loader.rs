@@ -234,11 +234,14 @@ impl DatabaseStore {
             loaded_at: Utc::now(),
         };
 
+        // Normalize host entries to lowercase
+        config.normalize_hosts();
+
         if let Err(dupes) = config.validate_unique_listen_paths() {
             for msg in &dupes {
                 error!("{}", msg);
             }
-            anyhow::bail!("Database has duplicate listen_path values");
+            anyhow::bail!("Database has conflicting host+listen_path combinations");
         }
 
         // Validate stream proxy (TCP/UDP) configuration
@@ -358,11 +361,14 @@ impl DatabaseStore {
 
         let mut tx = self.pool.begin().await?;
 
+        let hosts_json = serde_json::to_string(&proxy.hosts)?;
+
         sqlx::query(
-            &self.q("INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
+        .bind(&hosts_json)
         .bind(&proxy.listen_path)
         .bind(proxy.backend_protocol.to_string())
         .bind(&proxy.backend_host)
@@ -433,10 +439,13 @@ impl DatabaseStore {
 
         let mut tx = self.pool.begin().await?;
 
+        let hosts_json = serde_json::to_string(&proxy.hosts)?;
+
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, updated_at=? WHERE id=?")
         )
         .bind(&proxy.name)
+        .bind(&hosts_json)
         .bind(&proxy.listen_path)
         .bind(proxy.backend_protocol.to_string())
         .bind(&proxy.backend_host)
@@ -853,24 +862,48 @@ impl DatabaseStore {
         }
     }
 
+    /// Check if a proxy's (hosts, listen_path) combination is unique.
+    ///
+    /// Two proxies may share the same `listen_path` if their `hosts` sets are
+    /// completely disjoint. Returns `true` if no conflict is found.
     pub async fn check_listen_path_unique(
         &self,
         listen_path: &str,
+        hosts: &[String],
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_path = ? AND id != ?"))
+            sqlx::query(&self.q("SELECT id, hosts FROM proxies WHERE listen_path = ? AND id != ?"))
                 .bind(listen_path)
                 .bind(eid)
                 .fetch_all(&self.pool)
                 .await?
         } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_path = ?"))
+            sqlx::query(&self.q("SELECT id, hosts FROM proxies WHERE listen_path = ?"))
                 .bind(listen_path)
                 .fetch_all(&self.pool)
                 .await?
         };
-        Ok(rows.is_empty())
+
+        // No other proxy with this listen_path — unique
+        if rows.is_empty() {
+            return Ok(true);
+        }
+
+        // Check if any existing proxy's hosts overlap with the new hosts
+        for row in &rows {
+            let existing_hosts: Vec<String> = row
+                .try_get::<String, _>("hosts")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     /// Check if a proxy name is unique (when present).
@@ -1544,9 +1577,16 @@ fn row_to_proxy(
         "single".into()
     });
 
+    let hosts: Vec<String> = row
+        .try_get::<String, _>("hosts")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
     Ok(Proxy {
         id,
         name: row.try_get("name").ok(),
+        hosts,
         listen_path: row.try_get("listen_path")?,
         backend_protocol: parse_protocol(&proto_str),
         backend_host: row.try_get("backend_host")?,

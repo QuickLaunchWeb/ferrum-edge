@@ -62,6 +62,7 @@ pub fn create_test_proxy() -> Proxy {
     Proxy {
         id: "test-proxy".to_string(),
         name: Some("Test Proxy".to_string()),
+        hosts: vec![],
         listen_path: "/test".to_string(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),

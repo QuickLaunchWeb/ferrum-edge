@@ -92,7 +92,19 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
-    // Validate listen_path uniqueness
+    // Normalize and validate host entries
+    config.normalize_hosts();
+    if let Err(errors) = config.validate_hosts() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid host(s) found",
+            errors.len()
+        );
+    }
+
+    // Validate host+listen_path uniqueness
     if let Err(dupes) = config.validate_unique_listen_paths() {
         for msg in &dupes {
             error!("{}", msg);

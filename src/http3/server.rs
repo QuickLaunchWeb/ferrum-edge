@@ -304,8 +304,23 @@ async fn handle_h3_request(
         }
     }
 
-    // Route: longest prefix match via router cache
-    let matched_proxy = state.router_cache.find_proxy(&path);
+    // Extract request host for host-based routing.
+    // HTTP/3 uses the :authority pseudo-header (from URI authority).
+    // Also check the host header as a fallback. Strip port and lowercase.
+    let request_host: Option<String> = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| ctx.headers.get("host").map(|h| h.as_str()))
+        .map(|h| {
+            let without_port = h.split(':').next().unwrap_or(h);
+            without_port.to_lowercase()
+        });
+
+    // Route: host + longest prefix match via router cache
+    let matched_proxy = state
+        .router_cache
+        .find_proxy(request_host.as_deref(), &path);
 
     let proxy = match matched_proxy {
         Some(p) => p,

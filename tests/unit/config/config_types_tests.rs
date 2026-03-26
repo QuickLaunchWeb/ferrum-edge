@@ -1,7 +1,8 @@
 use chrono::Utc;
 use ferrum_gateway::config::types::{
     AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy,
-    Upstream, UpstreamTarget, validate_resource_id,
+    Upstream, UpstreamTarget, hosts_overlap, validate_host_entry, validate_resource_id,
+    wildcard_matches,
 };
 use std::collections::HashMap;
 
@@ -10,6 +11,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.into(),
         name: None,
+        hosts: vec![],
         listen_path: listen_path.into(),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),
@@ -98,6 +100,7 @@ fn test_unique_listen_paths_valid() {
             Proxy {
                 id: "1".into(),
                 name: None,
+                hosts: vec![],
                 listen_path: "/api/v1".into(),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
@@ -136,6 +139,7 @@ fn test_unique_listen_paths_valid() {
             Proxy {
                 id: "2".into(),
                 name: None,
+                hosts: vec![],
                 listen_path: "/api/v2".into(),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
@@ -188,6 +192,7 @@ fn test_unique_listen_paths_duplicate() {
             Proxy {
                 id: "1".into(),
                 name: None,
+                hosts: vec![],
                 listen_path: "/api/v1".into(),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
@@ -226,6 +231,7 @@ fn test_unique_listen_paths_duplicate() {
             Proxy {
                 id: "2".into(),
                 name: None,
+                hosts: vec![],
                 listen_path: "/api/v1".into(),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
@@ -611,4 +617,252 @@ fn test_validate_unique_resource_ids_same_id_different_types_ok() {
     config.consumers = vec![make_consumer("shared-id", "alice")];
     config.upstreams = vec![make_upstream("shared-id")];
     assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+// ---- Host validation tests ----
+
+fn make_proxy_with_hosts(id: &str, listen_path: &str, hosts: Vec<&str>) -> Proxy {
+    let mut p = make_proxy(id, listen_path);
+    p.hosts = hosts.into_iter().map(String::from).collect();
+    p
+}
+
+#[test]
+fn test_validate_host_entry_valid_exact() {
+    assert!(validate_host_entry("api.example.com").is_ok());
+    assert!(validate_host_entry("example.com").is_ok());
+    assert!(validate_host_entry("a.b.c.example.com").is_ok());
+    assert!(validate_host_entry("localhost").is_ok());
+    assert!(validate_host_entry("my-api.example.com").is_ok());
+}
+
+#[test]
+fn test_validate_host_entry_valid_wildcard() {
+    assert!(validate_host_entry("*.example.com").is_ok());
+    assert!(validate_host_entry("*.a.example.com").is_ok());
+}
+
+#[test]
+fn test_validate_host_entry_rejects_scheme() {
+    let err = validate_host_entry("http://example.com").unwrap_err();
+    assert!(err.contains("scheme"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_port() {
+    let err = validate_host_entry("example.com:8080").unwrap_err();
+    assert!(err.contains("port"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_path() {
+    let err = validate_host_entry("example.com/path").unwrap_err();
+    assert!(err.contains("path"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_uppercase() {
+    let err = validate_host_entry("API.example.com").unwrap_err();
+    assert!(err.contains("lowercase"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_invalid_wildcard() {
+    // Wildcard not at start
+    let err = validate_host_entry("api.*.com").unwrap_err();
+    assert!(err.contains("wildcard"));
+
+    // Bare wildcard
+    let err = validate_host_entry("*").unwrap_err();
+    assert!(err.contains("wildcard"));
+}
+
+#[test]
+fn test_validate_host_entry_rejects_empty() {
+    let err = validate_host_entry("").unwrap_err();
+    assert!(err.contains("empty"));
+}
+
+#[test]
+fn test_wildcard_matches_single_level() {
+    assert!(wildcard_matches("*.example.com", "api.example.com"));
+    assert!(wildcard_matches("*.example.com", "admin.example.com"));
+}
+
+#[test]
+fn test_wildcard_does_not_match_base_domain() {
+    assert!(!wildcard_matches("*.example.com", "example.com"));
+}
+
+#[test]
+fn test_wildcard_does_not_match_multi_level() {
+    assert!(!wildcard_matches("*.example.com", "a.b.example.com"));
+}
+
+#[test]
+fn test_wildcard_matches_exact_pattern() {
+    // Non-wildcard pattern should do exact matching
+    assert!(wildcard_matches("api.example.com", "api.example.com"));
+    assert!(!wildcard_matches("api.example.com", "other.example.com"));
+}
+
+#[test]
+fn test_hosts_overlap_both_empty_catch_all() {
+    // Both catch-all → overlap
+    assert!(hosts_overlap(&[], &[]));
+}
+
+#[test]
+fn test_hosts_overlap_one_empty_catch_all() {
+    // Catch-all overlaps with everything
+    let hosts = vec!["api.example.com".to_string()];
+    assert!(hosts_overlap(&hosts, &[]));
+    assert!(hosts_overlap(&[], &hosts));
+}
+
+#[test]
+fn test_hosts_overlap_disjoint() {
+    let a = vec!["api.example.com".to_string()];
+    let b = vec!["admin.example.com".to_string()];
+    assert!(!hosts_overlap(&a, &b));
+}
+
+#[test]
+fn test_hosts_overlap_shared_host() {
+    let a = vec!["api.example.com".to_string()];
+    let b = vec![
+        "api.example.com".to_string(),
+        "admin.example.com".to_string(),
+    ];
+    assert!(hosts_overlap(&a, &b));
+}
+
+#[test]
+fn test_hosts_overlap_wildcard_matches_exact() {
+    let a = vec!["*.example.com".to_string()];
+    let b = vec!["api.example.com".to_string()];
+    assert!(hosts_overlap(&a, &b));
+}
+
+#[test]
+fn test_hosts_overlap_wildcard_no_match() {
+    let a = vec!["*.example.com".to_string()];
+    let b = vec!["api.other.org".to_string()];
+    assert!(!hosts_overlap(&a, &b));
+}
+
+// ---- Host+listen_path uniqueness validation tests ----
+
+#[test]
+fn test_unique_listen_paths_same_path_disjoint_hosts() {
+    // Same listen_path but different hosts → OK
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]),
+        make_proxy_with_hosts("p2", "/api", vec!["admin.example.com"]),
+    ];
+    assert!(config.validate_unique_listen_paths().is_ok());
+}
+
+#[test]
+fn test_unique_listen_paths_same_path_overlapping_hosts() {
+    // Same listen_path AND overlapping hosts → conflict
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]),
+        make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]),
+    ];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Overlapping"));
+}
+
+#[test]
+fn test_unique_listen_paths_same_path_catchall_conflict() {
+    // Two catch-all proxies (no hosts) with same path → conflict
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/api")];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate listen_path"));
+}
+
+#[test]
+fn test_unique_listen_paths_catchall_vs_specific_host() {
+    // Catch-all overlaps with any specific host
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("p1", "/api"),
+        make_proxy_with_hosts("p2", "/api", vec!["api.example.com"]),
+    ];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+}
+
+#[test]
+fn test_unique_listen_paths_different_paths_same_hosts_ok() {
+    // Different listen_path → OK even with same hosts
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]),
+        make_proxy_with_hosts("p2", "/web", vec!["api.example.com"]),
+    ];
+    assert!(config.validate_unique_listen_paths().is_ok());
+}
+
+#[test]
+fn test_validate_hosts_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy_with_hosts("p1", "/api", vec!["api.example.com"]),
+        make_proxy_with_hosts("p2", "/web", vec!["*.example.com"]),
+    ];
+    assert!(config.validate_hosts().is_ok());
+}
+
+#[test]
+fn test_validate_hosts_invalid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy_with_hosts("p1", "/api", vec!["INVALID.COM"])];
+    let err = config.validate_hosts().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("p1"));
+}
+
+#[test]
+fn test_normalize_hosts() {
+    let mut config = empty_config();
+    let mut p = make_proxy("p1", "/api");
+    p.hosts = vec!["API.EXAMPLE.COM".to_string()];
+    config.proxies = vec![p];
+    config.normalize_hosts();
+    assert_eq!(config.proxies[0].hosts[0], "api.example.com");
+}
+
+#[test]
+fn test_hosts_deserialization_default_empty() {
+    // When hosts field is missing from JSON, it should default to empty vec
+    let json = r#"{
+        "id": "p1",
+        "listen_path": "/api",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 3000
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert!(proxy.hosts.is_empty());
+}
+
+#[test]
+fn test_hosts_deserialization_with_values() {
+    let json = r#"{
+        "id": "p1",
+        "hosts": ["api.example.com", "*.example.org"],
+        "listen_path": "/api",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 3000
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.hosts, vec!["api.example.com", "*.example.org"]);
 }
