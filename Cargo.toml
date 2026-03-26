@@ -3,7 +3,7 @@ name = "ferrum-gateway"
 version = "0.1.0"
 edition = "2024"
 description = "A high-performance API Gateway and Reverse Proxy built in Rust"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [[bin]]
 name = "ferrum-gateway"

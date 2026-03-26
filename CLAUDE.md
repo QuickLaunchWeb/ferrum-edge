@@ -9,7 +9,7 @@ Ferrum Gateway is a high-performance API Gateway and reverse proxy built in Rust
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
 - **Binary**: `ferrum-gateway` (single binary, mode selected via env var)
-- **License**: MIT
+- **License**: PolyForm Noncommercial 1.0.0 (dual-licensed with paid commercial option)
 
 ## Quick Reference — Commands
 
