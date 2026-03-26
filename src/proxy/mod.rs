@@ -181,6 +181,7 @@ impl ProxyState {
             dns_cache.clone(),
             load_balancer_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
+            env_config_arc.backend_tls_no_verify,
         ));
 
         // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
@@ -2784,7 +2785,9 @@ async fn proxy_to_backend(
                 .timeout(std::time::Duration::from_millis(
                     proxy.backend_read_timeout_ms,
                 ))
-                .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
+                .danger_accept_invalid_certs(
+                    !proxy.backend_tls_verify_server_cert || state.env_config.backend_tls_no_verify,
+                )
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }

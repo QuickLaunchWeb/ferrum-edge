@@ -338,6 +338,7 @@ async fn test_http3_proxy_state_creation() {
             dns_cache.clone(),
             lb_cache.clone(),
             None,
+            false,
         ),
     );
     let proxy_state = ProxyState {
@@ -485,6 +486,7 @@ async fn test_http3_full_integration() {
             dns_cache.clone(),
             lb_cache.clone(),
             None,
+            false,
         ),
     );
     let proxy_state = ProxyState {

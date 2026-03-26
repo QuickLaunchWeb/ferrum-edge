@@ -48,6 +48,8 @@ pub struct StreamListenerManager {
     /// When set, the gateway requires and verifies client DTLS certificates
     /// using this trust store (separate from TCP TLS client CA).
     frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
+    /// Global override to disable backend TLS certificate verification.
+    backend_tls_no_verify: bool,
 }
 
 impl StreamListenerManager {
@@ -57,6 +59,7 @@ impl StreamListenerManager {
         dns_cache: DnsCache,
         load_balancer_cache: Arc<LoadBalancerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+        backend_tls_no_verify: bool,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -67,6 +70,7 @@ impl StreamListenerManager {
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
+            backend_tls_no_verify,
         }
     }
 
@@ -181,6 +185,7 @@ impl StreamListenerManager {
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
             let lb_cache = self.load_balancer_cache.clone();
+            let backend_tls_no_verify = self.backend_tls_no_verify;
 
             let join_handle = if protocol.is_udp() {
                 // UDP or DTLS listener
@@ -225,6 +230,7 @@ impl StreamListenerManager {
                         shutdown: shutdown_rx,
                         metrics,
                         frontend_dtls_config,
+                        backend_tls_no_verify,
                     })
                     .await
                     {
@@ -255,6 +261,7 @@ impl StreamListenerManager {
                         frontend_tls_config: tls_config,
                         shutdown: shutdown_rx,
                         metrics,
+                        backend_tls_no_verify,
                     })
                     .await
                     {

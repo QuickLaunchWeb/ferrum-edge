@@ -68,6 +68,7 @@ pub struct UdpListenerConfig {
     /// DTLS server config for frontend termination. When `Some`, the listener
     /// accepts DTLS connections from clients instead of plain UDP.
     pub frontend_dtls_config: Option<webrtc_dtls::config::Config>,
+    pub backend_tls_no_verify: bool,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -89,6 +90,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         shutdown,
         metrics,
         frontend_dtls_config,
+        backend_tls_no_verify,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -102,6 +104,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             shutdown,
             metrics,
             dtls_config,
+            backend_tls_no_verify,
         )
         .await;
     }
@@ -176,6 +179,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                         client_addr,
                         &sessions,
                         &metrics,
+                        backend_tls_no_verify,
                     ).await {
                         Ok(session) => session,
                         Err(e) => {
@@ -286,6 +290,7 @@ async fn start_dtls_frontend_listener(
     shutdown: watch::Receiver<bool>,
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: webrtc_dtls::config::Config,
+    backend_tls_no_verify: bool,
 ) -> Result<(), anyhow::Error> {
     use webrtc_util::conn::Listener;
 
@@ -344,6 +349,7 @@ async fn start_dtls_frontend_listener(
                         &handler_dns,
                         &handler_lb,
                         &handler_metrics,
+                        backend_tls_no_verify,
                     )
                     .await
                     {
@@ -382,6 +388,7 @@ async fn handle_dtls_client(
     dns_cache: &DnsCache,
     lb_cache: &LoadBalancerCache,
     metrics: &Arc<UdpProxyMetrics>,
+    backend_tls_no_verify: bool,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let current_config = config.load();
@@ -412,7 +419,8 @@ async fn handle_dtls_client(
     ) = if proxy.backend_protocol == BackendProtocol::Dtls {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(backend_addr).await?;
-        let dtls_config = crate::dtls::build_backend_dtls_config(&proxy, &backend_host)?;
+        let dtls_config =
+            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, backend_tls_no_verify)?;
         let dtls = crate::dtls::connect_dtls_backend(socket, dtls_config).await?;
         debug!(
             proxy_id = %proxy_id,
@@ -553,6 +561,7 @@ async fn create_session(
     client_addr: SocketAddr,
     sessions: &SessionMap,
     metrics: &Arc<UdpProxyMetrics>,
+    backend_tls_no_verify: bool,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let current_config = config.load();
     let proxy = current_config
@@ -585,7 +594,8 @@ async fn create_session(
         socket.connect(backend_addr).await?;
         let placeholder = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
-        let dtls_config = crate::dtls::build_backend_dtls_config(&proxy, &backend_host)?;
+        let dtls_config =
+            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, backend_tls_no_verify)?;
         let dtls = crate::dtls::connect_dtls_backend(socket, dtls_config).await?;
         debug!(
             proxy_id = %proxy_id,
