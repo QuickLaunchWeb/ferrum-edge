@@ -317,7 +317,7 @@ impl DnsCache {
         let elapsed = start.elapsed();
         if elapsed > threshold {
             warn!(
-                "DNS slow resolution for {} took {:.1}ms (threshold: {}ms, resolver: {})",
+                "DNS slow resolution for {} took {:.1}ms (threshold: {}ms, nameservers: {})",
                 hostname,
                 elapsed.as_secs_f64() * 1000.0,
                 threshold.as_millis(),
