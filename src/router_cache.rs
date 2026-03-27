@@ -153,10 +153,12 @@ impl RouterCache {
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
-        let cache_key = make_cache_key(host, path);
+        let mut buf = [0u8; 512];
+        let cache_key = make_cache_key(host, path, &mut buf);
+        let key_str = cache_key.as_str();
 
         // Fast path 1: check prefix cache (includes negative entries for total misses)
-        if let Some(entry) = self.prefix_cache.get(&cache_key) {
+        if let Some(entry) = self.prefix_cache.get(key_str) {
             return entry.value().as_ref().map(|proxy| RouteMatch {
                 proxy: Arc::clone(proxy),
                 path_params: Vec::new(),
@@ -165,7 +167,7 @@ impl RouterCache {
         }
 
         // Fast path 2: check regex cache (only contains positive matches)
-        if let Some(entry) = self.regex_cache.get(&cache_key) {
+        if let Some(entry) = self.regex_cache.get(key_str) {
             let cached = entry.value();
             return Some(RouteMatch {
                 proxy: Arc::clone(&cached.proxy),
@@ -178,6 +180,9 @@ impl RouterCache {
         let table = self.route_table.load();
         let result = Self::search_route_table(&table, host, path);
 
+        // Materialize cache key as owned String only on slow path (cache miss)
+        let owned_key = key_str.to_owned();
+
         // Cache the result in the appropriate partition
         match &result {
             Some(route_match)
@@ -188,7 +193,7 @@ impl RouterCache {
                     self.evict_regex_sample();
                 }
                 self.regex_cache.insert(
-                    cache_key,
+                    owned_key,
                     RegexCacheEntry {
                         proxy: Arc::clone(&route_match.proxy),
                         path_params: route_match.path_params.clone(),
@@ -202,14 +207,14 @@ impl RouterCache {
                     self.evict_prefix_sample();
                 }
                 self.prefix_cache
-                    .insert(cache_key, Some(Arc::clone(&route_match.proxy)));
+                    .insert(owned_key, Some(Arc::clone(&route_match.proxy)));
             }
             None => {
                 // Negative entry → prefix cache (both tiers missed)
                 if self.prefix_cache.len() >= self.max_cache_entries {
                     self.evict_prefix_sample();
                 }
-                self.prefix_cache.insert(cache_key, None);
+                self.prefix_cache.insert(owned_key, None);
             }
         }
 
@@ -601,11 +606,51 @@ fn evict_dashmap_sample<V>(
     );
 }
 
-/// Build a cache key from host and path.
+/// Build a cache key from host and path into a caller-provided buffer.
 /// Uses NUL separator which cannot appear in hostnames or URL paths.
-fn make_cache_key(host: Option<&str>, path: &str) -> String {
-    match host {
-        Some(h) => format!("{}\0{}", h, path),
-        None => format!("\0{}", path),
+/// Returns the slice of `buf` that was written to, or falls back to a
+/// heap-allocated `String` when the combined key exceeds the buffer.
+///
+/// The caller passes a stack-allocated `[u8; 512]` (enough for virtually
+/// all real-world host+path combinations), so the fast path does zero
+/// heap allocations.
+enum CacheKey<'a> {
+    Stack(&'a [u8]),
+    Heap(String),
+}
+
+impl<'a> CacheKey<'a> {
+    fn as_str(&self) -> &str {
+        match self {
+            CacheKey::Stack(bytes) => {
+                // SAFETY: we only write valid UTF-8 bytes (ASCII host + NUL + path)
+                unsafe { std::str::from_utf8_unchecked(bytes) }
+            }
+            CacheKey::Heap(s) => s.as_str(),
+        }
+    }
+}
+
+fn make_cache_key<'a>(host: Option<&str>, path: &str, buf: &'a mut [u8; 512]) -> CacheKey<'a> {
+    let host_bytes = host.map(|h| h.as_bytes()).unwrap_or(&[]);
+    let needed = host_bytes.len() + 1 + path.len(); // host + NUL + path
+
+    if needed <= 512 {
+        let mut pos = 0;
+        buf[pos..pos + host_bytes.len()].copy_from_slice(host_bytes);
+        pos += host_bytes.len();
+        buf[pos] = 0; // NUL separator
+        pos += 1;
+        buf[pos..pos + path.len()].copy_from_slice(path.as_bytes());
+        CacheKey::Stack(&buf[..needed])
+    } else {
+        // Rare fallback for very long host+path combinations
+        let mut s = String::with_capacity(needed);
+        if let Some(h) = host {
+            s.push_str(h);
+        }
+        s.push('\0');
+        s.push_str(path);
+        CacheKey::Heap(s)
     }
 }

@@ -250,8 +250,10 @@ async fn handle_h3_request(
         }
         total_header_size += header_size;
         if let Ok(v) = value.to_str() {
-            ctx.headers
-                .insert(name.as_str().to_lowercase(), v.to_string());
+            // hyper's HeaderName is already lowercase-normalized, so
+            // name.as_str() returns a lowercase &str — skip to_lowercase()
+            // to avoid a per-header String allocation on the hot path.
+            ctx.headers.insert(name.as_str().to_owned(), v.to_owned());
         }
     }
     if total_header_size > state.max_header_size_bytes {
@@ -306,21 +308,30 @@ async fn handle_h3_request(
 
     // Extract request host for host-based routing.
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
-    // Also check the host header as a fallback. Strip port and lowercase.
-    let request_host: Option<String> = req
+    // Also check the host header as a fallback. Strip port if present.
+    // Hostnames are case-insensitive (RFC 7230 §2.7.1) — avoid heap allocation
+    // when the host is already ASCII lowercase (the common case).
+    let raw_host: Option<&str> = req
         .uri()
         .authority()
         .map(|a| a.as_str())
         .or_else(|| ctx.headers.get("host").map(|h| h.as_str()))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            without_port.to_lowercase()
-        });
+        .map(|h| h.split(':').next().unwrap_or(h));
+
+    let lowered_host_buf: String;
+    let request_host: Option<&str> = match raw_host {
+        Some(h) if h.bytes().all(|b| !b.is_ascii_uppercase()) => Some(h),
+        Some(h) => {
+            lowered_host_buf = h.to_ascii_lowercase();
+            Some(lowered_host_buf.as_str())
+        }
+        None => None,
+    };
 
     // Route: host + longest prefix match via router cache
     let route_match = state
         .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+        .find_proxy(request_host, &path);
 
     let proxy = match route_match {
         Some(rm) => {

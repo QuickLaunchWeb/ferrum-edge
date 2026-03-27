@@ -100,7 +100,10 @@ impl RequestContext {
             client_ip,
             method,
             path,
-            headers: HashMap::new(),
+            // Pre-size for typical HTTP request header count to avoid rehashing.
+            // Most requests carry 5-12 headers; 16 covers nearly all cases in
+            // one allocation with HashMap's default load factor.
+            headers: HashMap::with_capacity(16),
             query_params: HashMap::new(),
             matched_proxy: None,
             identified_consumer: None,

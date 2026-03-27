@@ -1708,21 +1708,32 @@ pub async fn handle_proxy_request(
 
     // Extract request host for host-based routing.
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
-    // (exposed via req.uri().authority()). Strip port if present and lowercase.
-    let request_host: Option<String> = ctx
+    // (exposed via req.uri().authority()). Strip port if present.
+    // Hostnames are case-insensitive (RFC 7230 §2.7.1) and the route table is
+    // already normalized to lowercase at config load time, so we lowercase the
+    // incoming host for matching. We avoid a heap allocation by checking if the
+    // host is already ASCII-lowercase (the common case for real traffic).
+    let raw_host: Option<&str> = ctx
         .headers
         .get("host")
         .map(|h| h.as_str())
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            without_port.to_lowercase()
-        });
+        .map(|h| h.split(':').next().unwrap_or(h));
+
+    let lowered_host_buf: String;
+    let request_host: Option<&str> = match raw_host {
+        Some(h) if h.bytes().all(|b| !b.is_ascii_uppercase()) => Some(h),
+        Some(h) => {
+            lowered_host_buf = h.to_ascii_lowercase();
+            Some(lowered_host_buf.as_str())
+        }
+        None => None,
+    };
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
     let route_match = state
         .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+        .find_proxy(request_host, &path);
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
