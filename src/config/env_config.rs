@@ -275,6 +275,11 @@ impl Default for EnvConfig {
 }
 
 impl EnvConfig {
+    /// Load configuration from environment variables and validate.
+    ///
+    /// When using external secret sources (`_FILE`, `_VAULT`, `_AWS`, `_GCP`,
+    /// `_AZURE`), call `secrets::resolve_all_env_secrets()` before this method
+    /// so that resolved values are available as plain env vars.
     pub fn from_env() -> Result<Self, String> {
         let mode = OperatingMode::from_env()?;
 
