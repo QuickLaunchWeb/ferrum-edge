@@ -128,8 +128,7 @@ impl ConnectionPool {
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
             .danger_accept_invalid_certs(
-                !proxy.backend_tls_verify_server_cert
-                    || self.global_mtls_config.backend_tls_no_verify,
+                !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify,
             )
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
@@ -155,8 +154,8 @@ impl ConnectionPool {
         }
 
         // Add custom CA bundle for server certificate verification (unless no_verify is set)
-        if !self.global_mtls_config.backend_tls_no_verify {
-            if let Some(ca_bundle_path) = &self.global_mtls_config.backend_tls_ca_bundle_path {
+        if !self.global_mtls_config.tls_no_verify {
+            if let Some(ca_bundle_path) = &self.global_mtls_config.tls_ca_bundle_path {
                 let ca_pem = std::fs::read_to_string(ca_bundle_path).map_err(|e| {
                     anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
                 })?;

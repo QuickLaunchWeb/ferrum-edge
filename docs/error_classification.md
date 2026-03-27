@@ -20,7 +20,7 @@ When a backend request fails (connection error, timeout, TLS failure, etc.), the
 | `ConnectionReset` | `"ConnectionReset"` | TCP connection was reset by the backend (RST received mid-stream) | Backend crashed, kernel killed the connection, intermediary proxy reset |
 | `ConnectionClosed` | `"ConnectionClosed"` | TCP connection was closed cleanly by the backend before a response was sent | Backend closed idle connection, connection pool stale entry, keep-alive timeout |
 | `DnsLookupError` | `"DnsLookupError"` | DNS resolution failed for the backend hostname | Hostname typo, DNS server unreachable, NXDOMAIN, missing DNS record |
-| `TlsError` | `"TlsError"` | TLS handshake failed | Certificate expired/untrusted, protocol version mismatch, SNI mismatch, self-signed cert without `backend_tls_no_verify` |
+| `TlsError` | `"TlsError"` | TLS handshake failed | Certificate expired/untrusted, protocol version mismatch, SNI mismatch, self-signed cert without `tls_no_verify` |
 | `ReadWriteTimeout` | `"ReadWriteTimeout"` | Connection was established but the response was not received within the configured timeout | Backend is slow, query/computation takes too long, deadlock in backend |
 | `ClientDisconnect` | `"ClientDisconnect"` | Client disconnected before the gateway could forward the full request/response | Client cancelled request, mobile network drop, browser navigation |
 | `ProtocolError` | `"ProtocolError"` | HTTP/2 or HTTP/3 protocol-level error (stream reset, GOAWAY, etc.) | Backend sent invalid HTTP frames, HTTP/2 stream limit exceeded, QUIC protocol error |
@@ -42,7 +42,7 @@ These error classes typically indicate problems with the gateway node itself or 
 
 ### TLS Issues
 
-- **`TlsError`** — Check that the backend's TLS certificate is valid and trusted by the gateway. For self-signed certs in development, set `FERRUM_BACKEND_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate and CA chain.
+- **`TlsError`** — Check that the backend's TLS certificate is valid and trusted by the gateway. For self-signed certs in development, set `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate and CA chain.
 
 ### Backend Performance Issues
 

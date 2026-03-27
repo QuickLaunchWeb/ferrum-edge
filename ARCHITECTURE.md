@@ -284,7 +284,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - TCP keepalive only when `enable_http_keep_alive` is true
 - Backend mTLS authentication with client certificates
 - Custom CA bundle support for server certificate verification
-- No-Verify mode for testing environments (`FERRUM_BACKEND_TLS_NO_VERIFY`)
+- No-Verify mode for testing environments (`FERRUM_TLS_NO_VERIFY`)
 - Per-proxy connection configuration overrides
 - Transparent DNS cache integration via `DnsCacheResolver` — no DNS in the hot path
 - Connection statistics and monitoring
@@ -519,7 +519,7 @@ proxies:
 
 ```bash
 # Global environment variables (fallback)
-export FERRUM_BACKEND_TLS_CA_BUNDLE_PATH="/path/to/ca-bundle.pem"
+export FERRUM_TLS_CA_BUNDLE_PATH="/path/to/ca-bundle.pem"
 export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/global-cert.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/global-key.pem"
 ```

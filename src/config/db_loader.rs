@@ -1,7 +1,7 @@
 use crate::config::types::{
     AuthMode, BackendProtocol, CircuitBreakerConfig, Consumer, GatewayConfig, HealthCheckConfig,
     LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
-    RetryConfig, Upstream, UpstreamTarget,
+    RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use chrono::{DateTime, Duration, Utc};
 use sqlx::Executor;
@@ -236,6 +236,14 @@ impl DatabaseStore {
 
         // Normalize host entries to lowercase
         config.normalize_hosts();
+
+        // Validate regex listen_paths compile correctly
+        if let Err(errors) = config.validate_regex_listen_paths() {
+            for msg in &errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!("Database has invalid regex listen_path(s)");
+        }
 
         if let Err(dupes) = config.validate_unique_listen_paths() {
             for msg in &dupes {
@@ -744,9 +752,14 @@ impl DatabaseStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let service_discovery_json = upstream
+            .service_discovery
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&upstream.id)
         .bind(&upstream.name)
@@ -754,6 +767,7 @@ impl DatabaseStore {
         .bind(algo_str)
         .bind(&upstream.hash_on)
         .bind(&health_checks_json)
+        .bind(&service_discovery_json)
         .bind(upstream.created_at.to_rfc3339())
         .bind(upstream.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -771,15 +785,21 @@ impl DatabaseStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let service_discovery_json = upstream
+            .service_discovery
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, health_checks=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, health_checks=?, service_discovery=?, updated_at=? WHERE id=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
         .bind(algo_str)
         .bind(&upstream.hash_on)
         .bind(&health_checks_json)
+        .bind(&service_discovery_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
         .execute(&self.pool)
@@ -1781,6 +1801,18 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
                 .ok()
         });
 
+    let service_discovery: Option<ServiceDiscoveryConfig> = row
+        .try_get::<String, _>("service_discovery")
+        .ok()
+        .and_then(|s| {
+            serde_json::from_str(&s)
+                .map_err(|e| {
+                    warn!("Failed to parse upstream service_discovery JSON: {}", e);
+                    e
+                })
+                .ok()
+        });
+
     Ok(Upstream {
         id: row.try_get("id")?,
         name: row.try_get("name").ok(),
@@ -1788,6 +1820,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         algorithm,
         hash_on: row.try_get("hash_on").ok(),
         health_checks,
+        service_discovery,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

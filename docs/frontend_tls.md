@@ -196,7 +196,7 @@ export FERRUM_ADMIN_HTTPS_PORT="9443"
 export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 
 # Backend TLS no-verify (testing only)
-export FERRUM_BACKEND_TLS_NO_VERIFY="true"
+export FERRUM_TLS_NO_VERIFY="true"
 
 # JWT authentication (required)
 export FERRUM_ADMIN_JWT_SECRET="your-secret-key"
@@ -263,7 +263,7 @@ The no-verify mode is designed for development, testing, and isolated environmen
 ```bash
 # Development with self-signed certificates
 export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-export FERRUM_BACKEND_TLS_NO_VERIFY="true"
+export FERRUM_TLS_NO_VERIFY="true"
 
 # Internal testing with custom CAs
 export FERRUM_ADMIN_TLS_NO_VERIFY="true"

@@ -21,6 +21,7 @@ pub mod proxy;
 pub mod retry;
 pub mod router_cache;
 pub mod secrets;
+pub mod service_discovery;
 pub mod tls;
 
 pub use config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
@@ -28,4 +29,4 @@ pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;
 pub use plugin_cache::PluginCache;
 pub use proxy::build_backend_url;
-pub use router_cache::RouterCache;
+pub use router_cache::{RouteMatch, RouterCache};

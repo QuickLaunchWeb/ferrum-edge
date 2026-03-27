@@ -74,8 +74,16 @@ impl PluginHttpClient {
     /// - TCP keep-alive from PoolConfig (dead connection detection)
     /// - HTTP/2 keep-alive from PoolConfig (multiplexed stream health)
     /// - Gateway DNS cache (shared TTL, stale-while-revalidate, background refresh)
+    /// - Custom CA bundle from `FERRUM_TLS_CA_BUNDLE_PATH` (internal CAs)
+    /// - `FERRUM_TLS_NO_VERIFY` support (skip TLS verification)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
-    pub fn new(pool_config: &PoolConfig, dns_cache: DnsCache, slow_threshold_ms: u64) -> Self {
+    pub fn new(
+        pool_config: &PoolConfig,
+        dns_cache: DnsCache,
+        slow_threshold_ms: u64,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<&str>,
+    ) -> Self {
         let resolver = DnsCacheResolver::new(dns_cache);
 
         let mut builder = reqwest::Client::builder()
@@ -83,7 +91,25 @@ impl PluginHttpClient {
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
+            .danger_accept_invalid_certs(tls_no_verify)
             .dns_resolver(Arc::new(resolver));
+
+        // Load custom CA bundle for verifying internal/corporate CAs
+        if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
+            match std::fs::read(ca_path) {
+                Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
+                    Ok(cert) => {
+                        builder = builder.add_root_certificate(cert);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse CA bundle from {}: {}", ca_path, e);
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Failed to read CA bundle from {}: {}", ca_path, e);
+                }
+            }
+        }
 
         if pool_config.enable_http_keep_alive {
             builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));

@@ -6,7 +6,7 @@ fn test_admin_enhanced_tls() {
     println!("New Environment Variables:");
     println!("  - FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH: Admin client CA bundle for mTLS");
     println!("  - FERRUM_ADMIN_TLS_NO_VERIFY: Disable admin TLS verification (testing)");
-    println!("  - FERRUM_BACKEND_TLS_NO_VERIFY: Disable backend TLS verification (testing)");
+    println!("  - FERRUM_TLS_NO_VERIFY: Disable backend TLS verification (testing)");
     println!();
     println!("Enhanced Features:");
     println!("  - Admin API mTLS support with client certificate verification");
@@ -51,7 +51,7 @@ fn test_no_verify_scenarios() {
     println!();
     println!("Proxy Frontend No-Verify:");
     println!("  - FERRUM_PROXY_TLS_CERT_PATH and FERRUM_PROXY_TLS_KEY_PATH set");
-    println!("  - FERRUM_BACKEND_TLS_NO_VERIFY=true");
+    println!("  - FERRUM_TLS_NO_VERIFY=true");
     println!("  - Frontend TLS works but backend verification disabled");
     println!("  - Use case: Testing with self-signed backend certificates");
     println!();
@@ -90,11 +90,11 @@ fn test_env_var_combinations() {
     println!("  FERRUM_ADMIN_TLS_CERT_PATH=./dev/admin.crt");
     println!("  FERRUM_ADMIN_TLS_KEY_PATH=./dev/admin.key");
     println!("  FERRUM_ADMIN_TLS_NO_VERIFY=true");
-    println!("  FERRUM_BACKEND_TLS_NO_VERIFY=true");
+    println!("  FERRUM_TLS_NO_VERIFY=true");
     println!("  # Accepts self-signed certificates");
     println!();
     println!("Backend mTLS Setup:");
-    println!("  FERRUM_BACKEND_TLS_CA_BUNDLE_PATH=/etc/ssl/backend-ca.pem");
+    println!("  FERRUM_TLS_CA_BUNDLE_PATH=/etc/ssl/backend-ca.pem");
     println!("  FERRUM_BACKEND_TLS_CLIENT_CERT_PATH=/etc/ssl/client.crt");
     println!("  FERRUM_BACKEND_TLS_CLIENT_KEY_PATH=/etc/ssl/client.key");
     println!("  # Gateway authenticates to backends with mTLS");

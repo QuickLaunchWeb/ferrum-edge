@@ -245,6 +245,22 @@ impl HealthChecker {
         }
     }
 
+    /// Remove health state for targets no longer in the active target list.
+    ///
+    /// Called from the service discovery loop after `update_targets()` to
+    /// prevent unbounded growth of the `unhealthy_targets` and `target_states`
+    /// DashMaps when targets are dynamically removed. This runs in a
+    /// background task, NOT on the proxy hot path.
+    pub fn remove_stale_targets(&self, current_targets: &[UpstreamTarget]) {
+        let current_keys: std::collections::HashSet<String> =
+            current_targets.iter().map(target_key).collect();
+
+        self.unhealthy_targets
+            .retain(|key, _| current_keys.contains(key));
+        self.target_states
+            .retain(|key, _| current_keys.contains(key));
+    }
+
     /// Start a background timer that automatically restores passively-marked
     /// unhealthy targets after `healthy_after_seconds`.
     ///

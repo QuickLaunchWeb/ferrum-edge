@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat_hosts"
+        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat_hosts_service_discovery"
     }
 }
 
@@ -50,6 +50,7 @@ impl V001InitialSchema {
                 algorithm VARCHAR(50) NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
                 health_checks TEXT,
+                service_discovery TEXT,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL
             )
@@ -63,6 +64,7 @@ impl V001InitialSchema {
                 algorithm TEXT NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
                 health_checks TEXT,
+                service_discovery TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

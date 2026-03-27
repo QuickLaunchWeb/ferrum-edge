@@ -225,10 +225,113 @@ pub struct Upstream {
     pub hash_on: Option<String>,
     #[serde(default)]
     pub health_checks: Option<HealthCheckConfig>,
+    #[serde(default)]
+    pub service_discovery: Option<ServiceDiscoveryConfig>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+}
+
+/// Service discovery provider type.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SdProvider {
+    /// DNS-based service discovery using SRV records.
+    DnsSd,
+    /// Kubernetes EndpointSlice-based service discovery.
+    Kubernetes,
+    /// HashiCorp Consul service discovery via HTTP API.
+    Consul,
+}
+
+/// DNS-SD specific configuration (SRV record-based discovery).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSdConfig {
+    /// The DNS name to query for SRV records (e.g., "_http._tcp.my-service.example.com").
+    pub service_name: String,
+    /// Poll interval in seconds for re-querying DNS records. Default: 30.
+    #[serde(default = "default_sd_poll_interval")]
+    pub poll_interval_seconds: u64,
+}
+
+/// Kubernetes service discovery configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KubernetesConfig {
+    /// Kubernetes namespace. Default: "default".
+    #[serde(default = "default_k8s_namespace")]
+    pub namespace: String,
+    /// Service name in Kubernetes.
+    pub service_name: String,
+    /// Port name to select from EndpointSlice. If not set, uses the first port.
+    #[serde(default)]
+    pub port_name: Option<String>,
+    /// Label selector for filtering EndpointSlices.
+    #[serde(default)]
+    pub label_selector: Option<String>,
+    /// Poll interval in seconds. Default: 30.
+    #[serde(default = "default_sd_poll_interval")]
+    pub poll_interval_seconds: u64,
+}
+
+/// Consul service discovery configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsulConfig {
+    /// Consul HTTP API address (e.g., "http://consul:8500").
+    pub address: String,
+    /// Service name registered in Consul.
+    pub service_name: String,
+    /// Datacenter filter. If not set, uses the local datacenter.
+    #[serde(default)]
+    pub datacenter: Option<String>,
+    /// Service tag filter. If not set, no tag filtering.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Only return healthy services. Default: true.
+    #[serde(default = "default_sd_healthy_only")]
+    pub healthy_only: bool,
+    /// Consul ACL token for authentication.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Poll interval in seconds for blocking query long-poll. Default: 30.
+    #[serde(default = "default_sd_poll_interval")]
+    pub poll_interval_seconds: u64,
+}
+
+/// Service discovery configuration for an upstream.
+///
+/// Attaches a dynamic service discovery source to an upstream. Discovered
+/// targets are merged with any statically configured targets and fed into
+/// the load balancer. If the discovery source becomes unavailable, the
+/// gateway continues serving with the last-known targets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceDiscoveryConfig {
+    /// The service discovery provider to use.
+    pub provider: SdProvider,
+    /// DNS-SD provider configuration. Required when `provider` is `dns_sd`.
+    #[serde(default)]
+    pub dns_sd: Option<DnsSdConfig>,
+    /// Kubernetes provider configuration. Required when `provider` is `kubernetes`.
+    #[serde(default)]
+    pub kubernetes: Option<KubernetesConfig>,
+    /// Consul provider configuration. Required when `provider` is `consul`.
+    #[serde(default)]
+    pub consul: Option<ConsulConfig>,
+    /// Default weight assigned to discovered targets. Default: 1.
+    #[serde(default = "default_weight")]
+    pub default_weight: u32,
+}
+
+fn default_sd_poll_interval() -> u64 {
+    30
+}
+
+fn default_k8s_namespace() -> String {
+    "default".to_string()
+}
+
+fn default_sd_healthy_only() -> bool {
+    true
 }
 
 /// Circuit breaker configuration for a proxy.
@@ -636,6 +739,44 @@ impl GatewayConfig {
             for host in &proxy.hosts {
                 if let Err(msg) = validate_host_entry(host) {
                     errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate that regex listen_paths compile correctly.
+    ///
+    /// Listen paths starting with `~` are treated as regex patterns. The `~`
+    /// prefix is stripped and the remainder is compiled as a regex (auto-anchored
+    /// with `^` if not already). Compilation errors are reported here at config
+    /// load time rather than silently skipping routes at runtime.
+    pub fn validate_regex_listen_paths(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            if proxy.listen_path.starts_with('~') {
+                let pattern = &proxy.listen_path[1..];
+                if pattern.is_empty() {
+                    errors.push(format!(
+                        "Proxy '{}': regex listen_path '~' has empty pattern",
+                        proxy.id
+                    ));
+                    continue;
+                }
+                let anchored = if pattern.starts_with('^') {
+                    pattern.to_string()
+                } else {
+                    format!("^{}", pattern)
+                };
+                if let Err(e) = Regex::new(&anchored) {
+                    errors.push(format!(
+                        "Proxy '{}': invalid regex listen_path '{}': {}",
+                        proxy.id, proxy.listen_path, e
+                    ));
                 }
             }
         }

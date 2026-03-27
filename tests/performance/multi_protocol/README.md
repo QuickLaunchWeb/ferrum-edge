@@ -93,7 +93,7 @@ Key environment variables set by the test runner:
 |----------|-------|---------|
 | `FERRUM_MODE` | `file` | File-based config |
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | `200` | Prevent connection churn |
-| `FERRUM_BACKEND_TLS_NO_VERIFY` | `true` | Accept self-signed certs |
+| `FERRUM_TLS_NO_VERIFY` | `true` | Accept self-signed certs |
 | `FERRUM_ENABLE_HTTP3` | `true` | Enable QUIC listener (HTTP/3 test) |
 | `FERRUM_PROXY_TLS_CERT_PATH` | `certs/cert.pem` | Gateway TLS cert |
 | `FERRUM_DTLS_CERT_PATH` | `certs/cert.pem` | Gateway DTLS cert |

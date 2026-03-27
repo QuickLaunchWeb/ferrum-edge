@@ -25,8 +25,8 @@ Backend WebSocket connections use `tokio_tungstenite::connect_async_tls_with_con
 
 - **TLS library**: rustls (not native-tls/OpenSSL)
 - **Root CA store**: `webpki-roots` (Mozilla's root certificates compiled into the binary), plus any custom CA bundles
-- **Server certificate verification**: Controlled by proxy-level `backend_tls_verify_server_cert` (default: `true`) and global `FERRUM_BACKEND_TLS_NO_VERIFY`
-- **Custom CA bundles**: Proxy-level `backend_tls_server_ca_cert_path` takes priority; falls back to global `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH`
+- **Server certificate verification**: Controlled by proxy-level `backend_tls_verify_server_cert` (default: `true`) and global `FERRUM_TLS_NO_VERIFY`
+- **Custom CA bundles**: Proxy-level `backend_tls_server_ca_cert_path` takes priority; falls back to global `FERRUM_TLS_CA_BUNDLE_PATH`
 - **Client certificates (mTLS)**: Proxy-level `backend_tls_client_cert_path`/`backend_tls_client_key_path` take priority; falls back to global `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`/`FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`
 
 This matches the same TLS configuration hierarchy used by HTTP/HTTPS backends in `connection_pool.rs`.

@@ -115,7 +115,7 @@ start_gateway() {
         FERRUM_POOL_MAX_IDLE_PER_HOST=200
         FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
         FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
-        FERRUM_BACKEND_TLS_NO_VERIFY=true
+        FERRUM_TLS_NO_VERIFY=true
     )
     if [ -f "$cert_dir/cert.pem" ]; then
         env_cmd+=(

@@ -171,6 +171,7 @@ fn test_load_balancer_cache() {
             algorithm: LoadBalancerAlgorithm::RoundRobin,
             hash_on: None,
             health_checks: None,
+            service_discovery: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }],

@@ -129,6 +129,36 @@ impl LoadBalancerCache {
         idx.get(upstream_id).cloned()
     }
 
+    /// Update the targets for a single upstream (used by service discovery).
+    ///
+    /// Creates a new `LoadBalancer` instance with the provided targets and
+    /// swaps it in atomically. Other upstreams keep their existing instances
+    /// with preserved round-robin counters and connection counts.
+    pub fn update_targets(
+        &self,
+        upstream_id: &str,
+        new_targets: Vec<UpstreamTarget>,
+        algorithm: LoadBalancerAlgorithm,
+        hash_on: Option<String>,
+    ) {
+        // Update the balancer
+        let mut new_balancers = self.balancers.load().as_ref().clone();
+        new_balancers.insert(
+            upstream_id.to_string(),
+            Arc::new(LoadBalancer::new(algorithm, &new_targets, hash_on)),
+        );
+        self.balancers.store(Arc::new(new_balancers));
+
+        // Update the upstream index
+        let mut new_upstreams = self.upstreams.load().as_ref().clone();
+        if let Some(existing) = new_upstreams.get(upstream_id) {
+            let mut updated = (**existing).clone();
+            updated.targets = new_targets;
+            new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
+        }
+        self.upstreams.store(Arc::new(new_upstreams));
+    }
+
     /// Select a target from the upstream, filtering out unhealthy targets.
     ///
     /// Returns a [`TargetSelection`] indicating whether the target came from

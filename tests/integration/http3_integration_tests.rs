@@ -142,12 +142,12 @@ fn create_http3_test_env_config() -> EnvConfig {
         dns_valid_ttl: None,
         dns_stale_ttl: 3600,
         dns_error_ttl: 1,
-        backend_tls_ca_bundle_path: None,
+        tls_ca_bundle_path: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         frontend_tls_client_ca_bundle_path: None,
         admin_tls_client_ca_bundle_path: None,
-        backend_tls_no_verify: false,
+        tls_no_verify: false,
         admin_read_only: false,
         admin_tls_no_verify: false,
         // HTTP/3 specific configuration (shares proxy_https_port for QUIC listener)
@@ -342,6 +342,7 @@ async fn test_http3_proxy_state_creation() {
             false,
         ),
     );
+    let dns_cache_for_sd = dns_cache.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
         dns_cache,
@@ -353,9 +354,20 @@ async fn test_http3_proxy_state_creation() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
-        load_balancer_cache: lb_cache,
+        load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
+        service_discovery_manager: {
+            let hc = Arc::new(ferrum_gateway::health_check::HealthChecker::new());
+            Arc::new(
+                ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
+                    lb_cache,
+                    dns_cache_for_sd,
+                    hc,
+                    ferrum_gateway::plugins::PluginHttpClient::default(),
+                ),
+            )
+        },
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
@@ -490,6 +502,7 @@ async fn test_http3_full_integration() {
             false,
         ),
     );
+    let dns_cache_for_sd = dns_cache.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
         dns_cache,
@@ -501,9 +514,20 @@ async fn test_http3_full_integration() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
-        load_balancer_cache: lb_cache,
+        load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
+        service_discovery_manager: {
+            let hc = Arc::new(ferrum_gateway::health_check::HealthChecker::new());
+            Arc::new(
+                ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
+                    lb_cache,
+                    dns_cache_for_sd,
+                    hc,
+                    ferrum_gateway::plugins::PluginHttpClient::default(),
+                ),
+            )
+        },
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,

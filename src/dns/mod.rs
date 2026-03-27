@@ -456,6 +456,31 @@ impl DnsCache {
             .unwrap_or(false)
     }
 
+    /// Resolve a DNS SRV record to a list of (hostname, port, weight) tuples.
+    ///
+    /// Used by DNS-SD service discovery. Does not use the cache — callers
+    /// manage their own polling intervals. Reuses the configured resolver
+    /// so custom nameservers from `FERRUM_DNS_RESOLVER_ADDRESS` are respected.
+    pub async fn resolve_srv(
+        &self,
+        service_name: &str,
+    ) -> Result<Vec<(String, u16, u16)>, anyhow::Error> {
+        let srv_lookup = self
+            .resolver
+            .srv_lookup(service_name)
+            .await
+            .map_err(|e| anyhow::anyhow!("SRV lookup failed for {}: {}", service_name, e))?;
+
+        let mut results = Vec::new();
+        for record in srv_lookup.iter() {
+            let target = record.target().to_string();
+            let target = target.trim_end_matches('.').to_string();
+            results.push((target, record.port(), record.priority()));
+        }
+
+        Ok(results)
+    }
+
     /// Evict expired entries and enforce max cache size.
     /// Removes entries past their stale deadline first, then evicts oldest
     /// entries (by expiration time) if still over capacity.

@@ -351,13 +351,13 @@ fn test_env_config_tls_flags() {
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
-            ("FERRUM_BACKEND_TLS_NO_VERIFY", "true"),
+            ("FERRUM_TLS_NO_VERIFY", "true"),
             ("FERRUM_ADMIN_TLS_NO_VERIFY", "true"),
             ("FERRUM_ADMIN_READ_ONLY", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert!(config.backend_tls_no_verify);
+            assert!(config.tls_no_verify);
             assert!(config.admin_tls_no_verify);
             assert!(config.admin_read_only);
         },
@@ -372,12 +372,12 @@ fn test_env_config_tls_flags_default_false() {
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
         ],
         || {
-            remove_var("FERRUM_BACKEND_TLS_NO_VERIFY");
+            remove_var("FERRUM_TLS_NO_VERIFY");
             remove_var("FERRUM_ADMIN_TLS_NO_VERIFY");
             remove_var("FERRUM_ADMIN_READ_ONLY");
 
             let config = EnvConfig::from_env().unwrap();
-            assert!(!config.backend_tls_no_verify);
+            assert!(!config.tls_no_verify);
             assert!(!config.admin_tls_no_verify);
             assert!(!config.admin_read_only);
         },

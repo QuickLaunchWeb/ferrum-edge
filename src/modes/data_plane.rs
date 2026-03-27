@@ -34,6 +34,10 @@ pub async fn run(
     // Start with empty config; CP will push the real one via gRPC
     let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone())?;
 
+    // Start service discovery background tasks (initially no-op with empty config;
+    // tasks are reconciled when CP pushes config via update_config)
+    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
+
     // Spawn the DP gRPC client to connect to CP and receive config updates
     let cp_url = env_config
         .dp_cp_grpc_url
@@ -69,7 +73,7 @@ pub async fn run(
             cert_path,
             key_path,
             client_ca_bundle_path,
-            env_config.backend_tls_no_verify,
+            env_config.tls_no_verify,
             &tls_policy,
         ) {
             Ok(config) => {

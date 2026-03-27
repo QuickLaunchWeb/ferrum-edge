@@ -136,7 +136,7 @@ fn start_gateway(
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_BACKEND_TLS_NO_VERIFY", "true")
+        .env("FERRUM_TLS_NO_VERIFY", "true")
         .env("RUST_LOG", "ferrum_gateway=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

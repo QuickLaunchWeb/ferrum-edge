@@ -14,7 +14,7 @@ Set these environment variables to configure client certificates and CA verifica
 
 ```bash
 # Path to CA bundle for backend TLS verification (overrides system trust store)
-export FERRUM_BACKEND_TLS_CA_BUNDLE_PATH="/path/to/ca-bundle.pem"
+export FERRUM_TLS_CA_BUNDLE_PATH="/path/to/ca-bundle.pem"
 
 # Path to client certificate file (PEM format)
 export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/client-cert.pem"
@@ -23,12 +23,12 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/client-cert.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/client-key.pem"
 
 # Disable backend TLS certificate verification (testing only)
-export FERRUM_BACKEND_TLS_NO_VERIFY="true"
+export FERRUM_TLS_NO_VERIFY="true"
 ```
 
 ### Custom CA Bundles
 
-The `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authority (CA) bundles for backend TLS verification. This is useful for:
+The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authority (CA) bundles for backend TLS verification. This is useful for:
 
 - **Enterprise Environments**: When backend services use certificates from private CAs
 - **Development**: Using self-signed certificates in testing environments  
@@ -218,7 +218,7 @@ The mTLS implementation uses:
 For development and testing environments where certificate verification is not practical, you can disable backend TLS verification:
 
 ```bash
-export FERRUM_BACKEND_TLS_NO_VERIFY="true"
+export FERRUM_TLS_NO_VERIFY="true"
 ```
 
 **⚠️ Security Warning**: No-verify mode disables ALL certificate verification and should NEVER be used in production environments.

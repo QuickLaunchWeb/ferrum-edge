@@ -34,6 +34,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Health Checking**: Active probes (HTTP, TCP SYN, UDP) and passive status monitoring with configurable thresholds
 - **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
 - **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
+- **Service Discovery**: Dynamic upstream target resolution via DNS-SD, Kubernetes, and Consul providers with background polling and static+dynamic target merging
 - **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
 
 ## Operating Modes
@@ -311,6 +312,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (values override env vars). See [Configuration File](#configuration-file-ferrumconf). |
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
@@ -356,7 +358,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
 | `FERRUM_DNS_ERROR_TTL` | No | `1` | TTL (seconds) for errors/empty responses |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
-| `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH` | No | — | Path to CA bundle for backend TLS verification |
+| `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification (proxy, service discovery, plugins) |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
 | `FERRUM_PROXY_TLS_CERT_PATH` | No | — | Path to server TLS certificate for HTTPS |
@@ -366,7 +368,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_TLS_KEY_PATH` | No | — | Path to admin TLS private key for HTTPS |
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
-| `FERRUM_BACKEND_TLS_NO_VERIFY` | No | `false` | Disable backend TLS certificate verification (testing only) |
+| `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version (`1.2` or `1.3`) |
 | `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version (`1.2` or `1.3`) |
 | `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites (see [TLS Policy Hardening](docs/frontend_tls.md#tls-policy-hardening)) |
@@ -386,6 +388,43 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls (http_logging, oauth2, JWKS, OTLP) |
 
 See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
+
+### Configuration File (`ferrum.conf`)
+
+As an alternative to environment variables, the gateway supports a `ferrum.conf` configuration file. Values set in the conf file **take precedence** over environment variables, providing a single-file approach for operators who prefer file-based configuration over environment variables.
+
+**File location:**
+- Default: `./ferrum.conf` (current working directory)
+- Override with the `FERRUM_CONF_PATH` environment variable (the only setting that must remain an env var)
+- If the file does not exist at the default path, it is silently skipped
+
+**Format:** Simple key-value pairs using the same `FERRUM_*` names as environment variables:
+
+```conf
+# Operating mode
+FERRUM_MODE = file
+FERRUM_FILE_CONFIG_PATH = /etc/ferrum/config.yaml
+FERRUM_LOG_LEVEL = info
+
+# Proxy ports
+FERRUM_PROXY_HTTP_PORT = 8080
+FERRUM_PROXY_HTTPS_PORT = 8443
+
+# TLS hardening
+FERRUM_TLS_MIN_VERSION = 1.3
+
+# Quoted values for paths with spaces
+FERRUM_PROXY_TLS_CERT_PATH = "/path/with spaces/cert.pem"
+```
+
+- Lines starting with `#` are comments
+- Inline comments are supported: `KEY = value # comment`
+- Values can be quoted with double or single quotes (quotes are stripped)
+- Empty lines are ignored
+
+A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
+
+**Precedence order:** `ferrum.conf` > environment variables > built-in defaults
 
 ### Configuration File Format (File Mode)
 
@@ -465,6 +504,59 @@ proxies:
 ```
 
 See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for full documentation.
+
+#### Service Discovery
+
+Upstreams can discover targets dynamically using a `service_discovery` block. Three providers are supported:
+
+**DNS-SD** (DNS Service Discovery):
+```yaml
+upstreams:
+  - id: "my-upstream"
+    targets: []
+    algorithm: round_robin
+    service_discovery:
+      provider: dns_sd
+      dns_sd:
+        service_name: "_http._tcp.my-service.local"
+        poll_interval_seconds: 30
+```
+
+**Kubernetes**:
+```yaml
+upstreams:
+  - id: "k8s-upstream"
+    targets: []
+    algorithm: least_connections
+    service_discovery:
+      provider: kubernetes
+      kubernetes:
+        namespace: "default"
+        service_name: "my-service"
+        port_name: "http"
+        poll_interval_seconds: 15
+```
+
+**Consul**:
+```yaml
+upstreams:
+  - id: "consul-upstream"
+    targets:
+      - host: "fallback.example.com"
+        port: 8080
+        weight: 1
+    algorithm: round_robin
+    service_discovery:
+      provider: consul
+      consul:
+        address: "http://consul.internal:8500"
+        service_name: "my-service"
+        datacenter: "dc1"
+        poll_interval_seconds: 10
+        token: "consul-acl-token"
+```
+
+Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
 
 ## Connection Pooling
 
@@ -1073,21 +1165,30 @@ See [docs/cors_plugin.md](docs/cors_plugin.md) for detailed configuration, reque
 
 #### `request_transformer`
 
-Modifies request headers and query parameters before proxying.
+Modifies request headers, query parameters, and JSON body fields before proxying.
 
 **Config**:
 ```yaml
 config:
   rules:
-    - operation: add     # add, remove, update
-      target: header     # header, query
+    - operation: add       # add, remove, update, rename
+      target: header       # header, query, body
       key: "X-Custom"
       value: "my-value"
+    - operation: rename
+      target: body
+      key: "user.old_field"       # dot-notation for nested JSON
+      new_key: "user.new_field"
+    - operation: remove
+      target: body
+      key: "internal.debug_info"
 ```
+
+Body rules use dot-notation paths (e.g., `user.address.city`) to navigate nested JSON objects. The `add` operation creates intermediate objects as needed. Values are auto-parsed as JSON when possible (`"42"` → number, `"true"` → boolean). Body transformation only applies to `application/json` (or `+json`) content types.
 
 #### `response_transformer`
 
-Modifies response headers before sending to the client.
+Modifies response headers and JSON body fields before sending to the client. When body rules are configured, response body buffering is automatically enabled.
 
 **Config**:
 ```yaml
@@ -1096,7 +1197,16 @@ config:
     - operation: add
       key: "X-Powered-By"
       value: "Ferrum-Gateway"
+    - operation: rename
+      target: body
+      key: "resp_data"
+      new_key: "data"
+    - operation: remove
+      target: body
+      key: "internal_trace_id"
 ```
+
+Header rules default to `target: header` for backwards compatibility (no `target` field required). Body rules require explicit `target: body` and support the same dot-notation paths as `request_transformer`.
 
 #### `rate_limiting`
 
@@ -1163,16 +1273,25 @@ Detects and blocks bot traffic based on User-Agent patterns. By default, missing
 
 #### `body_validator`
 
-Validates JSON and XML request bodies against schemas. Supports comprehensive JSON Schema validation including type checking, string/numeric constraints, array/object validation, composition operators, and format validation.
+Validates JSON and XML request and response bodies against schemas. Supports comprehensive JSON Schema validation including type checking, string/numeric constraints, array/object validation, composition operators, and format validation. Request validation rejects with 400; response validation rejects with 502 and automatically enables response body buffering.
 
-**Config**:
+**Request validation config**:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `json_schema` | Object | — | JSON Schema for validation (supports `type`, `required`, `properties`, `additionalProperties`, `minLength`/`maxLength`, `pattern`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`, `enum`, `const`, `items`, `minItems`/`maxItems`, `uniqueItems`, `allOf`/`anyOf`/`oneOf`/`not`, `format`) |
+| `json_schema` | Object | — | JSON Schema for request body validation (supports `type`, `required`, `properties`, `additionalProperties`, `minLength`/`maxLength`, `pattern`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`, `enum`, `const`, `items`, `minItems`/`maxItems`, `uniqueItems`, `allOf`/`anyOf`/`oneOf`/`not`, `format`) |
 | `required_fields` | String[] | `[]` | Simple required field names (alternative to JSON Schema `required`) |
 | `validate_xml` | bool | `false` | Enable XML well-formedness validation |
 | `required_xml_elements` | String[] | `[]` | Required XML element names |
 | `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
+
+**Response validation config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `response_json_schema` | Object | — | JSON Schema for response body validation (same schema support as request) |
+| `response_required_fields` | String[] | `[]` | Required field names in response JSON body |
+| `response_validate_xml` | bool | `false` | Enable XML well-formedness validation for responses |
+| `response_required_xml_elements` | String[] | `[]` | Required XML element names in responses |
+| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
 
 **Supported `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 

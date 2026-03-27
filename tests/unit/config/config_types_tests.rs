@@ -75,6 +75,7 @@ fn make_upstream(id: &str) -> Upstream {
         algorithm: Default::default(),
         hash_on: None,
         health_checks: None,
+        service_discovery: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
