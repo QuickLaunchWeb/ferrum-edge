@@ -329,9 +329,7 @@ async fn handle_h3_request(
     };
 
     // Route: host + longest prefix match via router cache
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host, &path);
+    let route_match = state.router_cache.find_proxy(request_host, &path);
 
     let proxy = match route_match {
         Some(rm) => {

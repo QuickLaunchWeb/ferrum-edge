@@ -1731,9 +1731,7 @@ pub async fn handle_proxy_request(
     };
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host, &path);
+    let route_match = state.router_cache.find_proxy(request_host, &path);
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
