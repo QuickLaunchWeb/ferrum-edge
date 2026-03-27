@@ -7,6 +7,7 @@ mod body_validator_tests;
 mod bot_detection_tests;
 mod correlation_id_tests;
 mod cors_tests;
+mod graphql_tests;
 mod hmac_auth_tests;
 mod http_logging_tests;
 mod ip_restriction_tests;

@@ -690,6 +690,7 @@ paths:
                 - correlation_id
                 - request_transformer
                 - response_transformer
+                - graphql
                 - rate_limiting
                 - body_validator
                 - request_termination

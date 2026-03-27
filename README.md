@@ -978,6 +978,7 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 | 100 | Early | `cors`, `ip_restriction`, `bot_detection` |
 | 1000-1400 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
 | 2000 | Authorization | `access_control` |
+| 2850 | Authorization | `graphql` (depth, complexity, per-operation rate limiting) |
 | 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
 | 3000 | Transform | `request_transformer`, `body_validator`, `request_termination` |
 | 4000 | Response | `response_transformer` |
@@ -1294,6 +1295,48 @@ Validates JSON and XML request and response bodies against schemas. Supports com
 | `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
 
 **Supported `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
+
+#### `graphql`
+
+Adds GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting. Parses GraphQL queries from POST request bodies (`application/json` with a `query` field) and enforces configurable protections.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
+| `max_complexity` | u32 (optional) | — | Maximum allowed field count (complexity proxy) |
+| `max_aliases` | u32 (optional) | — | Maximum allowed alias count (prevents alias-based DoS) |
+| `introspection_allowed` | bool | `true` | Whether `__schema`/`__type` introspection queries are permitted |
+| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
+| `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
+| `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
+
+Each rate limit entry is an object with `max_requests` (u64) and `window_seconds` (u64).
+
+**Metadata**: The plugin populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity` for downstream plugins and logging.
+
+**Rejection format**: All rejections use GraphQL-standard `{"errors":[{"message":"..."}]}` format with `content-type: application/json`.
+
+```yaml
+plugin_name: graphql
+config:
+  max_depth: 10
+  max_complexity: 100
+  max_aliases: 10
+  introspection_allowed: false
+  limit_by: ip
+  type_rate_limits:
+    mutation:
+      max_requests: 20
+      window_seconds: 60
+  operation_rate_limits:
+    GetUser:
+      max_requests: 50
+      window_seconds: 60
+    CreateOrder:
+      max_requests: 5
+      window_seconds: 60
+```
 
 #### `request_termination`
 
