@@ -229,6 +229,7 @@ async fn run_tcp_echo(addr: SocketAddr) -> anyhow::Result<()> {
         .context("binding tcp echo listener")?;
     loop {
         let (mut stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let (mut rd, mut wr) = stream.split();
             let _ = tokio::io::copy(&mut rd, &mut wr).await;
@@ -285,28 +286,30 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
             };
 
             while let Ok(Some(resolver)) = conn.accept().await {
-                let Ok((req, mut stream)) = resolver.resolve_request().await else {
-                    continue;
-                };
-                let (status, body) = match req.uri().path() {
-                    "/health" => (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8]),
-                    "/api/users" => (
-                        StatusCode::OK,
-                        b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}"
-                            as &[u8],
-                    ),
-                    _ => (StatusCode::NOT_FOUND, b"not found" as &[u8]),
-                };
+                tokio::spawn(async move {
+                    let Ok((req, mut stream)) = resolver.resolve_request().await else {
+                        return;
+                    };
+                    let (status, body) = match req.uri().path() {
+                        "/health" => (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8]),
+                        "/api/users" => (
+                            StatusCode::OK,
+                            b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}"
+                                as &[u8],
+                        ),
+                        _ => (StatusCode::NOT_FOUND, b"not found" as &[u8]),
+                    };
 
-                let resp = http::Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(())
-                    .unwrap();
+                    let resp = http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(())
+                        .unwrap();
 
-                let _ = stream.send_response(resp).await;
-                let _ = stream.send_data(bytes::Bytes::copy_from_slice(body)).await;
-                let _ = stream.finish().await;
+                    let _ = stream.send_response(resp).await;
+                    let _ = stream.send_data(bytes::Bytes::copy_from_slice(body)).await;
+                    let _ = stream.finish().await;
+                });
             }
         });
     }
@@ -322,6 +325,9 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
     // from_pem expects key PEM before cert PEM
     let cert_pem = std::fs::read_to_string(cert_path).context("reading DTLS cert")?;
     let key_pem = std::fs::read_to_string(key_path).context("reading DTLS key")?;
+    let key_pem = key_pem
+        .replace("BEGIN PRIVATE KEY", "BEGIN PRIVATE_KEY")
+        .replace("END PRIVATE KEY", "END PRIVATE_KEY");
     let combined_pem = format!("{key_pem}\n{cert_pem}");
     let cert = DtlsCert::from_pem(&combined_pem)
         .map_err(|e| anyhow::anyhow!("loading DTLS certificate: {e}"))?;

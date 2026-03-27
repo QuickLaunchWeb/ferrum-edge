@@ -105,23 +105,16 @@ pub fn make_h3_server_config(
         .context("h3 server TLS config")?;
 
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-
-    // Apply optimized QUIC transport settings for the backend server
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.stream_receive_window(
-        quinn::VarInt::from_u64(8_388_608).unwrap_or(quinn::VarInt::from_u32(8_388_608)),
-    ); // 8 MiB
-    transport_config.receive_window(
-        quinn::VarInt::from_u64(33_554_432).unwrap_or(quinn::VarInt::from_u32(33_554_432)),
-    ); // 32 MiB
-    transport_config.send_window(8_388_608); // 8 MiB
-    transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1000));
-
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
             .context("quinn crypto config")?,
     ));
-    server_cfg.transport_config(Arc::new(transport_config));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
+    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    transport.send_window(16 * 1024 * 1024);
+    server_cfg.transport_config(Arc::new(transport));
     Ok(server_cfg)
 }
 
@@ -140,20 +133,14 @@ pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
 
     let quic_cfg =
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic client config");
-
-    // Optimized QUIC transport settings — match the gateway's tuned defaults
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.stream_receive_window(
-        quinn::VarInt::from_u64(8_388_608).unwrap_or(quinn::VarInt::from_u32(8_388_608)),
-    ); // 8 MiB
-    transport_config.receive_window(
-        quinn::VarInt::from_u64(33_554_432).unwrap_or(quinn::VarInt::from_u32(33_554_432)),
-    ); // 32 MiB
-    transport_config.send_window(8_388_608); // 8 MiB
-
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_cfg));
-    client_config.transport_config(Arc::new(transport_config));
-    client_config
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
+    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    transport.send_window(16 * 1024 * 1024);
+    client_cfg.transport_config(Arc::new(transport));
+    client_cfg
 }
 
 // ── NoCertVerifier ───────────────────────────────────────────────────────────

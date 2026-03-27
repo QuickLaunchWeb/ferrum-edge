@@ -26,7 +26,7 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
@@ -61,18 +61,14 @@ fn now_epoch_ms() -> u64 {
 /// - Global mTLS and CA bundle settings from `EnvConfig`
 /// - Background idle connection cleanup
 pub struct GrpcConnectionPool {
-    /// Cached sender handles keyed by `host:port:tls:index`
+    /// Cached sender handles keyed by `host:port:tls#shard`
     entries: Arc<DashMap<String, GrpcPoolEntry>>,
+    /// Round-robin counters keyed by the base backend host:port:tls tuple.
+    rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
     /// Global pool configuration (idle timeout, keepalive, etc.)
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
-    /// Round-robin counter for distributing streams across backend connections.
-    conn_counter: AtomicU64,
-    /// Number of connections to maintain per backend. Multiple connections
-    /// distribute HTTP/2 frame processing across tokio tasks, reducing
-    /// contention at high concurrency.
-    connections_per_backend: usize,
 }
 
 impl Default for GrpcConnectionPool {
@@ -88,10 +84,9 @@ impl GrpcConnectionPool {
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
+            rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
-            conn_counter: AtomicU64::new(0),
-            connections_per_backend: 4,
         };
 
         pool.start_cleanup_task();
@@ -101,49 +96,85 @@ impl GrpcConnectionPool {
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
-    fn pool_key(proxy: &Proxy, index: usize) -> String {
+    fn pool_key(proxy: &Proxy) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
-        format!(
-            "{}:{}:{}:{}",
-            proxy.backend_host, proxy.backend_port, tls, index
-        )
+        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)
+    }
+
+    fn shard_key(base_key: &str, shard: usize) -> String {
+        format!("{base_key}#{shard}")
     }
 
     /// Get or create an HTTP/2 connection to the gRPC backend.
-    ///
-    /// Uses round-robin across `connections_per_backend` connections to
-    /// distribute HTTP/2 frame processing across multiple tokio tasks.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Incoming>, GrpcProxyError> {
-        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize
-            % self.connections_per_backend;
-        let key = Self::pool_key(proxy, index);
+        let base_key = Self::pool_key(proxy);
+        let pool_config = self.global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
+        let rr = self
+            .rr_counters
+            .entry(base_key.clone())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+        let selected_key = Self::shard_key(&base_key, start);
 
-        // Try to reuse existing connection
-        if let Some(entry) = self.entries.get(&key) {
+        if let Some(entry) = self.entries.get(&selected_key) {
             if !entry.sender.is_closed() {
                 entry
                     .last_used_epoch_ms
                     .store(now_epoch_ms(), Ordering::Relaxed);
                 return Ok(entry.sender.clone());
             }
-            // Connection is closed, remove it
             drop(entry);
-            self.entries.remove(&key);
+            self.entries.remove(&selected_key);
         }
 
-        // Create a new connection
-        let sender = self.create_connection(proxy, dns_cache).await?;
-        self.entries.insert(
-            key,
-            GrpcPoolEntry {
-                sender: sender.clone(),
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
+        // Fill the selected shard eagerly so round-robin distribution actually
+        // materializes multiple backend connections under load.
+        let sender = match self.create_connection(proxy, dns_cache).await {
+            Ok(sender) => sender,
+            Err(err) => {
+                for offset in 1..shard_count {
+                    let shard = (start + offset) % shard_count;
+                    let key = Self::shard_key(&base_key, shard);
+                    if let Some(entry) = self.entries.get(&key) {
+                        if !entry.sender.is_closed() {
+                            entry
+                                .last_used_epoch_ms
+                                .store(now_epoch_ms(), Ordering::Relaxed);
+                            return Ok(entry.sender.clone());
+                        }
+                        drop(entry);
+                        self.entries.remove(&key);
+                    }
+                }
+                return Err(err);
+            }
+        };
+        let sender = match self.entries.entry(selected_key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if occupied.get().sender.is_closed() {
+                    occupied.insert(GrpcPoolEntry {
+                        sender: sender.clone(),
+                        last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+                    });
+                    sender
+                } else {
+                    occupied.get().sender.clone()
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(GrpcPoolEntry {
+                    sender: sender.clone(),
+                    last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+                });
+                sender
+            }
+        };
         Ok(sender)
     }
 
@@ -222,7 +253,8 @@ impl GrpcConnectionPool {
                 ))
                 .keep_alive_timeout(Duration::from_secs(
                     pool_config.http2_keep_alive_timeout_seconds,
-                ));
+                ))
+                .max_concurrent_reset_streams(4096);
         }
 
         // Flow-control tuning — larger windows dramatically improve throughput
@@ -501,7 +533,6 @@ pub async fn proxy_grpc_request(
 ) -> Result<GrpcResponse, GrpcProxyError> {
     // Get or create HTTP/2 connection to backend (round-robins across pool)
     let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
-
     // Parse the backend URL to extract path and authority
     let uri: hyper::Uri = backend_url
         .parse()
