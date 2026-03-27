@@ -40,7 +40,7 @@ pub struct ServiceDiscoveryManager {
     health_checker: Arc<HealthChecker>,
     /// Shared HTTP client for Kubernetes and Consul discovery calls.
     /// Inherits the gateway's pool config, DNS cache, trust store, and
-    /// `FERRUM_BACKEND_TLS_NO_VERIFY` setting.
+    /// `FERRUM_TLS_NO_VERIFY` setting.
     http_client: PluginHttpClient,
 }
 

@@ -152,7 +152,8 @@ impl ProxyState {
             &global_pool_config,
             dns_cache.clone(),
             env_config_arc.plugin_http_slow_threshold_ms,
-            env_config_arc.backend_tls_no_verify,
+            env_config_arc.tls_no_verify,
+            env_config_arc.tls_ca_bundle_path.as_deref(),
         );
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client.clone())
@@ -192,7 +193,7 @@ impl ProxyState {
             dns_cache.clone(),
             load_balancer_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
-            env_config_arc.backend_tls_no_verify,
+            env_config_arc.tls_no_verify,
         ));
 
         // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
@@ -1090,7 +1091,7 @@ fn build_websocket_tls_connector(
     }
 
     // Determine if we should skip server cert verification
-    let skip_verify = env_config.backend_tls_no_verify || !proxy.backend_tls_verify_server_cert;
+    let skip_verify = env_config.tls_no_verify || !proxy.backend_tls_verify_server_cert;
 
     // Build root certificate store
     let mut root_store =
@@ -1100,7 +1101,7 @@ fn build_websocket_tls_connector(
     let ca_path = proxy
         .backend_tls_server_ca_cert_path
         .as_ref()
-        .or(env_config.backend_tls_ca_bundle_path.as_ref());
+        .or(env_config.tls_ca_bundle_path.as_ref());
     if let Some(ca_path) = ca_path {
         match std::fs::read(ca_path) {
             Ok(ca_pem) => {
@@ -2859,7 +2860,7 @@ async fn proxy_to_backend(
                     proxy.backend_read_timeout_ms,
                 ))
                 .danger_accept_invalid_certs(
-                    !proxy.backend_tls_verify_server_cert || state.env_config.backend_tls_no_verify,
+                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())

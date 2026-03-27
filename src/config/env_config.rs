@@ -121,8 +121,9 @@ pub struct EnvConfig {
     /// Threshold in milliseconds above which DNS resolutions are logged as slow. Default: disabled
     pub dns_slow_threshold_ms: Option<u64>,
 
-    /// Path to a PEM file containing trusted CA certificates for backend TLS verification
-    pub backend_tls_ca_bundle_path: Option<String>,
+    /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
+    /// Used by backend proxy connections, service discovery, and plugin HTTP calls.
+    pub tls_ca_bundle_path: Option<String>,
     /// Path to a PEM file containing the client certificate for backend TLS verification
     pub backend_tls_client_cert_path: Option<String>,
     /// Path to a PEM file containing the client key for backend TLS verification
@@ -132,8 +133,9 @@ pub struct EnvConfig {
 
     /// Admin API TLS client CA bundle for mTLS verification
     pub admin_tls_client_ca_bundle_path: Option<String>,
-    /// Disable backend TLS certificate verification (for testing only)
-    pub backend_tls_no_verify: bool,
+    /// Disable outbound TLS certificate verification for all outbound connections
+    /// (backend proxy, service discovery, plugin HTTP calls). For testing only.
+    pub tls_no_verify: bool,
     /// Admin API read-only mode (default: false, always true in DP mode)
     pub admin_read_only: bool,
     /// Disable admin TLS certificate verification (for testing only)
@@ -247,12 +249,12 @@ impl Default for EnvConfig {
             dns_error_ttl: 1,
             dns_cache_max_size: 10_000,
             dns_slow_threshold_ms: None,
-            backend_tls_ca_bundle_path: None,
+            tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
             frontend_tls_client_ca_bundle_path: None,
             admin_tls_client_ca_bundle_path: None,
-            backend_tls_no_verify: false,
+            tls_no_verify: false,
             admin_read_only: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
@@ -352,8 +354,10 @@ impl EnvConfig {
                 .ok()
                 .and_then(|v| v.parse().ok()),
 
-            // Global Backend mTLS
-            backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),
+            // Global TLS trust store and mTLS
+            tls_ca_bundle_path: env::var("FERRUM_TLS_CA_BUNDLE_PATH")
+                .or_else(|_| env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH"))
+                .ok(),
             backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
             backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
 
@@ -366,7 +370,9 @@ impl EnvConfig {
             // Admin API TLS enhancements
             admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH")
                 .ok(),
-            backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default()
+            tls_no_verify: env::var("FERRUM_TLS_NO_VERIFY")
+                .or_else(|_| env::var("FERRUM_BACKEND_TLS_NO_VERIFY"))
+                .unwrap_or_default()
                 == "true",
             admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default()
                 == "true",

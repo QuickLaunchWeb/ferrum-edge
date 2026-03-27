@@ -37,7 +37,7 @@ pub struct TcpListenerConfig {
     pub frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<TcpProxyMetrics>,
-    pub backend_tls_no_verify: bool,
+    pub tls_no_verify: bool,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -58,7 +58,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         frontend_tls_config,
         shutdown,
         metrics,
-        backend_tls_no_verify,
+        tls_no_verify,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -100,7 +100,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &dns_cache,
                         &lb_cache,
                         frontend_tls.as_ref(),
-                        backend_tls_no_verify,
+                        tls_no_verify,
                     )
                     .await;
 
@@ -148,7 +148,7 @@ async fn handle_tcp_connection(
     dns_cache: &DnsCache,
     lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
-    backend_tls_no_verify: bool,
+    tls_no_verify: bool,
 ) -> Result<(u64, u64, Duration), anyhow::Error> {
     let start = Instant::now();
 
@@ -185,8 +185,7 @@ async fn handle_tcp_connection(
         // Connect to backend (with or without TLS origination)
         if proxy.backend_protocol == BackendProtocol::TcpTls {
             let backend_stream =
-                connect_backend_tls(backend_addr, &backend_host, &proxy, backend_tls_no_verify)
-                    .await?;
+                connect_backend_tls(backend_addr, &backend_host, &proxy, tls_no_verify).await?;
             bidirectional_copy(tls_stream, backend_stream).await
         } else {
             let backend_stream = connect_backend_plain(backend_addr, &proxy).await?;
@@ -196,8 +195,7 @@ async fn handle_tcp_connection(
         // No frontend TLS — raw TCP
         if proxy.backend_protocol == BackendProtocol::TcpTls {
             let backend_stream =
-                connect_backend_tls(backend_addr, &backend_host, &proxy, backend_tls_no_verify)
-                    .await?;
+                connect_backend_tls(backend_addr, &backend_host, &proxy, tls_no_verify).await?;
             bidirectional_copy(client_stream, backend_stream).await
         } else {
             let backend_stream = connect_backend_plain(backend_addr, &proxy).await?;
@@ -240,7 +238,7 @@ async fn connect_backend_tls(
     addr: SocketAddr,
     hostname: &str,
     proxy: &Proxy,
-    backend_tls_no_verify: bool,
+    tls_no_verify: bool,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
     let tcp_stream = connect_backend_plain(addr, proxy).await?;
 
@@ -285,7 +283,7 @@ async fn connect_backend_tls(
             .with_no_client_auth()
     };
 
-    if !proxy.backend_tls_verify_server_cert || backend_tls_no_verify {
+    if !proxy.backend_tls_verify_server_cert || tls_no_verify {
         tls_config
             .dangerous()
             .set_certificate_verifier(Arc::new(NoVerifier));

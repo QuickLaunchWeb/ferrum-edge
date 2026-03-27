@@ -217,8 +217,8 @@ impl Http2ConnectionPool {
         };
 
         // Add custom CA bundle if configured (unless no_verify is set)
-        if !self.global_env_config.backend_tls_no_verify
-            && let Some(ca_bundle_path) = &self.global_env_config.backend_tls_ca_bundle_path
+        if !self.global_env_config.tls_no_verify
+            && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
         {
             match std::fs::read(ca_bundle_path) {
                 Ok(ca_pem) => {
@@ -304,7 +304,7 @@ impl Http2ConnectionPool {
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
         // Optionally skip server cert verification
-        if !proxy.backend_tls_verify_server_cert || self.global_env_config.backend_tls_no_verify {
+        if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoCertificateVerification));

@@ -7,7 +7,7 @@
 //! Uses the gateway's shared `PluginHttpClient` (via its underlying
 //! `reqwest::Client`) so that Consul API calls inherit the gateway's
 //! connection pool settings, DNS cache, trust store, and
-//! `FERRUM_BACKEND_TLS_NO_VERIFY` setting.
+//! `FERRUM_TLS_NO_VERIFY` setting.
 
 use crate::config::types::UpstreamTarget;
 use std::collections::HashMap;

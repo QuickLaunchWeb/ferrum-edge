@@ -15,16 +15,16 @@ use crate::config::types::Proxy;
 /// Build a DTLS client config for backend connections (gateway → backend).
 ///
 /// Maps the proxy's `backend_tls_*` fields to DTLS `Config`:
-/// - `backend_tls_verify_server_cert` / `backend_tls_no_verify` → `insecure_skip_verify` (inverted)
+/// - `backend_tls_verify_server_cert` / `tls_no_verify` → `insecure_skip_verify` (inverted)
 /// - `backend_tls_server_ca_cert_path` → `roots_cas`
 /// - `backend_tls_client_cert_path` + `backend_tls_client_key_path` → `certificates`
 pub fn build_backend_dtls_config(
     proxy: &Proxy,
     backend_host: &str,
-    backend_tls_no_verify: bool,
+    tls_no_verify: bool,
 ) -> Result<DtlsConfig, anyhow::Error> {
     let mut config = DtlsConfig {
-        insecure_skip_verify: !proxy.backend_tls_verify_server_cert || backend_tls_no_verify,
+        insecure_skip_verify: !proxy.backend_tls_verify_server_cert || tls_no_verify,
         server_name: backend_host.to_string(),
         ..Default::default()
     };

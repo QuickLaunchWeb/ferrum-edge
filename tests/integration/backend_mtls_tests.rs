@@ -83,7 +83,7 @@ fn create_test_env_config_with_mtls(
         admin_read_only: false,
         admin_tls_client_ca_bundle_path: None,
         admin_tls_no_verify: false,
-        backend_tls_no_verify: false,
+        tls_no_verify: false,
         admin_jwt_secret: None,
         db_type: None,
         db_url: None,
@@ -110,7 +110,7 @@ fn create_test_env_config_with_mtls(
         dns_valid_ttl: None,
         dns_stale_ttl: 3600,
         dns_error_ttl: 1,
-        backend_tls_ca_bundle_path: None,
+        tls_ca_bundle_path: None,
         backend_tls_client_cert_path: cert_path,
         backend_tls_client_key_path: key_path,
         frontend_tls_client_ca_bundle_path: None,
@@ -339,7 +339,7 @@ async fn test_backend_ca_bundle_global_config() {
 
     // Create environment config with CA bundle
     let env_config = EnvConfig {
-        backend_tls_ca_bundle_path: Some(ca_file.path().to_string_lossy().to_string()),
+        tls_ca_bundle_path: Some(ca_file.path().to_string_lossy().to_string()),
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
         ..create_test_env_config_with_mtls(None, None)
