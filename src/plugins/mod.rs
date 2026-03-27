@@ -5,6 +5,7 @@ pub mod body_validator;
 pub mod bot_detection;
 pub mod correlation_id;
 pub mod cors;
+pub mod graphql;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
@@ -227,6 +228,7 @@ pub mod priority {
     pub const BASIC_AUTH: u16 = 1300;
     pub const HMAC_AUTH: u16 = 1400;
     pub const ACCESS_CONTROL: u16 = 2000;
+    pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
@@ -491,6 +493,7 @@ pub fn create_plugin_with_http_client(
         "response_transformer" => Ok(Some(Arc::new(
             response_transformer::ResponseTransformer::new(config),
         ))),
+        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)))),
         "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(config)))),
         "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)))),
         "request_termination" => Ok(Some(Arc::new(
@@ -553,6 +556,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "correlation_id",
         "request_transformer",
         "response_transformer",
+        "graphql",
         "rate_limiting",
         "body_validator",
         "request_termination",

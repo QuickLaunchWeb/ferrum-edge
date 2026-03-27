@@ -57,7 +57,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–999 | Pre-processing that must run before auth | `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
 | **AuthN** | 1000–1999 | Authentication / identity verification | `oauth2_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `rate_limiting` (2900) |
+| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900) |
 | **Transform** | 3000–3999 | Request modification before backend call | `request_transformer` (3000), `body_validator` (3100), `request_termination` (3200) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -78,17 +78,18 @@ Given all built-in plugins enabled, the execution order is:
 | 7 | `basic_auth` | 1300 | authenticate |
 | 8 | `hmac_auth` | 1400 | authenticate |
 | 9 | `access_control` | 2000 | authorize |
-| 10 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
-| 11 | `request_transformer` | 3000 | before_proxy |
-| 12 | `body_validator` | 3100 | before_proxy, on_response_body |
-| 13 | `request_termination` | 3200 | before_proxy |
-| 14 | `response_transformer` | 4000 | after_proxy |
-| 15 | `stdout_logging` | 9000 | log |
-| 16 | `correlation_id` | 9050 | on_request_received, log |
-| 17 | `http_logging` | 9100 | log |
-| 18 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
-| 19 | `prometheus_metrics` | 9300 | after_proxy, log |
-| 20 | `otel_tracing` | 9400 | on_request_received, after_proxy |
+| 10 | `graphql` | 2850 | before_proxy |
+| 11 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
+| 12 | `request_transformer` | 3000 | before_proxy |
+| 13 | `body_validator` | 3100 | before_proxy, on_response_body |
+| 14 | `request_termination` | 3200 | before_proxy |
+| 15 | `response_transformer` | 4000 | after_proxy |
+| 16 | `stdout_logging` | 9000 | log |
+| 17 | `correlation_id` | 9050 | on_request_received, log |
+| 18 | `http_logging` | 9100 | log |
+| 19 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
+| 20 | `prometheus_metrics` | 9300 | after_proxy, log |
+| 21 | `otel_tracing` | 9400 | on_request_received, after_proxy |
 
 ## Why This Order Matters
 
@@ -214,6 +215,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
+| `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
