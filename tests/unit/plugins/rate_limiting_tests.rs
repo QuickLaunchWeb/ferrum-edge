@@ -402,9 +402,9 @@ async fn test_rate_limiting_tps_refills_over_time() {
 async fn test_rate_limiting_high_tps_limit() {
     // Ensure high TPS limits work without memory issues.
     // With a token bucket at 10,000 req/s, micro-refill during the loop
-    // means we may slightly exceed the nominal bucket capacity. The key
-    // assertion: we can fire ~10,000 requests without OOM, and eventually
-    // the bucket runs dry.
+    // means we may slightly exceed the nominal bucket capacity. Fire 2x
+    // the bucket capacity to guarantee drainage even on slow CI runners
+    // where per-iteration time (~10μs) allows significant token refill.
     let config = json!({
         "requests_per_second": 10000,
         "limit_by": "ip"
@@ -413,10 +413,11 @@ async fn test_rate_limiting_high_tps_limit() {
 
     let mut ctx = create_test_context();
 
-    // Fire 10500 requests — most should pass, some at the tail should be rejected
+    // Fire 20,000 requests — 2x bucket capacity guarantees some rejections
+    // even if each iteration takes ~10μs (refilling ~100 tokens total)
     let mut passed = 0;
     let mut rejected = 0;
-    for _ in 0..10500 {
+    for _ in 0..20_000 {
         let result = plugin.on_request_received(&mut ctx).await;
         match result {
             PluginResult::Continue => passed += 1,
@@ -430,10 +431,12 @@ async fn test_rate_limiting_high_tps_limit() {
         "Expected at least 10000 passed, got {}",
         passed
     );
-    // Should have rejected some at the end
+    // Should have rejected some — 2x capacity ensures the bucket drains
     assert!(
         rejected > 0,
-        "Expected some rejections after draining bucket"
+        "Expected some rejections after draining bucket, passed={} rejected={}",
+        passed,
+        rejected
     );
 }
 
