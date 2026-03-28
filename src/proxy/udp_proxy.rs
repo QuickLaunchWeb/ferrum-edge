@@ -29,6 +29,11 @@ use crate::load_balancer::LoadBalancerCache;
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
+/// Maximum datagrams to drain per recv wakeup via `try_recv_from` before yielding
+/// back to the async runtime. Keeps the event loop responsive while amortising
+/// wakeup overhead under burst traffic.
+const RECV_BATCH_LIMIT: usize = 64;
+
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]
 pub struct UdpProxyMetrics {
@@ -144,6 +149,10 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let mut shutdown_rx = shutdown;
 
+    // Hot-path cache: skip DashMap lookup when consecutive datagrams come from the
+    // same client address (very common in streaming UDP protocols).
+    let mut last_client: Option<(SocketAddr, Arc<UdpSession>)> = None;
+
     loop {
         tokio::select! {
             result = frontend_socket.recv_from(&mut buf) => {
@@ -155,71 +164,71 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     }
                 };
 
-                metrics.datagrams_in.fetch_add(1, Ordering::Relaxed);
-                metrics.bytes_in.fetch_add(len as u64, Ordering::Relaxed);
+                // Batch-local metric accumulators — flushed to atomics once per batch.
+                let mut batch_dgrams_in: u64 = 1;
+                let mut batch_bytes_in: u64 = len as u64;
+                let mut batch_dgrams_out: u64 = 0;
+                let mut batch_bytes_out: u64 = 0;
 
-                let data = &buf[..len];
-
-                // Get or create session
-                let session = if let Some(existing) = sessions.get(&client_addr) {
-                    existing.value().clone()
-                } else {
-                    // Check session limit
-                    if sessions.len() >= max_sessions {
-                        warn!(
-                            proxy_id = %proxy_id,
-                            client = %client_addr,
-                            "UDP session limit reached ({}), dropping datagram",
-                            max_sessions
-                        );
-                        continue;
-                    }
-
-                    // Create new session
-                    match create_session(
-                        &proxy_id,
-                        &config,
-                        &dns_cache,
-                        &load_balancer_cache,
-                        &frontend_socket,
-                        client_addr,
-                        &sessions,
-                        &metrics,
-                        tls_no_verify,
-                    ).await {
-                        Ok(session) => session,
-                        Err(e) => {
-                            warn!(
-                                proxy_id = %proxy_id,
-                                client = %client_addr,
-                                "Failed to create UDP session: {}",
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                };
-
-                // Forward datagram to backend (via DTLS if configured)
-                session.last_activity.store(coarse_epoch_millis(), Ordering::Relaxed);
-                let send_result = if let Some(ref dtls) = session.dtls_conn {
-                    dtls.write(data, None).await.map_err(|e| std::io::Error::other(e.to_string()))
-                } else {
-                    session.backend_socket.send(data).await
-                };
-
-                if let Err(e) = send_result {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %client_addr,
-                        "UDP send to backend failed: {}",
-                        e
-                    );
-                } else {
-                    session.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
-                    metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-                    metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
+                // Process first datagram then drain more with try_recv_from.
+                let result = process_datagram(
+                    &buf[..len],
+                    client_addr,
+                    &proxy_id,
+                    &config,
+                    &dns_cache,
+                    &load_balancer_cache,
+                    &frontend_socket,
+                    &sessions,
+                    &metrics,
+                    tls_no_verify,
+                    max_sessions,
+                    &mut last_client,
+                    &mut batch_dgrams_out,
+                    &mut batch_bytes_out,
+                )
+                .await;
+                if let Err(e) = result {
+                    debug!(proxy_id = %proxy_id, client = %client_addr, "UDP forward error: {}", e);
                 }
+
+                // Drain additional pending datagrams without yielding to the runtime.
+                for _ in 0..RECV_BATCH_LIMIT {
+                    match frontend_socket.try_recv_from(&mut buf) {
+                        Ok((len2, addr2)) => {
+                            batch_dgrams_in += 1;
+                            batch_bytes_in += len2 as u64;
+
+                            let result = process_datagram(
+                                &buf[..len2],
+                                addr2,
+                                &proxy_id,
+                                &config,
+                                &dns_cache,
+                                &load_balancer_cache,
+                                &frontend_socket,
+                                &sessions,
+                                &metrics,
+                                tls_no_verify,
+                                max_sessions,
+                                &mut last_client,
+                                &mut batch_dgrams_out,
+                                &mut batch_bytes_out,
+                            )
+                            .await;
+                            if let Err(e) = result {
+                                debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                            }
+                        }
+                        Err(_) => break, // WouldBlock — socket drained
+                    }
+                }
+
+                // Flush batched metrics to atomics once.
+                metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
+                metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
+                metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
+                metrics.bytes_out.fetch_add(batch_bytes_out, Ordering::Relaxed);
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {}", port);
@@ -227,6 +236,97 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             }
         }
     }
+}
+
+/// Process a single datagram: resolve session, forward to backend, update batch counters.
+///
+/// Uses `last_client` as a hot-path cache to avoid DashMap lookups when consecutive
+/// datagrams arrive from the same client address.
+#[allow(clippy::too_many_arguments)]
+async fn process_datagram(
+    data: &[u8],
+    client_addr: SocketAddr,
+    proxy_id: &str,
+    config: &arc_swap::ArcSwap<GatewayConfig>,
+    dns_cache: &DnsCache,
+    lb_cache: &LoadBalancerCache,
+    frontend_socket: &Arc<UdpSocket>,
+    sessions: &SessionMap,
+    metrics: &Arc<UdpProxyMetrics>,
+    tls_no_verify: bool,
+    max_sessions: usize,
+    last_client: &mut Option<(SocketAddr, Arc<UdpSession>)>,
+    batch_dgrams_out: &mut u64,
+    batch_bytes_out: &mut u64,
+) -> Result<(), anyhow::Error> {
+    // Fast path: check last-client cache before hitting DashMap.
+    let session = if let Some((cached_addr, ref cached_session)) = *last_client {
+        if cached_addr == client_addr {
+            cached_session.clone()
+        } else {
+            lookup_or_create_session(
+                client_addr, proxy_id, config, dns_cache, lb_cache,
+                frontend_socket, sessions, metrics, tls_no_verify, max_sessions,
+            ).await?
+        }
+    } else {
+        lookup_or_create_session(
+            client_addr, proxy_id, config, dns_cache, lb_cache,
+            frontend_socket, sessions, metrics, tls_no_verify, max_sessions,
+        ).await?
+    };
+
+    // Update cache for next datagram.
+    *last_client = Some((client_addr, session.clone()));
+
+    // Forward to backend.
+    session.last_activity.store(coarse_epoch_millis(), Ordering::Relaxed);
+    let send_result = if let Some(ref dtls) = session.dtls_conn {
+        dtls.write(data, None).await.map_err(|e| std::io::Error::other(e.to_string()))
+    } else {
+        session.backend_socket.send(data).await
+    };
+
+    match send_result {
+        Ok(_) => {
+            session.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+            *batch_dgrams_out += 1;
+            *batch_bytes_out += data.len() as u64;
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!("send to backend failed: {}", e)),
+    }
+}
+
+/// Look up an existing session or create a new one.
+#[allow(clippy::too_many_arguments)]
+async fn lookup_or_create_session(
+    client_addr: SocketAddr,
+    proxy_id: &str,
+    config: &arc_swap::ArcSwap<GatewayConfig>,
+    dns_cache: &DnsCache,
+    lb_cache: &LoadBalancerCache,
+    frontend_socket: &Arc<UdpSocket>,
+    sessions: &SessionMap,
+    metrics: &Arc<UdpProxyMetrics>,
+    tls_no_verify: bool,
+    max_sessions: usize,
+) -> Result<Arc<UdpSession>, anyhow::Error> {
+    if let Some(existing) = sessions.get(&client_addr) {
+        return Ok(existing.value().clone());
+    }
+
+    if sessions.len() >= max_sessions {
+        return Err(anyhow::anyhow!(
+            "UDP session limit reached ({}), dropping datagram",
+            max_sessions
+        ));
+    }
+
+    create_session(
+        proxy_id, config, dns_cache, lb_cache, frontend_socket,
+        client_addr, sessions, metrics, tls_no_verify,
+    ).await
 }
 
 /// Spawn a background task that periodically removes idle UDP sessions.
@@ -640,13 +740,14 @@ async fn create_session(
         "New UDP session created"
     );
 
-    // Spawn backend → client reply forwarder
+    // Spawn backend → client reply forwarder with batch recv optimization.
     let frontend = frontend_socket.clone();
     let reply_session = session.clone();
     let reply_proxy_id = proxy_id.to_string();
     let reply_metrics = metrics.clone();
     let reply_sessions = sessions.clone();
     let reply_dtls = dtls_conn;
+    let is_dtls = reply_dtls.is_some();
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
@@ -659,31 +760,9 @@ async fn create_session(
                 backend_socket.recv(&mut buf).await
             };
 
-            match recv_result {
-                Ok(len) => {
-                    reply_session
-                        .last_activity
-                        .store(coarse_epoch_millis(), Ordering::Relaxed);
-                    reply_session
-                        .bytes_received
-                        .fetch_add(len as u64, Ordering::Relaxed);
-                    reply_metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
-                    reply_metrics
-                        .bytes_out
-                        .fetch_add(len as u64, Ordering::Relaxed);
-
-                    if let Err(e) = frontend.send_to(&buf[..len], client_addr).await {
-                        debug!(
-                            proxy_id = %reply_proxy_id,
-                            client = %client_addr,
-                            "UDP send to client failed: {}",
-                            e
-                        );
-                        break;
-                    }
-                }
+            let len = match recv_result {
+                Ok(len) => len,
                 Err(e) => {
-                    // Backend socket closed or error — clean up session
                     debug!(
                         proxy_id = %reply_proxy_id,
                         client = %client_addr,
@@ -692,7 +771,65 @@ async fn create_session(
                     );
                     break;
                 }
+            };
+
+            // Batch-local counters for this recv burst.
+            let mut batch_dgrams: u64 = 1;
+            let mut batch_bytes: u64 = len as u64;
+            let mut batch_bytes_received: u64 = len as u64;
+            let now = coarse_epoch_millis();
+
+            if let Err(e) = frontend.send_to(&buf[..len], client_addr).await {
+                debug!(
+                    proxy_id = %reply_proxy_id,
+                    client = %client_addr,
+                    "UDP send to client failed: {}",
+                    e
+                );
+                break;
             }
+
+            // For plain UDP, drain additional pending replies without yielding.
+            // DTLS reads cannot use try_recv, so skip batching for DTLS backends.
+            if !is_dtls {
+                for _ in 0..RECV_BATCH_LIMIT {
+                    match backend_socket.try_recv(&mut buf) {
+                        Ok(len2) => {
+                            batch_dgrams += 1;
+                            batch_bytes += len2 as u64;
+                            batch_bytes_received += len2 as u64;
+
+                            if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %client_addr,
+                                    "UDP send to client failed: {}",
+                                    e
+                                );
+                                // Flush what we have and exit.
+                                reply_session.last_activity.store(now, Ordering::Relaxed);
+                                reply_session.bytes_received.fetch_add(batch_bytes_received, Ordering::Relaxed);
+                                reply_metrics.datagrams_out.fetch_add(batch_dgrams, Ordering::Relaxed);
+                                reply_metrics.bytes_out.fetch_add(batch_bytes, Ordering::Relaxed);
+                                // Exit outer loop via return.
+                                if let Some(ref dtls) = reply_dtls {
+                                    let _ = dtls.close().await;
+                                }
+                                reply_sessions.remove(&client_addr);
+                                reply_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                        Err(_) => break, // WouldBlock — socket drained
+                    }
+                }
+            }
+
+            // Flush batched metrics.
+            reply_session.last_activity.store(now, Ordering::Relaxed);
+            reply_session.bytes_received.fetch_add(batch_bytes_received, Ordering::Relaxed);
+            reply_metrics.datagrams_out.fetch_add(batch_dgrams, Ordering::Relaxed);
+            reply_metrics.bytes_out.fetch_add(batch_bytes, Ordering::Relaxed);
         }
         // Session's backend receiver exited — remove session
         // Close DTLS connection if active
@@ -725,10 +862,12 @@ fn resolve_backend_target(
 
 /// Coarse-grained epoch millisecond timestamp updated periodically.
 /// Avoids calling `SystemTime::now()` on every datagram in the hot path.
-/// Resolution is ~1ms which is sufficient for session idle timeout tracking.
+/// Resolution is ~100ms which is more than sufficient for session idle timeout
+/// tracking (timeouts are typically 60s+) while saving ~990 timer wakes/sec
+/// compared to the previous 1ms resolution.
 static COARSE_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Start the background timer that updates `COARSE_EPOCH_MS` every millisecond.
+/// Start the background timer that updates `COARSE_EPOCH_MS` every 100ms.
 /// Safe to call multiple times; only the first call spawns the task.
 fn ensure_coarse_timer_started() {
     use std::sync::Once;
@@ -737,7 +876,7 @@ fn ensure_coarse_timer_started() {
         // Seed with current time
         COARSE_EPOCH_MS.store(epoch_millis_precise(), Ordering::Relaxed);
         tokio::spawn(async {
-            let mut interval = tokio::time::interval(Duration::from_millis(1));
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
             loop {
                 interval.tick().await;
                 COARSE_EPOCH_MS.store(epoch_millis_precise(), Ordering::Relaxed);
