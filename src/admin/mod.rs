@@ -14,6 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -2166,20 +2167,36 @@ async fn handle_batch_create(
         match serde_json::from_value::<Vec<Consumer>>(consumers_val.clone()) {
             Ok(mut consumers) => {
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
+                let mut seen_usernames: HashSet<String> = HashSet::new();
+                let mut seen_custom_ids: HashSet<String> = HashSet::new();
                 for c in &mut consumers {
                     if c.id.is_empty() {
                         c.id = Uuid::new_v4().to_string();
                     } else if let Err(msg) = validate_resource_id(&c.id) {
                         errors.push(format!("Consumer '{}': {}", c.id, msg));
                     }
+                    if !seen_ids.insert(c.id.clone()) {
+                        errors.push(format!("Duplicate consumer ID '{}' in batch", c.id));
+                    }
                     if c.username.trim().is_empty() {
                         errors.push(format!("Consumer '{}': username must not be empty", c.id));
+                    } else if !seen_usernames.insert(c.username.clone()) {
+                        errors.push(format!(
+                            "Duplicate consumer username '{}' in batch",
+                            c.username
+                        ));
                     }
                     // Normalize custom_id: treat empty string as None
                     if let Some(ref cid) = c.custom_id
                         && cid.trim().is_empty()
                     {
                         c.custom_id = None;
+                    }
+                    if let Some(ref cid) = c.custom_id
+                        && !seen_custom_ids.insert(cid.clone())
+                    {
+                        errors.push(format!("Duplicate consumer custom_id '{}' in batch", cid));
                     }
                     c.created_at = now;
                     c.updated_at = now;
@@ -2203,11 +2220,21 @@ async fn handle_batch_create(
         match serde_json::from_value::<Vec<Upstream>>(upstreams_val.clone()) {
             Ok(mut upstreams) => {
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
+                let mut seen_names: HashSet<String> = HashSet::new();
                 for u in &mut upstreams {
                     if u.id.is_empty() {
                         u.id = Uuid::new_v4().to_string();
                     } else if let Err(msg) = validate_resource_id(&u.id) {
                         errors.push(format!("Upstream '{}': {}", u.id, msg));
+                    }
+                    if !seen_ids.insert(u.id.clone()) {
+                        errors.push(format!("Duplicate upstream ID '{}' in batch", u.id));
+                    }
+                    if let Some(ref name) = u.name
+                        && !seen_names.insert(name.clone())
+                    {
+                        errors.push(format!("Duplicate upstream name '{}' in batch", name));
                     }
                     if u.targets.is_empty() && u.service_discovery.is_none() {
                         errors.push(format!(
@@ -2234,11 +2261,15 @@ async fn handle_batch_create(
         match serde_json::from_value::<Vec<Proxy>>(proxies_val.clone()) {
             Ok(mut proxies) => {
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
                 for p in &mut proxies {
                     if p.id.is_empty() {
                         p.id = Uuid::new_v4().to_string();
                     } else if let Err(msg) = validate_resource_id(&p.id) {
                         errors.push(format!("Proxy '{}': {}", p.id, msg));
+                    }
+                    if !seen_ids.insert(p.id.clone()) {
+                        errors.push(format!("Duplicate proxy ID '{}' in batch", p.id));
                     }
                     if p.listen_path.is_empty() {
                         errors.push(format!("Proxy '{}': listen_path must be non-empty", p.id));
@@ -2298,11 +2329,15 @@ async fn handle_batch_create(
             Ok(mut pcs) => {
                 let known_plugins = crate::plugins::available_plugins();
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
                 for pc in &mut pcs {
                     if pc.id.is_empty() {
                         pc.id = Uuid::new_v4().to_string();
                     } else if let Err(msg) = validate_resource_id(&pc.id) {
                         errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+                    }
+                    if !seen_ids.insert(pc.id.clone()) {
+                        errors.push(format!("Duplicate plugin config ID '{}' in batch", pc.id));
                     }
                     if !known_plugins.contains(&pc.plugin_name.as_str()) {
                         errors.push(format!(
@@ -2629,7 +2664,53 @@ async fn handle_restore(
         body.len()
     );
 
-    // Phase 2: Delete all existing resources
+    // Phase 2: Validate payload BEFORE deleting anything.
+    // Assemble a temporary GatewayConfig and run the same validations as file mode.
+    {
+        let temp_config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies: payload.proxies.clone(),
+            consumers: payload.consumers.clone(),
+            plugin_configs: payload.plugin_configs.clone(),
+            upstreams: payload.upstreams.clone(),
+            loaded_at: Utc::now(),
+        };
+        let mut validation_errors: Vec<String> = Vec::new();
+
+        if let Err(errs) = temp_config.validate_unique_resource_ids() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_consumer_identities() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_consumer_credentials() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_regex_listen_paths() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_listen_paths() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_stream_proxies() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_upstream_references() {
+            validation_errors.extend(errs);
+        }
+
+        if !validation_errors.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "error": "Restore payload validation failed — existing config was NOT deleted",
+                    "validation_errors": validation_errors
+                }),
+            ));
+        }
+    }
+
+    // Phase 3: Delete all existing resources (safe: payload is validated)
     if let Err(e) = db.delete_all_resources().await {
         error!("Restore: failed to delete existing resources: {}", e);
         return Ok(json_response(

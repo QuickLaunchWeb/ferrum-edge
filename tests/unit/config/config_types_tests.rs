@@ -1111,3 +1111,66 @@ fn test_http_proxy_must_not_set_listen_port() {
     let err = config.validate_stream_proxies().unwrap_err();
     assert!(err[0].contains("must not set listen_port"));
 }
+
+// ---- Restore pre-deletion validation tests ----
+// These test the GatewayConfig validation methods used by handle_restore
+// to validate the entire payload before deleting existing data.
+
+#[test]
+fn test_restore_payload_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api")];
+    config.consumers = vec![make_consumer("c1", "alice")];
+    config.upstreams = vec![make_upstream("u1")];
+    assert!(config.validate_unique_resource_ids().is_ok());
+    assert!(config.validate_unique_consumer_identities().is_ok());
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+    assert!(config.validate_regex_listen_paths().is_ok());
+    assert!(config.validate_unique_listen_paths().is_ok());
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_restore_payload_rejects_duplicate_resource_ids() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("same-id", "/a"), make_proxy("same-id", "/b")];
+    let err = config.validate_unique_resource_ids().unwrap_err();
+    assert!(!err.is_empty());
+    assert!(err[0].contains("same-id"));
+}
+
+#[test]
+fn test_restore_payload_rejects_invalid_regex() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~(broken[regex")];
+    let err = config.validate_regex_listen_paths().unwrap_err();
+    assert!(err[0].contains("invalid regex"));
+}
+
+#[test]
+fn test_restore_payload_rejects_duplicate_listen_paths() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/api")];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn test_restore_payload_rejects_missing_upstream_reference() {
+    let mut p = make_proxy("p1", "/api");
+    p.upstream_id = Some("nonexistent".into());
+    let mut config = empty_config();
+    config.proxies = vec![p];
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(err[0].contains("nonexistent"));
+}
+
+#[test]
+fn test_restore_payload_accepts_valid_upstream_reference() {
+    let mut p = make_proxy("p1", "/api");
+    p.upstream_id = Some("u1".into());
+    let mut config = empty_config();
+    config.proxies = vec![p];
+    config.upstreams = vec![make_upstream("u1")];
+    assert!(config.validate_upstream_references().is_ok());
+}
