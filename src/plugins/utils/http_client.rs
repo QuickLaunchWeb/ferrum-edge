@@ -198,7 +198,7 @@ impl PluginHttpClient {
     /// Times the network round-trip and emits a `warn!` if the elapsed time
     /// exceeds the configured `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS`. The
     /// `label` identifies the caller in log output (e.g. "http_logging",
-    /// "oauth2_introspection", "jwks_fetch", "otel_export").
+    /// "jwks_fetch", "jwks_auth_oidc_discovery", "otel_export").
     ///
     /// The destination URL is extracted from the request and included in the
     /// slow-call warning so operators can identify which external endpoint is slow.

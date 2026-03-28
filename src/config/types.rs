@@ -830,7 +830,7 @@ impl GatewayConfig {
     /// In database mode the DB enforces this via UNIQUE constraints. In file
     /// mode there's no DB, so this catches duplicates at config load time
     /// and prevents the gateway from starting with ambiguous identity mappings
-    /// that would cause incorrect OAuth2/JWT authentication.
+    /// that would cause incorrect JWKS/JWT authentication.
     pub fn validate_unique_consumer_identities(&self) -> Result<(), Vec<String>> {
         let mut seen_usernames: HashMap<&str, &str> = HashMap::new();
         let mut seen_custom_ids: HashMap<&str, &str> = HashMap::new();
@@ -855,7 +855,7 @@ impl GatewayConfig {
 
         // Cross-namespace collision: a custom_id that matches another consumer's
         // username or ID would silently overwrite in the identity index, causing
-        // incorrect JWT/OAuth2 authentication.
+        // incorrect JWKS/JWT authentication.
         for consumer in &self.consumers {
             if let Some(ref custom_id) = consumer.custom_id
                 && let Some(&owner_id) = seen_usernames.get(custom_id.as_str())
@@ -863,7 +863,7 @@ impl GatewayConfig {
             {
                 duplicates.push(format!(
                     "Consumer '{}' custom_id '{}' collides with username of consumer '{}' \
-                     — this will cause incorrect JWT/OAuth2 authentication",
+                     — this will cause incorrect JWKS/JWT authentication",
                     consumer.id, custom_id, owner_id
                 ));
             }

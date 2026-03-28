@@ -207,7 +207,7 @@ Understanding where CPU cycles are spent helps you optimize for your specific wo
 | Route matching (cache hit) | Very low | O(1) DashMap lookup |
 | Route matching (cache miss) | Low | Pre-sorted prefix scan, result cached |
 | Plugin execution (JWT/key auth) | Low | Local validation against secrets, no external calls |
-| Plugin execution (OAuth2 introspection) | Medium–High | External HTTP call per request; use JWKS mode for local validation |
+| Plugin execution (JWKS auth) | Low | Local JWT validation using cached IdP public keys |
 | Plugin execution (rate limit) | Very low | In-memory atomic counters |
 | Plugin execution (custom plugins) | Variable | Depends on plugin logic; see [Custom Plugins](../CUSTOM_PLUGINS.md) |
 | Load balancer target selection | Very low | Atomic operations; consistent hashing does one hash per request |

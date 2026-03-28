@@ -151,7 +151,7 @@ src/
 Plugins execute in priority order (lower number = runs first). The lifecycle phases are:
 
 1. `on_request_received` — Correlation ID, request transformer, bot detection
-2. `authenticate` — Key auth, basic auth, JWT, HMAC, OAuth2
+2. `authenticate` — Key auth, basic auth, JWT, HMAC, JWKS
 3. `authorize` — Access control (ACL), IP restriction
 4. `before_proxy` — Rate limiting, body validation, request termination
 5. `after_proxy` — Response transformer, CORS headers
@@ -264,7 +264,7 @@ Use imperative mood, concise subject lines:
 
 ```
 Fix rate limiter to handle zero-window edge case
-Add OAuth2 JWKS key rotation support
+Add JWKS multi-provider auth support
 Reduce per-request allocations in plugin lookup
 ```
 

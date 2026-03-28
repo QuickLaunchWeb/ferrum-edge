@@ -271,7 +271,7 @@ pub struct EnvConfig {
     pub real_ip_header: Option<String>,
 
     /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.
-    /// When a plugin HTTP request (e.g. http_logging, oauth2 introspection,
+    /// When a plugin HTTP request (e.g. http_logging, JWKS fetch,
     /// JWKS fetch, OTLP export) exceeds this duration, a warning is logged.
     /// Default: 1000 (1 second).
     pub plugin_http_slow_threshold_ms: u64,

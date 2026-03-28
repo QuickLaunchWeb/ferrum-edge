@@ -1059,7 +1059,11 @@ async fn handle_websocket_request_authenticated(
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        consumer_username: ctx
+            .identified_consumer
+            .as_ref()
+            .map(|c| c.username.clone())
+            .or_else(|| ctx.authenticated_identity.clone()),
         http_method: "GET".to_string(),
         request_path: ctx.path.clone(),
         matched_proxy_id: Some(proxy.id.clone()),
@@ -1664,7 +1668,11 @@ pub async fn log_rejected_request(
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        consumer_username: ctx
+            .identified_consumer
+            .as_ref()
+            .map(|c| c.username.clone())
+            .or_else(|| ctx.authenticated_identity.clone()),
         http_method: ctx.method.clone(),
         request_path: ctx.path.clone(),
         matched_proxy_id: proxy.map(|p| p.id.clone()),
@@ -2037,6 +2045,16 @@ pub async fn handle_proxy_request(
         headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
         if let Some(ref custom_id) = consumer.custom_id {
             headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
+        }
+    } else if ctx.authenticated_identity.is_some() || ctx.authenticated_identity_header.is_some() {
+        // External auth (e.g. jwks_auth) identified a user without a gateway Consumer
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        let header_val = ctx
+            .authenticated_identity_header
+            .as_deref()
+            .or(ctx.authenticated_identity.as_deref());
+        if let Some(val) = header_val {
+            headers.insert("X-Consumer-Username".to_string(), val.to_string());
         }
     }
     let proxy_headers: &HashMap<String, String> =
@@ -2555,7 +2573,11 @@ pub async fn handle_proxy_request(
         let summary = TransactionSummary {
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+            consumer_username: ctx
+                .identified_consumer
+                .as_ref()
+                .map(|c| c.username.clone())
+                .or_else(|| ctx.authenticated_identity.clone()),
             http_method: method,
             request_path: path,
             matched_proxy_id: Some(proxy.id.clone()),

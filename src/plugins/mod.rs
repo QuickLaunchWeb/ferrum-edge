@@ -9,6 +9,8 @@ pub mod graphql;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
+pub mod jwks_auth;
+pub mod jwks_cache;
 pub mod jwks_store;
 pub mod jwt_auth;
 pub mod key_auth;
@@ -86,6 +88,13 @@ pub struct RequestContext {
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Consumer>,
+    /// Identity string set by external auth plugins (e.g., `jwks_auth`) when no
+    /// matching `Consumer` exists in the gateway. Used as the rate-limit key and
+    /// for `consumer_username` in transaction logs.
+    pub authenticated_identity: Option<String>,
+    /// Human-readable identity for the `X-Consumer-Username` header sent to the
+    /// backend. Falls back to `authenticated_identity` when not set separately.
+    pub authenticated_identity_header: Option<String>,
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
@@ -109,6 +118,8 @@ impl RequestContext {
             query_params: HashMap::new(),
             matched_proxy: None,
             identified_consumer: None,
+            authenticated_identity: None,
+            authenticated_identity_header: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
             tls_client_cert_der: None,
@@ -213,7 +224,7 @@ pub struct StreamTransactionSummary {
 /// | Band    | Range       | Purpose                                      | Plugins                          |
 /// |---------|-------------|----------------------------------------------|----------------------------------|
 /// | Early   | 0–999       | Pre-processing: CORS preflight               | cors (100)                       |
-/// | AuthN   | 950–1999    | Authentication: identity verification         | mtls (950), oauth2 (1000), jwt (1100), key (1200), basic (1300) |
+/// | AuthN   | 950–1999    | Authentication: identity verification         | mtls (950), jwks (1000), jwt (1100), key (1200), basic (1300) |
 /// | AuthZ   | 2000–2999   | Authorization & post-auth enforcement         | access_control (2000), rate_limiting (2900) |
 /// | Transform | 3000–3999 | Request transformation & caching              | request_transformer (3000), response_caching (3500) |
 /// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
@@ -227,6 +238,7 @@ pub mod priority {
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
     pub const MTLS_AUTH: u16 = 950;
+    pub const JWKS_AUTH: u16 = 1000;
     pub const OAUTH2_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
@@ -396,8 +408,8 @@ pub trait Plugin: Send + Sync {
     /// phase, where auth mode (Single vs Multi) determines how failures are
     /// handled. Custom auth plugins should override this to return `true`.
     ///
-    /// Default is `false`. Built-in auth plugins (jwt_auth, key_auth,
-    /// basic_auth, oauth2_auth, hmac_auth) override this to return `true`.
+    /// Default is `false`. Built-in auth plugins (jwks_auth, jwt_auth, key_auth,
+    /// basic_auth, hmac_auth) override this to return `true`.
     fn is_auth_plugin(&self) -> bool {
         false
     }
@@ -410,7 +422,7 @@ pub trait Plugin: Send + Sync {
     ///
     /// Default implementation returns an empty list (most plugins make no
     /// outbound network calls). Override this if your plugin has a configured
-    /// endpoint URL (e.g., http_logging, oauth2_auth introspection).
+    /// endpoint URL (e.g., http_logging, jwks_auth JWKS endpoints).
     fn warmup_hostnames(&self) -> Vec<String> {
         Vec::new()
     }
@@ -478,6 +490,10 @@ pub fn create_plugin_with_http_client(
         "transaction_debugger" => Ok(Some(Arc::new(
             transaction_debugger::TransactionDebugger::new(config),
         ))),
+        "jwks_auth" => Ok(Some(Arc::new(jwks_auth::JwksAuth::new(
+            config,
+            http_client.clone(),
+        )?))),
         "oauth2_auth" => Ok(Some(Arc::new(oauth2_auth::OAuth2Auth::new(
             config,
             http_client.clone(),
@@ -536,6 +552,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "basic_auth"
             | "jwt_auth"
             | "hmac_auth"
+            | "jwks_auth"
             | "oauth2_auth"
             | "mtls_auth"
             | "access_control"
@@ -548,6 +565,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "stdout_logging",
         "http_logging",
         "transaction_debugger",
+        "jwks_auth",
         "oauth2_auth",
         "jwt_auth",
         "key_auth",
