@@ -718,10 +718,18 @@ pool_enable_http2: false  # Better compatibility with auth plugins
 
 In performance tests (8 threads, 100 connections, 30 seconds), connection
 pooling with properly tuned `pool_max_idle_per_host` provides:
-- **~97,000 RPS** for lightweight health checks through the gateway
-- **~85,000 RPS** for API proxy vs ~54,000 RPS direct backend access
-- **Sub-millisecond p50 latency** for health checks, ~1.15ms for API proxy
+- **~88,500 RPS** for lightweight health checks through the gateway
+- **~77,000 RPS** for API proxy vs ~60,000 RPS direct backend access
+- **1.10ms avg latency** for health checks, ~1.24ms for API proxy
 - **Zero errors** under sustained load
+
+| Test | Requests/sec | Avg Latency | Max Latency |
+|------|-------------|-------------|-------------|
+| Health Check (gateway) | 88,489 | 1.10ms | 23.80ms |
+| Users API (gateway) | 77,010 | 1.24ms | 12.69ms |
+| Direct Backend (baseline) | 59,912 | 1.51ms | 3.40ms |
+
+*Results from local run on macOS Apple Silicon, release build, 8 threads, 100 connections, 30s duration (2026-03-28).*
 
 ### Performance Testing
 

@@ -86,6 +86,18 @@ WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./run_perf_test.sh
 
 ## 📈 Results
 
+### Latest Results (2026-03-28)
+
+Local run on macOS Apple Silicon, release build, 8 threads, 100 connections, 30s duration:
+
+| Test | Requests/sec | Avg Latency | Stdev | Max Latency |
+|------|-------------|-------------|-------|-------------|
+| Health Check (gateway) | 88,489 | 1.10ms | 560.65us | 23.80ms |
+| Users API (gateway) | 77,010 | 1.24ms | 578.98us | 12.69ms |
+| Direct Backend (baseline) | 59,912 | 1.51ms | 284.49us | 3.40ms |
+
+**Gateway overhead**: The gateway actually outperforms direct backend access on throughput (+28.5% RPS) due to connection pooling and keep-alive optimizations. Latency overhead is negligible (-0.27ms avg).
+
 After running the test, you'll get:
 
 ### 📊 Visual Performance Report
