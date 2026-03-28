@@ -15,6 +15,9 @@ use tracing::{debug, error, info, warn};
 /// Contains only the resources that changed since the last poll, plus IDs of
 /// resources that were deleted. The polling loop uses this to apply surgical
 /// updates without loading the entire database.
+///
+/// Serializable for CP-to-DP gRPC delta broadcasts.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
     pub removed_proxy_ids: Vec<String>,

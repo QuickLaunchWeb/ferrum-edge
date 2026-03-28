@@ -73,9 +73,21 @@ The gRPC channel between CP and DP supports three security modes:
 
 1. DP connects to CP's gRPC endpoint with JWT authentication
 2. CP sends an immediate `ConfigUpdate` with the full current config (type=FULL_SNAPSHOT)
-3. CP polls the database at `FERRUM_DB_POLL_INTERVAL` seconds
-4. When config changes are detected, CP broadcasts a `ConfigUpdate` to all subscribed DPs
-5. DPs atomically update their cached config (router cache, plugin cache, consumer index)
+3. CP polls the database incrementally at `FERRUM_DB_POLL_INTERVAL` seconds using indexed `updated_at` queries
+4. When changes are detected, CP broadcasts a `ConfigUpdate` with type=DELTA containing only the added/modified/removed resources
+5. DPs apply the delta surgically — only affected caches (router, plugin, consumer, load balancer) are updated
+6. If the incremental poll fails, CP falls back to a full database reload and broadcasts a FULL_SNAPSHOT
+
+### Update Types
+
+The `ConfigUpdate` proto message carries an `UpdateType` discriminator:
+
+| Type | Value | When | Content |
+|------|-------|------|---------|
+| `FULL_SNAPSHOT` | 0 | Initial subscription, fallback | Entire `GatewayConfig` as JSON |
+| `DELTA` | 1 | Incremental database changes | `IncrementalResult` with only changed resources |
+
+DPs handle both types transparently: full snapshots replace the entire config; deltas are applied via `ProxyState::apply_incremental()` which patches the in-memory config and performs surgical cache updates.
 
 ### Resilience
 

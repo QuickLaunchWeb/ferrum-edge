@@ -16,6 +16,7 @@ use tokio::time::timeout;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
+use ferrum_gateway::config::db_loader::IncrementalResult;
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 use ferrum_gateway::dns::{DnsCache, DnsConfig};
 use ferrum_gateway::grpc::cp_server::CpGrpcServer;
@@ -782,4 +783,299 @@ async fn test_dp_rejects_untrusted_cp_server_cert() {
         0,
         "Config should remain empty when TLS verification fails"
     );
+}
+
+// ── Delta / Incremental update tests ─────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_update_adding_proxy() {
+    // Start CP with initial config of 1 proxy
+    let cp_config = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    // Spawn DP client
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-1", &ps, None).await
+    });
+
+    // Wait for initial full snapshot
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received.is_ok(),
+        "Should receive initial config with 1 proxy"
+    );
+
+    // Now send a DELTA update that adds a new proxy
+    let new_proxy = create_test_proxy("proxy-new", "/api-new");
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![new_proxy],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    // Wait for the delta to be applied
+    let received_delta = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_delta.is_ok(),
+        "DP should have applied delta adding a proxy (expected 2 proxies)"
+    );
+
+    let config = proxy_state.config.load();
+    assert_eq!(config.proxies.len(), 2);
+    // Both original and new proxy should be present
+    let ids: Vec<&str> = config.proxies.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"proxy-0"));
+    assert!(ids.contains(&"proxy-new"));
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_update_removing_proxy() {
+    // Start CP with initial config of 3 proxies
+    let cp_config = create_test_config(3);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-2", &ps, None).await
+    });
+
+    // Wait for initial snapshot
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received.is_ok(),
+        "Should receive initial config with 3 proxies"
+    );
+
+    // Send a DELTA that removes proxy-1
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec!["proxy-1".to_string()],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    // Wait for delta to be applied
+    let received_delta = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_delta.is_ok(),
+        "DP should have applied delta removing proxy-1 (expected 2 proxies)"
+    );
+
+    let config = proxy_state.config.load();
+    assert_eq!(config.proxies.len(), 2);
+    let ids: Vec<&str> = config.proxies.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&"proxy-0"));
+    assert!(!ids.contains(&"proxy-1")); // removed
+    assert!(ids.contains(&"proxy-2"));
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_then_full_snapshot() {
+    // Verify that a full snapshot after deltas produces the correct final state.
+    let cp_config = create_test_config(2);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-3", &ps, None).await
+    });
+
+    // Wait for initial snapshot (2 proxies)
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok());
+
+    // Send a delta that adds proxy-extra
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("proxy-extra", "/api-extra")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    // Wait for delta
+    let received_delta = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received_delta.is_ok(), "Should have 3 proxies after delta");
+
+    // Now send a full snapshot with only 1 proxy — should replace everything
+    let final_config = create_test_config(1);
+    CpGrpcServer::broadcast_update(&update_tx, &final_config);
+
+    let received_full = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_full.is_ok(),
+        "Full snapshot should override to 1 proxy"
+    );
+
+    let config = proxy_state.config.load();
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].id, "proxy-0");
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_ignores_malformed_delta() {
+    // Verify that a malformed delta doesn't corrupt existing config.
+    let cp_config = create_test_config(2);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-4", &ps, None).await
+    });
+
+    // Wait for initial snapshot
+    let received = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(received.is_ok());
+
+    // Send malformed delta (invalid JSON for update_type=1)
+    let malformed = ferrum_gateway::grpc::proto::ConfigUpdate {
+        update_type: 1, // DELTA
+        config_json: "{not valid delta json!!!}".to_string(),
+        version: "bad".to_string(),
+        timestamp: Utc::now().timestamp(),
+    };
+    let _ = update_tx.send(malformed);
+
+    // Wait a bit, then verify config is unchanged
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        2,
+        "Config should remain unchanged after malformed delta"
+    );
+
+    // Send a valid delta to prove client is still alive
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("proxy-after", "/api-after")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+
+    let recovered = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "Client should recover and apply valid delta after malformed one"
+    );
+
+    client_handle.abort();
 }

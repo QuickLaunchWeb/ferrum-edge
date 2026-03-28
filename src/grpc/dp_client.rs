@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
+use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
@@ -137,30 +138,50 @@ pub async fn connect_and_subscribe(
             update.update_type, update.version
         );
 
-        match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-            Ok(mut config) => {
-                // Validate config received from CP before applying
-                config.normalize_hosts();
-                if let Err(errors) = config.validate_regex_listen_paths() {
-                    for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+        match update.update_type {
+            0 => {
+                // FULL_SNAPSHOT — replace entire config
+                match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                    Ok(mut config) => {
+                        config.normalize_hosts();
+                        if let Err(errors) = config.validate_regex_listen_paths() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid regex listen_paths");
+                            continue;
+                        }
+                        if let Err(errors) = config.validate_stream_proxies() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid stream proxy config");
+                            continue;
+                        }
+                        config.normalize_stream_proxy_paths();
+                        proxy_state.update_config(config);
+                        info!("Full configuration snapshot applied from CP");
                     }
-                    error!("Ignoring config update with invalid regex listen_paths");
-                    continue;
-                }
-                if let Err(errors) = config.validate_stream_proxies() {
-                    for msg in &errors {
-                        error!("CP config rejected — {}", msg);
+                    Err(e) => {
+                        error!("Failed to parse full config update: {}", e);
                     }
-                    error!("Ignoring config update with invalid stream proxy config");
-                    continue;
                 }
-                config.normalize_stream_proxy_paths();
-                proxy_state.update_config(config);
-                info!("Configuration updated from CP");
             }
-            Err(e) => {
-                error!("Failed to parse config update: {}", e);
+            1 => {
+                // DELTA — apply incremental changes only
+                match serde_json::from_str::<IncrementalResult>(&update.config_json) {
+                    Ok(result) => {
+                        if proxy_state.apply_incremental(result) {
+                            info!("Incremental config delta applied from CP");
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse delta update: {}", e);
+                    }
+                }
+            }
+            other => {
+                warn!("Unknown config update type {}, ignoring", other);
             }
         }
     }

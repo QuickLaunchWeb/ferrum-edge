@@ -216,7 +216,12 @@ pub async fn run(
         }
     });
 
-    // Database polling loop -> push updates to DPs (with shutdown)
+    // Database polling loop -> push incremental deltas to DPs (with shutdown).
+    //
+    // Uses the same incremental polling strategy as database mode: indexed
+    // `updated_at > ?` queries + lightweight ID queries for deletion detection.
+    // Deltas are broadcast as DELTA updates; DPs apply them via apply_incremental.
+    // Falls back to FULL_SNAPSHOT on incremental poll failure.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let config_poll = config_arc.clone();
@@ -224,27 +229,102 @@ pub async fn run(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.tick().await; // skip first immediate tick
+
+        // Seed incremental state from the initial config load
+        let initial_config = config_poll.load_full();
+        let (
+            mut known_proxy_ids,
+            mut known_consumer_ids,
+            mut known_plugin_config_ids,
+            mut known_upstream_ids,
+        ) = DatabaseStore::extract_known_ids(&initial_config);
+        let mut last_poll_at: Option<chrono::DateTime<chrono::Utc>> =
+            Some(initial_config.loaded_at);
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    match db_poll.load_full_config().await {
-                        Ok(new_config) => {
-                            let current = config_poll.load();
-                            let config_changed = current.loaded_at != new_config.loaded_at;
-                            // Store config before broadcasting so that a DP calling
-                            // GetFullConfig immediately after receiving the broadcast
-                            // reads the new version (not the stale one).
-                            config_poll.store(Arc::new(new_config.clone()));
-                            if config_changed {
-                                CpGrpcServer::broadcast_update(&update_tx, &new_config);
-                                info!("Configuration reloaded from database and pushed to DPs");
+                    if let Some(since) = last_poll_at {
+                        // Incremental poll — only fetch changes since last poll
+                        match db_poll.load_incremental_config(
+                            since,
+                            &known_proxy_ids,
+                            &known_consumer_ids,
+                            &known_plugin_config_ids,
+                            &known_upstream_ids,
+                        ).await {
+                            Ok(result) => {
+                                if result.is_empty() {
+                                    last_poll_at = Some(result.poll_timestamp);
+                                    continue;
+                                }
+                                let poll_ts = result.poll_timestamp;
+
+                                // Update known IDs (add new, remove deleted)
+                                update_known_ids(
+                                    &mut known_proxy_ids,
+                                    &result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect(),
+                                    &result.removed_proxy_ids,
+                                );
+                                update_known_ids(
+                                    &mut known_consumer_ids,
+                                    &result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect(),
+                                    &result.removed_consumer_ids,
+                                );
+                                update_known_ids(
+                                    &mut known_plugin_config_ids,
+                                    &result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect(),
+                                    &result.removed_plugin_config_ids,
+                                );
+                                update_known_ids(
+                                    &mut known_upstream_ids,
+                                    &result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect(),
+                                    &result.removed_upstream_ids,
+                                );
+
+                                // Broadcast delta to DPs before updating local config
+                                // so that a DP calling GetFullConfig immediately after
+                                // receives the new version.
+                                let version = poll_ts.to_rfc3339();
+                                CpGrpcServer::broadcast_delta(&update_tx, &result, &version);
+
+                                // Apply to CP's own in-memory config (for GetFullConfig
+                                // and the Admin API cached_config reads).
+                                // Clone current config, apply incremental changes, store.
+                                let mut new_config = (*config_poll.load_full()).clone();
+                                apply_incremental_to_config(&mut new_config, result);
+                                new_config.loaded_at = poll_ts;
+                                config_poll.store(Arc::new(new_config));
+
+                                info!("Incremental config update pushed to DPs");
+                                last_poll_at = Some(poll_ts);
                             }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to reload config from database (serving cached): {}",
-                                e
-                            );
+                            Err(e) => {
+                                warn!(
+                                    "Incremental poll failed, falling back to full reload: {}",
+                                    e
+                                );
+                                // Fallback to full config load + full snapshot broadcast
+                                match db_poll.load_full_config().await {
+                                    Ok(new_config) => {
+                                        let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                        known_proxy_ids = p;
+                                        known_consumer_ids = c;
+                                        known_plugin_config_ids = pc;
+                                        known_upstream_ids = u;
+                                        last_poll_at = Some(new_config.loaded_at);
+                                        config_poll.store(Arc::new(new_config.clone()));
+                                        CpGrpcServer::broadcast_update(&update_tx, &new_config);
+                                        info!("Configuration reloaded from database (full fallback) and pushed to DPs");
+                                    }
+                                    Err(e2) => {
+                                        warn!(
+                                            "Full config reload also failed (serving cached): {}",
+                                            e2
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -269,4 +349,102 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Apply an incremental result to a config snapshot in-place.
+///
+/// Removes deleted resources by ID, then upserts added/modified resources.
+/// This keeps the CP's in-memory config in sync without a full DB reload.
+fn apply_incremental_to_config(
+    config: &mut crate::config::types::GatewayConfig,
+    result: crate::config::db_loader::IncrementalResult,
+) {
+    use std::collections::HashSet;
+
+    // Remove deleted resources
+    let removed_proxies: HashSet<&str> = result
+        .removed_proxy_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let removed_consumers: HashSet<&str> = result
+        .removed_consumer_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let removed_plugins: HashSet<&str> = result
+        .removed_plugin_config_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let removed_upstreams: HashSet<&str> = result
+        .removed_upstream_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    config
+        .proxies
+        .retain(|p| !removed_proxies.contains(p.id.as_str()));
+    config
+        .consumers
+        .retain(|c| !removed_consumers.contains(c.id.as_str()));
+    config
+        .plugin_configs
+        .retain(|pc| !removed_plugins.contains(pc.id.as_str()));
+    config
+        .upstreams
+        .retain(|u| !removed_upstreams.contains(u.id.as_str()));
+
+    // Upsert added/modified resources using index for O(1) lookups
+    upsert_by_id(&mut config.proxies, result.added_or_modified_proxies, |p| {
+        p.id.clone()
+    });
+    upsert_by_id(
+        &mut config.consumers,
+        result.added_or_modified_consumers,
+        |c| c.id.clone(),
+    );
+    upsert_by_id(
+        &mut config.plugin_configs,
+        result.added_or_modified_plugin_configs,
+        |pc| pc.id.clone(),
+    );
+    upsert_by_id(
+        &mut config.upstreams,
+        result.added_or_modified_upstreams,
+        |u| u.id.clone(),
+    );
+}
+
+/// Upsert items into a vec by ID: replace existing entries, append new ones.
+fn upsert_by_id<T>(existing: &mut Vec<T>, updates: Vec<T>, get_id: fn(&T) -> String) {
+    let index: std::collections::HashMap<String, usize> = existing
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (get_id(item), i))
+        .collect();
+
+    for item in updates {
+        let id = get_id(&item);
+        if let Some(&pos) = index.get(&id) {
+            existing[pos] = item;
+        } else {
+            existing.push(item);
+        }
+    }
+}
+
+/// Update a known ID set by adding new IDs and removing deleted ones.
+fn update_known_ids(
+    known: &mut std::collections::HashSet<String>,
+    added: &Vec<String>,
+    removed: &[String],
+) {
+    for id in removed {
+        known.remove(id);
+    }
+    for id in added {
+        known.insert(id.clone());
+    }
 }

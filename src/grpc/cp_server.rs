@@ -60,7 +60,7 @@ impl CpGrpcServer {
         ConfigSyncServer::new(self)
     }
 
-    /// Broadcast a config update to all connected DPs.
+    /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
         let config_json = match serde_json::to_string(config) {
             Ok(json) => json,
@@ -73,6 +73,31 @@ impl CpGrpcServer {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
             version: config.loaded_at.to_rfc3339(),
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        let _ = tx.send(update);
+    }
+
+    /// Broadcast an incremental delta to all connected DPs.
+    ///
+    /// Sends only the resources that changed (added/modified/removed) instead
+    /// of the full config. DPs apply the delta via `ProxyState::apply_incremental`.
+    pub fn broadcast_delta(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        result: &crate::config::db_loader::IncrementalResult,
+        version: &str,
+    ) {
+        let config_json = match serde_json::to_string(result) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to serialize delta for broadcast: {}", e);
+                return;
+            }
+        };
+        let update = ConfigUpdate {
+            update_type: 1, // DELTA
+            config_json,
+            version: version.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
         };
         let _ = tx.send(update);
