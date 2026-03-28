@@ -1612,6 +1612,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "jsonwebtoken",
+ "percent-encoding",
  "pin-project-lite",
  "prost",
  "quinn",

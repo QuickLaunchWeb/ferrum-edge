@@ -357,13 +357,23 @@ async fn run_discovery_loop(
     }
 }
 
-/// Check if two target lists are equivalent (same host:port pairs, ignoring order).
+/// Check if two target lists are equivalent (same host:port:weight and tags, ignoring order).
 pub fn targets_equal(a: &[UpstreamTarget], b: &[UpstreamTarget]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut a_keys: Vec<String> = a.iter().map(|t| format!("{}:{}", t.host, t.port)).collect();
-    let mut b_keys: Vec<String> = b.iter().map(|t| format!("{}:{}", t.host, t.port)).collect();
+    // Build a sortable key that includes host, port, weight, and tags
+    fn sort_key(t: &UpstreamTarget) -> String {
+        let mut tag_pairs: Vec<(&str, &str)> = t
+            .tags
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        tag_pairs.sort();
+        format!("{}:{}:{}:{:?}", t.host, t.port, t.weight, tag_pairs)
+    }
+    let mut a_keys: Vec<String> = a.iter().map(sort_key).collect();
+    let mut b_keys: Vec<String> = b.iter().map(sort_key).collect();
     a_keys.sort();
     b_keys.sort();
     a_keys == b_keys

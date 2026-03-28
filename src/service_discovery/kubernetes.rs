@@ -9,8 +9,45 @@
 //! `FERRUM_TLS_NO_VERIFY` setting.
 
 use crate::config::types::UpstreamTarget;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use tracing::debug;
+
+/// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
+const PATH_SEGMENT_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'@')
+    .add(b'{')
+    .add(b'}')
+    .add(b'<')
+    .add(b'>')
+    .add(b'^')
+    .add(b'`')
+    .add(b'|');
+
+/// Characters that must be percent-encoded in a URL query parameter value.
+const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'=')
+    .add(b'{')
+    .add(b'}')
+    .add(b'<')
+    .add(b'>')
+    .add(b'^')
+    .add(b'`')
+    .add(b'|');
 
 /// Kubernetes service discoverer.
 ///
@@ -80,17 +117,25 @@ impl KubernetesDiscoverer {
             }
         };
 
+        let encoded_ns = utf8_percent_encode(&self.namespace, PATH_SEGMENT_ENCODE).to_string();
         let mut url = format!(
             "{}/apis/discovery.k8s.io/v1/namespaces/{}/endpointslices",
-            base, self.namespace
+            base, encoded_ns
         );
 
-        // Build label selector: always filter by service name
+        // Build label selector: always filter by service name.
+        // The service name is embedded as a label selector value — encode only
+        // the value portion, not the key or operators.
         let mut selectors = vec![format!("kubernetes.io/service-name={}", self.service_name)];
         if let Some(ref extra) = self.label_selector {
             selectors.push(extra.clone());
         }
-        url.push_str(&format!("?labelSelector={}", selectors.join(",")));
+        // Encode the entire labelSelector query value (commas, equals, slashes
+        // are valid within a Kubernetes label selector and the K8s API expects
+        // them unescaped, so we only encode characters unsafe in query values).
+        let joined = selectors.join(",");
+        let encoded_selector = utf8_percent_encode(&joined, QUERY_VALUE_ENCODE).to_string();
+        url.push_str(&format!("?labelSelector={}", encoded_selector));
 
         url
     }

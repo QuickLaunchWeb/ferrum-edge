@@ -81,6 +81,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 hickory-resolver = { version = "0.25", features = ["tokio", "system-config"] }
 base64 = "0.22"
 url = "2"
+percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"

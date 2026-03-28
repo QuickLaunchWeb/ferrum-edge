@@ -10,9 +10,47 @@
 //! `FERRUM_TLS_NO_VERIFY` setting.
 
 use crate::config::types::UpstreamTarget;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+/// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
+/// Encodes everything except unreserved chars and sub-delims that are safe in path segments.
+const PATH_SEGMENT_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'?')
+    .add(b'[')
+    .add(b']')
+    .add(b'@')
+    .add(b'{')
+    .add(b'}')
+    .add(b'<')
+    .add(b'>')
+    .add(b'^')
+    .add(b'`')
+    .add(b'|');
+
+/// Characters that must be percent-encoded in a URL query parameter value.
+const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'+')
+    .add(b'=')
+    .add(b'{')
+    .add(b'}')
+    .add(b'<')
+    .add(b'>')
+    .add(b'^')
+    .add(b'`')
+    .add(b'|');
 
 /// Consul service discoverer.
 ///
@@ -57,17 +95,32 @@ impl ConsulDiscoverer {
     }
 
     fn build_url(&self) -> String {
-        let mut url = format!("{}/v1/health/service/{}", self.address, self.service_name);
+        use std::fmt::Write;
+
+        let encoded_service =
+            utf8_percent_encode(&self.service_name, PATH_SEGMENT_ENCODE).to_string();
+        let mut url = format!("{}/v1/health/service/{}", self.address, encoded_service);
 
         let mut params = Vec::new();
         if self.healthy_only {
             params.push("passing=true".to_string());
         }
         if let Some(ref dc) = self.datacenter {
-            params.push(format!("dc={}", dc));
+            let encoded = utf8_percent_encode(dc, QUERY_VALUE_ENCODE);
+            params.push(format!("dc={}", encoded));
         }
         if let Some(ref tag) = self.tag {
-            params.push(format!("tag={}", tag));
+            let encoded = utf8_percent_encode(tag, QUERY_VALUE_ENCODE);
+            params.push(format!("tag={}", encoded));
+        }
+
+        // Use blocking query if we have a previous index
+        let last = self.last_index.load(Ordering::Relaxed);
+        if last > 0 {
+            let mut param = String::new();
+            write!(param, "index={}", last).ok();
+            params.push(param);
+            params.push("wait=30s".to_string());
         }
 
         if !params.is_empty() {
