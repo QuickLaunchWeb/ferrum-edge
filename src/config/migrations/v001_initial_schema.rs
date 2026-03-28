@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat_hosts_service_discovery_allowed_methods"
+        "v001_initial_schema"
     }
 }
 
