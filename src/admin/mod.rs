@@ -999,6 +999,27 @@ async fn handle_create_consumer(
         }
     }
 
+    // Check mTLS identity uniqueness (stored in JSON, no DB constraint)
+    if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+        && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
+    {
+        match db.check_mtls_identity_unique(identity, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A consumer with this mTLS identity already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
     match db.create_consumer(&consumer).await {
         Ok(_) => Ok(json_response(
             StatusCode::CREATED,
@@ -1135,6 +1156,27 @@ async fn handle_update_consumer(
         }
     }
 
+    // Check mTLS identity uniqueness excluding self (stored in JSON, no DB constraint)
+    if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+        && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
+    {
+        match db.check_mtls_identity_unique(identity, Some(id)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A consumer with this mTLS identity already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
     match db.update_consumer(&consumer).await {
         Ok(_) => Ok(json_response(
             StatusCode::OK,
@@ -1251,6 +1293,29 @@ async fn handle_update_credentials(
                         return Ok(json_response(
                             StatusCode::CONFLICT,
                             &json!({"error": "A consumer with this API key already exists"}),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": format!("Database error: {}", e)}),
+                        ));
+                    }
+                }
+            }
+            // Check mTLS identity uniqueness before updating (no DB constraint)
+            if cred_type == "mtls_auth"
+                && let Some(identity) = hashed_cred.get("identity").and_then(|i| i.as_str())
+            {
+                match db
+                    .check_mtls_identity_unique(identity, Some(consumer_id))
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(json_response(
+                            StatusCode::CONFLICT,
+                            &json!({"error": "A consumer with this mTLS identity already exists"}),
                         ));
                     }
                     Err(e) => {

@@ -349,6 +349,79 @@ fn test_unique_consumer_credentials_no_keyauth_ok() {
     assert!(config.validate_unique_consumer_credentials().is_ok());
 }
 
+#[test]
+fn test_unique_consumer_credentials_duplicate_basicauth() {
+    // Two consumers with basicauth and the same username should conflict
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$abc"}),
+    );
+    let mut c2 = make_consumer("c2", "alice");
+    c2.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$def"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate basicauth username"));
+}
+
+#[test]
+fn test_unique_consumer_credentials_basicauth_different_usernames_ok() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$abc"}),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$def"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
+#[test]
+fn test_unique_consumer_credentials_duplicate_mtls_identity() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client1"}),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client1"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate mtls_auth identity"));
+}
+
+#[test]
+fn test_unique_consumer_credentials_mtls_different_identities_ok() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client1"}),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client2"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
 // ---- Consumer identity uniqueness tests ----
 
 #[test]

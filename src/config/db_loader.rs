@@ -263,6 +263,21 @@ impl DatabaseStore {
             );
         }
 
+        // Defense-in-depth: validate consumer identity and credential uniqueness.
+        // The database schema has UNIQUE constraints, but if data was imported or
+        // the schema was modified, duplicates could exist. Log warnings instead of
+        // failing startup so the gateway can still serve with the DB's data.
+        if let Err(errors) = config.validate_unique_consumer_identities() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
+        }
+        if let Err(errors) = config.validate_unique_consumer_credentials() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
+        }
+
         // Normalize stream proxy listen_paths to synthetic values (__tcp:PORT, __udp:PORT)
         config.normalize_stream_proxy_paths();
 
@@ -1022,6 +1037,50 @@ impl DatabaseStore {
                     .and_then(|k| k.get("key"))
                     .and_then(|k| k.as_str())
                 && key == api_key
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Check that an mTLS identity is not already used by another consumer.
+    ///
+    /// mTLS identities are stored inside the credentials JSON blob, so there is
+    /// no database-level UNIQUE constraint — this application-level check is
+    /// the only enforcement.
+    ///
+    /// Returns `true` if the identity is unique (safe to insert/update).
+    pub async fn check_mtls_identity_unique(
+        &self,
+        mtls_identity: &str,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
+            .fetch_all(&self.pool)
+            .await?;
+
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            if let Some(eid) = exclude_consumer_id
+                && id == eid
+            {
+                continue;
+            }
+            let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
+                warn!(
+                    "Failed to read credentials column for consumer {}: {}",
+                    id, e
+                );
+                String::new()
+            });
+            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str)
+                && let Some(identity) = creds
+                    .get("mtls_auth")
+                    .and_then(|m| m.get("identity"))
+                    .and_then(|i| i.as_str())
+                && identity == mtls_identity
             {
                 return Ok(false);
             }
