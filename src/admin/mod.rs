@@ -581,6 +581,30 @@ async fn handle_create_proxy(
         }
     }
 
+    // Validate and normalize allowed_methods
+    if let Some(ref mut methods) = proxy.allowed_methods {
+        if methods.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "allowed_methods must be null (allow all) or a non-empty array"}),
+            ));
+        }
+        for m in methods.iter_mut() {
+            *m = m.to_uppercase();
+        }
+        let valid = [
+            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+        ];
+        for m in methods.iter() {
+            if !valid.contains(&m.as_str()) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid HTTP method: {}", m)}),
+                ));
+            }
+        }
+    }
+
     if proxy.id.is_empty() {
         proxy.id = Uuid::new_v4().to_string();
     } else if let Err(msg) = validate_resource_id(&proxy.id) {
@@ -848,6 +872,30 @@ async fn handle_update_proxy(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
             ));
+        }
+    }
+
+    // Validate and normalize allowed_methods
+    if let Some(ref mut methods) = proxy.allowed_methods {
+        if methods.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "allowed_methods must be null (allow all) or a non-empty array"}),
+            ));
+        }
+        for m in methods.iter_mut() {
+            *m = m.to_uppercase();
+        }
+        let valid = [
+            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+        ];
+        for m in methods.iter() {
+            if !valid.contains(&m.as_str()) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid HTTP method: {}", m)}),
+                ));
+            }
         }
     }
 

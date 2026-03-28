@@ -371,6 +371,23 @@ async fn handle_h3_request(
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Per-proxy HTTP method filtering (checked before plugins to save work)
+    if let Some(ref allowed) = proxy.allowed_methods
+        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+    {
+        record_request(&state, 405);
+        let mut headers = HashMap::new();
+        headers.insert("allow".to_string(), allowed.join(", "));
+        send_h3_reject_response(
+            &mut stream,
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"Method Not Allowed"}"#,
+            &headers,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Get pre-resolved plugins from cache (O(1) lookup)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 

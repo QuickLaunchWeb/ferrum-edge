@@ -50,6 +50,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -146,6 +147,7 @@ fn test_unique_listen_paths_valid() {
                 listen_port: None,
                 frontend_tls: false,
                 udp_idle_timeout_seconds: 60,
+                allowed_methods: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -191,6 +193,7 @@ fn test_unique_listen_paths_valid() {
                 listen_port: None,
                 frontend_tls: false,
                 udp_idle_timeout_seconds: 60,
+                allowed_methods: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -250,6 +253,7 @@ fn test_unique_listen_paths_duplicate() {
                 listen_port: None,
                 frontend_tls: false,
                 udp_idle_timeout_seconds: 60,
+                allowed_methods: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -295,6 +299,7 @@ fn test_unique_listen_paths_duplicate() {
                 listen_port: None,
                 frontend_tls: false,
                 udp_idle_timeout_seconds: 60,
+                allowed_methods: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -1173,4 +1178,68 @@ fn test_restore_payload_accepts_valid_upstream_reference() {
     config.proxies = vec![p];
     config.upstreams = vec![make_upstream("u1")];
     assert!(config.validate_upstream_references().is_ok());
+}
+
+// --- allowed_methods tests ---
+
+#[test]
+fn test_proxy_allowed_methods_defaults_to_none() {
+    let p = make_proxy("p1", "/api");
+    assert!(p.allowed_methods.is_none());
+}
+
+#[test]
+fn test_proxy_allowed_methods_deserialize_with_methods() {
+    let json = serde_json::json!({
+        "id": "p1",
+        "listen_path": "/api",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 3000,
+        "allowed_methods": ["GET", "POST"]
+    });
+    let proxy: Proxy = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        proxy.allowed_methods,
+        Some(vec!["GET".to_string(), "POST".to_string()])
+    );
+}
+
+#[test]
+fn test_proxy_allowed_methods_deserialize_null() {
+    let json = serde_json::json!({
+        "id": "p1",
+        "listen_path": "/api",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 3000,
+        "allowed_methods": null
+    });
+    let proxy: Proxy = serde_json::from_value(json).unwrap();
+    assert!(proxy.allowed_methods.is_none());
+}
+
+#[test]
+fn test_proxy_allowed_methods_deserialize_omitted() {
+    let json = serde_json::json!({
+        "id": "p1",
+        "listen_path": "/api",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 3000
+    });
+    let proxy: Proxy = serde_json::from_value(json).unwrap();
+    assert!(proxy.allowed_methods.is_none());
+}
+
+#[test]
+fn test_proxy_allowed_methods_roundtrip_serialization() {
+    let mut p = make_proxy("p1", "/api");
+    p.allowed_methods = Some(vec!["GET".into(), "HEAD".into()]);
+    let json = serde_json::to_string(&p).unwrap();
+    let deserialized: Proxy = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        deserialized.allowed_methods,
+        Some(vec!["GET".to_string(), "HEAD".to_string()])
+    );
 }

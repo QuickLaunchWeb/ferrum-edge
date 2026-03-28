@@ -83,6 +83,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

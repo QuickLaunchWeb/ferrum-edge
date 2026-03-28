@@ -1852,6 +1852,25 @@ pub async fn handle_proxy_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
+    // Per-proxy HTTP method filtering (checked before plugins to save work)
+    if let Some(ref allowed) = proxy.allowed_methods
+        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+    {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        record_status(&state, 405);
+        let allow_header = allowed.join(", ");
+        let mut resp = build_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"Method Not Allowed"}"#,
+        );
+        resp.headers_mut().insert(
+            hyper::header::ALLOW,
+            hyper::header::HeaderValue::from_str(&allow_header)
+                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("")),
+        );
+        return Ok(resp);
+    }
+
     // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 

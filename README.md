@@ -1517,6 +1517,8 @@ Ferrum uses **longest prefix matching** on `listen_path` values. All paths must 
 
 Proxies may optionally specify a `hosts` list to restrict matching to specific hostnames. Exact hostnames and wildcard prefixes (e.g., `*.example.com`) are supported. An empty `hosts` list (the default) matches all hosts.
 
+Proxies may also specify an `allowed_methods` list (e.g., `["GET", "POST"]`) to restrict which HTTP methods are accepted. When set, requests with disallowed methods receive `405 Method Not Allowed` with an `Allow` header. When omitted or `null` (the default), all methods are allowed.
+
 ### Path Forwarding
 
 - **`strip_listen_path: true`** (default): Strips the matched prefix, forwarding only the remainder

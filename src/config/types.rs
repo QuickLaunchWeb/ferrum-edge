@@ -638,6 +638,11 @@ pub struct Proxy {
     /// the UDP session mapping is removed. Default: 60 seconds.
     #[serde(default = "default_udp_idle_timeout")]
     pub udp_idle_timeout_seconds: u64,
+    /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
+    /// When `None` (default), all methods are allowed. When `Some`, requests
+    /// with methods not in the list receive 405 Method Not Allowed.
+    #[serde(default)]
+    pub allowed_methods: Option<Vec<String>>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
