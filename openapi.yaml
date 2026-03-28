@@ -1255,6 +1255,18 @@ components:
           description: |
             UDP session idle timeout in seconds. After this duration of inactivity,
             the UDP session mapping is removed. Only applicable for udp/dtls protocols.
+        allowed_methods:
+          oneOf:
+            - type: array
+              items:
+                type: string
+                enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT]
+            - type: "null"
+          default: null
+          description: |
+            Optional list of HTTP methods this proxy accepts. When null (default),
+            all methods are allowed. When set, requests with methods not in the list
+            receive 405 Method Not Allowed before any plugin processing.
         circuit_breaker:
           oneOf:
             - $ref: "#/components/schemas/CircuitBreakerConfig"

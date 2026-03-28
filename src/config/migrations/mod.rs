@@ -54,9 +54,9 @@ impl MigrationRunner {
 
     /// Build the ordered list of all known migrations.
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
-        vec![Box::new(MigrationEntryV001(
-            v001_initial_schema::V001InitialSchema,
-        ))]
+        vec![
+            Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
+        ]
     }
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
@@ -318,3 +318,4 @@ impl MigrationEntry for MigrationEntryV001 {
         Box::pin(self.0.up(pool, db_type))
     }
 }
+

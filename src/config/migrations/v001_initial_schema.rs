@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat_hosts_service_discovery"
+        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes_mysql_compat_hosts_service_discovery_allowed_methods"
     }
 }
 
@@ -139,6 +139,7 @@ impl V001InitialSchema {
                 listen_port INTEGER,
                 frontend_tls INTEGER NOT NULL DEFAULT 0,
                 udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                allowed_methods TEXT,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT
@@ -187,6 +188,7 @@ impl V001InitialSchema {
                 listen_port INTEGER,
                 frontend_tls INTEGER NOT NULL DEFAULT 0,
                 udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                allowed_methods TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

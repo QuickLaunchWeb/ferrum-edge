@@ -91,6 +91,7 @@ fn create_http3_test_proxy() -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        allowed_methods: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

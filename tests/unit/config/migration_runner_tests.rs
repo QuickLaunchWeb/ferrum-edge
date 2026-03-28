@@ -54,10 +54,10 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should NOT be applied (bootstrapped instead), no other migrations pending
+    // V1 should NOT be applied (bootstrapped instead)
     assert!(applied.is_empty());
 
-    // Check that V1 is recorded as applied (via bootstrap)
+    // Check that V1 (bootstrapped) is recorded
     let status = runner.status().await.unwrap();
     assert_eq!(status.applied.len(), 1);
     assert_eq!(status.applied[0].version, 1);
