@@ -1381,14 +1381,8 @@ async fn handle_delete_consumer(
 }
 
 /// Allowed credential types for consumer authentication plugins.
-pub const ALLOWED_CREDENTIAL_TYPES: &[&str] = &[
-    "basicauth",
-    "keyauth",
-    "jwt",
-    "hmac_auth",
-    "oauth2",
-    "mtls_auth",
-];
+pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
+    &["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
 
 async fn handle_update_credentials(
     state: &AdminState,
@@ -2986,13 +2980,6 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         && obj.contains_key("secret")
     {
         obj.insert("secret".to_string(), json!("[REDACTED]"));
-    }
-    // Redact OAuth2 client secret
-    if let Some(oauth2) = redacted.credentials.get_mut("oauth2")
-        && let Some(obj) = oauth2.as_object_mut()
-        && obj.contains_key("client_secret")
-    {
-        obj.insert("client_secret".to_string(), json!("[REDACTED]"));
     }
     // Redact JWT auth secret
     if let Some(jwt) = redacted.credentials.get_mut("jwt")

@@ -390,7 +390,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DTLS_CERT_PATH` | No | — | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519 only) |
 | `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | No | — | PEM CA certificate for verifying DTLS client certs (frontend mTLS) |
-| `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls (http_logging, oauth2, JWKS, OTLP) |
+| `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls (http_logging, JWKS fetch, OTLP) |
 
 See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
 
@@ -988,7 +988,7 @@ Both `/health` and `/status` return the same response and do not require JWT aut
 Plugins execute in a defined pipeline for each request:
 
 1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, rate limiting)
-2. **`authenticate`** — Identifies the consumer (JWT, API Key, Basic Auth, OAuth2)
+2. **`authenticate`** — Identifies the consumer (JWKS, JWT, API Key, Basic Auth)
 3. **`authorize`** — Checks consumer permissions (Access Control)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
 5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
@@ -1001,7 +1001,7 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 | Priority | Band | Plugins |
 |----------|------|---------|
 | 100 | Early | `cors`, `ip_restriction`, `bot_detection` |
-| 1000-1400 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
+| 1000-1400 | Authentication | `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
 | 2000 | Authorization | `access_control` |
 | 2850 | Authorization | `graphql` (depth, complexity, per-operation rate limiting) |
 | 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
@@ -1136,18 +1136,29 @@ credentials:
     password_hash: "$2b$12$..." # bcrypt hash
 ```
 
-#### `oauth2_auth`
+#### `jwks_auth`
 
-Authenticates using OAuth2 Bearer tokens via introspection or local JWKS-style validation.
+Authenticates using Bearer JWTs validated against one or more Identity Provider JWKS endpoints. Supports multi-provider configurations with per-provider claim-based authorization (scopes/roles).
 
 **Config**:
 | Parameter | Type | Description |
 |---|---|---|
-| `validation_mode` | String | `introspection` or `jwks` |
-| `introspection_url` | String | Token introspection endpoint URL |
-| `jwks_uri` | String | JWKS URI for key retrieval |
-| `expected_issuer` | String (optional) | Expected JWT issuer |
-| `expected_audience` | String (optional) | Expected JWT audience |
+| `providers` | Array | Array of identity provider configurations (required) |
+| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
+| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`) |
+| `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
+| `providers[].audience` | String (optional) | Expected JWT `aud` claim |
+| `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in the token |
+| `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token |
+| `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path |
+| `providers[].role_claim` | String (optional) | Per-provider override for role claim path |
+| `scope_claim` | String | Global scope claim path (default: `"scope"`) |
+| `role_claim` | String | Global role claim path (default: `"roles"`) |
+| `consumer_identity_claim` | String | JWT claim for consumer lookup and rate-limit key (default: `"sub"`) |
+| `consumer_header_claim` | String | JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `300`) |
+
+Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths (e.g., `realm_access.roles` for Keycloak).
 
 #### `access_control`
 
@@ -1437,7 +1448,7 @@ Set `backend_protocol: ws` or `wss`. Ferrum handles the HTTP Upgrade and proxies
 
 Set `backend_protocol: grpc` (cleartext h2c) or `grpcs` (TLS with ALPN h2). Ferrum uses hyper's HTTP/2 client directly to proxy gRPC requests with full trailer support (`grpc-status`, `grpc-message`).
 
-**How it works**: gRPC runs on HTTP/2, so the gateway transparently forwards HTTP/2 frames — it does not need to understand protobuf. gRPC metadata maps directly to HTTP/2 headers, so all existing auth plugins (JWT, API key, Basic, OAuth2) work unchanged with gRPC. Clients send `authorization: Bearer <token>` as gRPC metadata, which plugins already inspect.
+**How it works**: gRPC runs on HTTP/2, so the gateway transparently forwards HTTP/2 frames — it does not need to understand protobuf. gRPC metadata maps directly to HTTP/2 headers, so all existing auth plugins (JWKS, JWT, API key, Basic) work unchanged with gRPC. Clients send `authorization: Bearer <token>` as gRPC metadata, which plugins already inspect.
 
 **Configuration example** (YAML):
 ```yaml
@@ -1519,7 +1530,7 @@ FERRUM_DB_CONFIG_BACKUP_PATH=/etc/ferrum/backup-config.json
 - Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
 - Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
 - Non-blocking startup warmup resolves all backend, upstream, and plugin endpoint hostnames (deduplicated)
-- Shared DNS cache for plugin outbound calls (http_logging, oauth2_auth, etc.) via custom reqwest resolver
+- Shared DNS cache for plugin outbound calls (http_logging, jwks_auth, etc.) via custom reqwest resolver
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
 ### HTTP/3 (QUIC) Support

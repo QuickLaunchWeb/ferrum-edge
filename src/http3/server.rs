@@ -579,7 +579,11 @@ async fn handle_h3_request(
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        consumer_username: ctx
+            .identified_consumer
+            .as_ref()
+            .map(|c| c.username.clone())
+            .or_else(|| ctx.authenticated_identity.clone()),
         http_method: method,
         request_path: path,
         matched_proxy_id: Some(proxy.id.clone()),

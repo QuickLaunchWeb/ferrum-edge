@@ -116,7 +116,7 @@ pub async fn run(
     // cache, then collect plugin hostnames to include in warmup.
     let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone())?;
 
-    // Collect plugin endpoint hostnames (http_logging, oauth2_auth, etc.)
+    // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
     for host in plugin_hosts {
         hostnames.push((host, None, None));

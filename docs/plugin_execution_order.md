@@ -16,7 +16,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 2. authenticate         │  Identity verification: JWT, OAuth2, API key, Basic
+│ 2. authenticate         │  Identity verification: JWKS, JWT, API key, Basic
 └────────────┬────────────┘
              │
              ▼
@@ -56,7 +56,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
 | **Early** | 0–999 | Pre-processing that must run before auth | `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
-| **AuthN** | 1000–1999 | Authentication / identity verification | `oauth2_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
+| **AuthN** | 1000–1999 | Authentication / identity verification | `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
 | **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900) |
 | **Transform** | 3000–3999 | Request modification before backend call | `request_transformer` (3000), `body_validator` (3100), `request_termination` (3200) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000) |
@@ -72,7 +72,7 @@ Given all built-in plugins enabled, the execution order is:
 | 1 | `cors` | 100 | on_request_received, after_proxy |
 | 2 | `ip_restriction` | 150 | on_request_received |
 | 3 | `bot_detection` | 200 | on_request_received |
-| 4 | `oauth2_auth` | 1000 | authenticate |
+| 4 | `jwks_auth` | 1000 | authenticate |
 | 5 | `jwt_auth` | 1100 | authenticate |
 | 6 | `key_auth` | 1200 | authenticate |
 | 7 | `basic_auth` | 1300 | authenticate |
@@ -209,7 +209,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
-| `oauth2_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
+| `jwks_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
@@ -291,7 +291,7 @@ Body transformation only applies to JSON bodies (detected by `Content-Type` cont
 
 All plugins in the execution pipeline work transparently with gRPC requests. gRPC metadata maps directly to HTTP/2 headers, so:
 
-- **Authentication plugins** (JWT, OAuth2, API key, Basic) inspect the `authorization` header, which gRPC clients send as metadata.
+- **Authentication plugins** (JWKS, JWT, API key, Basic) inspect the `authorization` header, which gRPC clients send as metadata.
 - **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.
 - **Request/Response transformers** can add, modify, or remove gRPC metadata (HTTP/2 headers).
 - **Logging plugins** receive the same `TransactionSummary` with the gRPC path (e.g., `/my.Service/MyMethod`) and HTTP status.

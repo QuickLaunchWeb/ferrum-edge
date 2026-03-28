@@ -17,7 +17,7 @@ pub struct ConsumerIndex {
     identity_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
     /// mTLS identity index: maps `mtls_auth.identity` → Consumer for O(1) cert-based auth.
     mtls_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
-    /// Full consumer list for plugins that need iteration (jwt_auth, oauth2_auth)
+    /// Full consumer list for plugins that need iteration (jwt_auth, jwks_auth)
     all_consumers: ArcSwap<Vec<Arc<Consumer>>>,
 }
 
@@ -64,7 +64,7 @@ impl ConsumerIndex {
         idx.get(username).cloned()
     }
 
-    /// O(1) lookup by username or ID (for jwt_auth/oauth2_auth claim matching). No allocation.
+    /// O(1) lookup by username or ID (for jwt_auth/jwks_auth claim matching). No allocation.
     pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
         let idx = self.identity_index.load();
         idx.get(identity).cloned()
@@ -278,7 +278,7 @@ impl ConsumerIndex {
                 }
             }
 
-            // Index by username and id (for jwt/oauth2 claim matching)
+            // Index by username and id (for jwt/jwks claim matching)
             let prev = identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             if let Some(existing) = prev {
                 warn!(
@@ -294,7 +294,7 @@ impl ConsumerIndex {
                 {
                     error!(
                         "IDENTITY COLLISION: custom_id '{}' for consumer '{}' overwrites consumer '{}'. \
-                         This will cause incorrect OAuth2/JWT authentication. \
+                         This will cause incorrect JWKS/JWT authentication. \
                          Ensure custom_id values are unique across all consumers.",
                         custom_id, consumer.id, existing.id
                     );

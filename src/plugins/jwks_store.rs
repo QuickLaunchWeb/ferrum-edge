@@ -81,6 +81,11 @@ impl JwksKeyStore {
         }
     }
 
+    /// Get the JWKS URI this store fetches keys from.
+    pub fn jwks_uri(&self) -> &str {
+        &self.jwks_uri
+    }
+
     /// Look up a cached key by its key ID (`kid`).
     pub fn get_key(&self, kid: &str) -> Option<CachedJwk> {
         let keys = self.keys.load();

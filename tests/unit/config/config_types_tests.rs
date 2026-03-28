@@ -468,7 +468,7 @@ fn test_unique_consumer_identities_cross_namespace_collision() {
     let err = config.validate_unique_consumer_identities().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("collides with username"));
-    assert!(err[0].contains("incorrect JWT/OAuth2"));
+    assert!(err[0].contains("incorrect"));
 }
 
 #[test]

@@ -9,14 +9,7 @@ use serde_json::json;
 
 #[test]
 fn test_allowed_credential_types_contains_expected() {
-    let expected = &[
-        "basicauth",
-        "keyauth",
-        "jwt",
-        "hmac_auth",
-        "oauth2",
-        "mtls_auth",
-    ];
+    let expected = &["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
     for cred_type in expected {
         assert!(
             ferrum_gateway::admin::ALLOWED_CREDENTIAL_TYPES.contains(cred_type),
@@ -47,11 +40,11 @@ fn test_disallowed_credential_types_rejected() {
 
 #[test]
 fn test_credential_types_count() {
-    // Ensure we have exactly the 6 known credential types
+    // Ensure we have exactly the 5 known credential types
     assert_eq!(
         ferrum_gateway::admin::ALLOWED_CREDENTIAL_TYPES.len(),
-        6,
-        "Expected exactly 6 allowed credential types"
+        5,
+        "Expected exactly 5 allowed credential types"
     );
 }
 
@@ -98,21 +91,6 @@ fn test_redact_hmac_auth_secret() {
     let hmac = redacted.credentials.get("hmac_auth").unwrap();
     assert_eq!(hmac["secret"], "[REDACTED]");
     assert_eq!(hmac["username"], "bob");
-}
-
-#[test]
-fn test_redact_oauth2_client_secret() {
-    let mut credentials = std::collections::HashMap::new();
-    credentials.insert(
-        "oauth2".to_string(),
-        json!({"client_id": "app1", "client_secret": "topsecret"}),
-    );
-    let consumer = make_consumer(credentials);
-
-    let redacted = ferrum_gateway::admin::redact_consumer_credentials(&consumer);
-    let oauth2 = redacted.credentials.get("oauth2").unwrap();
-    assert_eq!(oauth2["client_secret"], "[REDACTED]");
-    assert_eq!(oauth2["client_id"], "app1");
 }
 
 #[test]

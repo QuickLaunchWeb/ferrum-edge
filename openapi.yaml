@@ -603,11 +603,11 @@ paths:
             - basicauth
             - key-auth
             - jwt
-            - oauth2
             - hmac_auth
+            - mtls_auth
         description: |
           Credential type to set or remove (e.g. `basicauth`, `key-auth`,
-          `jwt`, `oauth2`, `hmac_auth`).
+          `jwt`, `hmac_auth`, `mtls_auth`).
 
     put:
       operationId: updateConsumerCredentials
@@ -678,7 +678,7 @@ paths:
                 - stdout_logging
                 - http_logging
                 - transaction_debugger
-                - oauth2_auth
+                - jwks_auth
                 - jwt_auth
                 - key_auth
                 - basic_auth
@@ -1349,7 +1349,7 @@ components:
           description: >-
             Optional external identifier. Must be unique across all consumers when
             set. Empty strings are normalized to null. Must not collide with another
-            consumer's username (this would cause incorrect JWT/OAuth2 authentication).
+            consumer's username (this would cause incorrect JWKS/JWT authentication).
         credentials:
           type: object
           default: {}
@@ -1365,7 +1365,7 @@ components:
             | `basicauth` | `password` or `password_hash` (bcrypt/HMAC) | Indexed by consumer `username` (unique) |
             | `mtls_auth` | `identity` | `identity` must be globally unique |
             | `jwt_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` |
-            | `oauth2` | (identity from token claim) | Looked up by `username`, `id`, or `custom_id` |
+            | `jwks_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` (optional — consumer-less flow supported) |
             | `hmac_auth` | `secret` | Looked up by username in Authorization header |
         created_at:
           type: [string, "null"]
@@ -1406,7 +1406,7 @@ components:
           description: >-
             Plugin-specific JSON configuration. Validated when the plugin is
             instantiated at config reload time. Security plugins (key_auth,
-            basic_auth, jwt_auth, hmac_auth, oauth2_auth, mtls_auth,
+            basic_auth, jwt_auth, hmac_auth, jwks_auth, mtls_auth,
             access_control, ip_restriction) block gateway startup if their
             config is invalid.
         scope:

@@ -85,11 +85,13 @@ src/
 │   ├── hmac_auth.rs           # HMAC authentication
 │   ├── http_logging.rs        # HTTP endpoint logging
 │   ├── ip_restriction.rs      # IP-based access control
-│   ├── jwks_store.rs          # JWKS key store for JWT/OAuth2
+│   ├── jwks_auth.rs           # JWKS multi-provider JWT validation
+│   ├── jwks_cache.rs          # Global shared JWKS key store cache
+│   ├── jwks_store.rs          # JWKS key store with background refresh
 │   ├── jwt_auth.rs            # HS256 JWT authentication
 │   ├── key_auth.rs            # API key authentication
 │   ├── mtls_auth.rs           # Mutual TLS client certificate authentication
-│   ├── oauth2_auth.rs         # OAuth2 introspection/JWKS validation
+│   ├── oauth2_auth.rs         # OAuth2 introspection/JWKS validation (legacy)
 │   ├── otel_tracing.rs        # OpenTelemetry distributed tracing
 │   ├── prometheus_metrics.rs  # Prometheus metrics export
 │   ├── rate_limiting.rs       # In-memory rate limiting
@@ -339,7 +341,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 Extensible plugin architecture for authentication, authorization, and transformations:
 
 **23 Plugins Registered**:
-- **Authentication**: `jwt_auth`, `key_auth`, `basic_auth`, `oauth2_auth`, `hmac_auth`, `mtls_auth`
+- **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`
 - **Rate Limiting**: `rate_limiting`

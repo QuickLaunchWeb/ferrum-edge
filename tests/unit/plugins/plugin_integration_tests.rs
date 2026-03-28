@@ -57,6 +57,9 @@ async fn test_plugin_creation_all_plugins() {
         let config = match plugin_name {
             "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
             "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+            "jwks_auth" => {
+                json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})
+            }
             "oauth2_auth" => json!({"jwks_uri": "https://example.com/.well-known/jwks.json"}),
             "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
             "access_control" => json!({"allowed_ips": ["0.0.0.0/0"]}),

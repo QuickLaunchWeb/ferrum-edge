@@ -63,7 +63,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **API Key** — header or query parameter lookup
 - **Basic Auth** — bcrypt or HMAC-SHA256 password verification
 - **HMAC** — request signature verification
-- **OAuth2** — introspection and JWKS validation modes
+- **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization
 
 ### Authorization & Security Plugins
 
