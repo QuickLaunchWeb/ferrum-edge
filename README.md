@@ -349,7 +349,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DP_GRPC_AUTH_TOKEN` | DP mode | — | Pre-signed HS256 JWT for CP authentication |
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | No | `32768` | Maximum total request header size (all headers combined) |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | No | `16384` | Maximum size of any single request header (name + value) |
-| `FERRUM_MAX_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
+| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | No | `10485760` | Maximum response body size from backends (0=unlimited) |
 | `FERRUM_DNS_CACHE_TTL_SECONDS` | No | `300` | Default DNS cache TTL |
 | `FERRUM_DNS_OVERRIDES` | No | `{}` | JSON map of hostname→IP static overrides |
@@ -1516,6 +1516,8 @@ See [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the full developer guide, trait r
 Ferrum uses **longest prefix matching** on `listen_path` values. All paths must be unique. If no proxy matches, the gateway returns `404 Not Found`.
 
 Proxies may optionally specify a `hosts` list to restrict matching to specific hostnames. Exact hostnames and wildcard prefixes (e.g., `*.example.com`) are supported. An empty `hosts` list (the default) matches all hosts.
+
+Proxies may also specify an `allowed_methods` list (e.g., `["GET", "POST"]`) to restrict which HTTP methods are accepted. When set, requests with disallowed methods receive `405 Method Not Allowed` with an `Allow` header. When omitted or `null` (the default), all methods are allowed.
 
 ### Path Forwarding
 

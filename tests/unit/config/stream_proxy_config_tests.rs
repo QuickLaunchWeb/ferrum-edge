@@ -48,6 +48,7 @@ fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
         listen_port: Some(port),
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -96,6 +97,7 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

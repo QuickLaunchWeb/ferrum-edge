@@ -371,6 +371,23 @@ async fn handle_h3_request(
 
     ctx.matched_proxy = Some(Arc::clone(&proxy));
 
+    // Per-proxy HTTP method filtering (checked before plugins to save work)
+    if let Some(ref allowed) = proxy.allowed_methods
+        && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
+    {
+        record_request(&state, 405);
+        let mut headers = HashMap::new();
+        headers.insert("allow".to_string(), allowed.join(", "));
+        send_h3_reject_response(
+            &mut stream,
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"Method Not Allowed"}"#,
+            &headers,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Get pre-resolved plugins from cache (O(1) lookup)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
@@ -512,10 +529,10 @@ async fn handle_h3_request(
     }
 
     // Enforce request body size limit via Content-Length fast path
-    if state.max_body_size_bytes > 0
+    if state.max_request_body_size_bytes > 0
         && let Some(content_length) = ctx.headers.get("content-length")
         && let Ok(len) = content_length.parse::<usize>()
-        && len > state.max_body_size_bytes
+        && len > state.max_request_body_size_bytes
     {
         record_request(&state, 413);
         send_h3_response(
@@ -531,8 +548,8 @@ async fn handle_h3_request(
     let mut body_data = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
         let bytes = chunk.chunk();
-        if state.max_body_size_bytes > 0
-            && body_data.len() + bytes.len() > state.max_body_size_bytes
+        if state.max_request_body_size_bytes > 0
+            && body_data.len() + bytes.len() > state.max_request_body_size_bytes
         {
             record_request(&state, 413);
             send_h3_response(

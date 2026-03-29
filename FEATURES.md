@@ -25,6 +25,7 @@ A comprehensive feature list for Ferrum Gateway.
 - Host-based routing with exact and wildcard prefix support (`*.example.com`)
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
+- Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses
 
 ## Load Balancing
 

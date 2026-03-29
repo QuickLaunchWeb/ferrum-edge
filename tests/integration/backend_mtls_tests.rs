@@ -55,6 +55,7 @@ fn create_test_mtls_proxy() -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -113,7 +114,7 @@ fn create_test_env_config_with_mtls(
         dp_grpc_tls_no_verify: false,
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
-        max_body_size_bytes: 10485760,
+        max_request_body_size_bytes: 10485760,
         max_response_body_size_bytes: 10485760,
         dns_cache_ttl_seconds: 300,
         dns_overrides: HashMap::new(),
