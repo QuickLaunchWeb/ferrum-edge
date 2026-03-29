@@ -60,3 +60,44 @@ fn extract_hostname_localhost() {
         Some("localhost".to_string())
     );
 }
+
+#[test]
+fn extract_hostname_read_replica_url() {
+    let url = "postgres://user:pass@replica.us-west-2.rds.amazonaws.com:5432/ferrum";
+    assert_eq!(
+        DatabaseStore::extract_db_hostname(url),
+        Some("replica.us-west-2.rds.amazonaws.com".to_string())
+    );
+}
+
+#[test]
+fn extract_hostname_failover_url() {
+    let url = "postgres://user:pass@standby.internal.example.com:5432/ferrum?sslmode=require";
+    assert_eq!(
+        DatabaseStore::extract_db_hostname(url),
+        Some("standby.internal.example.com".to_string())
+    );
+}
+
+#[test]
+fn redact_url_hides_credentials() {
+    let url = "postgres://admin:supersecret@db.example.com:5432/ferrum";
+    let redacted = DatabaseStore::redact_url(url);
+    assert!(!redacted.contains("supersecret"));
+    assert!(!redacted.contains("admin"));
+    assert!(redacted.contains("db.example.com"));
+    assert!(redacted.contains("5432"));
+}
+
+#[test]
+fn redact_url_no_credentials() {
+    let url = "postgres://db.example.com:5432/ferrum";
+    let redacted = DatabaseStore::redact_url(url);
+    assert!(redacted.contains("db.example.com"));
+}
+
+#[test]
+fn redact_url_invalid() {
+    let redacted = DatabaseStore::redact_url("not-a-url");
+    assert_eq!(redacted, "<invalid-url>");
+}

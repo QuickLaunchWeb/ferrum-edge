@@ -1034,3 +1034,189 @@ fn test_effective_db_url_none_when_no_db_url() {
         },
     );
 }
+
+// ============================================================================
+// Database Failover URL Tests
+// ============================================================================
+
+#[test]
+fn test_db_failover_urls_empty_by_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.db_failover_urls.is_empty());
+            assert!(config.effective_db_failover_urls().is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_db_failover_urls_parsed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_DB_FAILOVER_URLS",
+                "postgres://secondary1/ferrum, postgres://secondary2/ferrum",
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_failover_urls.len(), 2);
+            assert_eq!(config.db_failover_urls[0], "postgres://secondary1/ferrum");
+            assert_eq!(config.db_failover_urls[1], "postgres://secondary2/ferrum");
+        },
+    );
+}
+
+#[test]
+fn test_db_failover_urls_filters_empty_entries() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            ("FERRUM_DB_FAILOVER_URLS", "postgres://secondary/ferrum,,, "),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_failover_urls.len(), 1);
+            assert_eq!(config.db_failover_urls[0], "postgres://secondary/ferrum");
+        },
+    );
+}
+
+#[test]
+fn test_db_failover_urls_with_ssl_params() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            ("FERRUM_DB_FAILOVER_URLS", "postgres://secondary/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "verify-full"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let effective = config.effective_db_failover_urls();
+            assert_eq!(effective.len(), 1);
+            assert!(effective[0].contains("sslmode=verify-full"));
+        },
+    );
+}
+
+// ============================================================================
+// Database Read Replica URL Tests
+// ============================================================================
+
+#[test]
+fn test_db_read_replica_url_none_by_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.db_read_replica_url.is_none());
+            assert!(config.effective_db_read_replica_url().is_none());
+        },
+    );
+}
+
+#[test]
+fn test_db_read_replica_url_parsed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            ("FERRUM_DB_READ_REPLICA_URL", "postgres://replica/ferrum"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_read_replica_url.as_deref(),
+                Some("postgres://replica/ferrum")
+            );
+            assert_eq!(
+                config.effective_db_read_replica_url().as_deref(),
+                Some("postgres://replica/ferrum")
+            );
+        },
+    );
+}
+
+#[test]
+fn test_db_read_replica_url_with_ssl_params() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            ("FERRUM_DB_READ_REPLICA_URL", "postgres://replica/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+            ("FERRUM_DB_SSL_ROOT_CERT", "/path/to/ca.pem"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let effective = config.effective_db_read_replica_url().unwrap();
+            assert!(effective.contains("sslmode=require"));
+            assert!(effective.contains("sslrootcert=/path/to/ca.pem"));
+        },
+    );
+}
+
+#[test]
+fn test_db_read_replica_url_mysql_ssl_mode_translation() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://primary/ferrum"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            ("FERRUM_DB_READ_REPLICA_URL", "mysql://replica/ferrum"),
+            ("FERRUM_DB_SSL_MODE", "verify-full"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let effective = config.effective_db_read_replica_url().unwrap();
+            assert!(effective.contains("ssl-mode=VERIFY_IDENTITY"));
+        },
+    );
+}
+
+#[test]
+fn test_db_read_replica_url_sqlite_no_ssl() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "sqlite"),
+            ("FERRUM_DB_URL", "sqlite://ferrum.db"),
+            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            ("FERRUM_DB_READ_REPLICA_URL", "sqlite://replica.db"),
+            ("FERRUM_DB_SSL_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let effective = config.effective_db_read_replica_url().unwrap();
+            // SQLite should not get SSL params
+            assert_eq!(effective, "sqlite://replica.db");
+        },
+    );
+}

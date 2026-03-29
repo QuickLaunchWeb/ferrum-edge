@@ -57,7 +57,9 @@ impl IncrementalResult {
 #[derive(Clone)]
 pub struct DatabaseStore {
     pool: Arc<ArcSwap<AnyPool>>,
+    read_replica_pool: Option<Arc<ArcSwap<AnyPool>>>,
     db_type: String,
+    failover_urls: Vec<String>,
 }
 
 impl DatabaseStore {
@@ -137,7 +139,9 @@ impl DatabaseStore {
 
         let store = Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
+            read_replica_pool: None,
             db_type: db_type.to_string(),
+            failover_urls: Vec::new(),
         };
 
         store.run_migrations().await?;
@@ -318,13 +322,13 @@ impl DatabaseStore {
 
     async fn load_proxies(&self) -> Result<Vec<Proxy>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM proxies")
-            .fetch_all(&self.pool())
+            .fetch_all(&self.rpool())
             .await?;
 
         // Batch-load all proxy_plugins in one query (eliminates N+1)
         let assoc_rows: Vec<AnyRow> =
             match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                .fetch_all(&self.pool())
+                .fetch_all(&self.rpool())
                 .await
             {
                 Ok(rows) => rows,
@@ -372,7 +376,7 @@ impl DatabaseStore {
 
     async fn load_consumers(&self) -> Result<Vec<Consumer>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM consumers")
-            .fetch_all(&self.pool())
+            .fetch_all(&self.rpool())
             .await?;
 
         let mut consumers = Vec::new();
@@ -385,7 +389,7 @@ impl DatabaseStore {
 
     async fn load_plugin_configs(&self) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM plugin_configs")
-            .fetch_all(&self.pool())
+            .fetch_all(&self.rpool())
             .await?;
 
         let mut configs = Vec::new();
@@ -790,7 +794,7 @@ impl DatabaseStore {
 
     async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams")
-            .fetch_all(&self.pool())
+            .fetch_all(&self.rpool())
             .await?;
 
         let mut upstreams = Vec::new();
@@ -1207,7 +1211,7 @@ impl DatabaseStore {
     async fn load_proxies_since(&self, since_str: &str) -> Result<Vec<Proxy>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE updated_at > ?"))
             .bind(since_str)
-            .fetch_all(&self.pool())
+            .fetch_all(&self.rpool())
             .await?;
 
         if rows.is_empty() {
@@ -1229,7 +1233,7 @@ impl DatabaseStore {
             let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 500 {
                 // Too many IDs for an IN clause — fetch all and filter in memory
                 match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                    .fetch_all(&self.pool())
+                    .fetch_all(&self.rpool())
                     .await
                 {
                     Ok(all_rows) => all_rows
@@ -1264,7 +1268,7 @@ impl DatabaseStore {
                 for id in &changed_id_list {
                     query = query.bind(*id);
                 }
-                match query.fetch_all(&self.pool()).await {
+                match query.fetch_all(&self.rpool()).await {
                     Ok(rows) => rows,
                     Err(e) => {
                         warn!(
@@ -1304,7 +1308,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM consumers WHERE updated_at > ?"))
                 .bind(since_str)
-                .fetch_all(&self.pool())
+                .fetch_all(&self.rpool())
                 .await?;
 
         let mut consumers = Vec::with_capacity(rows.len());
@@ -1322,7 +1326,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE updated_at > ?"))
                 .bind(since_str)
-                .fetch_all(&self.pool())
+                .fetch_all(&self.rpool())
                 .await?;
 
         let mut configs = Vec::with_capacity(rows.len());
@@ -1337,7 +1341,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM upstreams WHERE updated_at > ?"))
                 .bind(since_str)
-                .fetch_all(&self.pool())
+                .fetch_all(&self.rpool())
                 .await?;
 
         let mut upstreams = Vec::with_capacity(rows.len());
@@ -1351,7 +1355,7 @@ impl DatabaseStore {
     async fn load_table_ids(&self, table: &str) -> Result<HashSet<String>, anyhow::Error> {
         // Table name is a compile-time constant from the caller, not user input.
         let sql = format!("SELECT id FROM {}", table);
-        let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.pool()).await?;
+        let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.rpool()).await?;
 
         let mut ids = HashSet::with_capacity(rows.len());
         for row in rows {
@@ -1792,6 +1796,298 @@ impl DatabaseStore {
         }
 
         Some(host.to_string())
+    }
+
+    /// Connect to the primary database, trying failover URLs if the primary fails.
+    ///
+    /// Tries the primary URL first. If it fails and failover URLs are provided,
+    /// tries each in order. The first successful connection is used. Migrations
+    /// are run on the connected database.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_with_failover(
+        db_type: &str,
+        primary_url: &str,
+        failover_urls: &[String],
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<Self, anyhow::Error> {
+        match Self::connect_with_tls_config(
+            db_type,
+            primary_url,
+            tls_enabled,
+            tls_ca_cert_path,
+            tls_client_cert_path,
+            tls_client_key_path,
+            tls_insecure,
+        )
+        .await
+        {
+            Ok(mut store) => {
+                store.failover_urls = failover_urls.to_vec();
+                Ok(store)
+            }
+            Err(primary_err) => {
+                if failover_urls.is_empty() {
+                    return Err(primary_err);
+                }
+                warn!(
+                    "Primary database connection failed: {}. Trying {} failover URL(s)...",
+                    primary_err,
+                    failover_urls.len()
+                );
+                for (i, url) in failover_urls.iter().enumerate() {
+                    match Self::connect_with_tls_config(
+                        db_type,
+                        url,
+                        tls_enabled,
+                        tls_ca_cert_path,
+                        tls_client_cert_path,
+                        tls_client_key_path,
+                        tls_insecure,
+                    )
+                    .await
+                    {
+                        Ok(mut store) => {
+                            info!(
+                                "Connected to failover database #{} ({})",
+                                i + 1,
+                                Self::redact_url(url)
+                            );
+                            store.failover_urls = failover_urls.to_vec();
+                            return Ok(store);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failover database #{} ({}) failed: {}",
+                                i + 1,
+                                Self::redact_url(url),
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(anyhow::anyhow!(
+                    "All database URLs failed. Primary: {}. Tried {} failover URL(s).",
+                    primary_err,
+                    failover_urls.len()
+                ))
+            }
+        }
+    }
+
+    /// Connect a read replica pool for config polling.
+    ///
+    /// The read replica pool uses the same connection settings (max_connections,
+    /// max_lifetime) as the primary. Migrations are NOT run on the replica.
+    pub async fn connect_read_replica(
+        &mut self,
+        replica_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::any::install_default_drivers();
+
+        let final_url = if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
+            Self::build_tls_connection_url(
+                replica_url,
+                &self.db_type,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )?
+        } else {
+            replica_url.to_string()
+        };
+
+        let is_sqlite = self.db_type == "sqlite";
+        let pool = AnyPoolOptions::new()
+            .max_connections(10)
+            .max_lifetime(std::time::Duration::from_secs(300))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if is_sqlite {
+                        conn.execute("PRAGMA foreign_keys = ON").await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect(&final_url)
+            .await?;
+
+        self.read_replica_pool = Some(Arc::new(ArcSwap::from_pointee(pool)));
+        info!(
+            "Read replica connected (db_type={}, url={})",
+            self.db_type,
+            Self::redact_url(replica_url)
+        );
+        Ok(())
+    }
+
+    /// Get a snapshot of the read replica pool, falling back to the primary.
+    ///
+    /// Used by config polling (load_full_config, load_incremental_config) to
+    /// offload read traffic from the primary. If no read replica is configured
+    /// or the replica pool has been closed, returns the primary pool.
+    fn rpool(&self) -> AnyPool {
+        if let Some(ref rp) = self.read_replica_pool {
+            (**rp.load()).clone()
+        } else {
+            self.pool()
+        }
+    }
+
+    /// Atomically replace the read replica pool with a freshly connected one.
+    ///
+    /// Called by the DB polling loop when DnsCache detects that the read replica
+    /// FQDN now resolves to a different set of IPs.
+    pub async fn reconnect_read_replica(
+        &self,
+        replica_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<(), anyhow::Error> {
+        let rp = match &self.read_replica_pool {
+            Some(rp) => rp,
+            None => return Ok(()), // no replica configured
+        };
+
+        sqlx::any::install_default_drivers();
+
+        let final_url = if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
+            Self::build_tls_connection_url(
+                replica_url,
+                &self.db_type,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )?
+        } else {
+            replica_url.to_string()
+        };
+
+        let is_sqlite = self.db_type == "sqlite";
+        let new_pool = AnyPoolOptions::new()
+            .max_connections(10)
+            .max_lifetime(std::time::Duration::from_secs(300))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if is_sqlite {
+                        conn.execute("PRAGMA foreign_keys = ON").await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect(&final_url)
+            .await?;
+
+        let old_pool = rp.swap(Arc::new(new_pool));
+        info!(
+            "Read replica pool reconnected (db_type={}). Old pool closing in background.",
+            self.db_type
+        );
+
+        tokio::spawn(async move {
+            old_pool.close().await;
+        });
+
+        Ok(())
+    }
+
+    /// Try to reconnect to any available database URL (primary first, then failover).
+    ///
+    /// Called by the polling loop when the current connection is failing.
+    /// Returns the URL that succeeded, or an error if all failed.
+    pub async fn try_failover_reconnect(
+        &self,
+        primary_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<String, anyhow::Error> {
+        // Try primary first
+        if self
+            .reconnect(
+                primary_url,
+                tls_enabled,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )
+            .await
+            .is_ok()
+        {
+            info!("Reconnected to primary database");
+            return Ok(primary_url.to_string());
+        }
+
+        // Try failover URLs in order
+        for (i, url) in self.failover_urls.iter().enumerate() {
+            if self
+                .reconnect(
+                    url,
+                    tls_enabled,
+                    tls_ca_cert_path,
+                    tls_client_cert_path,
+                    tls_client_key_path,
+                    tls_insecure,
+                )
+                .await
+                .is_ok()
+            {
+                info!(
+                    "Reconnected to failover database #{} ({})",
+                    i + 1,
+                    Self::redact_url(url)
+                );
+                return Ok(url.clone());
+            }
+            warn!(
+                "Failover database #{} ({}) reconnect failed",
+                i + 1,
+                Self::redact_url(url)
+            );
+        }
+
+        Err(anyhow::anyhow!(
+            "All database URLs failed during reconnect ({} failover URL(s) tried)",
+            self.failover_urls.len()
+        ))
+    }
+
+    /// Redact credentials from a database URL for safe logging.
+    pub fn redact_url(url: &str) -> String {
+        match url::Url::parse(url) {
+            Ok(mut parsed) => {
+                if parsed.password().is_some() {
+                    let _ = parsed.set_password(Some("***"));
+                }
+                if !parsed.username().is_empty() {
+                    let _ = parsed.set_username("***");
+                }
+                parsed.to_string()
+            }
+            Err(_) => "<invalid-url>".to_string(),
+        }
+    }
+
+    /// Returns true if a read replica pool is configured.
+    #[allow(dead_code)] // Public API for tests and future consumers
+    pub fn has_read_replica(&self) -> bool {
+        self.read_replica_pool.is_some()
     }
 }
 

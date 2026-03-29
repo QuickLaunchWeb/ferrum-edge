@@ -133,6 +133,8 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - In-memory config cache survives source outages (DB, file, gRPC)
 - Startup failover with externally provisioned backup config (`FERRUM_DB_CONFIG_BACKUP_PATH`)
+- Multi-URL database failover (`FERRUM_DB_FAILOVER_URLS`) with automatic ordered connection failover
+- Read replica support (`FERRUM_DB_READ_REPLICA_URL`) for offloading config polling reads from the primary database
 - Graceful shutdown with active request draining (SIGTERM/SIGINT)
 - Client observability headers (`X-Gateway-Error`, `X-Gateway-Upstream-Status`)
 

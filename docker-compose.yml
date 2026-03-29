@@ -77,6 +77,8 @@ services:
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
       FERRUM_LOG_LEVEL: info
       FERRUM_DB_POLL_INTERVAL: 30
+      # FERRUM_DB_FAILOVER_URLS: postgres://ferrum:${POSTGRES_PASSWORD}@postgres-standby:5432/ferrum
+      # FERRUM_DB_READ_REPLICA_URL: postgres://ferrum:${POSTGRES_PASSWORD}@postgres-replica:5432/ferrum
     networks:
       - ferrum-network
     healthcheck:
