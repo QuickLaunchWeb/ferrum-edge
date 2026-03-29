@@ -2558,7 +2558,7 @@ pub async fn handle_proxy_request(
     {
         for plugin in plugins.iter() {
             let result = plugin
-                .on_response_body(&ctx, response_status, &response_headers, data)
+                .on_response_body(&mut ctx, response_status, &response_headers, data)
                 .await;
             match result {
                 PluginResult::Continue => {}
