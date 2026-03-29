@@ -342,6 +342,8 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
 | `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable (e.g. K8S pod restart during DB outage). See [Resilience & Caching](#resilience--caching). |
+| `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs |
+| `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
 | `FERRUM_CP_GRPC_JWT_SECRET` | CP mode | — | HS256 secret for DP node authentication |

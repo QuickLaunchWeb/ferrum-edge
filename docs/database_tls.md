@@ -367,3 +367,14 @@ PostgreSQL requires the server key file to have `chmod 600` and be owned by the 
 ### Connection works without TLS env vars
 
 If the database URL already contains SSL parameters (e.g., `?sslmode=require`), those take precedence. The `FERRUM_DB_SSL_*` variables are appended and may conflict. Use one approach or the other.
+
+## Failover and Read Replica URLs
+
+When using `FERRUM_DB_FAILOVER_URLS` or `FERRUM_DB_READ_REPLICA_URL`, the same TLS
+settings (`FERRUM_DB_TLS_*` and `FERRUM_DB_SSL_*`) apply to all database connections.
+If your failover or replica databases require different TLS parameters, embed them
+directly in the URL query string:
+
+```
+FERRUM_DB_FAILOVER_URLS=postgres://standby1:5432/ferrum?sslmode=verify-full&sslrootcert=/certs/ca.pem,postgres://standby2:5432/ferrum?sslmode=require
+```

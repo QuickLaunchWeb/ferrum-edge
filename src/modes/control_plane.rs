@@ -23,9 +23,11 @@ pub async fn run(
     let effective_url = env_config
         .effective_db_url()
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
-    let db = DatabaseStore::connect_with_tls_config(
+    let failover_urls = env_config.effective_db_failover_urls();
+    let mut db = DatabaseStore::connect_with_failover(
         env_config.db_type.as_deref().unwrap_or("sqlite"),
         &effective_url,
+        &failover_urls,
         env_config.db_tls_enabled,
         env_config.db_tls_ca_cert_path.as_deref(),
         env_config.db_tls_client_cert_path.as_deref(),
@@ -33,6 +35,28 @@ pub async fn run(
         env_config.db_tls_insecure,
     )
     .await?;
+
+    // Connect read replica for config polling (reduces primary load)
+    let effective_replica_url = env_config.effective_db_read_replica_url();
+    if let Some(ref replica_url) = effective_replica_url {
+        match db
+            .connect_read_replica(
+                replica_url,
+                env_config.db_tls_enabled,
+                env_config.db_tls_ca_cert_path.as_deref(),
+                env_config.db_tls_client_cert_path.as_deref(),
+                env_config.db_tls_client_key_path.as_deref(),
+                env_config.db_tls_insecure,
+            )
+            .await
+        {
+            Ok(()) => info!("Read replica connected for config polling"),
+            Err(e) => warn!(
+                "Read replica connection failed, polling will use primary: {}",
+                e
+            ),
+        }
+    }
 
     let config = db.load_full_config().await?;
     info!(
@@ -241,6 +265,9 @@ pub async fn run(
     // DNS re-resolution for the database FQDN (same as database mode).
     // CP mode doesn't run a proxy, but still needs to detect DB IP changes.
     let db_hostname = DatabaseStore::extract_db_hostname(&effective_url);
+    let replica_hostname = effective_replica_url
+        .as_deref()
+        .and_then(DatabaseStore::extract_db_hostname);
     let dns_cache_for_poll = DnsCache::new(DnsConfig {
         default_ttl_seconds: env_config.dns_cache_ttl_seconds,
         global_overrides: env_config.dns_overrides.clone(),
@@ -254,6 +281,7 @@ pub async fn run(
         slow_threshold_ms: env_config.dns_slow_threshold_ms,
     });
     let db_url_for_reconnect = effective_url.clone();
+    let replica_url_for_reconnect = effective_replica_url.clone();
     let db_tls_enabled = env_config.db_tls_enabled;
     let db_tls_ca_cert = env_config.db_tls_ca_cert_path.clone();
     let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
@@ -266,6 +294,7 @@ pub async fn run(
 
         // Track the last known set of resolved IPs for the DB hostname.
         let mut last_db_ips: Option<Vec<IpAddr>> = None;
+        let mut last_replica_ips: Option<Vec<IpAddr>> = None;
 
         // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
@@ -315,6 +344,43 @@ pub async fn run(
                             }
                         }
                         last_db_ips = Some(ips);
+                    }
+
+                    // Check if the read replica FQDN now resolves to different IPs
+                    if let Some(ref replica_hostname) = replica_hostname
+                        && let Some(ref replica_url) = replica_url_for_reconnect
+                        && let Ok(ips) = dns_cache_for_poll.resolve_all(replica_hostname, None, None).await
+                    {
+                        let needs_reconnect = match &last_replica_ips {
+                            Some(prev) => {
+                                let mut prev_sorted = prev.clone();
+                                prev_sorted.sort();
+                                let mut cur_sorted = ips.clone();
+                                cur_sorted.sort();
+                                prev_sorted != cur_sorted
+                            }
+                            None => false,
+                        };
+                        if needs_reconnect {
+                            info!(
+                                "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting replica pool",
+                                replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
+                            );
+                            if let Err(e) = db_poll.reconnect_read_replica(
+                                replica_url,
+                                db_tls_enabled,
+                                db_tls_ca_cert.as_deref(),
+                                db_tls_client_cert.as_deref(),
+                                db_tls_client_key.as_deref(),
+                                db_tls_insecure,
+                            ).await {
+                                error!(
+                                    "Failed to reconnect read replica pool after DNS change for '{}': {}",
+                                    replica_hostname, e
+                                );
+                            }
+                        }
+                        last_replica_ips = Some(ips);
                     }
 
                     if let Some(since) = last_poll_at {
@@ -393,11 +459,47 @@ pub async fn run(
                                         info!("Configuration reloaded from database (full fallback) and pushed to DPs");
                                     }
                                     Err(e2) => {
-                                        db_available_poll.store(false, Ordering::Relaxed);
-                                        warn!(
-                                            "Full config reload also failed (serving cached): {}",
-                                            e2
-                                        );
+                                        // Both incremental and full reload failed —
+                                        // try failover URLs before giving up.
+                                        match db_poll.try_failover_reconnect(
+                                            &db_url_for_reconnect,
+                                            db_tls_enabled,
+                                            db_tls_ca_cert.as_deref(),
+                                            db_tls_client_cert.as_deref(),
+                                            db_tls_client_key.as_deref(),
+                                            db_tls_insecure,
+                                        ).await {
+                                            Ok(_url) => {
+                                                match db_poll.load_full_config().await {
+                                                    Ok(new_config) => {
+                                                        db_available_poll.store(true, Ordering::Relaxed);
+                                                        let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                                        known_proxy_ids = p;
+                                                        known_consumer_ids = c;
+                                                        known_plugin_config_ids = pc;
+                                                        known_upstream_ids = u;
+                                                        last_poll_at = Some(new_config.loaded_at);
+                                                        config_poll.store(Arc::new(new_config.clone()));
+                                                        CpGrpcServer::broadcast_update(&update_tx, &new_config);
+                                                        info!("Configuration reloaded from database (failover) and pushed to DPs");
+                                                    }
+                                                    Err(e3) => {
+                                                        db_available_poll.store(false, Ordering::Relaxed);
+                                                        warn!(
+                                                            "Failover reload also failed (serving cached): {}",
+                                                            e3
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                db_available_poll.store(false, Ordering::Relaxed);
+                                                warn!(
+                                                    "Full config reload also failed (serving cached): {}",
+                                                    e2
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

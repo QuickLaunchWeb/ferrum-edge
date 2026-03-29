@@ -413,7 +413,7 @@ All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lo
 | Mode | Data Source | On Source Failure |
 |------|------------|-------------------|
 | **File** | YAML/JSON file | Config loaded once at startup. File can be deleted/corrupted afterward with zero impact. SIGHUP reload gracefully falls back to previous config on parse errors. |
-| **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. |
+| **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. If `FERRUM_DB_FAILOVER_URLS` is configured, failover URLs are tried in order before marking the DB as unavailable. If `FERRUM_DB_READ_REPLICA_URL` is configured, polling reads are offloaded to the replica (falls back to primary if replica is unreachable). |
 | **Control Plane** | SQL database | Polling loop logs a warning. Does not broadcast stale updates to Data Planes. DPs retain their last known config. Admin API reads fall back to the in-memory cached config. |
 | **Data Plane** | Control Plane (gRPC) | Auto-reconnects to CP every 5 seconds. Continues serving traffic with cached config. Admin API reads served from cached config with `X-Data-Source: cached` header. |
 
