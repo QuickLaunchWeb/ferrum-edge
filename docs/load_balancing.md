@@ -12,6 +12,7 @@ Ferrum Gateway provides built-in load balancing to distribute traffic across mul
   - [Round Robin](#round-robin)
   - [Weighted Round Robin](#weighted-round-robin)
   - [Least Connections](#least-connections)
+  - [Least Latency](#least-latency)
   - [Consistent Hashing](#consistent-hashing)
   - [Random](#random)
 - [Health Checks](#health-checks)
@@ -202,6 +203,73 @@ upstreams:
 ```
 
 **Best for:** Long-lived connections or backends with variable response times.
+
+### Least Latency
+
+**Algorithm:** `least_latency`
+
+Routes each request to the target with the lowest observed response latency, using an Exponentially Weighted Moving Average (EWMA) to smooth out noise and adapt to changing conditions. This algorithm automatically discovers which backend is "closest" (lowest round-trip time) and sends the majority of traffic there, while keeping other targets as fallbacks.
+
+```yaml
+upstreams:
+  - id: "my-upstream"
+    algorithm: least_latency
+    targets:
+      - host: "us-east.backend.internal"
+        port: 8080
+      - host: "us-west.backend.internal"
+        port: 8080
+      - host: "eu-west.backend.internal"
+        port: 8080
+```
+
+**How it works:**
+
+1. **Warm-up phase**: When the upstream is first loaded (or after a config reload), the algorithm uses round-robin to distribute traffic evenly across all targets. Each target must receive at least 5 successful responses before latency-based selection begins. This ensures every target gets a fair baseline measurement.
+
+2. **Steady-state**: After warm-up, each request is routed to the target with the lowest EWMA latency. The EWMA is updated after every successful backend response using the formula:
+
+   ```
+   ewma = 0.3 × new_sample + 0.7 × previous_ewma
+   ```
+
+   The smoothing factor (alpha = 0.3) means recent measurements account for ~30% of the average, providing a good balance between responsiveness to latency changes and stability against transient spikes.
+
+3. **Latency sources**: Latency is measured from two sources:
+   - **Passive (proxy traffic)**: Time-to-first-byte (TTFB) from each proxied request. This is always active and requires no configuration.
+   - **Active (health check probes)**: When active health checks are configured, the RTT of each successful probe is also recorded. This provides latency data even during low-traffic periods.
+
+   Only successful responses are recorded — connection errors and timeouts are excluded to avoid polluting the EWMA with non-representative values.
+
+4. **Recovery**: When a target recovers from unhealthy status (via active or passive health checks), its EWMA is reset to the current minimum across all healthy targets. This gives the recovered target a fair chance at traffic instead of being penalized by a stale high latency value from before it went down.
+
+**Example: multi-region with automatic proximity routing**
+
+```yaml
+upstreams:
+  - id: "global-api"
+    algorithm: least_latency
+    targets:
+      - host: "api-us-east.internal"
+        port: 8080
+      - host: "api-us-west.internal"
+        port: 8080
+      - host: "api-eu.internal"
+        port: 8080
+    health_checks:
+      active:
+        http_path: "/health"
+        interval_seconds: 5
+        unhealthy_threshold: 3
+      passive:
+        unhealthy_status_codes: [500, 502, 503]
+        unhealthy_threshold: 3
+        unhealthy_window_seconds: 30
+```
+
+In this setup, a gateway deployed in `us-east` will naturally route most traffic to `api-us-east.internal` (lowest latency), with `us-west` and `eu` as fallbacks. If `us-east` becomes slow or unhealthy, traffic automatically shifts to the next-lowest-latency target.
+
+**Best for:** Multi-region deployments, backends with heterogeneous performance, latency-sensitive APIs, and scenarios where you want automatic proximity-based routing without manual weight tuning.
 
 ### Consistent Hashing
 

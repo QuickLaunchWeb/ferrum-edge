@@ -12,6 +12,7 @@ use crate::config::pool_config::PoolConfig;
 use crate::config::types::{
     ActiveHealthCheck, GatewayConfig, HealthProbeType, PassiveHealthCheck, UpstreamTarget,
 };
+use crate::load_balancer::LoadBalancerCache;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -69,6 +70,10 @@ pub struct HealthChecker {
     http_client: Arc<reqwest::Client>,
     /// Active check abort handles.
     active_check_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Optional reference to the load balancer cache for recording active
+    /// probe latencies (used by least-latency algorithm). Set via
+    /// `set_load_balancer_cache()` after construction.
+    lb_cache: Option<Arc<LoadBalancerCache>>,
 }
 
 impl Default for HealthChecker {
@@ -101,7 +106,14 @@ impl HealthChecker {
             target_states: Arc::new(DashMap::new()),
             http_client: Arc::new(client),
             active_check_handles: Vec::new(),
+            lb_cache: None,
         }
+    }
+
+    /// Set a reference to the load balancer cache so active health check probes
+    /// can record their RTT for least-latency load balancing.
+    pub fn set_load_balancer_cache(&mut self, lb_cache: Arc<LoadBalancerCache>) {
+        self.lb_cache = Some(lb_cache);
     }
 
     /// Start health checks for all upstreams in the config.
@@ -125,7 +137,12 @@ impl HealthChecker {
                 // Start active health checks
                 if let Some(active) = &hc_config.active {
                     for target in &upstream.targets {
-                        let handle = self.start_active_check(target, active, shutdown_rx.clone());
+                        let handle = self.start_active_check(
+                            target,
+                            active,
+                            &upstream.id,
+                            shutdown_rx.clone(),
+                        );
                         self.active_check_handles.push(handle);
                     }
                 }
@@ -336,6 +353,7 @@ impl HealthChecker {
         &self,
         target: &UpstreamTarget,
         config: &ActiveHealthCheck,
+        upstream_id: &str,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let key = target_key(target);
@@ -360,6 +378,11 @@ impl HealthChecker {
             .and_then(|hex| hex::decode(hex).ok())
             .unwrap_or_default();
 
+        // Clone target and upstream_id for latency recording inside the spawned task
+        let probe_target = target.clone();
+        let lb_cache = self.lb_cache.clone();
+        let upstream_id_owned = upstream_id.to_owned();
+
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
 
@@ -381,6 +404,8 @@ impl HealthChecker {
                     .or_insert_with(|| Arc::new(TargetHealth::new()))
                     .clone();
 
+                // Measure probe RTT for least-latency load balancing
+                let probe_start = std::time::Instant::now();
                 let probe_success = match probe_type {
                     HealthProbeType::Http => {
                         http_probe(&client, &url, timeout, &healthy_status_codes).await
@@ -393,11 +418,24 @@ impl HealthChecker {
                     state.consecutive_failures.store(0, Ordering::Relaxed);
                     let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
+                    // Record probe latency for least-latency load balancing.
+                    // Only successful probes are recorded to avoid polluting the
+                    // EWMA with timeout values that don't reflect real latency.
+                    if let Some(ref cache) = lb_cache {
+                        let latency_us = probe_start.elapsed().as_micros() as u64;
+                        cache.record_latency(&upstream_id_owned, &probe_target, latency_us);
+                    }
+
                     if successes >= healthy_threshold && unhealthy_targets.remove(&key).is_some() {
                         info!(
                             "Active health check: target {} is healthy ({:?} probe)",
                             key, probe_type
                         );
+                        // Reset latency EWMA for recovered target so it gets a
+                        // fair chance at traffic with the least-latency algorithm
+                        if let Some(ref cache) = lb_cache {
+                            cache.reset_recovered_target_latency(&upstream_id_owned, &probe_target);
+                        }
                     }
                 } else {
                     state.consecutive_successes.store(0, Ordering::Relaxed);

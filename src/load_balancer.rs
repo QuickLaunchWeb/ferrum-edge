@@ -1,7 +1,7 @@
 //! Load balancer for distributing requests across upstream targets.
 //!
 //! Supports multiple algorithms: round-robin, weighted round-robin,
-//! least connections, consistent hashing, and random.
+//! least connections, least latency, consistent hashing, and random.
 
 use crate::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use arc_swap::ArcSwap;
@@ -10,6 +10,23 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+/// Default EWMA smoothing factor, stored as fixed-point with 1000 = 1.0.
+/// 300 = 0.3 — gives recent samples ~30% influence per update, balancing
+/// responsiveness to latency changes against noise from individual spikes.
+const DEFAULT_EWMA_ALPHA_FP: u64 = 300;
+
+/// Fixed-point scale factor for EWMA alpha (1000 = 1.0).
+const EWMA_SCALE: u64 = 1000;
+
+/// Number of latency samples per target before switching from round-robin
+/// warm-up to latency-based selection. Ensures every target gets enough
+/// traffic to establish a meaningful baseline before the algorithm starts
+/// preferring the lowest-latency target.
+const LATENCY_WARMUP_THRESHOLD: u64 = 5;
+
+/// Sentinel value indicating no latency has been recorded yet.
+const LATENCY_UNSET: u64 = u64::MAX;
 
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
@@ -29,8 +46,8 @@ pub struct TargetSelection {
 /// incremental updates can clone the HashMap cheaply (just Arc pointer
 /// copies) and only allocate new `LoadBalancer` instances for changed
 /// upstreams. Unchanged upstreams keep their exact same instance —
-/// round-robin counters, WRR weights, active connection counts, and
-/// consistent hash rings are all preserved.
+/// round-robin counters, WRR weights, active connection counts, latency
+/// EWMAs, and consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
     balancers: ArcSwap<HashMap<String, Arc<LoadBalancer>>>,
     /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
@@ -84,7 +101,8 @@ impl LoadBalancerCache {
     /// - Removes deleted upstreams
     /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
-    ///   round-robin counters, WRR weights, active connection counts, and hash rings
+    ///   round-robin counters, WRR weights, active connection counts, latency
+    ///   EWMAs, and hash rings
     pub fn apply_delta(
         &self,
         full_new_config: &GatewayConfig,
@@ -243,6 +261,32 @@ impl LoadBalancerCache {
             }
         }
     }
+
+    /// Record a response latency measurement for a target (for least-latency).
+    ///
+    /// Updates the target's EWMA (Exponentially Weighted Moving Average) with
+    /// the new sample. Latency is stored in microseconds for sub-millisecond
+    /// precision without floating-point atomics.
+    ///
+    /// Called from:
+    /// - **Passive path**: `proxy/mod.rs` after each backend response (TTFB)
+    /// - **Active path**: `health_check.rs` after each successful probe
+    pub fn record_latency(&self, upstream_id: &str, target: &UpstreamTarget, latency_us: u64) {
+        let balancers = self.balancers.load();
+        if let Some(balancer) = balancers.get(upstream_id) {
+            balancer.record_latency(target, latency_us);
+        }
+    }
+
+    /// Reset the latency EWMA for a target to the current minimum among healthy
+    /// targets. Called when a target recovers from unhealthy status so it gets a
+    /// fair chance at traffic instead of being penalized by a stale high EWMA.
+    pub fn reset_recovered_target_latency(&self, upstream_id: &str, target: &UpstreamTarget) {
+        let balancers = self.balancers.load();
+        if let Some(balancer) = balancers.get(upstream_id) {
+            balancer.reset_recovered_target_latency(target);
+        }
+    }
 }
 
 pub fn target_key(target: &UpstreamTarget) -> String {
@@ -265,6 +309,15 @@ pub struct LoadBalancer {
     pub active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
     hash_ring: Vec<(u64, usize)>,
+    /// EWMA latency per target in microseconds (for least-latency).
+    /// Key: "host:port", Value: EWMA in microseconds (LATENCY_UNSET = no data yet).
+    /// Uses AtomicU64 for lock-free updates on the hot path.
+    pub latency_ewma: DashMap<String, AtomicU64>,
+    /// Number of latency samples recorded per target (for least-latency warm-up).
+    /// During the warm-up phase (< LATENCY_WARMUP_THRESHOLD samples per target),
+    /// round-robin is used to ensure all targets get enough traffic to establish
+    /// baseline latency measurements.
+    pub latency_sample_count: DashMap<String, AtomicU64>,
 }
 
 impl LoadBalancer {
@@ -292,6 +345,16 @@ impl LoadBalancer {
             hash_ring.sort_by_key(|&(hash, _)| hash);
         }
 
+        // Initialize latency tracking for least-latency algorithm
+        let latency_ewma = DashMap::new();
+        let latency_sample_count = DashMap::new();
+        if algorithm == LoadBalancerAlgorithm::LeastLatency {
+            for key in &target_keys {
+                latency_ewma.insert(key.clone(), AtomicU64::new(LATENCY_UNSET));
+                latency_sample_count.insert(key.clone(), AtomicU64::new(0));
+            }
+        }
+
         Self {
             targets: targets.to_vec(),
             target_keys,
@@ -300,6 +363,94 @@ impl LoadBalancer {
             wrr_state: std::sync::Mutex::new(wrr_weights),
             active_connections: DashMap::new(),
             hash_ring,
+            latency_ewma,
+            latency_sample_count,
+        }
+    }
+
+    /// Record a latency sample for a target, updating the EWMA.
+    ///
+    /// Uses fixed-point arithmetic (scale factor 1000) to avoid floating-point
+    /// operations in the hot path. The EWMA formula is:
+    ///
+    ///   ewma = alpha * new_sample + (1 - alpha) * old_ewma
+    ///
+    /// With alpha = 0.3 (DEFAULT_EWMA_ALPHA_FP = 300), recent measurements
+    /// account for ~30% of the EWMA, providing a good balance between
+    /// responsiveness and stability.
+    ///
+    /// The first sample for a target sets the EWMA directly (no smoothing).
+    pub fn record_latency(&self, target: &UpstreamTarget, latency_us: u64) {
+        let key = match self.find_target_key(target) {
+            Some(k) => k,
+            None => return,
+        };
+
+        // Update sample count
+        if let Some(count) = self.latency_sample_count.get(key) {
+            count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.latency_sample_count
+                .insert(key.to_owned(), AtomicU64::new(1));
+        }
+
+        // Update EWMA using compare-and-swap loop for lock-free concurrent updates.
+        // The CAS loop is bounded — contention only occurs when two latency
+        // recordings for the same target happen simultaneously, which is rare.
+        if let Some(ewma_ref) = self.latency_ewma.get(key) {
+            let ewma = ewma_ref.value();
+            loop {
+                let current = ewma.load(Ordering::Relaxed);
+                let new_ewma = if current == LATENCY_UNSET {
+                    // First sample — seed the EWMA directly
+                    latency_us
+                } else {
+                    // EWMA = alpha * sample + (1 - alpha) * current
+                    // Using fixed-point: (alpha_fp * sample + (SCALE - alpha_fp) * current) / SCALE
+                    let alpha = DEFAULT_EWMA_ALPHA_FP;
+                    (alpha * latency_us + (EWMA_SCALE - alpha) * current) / EWMA_SCALE
+                };
+                if ewma
+                    .compare_exchange_weak(current, new_ewma, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        } else {
+            // Target not pre-initialized (shouldn't happen for LeastLatency, but
+            // handle gracefully for mixed-algorithm recording)
+            self.latency_ewma
+                .insert(key.to_owned(), AtomicU64::new(latency_us));
+        }
+    }
+
+    /// Reset a recovered target's EWMA to the current minimum among all targets
+    /// so it gets a fair chance at traffic after recovering from unhealthy status.
+    ///
+    /// Without this, a target that was slow before going unhealthy would retain
+    /// its high EWMA and never receive traffic even after recovery.
+    pub fn reset_recovered_target_latency(&self, target: &UpstreamTarget) {
+        let key = match self.find_target_key(target) {
+            Some(k) => k,
+            None => return,
+        };
+
+        // Find minimum EWMA among all targets (excluding unset)
+        let min_ewma = self
+            .latency_ewma
+            .iter()
+            .map(|entry| entry.value().load(Ordering::Relaxed))
+            .filter(|&v| v != LATENCY_UNSET)
+            .min()
+            .unwrap_or(LATENCY_UNSET);
+
+        if let Some(ewma_ref) = self.latency_ewma.get(key) {
+            ewma_ref.value().store(min_ewma, Ordering::Relaxed);
+        }
+        // Reset sample count so the target goes through warm-up again
+        if let Some(count_ref) = self.latency_sample_count.get(key) {
+            count_ref.value().store(0, Ordering::Relaxed);
         }
     }
 
@@ -358,6 +509,7 @@ impl LoadBalancer {
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
+            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency(&healthy),
             LoadBalancerAlgorithm::ConsistentHashing => {
                 self.select_consistent_hash(ctx_key, &healthy)
             }
@@ -392,6 +544,10 @@ impl LoadBalancer {
             LoadBalancerAlgorithm::LeastConnections => {
                 let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
                 self.select_least_connections(&all)
+            }
+            LoadBalancerAlgorithm::LeastLatency => {
+                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                self.select_least_latency(&all)
             }
             LoadBalancerAlgorithm::ConsistentHashing => {
                 let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
@@ -452,6 +608,7 @@ impl LoadBalancer {
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
+            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency(&healthy),
             LoadBalancerAlgorithm::ConsistentHashing => {
                 self.select_consistent_hash(ctx_key, &healthy)
             }
@@ -519,6 +676,69 @@ impl LoadBalancer {
                 min_conns = conns;
                 best = candidate;
             }
+        }
+
+        Some(best.1.clone())
+    }
+
+    /// Select the target with the lowest latency EWMA.
+    ///
+    /// **Warm-up phase**: Until every candidate has at least `LATENCY_WARMUP_THRESHOLD`
+    /// samples, round-robin is used to ensure all targets get enough traffic to
+    /// establish meaningful latency baselines. Without warm-up, the first target
+    /// to receive a response would monopolize all traffic.
+    ///
+    /// **Steady-state**: Selects the candidate with the lowest EWMA value.
+    /// Ties are broken by candidate order (first lowest wins), providing
+    /// deterministic behavior under equal latency.
+    ///
+    /// **No data**: If no target has latency data (all EWMA values are LATENCY_UNSET),
+    /// falls back to round-robin.
+    fn select_least_latency(
+        &self,
+        candidates: &[(usize, &UpstreamTarget)],
+    ) -> Option<UpstreamTarget> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Check if all candidates have enough samples for latency-based selection.
+        // During warm-up, use round-robin so all targets get baseline measurements.
+        let all_warmed_up = candidates.iter().all(|(idx, _)| {
+            let key = &self.target_keys[*idx];
+            self.latency_sample_count
+                .get(key)
+                .map(|v| v.load(Ordering::Relaxed) >= LATENCY_WARMUP_THRESHOLD)
+                .unwrap_or(false)
+        });
+
+        if !all_warmed_up {
+            // Warm-up: round-robin to distribute traffic evenly for baseline measurement
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            return Some(candidates[idx % candidates.len()].1.clone());
+        }
+
+        // Steady-state: select the candidate with the lowest EWMA
+        let mut min_latency = u64::MAX;
+        let mut best = &candidates[0];
+
+        for candidate in candidates {
+            let key = &self.target_keys[candidate.0];
+            let latency = self
+                .latency_ewma
+                .get(key)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(LATENCY_UNSET);
+            if latency < min_latency {
+                min_latency = latency;
+                best = candidate;
+            }
+        }
+
+        // If all targets have no data, fall back to round-robin
+        if min_latency == LATENCY_UNSET {
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            return Some(candidates[idx % candidates.len()].1.clone());
         }
 
         Some(best.1.clone())

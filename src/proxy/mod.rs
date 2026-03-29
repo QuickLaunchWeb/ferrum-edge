@@ -229,6 +229,7 @@ impl ProxyState {
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
         let mut health_checker = HealthChecker::with_pool_config(&global_pool_config);
+        health_checker.set_load_balancer_cache(load_balancer_cache.clone());
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
@@ -2631,6 +2632,19 @@ pub async fn handle_proxy_request(
         state
             .load_balancer_cache
             .record_connection_end(upstream_id, target);
+    }
+
+    // Record backend TTFB for least-latency load balancing.
+    // Only record successful responses (non-connection-error) to avoid
+    // polluting the EWMA with timeout/failure latencies that don't
+    // reflect the target's actual response time.
+    if !backend_resp.connection_error
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+    {
+        let latency_us = backend_start.elapsed().as_micros() as u64;
+        state
+            .load_balancer_cache
+            .record_latency(upstream_id, target, latency_us);
     }
 
     // Record circuit breaker result: successes reset failure counters (Closed state)
