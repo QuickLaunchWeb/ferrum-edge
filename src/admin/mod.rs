@@ -736,6 +736,27 @@ async fn handle_create_proxy(
                 &json!({"error": "Stream proxies (TCP/UDP) must use response_body_mode 'stream'"}),
             ));
         }
+        // Check listen_port uniqueness across all stream proxies
+        if let Some(port) = proxy.listen_port {
+            match db.check_listen_port_unique(port, None).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is already in use by another proxy",
+                            port
+                        )}),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
+                }
+            }
+        }
     } else if proxy.listen_port.is_some() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
@@ -1009,6 +1030,27 @@ async fn handle_update_proxy(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": "Stream proxies (TCP/UDP) must use response_body_mode 'stream'"}),
             ));
+        }
+        // Check listen_port uniqueness across all stream proxies (excluding self)
+        if let Some(port) = proxy.listen_port {
+            match db.check_listen_port_unique(port, Some(id)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is already in use by another proxy",
+                            port
+                        )}),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
+                }
+            }
         }
     } else if proxy.listen_port.is_some() {
         return Ok(json_response(

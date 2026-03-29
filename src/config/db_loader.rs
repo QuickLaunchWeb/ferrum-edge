@@ -1125,6 +1125,28 @@ impl DatabaseStore {
         Ok(true)
     }
 
+    /// Check if a listen_port is unique across all stream proxies.
+    /// Returns `true` if the port is unique (no conflicts found).
+    pub async fn check_listen_port_unique(
+        &self,
+        port: u16,
+        exclude_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_port = ? AND id != ?"))
+                .bind(port as i32)
+                .bind(eid)
+                .fetch_all(&self.pool())
+                .await?
+        } else {
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_port = ?"))
+                .bind(port as i32)
+                .fetch_all(&self.pool())
+                .await?
+        };
+        Ok(rows.is_empty())
+    }
+
     /// Check if an upstream with the given ID exists.
     /// Returns `true` if the upstream exists.
     pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {

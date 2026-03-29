@@ -285,6 +285,29 @@ impl V001InitialSchema {
             }
         }
 
+        // Unique index on listen_port to prevent duplicate stream proxy ports.
+        // listen_port is NULL for HTTP proxies; only non-NULL values must be unique.
+        // PostgreSQL/SQLite support partial indexes. MySQL allows multiple NULLs
+        // in UNIQUE indexes natively, so a plain unique index suffices.
+        let unique_listen_port_sql = if is_mysql {
+            "CREATE UNIQUE INDEX idx_proxies_unique_listen_port ON proxies (listen_port)"
+        } else {
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_unique_listen_port ON proxies (listen_port) WHERE listen_port IS NOT NULL"
+        };
+        if is_mysql {
+            match sqlx::query(unique_listen_port_sql).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("1061") {
+                        return Err(e.into());
+                    }
+                }
+            }
+        } else {
+            sqlx::query(unique_listen_port_sql).execute(pool).await?;
+        }
+
         Ok(())
     }
 }
