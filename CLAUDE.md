@@ -123,7 +123,7 @@ src/
 ├── circuit_breaker.rs         # Three-state circuit breaker
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS
-├── router_cache.rs            # Pre-sorted route table with host+path routing and LPM path cache
+├── router_cache.rs            # Pre-sorted route table with host+path routing, LPM path cache, and full-path-anchored regex routes
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
 ├── config_delta.rs            # Incremental config updates for CP/DP
@@ -145,6 +145,15 @@ src/
 | `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
+
+### Route Matching
+
+Routes are matched in priority order within each host tier (exact host → wildcard host → catch-all):
+
+1. **Prefix routes first** — longest-prefix match (pre-sorted by `listen_path.len()` descending)
+2. **Regex routes second** — first match in config order wins
+
+**Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
 
 ### Plugin System
 
