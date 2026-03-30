@@ -285,8 +285,10 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_LOG_LEVEL` | `error` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
+| `FERRUM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for proxy listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
+| `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_JWT_SECRET` | (required for db/cp) | JWT secret for admin API auth |
 | `FERRUM_FILE_CONFIG_PATH` | (required for file mode) | Path to YAML/JSON config file |
 | `FERRUM_DB_TYPE` | (required for db mode) | `postgres`, `mysql`, `sqlite` |

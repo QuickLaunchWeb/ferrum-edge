@@ -230,7 +230,7 @@ pub async fn run(
     let mut handles = Vec::new();
 
     // HTTP listener (always enabled)
-    let http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.proxy_http_port).parse()?;
+    let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
     let http_state = proxy_state.clone();
     let http_shutdown = shutdown_tx.subscribe();
     let http_handle = tokio::spawn(async move {
@@ -243,7 +243,7 @@ pub async fn run(
 
     // HTTPS listener (only if TLS is configured)
     if let Some(tls_config) = tls_config.clone() {
-        let https_addr: SocketAddr = format!("0.0.0.0:{}", env_config.proxy_https_port).parse()?;
+        let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
         let https_state = proxy_state.clone();
         let https_shutdown = shutdown_tx.subscribe();
         let https_handle = tokio::spawn(async move {
@@ -267,7 +267,7 @@ pub async fn run(
     // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
     if env_config.enable_http3 {
         if let Some(tls_config) = tls_config.clone() {
-            let h3_addr: SocketAddr = format!("0.0.0.0:{}", env_config.proxy_https_port).parse()?;
+            let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
             let h3_state = proxy_state.clone();
             let h3_shutdown = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
@@ -296,7 +296,7 @@ pub async fn run(
     }
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
-    let admin_http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_http_port).parse()?;
+    let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
     let jwt_manager = create_jwt_manager_from_env()
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
 
@@ -334,7 +334,7 @@ pub async fn run(
         &env_config.admin_tls_key_path,
     ) {
         let admin_https_addr: SocketAddr =
-            format!("0.0.0.0:{}", env_config.admin_https_port).parse()?;
+            env_config.admin_socket_addr(env_config.admin_https_port);
         let admin_state_for_https = AdminState {
             db: Some(db.clone()),
             jwt_manager: create_jwt_manager_from_env()

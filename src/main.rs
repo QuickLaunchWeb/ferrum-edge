@@ -92,6 +92,21 @@ fn main() {
     };
 
     info!("Operating mode: {:?}", env_config.mode);
+    info!(
+        "Proxy bind address: {}, Admin bind address: {}",
+        env_config.proxy_bind_address, env_config.admin_bind_address
+    );
+
+    // Detect IPv6 dual-stack support and log a hint if listeners are IPv4-only
+    if (env_config.proxy_bind_address == "0.0.0.0" || env_config.admin_bind_address == "0.0.0.0")
+        && std::net::TcpListener::bind("[::]:0").is_ok()
+    {
+        info!(
+            "IPv6 dual-stack support detected. To accept both IPv4 and IPv6 connections, \
+             set FERRUM_PROXY_BIND_ADDRESS=:: and/or FERRUM_ADMIN_BIND_ADDRESS=:: \
+             (dual-stack binds to [::] and accepts IPv4 via mapped addresses on most OSes)"
+        );
+    }
 
     // Start the main multi-threaded runtime for the gateway
     let rt = tokio::runtime::Builder::new_multi_thread()

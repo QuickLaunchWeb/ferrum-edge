@@ -85,7 +85,7 @@ pub async fn run(
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
-    let admin_http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_http_port).parse()?;
+    let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
     let jwt_manager = create_jwt_manager_from_env()
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
 
@@ -122,7 +122,7 @@ pub async fn run(
         &env_config.admin_tls_key_path,
     ) {
         let admin_https_addr: SocketAddr =
-            format!("0.0.0.0:{}", env_config.admin_https_port).parse()?;
+            env_config.admin_socket_addr(env_config.admin_https_port);
         let admin_state_for_https = AdminState {
             db: Some(db.clone()),
             jwt_manager: create_jwt_manager_from_env()
@@ -186,11 +186,11 @@ pub async fn run(
     };
 
     // gRPC listener (with optional TLS/mTLS)
-    let grpc_addr: SocketAddr = env_config
-        .cp_grpc_listen_addr
-        .as_deref()
-        .unwrap_or("0.0.0.0:50051")
-        .parse()?;
+    let grpc_addr: SocketAddr = if let Some(ref addr) = env_config.cp_grpc_listen_addr {
+        addr.parse()?
+    } else {
+        env_config.admin_socket_addr(50051)
+    };
 
     let grpc_tls_config = if let (Some(cert_path), Some(key_path)) = (
         &env_config.cp_grpc_tls_cert_path,

@@ -68,17 +68,28 @@ pub struct EnvConfig {
     /// Default: false (maximum throughput).
     pub enable_streaming_latency_tracking: bool,
 
-    // Proxy traffic ports
+    // Proxy traffic
     pub proxy_http_port: u16,
     pub proxy_https_port: u16,
     pub proxy_tls_cert_path: Option<String>,
     pub proxy_tls_key_path: Option<String>,
+    /// Bind address for proxy listeners (HTTP, HTTPS, HTTP/3).
+    /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
+    /// On most operating systems, binding to "::" accepts both IPv4 and IPv6
+    /// connections via IPv4-mapped IPv6 addresses (dual-stack). This requires
+    /// the OS to have dual-stack support enabled (the default on Linux, macOS,
+    /// and Windows). If `net.ipv6.bindv6only=1` is set (Linux sysctl), binding
+    /// to "::" will only accept IPv6 connections.
+    pub proxy_bind_address: String,
 
-    // Admin API ports
+    // Admin API
     pub admin_http_port: u16,
     pub admin_https_port: u16,
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
+    /// Bind address for Admin API listeners (HTTP, HTTPS).
+    /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
+    pub admin_bind_address: String,
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
@@ -310,10 +321,12 @@ impl Default for EnvConfig {
             proxy_https_port: 8443,
             proxy_tls_cert_path: None,
             proxy_tls_key_path: None,
+            proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
+            admin_bind_address: "0.0.0.0".into(),
             admin_jwt_secret: None,
             db_type: None,
             db_url: None,
@@ -427,11 +440,13 @@ impl EnvConfig {
             proxy_https_port: resolve_u16(conf, "FERRUM_PROXY_HTTPS_PORT", 8443),
             proxy_tls_cert_path: resolve_var(conf, "FERRUM_PROXY_TLS_CERT_PATH"),
             proxy_tls_key_path: resolve_var(conf, "FERRUM_PROXY_TLS_KEY_PATH"),
+            proxy_bind_address: resolve_var_or(conf, "FERRUM_PROXY_BIND_ADDRESS", "0.0.0.0"),
 
             admin_http_port: resolve_u16(conf, "FERRUM_ADMIN_HTTP_PORT", 9000),
             admin_https_port: resolve_u16(conf, "FERRUM_ADMIN_HTTPS_PORT", 9443),
             admin_tls_cert_path: resolve_var(conf, "FERRUM_ADMIN_TLS_CERT_PATH"),
             admin_tls_key_path: resolve_var(conf, "FERRUM_ADMIN_TLS_KEY_PATH"),
+            admin_bind_address: resolve_var_or(conf, "FERRUM_ADMIN_BIND_ADDRESS", "0.0.0.0"),
             admin_jwt_secret: resolve_var(conf, "FERRUM_ADMIN_JWT_SECRET"),
             db_type: resolve_var(conf, "FERRUM_DB_TYPE"),
             db_url: resolve_var(conf, "FERRUM_DB_URL"),
@@ -615,6 +630,25 @@ impl EnvConfig {
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// Build a `SocketAddr` from the proxy bind address and the given port.
+    /// The bind address is validated at config load time, so the parse is safe.
+    pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
+        let ip: std::net::IpAddr = self
+            .proxy_bind_address
+            .parse()
+            .expect("proxy_bind_address validated at config load");
+        std::net::SocketAddr::new(ip, port)
+    }
+
+    /// Build a `SocketAddr` from the admin bind address and the given port.
+    pub fn admin_socket_addr(&self, port: u16) -> std::net::SocketAddr {
+        let ip: std::net::IpAddr = self
+            .admin_bind_address
+            .parse()
+            .expect("admin_bind_address validated at config load");
+        std::net::SocketAddr::new(ip, port)
     }
 
     /// Returns the database URL with TLS/SSL query parameters appended based on
@@ -934,6 +968,20 @@ impl EnvConfig {
             if self.cp_grpc_jwt_secret.is_none() {
                 return Err("FERRUM_CP_GRPC_JWT_SECRET is required in cp mode".into());
             }
+        }
+
+        // Validate bind addresses are valid IP addresses
+        if self.proxy_bind_address.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "Invalid FERRUM_PROXY_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                self.proxy_bind_address
+            ));
+        }
+        if self.admin_bind_address.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                self.admin_bind_address
+            ));
         }
 
         Ok(())

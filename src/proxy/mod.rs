@@ -248,7 +248,13 @@ impl ProxyState {
         let stream_bind_addr: std::net::IpAddr = env_config_arc
             .stream_proxy_bind_address
             .parse()
-            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            .unwrap_or_else(|_| {
+                // Fall back to the proxy bind address, then to IPv4 unspecified
+                env_config_arc
+                    .proxy_bind_address
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            });
 
         let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
             stream_bind_addr,

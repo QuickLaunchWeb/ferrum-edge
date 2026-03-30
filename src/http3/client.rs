@@ -171,12 +171,18 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-        endpoint.set_default_client_config(client_config);
-
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
         let addr = resolve_backend_addr(host, port).await?;
+
+        // Bind to the matching address family (IPv4 or IPv6) based on the resolved backend
+        let bind_addr: SocketAddr = if addr.is_ipv6() {
+            "[::]:0".parse()?
+        } else {
+            "0.0.0.0:0".parse()?
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+        endpoint.set_default_client_config(client_config);
 
         debug!(
             "HTTP/3 pool: connecting to {}:{} (resolved: {})",
