@@ -1,4 +1,6 @@
+mod functional_admin_operations_test;
 mod functional_auth_acl_test;
+mod functional_circuit_breaker_retry_test;
 mod functional_cp_dp_test;
 mod functional_database_test;
 mod functional_db_tls_test;
@@ -8,6 +10,7 @@ mod functional_grpc_test;
 mod functional_load_balancer_test;
 mod functional_load_stress_test;
 mod functional_logging_test;
+mod functional_plugin_test;
 mod functional_scale_perf_test;
 mod functional_tcp_proxy_test;
 mod functional_udp_proxy_test;
