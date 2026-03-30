@@ -11,7 +11,7 @@ use super::plugin_utils::{
 #[tokio::test]
 async fn test_key_auth_plugin_creation() {
     let config = json!({
-        "key_lookup": "header:X-API-Key"
+        "key_location": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
     assert_eq!(plugin.name(), "key_auth");
@@ -27,7 +27,7 @@ async fn test_key_auth_plugin_default_config() {
 #[tokio::test]
 async fn test_key_auth_plugin_successful_auth() {
     let config = json!({
-        "key_lookup": "header:X-API-Key"
+        "key_location": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
 
@@ -48,7 +48,7 @@ async fn test_key_auth_plugin_successful_auth() {
 #[tokio::test]
 async fn test_key_auth_plugin_missing_key() {
     let config = json!({
-        "key_lookup": "header:X-API-Key"
+        "key_location": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
 
@@ -66,7 +66,7 @@ async fn test_key_auth_plugin_missing_key() {
 #[tokio::test]
 async fn test_key_auth_plugin_invalid_key() {
     let config = json!({
-        "key_lookup": "header:X-API-Key"
+        "key_location": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
 
@@ -86,7 +86,7 @@ async fn test_key_auth_plugin_invalid_key() {
 #[tokio::test]
 async fn test_key_auth_plugin_query_parameter() {
     let config = json!({
-        "key_lookup": "query:api_key"
+        "key_location": "query:api_key"
     });
     let plugin = KeyAuth::new(&config);
 
@@ -95,6 +95,9 @@ async fn test_key_auth_plugin_query_parameter() {
 
     // Test successful authentication via query parameter
     let mut valid_ctx = create_test_context();
+    valid_ctx.headers.remove("X-API-Key");
+    valid_ctx.headers.remove("x-api-key");
+    valid_ctx.identified_consumer = None;
     valid_ctx
         .query_params
         .insert("api_key".to_string(), "test-api-key".to_string());
@@ -102,4 +105,173 @@ async fn test_key_auth_plugin_query_parameter() {
     let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
     assert!(valid_ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_key_auth_empty_key_in_header_is_rejected() {
+    let config = json!({
+        "key_location": "header:X-API-Key"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = create_test_context();
+    ctx.headers.insert("X-API-Key".to_string(), "".to_string());
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_key_auth_whitespace_key_is_rejected() {
+    let config = json!({
+        "key_location": "header:X-API-Key"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("X-API-Key".to_string(), "   ".to_string());
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_key_auth_case_insensitive_header_lookup() {
+    let config = json!({
+        "key_location": "header:X-API-Key"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    // Key lookup does lowercase fallback — test with lowercase header
+    let mut ctx = create_test_context();
+    ctx.headers.remove("X-API-Key");
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn test_key_auth_missing_query_param() {
+    let config = json!({
+        "key_location": "query:apikey"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = create_test_context();
+    ctx.query_params.clear();
+    ctx.headers.remove("X-API-Key");
+    ctx.headers.remove("x-api-key");
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_key_auth_custom_header_name() {
+    let config = json!({
+        "key_location": "header:Authorization-Token"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = create_test_context();
+    ctx.headers.insert(
+        "Authorization-Token".to_string(),
+        "test-api-key".to_string(),
+    );
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_key_auth_multiple_consumers_correct_match() {
+    let config = json!({
+        "key_location": "header:X-API-Key"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    // Create two consumers with different keys
+    let mut consumer1 = create_test_consumer();
+    consumer1.id = "consumer-1".to_string();
+    consumer1.username = "user1".to_string();
+    let mut keyauth1 = serde_json::Map::new();
+    keyauth1.insert(
+        "key".to_string(),
+        serde_json::Value::String("key-one".to_string()),
+    );
+    consumer1
+        .credentials
+        .insert("keyauth".to_string(), serde_json::Value::Object(keyauth1));
+
+    let mut consumer2 = create_test_consumer();
+    consumer2.id = "consumer-2".to_string();
+    consumer2.username = "user2".to_string();
+    let mut keyauth2 = serde_json::Map::new();
+    keyauth2.insert(
+        "key".to_string(),
+        serde_json::Value::String("key-two".to_string()),
+    );
+    consumer2
+        .credentials
+        .insert("keyauth".to_string(), serde_json::Value::Object(keyauth2));
+
+    let consumer_index = ConsumerIndex::new(&[consumer1, consumer2]);
+
+    // Authenticate with consumer2's key
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("X-API-Key".to_string(), "key-two".to_string());
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        "user2",
+        "Should match the correct consumer"
+    );
+}
+
+#[tokio::test]
+async fn test_key_auth_fallback_default_header() {
+    // When key_location has unknown prefix, falls back to x-api-key / X-API-Key
+    let config = json!({
+        "key_location": "cookie:token"
+    });
+    let plugin = KeyAuth::new(&config);
+
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("x-api-key".to_string(), "test-api-key".to_string());
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
 }
