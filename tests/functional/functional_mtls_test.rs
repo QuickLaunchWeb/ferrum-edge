@@ -8,7 +8,7 @@
 //! 5. TCP frontend mTLS — TCP stream proxy with client cert verification
 //!
 //! Run with:
-//!   cargo build --bin ferrum-gateway && cargo test --test functional_tests -- functional_mtls --ignored --nocapture
+//!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_mtls --ignored --nocapture
 
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use std::io::Write;
@@ -207,10 +207,10 @@ async fn start_tcp_echo(port: u16) -> tokio::task::JoinHandle<()> {
 // ============================================================================
 
 fn gw_bin() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     }
 }
 
