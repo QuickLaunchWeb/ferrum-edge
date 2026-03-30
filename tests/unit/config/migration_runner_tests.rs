@@ -45,7 +45,7 @@ async fn test_migration_runner_bootstrap_existing_db() {
     .await
     .unwrap();
     sqlx::query(
-        "CREATE TABLE upstreams (id TEXT PRIMARY KEY, name TEXT, targets TEXT NOT NULL DEFAULT '[]', algorithm TEXT NOT NULL DEFAULT 'round_robin', hash_on TEXT, health_checks TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE upstreams (id TEXT PRIMARY KEY, name TEXT, targets TEXT NOT NULL DEFAULT '[]', algorithm TEXT NOT NULL DEFAULT 'round_robin', hash_on TEXT, hash_on_cookie_config TEXT, health_checks TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     .execute(&pool)
     .await
