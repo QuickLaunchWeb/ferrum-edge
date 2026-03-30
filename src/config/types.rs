@@ -139,6 +139,7 @@ pub enum LoadBalancerAlgorithm {
     RoundRobin,
     WeightedRoundRobin,
     LeastConnections,
+    LeastLatency,
     ConsistentHashing,
     Random,
 }

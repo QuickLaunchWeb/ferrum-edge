@@ -19,7 +19,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
-- **Load Balancing**: Five algorithms (round robin, weighted round robin, least connections, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
+- **Load Balancing**: Six algorithms (round robin, weighted round robin, least connections, least latency, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
 - **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
 - **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
 - **Consumer Identity Forwarding**: Automatically injects `X-Consumer-Username` and `X-Consumer-Custom-Id` headers on requests forwarded to backends after successful authentication
@@ -30,7 +30,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows and optional `x-ratelimit-*` header exposure
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
 - **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
-- **Load Balancing**: Five algorithms (RoundRobin, Weighted, LeastConnections, ConsistentHash, Random) with unhealthy target filtering
+- **Load Balancing**: Six algorithms (RoundRobin, Weighted, LeastConnections, LeastLatency, ConsistentHash, Random) with unhealthy target filtering
 - **Health Checking**: Active probes (HTTP, TCP SYN, UDP) and passive status monitoring with configurable thresholds
 - **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
 - **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
@@ -929,7 +929,7 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
 ```
 
-Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`.
+Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`.
 
 To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`. Each target may also specify an optional `path` field (e.g., `{"host": "backend1.example.com", "port": 8080, "path": "/v2"}`) which overrides the proxy's `backend_path` when that target is selected.
 
