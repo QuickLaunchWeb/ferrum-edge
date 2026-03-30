@@ -1,5 +1,4 @@
 pub mod v001_initial_schema;
-pub mod v002_hash_on_cookie_config;
 
 use chrono::Utc;
 use sqlx::any::AnyRow;
@@ -55,12 +54,9 @@ impl MigrationRunner {
 
     /// Build the ordered list of all known migrations.
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
-        vec![
-            Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
-            Box::new(MigrationEntryV002(
-                v002_hash_on_cookie_config::V002HashOnCookieConfig,
-            )),
-        ]
+        vec![Box::new(MigrationEntryV001(
+            v001_initial_schema::V001InitialSchema,
+        ))]
     }
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
@@ -323,25 +319,3 @@ impl MigrationEntry for MigrationEntryV001 {
     }
 }
 
-/// Wrapper for V002HashOnCookieConfig.
-struct MigrationEntryV002(v002_hash_on_cookie_config::V002HashOnCookieConfig);
-
-impl MigrationEntry for MigrationEntryV002 {
-    fn version(&self) -> i64 {
-        self.0.version()
-    }
-    fn name(&self) -> &str {
-        self.0.name()
-    }
-    fn checksum(&self) -> &str {
-        self.0.checksum()
-    }
-    fn run_up<'a>(
-        &'a self,
-        pool: &'a AnyPool,
-        db_type: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'a>>
-    {
-        Box::pin(self.0.up(pool, db_type))
-    }
-}
