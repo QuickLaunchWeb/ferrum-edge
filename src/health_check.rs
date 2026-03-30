@@ -510,7 +510,14 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
 /// A response (any data) means the target is alive. Timeout means unhealthy.
 async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> bool {
     let addr = format!("{}:{}", host, port);
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+    // Bind to the correct address family based on the target — IPv6 targets
+    // require an IPv6 ephemeral socket, IPv4 targets require IPv4.
+    let bind_addr = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
             debug!("UDP health probe: failed to bind socket: {}", e);

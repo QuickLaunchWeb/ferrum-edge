@@ -319,10 +319,12 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
+| `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_PROXY_TLS_CERT_PATH` | If HTTPS | — | Path to proxy TLS certificate |
 | `FERRUM_PROXY_TLS_KEY_PATH` | If HTTPS | — | Path to proxy TLS private key |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
+| `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth |

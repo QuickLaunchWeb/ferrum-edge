@@ -716,11 +716,17 @@ async fn handle_dtls_client(
 
     // Create backend connection — plain UDP or DTLS depending on backend_protocol.
     // Frontend DTLS termination can forward to either plain UDP or DTLS backends.
+    // Bind ephemeral socket to the correct address family matching the backend.
+    let ephemeral_bind: &str = if backend_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let (backend_udp, backend_dtls): (
         Option<Arc<UdpSocket>>,
         Option<Arc<webrtc_dtls::conn::DTLSConn>>,
     ) = if proxy.backend_protocol == BackendProtocol::Dtls {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = UdpSocket::bind(ephemeral_bind).await?;
         socket.connect(backend_addr).await?;
         let dtls_config =
             crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
@@ -733,7 +739,7 @@ async fn handle_dtls_client(
         );
         (None, Some(dtls))
     } else {
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = UdpSocket::bind(ephemeral_bind).await?;
         sock.connect(backend_addr).await?;
         (Some(Arc::new(sock)), None)
     };
@@ -908,13 +914,19 @@ async fn create_session(
     let backend_addr = SocketAddr::new(resolved_ip, backend_port);
 
     // Create backend connection — plain UDP or DTLS
+    // Bind ephemeral socket to the correct address family matching the backend.
+    let ephemeral_bind: &str = if backend_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let (backend_socket, dtls_conn) = if proxy.backend_protocol == BackendProtocol::Dtls {
         // DTLS: create a connected socket and wrap it with DTLSConn.
         // The DTLS layer takes ownership of the connected socket; we keep a
         // placeholder backend_socket for the session struct (unused for I/O).
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = UdpSocket::bind(ephemeral_bind).await?;
         socket.connect(backend_addr).await?;
-        let placeholder = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let placeholder = Arc::new(UdpSocket::bind(ephemeral_bind).await?);
 
         let dtls_config =
             crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
@@ -928,7 +940,7 @@ async fn create_session(
         (placeholder, Some(dtls))
     } else {
         // Plain UDP
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = UdpSocket::bind(ephemeral_bind).await?;
         socket.connect(backend_addr).await?;
         (Arc::new(socket), None)
     };
