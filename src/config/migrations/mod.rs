@@ -318,4 +318,3 @@ impl MigrationEntry for MigrationEntryV001 {
         Box::pin(self.0.up(pool, db_type))
     }
 }
-
