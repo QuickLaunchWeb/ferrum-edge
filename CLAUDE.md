@@ -197,11 +197,14 @@ tests/
 
 ### Before Every Commit
 
-1. `cargo fmt` — format all code
-2. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
-3. `cargo test --test unit_tests --all-features` — all unit tests pass
-4. `cargo test --test integration_tests --all-features` — integration tests pass
-5. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+1. `cargo fmt --all` — format all code
+2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI enforces this)
+3. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
+4. `cargo test --test unit_tests --all-features` — all unit tests pass
+5. `cargo test --test integration_tests --all-features` — integration tests pass
+6. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+
+**All steps (1-5) must pass locally before pushing. Do not skip step 2 — `cargo fmt` can miss files that `cargo fmt --all -- --check` catches.**
 
 ### Code Quality Rules
 
