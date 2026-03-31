@@ -4,170 +4,58 @@ A high-performance edge proxy built in Rust, powered by `tokio` and `hyper`.
 
 ## Overview
 
-Ferrum Edge is a lightweight, extensible edge proxy designed for modern microservice architectures. It provides dynamic routing, protocol flexibility (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP with TLS and DTLS support), a robust plugin system with authentication, authorization, rate limiting, and request/response transformation capabilities. It supports multiple deployment topologies through its operating modes — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
+Ferrum Edge is a lightweight, extensible edge proxy designed for modern microservice architectures. It provides dynamic routing, multi-protocol support, a robust plugin system, and multiple deployment topologies — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
 
-## Features
+**Key highlights:**
 
-- **Multiple Operating Modes**: Database, File, Control Plane (CP), and Data Plane (DP) modes
-- **Protocol Support**: HTTP/1.1, HTTP/2 (ALPN-negotiated on TLS), HTTP/3, WebSocket (`ws`/`wss`), gRPC proxying, and raw TCP/UDP/DTLS stream proxying
-- **TCP/UDP Proxy**: Dedicated-port TCP and UDP stream proxying with full TLS/DTLS support (frontend termination + backend origination for both TCP and UDP), session tracking, load balancing, health checks (TCP SYN, UDP probe), and plugin support (IP restriction, rate limiting, logging) — see [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md)
-- **Connection Pooling**: Lock-free connection reuse with per-proxy pool keys, AtomicU64 cleanup, HTTP/2 via ALPN (no forced h2c)
-- **Router Cache**: Pre-sorted route table with bounded O(1) path cache; rebuilt atomically on config changes, never on hot path
-- **Longest Prefix Match Routing**: Efficient route matching with wildcard path-suffix forwarding and unique `listen_path` enforcement
-- **Host-Based Routing**: Optional per-proxy hostname matching with exact and wildcard prefix support (e.g., `*.example.com`)
-- **Dynamic Configuration**: Zero-downtime configuration reloads via DB polling, SIGHUP signals (Unix only), or CP push
-- **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
-- **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
-- **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
-- **Load Balancing**: Six algorithms (round robin, weighted round robin, least connections, least latency, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
-- **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
-- **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
-- **Consumer Identity Forwarding**: Automatically injects `X-Consumer-Username` and `X-Consumer-Custom-Id` headers on requests forwarded to backends after successful authentication
-- **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets + plugin endpoints, deduplicated), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients including plugin outbound calls, per-proxy TTL overrides, and static overrides
-- **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints, batch operations, and full config backup/restore
-- **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
-- **Client IP Resolution**: Secure originating IP detection via trusted proxy configuration with `X-Forwarded-For` right-to-left walk and optional authoritative header support (e.g., `CF-Connecting-IP`)
-- **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows and optional `x-ratelimit-*` header exposure
-- **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
-- **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
-- **Load Balancing**: Six algorithms (RoundRobin, Weighted, LeastConnections, LeastLatency, ConsistentHash, Random) with unhealthy target filtering
-- **Health Checking**: Active probes (HTTP, TCP SYN, UDP) and passive status monitoring with configurable thresholds
-- **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
-- **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies for HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket — see [docs/retry.md](docs/retry.md)
-- **Service Discovery**: Dynamic upstream target resolution via DNS-SD, Kubernetes, and Consul providers with background polling and static+dynamic target merging
-- **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
+- **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
+- **28 built-in plugins**: Authentication, authorization, rate limiting, transformation, AI/LLM-specific plugins, and observability
+- **Four operating modes**: Database, File, Control Plane, Data Plane
+- **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
+- **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
+
+For the full feature list, see [FEATURES.md](FEATURES.md).
 
 ## Operating Modes
 
-### Database Mode (`FERRUM_MODE=database`)
+| Mode | Env Var | Description | Admin API | Proxy |
+|------|---------|-------------|-----------|-------|
+| **Database** | `FERRUM_MODE=database` | Single-instance, DB-backed (PostgreSQL/MySQL/SQLite) | Read/Write | Yes |
+| **File** | `FERRUM_MODE=file` | Single-instance, YAML/JSON config, SIGHUP reload | Read-only | Yes |
+| **Control Plane** | `FERRUM_MODE=cp` | Centralized config authority, gRPC distribution to DPs | Read/Write | No |
+| **Data Plane** | `FERRUM_MODE=dp` | Horizontally scalable traffic processing nodes | Read-only | Yes |
+| **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits | No | No |
 
-A single gateway instance reads configuration from a database, handles proxy traffic, and serves the Admin API.
-
-**Use case**: Single-node or small-scale deployments where simplicity is preferred.
-
-- Connects to PostgreSQL, MySQL, or SQLite
-- Uses incremental polling to detect config changes efficiently — only fetches rows modified since the last poll via indexed `updated_at` queries, with lightweight ID queries for deletion detection. Falls back to full reload on error.
-- Maintains an in-memory cache for resilience during DB outages
-- Serves both proxy traffic and Admin API
-
-### File Mode (`FERRUM_MODE=file`)
-
-A gateway instance reads its entire configuration from a local YAML or JSON file. No Admin API is exposed.
-
-**Use case**: Development, testing, or immutable infrastructure deployments (e.g., Kubernetes ConfigMaps).
-
-- Reads config from `FERRUM_FILE_CONFIG_PATH`
-- Reloads on `SIGHUP` signal
-- Failed reloads keep the previous valid configuration
-- Only proxy traffic listeners are active
-
-### Control Plane Mode (`FERRUM_MODE=cp`)
-
-Acts as the centralized configuration authority. Reads from the database, serves the Admin API, and pushes configuration to Data Plane nodes via gRPC. Does **not** handle proxy traffic.
-
-**Use case**: Distributed deployments where configuration management is separated from traffic handling.
-
-- Serves Admin API and gRPC config distribution
-- Authenticates DP nodes via HS256 JWT
-- Pushes config updates to all subscribed DP nodes
-- Caches config for resilience during DB outages
-
-### Data Plane Mode (`FERRUM_MODE=dp`)
-
-Handles proxy traffic only, receiving its configuration from a Control Plane node. No database access or Admin API.
-
-**Use case**: Horizontally scalable traffic processing nodes in a distributed deployment.
-
-- Connects to CP via gRPC with JWT authentication
-- Receives initial config and subsequent updates
-- Continues serving with cached config if CP connection is lost
-- Automatically reconnects to CP
-- Exposes a read-only Admin API for monitoring
-
-See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for detailed architecture, protocol, and deployment documentation.
-
-## Admin Read-Only Mode
-
-Ferrum Edge supports a configurable read-only mode for the Admin API, providing an additional layer of security for production deployments.
-
-### Behavior
-
-- **Read Operations**: All GET endpoints continue to work normally, allowing monitoring and health checks
-- **Write Operations**: POST, PUT, and DELETE requests are blocked and return `403 Forbidden`
-- **Error Response**: `{"error": "Admin API is in read-only mode"}`
-
-### Configuration
-
-| Environment Variable | Default | Description |
-|---|---|---|
-| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode (DP mode defaults to `true`) |
-
-### Mode-Specific Behavior
-
-- **Control Plane (CP)**: Respects the `FERRUM_ADMIN_READ_ONLY` environment variable
-- **Data Plane (DP)**: **Always** read-only regardless of environment variable
-- **Database/File Modes**: Respect the `FERRUM_ADMIN_READ_ONLY` environment variable
-
-### Use Cases
-
-- **Production Safety**: Prevent accidental configuration changes in production environments
-- **DP Mode Security**: Ensure data plane nodes cannot modify configuration
-- **Compliance**: Meet security requirements for immutable infrastructure
-- **Maintenance**: Allow monitoring without risking configuration changes
+See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
 
 ## Prerequisites
 
-- **Rust** toolchain (latest stable, 1.85+)
-- **Database** (optional): PostgreSQL, MySQL, or SQLite (for database and CP modes)
+- **Rust** toolchain (stable 1.85+)
 - **protoc** (Protocol Buffers compiler) for gRPC code generation
+- **Database** (optional): PostgreSQL, MySQL, or SQLite (for database and CP modes)
 
 ## Installation
 
 ### From Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/QuickLaunchWeb/ferrum-edge.git
 cd ferrum-edge
-
-# Build in release mode
 cargo build --release
-
-# The binary is at target/release/ferrum-edge
+# Binary: target/release/ferrum-edge
 ```
 
-### From Release Binaries
+### Pre-built Binaries
 
-Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-edge/releases) page:
+Download from [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64.
 
-```bash
-# Download the latest release for your platform
-# Linux x86_64
-wget https://github.com/QuickLaunchWeb/ferrum-edge/releases/download/v0.1.0/ferrum-edge-linux-x86_64
-chmod +x ferrum-edge-linux-x86_64
-
-# macOS x86_64 (Intel)
-wget https://github.com/QuickLaunchWeb/ferrum-edge/releases/download/v0.1.0/ferrum-edge-macos-x86_64
-chmod +x ferrum-edge-macos-x86_64
-
-# macOS ARM64 (Apple Silicon)
-wget https://github.com/QuickLaunchWeb/ferrum-edge/releases/download/v0.1.0/ferrum-edge-macos-aarch64
-chmod +x ferrum-edge-macos-aarch64
-
-# Verify checksum
-sha256sum -c ferrum-edge-linux-x86_64.sha256
-```
-
-### Using Docker
+### Docker
 
 ```bash
-# Pull and run the latest Docker image
 docker pull ghcr.io/quicklaunchweb/ferrum-edge:latest
 
-docker run -d \
-  --name ferrum-edge \
-  -p 8000:8000 \
-  -p 9000:9000 \
+docker run -d --name ferrum-edge \
+  -p 8000:8000 -p 9000:9000 \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=sqlite \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
@@ -176,14 +64,13 @@ docker run -d \
   ghcr.io/quicklaunchweb/ferrum-edge:latest
 ```
 
-See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
+See [docs/docker.md](docs/docker.md) for Docker Compose examples and production deployment.
 
 ## Getting Started
 
 ### File Mode (quickest start)
 
 ```bash
-# Run with the example configuration
 FERRUM_MODE=file \
 FERRUM_FILE_CONFIG_PATH=tests/config.yaml \
 FERRUM_LOG_LEVEL=info \
@@ -213,8 +100,8 @@ cargo run --release
 
 ### Control Plane + Data Plane
 
-**Control Plane (plaintext):**
 ```bash
+# Control Plane
 FERRUM_MODE=cp \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
@@ -222,249 +109,46 @@ FERRUM_ADMIN_JWT_SECRET="admin-secret" \
 FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
 FERRUM_CP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release
-```
 
-**Data Plane (plaintext):**
-```bash
+# Data Plane
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
 FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
 cargo run --release
 ```
 
-For production deployments, enable TLS or mTLS on the CP/DP gRPC channel. See [CP/DP Mode docs](docs/cp_dp_mode.md#transport-security-tlsmtls) for `FERRUM_CP_GRPC_TLS_*` and `FERRUM_DP_GRPC_TLS_*` environment variables.
-
-## Docker Deployment
-
-Ferrum Edge can be deployed using Docker or Docker Compose for development, testing, and production.
-
-### Quick Start with Docker Compose
-
-**SQLite Single-Node** (simplest):
-```bash
-docker-compose up ferrum-sqlite
-```
-
-**PostgreSQL Single-Node** (production-ready):
-```bash
-docker-compose --profile postgres up ferrum-postgres
-```
-
-**CP/DP Distributed** (horizontal scaling):
-```bash
-docker-compose --profile cp-dp up
-```
-
-### Building Docker Image
-
-```bash
-# Build locally
-docker build -t ferrum-edge:latest .
-
-# Build for specific platform
-docker buildx build --platform linux/amd64,linux/arm64 -t ferrum-edge:latest .
-```
-
-**Image Features**:
-- Multi-stage build for minimal size (~200MB)
-- Non-root user execution
-- Health check endpoint
-- Comprehensive metadata labels
-
-See [Docker Deployment Guide](docs/docker.md) for detailed examples, configuration, and production best practices.
-
-## CI/CD Pipeline
-
-Ferrum Edge includes automated CI/CD workflows for testing, building, and releasing.
-
-### Automated Testing & Builds
-
-On every push to `main` and pull request:
-- Run all tests (`cargo test`)
-- Check code quality (clippy, fmt)
-- Build release binaries for Linux x86_64, macOS x86_64, and macOS ARM64
-- Build Docker image (pushed to registry on main branch only)
-
-### Automated Releases
-
-When you create a version tag (e.g., `v0.2.0`):
-1. Builds optimized binaries for all platforms (Linux x86_64/ARM64, macOS x86_64/ARM64)
-2. Generates SHA256 checksums
-3. Creates GitHub Release with binaries, checksums, and release notes
-4. Builds Docker image with version tag
-
-### Creating a Release
-
-```bash
-# 1. Update version in Cargo.toml
-# 2. Commit changes to main branch
-# 3. Create and push version tag
-git tag -a v0.2.0 -m "Release version 0.2.0"
-git push origin v0.2.0
-
-# Binaries automatically available at:
-# https://github.com/QuickLaunchWeb/ferrum-edge/releases/tag/v0.2.0
-```
-
-See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets configuration, and customization.
+For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls).
 
 ## Configuration
 
-### Environment Variables
+Ferrum Edge is configured through environment variables, with an optional `ferrum.conf` file for defaults. Environment variables take precedence.
+
+### Essential Variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override). See [Configuration File](#configuration-file-ferrumconf). |
-| `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
-| `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
-| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
-| `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
-| `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
-| `FERRUM_PROXY_TLS_CERT_PATH` | If HTTPS | — | Path to proxy TLS certificate |
-| `FERRUM_PROXY_TLS_KEY_PATH` | If HTTPS | — | Path to proxy TLS private key |
+| `FERRUM_MODE` | **Yes** | — | `database`, `file`, `cp`, `dp`, `migrate` |
+| `FERRUM_LOG_LEVEL` | No | `error` | `error`, `warn`, `info`, `debug`, `trace` |
+| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port |
+| `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
-| `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
-| `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
-| `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
-| `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
-| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth |
-| `FERRUM_ADMIN_READ_ONLY` | All modes | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
-| `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` (supports ~30K proxies + 90K plugins at default) |
-| `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
-| `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
-| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
-| `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
-| `FERRUM_DB_TLS_ENABLED` | No | `false` | Enable TLS for database connections |
-| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database TLS verification |
-| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
-| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS |
-| `FERRUM_DB_TLS_INSECURE` | No | `false` | Skip certificate verification for database TLS (testing only) |
-| `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
-| `FERRUM_DB_SSL_ROOT_CERT` | No | — | Path to CA certificate for database server verification |
-| `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
-| `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
-| `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable (e.g. K8S pod restart during DB outage). See [Resilience & Caching](#resilience--caching). |
-| `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs |
-| `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling |
+| `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API |
+| `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite` |
+| `FERRUM_DB_URL` | DB/CP | — | Database connection string |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
-| `FERRUM_CP_GRPC_JWT_SECRET` | CP mode | — | HS256 secret for DP node authentication |
-| `FERRUM_DP_CP_GRPC_URL` | DP mode | — | Control Plane gRPC URL |
-| `FERRUM_DP_GRPC_AUTH_TOKEN` | DP mode | — | Pre-signed HS256 JWT for CP authentication |
-| `FERRUM_MAX_HEADER_SIZE_BYTES` | No | `32768` | Maximum total request header size (all headers combined) |
-| `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | No | `16384` | Maximum size of any single request header (name + value) |
-| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
-| `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | No | `10485760` | Maximum response body size from backends (0=unlimited) |
-| `FERRUM_DNS_CACHE_TTL_SECONDS` | No | `300` | Default DNS cache TTL |
-| `FERRUM_DNS_OVERRIDES` | No | `{}` | JSON map of hostname→IP static overrides |
-| `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
-| `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
-| `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
-| `FERRUM_DNS_VALID_TTL` | No | response TTL | Override TTL (seconds) for positive records |
-| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
-| `FERRUM_DNS_ERROR_TTL` | No | `1` | TTL (seconds) for errors/empty responses |
-| `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
-| `FERRUM_TLS_CA_BUNDLE_PATH` | No | — | Path to PEM CA bundle for all outbound TLS verification (proxy, service discovery, plugins) |
-| `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
-| `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
-| `FERRUM_PROXY_TLS_CERT_PATH` | No | — | Path to server TLS certificate for HTTPS |
-| `FERRUM_PROXY_TLS_KEY_PATH` | No | — | Path to server TLS private key for HTTPS |
-| `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to client CA bundle for mTLS verification |
-| `FERRUM_ADMIN_TLS_CERT_PATH` | No | — | Path to admin TLS certificate for HTTPS |
-| `FERRUM_ADMIN_TLS_KEY_PATH` | No | — | Path to admin TLS private key for HTTPS |
-| `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
-| `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
-| `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
-| `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version (`1.2` or `1.3`) |
-| `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version (`1.2` or `1.3`) |
-| `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites (see [TLS Policy Hardening](docs/frontend_tls.md#tls-policy-hardening)) |
-| `FERRUM_TLS_CURVES` | No | `X25519,secp256r1` | Comma-separated key exchange groups: `X25519`, `secp256r1`/`P-256`, `secp384r1`/`P-384` |
-| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation |
-| `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency via deferred task (adds one `Arc` + `tokio::spawn` per streaming request) |
-| `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
-| `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
-| `FERRUM_HTTP3_MAX_STREAMS` | No | `1000` | Maximum concurrent HTTP/3 streams per connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `8388608` | HTTP/3 per-stream receive window in bytes (default: 8 MiB) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `33554432` | HTTP/3 connection-level receive window in bytes (default: 32 MiB) |
-| `FERRUM_HTTP3_SEND_WINDOW` | No | `8388608` | HTTP/3 per-connection send window in bytes (default: 8 MiB) |
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | — | Server secret for HMAC-SHA256 password verification (~1μs). When set, the Admin API stores `hmac_sha256:<hex>` hashes instead of bcrypt. Existing bcrypt hashes remain valid. |
-| `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
-| `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
-| `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
-| `FERRUM_DTLS_CERT_PATH` | No | — | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519 only) |
-| `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
-| `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | No | — | PEM CA certificate for verifying DTLS client certs (frontend mTLS) |
-| `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls (http_logging, JWKS fetch, OTLP) |
-| `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads (auto-detected like nginx `worker_processes auto`) |
-| `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
-| `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
-| `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
-| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `250` | Server-side HTTP/2 max concurrent streams per inbound connection |
 
-See [docs/infrastructure_sizing.md](docs/infrastructure_sizing.md) for detailed tuning guidance on runtime and listener settings.
+For the full list of 90+ environment variables, see [docs/configuration.md](docs/configuration.md).
 
-See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
-
-### Configuration File (`ferrum.conf`)
-
-As an alternative to environment variables, the gateway supports a `ferrum.conf` configuration file for setting reasonable defaults. Environment variables **take precedence** over values in the conf file, allowing operators to define baseline configuration in the file and override specific values per deployment via env vars.
-
-**File location:**
-- Default: `./ferrum.conf` (current working directory)
-- Override with the `FERRUM_CONF_PATH` environment variable (the only setting that must remain an env var)
-- If the file does not exist at the default path, it is silently skipped
-
-**Format:** Simple key-value pairs using the same `FERRUM_*` names as environment variables:
-
-```conf
-# Operating mode
-FERRUM_MODE = file
-FERRUM_FILE_CONFIG_PATH = /etc/ferrum/config.yaml
-FERRUM_LOG_LEVEL = info
-
-# Proxy ports
-FERRUM_PROXY_HTTP_PORT = 8080
-FERRUM_PROXY_HTTPS_PORT = 8443
-
-# TLS hardening
-FERRUM_TLS_MIN_VERSION = 1.3
-
-# Quoted values for paths with spaces
-FERRUM_PROXY_TLS_CERT_PATH = "/path/with spaces/cert.pem"
-```
-
-- Lines starting with `#` are comments
-- Inline comments are supported: `KEY = value # comment`
-- Values can be quoted with double or single quotes (quotes are stripped)
-- Empty lines are ignored
-
-A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
-
-**Precedence order:** environment variables > `ferrum.conf` > built-in defaults
-
-### Configuration File Format (File Mode)
-
-Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
+### File Mode Config Format
 
 ```yaml
 proxies:
   - id: "my-api"
-    name: "My Backend API"
     listen_path: "/api/v1"
     backend_protocol: http
     backend_host: "backend-service"
     backend_port: 3000
     strip_listen_path: true
-    preserve_host_header: false
-    backend_connect_timeout_ms: 5000
-    backend_read_timeout_ms: 30000
-    backend_write_timeout_ms: 30000
-    # Response body mode: "stream" (default) or "buffer"
-    # response_body_mode: stream
-    # Connection pooling settings (optional - override global defaults)
-    pool_idle_timeout_seconds: 120      # Override global default (90)
-    # pool_enable_http_keep_alive and pool_enable_http2 use global defaults
-    auth_mode: single
     plugins:
       - plugin_config_id: "log-plugin"
 
@@ -483,1542 +167,196 @@ plugin_configs:
     enabled: true
 ```
 
-#### Stream Proxy (TCP/UDP/DTLS)
-
-Stream proxies use `listen_port` instead of `listen_path` and bind to dedicated ports:
-
-```yaml
-proxies:
-  # TCP proxy with TLS origination to backend
-  - id: "postgres-proxy"
-    listen_path: ""
-    listen_port: 5432
-    backend_protocol: tcp_tls
-    backend_host: "db.internal"
-    backend_port: 5432
-
-  # UDP proxy with DTLS encryption to backend
-  - id: "iot-proxy"
-    listen_path: ""
-    listen_port: 5684
-    backend_protocol: dtls
-    backend_host: "iot-backend.internal"
-    backend_port: 5684
-    backend_tls_verify_server_cert: false
-    udp_idle_timeout_seconds: 120
-
-  # Full DTLS e2e: DTLS client → gateway → DTLS backend
-  - id: "secure-iot"
-    listen_path: ""
-    listen_port: 5685
-    backend_protocol: dtls
-    backend_host: "secure-iot.internal"
-    backend_port: 5684
-    frontend_tls: true               # Accept DTLS from clients
-    backend_tls_verify_server_cert: false
-```
-
-See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for full documentation.
-
-#### Service Discovery
-
-Upstreams can discover targets dynamically using a `service_discovery` block. Three providers are supported:
-
-**DNS-SD** (DNS Service Discovery):
-```yaml
-upstreams:
-  - id: "my-upstream"
-    targets: []
-    algorithm: round_robin
-    service_discovery:
-      provider: dns_sd
-      dns_sd:
-        service_name: "_http._tcp.my-service.local"
-        poll_interval_seconds: 30
-```
-
-**Kubernetes**:
-```yaml
-upstreams:
-  - id: "k8s-upstream"
-    targets: []
-    algorithm: least_connections
-    service_discovery:
-      provider: kubernetes
-      kubernetes:
-        namespace: "default"
-        service_name: "my-service"
-        port_name: "http"
-        poll_interval_seconds: 15
-```
-
-**Consul**:
-```yaml
-upstreams:
-  - id: "consul-upstream"
-    targets:
-      - host: "fallback.example.com"
-        port: 8080
-        weight: 1
-    algorithm: round_robin
-    service_discovery:
-      provider: consul
-      consul:
-        address: "http://consul.internal:8500"
-        service_name: "my-service"
-        datacenter: "dc1"
-        poll_interval_seconds: 10
-        token: "consul-acl-token"
-```
-
-Discovered targets are merged with any statically defined `targets`. If the provider is unreachable, the upstream keeps its last-known targets to maintain availability.
-
-## Connection Pooling
-
-Ferrum Edge includes enterprise-grade connection pooling that significantly improves performance by reusing HTTP/HTTPS/WebSocket connections. This reduces TCP handshake overhead, lowers latency, and increases throughput.
-
-### Hybrid Configuration Approach
-
-Connection pooling uses a **hybrid configuration** with global defaults and per-proxy overrides:
-
-#### Global Environment Variables
-```bash
-# Set global defaults (optional - shown with defaults)
-FERRUM_POOL_MAX_IDLE_PER_HOST=64
-FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
-FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
-FERRUM_POOL_ENABLE_HTTP2=true
-FERRUM_POOL_TCP_KEEPALIVE_SECONDS=60
-FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS=30
-FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS=45
-# HTTP/2 flow control tuning (dramatically improves HTTP/2 and gRPC throughput)
-FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608       # 8 MiB (vs 64 KB h2 spec default)
-FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432   # 32 MiB
-FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false                    # Fixed windows for predictable performance
-FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=65535                     # Max frame payload
-FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000              # Concurrent streams per connection
-```
-
-#### Per-Proxy Overrides (Optional)
-```yaml
-proxies:
-  - id: "high-traffic-api"
-    # Override specific settings for this proxy
-    pool_enable_http2: false
-    pool_tcp_keepalive_seconds: 30
-    pool_http2_keep_alive_interval_seconds: 15
-    pool_http2_keep_alive_timeout_seconds: 5
-    # HTTP/2 flow control overrides
-    pool_http2_initial_stream_window_size: 16777216   # 16 MiB for large response bodies
-    pool_http2_initial_connection_window_size: 67108864  # 64 MiB
-    pool_http2_adaptive_window: true                  # Enable BDP probing for this proxy
-    # Other settings use global defaults
-```
-
-### Benefits
-
-- **2-3x Higher Throughput**: Connection reuse eliminates setup overhead
-- **Lower Latency**: Persistent connections avoid TCP handshakes
-- **Resource Efficiency**: Fewer file descriptors and memory usage
-- **Protocol Support**: HTTP/1.1 keep-alive, HTTP/2, HTTPS, WebSocket (WS/WSS)
-- **Flexible Configuration**: Global defaults with per-proxy fine-tuning
-
-### Configuration
-
-| Setting | Global Default | Description |
-|---------|----------------|-------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
-| `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed |
-| `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse |
-| `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
-| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
-| `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
-| `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | HTTP/2 per-stream flow-control window (bytes). Larger = higher single-stream throughput. Default: 8 MiB |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | HTTP/2 connection-level flow-control window (bytes). Aggregate budget across streams. Default: 32 MiB |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `false` | Enable adaptive flow-control (BDP probing). Disabled by default for predictable fixed-window performance |
-| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `65535` | Maximum HTTP/2 frame payload (bytes). Range: 16384–16777215 |
-| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
-
-### Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`
-
-This is the single most important pool setting for performance and reliability.
-It controls how many idle backend connections are kept alive and ready for reuse
-per backend host. Values that are too low cause connection churn under load (new
-TCP handshakes per request), while values that are too high waste file
-descriptors and memory. This is configured globally via the
-`FERRUM_POOL_MAX_IDLE_PER_HOST` environment variable.
-
-**Safety bounds:** The gateway enforces a minimum of **4** and a maximum of
-**1024**. Values outside this range are automatically clamped with a warning in
-the logs.
-
-#### Recommended values by workload
-
-| Workload | Expected Concurrency | Recommended Value | Notes |
-|----------|---------------------|-------------------|-------|
-| Low-traffic internal API | < 20 concurrent requests | `16`–`32` | Default of 64 is fine; keep-alive reuses connections efficiently |
-| Standard production API | 20–100 concurrent requests | `64`–`128` | Match or slightly exceed your expected peak concurrency per backend host |
-| High-traffic public API | 100–500 concurrent requests | `128`–`256` | Higher values prevent connection churn at peak; monitor backend capacity |
-| Health checks / monitoring | Low volume, high frequency | `16`–`32` | Small responses finish quickly; fewer idle connections needed |
-| WebSocket services | Long-lived connections | `16`–`64` | WebSocket connections are persistent; pool mainly holds upgrade handshakes |
-
-#### How to choose
-
-1. **Start with the default (64).** This handles most workloads well.
-2. **Match your expected peak concurrency.** If your gateway handles 200
-   concurrent requests to a single backend, set the value to at least `200`.
-   Idle connections beyond the limit are closed, so requests that arrive when no
-   idle connection is available must open a new TCP connection, adding latency.
-3. **Monitor for connection churn.** If your logs show frequent
-   "Backend request failed" errors under load, increase this value.
-4. **Do not exceed your backend's capacity.** Setting this to 1024 does not help
-   if your backend can only handle 100 concurrent connections — it just moves
-   the bottleneck.
-
-### Timeout Mechanisms Explained
-
-**Different Layers of Connection Management:**
-
-1. **TCP Keep-Alive** (Transport Layer)
-   - Prevents connection drops by NAT/firewalls
-   - Sends packets every N seconds when idle
-   - Applies to ALL connections (HTTP/1.1, HTTP/2, WebSocket)
-
-2. **HTTP/2 Keep-Alive** (Application Layer)
-   - Detects dead HTTP/2 connections via PING frames
-   - Only applies to HTTP/2 connections
-   - More responsive than TCP keep-alive for HTTP/2
-
-3. **HTTP Timeouts** (Request Layer)
-   - Controls request/response processing time
-   - `backend_connect_timeout_ms`: Connection establishment (default: 5000ms)
-   - `backend_read_timeout_ms`: Request processing (default: 30000ms)
-   - Applies during active requests
-
-**Recommended Relationships:**
-- HTTP/2 timeout should be **1.5x** the TCP keep-alive interval
-- HTTP read timeout should be **2-3x** the HTTP/2 timeout
-- TCP keep-alive should be **1.2-1.5x** the HTTP/2 interval
-
-### Protocol-Specific Recommendations
-
-#### HTTP/HTTPS APIs
-```bash
-# Global environment
-FERRUM_POOL_MAX_IDLE_PER_HOST=128
-FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
-FERRUM_POOL_ENABLE_HTTP2=true
-```
-
-#### WebSocket Services
-```yaml
-# Per-proxy override for WS/WSS
-pool_idle_timeout_seconds: 300
-pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
-```
-
-#### Auth-Protected APIs
-```yaml
-# Per-proxy override for auth-heavy services
-pool_enable_http2: false  # Better compatibility with auth plugins
-```
-
-### Performance Impact
-
-In performance tests (8 threads, 100 connections, 30 seconds), connection
-pooling with properly tuned `FERRUM_POOL_MAX_IDLE_PER_HOST` provides:
-- **~88,500 RPS** for lightweight health checks through the gateway
-- **~77,000 RPS** for API proxy vs ~60,000 RPS direct backend access
-- **1.10ms avg latency** for health checks, ~1.24ms for API proxy
-- **Zero errors** under sustained load
-
-| Test | Requests/sec | Avg Latency | Max Latency |
-|------|-------------|-------------|-------------|
-| Health Check (gateway) | 88,489 | 1.10ms | 23.80ms |
-| Users API (gateway) | 77,010 | 1.24ms | 12.69ms |
-| Direct Backend (baseline) | 59,912 | 1.51ms | 3.40ms |
-
-*Results from local run on macOS Apple Silicon, release build, 8 threads, 100 connections, 30s duration (2026-03-28).*
-
-### Performance Testing
-
-Ferrum Edge includes a comprehensive performance testing suite in the `tests/performance/` directory:
-
-```bash
-# Full performance test suite with HTML report
-cd tests/performance && ./run_perf_test.sh
-
-# Custom test parameters
-WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./run_perf_test.sh
-```
-
-The testing suite provides:
-- **Automated backend server** with multiple endpoints
-- **Gateway vs direct backend comparison**
-- **HTML performance reports** with visual analysis
-- **Configurable load testing** with wrk
-- **Protocol support** for HTTP, HTTPS, and WebSockets
-
-See `tests/performance/README.md` for detailed usage instructions.
-
-#### Multi-Protocol Performance Tests
-
-A dedicated multi-protocol benchmark suite tests all 10 supported protocols through the gateway:
-
-```bash
-cd tests/performance/multi_protocol
-
-# Run all protocol tests
-./run_protocol_test.sh all --duration 10 --concurrency 200
-
-# Run a single protocol
-./run_protocol_test.sh http1-tls --duration 10 --concurrency 200
-```
-
-| Protocol | Gateway RPS | Direct RPS | Overhead |
-|----------|------------|------------|----------|
-| HTTP/1.1 | 88,773 | 100,112 | ~11% |
-| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% |
-| HTTP/2 (TLS) | 49,223 | 109,162 | ~55% |
-| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% |
-| WebSocket | 104,465 | 219,620 | ~52% |
-| gRPC | 34,470 | 118,650 | ~71% |
-| TCP | 108,332 | 215,646 | ~50% |
-| TCP+TLS | 112,152 | 221,520 | ~49% |
-| UDP | 79,029 | 228,705 | ~65% |
-| UDP+DTLS | 74,098 | — | — |
-
-*Tested on macOS Apple Silicon, 200 concurrent connections, 10s duration. See `tests/performance/multi_protocol/README.md` for full details.*
-
-### Database Schema
-
-When using Database or CP modes, Ferrum auto-creates the following tables on startup:
-
-- **`proxies`**: Proxy route definitions (with `UNIQUE` constraint on `listen_path`)
-- **`consumers`**: API consumer/user definitions
-- **`plugin_configs`**: Plugin configurations (global or per-proxy scoped)
-- **`proxy_plugins`**: Many-to-many linking proxies to plugin configs
-- **`upstreams`**: Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
+See [docs/configuration.md](docs/configuration.md) for stream proxy config, service discovery, and the `ferrum.conf` reference.
 
 ## Admin API
 
-### Authentication
-
-All Admin API endpoints (except `/health`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET`.
-
-Generate a token:
-```bash
-# Using any JWT library; payload can be minimal
-# Example using Node.js jsonwebtoken:
-node -e "console.log(require('jsonwebtoken').sign({sub:'admin'}, 'my-super-secret-jwt-key'))"
-```
-
-### Endpoints
-
-#### Proxies
+JWT-protected REST API for managing proxies, consumers, plugins, and upstreams at runtime.
 
 ```bash
-# List all proxies
+# Health check (no auth required)
+curl http://localhost:9000/health
+
+# List proxies
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies
 
 # Create a proxy
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "listen_path": "/new-api",
-    "backend_protocol": "http",
-    "backend_host": "backend",
-    "backend_port": 3000,
-    "strip_listen_path": true
-  }' \
+  -d '{"listen_path": "/api", "backend_protocol": "http", "backend_host": "backend", "backend_port": 3000}' \
   http://localhost:9000/proxies
 
-# Get a proxy
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
-
-# Update a proxy
-curl -X PUT -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"listen_path": "/new-api", "backend_host": "new-backend", "backend_port": 4000, "backend_protocol": "http"}' \
-  http://localhost:9000/proxies/{proxy_id}
-
-# Delete a proxy
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
+# Backup / Restore
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/backup > backup.json
+curl -X POST -H "Authorization: Bearer $TOKEN" -d @backup.json "http://localhost:9000/restore?confirm=true"
 ```
 
-#### Consumers
-
-```bash
-# List consumers
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/consumers
-
-# Create consumer
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"username": "alice", "credentials": {"keyauth": {"key": "my-key"}}}' \
-  http://localhost:9000/consumers
-
-# Update consumer credentials
-curl -X PUT -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"key": "new-api-key"}' \
-  http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
-
-# Delete a credential type
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
-  http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
-```
-
-#### Plugin Configs
-
-```bash
-# List available plugin types
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins
-
-# List all plugin configs
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/plugins/config
-
-# Create plugin config
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "plugin_name": "rate_limiting",
-    "config": {"limit_by": "ip", "requests_per_minute": 60},
-    "scope": "global",
-    "enabled": true
-  }' \
-  http://localhost:9000/plugins/config
-```
-
-#### Upstreams
-
-```bash
-# List all upstreams
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
-
-# Create an upstream (load-balanced backend group)
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "my-backend-pool",
-    "targets": [
-      {"host": "backend1.example.com", "port": 8080, "weight": 5},
-      {"host": "backend2.example.com", "port": 8080, "weight": 3}
-    ],
-    "algorithm": "weighted_round_robin",
-    "health_checks": {
-      "active": {
-        "http_path": "/health",
-        "interval_seconds": 10,
-        "healthy_threshold": 3,
-        "unhealthy_threshold": 3
-      }
-    }
-  }' \
-  http://localhost:9000/upstreams
-
-# Get an upstream
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
-
-# Update an upstream
-curl -X PUT -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "my-backend-pool",
-    "targets": [
-      {"host": "backend1.example.com", "port": 8080, "weight": 5},
-      {"host": "backend3.example.com", "port": 8080, "weight": 2}
-    ],
-    "algorithm": "round_robin"
-  }' \
-  http://localhost:9000/upstreams/{upstream_id}
-
-# Delete an upstream
-curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
-```
-
-Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `least_latency`, `consistent_hashing`, `random`.
-
-To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`. Each target may also specify an optional `path` field (e.g., `{"host": "backend1.example.com", "port": 8080, "path": "/v2"}`) which overrides the proxy's `backend_path` when that target is selected.
-
-#### Backup & Restore
-
-```bash
-# Full backup — exports all proxies, consumers, plugins, upstreams (unredacted)
-curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:9000/backup > ferrum-backup.json
-
-# Partial backup — only proxies and upstreams
-curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:9000/backup?resources=proxies,upstreams" > partial-backup.json
-
-# Restore from backup (destructive — replaces all existing config)
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @ferrum-backup.json \
-  "http://localhost:9000/restore?confirm=true"
-```
-
-The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports. See [docs/admin_backup_restore.md](docs/admin_backup_restore.md) for details.
-
-#### Metrics
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/admin/metrics
-```
-
-Returns:
-```json
-{
-  "mode": "database",
-  "config_last_updated_at": "2025-01-15T10:30:00Z",
-  "config_source_status": "online",
-  "proxy_count": 5,
-  "consumer_count": 10,
-  "requests_per_second_current": 150,
-  "status_codes_last_second": {"200": 145, "404": 3, "429": 2}
-}
-```
-
-#### Health Check (Unauthenticated)
-
-```bash
-curl http://localhost:9000/health
-# or equivalently:
-curl http://localhost:9000/status
-# Returns: {"status": "ok", "timestamp": "...", "mode": "database"}
-```
-
-Both `/health` and `/status` return the same response and do not require JWT authentication, making them suitable for load balancer health probes and monitoring systems.
+See [docs/admin_api.md](docs/admin_api.md) for the full endpoint reference, and [openapi.yaml](openapi.yaml) for the OpenAPI specification.
 
 ## Plugin System
 
-### Lifecycle Hooks
-
-Plugins execute in a defined pipeline for each request:
-
-1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, rate limiting)
-2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, Basic Auth)
-3. **`authorize`** — Checks consumer permissions (Access Control)
-4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
-6. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
-
-### Execution Order
-
-Within each phase, plugins run in **priority order** (lowest number first). This ensures predictable behavior — for example, CORS preflight responses are sent before authentication can reject them, and rate limiting fires before expensive auth operations.
-
-| Priority | Band | Plugins |
-|----------|------|---------|
-| 100 | Early | `cors`, `ip_restriction`, `bot_detection` |
-| 950-1400 | Authentication | `mtls_auth`, `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
-| 2000 | Authorization | `access_control` |
-| 2850 | Authorization | `graphql` (depth, complexity, per-operation rate limiting) |
-| 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
-| 2925-2975 | AI Pre-proxy | `ai_prompt_shield` (PII scan), `ai_request_guard` (model/token policy) |
-| 3000 | Transform | `request_transformer`, `body_validator`, `request_termination` |
-| 4000-4200 | Response | `response_transformer`, `ai_token_metrics` (extract usage), `ai_rate_limiter` (count tokens) |
-| 25 | Tracing | `otel_tracing` (W3C trace context + OTLP export, runs first for accurate timing) |
-| 9000-9300 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics` |
-
-Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
-
-### Protocol-Aware Plugin Filtering
-
-Each plugin declares which proxy protocols it supports (HTTP, gRPC, WebSocket, TCP, UDP). The gateway automatically skips plugins that don't apply to the current proxy's protocol — for example, CORS is never invoked on a TCP stream proxy, and auth plugins are skipped for raw UDP connections. Protocol-filtered plugin lists are pre-computed at config reload time for zero hot-path overhead. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full per-plugin protocol matrix.
-
-### Global vs. Proxy Scope
-
-- **Global** plugins apply to all proxies
-- **Proxy-scoped** plugins apply only to a specific proxy and override globals of the same plugin type
-
-### Multi-Authentication Mode
-
-When a proxy has `auth_mode: multi`, all attached authentication plugins execute sequentially. The first plugin that successfully identifies a consumer attaches that consumer's context. Subsequent auth plugins cannot overwrite it. After all auth plugins run, the Access Control plugin verifies that at least one consumer was identified.
-
-### Consumer Identity Headers
-
-When a request is successfully authenticated and a consumer is identified, the gateway automatically injects identity headers into the request forwarded to the backend:
-
-| Header | Value | Present |
-|--------|-------|---------|
-| `X-Consumer-Username` | The consumer's `username` field | Always (when authenticated) |
-| `X-Consumer-Custom-Id` | The consumer's `custom_id` field | Only when `custom_id` is set |
-
-These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket) after the authentication phase completes, allowing backend services to identify the caller without re-validating credentials.
-
-### Available Plugins
-
-#### `stdout_logging`
-
-Logs a JSON transaction summary to stdout for each request.
-
-**Config**: None required.
-
-```yaml
-plugin_name: stdout_logging
-config: {}
-```
-
-#### `http_logging`
-
-Sends transaction summaries as JSON to an external HTTP endpoint. Entries are buffered and sent in batches (as a JSON array) to reduce per-request HTTP overhead. A background task handles flushing, retries, and delivery — the proxy hot path only performs a non-blocking channel write.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `endpoint_url` | String | `""` | URL to POST transaction logs to |
-| `authorization_header` | String | *(none)* | Authorization header value for the logging endpoint |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
-| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
-| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-
-Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. After all retries are exhausted, the batch is discarded to keep memory usage bounded.
-
-```yaml
-plugin_name: http_logging
-config:
-  endpoint_url: "https://logging-service.example.com/ingest"
-  authorization_header: "Bearer log-token-123"
-  batch_size: 50
-  flush_interval_ms: 1000
-  max_retries: 3
-  retry_delay_ms: 1000
-  buffer_capacity: 10000
-```
-
-#### `transaction_debugger`
-
-Logs verbose request/response details to stdout. Sensitive headers (Authorization, Cookie, X-API-Key, etc.) are automatically redacted in debug output. Enable per-proxy only for debugging.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `log_request_body` | bool | `false` | Log incoming request body |
-| `log_response_body` | bool | `false` | Log backend response body |
-| `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
-
-**Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
-
-#### `mtls_auth`
-
-Authenticates requests using the client's TLS certificate, matching a configurable certificate field against consumer credentials. Operates on top of the gateway's global CA verification — the TLS handshake validates the certificate chain, and this plugin provides per-proxy consumer identity matching with optional CA filtering.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `cert_field` | String | `subject_cn` | Certificate field to use as identity (see below) |
-| `allowed_issuers` | Object[] | *(none)* | Per-proxy issuer DN filters (see [Issuer Filtering](#issuer-filtering)) |
-| `allowed_ca_fingerprints_sha256` | String[] | *(none)* | SHA-256 fingerprints of allowed CA/intermediate certs (see [CA Fingerprint Filtering](#ca-fingerprint-filtering)) |
-
-**Supported `cert_field` values:**
-
-| Value | Description |
-|-------|-------------|
-| `subject_cn` | Subject Common Name (default) |
-| `subject_ou` | Subject Organizational Unit |
-| `subject_o` | Subject Organization |
-| `san_dns` | First DNS Subject Alternative Name |
-| `san_email` | First email Subject Alternative Name |
-| `fingerprint_sha256` | SHA-256 fingerprint of the DER-encoded certificate (lowercase hex) |
-| `serial` | Certificate serial number (lowercase hex) |
-
-**Consumer credential** (`mtls_auth`):
-```yaml
-credentials:
-  mtls_auth:
-    identity: "client.example.com"
-```
-
-The `identity` value must exactly match the extracted certificate field (case-sensitive).
-
-##### Issuer Filtering
-
-When `allowed_issuers` is configured, the plugin verifies the client certificate's issuer DN matches at least one filter entry. This enables per-proxy CA restrictions on top of the global truststore.
-
-Each filter object can specify `cn`, `o`, and/or `ou` fields. Within a single filter, all specified fields must match (**AND** logic). Across filter entries, any match is sufficient (**OR** logic).
-
-```yaml
-plugin_name: mtls_auth
-config:
-  cert_field: subject_cn
-  allowed_issuers:
-    - cn: "Internal Services CA"
-    - cn: "Partner Portal CA"
-      o: "Partner Corp"
-```
-
-In this example, clients are accepted if their certificate was issued by "Internal Services CA" (any org) **or** by "Partner Portal CA" with organization "Partner Corp".
-
-##### CA Fingerprint Filtering
-
-When `allowed_ca_fingerprints_sha256` is configured, the plugin verifies that at least one certificate in the client's TLS chain (intermediate/CA certs sent during the handshake) matches a configured SHA-256 fingerprint. Fingerprints are case-insensitive.
-
-```yaml
-plugin_name: mtls_auth
-config:
-  cert_field: subject_cn
-  allowed_ca_fingerprints_sha256:
-    - "a1b2c3d4e5f6..."
-```
-
-> **Note:** Root CA certificates are typically not included in the client's certificate chain — they are in the server's trust store. Use `allowed_issuers` for root CA filtering, and `allowed_ca_fingerprints_sha256` for intermediate CA filtering.
-
-When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, **both** constraints must pass (AND logic).
-
-##### Multi-Auth Compatibility
-
-`mtls_auth` works with `auth_mode: multi`. When combined with other auth plugins (e.g., `jwt_auth`, `key_auth`), if the mTLS check fails (no cert, wrong issuer, unknown identity), the gateway continues to the next auth plugin. The request is only rejected if **all** configured auth plugins fail.
-
-```yaml
-auth_mode: multi
-plugins:
-  - plugin_config_id: "mtls-plugin"    # Try mTLS first (priority 950)
-  - plugin_config_id: "jwt-plugin"     # Fall back to JWT (priority 1100)
-```
-
-##### How It Works
-
-1. **TLS handshake** (global) — the gateway validates the client certificate against the global CA truststore (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`). This is all-or-nothing per listener.
-2. **Issuer check** (per-proxy, optional) — if `allowed_issuers` is configured, the plugin verifies the peer cert's issuer DN. Rejects with `403` on mismatch.
-3. **CA fingerprint check** (per-proxy, optional) — if `allowed_ca_fingerprints_sha256` is configured, the plugin checks the chain certs. Rejects with `403` on mismatch.
-4. **Identity extraction** — the configured `cert_field` is extracted from the peer certificate.
-5. **Consumer lookup** — O(1) lookup via `ConsumerIndex` using the extracted identity.
-
-#### `jwt_auth`
-
-Authenticates requests using HS256 JWT Bearer tokens matched against consumer credentials.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
-| `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
-
-**Consumer credential** (`jwt`):
-```yaml
-credentials:
-  jwt:
-    secret: "consumer-specific-hs256-secret"
-```
-
-#### `key_auth`
-
-Authenticates requests using an API key matched against consumer credentials.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
-
-**Consumer credential** (`keyauth`):
-```yaml
-credentials:
-  keyauth:
-    key: "the-api-key-value"
-```
-
-#### `basic_auth`
-
-Authenticates using HTTP Basic credentials with bcrypt-hashed password verification.
-
-**Config**: None required.
-
-**Consumer credential** (`basicauth`):
-```yaml
-credentials:
-  basicauth:
-    password_hash: "$2b$12$..." # bcrypt hash
-```
-
-#### `jwks_auth`
-
-Authenticates using Bearer JWTs validated against one or more Identity Provider JWKS endpoints. Supports multi-provider configurations with per-provider claim-based authorization (scopes/roles).
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `providers` | Array | Array of identity provider configurations (required) |
-| `providers[].jwks_uri` | String | Direct URL to the IdP's JWKS endpoint |
-| `providers[].discovery_url` | String | OIDC discovery URL (auto-discovers `jwks_uri`) |
-| `providers[].issuer` | String (optional) | Expected JWT `iss` claim — routes tokens to this provider |
-| `providers[].audience` | String (optional) | Expected JWT `aud` claim |
-| `providers[].required_scopes` | String[] (optional) | Scopes that must all be present in the token |
-| `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token |
-| `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path |
-| `providers[].role_claim` | String (optional) | Per-provider override for role claim path |
-| `scope_claim` | String | Global scope claim path (default: `"scope"`) |
-| `role_claim` | String | Global role claim path (default: `"roles"`) |
-| `consumer_identity_claim` | String | JWT claim for consumer lookup and rate-limit key (default: `"sub"`) |
-| `consumer_header_claim` | String | JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
-| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `300`) |
-
-Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths (e.g., `realm_access.roles` for Keycloak).
-
-#### `access_control`
-
-Authorizes requests based on IP address, CIDR range, and/or the identified consumer's username. Blocked IPs take precedence over allowed IPs. If `allowed_ips` is specified, only IPs in that list are permitted; all others are rejected.
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `allowed_ips` | String[] | IP addresses or CIDR ranges allowed (e.g., `["10.0.0.0/8", "192.168.1.1"]`) |
-| `blocked_ips` | String[] | IP addresses or CIDR ranges explicitly denied |
-| `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
-| `disallowed_consumers` | String[] | Usernames explicitly denied |
-
-#### `cors`
-
-Handles Cross-Origin Resource Sharing (CORS) at the gateway level. Intercepts preflight `OPTIONS` requests, validates origins and methods against configured allow-lists, and injects CORS response headers on actual cross-origin requests. Disallowed origins or methods are rejected with `403 Forbidden`.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `allowed_origins` | String[] | `["*"]` | Permitted origins; `["*"]` allows any origin |
-| `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Methods returned in preflight `Access-Control-Allow-Methods` |
-| `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Headers returned in preflight `Access-Control-Allow-Headers` |
-| `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
-| `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` (cannot combine with wildcard origins) |
-| `max_age` | u64 | `86400` | Preflight cache duration in seconds |
-| `preflight_continue` | bool | `false` | Pass preflight requests to backend instead of short-circuiting |
-
-```yaml
-plugin_name: cors
-config:
-  allowed_origins: ["https://app.example.com", "https://admin.example.com"]
-  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
-  allowed_headers: ["Authorization", "Content-Type", "X-Request-ID"]
-  exposed_headers: ["X-Request-ID", "X-RateLimit-Remaining"]
-  allow_credentials: true
-  max_age: 3600
-```
-
-See [docs/cors_plugin.md](docs/cors_plugin.md) for detailed configuration, request flow diagrams, and troubleshooting.
-
-#### `request_transformer`
-
-Modifies request headers, query parameters, and JSON body fields before proxying.
-
-**Config**:
-```yaml
-config:
-  rules:
-    - operation: add       # add, remove, update, rename
-      target: header       # header, query, body
-      key: "X-Custom"
-      value: "my-value"
-    - operation: rename
-      target: body
-      key: "user.old_field"       # dot-notation for nested JSON
-      new_key: "user.new_field"
-    - operation: remove
-      target: body
-      key: "internal.debug_info"
-```
-
-Body rules use dot-notation paths (e.g., `user.address.city`) to navigate nested JSON objects. The `add` operation creates intermediate objects as needed. Values are auto-parsed as JSON when possible (`"42"` → number, `"true"` → boolean). Body transformation only applies to `application/json` (or `+json`) content types.
-
-#### `response_transformer`
-
-Modifies response headers and JSON body fields before sending to the client. When body rules are configured, response body buffering is automatically enabled.
-
-**Config**:
-```yaml
-config:
-  rules:
-    - operation: add
-      key: "X-Powered-By"
-      value: "Ferrum-Gateway"
-    - operation: rename
-      target: body
-      key: "resp_data"
-      new_key: "data"
-    - operation: remove
-      target: body
-      key: "internal_trace_id"
-```
-
-Header rules default to `target: header` for backwards compatibility (no `target` field required). Body rules require explicit `target: body` and support the same dot-notation paths as `request_transformer`.
-
-#### `rate_limiting`
-
-Enforces request rate limits per time window. Supports limiting by client IP address or by authenticated consumer identity. State is maintained in-memory per node.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `limit_by` | String | `ip` | Rate limit key: `ip` (client IP) or `consumer` (authenticated consumer username) |
-| `expose_headers` | bool | `false` | When `true`, inject `x-ratelimit-*` headers on upstream requests and downstream responses |
-| `requests_per_second` | u64 (optional) | — | Max requests per second |
-| `requests_per_minute` | u64 (optional) | — | Max requests per minute |
-| `requests_per_hour` | u64 (optional) | — | Max requests per hour |
-
-**Behavior by mode:**
-- `limit_by: "ip"` — Enforces limits in the `on_request_received` phase (before authentication), keyed by client IP. This protects auth endpoints from brute-force attacks.
-- `limit_by: "consumer"` — Enforces limits in the `authorize` phase (after authentication), keyed by the authenticated consumer's username. If no consumer is identified, falls back to client IP as the key.
-
-Returns HTTP `429 Too Many Requests` when exceeded.
-
-**Rate limit headers** (when `expose_headers: true`):
-
-| Header | Description |
-|---|---|
-| `x-ratelimit-limit` | Configured request limit for the tightest window |
-| `x-ratelimit-remaining` | Requests remaining in that window |
-| `x-ratelimit-window` | Window name (e.g., `per_minute`, `per_hour`) |
-| `x-ratelimit-identity` | Rate limit key — `consumer:<username>` or `ip:<address>` |
-
-Headers are added to both upstream requests (visible to backends in `before_proxy`) and downstream responses (visible to clients in `after_proxy`). On `429` rejections, headers are included in the error response with `remaining: 0`. When multiple windows are configured, the tightest window (lowest remaining) is reported.
-
-#### `hmac_auth`
-
-Authenticates requests using HMAC signatures.
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `secret` | String | Shared secret for HMAC computation |
-| `algorithm` | String | Hash algorithm (e.g., `sha256`) |
-| `header` | String | Header containing the HMAC signature |
-
-#### `ip_restriction`
-
-Restricts access based on client IP address or CIDR range.
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `allow` | String[] | Allowed IP addresses or CIDR ranges |
-| `deny` | String[] | Denied IP addresses or CIDR ranges |
-
-#### `bot_detection`
-
-Detects and blocks bot traffic based on User-Agent patterns. By default, missing User-Agent headers are allowed (for health checks and load balancer probes).
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests",...]` | User-Agent substrings to block (case-insensitive) |
-| `allow_list` | String[] | `[]` | User-Agent substrings to always allow (checked before blocked_patterns) |
-| `allow_missing_user_agent` | bool | `true` | Allow requests with no User-Agent header (health checks, LB probes) |
-| `custom_response_code` | u16 | `403` | HTTP status code returned for blocked requests |
-
-#### `body_validator`
-
-Validates JSON and XML request and response bodies against schemas. Supports comprehensive JSON Schema validation including type checking, string/numeric constraints, array/object validation, composition operators, and format validation. Request validation rejects with 400; response validation rejects with 502 and automatically enables response body buffering.
-
-**Request validation config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `json_schema` | Object | — | JSON Schema for request body validation (supports `type`, `required`, `properties`, `additionalProperties`, `minLength`/`maxLength`, `pattern`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`, `enum`, `const`, `items`, `minItems`/`maxItems`, `uniqueItems`, `allOf`/`anyOf`/`oneOf`/`not`, `format`) |
-| `required_fields` | String[] | `[]` | Simple required field names (alternative to JSON Schema `required`) |
-| `validate_xml` | bool | `false` | Enable XML well-formedness validation |
-| `required_xml_elements` | String[] | `[]` | Required XML element names |
-| `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
-
-**Response validation config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `response_json_schema` | Object | — | JSON Schema for response body validation (same schema support as request) |
-| `response_required_fields` | String[] | `[]` | Required field names in response JSON body |
-| `response_validate_xml` | bool | `false` | Enable XML well-formedness validation for responses |
-| `response_required_xml_elements` | String[] | `[]` | Required XML element names in responses |
-| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
-
-**Supported `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
-
-#### `request_size_limiting`
-
-Enforces per-proxy request body size limits that are lower than the global `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`. Checks the `Content-Length` header for instant rejection without reading the body. Also verifies the actual buffered body size in `before_proxy` when other plugins (e.g., `body_validator`) cause body buffering. Rejects with HTTP 413.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed request body size in bytes |
-
-```yaml
-plugin_name: request_size_limiting
-config:
-  max_bytes: 1048576  # 1 MiB — stricter than the 10 MiB global default
-```
-
-#### `response_size_limiting`
-
-Enforces per-proxy response body size limits that are lower than the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. Checks the `Content-Length` response header for instant rejection. Optionally forces response body buffering to catch chunked responses without `Content-Length`. Rejects with HTTP 502.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
-| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual size (adds memory overhead) |
-
-```yaml
-plugin_name: response_size_limiting
-config:
-  max_bytes: 5242880         # 5 MiB
-  require_buffered_check: false  # only check Content-Length header (default)
-```
-
-#### `graphql`
-
-Adds GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting. Parses GraphQL queries from POST request bodies (`application/json` with a `query` field) and enforces configurable protections.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `max_depth` | u32 (optional) | — | Maximum allowed query nesting depth |
-| `max_complexity` | u32 (optional) | — | Maximum allowed field count (complexity proxy) |
-| `max_aliases` | u32 (optional) | — | Maximum allowed alias count (prevents alias-based DoS) |
-| `introspection_allowed` | bool | `true` | Whether `__schema`/`__type` introspection queries are permitted |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
-| `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
-| `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
-
-Each rate limit entry is an object with `max_requests` (u64) and `window_seconds` (u64).
-
-**Metadata**: The plugin populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity` for downstream plugins and logging.
-
-**Rejection format**: All rejections use GraphQL-standard `{"errors":[{"message":"..."}]}` format with `content-type: application/json`.
-
-```yaml
-plugin_name: graphql
-config:
-  max_depth: 10
-  max_complexity: 100
-  max_aliases: 10
-  introspection_allowed: false
-  limit_by: ip
-  type_rate_limits:
-    mutation:
-      max_requests: 20
-      window_seconds: 60
-  operation_rate_limits:
-    GetUser:
-      max_requests: 50
-      window_seconds: 60
-    CreateOrder:
-      max_requests: 5
-      window_seconds: 60
-```
-
-#### `request_termination`
-
-Returns a predefined response without proxying to the backend. Useful for maintenance mode or stubbing endpoints.
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `status_code` | u16 | HTTP status code to return |
-| `body` | String | Response body |
-| `content_type` | String | Response Content-Type header |
-| `message` | String | Error message |
-
-#### `correlation_id`
-
-Generates and propagates correlation IDs for request tracing across services.
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `header_name` | String | Header name for correlation ID (default: `X-Correlation-ID`) |
-| `generator` | String | ID generation strategy (e.g., `uuid`) |
-| `echo_downstream` | bool | Include correlation ID in response headers |
-
-#### `prometheus_metrics`
-
-Exports gateway metrics in Prometheus exposition format.
-
-**Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `path` | String | Metrics endpoint path (default: `/metrics`) |
-
-#### `otel_tracing`
-
-W3C Trace Context propagation and OTLP span export. Runs at priority 25 (earliest plugin) to capture accurate request timing. Supports two modes:
-
-- **Propagation + Export** (default): Generates/propagates `traceparent`/`tracestate` headers and exports spans to an OTLP collector via HTTP/JSON.
-- **Propagation-only**: When no `endpoint` is configured, generates/propagates trace context without exporting spans.
-
-Exported spans include OTel semantic convention attributes (`http.request.method`, `url.path`, `http.response.status_code`, `client.address`, `user_agent.original`, `http.route`, `server.address`, `server.socket.address`), gateway-specific attributes (`gateway.proxy.id`, `gateway.latency.*`, `gateway.response.streamed`, `gateway.client.disconnected`), error classification events, and resource attributes (`service.name`, `service.version`, `deployment.environment`).
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode |
-| `service_name` | String | `ferrum-edge` | Service name in spans and resource attributes |
-| `deployment_environment` | String | _(none)_ | `deployment.environment` resource attribute (e.g. `production`, `staging`) |
-| `generate_trace_id` | Boolean | `true` | Generate trace IDs for requests without incoming `traceparent` |
-| `headers` | Object | `{}` | Custom HTTP headers sent with OTLP exports (e.g. `{"x-honeycomb-team": "key"}`) |
-| `authorization` | String | _(none)_ | Authorization header value for OTLP exports |
-| `batch_size` | Integer | `50` | Spans per export batch |
-| `flush_interval_ms` | Integer | `5000` | Max delay before flushing a partial batch |
-| `buffer_capacity` | Integer | `10000` | Max pending spans; drops oldest when full |
-| `max_retries` | Integer | `2` | Retry attempts on export failure |
-| `retry_delay_ms` | Integer | `1000` | Delay between retries |
-
-### Custom Plugins
-
-Ferrum supports drop-in custom plugins. Create a `.rs` file in the `custom_plugins/` directory, export a `create_plugin()` factory function, and rebuild — the build script auto-discovers and registers it. No core files need editing.
-
-Optionally set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to include only specific custom plugins.
-
-See [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the full developer guide, trait reference, and working examples.
-
-## Proxying Behavior
-
-### Routing
-
-Ferrum uses **longest prefix matching** on `listen_path` values. All paths must be unique. If no proxy matches, the gateway returns `404 Not Found`.
-
-Proxies may optionally specify a `hosts` list to restrict matching to specific hostnames. Exact hostnames and wildcard prefixes (e.g., `*.example.com`) are supported. An empty `hosts` list (the default) matches all hosts.
-
-Proxies may also specify an `allowed_methods` list (e.g., `["GET", "POST"]`) to restrict which HTTP methods are accepted. When set, requests with disallowed methods receive `405 Method Not Allowed` with an `Allow` header. When omitted or `null` (the default), all methods are allowed.
-
-### Path Forwarding
-
-- **`strip_listen_path: true`** (default): Strips the matched prefix, forwarding only the remainder
-  - Request: `/api/v1/users` with `listen_path: /api/v1` → Backend receives `/users`
-- **`strip_listen_path: false`**: Forwards the full original path
-  - Request: `/api/v1/users` → Backend receives `/api/v1/users`
-- **`backend_path`**: Optional prefix prepended to the forwarded path
-
-### WebSocket Proxying
-
-Set `backend_protocol: ws` or `wss`. Ferrum handles the HTTP Upgrade and proxies the bidirectional stream.
-
-### gRPC Proxying
-
-Set `backend_protocol: grpc` (cleartext h2c) or `grpcs` (TLS with ALPN h2). Ferrum uses hyper's HTTP/2 client directly to proxy gRPC requests with full trailer support (`grpc-status`, `grpc-message`).
-
-**How it works**: gRPC runs on HTTP/2, so the gateway transparently forwards HTTP/2 frames — it does not need to understand protobuf. gRPC metadata maps directly to HTTP/2 headers, so all existing auth plugins (JWKS, JWT, API key, Basic) work unchanged with gRPC. Clients send `authorization: Bearer <token>` as gRPC metadata, which plugins already inspect.
-
-**Configuration example** (YAML):
-```yaml
-proxies:
-  - id: grpc-users
-    listen_path: /grpc
-    backend_protocol: grpc        # h2c (cleartext HTTP/2)
-    backend_host: grpc-backend
-    backend_port: 50051
-    strip_listen_path: true
-    plugins:
-      - name: jwt_auth             # Works with gRPC metadata
-        config:
-          secret: "my-jwt-secret"
-```
-
-**Configuration example** (gRPC over TLS):
-```yaml
-proxies:
-  - id: grpc-secure
-    listen_path: /grpc
-    backend_protocol: grpcs       # HTTP/2 over TLS with ALPN
-    backend_host: grpc-backend
-    backend_port: 443
-```
-
-**Protocol details**:
-- `grpc` — h2c (cleartext HTTP/2 via prior knowledge handshake). Use for internal backends without TLS.
-- `grpcs` — HTTP/2 over TLS with ALPN `h2` negotiation. Use for external or secured backends.
-- gRPC error responses follow the spec: HTTP 200 with `grpc-status` and `grpc-message` headers.
-- When the backend is unavailable, the gateway returns `grpc-status: 14` (UNAVAILABLE).
-- When the backend times out, the gateway returns `grpc-status: 4` (DEADLINE_EXCEEDED).
-- The frontend listener accepts both HTTP/1.1 and h2c connections, so gRPC clients can connect to the standard HTTP port without TLS.
-
-## Resilience & Caching
-
-### Configuration Caching
-
-All modes maintain an in-memory cache of the last valid configuration. If the configuration source (database or CP) becomes unavailable, the gateway continues operating with the cached config.
-
-### Database Outage (Database/CP Modes)
-
-- Proxy traffic continues using cached configuration
-- Admin API write operations return `503 Service Unavailable`
-- Warnings are logged about the connection status
-- Automatic reconnection on next poll interval
-
-#### Startup Failover with Backup Config
-
-In Kubernetes environments, a pod restart while the database is down would normally prevent the gateway from starting (no initial config available). Setting `FERRUM_DB_CONFIG_BACKUP_PATH` to a JSON config file allows the gateway to start with that backup config when the database is unreachable.
-
-The backup file is **not generated by the gateway** — it must be provisioned externally (e.g. via ConfigMap, PersistentVolume, or a sidecar that periodically exports the running config via the Admin API).
-
-**Behavior:**
-- **Startup, DB reachable:** Config loads from the database normally. The backup file is ignored.
-- **Startup, DB unreachable:** Config loads from the backup file. The gateway starts and begins serving traffic with the (potentially stale) backup config. The polling loop continues retrying the database and will switch to live config once the DB recovers.
-- **Runtime, DB unreachable:** The backup file is **not** consulted. The gateway continues serving with its in-memory cached config (the last successfully loaded config).
-- **Env var not set:** No fallback — startup fails if the database is unreachable (existing behavior).
-
-```bash
-# Example: mount a backup config via K8S ConfigMap or PV
-FERRUM_DB_CONFIG_BACKUP_PATH=/etc/ferrum/backup-config.json
-```
-
-### CP Outage (DP Mode)
-
-- DP continues serving with its last known configuration
-- Periodic reconnection attempts (every 5 seconds)
-- Full config resynchronization on reconnect
-
-### DNS Resolver
-
-- Built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns) with full configurability
-- Configurable nameservers, custom hosts file, and DNS record type query ordering
-- In-memory DashMap cache with stale-while-revalidate (serve stale data during background refresh)
-- Error caching prevents hammering DNS for non-existent domains
-- Proactive background refresh at 75% TTL keeps entries warm
-- Per-proxy TTL override via `dns_cache_ttl_seconds`
-- Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
-- Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
-- Non-blocking startup warmup resolves all backend, upstream, and plugin endpoint hostnames (deduplicated)
-- Shared DNS cache for plugin outbound calls (http_logging, jwks_auth, etc.) via custom reqwest resolver
-- See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
-
-### HTTP/3 (QUIC) Support
-
-Ferrum supports HTTP/3 over QUIC on the same port as HTTPS. HTTP/3 requires TLS to be configured.
-
-```bash
-FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem \
-FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
-FERRUM_ENABLE_HTTP3=true \
-FERRUM_HTTP3_IDLE_TIMEOUT=30 \
-FERRUM_HTTP3_MAX_STREAMS=1000
-```
-
-When enabled, the gateway listens for QUIC connections on `FERRUM_PROXY_HTTPS_PORT` alongside the standard HTTPS listener. Clients that support HTTP/3 (e.g., `curl --http3`) can connect via QUIC for lower-latency connections with built-in multiplexing and improved head-of-line blocking behavior.
+Plugins execute in a defined pipeline with priority ordering (lower = runs first):
+
+| Phase | Plugins |
+|-------|---------|
+| **Tracing** (25) | `otel_tracing` |
+| **Early** (100) | `cors`, `ip_restriction`, `bot_detection` |
+| **Authentication** (950-1400) | `mtls_auth`, `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
+| **Authorization** (2000-2900) | `access_control`, `graphql`, `rate_limiting` |
+| **AI Pre-proxy** (2925-2975) | `ai_prompt_shield`, `ai_request_guard` |
+| **Transform** (3000) | `request_transformer`, `body_validator`, `request_size_limiting`, `request_termination` |
+| **Response** (4000-4200) | `response_transformer`, `response_size_limiting`, `ai_token_metrics`, `ai_rate_limiter` |
+| **Logging** (9000-9300) | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics` |
+
+Plugins are protocol-aware — the gateway automatically skips plugins that don't apply to the current protocol (e.g., CORS is never invoked on TCP streams).
+
+See [docs/plugins.md](docs/plugins.md) for detailed configuration of each plugin, and [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full protocol support matrix.
 
 ### AI / LLM Plugins
 
-Ferrum provides four plugins purpose-built for AI/LLM API gateway use cases. They compose together to give you cost visibility, budget enforcement, request policy, and PII protection — all at the gateway layer with no changes to your application code.
+Four plugins for AI gateway use cases — cost visibility, budget enforcement, request policy, and PII protection:
 
-These plugins auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible: Azure OpenAI, Groq, Together, etc.), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+- **`ai_token_metrics`** — Extract token usage from LLM responses for observability
+- **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
+- **`ai_rate_limiter`** — Rate-limit by token consumption instead of request count
+- **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
 
-#### `ai_token_metrics`
+Auto-detects OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock response formats. See [docs/plugins.md](docs/plugins.md#ai--llm-plugins) for configuration and a composition example.
 
-Extracts token usage from LLM response bodies and writes it to request metadata, making token counts available to all downstream logging and observability plugins (stdout_logging, http_logging, prometheus_metrics, otel_tracing).
+### Custom Plugins
 
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `provider` | String | `"auto"` | LLM provider format: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock` |
-| `include_model` | Boolean | `true` | Extract model name into metadata |
-| `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately (not just total) |
-| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (e.g., `ai_total_tokens`) |
-| `cost_per_prompt_token` | Float | *(none)* | If set, calculates estimated cost per request |
-| `cost_per_completion_token` | Float | *(none)* | If set, calculates estimated cost per request |
+Drop-in custom plugins via `custom_plugins/` directory — auto-discovered at build time. See [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md).
 
-**Metadata keys written**: `{prefix}_provider`, `{prefix}_total_tokens`, `{prefix}_prompt_tokens`, `{prefix}_completion_tokens`, `{prefix}_model`, `{prefix}_estimated_cost`
+## Routing
 
-**Note**: This plugin requires response body buffering. For AI proxies, set `response_body_mode: buffer` on the proxy or let the plugin force it automatically.
+- **Longest prefix match** on `listen_path` with unique path enforcement
+- **Host-based routing** with exact and wildcard prefix support (`*.example.com`)
+- **Regex routes** with auto-anchored full-path matching (prefix with `~`)
+- **Method filtering** via `allowed_methods` per-proxy (405 on mismatch)
+- **Path forwarding**: `strip_listen_path` (default: true), optional `backend_path` prefix
 
-```yaml
-plugin_name: ai_token_metrics
-config:
-  provider: auto
-  include_model: true
-  include_token_details: true
-  metadata_prefix: ai
-  cost_per_prompt_token: 0.000003    # $3/M input tokens (GPT-4o-mini)
-  cost_per_completion_token: 0.000012 # $12/M output tokens
-```
+See [docs/routing.md](docs/routing.md) for detailed routing behavior.
 
-#### `ai_request_guard`
+### Protocol-Specific Proxying
 
-Validates and constrains AI/LLM API requests before they reach the backend. Prevents expensive mistakes (unbounded max_tokens, unauthorized models) and enforces organizational policy at the gateway layer.
+| Protocol | Config | Notes |
+|----------|--------|-------|
+| **HTTP/1.1** | `backend_protocol: http` / `https` | Default, with connection pooling |
+| **HTTP/2** | ALPN-negotiated on TLS | Automatic via `pool_enable_http2: true` |
+| **HTTP/3** | `FERRUM_ENABLE_HTTP3=true` | QUIC on HTTPS port, requires TLS |
+| **WebSocket** | `backend_protocol: ws` / `wss` | Transparent HTTP upgrade + bidirectional proxy |
+| **gRPC** | `backend_protocol: grpc` / `grpcs` | HTTP/2 with trailer support, all auth plugins work |
+| **TCP** | `backend_protocol: tcp` / `tcp_tls` | Dedicated-port stream proxy |
+| **UDP** | `backend_protocol: udp` / `dtls` | Datagram proxy with session tracking |
 
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `max_tokens_limit` | Integer | *(none)* | Maximum allowed `max_tokens` / `max_output_tokens` value |
-| `enforce_max_tokens` | String | `"reject"` | `reject` (400 error) or `clamp` (silently cap to limit) |
-| `default_max_tokens` | Integer | *(none)* | Inject `max_tokens` if not present in request |
-| `allowed_models` | String[] | `[]` | Whitelist of allowed model names (empty = allow all) |
-| `blocked_models` | String[] | `[]` | Blacklist of model names (takes precedence over allowed) |
-| `require_user_field` | Boolean | `false` | Require `user` field in request body (for audit trails) |
-| `max_messages` | Integer | *(none)* | Maximum number of messages in the messages array |
-| `max_prompt_characters` | Integer | *(none)* | Maximum total characters across all message content |
-| `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for temperature |
-| `block_system_prompts` | Boolean | `false` | Reject requests containing `role: "system"` messages |
-| `required_metadata_fields` | String[] | `[]` | Require these fields in the request body |
+See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for TCP/UDP/DTLS proxy configuration.
 
-Model matching is case-insensitive. Only POST requests with JSON content-type are validated.
+## Load Balancing & Resilience
 
-```yaml
-plugin_name: ai_request_guard
-config:
-  allowed_models:
-    - gpt-4o-mini
-    - gpt-4o
-    - claude-sonnet-4-20250514
-  blocked_models:
-    - o3           # Block expensive reasoning model
-  max_tokens_limit: 4096
-  enforce_max_tokens: clamp  # Silently cap instead of rejecting
-  default_max_tokens: 1024   # Inject if caller doesn't set it
-  temperature_range: [0.0, 1.0]
-  require_user_field: true
-  max_messages: 50
-  max_prompt_characters: 100000
-```
+- **Six algorithms**: Round Robin, Weighted Round Robin, Least Connections, Least Latency, Consistent Hashing, Random
+- **Health checks**: Active probes (HTTP, TCP SYN, UDP) and passive monitoring
+- **Circuit breaker**: Three-state pattern (Closed/Open/Half-Open)
+- **Retry**: Connection and HTTP-level retries with fixed/exponential backoff
+- **Service discovery**: DNS-SD, Kubernetes, and Consul providers
+- **Config caching**: All modes maintain in-memory config cache for resilience during source outages
+- **Startup failover**: `FERRUM_DB_CONFIG_BACKUP_PATH` for DB outage recovery in Kubernetes
+- **Multi-URL failover**: `FERRUM_DB_FAILOVER_URLS` for database high availability
 
-#### `ai_rate_limiter`
+See [docs/load_balancing.md](docs/load_balancing.md), [docs/retry.md](docs/retry.md), and [docs/error_classification.md](docs/error_classification.md).
 
-Rate-limits consumers by LLM token consumption instead of request count. A 10-token request and a 50,000-token request shouldn't count the same.
+## Connection Pooling
 
-Works in two phases: checks accumulated token usage before proxying (rejects with 429 if over budget), then records actual token consumption from the response after proxying.
+Lock-free connection reuse with per-proxy pool keys and HTTP/2 flow control tuning. Hybrid configuration with global defaults and per-proxy overrides.
 
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
-| `window_seconds` | Integer | `60` | Sliding window duration in seconds |
-| `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens` |
-| `limit_by` | String | `"consumer"` | Rate limit key: `consumer` or `ip` |
-| `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers on responses |
-| `provider` | String | `"auto"` | LLM provider format for token extraction |
-
-**Response headers** (when `expose_headers: true`):
-- `x-ai-ratelimit-limit` — configured token limit
-- `x-ai-ratelimit-remaining` — tokens remaining in current window
-- `x-ai-ratelimit-window` — window duration in seconds
-- `x-ai-ratelimit-usage` — tokens consumed in current window
-
-```yaml
-plugin_name: ai_rate_limiter
-config:
-  token_limit: 500000        # 500K tokens per window
-  window_seconds: 3600       # Per hour
-  count_mode: total_tokens
-  limit_by: consumer
-  expose_headers: true
-```
-
-#### `ai_prompt_shield`
-
-Scans AI/LLM request bodies for PII (personally identifiable information) and either rejects the request, redacts the PII, or logs a warning. Built-in patterns cover common PII types; custom regex patterns can be added for organization-specific data.
-
-**Config**:
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `action` | String | `"reject"` | `reject` (400 error), `redact` (replace PII), or `warn` (log and pass) |
-| `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
-| `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns |
-| `scan_fields` | String | `"content"` | `content` (scan message content only) or `all` (scan entire body) |
-| `exclude_roles` | String[] | `[]` | Message roles to skip scanning (e.g., `["system"]`) |
-| `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text (`{type}` = pattern name) |
-| `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size (1MB default) |
-
-**Built-in patterns**: `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
-
-```yaml
-plugin_name: ai_prompt_shield
-config:
-  action: redact
-  patterns:
-    - ssn
-    - credit_card
-    - email
-    - api_key
-    - aws_key
-  custom_patterns:
-    - name: internal_account
-      regex: "ACCT-\\d{8}"
-  scan_fields: content
-  exclude_roles:
-    - system            # Don't scan system prompts
-  redaction_placeholder: "[REDACTED:{type}]"
-```
-
-**Example**: A request containing `"My SSN is 123-45-6789"` in a message content field would be:
-- **reject mode**: Blocked with `400 {"error":"PII detected in request","detected_types":["ssn"],...}`
-- **redact mode**: Rewritten to `"My SSN is [REDACTED:ssn]"` before forwarding to the backend
-- **warn mode**: Passed through unchanged, with `ai_shield_warnings: ssn` in transaction metadata
-
-#### AI Plugin Composition Example
-
-A typical AI gateway proxy combining all four plugins:
-
-```yaml
-# Proxy config for OpenAI API
-listen_path: /v1/chat/completions
-backend_protocol: https
-backend_host: api.openai.com
-backend_port: 443
-backend_path: /v1/chat/completions
-response_body_mode: buffer
-
-# Plugin configs (applied in priority order automatically)
-plugins:
-  - plugin_name: key_auth            # Authenticate callers
-    config: {}
-  - plugin_name: ai_prompt_shield    # Scan for PII before backend
-    config:
-      action: redact
-      patterns: [ssn, credit_card, email, api_key]
-  - plugin_name: ai_request_guard    # Enforce model/token policy
-    config:
-      allowed_models: [gpt-4o-mini, gpt-4o]
-      max_tokens_limit: 4096
-      enforce_max_tokens: clamp
-      default_max_tokens: 1024
-  - plugin_name: ai_token_metrics    # Extract usage for observability
-    config:
-      cost_per_prompt_token: 0.00000015
-      cost_per_completion_token: 0.0000006
-  - plugin_name: ai_rate_limiter     # Enforce token budgets
-    config:
-      token_limit: 1000000
-      window_seconds: 86400
-      limit_by: consumer
-      expose_headers: true
-  - plugin_name: stdout_logging      # Logs include ai_* metadata
-    config: {}
-```
+See [docs/connection_pooling.md](docs/connection_pooling.md) for sizing guidance and configuration.
 
 ## Security
 
-### TLS Configuration
+### TLS
 
-Ferrum supports TLS on both proxy and admin listeners:
+- **Frontend TLS/mTLS**: Proxy and admin HTTPS with optional client certificate verification — [docs/frontend_tls.md](docs/frontend_tls.md)
+- **Backend mTLS**: Per-proxy client certificates for backend authentication — [docs/backend_mtls.md](docs/backend_mtls.md)
+- **Database TLS**: PostgreSQL and MySQL TLS/mTLS connections — [docs/database_tls.md](docs/database_tls.md)
+- **TLS hardening**: Configurable cipher suites, key exchange groups, and protocol versions — [docs/frontend_tls.md](docs/frontend_tls.md#tls-policy-hardening)
 
-```bash
-FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem \
-FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
-FERRUM_ADMIN_TLS_CERT_PATH=/path/to/admin-cert.pem \
-FERRUM_ADMIN_TLS_KEY_PATH=/path/to/admin-key.pem
-```
+### Client IP Resolution
 
-### Database TLS/SSL
+Secure originating IP detection via trusted proxy configuration with `X-Forwarded-For` right-to-left walk. See [docs/client_ip_resolution.md](docs/client_ip_resolution.md).
 
-Ferrum supports TLS encryption for PostgreSQL and MySQL database connections. There are two configuration approaches — use whichever fits your workflow.
+### DNS
 
-#### Option 1: `FERRUM_DB_SSL_*` variables (recommended)
+In-memory async DNS cache with startup warmup, stale-while-revalidate, per-proxy TTL overrides, and static overrides. See [docs/dns_resolver.md](docs/dns_resolver.md).
 
-These variables give you granular control over SSL mode and are translated into connection string parameters automatically, so you don't need to embed them in `FERRUM_DB_URL`.
+## Performance
 
-**PostgreSQL with server certificate verification:**
-```bash
-FERRUM_DB_TYPE=postgres \
-FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
-FERRUM_DB_SSL_MODE=verify-ca \
-FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
-```
+Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s):
 
-**PostgreSQL with mutual TLS (mTLS):**
-```bash
-FERRUM_DB_TYPE=postgres \
-FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
-FERRUM_DB_SSL_MODE=verify-full \
-FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem \
-FERRUM_DB_SSL_CLIENT_CERT=/certs/client.pem \
-FERRUM_DB_SSL_CLIENT_KEY=/certs/client-key.pem
-```
+| Protocol | Gateway RPS | Direct RPS | Overhead |
+|----------|------------|------------|----------|
+| HTTP/1.1 | 88,773 | 100,112 | ~11% |
+| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% |
+| HTTP/2 | 49,223 | 109,162 | ~55% |
+| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% |
+| gRPC | 34,470 | 118,650 | ~71% |
+| WebSocket | 104,465 | 219,620 | ~52% |
+| TCP | 108,332 | 215,646 | ~50% |
 
-**MySQL with TLS:**
-```bash
-FERRUM_DB_TYPE=mysql \
-FERRUM_DB_URL="mysql://user:pass@db.example.com/ferrum" \
-FERRUM_DB_SSL_MODE=require \
-FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
-```
-
-**SSL mode values:**
-
-| Mode | Description |
-|------|-------------|
-| `disable` | No SSL |
-| `prefer` | Try SSL, fall back to plain |
-| `require` | Require SSL, skip CA verification |
-| `verify-ca` | Require SSL, verify server CA certificate |
-| `verify-full` | Require SSL, verify CA and hostname |
-
-> **Note:** SQLite connections ignore SSL settings (file-based, no network TLS). MySQL mode values are automatically mapped to the MySQL-native format (e.g., `require` → `REQUIRED`, `verify-ca` → `VERIFY_CA`).
-
-#### Option 2: `FERRUM_DB_TLS_*` variables
-
-A simpler toggle-based approach. Set `FERRUM_DB_TLS_ENABLED=true` to enable TLS with `sslmode=require` (PostgreSQL) or `ssl-mode=REQUIRED` (MySQL), then optionally provide certificate paths.
-
-```bash
-FERRUM_DB_TYPE=postgres \
-FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
-FERRUM_DB_TLS_ENABLED=true \
-FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
-FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.pem \
-FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client-key.pem
-```
-
-Set `FERRUM_DB_TLS_INSECURE=true` to skip certificate verification (testing only).
-
-> **Note:** If both `FERRUM_DB_SSL_*` and `FERRUM_DB_TLS_*` variables are set, the SSL parameters are appended to the connection URL first, then the TLS layer applies on top. Use one approach or the other to avoid confusion.
-
-### Frontend mTLS (Client Certificate Verification)
-
-Ferrum can require clients to present a valid TLS certificate when connecting to the proxy HTTPS listener. This is configured by providing a CA bundle containing the trusted certificate authorities used to verify client certificates.
-
-```bash
-# Enable frontend mTLS on the proxy listener
-FERRUM_PROXY_TLS_CERT_PATH=/certs/server.pem \
-FERRUM_PROXY_TLS_KEY_PATH=/certs/server-key.pem \
-FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH=/certs/client-ca-bundle.pem
-```
-
-Clients must then present a valid certificate signed by one of the CAs in the bundle:
-
-```bash
-curl --cert /certs/client.pem --key /certs/client-key.pem \
-  https://gateway.example.com:8443/api/v1/resource
-```
-
-The admin API supports the same pattern with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` for mTLS on the admin HTTPS listener.
-
-### Backend mTLS
-
-Configure per-proxy for mutual TLS to backends:
-```yaml
-backend_tls_client_cert_path: "/path/to/client-cert.pem"
-backend_tls_client_key_path: "/path/to/client-key.pem"
-backend_tls_verify_server_cert: true
-backend_tls_server_ca_cert_path: "/path/to/ca.pem"
-```
-
-### JWT Secrets
-
-- Use strong, randomly generated secrets for `FERRUM_ADMIN_JWT_SECRET` and `FERRUM_CP_GRPC_JWT_SECRET`
-- Store secrets securely (environment variables, secret managers)
-- Rotate secrets by updating the environment variable and restarting
-
-### Credential Hashing
-
-Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API automatically hashes plaintext passwords on creation/update.
+See `tests/performance/` for the full benchmark suite.
 
 ## Troubleshooting
 
 | Issue | Solution |
 |---|---|
-| `Configuration validation failed: duplicate listen_path` | Ensure all proxy `listen_path` values are unique |
 | `FERRUM_MODE not set` | Set the `FERRUM_MODE` environment variable |
-| `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` are correct |
-| `401 Unauthorized on Admin API` | Check that your JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
-| `404 Not Found on proxy request` | Verify the request path matches a configured `listen_path` prefix |
-| `502 Bad Gateway` | Backend is unreachable; check `X-Gateway-Error` header for details (`connection_failure` vs `backend_error`); verify `backend_host`, `backend_port`, DNS, and timeouts |
-| `504 Gateway Timeout` | Backend did not respond in time; `X-Gateway-Error: backend_timeout` is set; check `backend_read_timeout_ms` |
-| `X-Gateway-Upstream-Status: degraded` | All upstream targets are unhealthy; requests are routed via fallback — check health check configuration |
-| `429 Too Many Requests` | Rate limit exceeded; check `rate_limiting` plugin config |
-| DP not receiving config | Verify `FERRUM_DP_GRPC_AUTH_TOKEN` is a valid JWT signed with `FERRUM_CP_GRPC_JWT_SECRET` |
+| `duplicate listen_path` | Ensure all proxy `listen_path` values are unique |
+| `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` |
+| `401 on Admin API` | Check JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
+| `404 on proxy request` | Verify request path matches a configured `listen_path` |
+| `502 Bad Gateway` | Backend unreachable — check `X-Gateway-Error` header for details |
+| `504 Gateway Timeout` | Increase `backend_read_timeout_ms` |
+| `429 Too Many Requests` | Rate limit exceeded — check plugin config |
+| DP not receiving config | Verify `FERRUM_DP_GRPC_AUTH_TOKEN` JWT is signed with `FERRUM_CP_GRPC_JWT_SECRET` |
+
+## Documentation
+
+| Topic | Link |
+|-------|------|
+| Full configuration reference | [docs/configuration.md](docs/configuration.md) |
+| Plugin reference | [docs/plugins.md](docs/plugins.md) |
+| Admin API | [docs/admin_api.md](docs/admin_api.md) |
+| Connection pooling | [docs/connection_pooling.md](docs/connection_pooling.md) |
+| Load balancing | [docs/load_balancing.md](docs/load_balancing.md) |
+| CP/DP distributed mode | [docs/cp_dp_mode.md](docs/cp_dp_mode.md) |
+| TCP/UDP/DTLS proxy | [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) |
+| Frontend TLS/mTLS | [docs/frontend_tls.md](docs/frontend_tls.md) |
+| Backend mTLS | [docs/backend_mtls.md](docs/backend_mtls.md) |
+| Database TLS | [docs/database_tls.md](docs/database_tls.md) |
+| DNS resolver | [docs/dns_resolver.md](docs/dns_resolver.md) |
+| Routing | [docs/routing.md](docs/routing.md) |
+| Retry logic | [docs/retry.md](docs/retry.md) |
+| Response streaming | [docs/response_body_streaming.md](docs/response_body_streaming.md) |
+| Plugin execution order | [docs/plugin_execution_order.md](docs/plugin_execution_order.md) |
+| Infrastructure sizing | [docs/infrastructure_sizing.md](docs/infrastructure_sizing.md) |
+| Docker deployment | [docs/docker.md](docs/docker.md) |
+| CI/CD pipeline | [docs/ci_cd.md](docs/ci_cd.md) |
+| Database migrations | [docs/migrations.md](docs/migrations.md) |
+| Custom plugins | [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) |
+| Feature list | [FEATURES.md](FEATURES.md) |
+| OpenAPI spec | [openapi.yaml](openapi.yaml) |
+
+## CI/CD
+
+On every push to `main` and PR: format check, tests (unit + integration + E2E), clippy, and performance regression testing. Version tags trigger multi-platform release builds with Docker images.
+
+See [docs/ci_cd.md](docs/ci_cd.md) for pipeline details.
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
 3. Write tests for new functionality
-4. Ensure all tests pass (`cargo test`)
-5. Run `cargo clippy` and `cargo fmt`
+4. Ensure all tests pass (`cargo test --all-features`)
+5. Run `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt`
 6. Submit a pull request
 
 ## License
@@ -2026,5 +364,3 @@ Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API
 Copyright (c) 2026 Ferrum Edge
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
-
-**TL;DR**: Free to use as long as you're not reselling our technology. Hobbyists, students, researchers, nonprofits — go wild. Companies evaluating Ferrum for a proof-of-concept or demo? Also totally fine, kick the tires. But if you're dropping this into your production network stack, we kindly ask that you grab a [commercial license](LICENSE-COMMERCIAL.md) and help fund our caffeine supply. Open source doesn't run on exposure — it runs on coffee, and coffee costs money.
