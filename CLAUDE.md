@@ -220,12 +220,12 @@ tests/
 
 **Backend CA Trust Chain** — all protocol paths follow this resolution order:
 
-1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with that CA (+ webpki roots for rustls paths)
-2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with global CA (+ webpki roots for rustls paths)
+1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA (webpki/system roots are excluded)
+2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with **only** the global CA (webpki/system roots are excluded)
 3. **Neither set** — verify with webpki/system roots (secure default)
 4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` per-proxy or `FERRUM_TLS_NO_VERIFY=true` globally skips verification
 
-There is **no "no CA = no verify" behavior**. When no CA is configured, the gateway verifies against public webpki roots.
+**CA exclusivity**: When a custom CA is configured (proxy or global), it is the **sole** trust anchor. Webpki/system roots are not added. This prevents backends with internal CAs from being MITMed via any public CA. Webpki roots are only used as a convenience fallback when no CA is explicitly configured.
 
 **Startup validation**: Per-proxy TLS file paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are validated at config load time. The gateway refuses to start (or rejects the config reload) if configured paths cannot be read or parsed. There is no silent fallback to unauthenticated or unverified connections.
 
@@ -254,7 +254,7 @@ There is **no "no CA = no verify" behavior**. When no CA is configured, the gate
 
 See `docs/backend_mtls.md` and `docs/frontend_tls.md` for full details.
 
-**When adding new protocol paths**: Must follow the same CA trust chain (proxy CA -> global CA -> webpki roots). Must validate cert paths at config load time. Must hard-error on cert load failure with no silent fallback.
+**When adding new protocol paths**: Must follow the same CA trust chain (proxy CA -> global CA -> webpki roots) with CA exclusivity (custom CA = sole trust anchor, no webpki mixing). For reqwest paths use `.tls_built_in_root_certs(false)` when adding a custom CA. For rustls paths use `RootCertStore::empty()` when a custom CA is present. Must validate cert paths at config load time. Must hard-error on cert load failure with no silent fallback.
 
 ### Performance Rules
 

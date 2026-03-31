@@ -411,14 +411,18 @@ impl GrpcConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        // Build root certificate store — start with webpki/system roots so that
-        // backends using public CAs are verified even when no custom CA is configured.
-        let mut root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Build root certificate store:
+        // - Custom CA configured → empty store + only that CA (no public roots)
+        // - No CA configured → webpki/system roots as default fallback
         let ca_path = proxy
             .backend_tls_server_ca_cert_path
             .as_ref()
             .or(self.global_env_config.tls_ca_bundle_path.as_ref());
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
 
         if let Some(ca_bundle_path) = ca_path {
             let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| {

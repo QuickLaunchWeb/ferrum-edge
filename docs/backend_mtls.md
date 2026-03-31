@@ -44,12 +44,14 @@ The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authori
 
 The gateway resolves backend CA trust in the following order:
 
-1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with that CA (plus webpki roots for rustls-based paths)
-2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with global CA (plus webpki roots for rustls-based paths)
-3. **Neither set** — verify with **webpki/system roots** (secure default). The gateway does **not** skip verification when no CA is configured. Public CAs are always trusted as a baseline.
+1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
+2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
+3. **Neither set** — verify with **webpki/system roots** (secure default). The gateway does **not** skip verification when no CA is configured.
 4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
 
-This means backends using certificates from public CAs work out of the box with no CA configuration. Backends using internal or self-signed certificates require either a proxy-specific or global CA bundle to be configured.
+**CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
+
+Backends using certificates from public CAs work out of the box with no CA configuration. Backends using internal or self-signed certificates require either a proxy-specific or global CA bundle.
 
 **CA Bundle Format:**
 ```bash

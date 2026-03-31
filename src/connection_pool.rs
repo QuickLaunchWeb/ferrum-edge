@@ -132,10 +132,6 @@ impl ConnectionPool {
 
         // Determine whether to skip server cert verification.
         // CA trust chain: proxy CA → global CA → webpki/system roots.
-        let ca_path = proxy
-            .backend_tls_server_ca_cert_path
-            .as_ref()
-            .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
         let skip_verify =
             !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify;
 
@@ -199,31 +195,37 @@ impl ConnectionPool {
     fn build_reqwest_tls_config(&self, proxy: &Proxy) -> Result<rustls::ClientConfig> {
         use crate::tls::NoVerifier;
 
-        // Build root certificate store with system roots
-        let mut root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Build root certificate store:
+        // - Custom CA configured -> empty store + only that CA (no public roots)
+        // - No CA configured -> webpki/system roots as default fallback
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_ref()
+            .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
 
-        // Add custom CA bundle (proxy-level takes priority over global)
-        if !self.global_mtls_config.tls_no_verify {
-            let ca_path = proxy
-                .backend_tls_server_ca_cert_path
-                .as_ref()
-                .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
-            if let Some(ca_bundle_path) = ca_path {
-                let ca_data = std::fs::read(ca_bundle_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
-                })?;
-                let certs = rustls_pemfile::certs(&mut &ca_data[..])
-                    .filter_map(|r| r.ok())
-                    .collect::<Vec<_>>();
-                let (added, _) = root_store.add_parsable_certificates(certs);
-                if added > 0 {
-                    tracing::debug!(
-                        "Added {} CA certificates from {} for reqwest backend",
-                        added,
-                        ca_bundle_path
-                    );
-                }
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
+
+        // Load custom CA bundle (proxy-level takes priority over global)
+        if !self.global_mtls_config.tls_no_verify
+            && let Some(ca_bundle_path) = ca_path
+        {
+            let ca_data = std::fs::read(ca_bundle_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
+            })?;
+            let certs = rustls_pemfile::certs(&mut &ca_data[..])
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            let (added, _) = root_store.add_parsable_certificates(certs);
+            if added > 0 {
+                tracing::debug!(
+                    "Added {} CA certificates from {} for reqwest backend",
+                    added,
+                    ca_bundle_path
+                );
             }
         }
 
@@ -267,7 +269,7 @@ impl ConnectionPool {
 
         // Disable server certificate verification if configured (testing only)
         if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
-            warn!("Backend TLS certificate verification DISABLED (testing mode)");
+            tracing::warn!("Backend TLS certificate verification DISABLED (testing mode)");
             client_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));
@@ -420,15 +422,19 @@ impl ConnectionPool {
             .as_ref()
             .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
 
-        // Build root certificate store — start with webpki/system roots so that
-        // backends using public CAs are verified even when no custom CA is configured.
-        let mut root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Build root certificate store:
+        // - Custom CA configured → empty store + only that CA (no public roots)
+        // - No CA configured → webpki/system roots as default fallback
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
 
         if skip_verify {
             tracing::warn!("Backend TLS certificate verification DISABLED for HTTP/3 backend");
         } else if let Some(ca_path) = ca_path {
-            // CA path configured (proxy or global): load it on top of system roots
+            // CA path configured (proxy or global): trust ONLY this CA, not public roots
             let ca_file = std::fs::File::open(ca_path).map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to open backend CA certificate '{}' for HTTP/3: {}",
