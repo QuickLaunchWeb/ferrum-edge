@@ -78,6 +78,46 @@ config:
   flush_interval_ms: 1000
 ```
 
+#### Splunk HEC Integration
+
+The `http_logging` plugin works with [Splunk HTTP Event Collector (HEC)](https://docs.splunk.com/Documentation/Splunk/latest/Data/UsetheHTTPEventCollector) using the **raw endpoint** (`/services/collector/raw`). The raw endpoint accepts arbitrary JSON — including the JSON arrays that `http_logging` sends — without requiring the HEC envelope format (`{"event": ...}`).
+
+**Setup steps:**
+
+1. **Enable HEC in Splunk** — Settings → Data Inputs → HTTP Event Collector → New Token. Note the token value.
+
+2. **Create a sourcetype** (optional but recommended) — create a custom sourcetype that extracts JSON fields. Under Settings → Source Types, create `ferrum_edge_logs` with:
+   - Event Breaking: `[\r\n]+` (one JSON object per line after array expansion)
+   - KV_MODE: `json`
+
+3. **Configure the HEC token** — edit the token's settings:
+   - **Source type**: set to `_json` (built-in) or your custom `ferrum_edge_logs`
+   - **Index**: choose your target index
+   - **Enable indexer acknowledgement**: optional, for guaranteed delivery
+
+4. **Configure the plugin** — point `endpoint_url` at the raw HEC endpoint and set the `authorization_header` to `Splunk <your-token>`:
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://splunk.example.com:8088/services/collector/raw"
+  authorization_header: "Splunk cf2fa345-1b2c-3d4e-5f6a-7b8c9d0e1f2a"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+Splunk will parse each object in the JSON array as a separate event. All `TransactionSummary` fields (`client_ip`, `latency_total_ms`, `response_status_code`, etc.) become searchable fields in Splunk.
+
+**Example Splunk search:**
+```
+sourcetype="ferrum_edge_logs" response_status_code>=500
+| stats count by matched_proxy_name, error_class
+```
+
+> **Note:** If you use the standard HEC endpoint (`/services/collector/event`) instead of `/services/collector/raw`, Splunk expects each event wrapped in `{"event": ...}` — which `http_logging` does not produce. Always use the `/raw` endpoint.
+
+> **TLS verification:** If your Splunk instance uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the HEC endpoint's certificate.
+
 ### `transaction_debugger`
 
 Logs verbose request/response details to stdout. Sensitive headers are automatically redacted. Enable per-proxy only for debugging.
