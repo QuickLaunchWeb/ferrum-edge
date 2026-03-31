@@ -1992,6 +1992,7 @@ components:
       description: Top-level gateway info and throughput counters.
       required:
         - mode
+        - ferrum_version
         - uptime_seconds
         - requests_per_second_current
         - status_codes_last_second
@@ -2003,6 +2004,10 @@ components:
         mode:
           type: string
           enum: [database, file, cp, dp]
+        ferrum_version:
+          type: string
+          description: Ferrum Edge binary version
+          example: "0.9.0"
           description: Operating mode (set by FERRUM_MODE)
         uptime_seconds:
           type: integer
@@ -2302,12 +2307,16 @@ components:
 
     BackupResponse:
       type: object
-      required: [version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
+      required: [version, ferrum_version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
       properties:
         version:
           type: string
           description: Configuration schema version
           example: "1"
+        ferrum_version:
+          type: string
+          description: Ferrum Edge binary version that produced this backup
+          example: "0.9.0"
         exported_at:
           type: string
           format: date-time

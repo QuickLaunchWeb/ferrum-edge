@@ -499,6 +499,7 @@ async fn test_dp_handles_malformed_config() {
         config_json: "{invalid json!!!}".to_string(),
         version: "bad".to_string(),
         timestamp: chrono::Utc::now().timestamp(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
     };
     let _ = update_tx.send(malformed_update);
 
@@ -1109,6 +1110,7 @@ async fn test_dp_ignores_malformed_delta() {
         config_json: "{not valid delta json!!!}".to_string(),
         version: "bad".to_string(),
         timestamp: Utc::now().timestamp(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
     };
     let _ = update_tx.send(malformed);
 
@@ -1344,4 +1346,148 @@ async fn test_dp_applies_delta_with_mixed_operations() {
     assert_eq!(proxy_0.backend_port, 5555);
 
     client_handle.abort();
+}
+
+/// Test that the CP rejects a DP with a mismatched minor version.
+#[allow(clippy::result_large_err)]
+#[tokio::test]
+async fn test_cp_rejects_dp_with_version_mismatch() {
+    let config = create_test_config(1);
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+
+    let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    // Give the server a moment to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let token = create_test_token();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", bound_addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    // Send a Subscribe with a fake incompatible version (different minor)
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "test-dp".to_string(),
+        ferrum_version: "99.99.0".to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(result.is_err(), "CP should reject mismatched DP version");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("Version mismatch"),
+        "Error should mention version mismatch, got: {}",
+        status.message()
+    );
+
+    // Also test GetFullConfig with mismatched version
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
+        node_id: "test-dp".to_string(),
+        ferrum_version: "99.99.0".to_string(),
+    });
+
+    let result = client.get_full_config(request).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+
+    // Verify that a matching version succeeds
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "test-dp-good".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(result.is_ok(), "CP should accept DP with matching version");
+
+    server_handle.abort();
+}
+
+/// Test that the CP rejects a DP that sends an empty version (pre-v0.9.0 DP).
+#[allow(clippy::result_large_err)]
+#[tokio::test]
+async fn test_cp_rejects_dp_with_empty_version() {
+    let config = create_test_config(1);
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+
+    let (server, _update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let token = create_test_token();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", bound_addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    // Empty version simulates a pre-v0.9.0 DP that doesn't set the field
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "old-dp".to_string(),
+        ferrum_version: String::new(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(result.is_err(), "CP should reject DP with empty version");
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("did not report its version"),
+        "Error should mention missing version, got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
 }

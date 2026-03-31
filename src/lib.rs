@@ -1,5 +1,8 @@
 //! Ferrum Edge - A high-performance edge proxy built in Rust
 
+/// The Ferrum Edge binary/crate version (sourced from Cargo.toml at compile time).
+pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod admin;
 pub mod circuit_breaker;
 pub mod config;

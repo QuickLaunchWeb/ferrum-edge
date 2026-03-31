@@ -30,6 +30,9 @@ use config::{EnvConfig, OperatingMode};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+/// The Ferrum Edge binary version (sourced from Cargo.toml at compile time).
+pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() {
     // Initialize rustls crypto provider
     if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
@@ -48,7 +51,7 @@ fn main() {
         .json()
         .init();
 
-    info!("Ferrum Edge starting...");
+    info!("Ferrum Edge v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // Resolve secrets using a single-threaded runtime so that subsequent
     // env var mutations are safe — no concurrent threads exist yet.
