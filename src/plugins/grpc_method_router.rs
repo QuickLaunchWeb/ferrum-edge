@@ -81,9 +81,14 @@ pub struct GrpcMethodRouter {
 
 impl GrpcMethodRouter {
     pub fn new(config: &Value) -> Self {
+        // Normalize method paths: strip leading '/' for consistent matching.
+        // Users can configure either "/pkg.Svc/Method" or "pkg.Svc/Method".
         let allow_methods = config["allow_methods"].as_array().map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(|s| s.strip_prefix('/').unwrap_or(s).to_string())
+                })
                 .collect::<HashSet<_>>()
         });
 
@@ -91,7 +96,10 @@ impl GrpcMethodRouter {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| {
+                        v.as_str()
+                            .map(|s| s.strip_prefix('/').unwrap_or(s).to_string())
+                    })
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
@@ -105,8 +113,9 @@ impl GrpcMethodRouter {
                     spec["max_requests"].as_u64(),
                     spec["window_seconds"].as_u64(),
                 ) {
+                    let normalized = method.strip_prefix('/').unwrap_or(method).to_string();
                     method_rate_limits.insert(
-                        method.clone(),
+                        normalized,
                         RateSpec {
                             max_requests,
                             window: Duration::from_secs(window_seconds.max(1)),
@@ -229,12 +238,13 @@ impl Plugin for GrpcMethodRouter {
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Parse the gRPC path and populate metadata
         if let Some((service, method)) = parse_grpc_path(&ctx.path) {
+            let full_method = format!("{}/{}", service, method);
             ctx.metadata
                 .insert("grpc_service".to_string(), service.to_string());
             ctx.metadata
                 .insert("grpc_method".to_string(), method.to_string());
             ctx.metadata
-                .insert("grpc_full_method".to_string(), ctx.path.clone());
+                .insert("grpc_full_method".to_string(), full_method);
         } else {
             debug!(
                 path = %ctx.path,

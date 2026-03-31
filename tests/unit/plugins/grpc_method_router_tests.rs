@@ -64,7 +64,7 @@ async fn test_metadata_populated_on_valid_path() {
     assert_eq!(ctx.metadata.get("grpc_method").unwrap(), "GetUser");
     assert_eq!(
         ctx.metadata.get("grpc_full_method").unwrap(),
-        "/my.package.UserService/GetUser"
+        "my.package.UserService/GetUser"
     );
 }
 
