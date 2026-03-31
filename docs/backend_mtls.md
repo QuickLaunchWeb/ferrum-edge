@@ -44,11 +44,12 @@ The `FERRUM_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authori
 
 The gateway resolves backend CA trust in the following order:
 
-1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — if set, used exclusively
-2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — if set, used when no proxy CA is configured
-3. **No CA configured** — backend server certificate verification is **automatically skipped**. The gateway does **not** fall back to system/public CA roots. This means if you don't configure a CA, the gateway trusts any backend certificate. To explicitly verify backends against public CAs, set `FERRUM_TLS_CA_BUNDLE_PATH` to your system CA bundle (e.g., `/etc/ssl/certs/ca-certificates.crt`).
+1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with that CA (plus webpki roots for rustls-based paths)
+2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with global CA (plus webpki roots for rustls-based paths)
+3. **Neither set** — verify with **webpki/system roots** (secure default). The gateway does **not** skip verification when no CA is configured. Public CAs are always trusted as a baseline.
+4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
 
-This design is intentional for edge proxy deployments where backends typically use internal or self-signed certificates. The `backend_tls_verify_server_cert: false` per-proxy flag and `FERRUM_TLS_NO_VERIFY=true` global flag also skip verification, but the "no CA = no verify" behavior means you don't need to set those flags just because you haven't configured a CA bundle.
+This means backends using certificates from public CAs work out of the box with no CA configuration. Backends using internal or self-signed certificates require either a proxy-specific or global CA bundle to be configured.
 
 **CA Bundle Format:**
 ```bash
@@ -215,7 +216,8 @@ The mTLS implementation uses:
 
 ### Connection Pool Behavior
 
-- **Fail-fast on bad certificates**: All TLS certificate files — both global env var paths (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH`) and per-proxy paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time. If any configured cert file is missing, unreadable (permission denied), or contains invalid/corrupt PEM data, the gateway **refuses to start** (or rejects the config reload). There is no silent fallback to unauthenticated connections. Cert and key paths must always be configured as a pair; setting one without the other is a validation error.
+- **Fail-fast on bad certificates**: All TLS certificate files — both global env var paths (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH`) and per-proxy paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time. If any configured cert file is missing, unreadable (permission denied), or contains invalid/corrupt PEM data, the gateway **refuses to start** (or rejects the config reload). There is no silent fallback to unauthenticated connections or to webpki-only verification when a configured CA file fails to load. Cert and key paths must always be configured as a pair; setting one without the other is a validation error. CA paths are independent — you can set just a CA to verify a server without presenting client identity.
+- **TLS path deduplication**: When multiple proxies share the same cert/key/CA file paths, each unique file is parsed only once during validation. This avoids redundant disk I/O and PEM parsing at config load time.
 - **Pool-per-cert-path**: Each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate connection pool entry** per protocol:
   - **HTTP/1.1 + H2** (`ConnectionPool`): separate `reqwest::Client` instances keyed by `host:port:protocol:dns_override:ca_path`
   - **HTTP/3** (`Http3ConnectionPool`): separate `rustls::ClientConfig` + QUIC endpoints per proxy

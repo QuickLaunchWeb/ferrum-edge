@@ -411,14 +411,14 @@ impl GrpcConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        // Build root certificate store — proxy-specific CA takes priority over global CA.
-        // No webpki roots: if no CA is configured, we use an empty store and set NoVerifier below.
-        let mut root_store = rustls::RootCertStore::empty();
+        // Build root certificate store — start with webpki/system roots so that
+        // backends using public CAs are verified even when no custom CA is configured.
+        let mut root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let ca_path = proxy
             .backend_tls_server_ca_cert_path
             .as_ref()
             .or(self.global_env_config.tls_ca_bundle_path.as_ref());
-        let has_ca = ca_path.is_some();
 
         if let Some(ca_bundle_path) = ca_path {
             let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| {
@@ -499,9 +499,8 @@ impl GrpcConnectionPool {
         // Force HTTP/2 via ALPN
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-        // Skip server cert verification if explicitly disabled, global no_verify, or no CA configured
-        if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify || !has_ca
-        {
+        // Skip server cert verification only if explicitly disabled or global no_verify
+        if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));

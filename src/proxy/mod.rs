@@ -1426,15 +1426,16 @@ fn build_websocket_tls_connector(
     // Determine if we should skip server cert verification
     let skip_verify = env_config.tls_no_verify || !proxy.backend_tls_verify_server_cert;
 
-    // Build root certificate store - start empty, only add explicit CAs
-    let mut root_store = rustls::RootCertStore::empty();
+    // Build root certificate store — start with webpki/system roots so that
+    // backends using public CAs are verified even when no custom CA is configured.
+    let mut root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     // Add custom CA bundle (proxy-level takes priority over global)
     let ca_path = proxy
         .backend_tls_server_ca_cert_path
         .as_ref()
         .or(env_config.tls_ca_bundle_path.as_ref());
-    let has_ca = ca_path.is_some();
     if let Some(ca_path) = ca_path {
         let ca_pem = std::fs::read(ca_path).map_err(|e| {
             anyhow::anyhow!(
@@ -1512,19 +1513,12 @@ fn build_websocket_tls_connector(
         builder.with_no_client_auth()
     };
 
-    // Disable server certificate verification if configured or if no CA is available
-    if skip_verify || !has_ca {
-        if skip_verify {
-            warn!(
-                "WebSocket backend TLS certificate verification DISABLED for proxy {}",
-                proxy.id
-            );
-        } else {
-            warn!(
-                "No CA configured for WebSocket backend TLS on proxy {} — verification disabled",
-                proxy.id
-            );
-        }
+    // Disable server certificate verification only if explicitly opted out
+    if skip_verify {
+        warn!(
+            "WebSocket backend TLS certificate verification DISABLED for proxy {}",
+            proxy.id
+        );
         client_config
             .dangerous()
             .set_certificate_verifier(Arc::new(NoVerifier));
@@ -3972,9 +3966,6 @@ async fn proxy_to_backend(
             error!("Failed to get client from pool: {}", e);
             // Fallback to creating new client with shared DNS cache
             let resolver = DnsCacheResolver::new(state.dns_cache.clone());
-            // No CA configured (proxy or global) = no verify, same as pool path
-            let has_ca = proxy.backend_tls_server_ca_cert_path.is_some()
-                || state.env_config.tls_ca_bundle_path.is_some();
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -3983,9 +3974,7 @@ async fn proxy_to_backend(
                     proxy.backend_read_timeout_ms,
                 ))
                 .danger_accept_invalid_certs(
-                    !proxy.backend_tls_verify_server_cert
-                        || state.env_config.tls_no_verify
-                        || !has_ca,
+                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
                 .dns_resolver(Arc::new(resolver))
                 .build()

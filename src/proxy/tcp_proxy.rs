@@ -41,13 +41,14 @@ impl CachedBackendTlsConfig {
         global_tls_ca_bundle_path: Option<&str>,
         tls_policy: Option<&TlsPolicy>,
     ) -> Result<Self, anyhow::Error> {
-        // Build root certificate store: proxy CA → global CA → empty (with NoVerifier)
-        let mut root_store = rustls::RootCertStore::empty();
+        // Build root certificate store — start with webpki/system roots so that
+        // backends using public CAs are verified even when no custom CA is configured.
+        let mut root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let ca_path = proxy
             .backend_tls_server_ca_cert_path
             .as_deref()
             .or(global_tls_ca_bundle_path);
-        let has_ca = ca_path.is_some();
         if let Some(ca_path) = ca_path {
             let ca_data = std::fs::read(ca_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
@@ -85,9 +86,8 @@ impl CachedBackendTlsConfig {
                 .with_no_client_auth()
         };
 
-        // Disable verification if explicitly requested OR if no CA is configured at all
-        // (empty root store would reject every cert, so NoVerifier is more useful).
-        if !proxy.backend_tls_verify_server_cert || tls_no_verify || !has_ca {
+        // Disable verification only if explicitly requested
+        if !proxy.backend_tls_verify_server_cert || tls_no_verify {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));

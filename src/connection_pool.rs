@@ -131,14 +131,13 @@ impl ConnectionPool {
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
         // Determine whether to skip server cert verification.
-        // CA trust chain: proxy CA → global CA → no-verify (no webpki/system roots).
+        // CA trust chain: proxy CA → global CA → webpki/system roots.
         let ca_path = proxy
             .backend_tls_server_ca_cert_path
             .as_ref()
             .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
-        let skip_verify = !proxy.backend_tls_verify_server_cert
-            || self.global_mtls_config.tls_no_verify
-            || ca_path.is_none();
+        let skip_verify =
+            !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify;
 
         let mut client_builder = reqwest::Client::builder()
             .dns_resolver(dns_resolver)
@@ -421,18 +420,15 @@ impl ConnectionPool {
             .as_ref()
             .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
 
-        // Build root certificate store
-        let mut root_store = rustls::RootCertStore::empty();
-        // Track whether we need to apply NoVerifier after building the config
-        let needs_no_verify;
+        // Build root certificate store — start with webpki/system roots so that
+        // backends using public CAs are verified even when no custom CA is configured.
+        let mut root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         if skip_verify {
-            // Explicit no-verify: empty root store, will set NoVerifier after config is built
-            needs_no_verify = true;
             tracing::warn!("Backend TLS certificate verification DISABLED for HTTP/3 backend");
         } else if let Some(ca_path) = ca_path {
-            // CA path configured (proxy or global): load it
-            needs_no_verify = false;
+            // CA path configured (proxy or global): load it on top of system roots
             let ca_file = std::fs::File::open(ca_path).map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to open backend CA certificate '{}' for HTTP/3: {}",
@@ -457,14 +453,6 @@ impl ConnectionPool {
                     ca_path
                 );
             }
-        } else {
-            // No CA configured and no explicit no-verify: auto no-verify since we have
-            // no trust anchors to verify against
-            needs_no_verify = true;
-            tracing::warn!(
-                "No CA certificate configured for HTTP/3 backend and no explicit \
-                 no-verify set — disabling certificate verification"
-            );
         }
 
         // Helper: build a ClientConfig builder using TLS policy or defaults.
@@ -533,8 +521,8 @@ impl ConnectionPool {
                 .with_no_client_auth()
         };
 
-        // Apply NoVerifier if needed (skip server certificate verification)
-        if needs_no_verify {
+        // Apply NoVerifier if explicitly opted out of verification
+        if skip_verify {
             client_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));

@@ -351,7 +351,11 @@ Frontend, admin, DTLS, and gRPC certificates are read at process startup. Global
 
 **No TLS surface supports hot reload — not frontend, not backend, not admin, not DTLS, not gRPC.** A config reload (SIGHUP in file mode, database polling, or CP→DP gRPC sync) refreshes routing, plugins, consumers, and upstreams — but does **not** re-read any TLS certificate files from disk. This includes frontend server certs, client CA bundles, backend mTLS certs/keys, backend CA bundles, DTLS certs, and gRPC TLS certs.
 
-**To rotate certificates**, replace the files on disk and **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach.
+**To rotate certificates**, replace the files on disk and **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach. For per-proxy backend cert paths, a config reload (SIGHUP, DB poll, or gRPC sync) refreshes the proxy config but does **not** re-read existing TLS files from disk for cached pool entries — only newly created pool entries will read the updated files.
+
+### Backend Connection Pool and TLS Paths
+
+For reqwest-based backend paths (HTTP/1.1, HTTP/2 via reqwest, HTTP/3 frontend-to-backend), each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate `reqwest::Client` pool entry**. Two proxies with different cert paths targeting the same backend host will not share connections. For rustls-based paths (gRPC pool, HTTP/2 direct pool), the TLS config is built per-connection rather than per-pool-entry, but the same isolation principle applies — different cert paths produce different TLS configurations.
 
 ## Security Best Practices
 

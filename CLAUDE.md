@@ -216,6 +216,46 @@ tests/
 - **Validate JWT expiration** — always set `validation.validate_exp = true` when verifying JWTs.
 - **Escape user input in response bodies** — when interpolating user-provided strings into JSON/XML response bodies, escape special characters.
 
+### TLS Architecture
+
+**Backend CA Trust Chain** — all protocol paths follow this resolution order:
+
+1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with that CA (+ webpki roots for rustls paths)
+2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with global CA (+ webpki roots for rustls paths)
+3. **Neither set** — verify with webpki/system roots (secure default)
+4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` per-proxy or `FERRUM_TLS_NO_VERIFY=true` globally skips verification
+
+There is **no "no CA = no verify" behavior**. When no CA is configured, the gateway verifies against public webpki roots.
+
+**Startup validation**: Per-proxy TLS file paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are validated at config load time. The gateway refuses to start (or rejects the config reload) if configured paths cannot be read or parsed. There is no silent fallback to unauthenticated or unverified connections.
+
+**TLS path deduplication**: Multiple proxies sharing the same cert file paths result in each unique file being parsed only once during validation.
+
+**Cert/key pairing**: Client cert and key must be configured as a pair. CA is independent — you can set just a CA to verify a server without presenting client identity.
+
+**No silent fallbacks**: All protocol paths hard-error on cert load failure. No degradation to unauthenticated connections.
+
+**No hot reload for any TLS surface**: Updating a cert file on disk has no effect until restart (or config reload for per-proxy paths, which creates new pool entries but does not re-read files for existing ones). This applies to frontend, backend, admin, DTLS, and gRPC TLS surfaces. See `docs/frontend_tls.md` for the complete list.
+
+**Pool-per-cert-path**: For reqwest-based paths (HTTP/1.1, H2 via reqwest, H3 frontend-to-backend), different cert paths create different `reqwest::Client` pool entries. For rustls-based paths (gRPC pool, H2 direct pool), TLS config is built per-connection.
+
+**Protocol TLS coverage** — all 8 backend protocol paths follow the CA trust chain:
+
+| Protocol Path | TLS Library | Pool Isolation |
+|---------------|-------------|----------------|
+| HTTP/1.1 (`ConnectionPool`) | reqwest/rustls | Per `reqwest::Client` keyed by cert paths |
+| HTTP/2 via reqwest (`ConnectionPool`) | reqwest/rustls | Same as HTTP/1.1 |
+| HTTP/2 direct (`Http2ConnectionPool`) | rustls | Per-connection TLS config |
+| HTTP/3 backend (`Http3ConnectionPool`) | rustls/quinn | Per-endpoint TLS config |
+| H3 frontend-to-backend (reqwest) | reqwest/rustls | Same as HTTP/1.1 |
+| gRPC (`GrpcConnectionPool`) | rustls/hyper-h2 | Per-connection TLS config |
+| WebSocket (wss://) | rustls | Per-connection (no persistent pool) |
+| TCP/TLS | rustls | Per-listener lifecycle |
+
+See `docs/backend_mtls.md` and `docs/frontend_tls.md` for full details.
+
+**When adding new protocol paths**: Must follow the same CA trust chain (proxy CA -> global CA -> webpki roots). Must validate cert paths at config load time. Must hard-error on cert load failure with no silent fallback.
+
 ### Performance Rules
 
 - **No allocations per-request when avoidable** — use pre-computed indexes (RouterCache, PluginCache, ConsumerIndex) instead of filtering/searching at request time. Static headers like Alt-Svc are pre-computed in `ProxyState` at startup.
