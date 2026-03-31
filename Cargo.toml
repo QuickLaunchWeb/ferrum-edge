@@ -51,7 +51,7 @@ tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 
 # JWT and auth
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 bcrypt = "0.19"
 argon2 = "0.5"
 
