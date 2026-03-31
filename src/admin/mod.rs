@@ -2445,6 +2445,7 @@ fn build_metrics(state: &AdminState) -> Value {
         json!({
             "gateway": {
                 "mode": state.mode,
+                "ferrum_version": crate::FERRUM_VERSION,
                 "uptime_seconds": uptime_seconds,
                 "requests_per_second_current": rps,
                 "status_codes_last_second": status_codes,
@@ -2507,6 +2508,7 @@ fn build_metrics(state: &AdminState) -> Value {
         json!({
             "gateway": {
                 "mode": state.mode,
+                "ferrum_version": crate::FERRUM_VERSION,
                 "uptime_seconds": 0,
                 "requests_per_second_current": 0,
                 "status_codes_last_second": {},
@@ -2846,6 +2848,7 @@ fn parse_backup_resources(query: Option<&str>) -> Option<std::collections::HashS
 #[derive(Serialize)]
 struct BackupPayload<'a> {
     version: &'a str,
+    ferrum_version: &'a str,
     exported_at: String,
     source: &'a str,
     counts: BackupCounts,
@@ -2955,6 +2958,7 @@ async fn handle_backup(
 
     let backup = BackupPayload {
         version: &config.version,
+        ferrum_version: crate::FERRUM_VERSION,
         exported_at: Utc::now().to_rfc3339(),
         source,
         counts: BackupCounts {

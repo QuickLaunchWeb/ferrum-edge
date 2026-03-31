@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
+use crate::FERRUM_VERSION;
 use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
@@ -124,19 +125,31 @@ pub async fn connect_and_subscribe(
             Ok(req)
         });
 
-    info!("Connected to CP, subscribing for config updates");
+    info!(
+        "Connected to CP, subscribing for config updates (DP v{})",
+        FERRUM_VERSION
+    );
 
     let request = tonic::Request::new(SubscribeRequest {
         node_id: node_id.to_string(),
+        ferrum_version: FERRUM_VERSION.to_string(),
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();
 
     while let Some(update) = stream.message().await? {
         info!(
-            "Received config update (type={}, version={})",
-            update.update_type, update.version
+            "Received config update (type={}, version={}, cp_version={})",
+            update.update_type, update.version, update.ferrum_version
         );
+
+        // Validate CP version compatibility before applying any config.
+        if !update.ferrum_version.is_empty()
+            && let Err(msg) = check_cp_version_compatibility(&update.ferrum_version)
+        {
+            error!("{}", msg);
+            return Err(anyhow::anyhow!(msg));
+        }
 
         match update.update_type {
             0 => {
@@ -184,6 +197,33 @@ pub async fn connect_and_subscribe(
                 warn!("Unknown config update type {}, ignoring", other);
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Check whether the CP's reported version is compatible with this DP.
+///
+/// Major and minor versions must match. Patch-level differences are allowed.
+fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
+    let dp_parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+    let cp_parts: Vec<&str> = cp_version.split('.').collect();
+
+    if dp_parts.len() < 2 || cp_parts.len() < 2 {
+        warn!(
+            "Unable to parse version for compatibility check (DP={}, CP={}), allowing connection",
+            FERRUM_VERSION, cp_version
+        );
+        return Ok(());
+    }
+
+    if dp_parts[0] != cp_parts[0] || dp_parts[1] != cp_parts[1] {
+        return Err(format!(
+            "Version mismatch: DP is v{} but CP is v{}. \
+             Major and minor versions must match. \
+             Upgrade the CP first, then upgrade DPs to the same major.minor version.",
+            FERRUM_VERSION, cp_version
+        ));
     }
 
     Ok(())
