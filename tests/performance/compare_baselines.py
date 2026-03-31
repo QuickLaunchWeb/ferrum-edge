@@ -4,11 +4,11 @@ Compare current performance results against a stored baseline.
 Exits with non-zero status if a regression is detected.
 
 Regression thresholds (configurable via env vars):
-  PERF_RPS_REGRESSION_PCT       - Max allowed RPS drop % (default: 15)
+  PERF_RPS_REGRESSION_PCT       - Max allowed RPS drop % (default: 35)
   PERF_LATENCY_REGRESSION_PCT   - Max allowed latency increase % (default: 50)
   PERF_P95_REGRESSION_PCT       - Max allowed p95 latency increase % (default: 55)
-  PERF_ERROR_THRESHOLD          - Max allowed total errors (default: 10)
-  PERF_OVERHEAD_MAX_PCT         - Max allowed gateway overhead % (default: 25)
+  PERF_ERROR_THRESHOLD          - Max allowed total errors (default: 01)
+  PERF_OVERHEAD_MAX_PCT         - Max allowed gateway overhead % (default: 45)
 
 CI environments have inherent variance, so thresholds are intentionally generous.
 The goal is to catch major regressions, not micro-optimizations. P99 latency is
