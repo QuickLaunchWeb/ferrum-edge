@@ -88,14 +88,18 @@ impl Http2ConnectionPool {
     /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
     fn pool_key(proxy: &Proxy) -> String {
         let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let ca = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
         let mtls_cert = proxy
             .backend_tls_client_cert_path
             .as_deref()
             .unwrap_or_default();
         let verify = proxy.backend_tls_verify_server_cert;
         format!(
-            "{}|{}|{}|{}|{}",
-            proxy.backend_host, proxy.backend_port, dns, mtls_cert, verify as u8,
+            "{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, dns, ca, mtls_cert, verify as u8,
         )
     }
 
@@ -354,10 +358,27 @@ impl Http2ConnectionPool {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
 
-        // Add custom CA bundle if configured (unless no_verify is set)
-        if !self.global_env_config.tls_no_verify
+        // Add per-proxy CA certificate if configured (takes priority over global bundle)
+        if let Some(ref ca_path) = proxy.backend_tls_server_ca_cert_path {
+            match std::fs::read(ca_path) {
+                Ok(ca_pem) => {
+                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
+                    let certs = rustls_pemfile::certs(&mut reader);
+                    for cert in certs.flatten() {
+                        if let Err(e) = root_store.add(cert) {
+                            warn!("http2_pool: failed to add CA cert from {}: {}", ca_path, e);
+                        }
+                    }
+                    debug!("http2_pool: loaded per-proxy CA cert from {}", ca_path);
+                }
+                Err(e) => {
+                    warn!("http2_pool: failed to read CA cert from {}: {}", ca_path, e);
+                }
+            }
+        } else if !self.global_env_config.tls_no_verify
             && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
         {
+            // Fall back to global CA bundle
             match std::fs::read(ca_bundle_path) {
                 Ok(ca_pem) => {
                     let mut reader = std::io::BufReader::new(&ca_pem[..]);

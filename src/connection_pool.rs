@@ -432,6 +432,13 @@ impl ConnectionPool {
         // HTTP/3 requires ALPN protocol "h3"
         client_config.alpn_protocols = vec![b"h3".to_vec()];
 
+        // Optionally skip server cert verification
+        if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
+            client_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
+        }
+
         Arc::new(client_config)
     }
 

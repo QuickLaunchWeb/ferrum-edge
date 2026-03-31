@@ -254,8 +254,8 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 | Pool | File | Key Format | Sharding | Notes |
 |------|------|-----------|----------|-------|
 | HTTP | `connection_pool.rs` | `{dest}\|{proto}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | No (reqwest internal) | `dest` is `u={upstream_id}` or `d={host}:{port}` to prevent namespace collisions. `verify` is the effective flag (proxy AND global). |
-| gRPC | `proxy/grpc_proxy.rs` | `{host}\|{port}\|{tls}\|{dns_override}\|{mtls_cert}\|{verify}` | `#N` suffix | `tls` is bool from `BackendProtocol::Grpcs`. Shard key reuses a pre-allocated buffer. |
-| HTTP/2 | `proxy/http2_pool.rs` | `{host}\|{port}\|{dns_override}\|{mtls_cert}\|{verify}` | `#N` suffix | Always TLS (no tls flag needed). |
+| gRPC | `proxy/grpc_proxy.rs` | `{host}\|{port}\|{tls}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | `#N` suffix | `tls` is bool from `BackendProtocol::Grpcs`. Shard key reuses a pre-allocated buffer. |
+| HTTP/2 | `proxy/http2_pool.rs` | `{host}\|{port}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | `#N` suffix | Always TLS (no tls flag needed). |
 | HTTP/3 | `http3/client.rs` | `{host}\|{port}\|{index}\|{ca_path}\|{mtls_cert}\|{verify}` | Index in key | `index` distributes across `connections_per_backend` QUIC connections. Target-path keys use `{host}\|{port}\|{index}` only (TLS inherited from proxy). |
 
 **Rules for modifying pool keys:**
