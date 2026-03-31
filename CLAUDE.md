@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (31 built-in plugins including 4 AI/LLM-specific plugins and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (33 built-in plugins including 4 AI/LLM-specific plugins, 2 gRPC-specific plugins, and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -112,7 +112,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
-├── plugins/                   # Plugin system (31 plugins, including 4 AI/LLM and 3 WS frame plugins)
+├── plugins/                   # Plugin system (33 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   └── [plugin_name].rs       # Individual plugin implementations
 ├── grpc/                      # CP/DP gRPC communication
@@ -303,7 +303,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
 2. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, or `HTTP_ONLY_PROTOCOLS`
+3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, or `GRPC_ONLY_PROTOCOLS`
 4. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
 5. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs`
 6. Add the module to `tests/unit/plugins/mod.rs`
@@ -419,7 +419,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
 | `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
-| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `250` | Server-side HTTP/2 max concurrent streams per inbound connection |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

@@ -265,8 +265,8 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
             .timer(TokioTimer::new())
             .initial_stream_window_size(8_388_608) // 8 MiB
             .initial_connection_window_size(33_554_432) // 32 MiB
-            .adaptive_window(false) // Fixed windows
-            .max_frame_size(65_535); // Max frame size
+            .adaptive_window(true) // BDP-based adaptive flow control
+            .max_frame_size(1_048_576); // 1 MiB
         builder
     };
 

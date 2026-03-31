@@ -52,8 +52,8 @@ proxies:
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
 | `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB |
 | `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `false` | Enable adaptive flow-control (BDP probing) |
-| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `65535` | Maximum HTTP/2 frame payload (bytes). Range: 16384-16777215 |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing) |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 
 ## Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`

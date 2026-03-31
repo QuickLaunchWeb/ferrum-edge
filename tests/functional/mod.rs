@@ -7,6 +7,7 @@ mod functional_db_outage_test;
 mod functional_db_tls_test;
 mod functional_db_upstream_test;
 mod functional_file_mode_test;
+mod functional_grpc_plugins_test;
 mod functional_grpc_test;
 mod functional_load_balancer_test;
 mod functional_load_stress_test;
