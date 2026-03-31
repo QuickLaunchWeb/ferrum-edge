@@ -224,6 +224,7 @@ tests/
 - **Avoid `format!()` in hot loops** — pre-compute string keys at build time. Response headers like Alt-Svc are pre-formatted once, not per-request.
 - **Use streaming responses by default** — only buffer when a plugin explicitly requires it. The buffering requirement is pre-computed per-proxy in `PluginCache` for O(1) lookup at request time.
 - **Skip plugin phases when no plugins are configured** — guard plugin iteration loops with `plugins.is_empty()` to avoid iterator setup and async machinery overhead on the hot path.
+- **Always use the shared DNS cache for `reqwest::Client`** — every `reqwest::Client::builder()` call must include `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`. This ensures all HTTP clients (connection pool, health probes, fallback clients, plugin HTTP clients) share the gateway's pre-warmed DNS cache with TTL, stale-while-revalidate, and background refresh. Never create a `reqwest::Client` that falls back to system DNS resolution in production code paths.
 
 ### Protocol-Specific Architecture
 
