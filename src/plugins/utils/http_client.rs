@@ -94,12 +94,16 @@ impl PluginHttpClient {
             .danger_accept_invalid_certs(tls_no_verify)
             .dns_resolver(Arc::new(resolver));
 
-        // Load custom CA bundle for verifying internal/corporate CAs
+        // Load custom CA bundle for verifying internal/corporate CAs.
+        // - Custom CA configured → disable built-in roots, trust ONLY the custom CA
+        // - No CA configured → reqwest uses webpki/system roots by default
         if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
             match std::fs::read(ca_path) {
                 Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
                     Ok(cert) => {
-                        builder = builder.add_root_certificate(cert);
+                        builder = builder
+                            .tls_built_in_root_certs(false)
+                            .add_root_certificate(cert);
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse CA bundle from {}: {}", ca_path, e);
