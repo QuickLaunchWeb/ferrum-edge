@@ -150,10 +150,10 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–949 | Pre-processing that must run before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
+| **Early** | 0–949 | Pre-processing that must run before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
 | **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925) |
-| **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `request_termination` (3200), `response_size_limiting` (3950) |
+| **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `grpc_deadline` (3050), `request_termination` (3200), `response_size_limiting` (3950) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `ws_frame_logging` (9050), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
@@ -168,33 +168,35 @@ Given all built-in plugins enabled, the execution order is:
 | 2 | `cors` | 100 | on_request_received, after_proxy |
 | 3 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 4 | `bot_detection` | 200 | on_request_received |
-| 5 | `mtls_auth` | 950 | authenticate |
-| 6 | `jwks_auth` | 1000 | authenticate |
-| 7 | `jwt_auth` | 1100 | authenticate |
-| 8 | `key_auth` | 1200 | authenticate |
-| 9 | `basic_auth` | 1300 | authenticate |
-| 10 | `hmac_auth` | 1400 | authenticate |
-| 11 | `access_control` | 2000 | authorize |
-| 12 | `request_size_limiting` | 2800 | on_request_received, before_proxy |
-| 13 | `ws_message_size_limiting` | 2810 | on_ws_frame |
-| 14 | `graphql` | 2850 | before_proxy |
-| 15 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
-| 16 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 17 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 18 | `body_validator` | 2950 | before_proxy, on_response_body |
-| 19 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 20 | `request_transformer` | 3000 | before_proxy |
-| 21 | `request_termination` | 3200 | before_proxy |
-| 22 | `response_size_limiting` | 3950 | after_proxy, on_response_body |
-| 23 | `response_transformer` | 4000 | after_proxy |
-| 24 | `ai_token_metrics` | 4100 | on_response_body |
-| 25 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
-| 26 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 27 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 28 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
-| 29 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 30 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 31 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
+| 5 | `grpc_method_router` | 275 | on_request_received, before_proxy |
+| 6 | `mtls_auth` | 950 | authenticate |
+| 7 | `jwks_auth` | 1000 | authenticate |
+| 8 | `jwt_auth` | 1100 | authenticate |
+| 9 | `key_auth` | 1200 | authenticate |
+| 10 | `basic_auth` | 1300 | authenticate |
+| 11 | `hmac_auth` | 1400 | authenticate |
+| 12 | `access_control` | 2000 | authorize |
+| 13 | `request_size_limiting` | 2800 | on_request_received, before_proxy |
+| 14 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 15 | `graphql` | 2850 | before_proxy |
+| 16 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 17 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 18 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 19 | `body_validator` | 2950 | before_proxy, on_response_body |
+| 20 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 21 | `request_transformer` | 3000 | before_proxy |
+| 22 | `grpc_deadline` | 3050 | before_proxy |
+| 23 | `request_termination` | 3200 | before_proxy |
+| 24 | `response_size_limiting` | 3950 | after_proxy, on_response_body |
+| 25 | `response_transformer` | 4000 | after_proxy |
+| 26 | `ai_token_metrics` | 4100 | on_response_body |
+| 27 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
+| 28 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 29 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 30 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
+| 31 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 32 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 33 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -266,6 +268,7 @@ impl Plugin for MyPlugin {
     //   HTTP_FAMILY_PROTOCOLS   — HTTP, gRPC, WebSocket
     //   HTTP_GRPC_PROTOCOLS     — HTTP, gRPC
     //   HTTP_ONLY_PROTOCOLS     — HTTP only (default)
+    //   GRPC_ONLY_PROTOCOLS     — gRPC only
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS  // Example: this plugin works with all protocols
     }
@@ -334,6 +337,8 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
+| `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
+| `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
 | `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |

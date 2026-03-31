@@ -354,7 +354,7 @@ pub struct EnvConfig {
     pub tcp_listen_backlog: u32,
     /// Server-side HTTP/2 max concurrent streams per inbound connection.
     /// Limits how many requests a single HTTP/2 client can multiplex.
-    /// Default: 250 (nginx=128, envoy=100, unlimited by spec).
+    /// Default: 1000 (nginx=128, envoy=100, unlimited by spec).
     pub server_http2_max_concurrent_streams: u32,
 }
 
@@ -461,7 +461,7 @@ impl Default for EnvConfig {
             blocking_threads: None,
             max_connections: 100_000,
             tcp_listen_backlog: 2048,
-            server_http2_max_concurrent_streams: 250,
+            server_http2_max_concurrent_streams: 1000,
         }
     }
 }
@@ -732,7 +732,7 @@ impl EnvConfig {
             )
             .and_then(|v| v.parse().ok())
             .map(|v: u32| v.max(1))
-            .unwrap_or(250),
+            .unwrap_or(1000),
         };
 
         config.validate()?;

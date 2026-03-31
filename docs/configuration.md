@@ -174,7 +174,7 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
 | `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
-| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `250` | Server-side HTTP/2 max concurrent streams per inbound connection |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 
 See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning guidance.
 

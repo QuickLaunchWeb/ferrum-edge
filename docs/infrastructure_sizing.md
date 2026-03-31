@@ -251,7 +251,7 @@ These settings control the gateway's ability to handle high connection concurren
 
 **`FERRUM_TCP_LISTEN_BACKLOG`** — The kernel queue size for connections waiting to be accepted. Under burst traffic, a small backlog causes the kernel to silently drop SYN packets. The default of 2048 handles most burst scenarios. On Linux, this is capped by `net.core.somaxconn` — ensure the sysctl value is at least as high as this setting.
 
-**`FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS`** — Limits how many requests a single HTTP/2 client connection can multiplex simultaneously. Without this, a single greedy or misbehaving client could open unlimited streams, consuming disproportionate resources. The default of 250 is generous (nginx uses 128, envoy uses 100). Lower it if you need tighter per-connection isolation; raise it for trusted internal clients that benefit from heavy multiplexing.
+**`FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS`** — Limits how many requests a single HTTP/2 client connection can multiplex simultaneously. Without this, a single greedy or misbehaving client could open unlimited streams, consuming disproportionate resources. The default of 1000 is tuned for high-throughput gRPC and HTTP/2 workloads where clients multiplex heavily (nginx uses 128, envoy uses 100). Lower it if you need tighter per-connection isolation; the default eliminates connection churn for most workloads.
 
 ### Runtime Threading
 

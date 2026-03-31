@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 31 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 33 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -502,6 +502,73 @@ config:
     mutation:
       max_requests: 20
       window_seconds: 60
+```
+
+---
+
+## gRPC Plugins
+
+### `grpc_method_router`
+
+Parses the gRPC path (`/package.Service/Method`) and enables per-method access control and rate limiting. Populates `grpc_service`, `grpc_method`, and `grpc_full_method` metadata for downstream plugins.
+
+**Priority:** 275
+**Protocol:** gRPC only
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allow_methods` | String[] | *(none)* | Only these gRPC methods are permitted (allowlist) |
+| `deny_methods` | String[] | `[]` | These gRPC methods are explicitly blocked (checked before allow) |
+| `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path |
+| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
+
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`.
+
+Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+
+Populates `ctx.metadata` with `grpc_service`, `grpc_method`, and `grpc_full_method` in the `on_request_received` phase.
+
+```yaml
+plugin_name: grpc_method_router
+config:
+  deny_methods:
+    - /admin.AdminService/DeleteAll
+  method_rate_limits:
+    /myapp.UserService/CreateUser:
+      max_requests: 10
+      window_seconds: 60
+    /myapp.UserService/ListUsers:
+      max_requests: 100
+      window_seconds: 60
+  limit_by: consumer
+```
+
+### `grpc_deadline`
+
+Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum deadlines, inject defaults when clients omit `grpc-timeout`, and subtract gateway processing time before forwarding.
+
+**Priority:** 3050
+**Protocol:** gRPC only
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds) |
+| `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it |
+| `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
+| `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` with HTTP 400 |
+
+Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds).
+
+When `subtract_gateway_processing` is true and the remaining deadline is zero or negative, returns gRPC status `DEADLINE_EXCEEDED` (status code 4) using the trailers-only response pattern.
+
+Populates `ctx.metadata` with `grpc_original_deadline_ms` and `grpc_adjusted_deadline_ms`.
+
+```yaml
+plugin_name: grpc_deadline
+config:
+  max_deadline_ms: 30000
+  default_deadline_ms: 5000
+  subtract_gateway_processing: true
 ```
 
 ---

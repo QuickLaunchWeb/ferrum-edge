@@ -10,6 +10,8 @@ pub mod bot_detection;
 pub mod correlation_id;
 pub mod cors;
 pub mod graphql;
+pub mod grpc_deadline;
+pub mod grpc_method_router;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
@@ -88,6 +90,9 @@ pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 
 /// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
 pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
+
+/// gRPC-only (single protocol).
+pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
 
 /// Direction of a WebSocket frame being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +284,7 @@ pub mod priority {
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
+    pub const GRPC_METHOD_ROUTER: u16 = 275;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
@@ -293,6 +299,7 @@ pub mod priority {
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
+    pub const GRPC_DEADLINE: u16 = 3050;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_SIZE_LIMITING: u16 = 3950;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
@@ -592,6 +599,10 @@ pub fn create_plugin_with_http_client(
             response_transformer::ResponseTransformer::new(config),
         ))),
         "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)))),
+        "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
+            config,
+        )))),
+        "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)))),
         "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(config)))),
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config),
@@ -680,6 +691,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "request_transformer",
         "response_transformer",
         "graphql",
+        "grpc_method_router",
+        "grpc_deadline",
         "rate_limiting",
         "request_size_limiting",
         "response_size_limiting",

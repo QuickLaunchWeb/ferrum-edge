@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 31 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, on WebSocket frame, log)
+- 33 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, on WebSocket frame, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -79,6 +79,8 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema and XML validation
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
+- **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
+- **gRPC Deadline** — `grpc-timeout` enforcement, default injection, max capping, and gateway processing time subtraction
 
 ### AI / LLM Plugins
 
@@ -121,7 +123,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **SO_REUSEPORT** for kernel-level connection distribution across CPU cores
 - Configurable TCP listen backlog (default 2048) for burst absorption
 - Connection limit semaphore (default 100k) with graceful queuing under overload
-- Server-side HTTP/2 `max_concurrent_streams` (default 250) to bound per-connection resource usage
+- Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage
 - Configurable tokio worker and blocking thread counts with auto-detection
 
 ## TLS & Security
