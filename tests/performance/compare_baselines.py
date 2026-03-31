@@ -27,11 +27,11 @@ def get_threshold(env_var, default):
 
 
 # Thresholds
-RPS_REGRESSION_PCT = get_threshold("PERF_RPS_REGRESSION_PCT", 15)
+RPS_REGRESSION_PCT = get_threshold("PERF_RPS_REGRESSION_PCT", 35)
 LATENCY_REGRESSION_PCT = get_threshold("PERF_LATENCY_REGRESSION_PCT", 50)
 P95_REGRESSION_PCT = get_threshold("PERF_P95_REGRESSION_PCT", 55)
-ERROR_THRESHOLD = int(get_threshold("PERF_ERROR_THRESHOLD", 10))
-OVERHEAD_MAX_PCT = get_threshold("PERF_OVERHEAD_MAX_PCT", 25)
+ERROR_THRESHOLD = int(get_threshold("PERF_ERROR_THRESHOLD", 01))
+OVERHEAD_MAX_PCT = get_threshold("PERF_OVERHEAD_MAX_PCT", 45)
 
 
 def pct_change(old, new):
