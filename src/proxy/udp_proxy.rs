@@ -60,6 +60,10 @@ struct UdpSession {
     created_at: AtomicU64,    // epoch millis
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
+    /// Backend target for logging (e.g., "10.0.2.10:5353").
+    backend_target: String,
+    /// DNS-resolved IP address of the backend for logging.
+    backend_resolved_ip: String,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
@@ -497,12 +501,19 @@ fn spawn_session_cleanup(
                                 let created_ms = session.created_at.load(Ordering::Relaxed);
                                 let duration_ms = (now.saturating_sub(created_ms)) as f64;
                                 let metadata = session.metadata.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                // Convert epoch millis to RFC3339 timestamps for logging.
+                                let ts_connected = chrono::DateTime::from_timestamp_millis(created_ms as i64)
+                                    .map(|dt| dt.to_rfc3339())
+                                    .unwrap_or_default();
+                                let ts_disconnected = chrono::DateTime::from_timestamp_millis(now as i64)
+                                    .map(|dt| dt.to_rfc3339())
+                                    .unwrap_or_default();
                                 let summary = StreamTransactionSummary {
                                     proxy_id: proxy_id.clone(),
                                     proxy_name: proxy_name.clone(),
                                     client_ip: addr.ip().to_string(),
-                                    backend_target: String::new(),
-                                    backend_resolved_ip: None,
+                                    backend_target: session.backend_target.clone(),
+                                    backend_resolved_ip: Some(session.backend_resolved_ip.clone()),
                                     protocol: backend_protocol.to_string(),
                                     listen_port,
                                     duration_ms,
@@ -510,8 +521,8 @@ fn spawn_session_cleanup(
                                     bytes_received: br,
                                     connection_error: None,
                                     error_class: None,
-                                    timestamp_connected: String::new(),
-                                    timestamp_disconnected: String::new(),
+                                    timestamp_connected: ts_connected,
+                                    timestamp_disconnected: ts_disconnected,
                                     metadata,
                                 };
                                 for plugin in plugins.iter() {
@@ -647,7 +658,7 @@ async fn start_dtls_frontend_listener(
                 let connected_at = chrono::Utc::now();
 
                 tokio::spawn(async move {
-                    let err_msg = match handle_dtls_client(
+                    let result = handle_dtls_client(
                         client_conn,
                         client_addr,
                         &handler_proxy_id,
@@ -658,8 +669,8 @@ async fn start_dtls_frontend_listener(
                         tls_no_verify,
                         &handler_cb_cache,
                     )
-                    .await
-                    {
+                    .await;
+                    let err_msg = match &result.outcome {
                         Ok(()) => None,
                         Err(e) => {
                             debug!(
@@ -679,8 +690,8 @@ async fn start_dtls_frontend_listener(
                             proxy_id: handler_proxy_id.to_string(),
                             proxy_name: handler_proxy_name,
                             client_ip: client_addr.ip().to_string(),
-                            backend_target: String::new(),
-                            backend_resolved_ip: None,
+                            backend_target: result.backend.backend_target,
+                            backend_resolved_ip: result.backend.backend_resolved_ip,
                             protocol: backend_protocol.to_string(),
                             listen_port: port,
                             duration_ms: (disconnected_at - connected_at).num_milliseconds() as f64,
@@ -711,11 +722,29 @@ async fn start_dtls_frontend_listener(
     }
 }
 
+/// Backend target info resolved during DTLS connection setup, available for logging
+/// regardless of whether the connection succeeded or failed.
+struct DtlsBackendInfo {
+    /// The backend target hostname:port (e.g., "10.0.2.10:5353").
+    backend_target: String,
+    /// The DNS-resolved IP address, if resolution succeeded.
+    backend_resolved_ip: Option<String>,
+}
+
+/// Result of a DTLS client handler: backend info (always present) plus the outcome.
+struct DtlsHandlerResult {
+    backend: DtlsBackendInfo,
+    outcome: Result<(), anyhow::Error>,
+}
+
 /// Handle a single DTLS frontend client connection.
 ///
 /// Reads decrypted datagrams from the client via the DTLS connection and forwards
 /// them to the backend (plain UDP or backend DTLS). Backend replies are forwarded
 /// back through the client's DTLS connection.
+///
+/// Always returns a `DtlsHandlerResult` containing backend info (for logging)
+/// and the connection outcome, so even failed connections log which backend was attempted.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client(
     client_conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
@@ -727,6 +756,42 @@ async fn handle_dtls_client(
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     circuit_breaker_cache: &CircuitBreakerCache,
+) -> DtlsHandlerResult {
+    let mut backend_info = DtlsBackendInfo {
+        backend_target: String::new(),
+        backend_resolved_ip: None,
+    };
+    let outcome = handle_dtls_client_inner(
+        client_conn,
+        client_addr,
+        proxy_id,
+        config,
+        dns_cache,
+        lb_cache,
+        metrics,
+        tls_no_verify,
+        circuit_breaker_cache,
+        &mut backend_info,
+    )
+    .await;
+    DtlsHandlerResult {
+        backend: backend_info,
+        outcome,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_dtls_client_inner(
+    client_conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
+    client_addr: SocketAddr,
+    proxy_id: &str,
+    config: &arc_swap::ArcSwap<GatewayConfig>,
+    dns_cache: &DnsCache,
+    lb_cache: &LoadBalancerCache,
+    metrics: &Arc<UdpProxyMetrics>,
+    tls_no_verify: bool,
+    circuit_breaker_cache: &CircuitBreakerCache,
+    backend_info: &mut DtlsBackendInfo,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let current_config = config.load();
@@ -739,6 +804,8 @@ async fn handle_dtls_client(
 
     // Resolve backend target
     let (backend_host, backend_port) = resolve_backend_target(&proxy, lb_cache)?;
+    // Populate backend target as soon as it's known — even if DNS or connect fails.
+    backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
     // Circuit breaker check — reject before creating backend connection if open.
     let cb_target_key = proxy
@@ -784,6 +851,8 @@ async fn handle_dtls_client(
         }
     };
     let backend_addr = SocketAddr::new(resolved_ip, backend_port);
+    // DNS succeeded — record the resolved IP for logging.
+    backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
     // Create backend connection — plain UDP or DTLS depending on backend_protocol.
     // Frontend DTLS termination can forward to either plain UDP or DTLS backends.
@@ -1204,6 +1273,8 @@ async fn create_session(
         created_at: AtomicU64::new(now),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
+        backend_target: format!("{}:{}", backend_host, backend_port),
+        backend_resolved_ip: resolved_ip.to_string(),
         metadata: std::sync::Mutex::new(stream_ctx.metadata),
     });
 

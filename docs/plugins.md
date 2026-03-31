@@ -78,6 +78,381 @@ config:
   flush_interval_ms: 1000
 ```
 
+#### Splunk HEC Integration
+
+The `http_logging` plugin works with [Splunk HTTP Event Collector (HEC)](https://docs.splunk.com/Documentation/Splunk/latest/Data/UsetheHTTPEventCollector) using the **raw endpoint** (`/services/collector/raw`). The raw endpoint accepts arbitrary JSON — including the JSON arrays that `http_logging` sends — without requiring the HEC envelope format (`{"event": ...}`).
+
+**Setup steps:**
+
+1. **Enable HEC in Splunk** — Settings → Data Inputs → HTTP Event Collector → New Token. Note the token value.
+
+2. **Create a sourcetype** (optional but recommended) — create a custom sourcetype that extracts JSON fields. Under Settings → Source Types, create `ferrum_edge_logs` with:
+   - Event Breaking: `[\r\n]+` (one JSON object per line after array expansion)
+   - KV_MODE: `json`
+
+3. **Configure the HEC token** — edit the token's settings:
+   - **Source type**: set to `_json` (built-in) or your custom `ferrum_edge_logs`
+   - **Index**: choose your target index
+   - **Enable indexer acknowledgement**: optional, for guaranteed delivery
+
+4. **Configure the plugin** — point `endpoint_url` at the raw HEC endpoint and set the `authorization_header` to `Splunk <your-token>`:
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://splunk.example.com:8088/services/collector/raw"
+  authorization_header: "Splunk cf2fa345-1b2c-3d4e-5f6a-7b8c9d0e1f2a"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+Splunk will parse each object in the JSON array as a separate event. All `TransactionSummary` fields (`client_ip`, `latency_total_ms`, `response_status_code`, etc.) become searchable fields in Splunk.
+
+**Example Splunk search:**
+```
+sourcetype="ferrum_edge_logs" response_status_code>=500
+| stats count by matched_proxy_name, error_class
+```
+
+> **Note:** If you use the standard HEC endpoint (`/services/collector/event`) instead of `/services/collector/raw`, Splunk expects each event wrapped in `{"event": ...}` — which `http_logging` does not produce. Always use the `/raw` endpoint.
+
+> **TLS verification:** If your Splunk instance uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the HEC endpoint's certificate.
+
+### Transaction Summary Reference
+
+Both `stdout_logging` and `http_logging` emit the same JSON structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
+
+#### TransactionSummary Fields (HTTP / gRPC / WebSocket)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp_received` | String (RFC 3339) | Request arrival time (UTC) |
+| `client_ip` | String | Client IP after trusted-proxy resolution |
+| `consumer_username` | String or null | Authenticated consumer identity (null if unauthenticated) |
+| `http_method` | String | HTTP method (e.g., `GET`, `POST`) |
+| `request_path` | String | Request path (query string stripped) |
+| `matched_proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
+| `matched_proxy_name` | String or null | Proxy name (null if unnamed or unmatched) |
+| `backend_target_url` | String or null | Backend URL (`host:port/path`); null for rejected requests |
+| `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
+| `response_status_code` | u16 | HTTP status code |
+| `latency_total_ms` | f64 | Total request-to-response time |
+| `latency_gateway_processing_ms` | f64 | Total time excluding backend communication |
+| `latency_backend_ttfb_ms` | f64 | Time to first byte from backend; -1.0 if no backend call |
+| `latency_backend_total_ms` | f64 | Full backend response time; -1.0 for streaming responses |
+| `latency_plugin_execution_ms` | f64 | Wall-clock time in all plugin hooks |
+| `latency_plugin_external_io_ms` | f64 | Subset of plugin time spent on external HTTP calls |
+| `latency_gateway_overhead_ms` | f64 | Pure gateway overhead (routing, framing, pool checkout) |
+| `request_user_agent` | String or null | User-Agent header value |
+| `response_streamed` | bool | Present and `true` when body was streamed (not buffered) |
+| `client_disconnected` | bool | Present and `true` when client disconnected early |
+| `error_class` | String or null | Error classification; omitted from JSON when null |
+| `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
+
+**Notes on conditional fields:** `response_streamed`, `client_disconnected`, `backend_resolved_ip`, and `error_class` are omitted from the JSON output when false/null to keep log entries compact.
+
+**`error_class` values:** `ConnectionFailed`, `Timeout`, `BadGateway`, `ServiceUnavailable`. Only set when the gateway itself could not communicate with the backend. Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.
+
+#### StreamTransactionSummary Fields (TCP / UDP / DTLS)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `proxy_id` | String | Proxy ID |
+| `proxy_name` | String or null | Proxy name |
+| `client_ip` | String | Client IP |
+| `backend_target` | String | Backend target (`host:port`); empty if target resolution failed before LB/config lookup |
+| `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
+| `protocol` | String | Protocol string: `tcp`, `tcp_tls`, `udp`, or `dtls` |
+| `listen_port` | u16 | Proxy listen port |
+| `duration_ms` | f64 | Connection/session lifetime in milliseconds |
+| `bytes_sent` | u64 | Bytes sent to backend |
+| `bytes_received` | u64 | Bytes received from backend |
+| `connection_error` | String or null | Error message if the connection failed |
+| `error_class` | String or null | Error classification; omitted from JSON when null |
+| `timestamp_connected` | String (RFC 3339) | Connection start time |
+| `timestamp_disconnected` | String (RFC 3339) | Connection end time |
+| `metadata` | Object | Plugin-injected key-value pairs; omitted from JSON when empty |
+
+#### Example: HTTP/1.1 or HTTP/2 (Buffered Response)
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:01.123Z",
+  "client_ip": "10.0.1.50",
+  "consumer_username": "api-service-a",
+  "http_method": "POST",
+  "request_path": "/api/v1/users",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440001",
+  "matched_proxy_name": "users-api",
+  "backend_target_url": "10.0.2.10:8080/api/v1/users",
+  "backend_resolved_ip": "10.0.2.10",
+  "response_status_code": 201,
+  "latency_total_ms": 12.45,
+  "latency_gateway_processing_ms": 2.10,
+  "latency_backend_ttfb_ms": 9.80,
+  "latency_backend_total_ms": 10.35,
+  "latency_plugin_execution_ms": 1.22,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 0.88,
+  "request_user_agent": "python-requests/2.31.0",
+  "metadata": {"x-correlation-id": "abc-123-def"}
+}
+```
+
+#### Example: HTTP/1.1 or HTTP/2 (Streaming Response)
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:03.456Z",
+  "client_ip": "10.0.1.51",
+  "consumer_username": null,
+  "http_method": "GET",
+  "request_path": "/api/v1/events",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440002",
+  "matched_proxy_name": "sse-events",
+  "backend_target_url": "10.0.2.15:8080/api/v1/events",
+  "backend_resolved_ip": "10.0.2.15",
+  "response_status_code": 200,
+  "latency_total_ms": 4.80,
+  "latency_gateway_processing_ms": 1.70,
+  "latency_backend_ttfb_ms": 2.90,
+  "latency_backend_total_ms": -1.0,
+  "latency_plugin_execution_ms": 0.55,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 1.15,
+  "request_user_agent": "curl/8.5.0",
+  "response_streamed": true,
+  "metadata": {}
+}
+```
+
+`latency_backend_total_ms` is `-1.0` because the body is still streaming when the log is emitted. Use `latency_backend_ttfb_ms` for alerting on streaming responses.
+
+#### Example: HTTP/3 (QUIC)
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:05.789Z",
+  "client_ip": "10.0.1.55",
+  "consumer_username": "mobile-app",
+  "http_method": "GET",
+  "request_path": "/api/v2/feed",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440003",
+  "matched_proxy_name": "feed-api",
+  "backend_target_url": "10.0.2.20:8080/api/v2/feed",
+  "backend_resolved_ip": "10.0.2.20",
+  "response_status_code": 200,
+  "latency_total_ms": 5.30,
+  "latency_gateway_processing_ms": 1.80,
+  "latency_backend_ttfb_ms": 3.10,
+  "latency_backend_total_ms": 3.50,
+  "latency_plugin_execution_ms": 0.95,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 0.85,
+  "request_user_agent": "CFNetwork/1568.200.51",
+  "metadata": {"x-correlation-id": "h3-789-xyz"}
+}
+```
+
+HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend accepts QUIC; the backend is reached via reqwest (HTTP/2 over TCP).
+
+#### Example: gRPC
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:10.456Z",
+  "client_ip": "10.0.1.60",
+  "consumer_username": "grpc-client",
+  "http_method": "POST",
+  "request_path": "/myapp.UserService/GetUser",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440004",
+  "matched_proxy_name": "grpc-users",
+  "backend_target_url": "10.0.2.30:50051/myapp.UserService/GetUser",
+  "backend_resolved_ip": "10.0.2.30",
+  "response_status_code": 200,
+  "latency_total_ms": 8.12,
+  "latency_gateway_processing_ms": 1.50,
+  "latency_backend_ttfb_ms": 6.20,
+  "latency_backend_total_ms": 6.62,
+  "latency_plugin_execution_ms": 0.80,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 0.70,
+  "request_user_agent": "grpc-go/1.62.0",
+  "metadata": {
+    "x-correlation-id": "grpc-456",
+    "grpc_service": "myapp.UserService",
+    "grpc_method": "GetUser"
+  }
+}
+```
+
+gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trailers. The `response_status_code` in the log reflects the HTTP status (200), not the gRPC status code. When the gateway cannot reach the gRPC backend, `error_class` is populated and `response_status_code` is 502 or 503.
+
+#### Example: WebSocket (Upgrade Handshake)
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:15.100Z",
+  "client_ip": "10.0.1.70",
+  "consumer_username": "ws-user",
+  "http_method": "GET",
+  "request_path": "/ws/chat",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440005",
+  "matched_proxy_name": "ws-chat",
+  "backend_target_url": "10.0.2.40:8080/ws/chat",
+  "backend_resolved_ip": "10.0.2.40",
+  "response_status_code": 101,
+  "latency_total_ms": 3.20,
+  "latency_gateway_processing_ms": 1.00,
+  "latency_backend_ttfb_ms": 0.0,
+  "latency_backend_total_ms": 0.0,
+  "latency_plugin_execution_ms": 0.60,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 0.40,
+  "request_user_agent": "Mozilla/5.0",
+  "metadata": {"x-correlation-id": "ws-101-abc"}
+}
+```
+
+WebSocket transaction logging captures the HTTP upgrade handshake only. After the 101 response, the connection is upgraded and no further `TransactionSummary` is emitted. For frame-level observability, use the `ws_frame_logging` plugin.
+
+#### Example: WebSocket (Upgrade Failed)
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:16.200Z",
+  "client_ip": "10.0.1.71",
+  "consumer_username": null,
+  "http_method": "GET",
+  "request_path": "/ws/chat",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440005",
+  "matched_proxy_name": "ws-chat",
+  "backend_target_url": "10.0.2.40:8080/ws/chat",
+  "response_status_code": 502,
+  "latency_total_ms": 5012.30,
+  "latency_gateway_processing_ms": 5012.30,
+  "latency_backend_ttfb_ms": -1.0,
+  "latency_backend_total_ms": -1.0,
+  "latency_plugin_execution_ms": 0.45,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 5011.85,
+  "request_user_agent": "Mozilla/5.0",
+  "error_class": "ConnectionFailed",
+  "metadata": {"rejection_phase": "websocket_backend_error"}
+}
+```
+
+#### Example: Rejected Request (Auth Failure)
+
+```json
+{
+  "timestamp_received": "2026-03-31T14:22:20.000Z",
+  "client_ip": "10.0.1.99",
+  "consumer_username": null,
+  "http_method": "GET",
+  "request_path": "/api/v1/secrets",
+  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440001",
+  "matched_proxy_name": "users-api",
+  "backend_target_url": null,
+  "response_status_code": 401,
+  "latency_total_ms": 0.15,
+  "latency_gateway_processing_ms": 0.15,
+  "latency_backend_ttfb_ms": -1.0,
+  "latency_backend_total_ms": -1.0,
+  "latency_plugin_execution_ms": 0.12,
+  "latency_plugin_external_io_ms": 0.0,
+  "latency_gateway_overhead_ms": 0.03,
+  "request_user_agent": "curl/8.5.0",
+  "metadata": {"rejection_phase": "authenticate"}
+}
+```
+
+Rejected requests have `backend_target_url: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`.
+
+#### Example: TCP Stream
+
+```json
+{
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440006",
+  "proxy_name": "tcp-database",
+  "client_ip": "10.0.1.80",
+  "backend_target": "db-primary.internal:5432",
+  "backend_resolved_ip": "10.0.2.50",
+  "protocol": "tcp",
+  "listen_port": 5432,
+  "duration_ms": 45230.5,
+  "bytes_sent": 102400,
+  "bytes_received": 2048576,
+  "connection_error": null,
+  "timestamp_connected": "2026-03-31T14:22:25.000+00:00",
+  "timestamp_disconnected": "2026-03-31T14:23:10.230+00:00"
+}
+```
+
+#### Example: TCP Stream (TLS, Connection Failed)
+
+```json
+{
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440006",
+  "proxy_name": "tcp-database",
+  "client_ip": "10.0.1.80",
+  "backend_target": "db-primary.internal:5432",
+  "protocol": "tcp_tls",
+  "listen_port": 5432,
+  "duration_ms": 5002.0,
+  "bytes_sent": 0,
+  "bytes_received": 0,
+  "connection_error": "DNS resolution failed for db-primary.internal: NXDOMAIN",
+  "error_class": "ConnectionTimeout",
+  "timestamp_connected": "2026-03-31T14:24:00.000+00:00",
+  "timestamp_disconnected": "2026-03-31T14:24:05.002+00:00"
+}
+```
+
+On connection failure, `backend_target` still shows the attempted target. `backend_resolved_ip` is absent when DNS failed. The `connection_error` message describes the failure.
+
+#### Example: UDP Session
+
+```json
+{
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440007",
+  "proxy_name": "udp-dns",
+  "client_ip": "10.0.1.90",
+  "backend_target": "dns-backend.internal:5353",
+  "backend_resolved_ip": "10.0.2.60",
+  "protocol": "udp",
+  "listen_port": 5353,
+  "duration_ms": 30000.0,
+  "bytes_sent": 512,
+  "bytes_received": 4096,
+  "connection_error": null,
+  "timestamp_connected": "2026-03-31T14:22:30.000+00:00",
+  "timestamp_disconnected": "2026-03-31T14:23:00.000+00:00"
+}
+```
+
+UDP sessions are logged when the session is cleaned up after idle timeout.
+
+#### Example: DTLS Session
+
+```json
+{
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440008",
+  "proxy_name": "dtls-iot",
+  "client_ip": "10.0.1.100",
+  "backend_target": "iot-backend.internal:5684",
+  "backend_resolved_ip": "10.0.2.70",
+  "protocol": "dtls",
+  "listen_port": 5684,
+  "duration_ms": 120500.0,
+  "bytes_sent": 8192,
+  "bytes_received": 16384,
+  "connection_error": null,
+  "timestamp_connected": "2026-03-31T14:20:00.000+00:00",
+  "timestamp_disconnected": "2026-03-31T14:22:00.500+00:00"
+}
+```
+
 ### `transaction_debugger`
 
 Logs verbose request/response details to stdout. Sensitive headers are automatically redacted. Enable per-proxy only for debugging.
