@@ -216,7 +216,7 @@ TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts ar
 **Admin API** (database/CP modes only):
 - Port uniqueness via DB query (`check_listen_port_unique()`)
 - Gateway reserved port conflict check (skipped in CP mode — proxies run on remote DPs)
-- OS-level port availability probe via `check_port_available()` — tries TCP+UDP bind then drops (skipped in CP mode)
+- OS-level port availability probe via `check_port_available()` — probes only the matching transport (TCP or UDP) then drops (skipped in CP mode)
 
 **Startup reconcile** (`initial_reconcile_stream_listeners()`):
 - Pre-binds each port before spawning the listener task; bind failures are collected

@@ -384,6 +384,15 @@ impl ProxyState {
     pub fn update_config(&self, new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
+        // Validate stream proxy port conflicts before applying any config.
+        let reserved_ports = self.env_config.reserved_gateway_ports();
+        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+            for msg in &errors {
+                error!("Config reload rejected: {}", msg);
+            }
+            return false;
+        }
+
         let old_config = self.config.load_full();
 
         // If this is the initial load (old config empty, new config has data),

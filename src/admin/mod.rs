@@ -790,8 +790,15 @@ async fn handle_create_proxy(
                         )}),
                     ));
                 }
-                // Check OS-level port availability (best-effort TOCTOU check)
-                if let Err(e) = check_port_available(port, &state.stream_proxy_bind_address).await {
+                // Check OS-level port availability (best-effort TOCTOU check).
+                // Only probe the transport the proxy will actually bind.
+                if let Err(e) = check_port_available(
+                    port,
+                    &state.stream_proxy_bind_address,
+                    proxy.backend_protocol.is_udp(),
+                )
+                .await
+                {
                     return Ok(json_response(
                         StatusCode::CONFLICT,
                         &json!({"error": format!(
@@ -1113,8 +1120,12 @@ async fn handle_update_proxy(
                     _ => None,
                 };
                 if old_port != Some(port)
-                    && let Err(e) =
-                        check_port_available(port, &state.stream_proxy_bind_address).await
+                    && let Err(e) = check_port_available(
+                        port,
+                        &state.stream_proxy_bind_address,
+                        proxy.backend_protocol.is_udp(),
+                    )
+                    .await
                 {
                     return Ok(json_response(
                         StatusCode::CONFLICT,
@@ -3447,25 +3458,29 @@ fn hash_basic_auth_password(password: &str) -> Result<String, String> {
 
 /// Best-effort OS-level port availability check.
 ///
-/// Attempts to bind a TCP and UDP socket on the given port and immediately drops
-/// them. This catches ports already bound by other processes or the OS. There is
-/// an inherent TOCTOU race (the port could be taken between the check and the
-/// actual listener bind), but this catches the vast majority of real conflicts
-/// and provides a clear error at the admin API level rather than a silent startup
-/// failure.
-async fn check_port_available(port: u16, bind_address: &str) -> Result<(), String> {
+/// Probes only the transport that the stream proxy will actually bind (TCP or
+/// UDP), matching the runtime behavior in `stream_listener.rs`. This avoids
+/// false positives where an unrelated service on a different transport occupies
+/// the same numeric port.
+///
+/// There is an inherent TOCTOU race (the port could be taken between the check
+/// and the actual listener bind), but this catches the vast majority of real
+/// conflicts and provides a clear error at the admin API level rather than a
+/// silent startup failure.
+async fn check_port_available(port: u16, bind_address: &str, udp: bool) -> Result<(), String> {
     let ip: std::net::IpAddr = bind_address
         .parse()
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     let addr = std::net::SocketAddr::new(ip, port);
 
-    // Check TCP
-    if let Err(e) = tokio::net::TcpListener::bind(addr).await {
-        return Err(format!("TCP bind failed: {}", e));
-    }
-    // Check UDP
-    if let Err(e) = tokio::net::UdpSocket::bind(addr).await {
-        return Err(format!("UDP bind failed: {}", e));
+    if udp {
+        if let Err(e) = tokio::net::UdpSocket::bind(addr).await {
+            return Err(format!("UDP bind failed: {}", e));
+        }
+    } else {
+        if let Err(e) = tokio::net::TcpListener::bind(addr).await {
+            return Err(format!("TCP bind failed: {}", e));
+        }
     }
     Ok(())
 }
