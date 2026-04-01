@@ -47,6 +47,8 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 4. Parse environment configuration (`EnvConfig::from_env()`)
 /// 5. Build the multi-threaded tokio runtime with configured worker/blocking threads
 /// 6. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
+///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
+///    per-proxy backend TLS paths before starting listeners
 /// 7. Wait for SIGINT/SIGTERM for graceful shutdown
 fn main() {
     // Initialize rustls crypto provider

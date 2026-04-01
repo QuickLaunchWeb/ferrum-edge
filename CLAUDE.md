@@ -91,6 +91,15 @@ All four jobs must pass for a PR to merge.
 7. **Mode dispatch** — Runs the selected operating mode (database/file/cp/dp/migrate)
 8. **Signal handling** — SIGINT/SIGTERM trigger graceful shutdown via `watch::channel`
 
+Within each mode (database/file/dp), after config is loaded:
+
+9. **TLS policy** — `TlsPolicy::from_env_config()` builds the cipher suite, protocol version, and key exchange group constraints from `FERRUM_TLS_*` env vars
+10. **Frontend TLS** — Loads `FERRUM_FRONTEND_TLS_CERT_PATH` / `FERRUM_FRONTEND_TLS_KEY_PATH` into a rustls `ServerConfig` for HTTPS, gRPC, and WebSocket listeners. Optionally loads `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` for frontend mTLS. The gateway hard-fails if configured paths are invalid (no silent fallback to plaintext).
+11. **Admin TLS** — Loads `FERRUM_ADMIN_TLS_CERT_PATH` / `FERRUM_ADMIN_TLS_KEY_PATH` for the admin API HTTPS listener (same validation rules as frontend TLS)
+12. **DTLS certs** — Loads `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` for UDP proxy frontend DTLS termination (ECDSA P-256 / Ed25519)
+13. **Backend TLS** — Per-proxy `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` are validated at config load time (startup and each reload). Invalid paths reject the config — no silent degradation.
+14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
+
 ### External Secret Resolution
 
 The gateway resolves secrets from external providers at startup, before any config is loaded. Env vars with provider-specific suffixes are resolved and the base env var is set:
