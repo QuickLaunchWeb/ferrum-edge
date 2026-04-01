@@ -123,6 +123,17 @@ pub async fn run(
         }
     };
 
+    // Validate stream proxy ports don't conflict with gateway reserved ports
+    let reserved_ports = env_config.reserved_gateway_ports();
+    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        return Err(anyhow::anyhow!(
+            "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+
     // DNS cache
     let dns_cache = DnsCache::new(DnsConfig {
         default_ttl_seconds: env_config.dns_cache_ttl_seconds,
@@ -245,14 +256,25 @@ pub async fn run(
             );
     }
 
+    // Start stream proxy listeners (TCP/UDP) and fail startup if any port is unavailable.
+    // This initial reconcile is awaited (not fire-and-forget) so bind errors are fatal.
+    proxy_state.initial_reconcile_stream_listeners().await?;
+
     // Re-reconcile to start any deferred frontend_tls / frontend DTLS listeners
     if tls_config.is_some()
         || (env_config.dtls_cert_path.is_some() && env_config.dtls_key_path.is_some())
     {
-        let slm = proxy_state.stream_listener_manager.clone();
-        tokio::spawn(async move {
-            slm.reconcile().await;
-        });
+        let failures = proxy_state.stream_listener_manager.reconcile().await;
+        if !failures.is_empty() {
+            let mut msg = String::from("TLS stream listener(s) failed to bind:\n");
+            for (proxy_id, port, err) in &failures {
+                msg.push_str(&format!(
+                    "  - proxy '{}' port {}: {}\n",
+                    proxy_id, port, err
+                ));
+            }
+            return Err(anyhow::anyhow!("{}", msg.trim_end()));
+        }
     }
 
     // Start separate listeners for HTTP and HTTPS
@@ -343,6 +365,8 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        reserved_ports: reserved_ports.clone(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -374,6 +398,8 @@ pub async fn run(
             read_only: env_config.admin_read_only,
             db_available: Some(db_available.clone()),
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+            reserved_ports: reserved_ports.clone(),
+            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 

@@ -194,14 +194,34 @@ pub async fn run(
             );
     }
 
+    // Start stream proxy listeners (TCP/UDP). In DP mode this is non-fatal:
+    // the DP doesn't control its own config (it comes from CP), so a port
+    // conflict shouldn't prevent the DP from starting. The DP will continue
+    // serving HTTP traffic and any working stream proxies. When the CP pushes
+    // corrected config, the DP will retry the failed listeners.
+    let failures = proxy_state.stream_listener_manager.reconcile().await;
+    for (proxy_id, port, err) in &failures {
+        error!(
+            proxy_id = %proxy_id,
+            port = port,
+            "Stream listener failed to bind at startup (non-fatal in DP mode): {}",
+            err
+        );
+    }
+
     // Re-reconcile to start any deferred frontend_tls / frontend DTLS listeners
     if tls_config.is_some()
         || (env_config.dtls_cert_path.is_some() && env_config.dtls_key_path.is_some())
     {
-        let slm = proxy_state.stream_listener_manager.clone();
-        tokio::spawn(async move {
-            slm.reconcile().await;
-        });
+        let failures = proxy_state.stream_listener_manager.reconcile().await;
+        for (proxy_id, port, err) in &failures {
+            error!(
+                proxy_id = %proxy_id,
+                port = port,
+                "TLS stream listener failed to bind at startup (non-fatal in DP mode): {}",
+                err
+            );
+        }
     }
 
     // Start separate listeners for HTTP and HTTPS
@@ -277,6 +297,7 @@ pub async fn run(
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
     let jwt_manager = create_jwt_manager_from_env()
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
+    let reserved_ports = env_config.reserved_gateway_ports();
     let admin_state = AdminState {
         db: None, // DP has no direct DB access
         jwt_manager,
@@ -286,6 +307,8 @@ pub async fn run(
         read_only: true, // DP admin API is always read-only
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        reserved_ports: reserved_ports.clone(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -317,6 +340,8 @@ pub async fn run(
             read_only: true,
             db_available: None,
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+            reserved_ports: reserved_ports.clone(),
+            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 

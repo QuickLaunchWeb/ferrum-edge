@@ -56,6 +56,17 @@ pub async fn run(
         config.consumers.len()
     );
 
+    // Validate stream proxy ports don't conflict with gateway reserved ports
+    let reserved_ports = env_config.reserved_gateway_ports();
+    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        return Err(anyhow::anyhow!(
+            "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+
     let dns_cache = DnsCache::new(DnsConfig {
         default_ttl_seconds: env_config.dns_cache_ttl_seconds,
         global_overrides: env_config.dns_overrides.clone(),
@@ -178,14 +189,24 @@ pub async fn run(
             );
     }
 
+    // Start stream proxy listeners (TCP/UDP) and fail startup if any port is unavailable.
+    proxy_state.initial_reconcile_stream_listeners().await?;
+
     // Re-reconcile to start any deferred frontend_tls / frontend DTLS listeners
     if tls_config.is_some()
         || (env_config.dtls_cert_path.is_some() && env_config.dtls_key_path.is_some())
     {
-        let slm = proxy_state.stream_listener_manager.clone();
-        tokio::spawn(async move {
-            slm.reconcile().await;
-        });
+        let failures = proxy_state.stream_listener_manager.reconcile().await;
+        if !failures.is_empty() {
+            let mut msg = String::from("TLS stream listener(s) failed to bind:\n");
+            for (proxy_id, port, err) in &failures {
+                msg.push_str(&format!(
+                    "  - proxy '{}' port {}: {}\n",
+                    proxy_id, port, err
+                ));
+            }
+            return Err(anyhow::anyhow!("{}", msg.trim_end()));
+        }
     }
 
     // Log size limits if non-default
@@ -276,6 +297,8 @@ pub async fn run(
         read_only: true,
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        reserved_ports,
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
     };
 
     let mut handles = Vec::new();

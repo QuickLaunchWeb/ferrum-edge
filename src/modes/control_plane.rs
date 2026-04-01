@@ -114,6 +114,7 @@ pub async fn run(
     // the cached config until the DB recovers.
     let db_available = Arc::new(AtomicBool::new(true));
 
+    let reserved_ports = env_config.reserved_gateway_ports();
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -123,6 +124,8 @@ pub async fn run(
         read_only: env_config.admin_read_only,
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        reserved_ports: reserved_ports.clone(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -153,6 +156,8 @@ pub async fn run(
             read_only: env_config.admin_read_only,
             db_available: Some(db_available.clone()),
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+            reserved_ports: reserved_ports.clone(),
+            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
