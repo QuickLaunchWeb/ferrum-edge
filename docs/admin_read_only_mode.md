@@ -4,7 +4,7 @@ The Ferrum Edge Admin API supports a configurable read-only mode that provides a
 
 ## Overview
 
-The Admin Read-Only Mode allows you to restrict write operations (POST, PUT, DELETE) on the Admin API while still allowing read operations (GET) for monitoring and health checks. This feature is particularly useful in production environments where you want to prevent accidental configuration changes.
+The Admin Read-Only Mode allows you to restrict write operations (POST, PUT, DELETE) on the Admin API while still allowing read operations (GET) for monitoring and health checks. This feature is particularly useful in production environments where you want to prevent accidental configuration changes. Some operating modes are always read-only by design.
 
 ## Behavior
 
@@ -47,7 +47,7 @@ With HTTP status code `403 Forbidden`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode (DP mode defaults to `true`) |
+| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode in modes that support writable admin operations |
 
 ### Mode-Specific Behavior
 
@@ -61,10 +61,15 @@ With HTTP status code `403 Forbidden`.
 - **Reasoning**: Data plane nodes should not modify configuration
 - **Security**: Ensures configuration changes only happen through the control plane
 
-#### Database/File Modes
-- **Respect** the `FERRUM_ADMIN_READ_ONLY` environment variable
+#### Database Mode
+- **Respects** the `FERRUM_ADMIN_READ_ONLY` environment variable
 - **Default**: Read-write (unless explicitly set to read-only)
 - **Use Case**: Single-node deployments where you may want to restrict changes
+
+#### File Mode
+- **Always** read-only regardless of environment variable
+- **Reasoning**: File mode has no writable admin datastore; configuration is loaded from a local YAML/JSON file
+- **Operational Note**: Use file edits plus `SIGHUP` on Unix, or a process restart on Windows, to change configuration
 
 ## Use Cases
 
@@ -134,7 +139,7 @@ The Admin API validates proxy configurations on create (`POST /proxies`) and upd
 | `backend_host` | Must be non-empty | `"backend_host must not be empty"` |
 | `backend_port` | Must be greater than 0 | `"backend_port must be greater than 0"` |
 
-These validations apply in all operating modes (database, file, CP) and are enforced regardless of read-only mode.
+These validations apply in modes where write operations are supported (database and CP) and are enforced regardless of read-only mode.
 
 ## Implementation Details
 
@@ -144,7 +149,7 @@ The read-only mode is implemented through:
 1. **Configuration Layer**: `FERRUM_ADMIN_READ_ONLY` environment variable parsed into `EnvConfig`
 2. **State Management**: `read_only` field added to `AdminState` struct
 3. **Handler Protection**: All write handlers check `state.read_only` before processing
-4. **Mode Integration**: DP mode always sets `read_only: true`, CP mode uses environment variable
+4. **Mode Integration**: DP and file modes always set `read_only: true`; database and CP modes use the environment variable
 
 ### Security Considerations
 - **JWT Authentication**: Required for all Admin API access
@@ -163,7 +168,7 @@ The feature includes comprehensive tests:
 ## Migration Guide
 
 ### Existing Deployments
-No changes required for existing deployments. The feature defaults to read-write mode for all modes except Data Plane.
+No changes required for existing deployments. The feature defaults to read-write mode for database and Control Plane deployments. Data Plane and file mode are always read-only.
 
 ### Enabling Read-Only
 1. Set `FERRUM_ADMIN_READ_ONLY=true` in your environment
@@ -185,7 +190,7 @@ No changes required for existing deployments. The feature defaults to read-write
 
 ### Read Operations Blocked
 - Verify JWT authentication is working
-- Check if you're using a Data Plane deployment (always read-only)
+- Check if you're using a Data Plane or file-mode deployment (always read-only)
 - Review logs for authentication errors
 
 ### Unexpected 403 Errors
@@ -197,7 +202,7 @@ No changes required for existing deployments. The feature defaults to read-write
 
 1. **Production**: Always enable read-only mode in production environments
 2. **Development**: Keep read-write mode for development and testing
-3. **Data Plane**: Rely on the automatic read-only behavior, don't set the variable
-4. **Control Plane**: Use environment variables, not code changes, to control read-only mode
+3. **Data Plane and File Mode**: Rely on the automatic read-only behavior, don't expect the variable to make them writable
+4. **Control Plane / Database Mode**: Use environment variables, not code changes, to control read-only mode
 5. **Monitoring**: Set up monitoring to alert on write attempts in read-only mode
 6. **Documentation**: Document your read-only mode configuration in runbooks

@@ -253,6 +253,7 @@ async fn handle_h3_request(
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
+    ctx.headers.reserve(req.headers().keys_len());
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -274,8 +275,9 @@ async fn handle_h3_request(
         }
         total_header_size += header_size;
         if let Ok(v) = value.to_str() {
-            ctx.headers
-                .insert(name.as_str().to_lowercase(), v.to_string());
+            // h3 normalizes header names to lowercase already, so avoid the
+            // extra allocation from to_lowercase() on every request header.
+            ctx.headers.insert(name.as_str().to_owned(), v.to_owned());
         }
     }
     if total_header_size > state.max_header_size_bytes {
@@ -289,53 +291,57 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Resolve real client IP using trusted proxy configuration
+    // Resolve real client IP using trusted proxy configuration.
     if !state.trusted_proxies.is_empty() {
+        let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
+            let header_val = ctx.headers.get(real_ip_header.as_str());
             if let Some(val) = header_val {
-                let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
                 if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
                     val.trim().to_string()
                 } else {
-                    crate::proxy::client_ip::resolve_client_ip(
-                        &socket_ip,
-                        ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
-                        &state.trusted_proxies,
-                    )
+                    socket_ip.to_string()
                 }
-            } else {
-                crate::proxy::client_ip::resolve_client_ip(
+            } else if let Some(ref addr) = socket_addr {
+                crate::proxy::client_ip::resolve_client_ip_parsed(
                     &socket_ip,
+                    addr,
                     ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
                     &state.trusted_proxies,
                 )
+            } else {
+                socket_ip.to_string()
             }
-        } else {
-            crate::proxy::client_ip::resolve_client_ip(
+        } else if let Some(ref addr) = socket_addr {
+            crate::proxy::client_ip::resolve_client_ip_parsed(
                 &socket_ip,
+                addr,
                 ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
                 &state.trusted_proxies,
             )
+        } else {
+            socket_ip.to_string()
         };
         ctx.client_ip = resolved;
     }
 
-    // Parse query params
-    for pair in query_string.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            ctx.query_params.insert(k.to_string(), v.to_string());
+    // Parse query params (skip when empty — most requests have no query string)
+    if !query_string.is_empty() {
+        for pair in query_string.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                ctx.query_params.insert(k.to_string(), v.to_string());
+            }
         }
     }
 
     // Extract request host for host-based routing.
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
     // Also check the host header as a fallback. Strip port and lowercase.
-    let request_host: Option<String> = req
-        .uri()
-        .authority()
-        .map(|a| a.as_str())
-        .or_else(|| ctx.headers.get("host").map(|h| h.as_str()))
+    let request_host: Option<String> = ctx
+        .headers
+        .get("host")
+        .map(|h| h.as_str())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .map(|h| {
             let without_port = h.split(':').next().unwrap_or(h);
             without_port.to_lowercase()
@@ -396,28 +402,31 @@ async fn handle_h3_request(
     let mut plugin_execution_ns: u64 = 0;
 
     // Execute on_request_received hooks
-    let phase_start = std::time::Instant::now();
-    for plugin in plugins.iter() {
-        match plugin.on_request_received(&mut ctx).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => {
-                record_request(&state, status_code);
-                send_h3_reject_response(
-                    &mut stream,
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &body,
-                    &headers,
-                )
-                .await?;
-                return Ok(());
+    if !plugins.is_empty() {
+        let phase_start = std::time::Instant::now();
+        for plugin in plugins.iter() {
+            match plugin.on_request_received(&mut ctx).await {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
+                    record_request(&state, status_code);
+                    send_h3_reject_response(
+                        &mut stream,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        &headers,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                PluginResult::Continue => {}
             }
-            PluginResult::Continue => {}
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
-    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
     // Authentication phase
     let auth_plugins: Vec<&Arc<dyn Plugin>> =
@@ -490,7 +499,7 @@ async fn handle_h3_request(
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
     // Authorization phase
-    {
+    if !plugins.is_empty() {
         let phase_start = std::time::Instant::now();
         for plugin in plugins.iter() {
             if plugin.name() == "access_control" {
@@ -517,12 +526,15 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // before_proxy hooks
-    let mut proxy_headers = ctx.headers.clone();
-    {
+    // before_proxy hooks — only clone headers when a plugin mutates them.
+    let needs_header_clone =
+        !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
+    let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
+    if needs_header_clone {
         let phase_start = std::time::Instant::now();
+        let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
-            match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
+            match plugin.before_proxy(&mut ctx, &mut cloned).await {
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -543,8 +555,35 @@ async fn handle_h3_request(
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        owned_proxy_headers = Some(cloned);
+    } else if !plugins.is_empty() {
+        let phase_start = std::time::Instant::now();
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
+        for plugin in plugins.iter() {
+            match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
+                    record_request(&state, status_code);
+                    ctx.headers = tmp_headers;
+                    send_h3_reject_response(
+                        &mut stream,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        &headers,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                PluginResult::Continue => {}
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.headers = tmp_headers;
     }
-
     // Enforce request body size limit via Content-Length fast path
     if state.max_request_body_size_bytes > 0
         && let Some(content_length) = ctx.headers.get("content-length")
@@ -621,25 +660,39 @@ async fn handle_h3_request(
         body_data
     };
 
+    let mut passthrough_headers = if owned_proxy_headers.is_none() {
+        Some(std::mem::take(&mut ctx.headers))
+    } else {
+        None
+    };
+
     if !needs_response_buffering {
         // ===== STREAMING RESPONSE PATH =====
         // Stream response body chunks from backend directly to the H3 client
         // without collecting them in memory. This is the fast path.
         let client_ip_owned = ctx.client_ip.clone();
-        let streaming_result = proxy_to_backend_h3_streaming(
-            &state,
-            &proxy,
-            &backend_url,
-            &method,
-            &proxy_headers,
-            body_data,
-            &client_ip_owned,
-            &mut stream,
-            &plugins,
-            &mut ctx,
-            &mut plugin_execution_ns,
-        )
-        .await;
+        let streaming_result = {
+            let proxy_headers = owned_proxy_headers
+                .as_ref()
+                .unwrap_or(passthrough_headers.as_ref().unwrap());
+            proxy_to_backend_h3_streaming(
+                &state,
+                &proxy,
+                &backend_url,
+                &method,
+                proxy_headers,
+                body_data,
+                &client_ip_owned,
+                &mut stream,
+                &plugins,
+                &mut ctx,
+                &mut plugin_execution_ns,
+            )
+            .await
+        };
+        if let Some(headers) = passthrough_headers.take() {
+            ctx.headers = headers;
+        }
 
         let (response_status, _response_headers, h3_error_class) = match streaming_result {
             Ok(result) => result,
@@ -710,17 +763,24 @@ async fn handle_h3_request(
     } else {
         // ===== BUFFERED RESPONSE PATH =====
         // Collect full response for plugin body inspection/transformation and retries.
-        let (mut response_status, response_body, mut response_headers, h3_error_class) =
+        let (mut response_status, response_body, mut response_headers, h3_error_class) = {
+            let proxy_headers = owned_proxy_headers
+                .as_ref()
+                .unwrap_or(passthrough_headers.as_ref().unwrap());
             proxy_to_backend_h3(
                 &state,
                 &proxy,
                 &backend_url,
                 &method,
-                &proxy_headers,
+                proxy_headers,
                 body_data,
                 &ctx.client_ip,
             )
-            .await;
+            .await
+        };
+        if let Some(headers) = passthrough_headers.take() {
+            ctx.headers = headers;
+        }
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;

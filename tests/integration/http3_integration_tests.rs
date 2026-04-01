@@ -209,6 +209,9 @@ fn create_http3_test_env_config() -> EnvConfig {
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
+        server_http2_max_pending_accept_reset_streams: 64,
+        server_http2_max_local_error_reset_streams: 256,
+        websocket_max_connections: 20_000,
     }
 }
 
@@ -420,6 +423,7 @@ async fn test_http3_proxy_state_creation() {
         max_response_body_size_bytes: 10_485_760,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
+        websocket_conn_limit: None,
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
     };
@@ -590,6 +594,7 @@ async fn test_http3_full_integration() {
         max_response_body_size_bytes: 10_485_760,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
+        websocket_conn_limit: None,
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
     };

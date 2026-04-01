@@ -52,14 +52,15 @@ A single gateway instance reads configuration from a database, handles proxy tra
 
 ### File Mode (`FERRUM_MODE=file`)
 
-A gateway instance reads its entire configuration from a local YAML or JSON file. No Admin API is exposed.
+A gateway instance reads its entire configuration from a local YAML or JSON file and exposes a read-only Admin API for health checks and monitoring.
 
 **Use case**: Development, testing, or immutable infrastructure deployments (e.g., Kubernetes ConfigMaps).
 
 - Reads config from `FERRUM_FILE_CONFIG_PATH`
 - Reloads on `SIGHUP` signal
 - Failed reloads keep the previous valid configuration
-- Only proxy traffic listeners are active
+- Proxy traffic listeners are active
+- Admin API is read-only; `/health`, `/status`, and monitoring endpoints remain available
 
 ### Control Plane Mode (`FERRUM_MODE=cp`)
 
@@ -74,7 +75,7 @@ Acts as the centralized configuration authority. Reads from the database, serves
 
 ### Data Plane Mode (`FERRUM_MODE=dp`)
 
-Handles proxy traffic only, receiving its configuration from a Control Plane node. No database access or Admin API.
+Handles proxy traffic only, receiving its configuration from a Control Plane node. No database access; exposes a read-only Admin API for monitoring.
 
 **Use case**: Horizontally scalable traffic processing nodes in a distributed deployment.
 
@@ -100,13 +101,14 @@ Ferrum Edge supports a configurable read-only mode for the Admin API, providing 
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode (DP mode defaults to `true`) |
+| `FERRUM_ADMIN_READ_ONLY` | `false` | Set Admin API to read-only mode in database/CP modes (DP and file modes are always read-only) |
 
 ### Mode-Specific Behavior
 
 - **Control Plane (CP)**: Respects the `FERRUM_ADMIN_READ_ONLY` environment variable
 - **Data Plane (DP)**: **Always** read-only regardless of environment variable
-- **Database/File Modes**: Respect the `FERRUM_ADMIN_READ_ONLY` environment variable
+- **Database Mode**: Respects the `FERRUM_ADMIN_READ_ONLY` environment variable
+- **File Mode**: **Always** read-only because configuration is loaded from a local file rather than a writable admin datastore
 
 ### Use Cases
 
@@ -178,6 +180,8 @@ docker run -d \
 
 See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
 
+See [Local Run Guide](docs/local_run.md) for Windows, macOS, and Linux setup details, and [Kubernetes Deployment Guide](docs/kubernetes_deployment.md) for cluster deployment, Services, port exposure, and probe examples.
+
 ## Getting Started
 
 ### File Mode (quickest start)
@@ -229,6 +233,7 @@ cargo run --release
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
 FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
+FERRUM_ADMIN_JWT_SECRET="admin-secret" \
 cargo run --release
 ```
 
@@ -327,8 +332,8 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
-| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth |
-| `FERRUM_ADMIN_READ_ONLY` | All modes | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
+| `FERRUM_ADMIN_JWT_SECRET` | No | — | HS256 secret for authenticated Admin API access. Set this in any mode where you want admin endpoints beyond `/health` and `/status` |
+| `FERRUM_ADMIN_READ_ONLY` | All modes | `false` | Set Admin API to read-only mode in database/CP modes (DP and file modes are always read-only) |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` (supports ~30K proxies + 90K plugins at default) |
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
@@ -991,6 +996,8 @@ curl http://localhost:9000/status
 ```
 
 Both `/health` and `/status` return the same response and do not require JWT authentication, making them suitable for load balancer health probes and monitoring systems.
+
+The endpoint returns HTTP `200` when the admin listener is healthy. If you need readiness to fail on degraded dependency states, inspect the JSON `status` field instead of relying on the HTTP status code alone.
 
 ## Plugin System
 

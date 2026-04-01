@@ -172,6 +172,9 @@ fn create_test_env_config_with_mtls(
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
+        server_http2_max_pending_accept_reset_streams: 64,
+        server_http2_max_local_error_reset_streams: 256,
+        websocket_max_connections: 20_000,
     }
 }
 
