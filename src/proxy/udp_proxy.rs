@@ -582,7 +582,7 @@ async fn start_dtls_frontend_listener(
     // Spawn the server's recv loop in a background task
     let server_runner = server.clone();
     let runner_proxy_id = proxy_id.clone();
-    tokio::spawn(async move {
+    let server_task = tokio::spawn(async move {
         if let Err(e) = server_runner.run().await {
             warn!(proxy_id = %runner_proxy_id, "DTLS server recv loop error: {}", e);
         }
@@ -721,6 +721,7 @@ async fn start_dtls_frontend_listener(
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {}", port);
                 server.close().await;
+                let _ = server_task.await;
                 return Ok(());
             }
         }
@@ -973,8 +974,10 @@ async fn handle_dtls_client_inner(
     // Bidirectional forwarding: client (DTLS) ↔ backend (UDP or DTLS)
     // Clone a sender for the backend→client direction before moving client_conn.
     let client_sender = client_conn.clone_sender();
+    let client_close = client_sender.clone();
     let backend_dtls_write = backend_dtls.clone();
     let backend_udp_write = backend_udp.clone();
+    let backend_dtls_cleanup = backend_dtls.clone();
     let metrics_fwd = metrics.clone();
     let proxy_id_fwd = proxy_id.to_string();
 
@@ -1067,6 +1070,11 @@ async fn handle_dtls_client_inner(
     tokio::select! {
         _ = client_to_backend => {}
         _ = backend_to_client => {}
+    }
+
+    client_close.close().await;
+    if let Some(ref dtls) = backend_dtls_cleanup {
+        dtls.close().await;
     }
 
     Ok(())

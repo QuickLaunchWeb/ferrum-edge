@@ -709,8 +709,8 @@ async fn connect_dtls_client_with_retry(
             config: std::sync::Arc::new(dimpl::Config::default()),
             certificate: dimpl::certificate::generate_self_signed_certificate()
                 .expect("generate ephemeral cert"),
-            trusted_cas: Vec::new(),
-            skip_verify: true,
+            server_name: None,
+            server_cert_verifier: None,
         };
 
         match tokio::time::timeout(
@@ -760,8 +760,7 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
         let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
             dimpl_config: std::sync::Arc::new(dimpl::Config::default()),
             certificate: cert,
-            require_client_cert: false,
-            client_ca_certs: Vec::new(),
+            client_cert_verifier: None,
         };
 
         let server = ferrum_edge::dtls::DtlsServer::bind(addr, frontend_config)

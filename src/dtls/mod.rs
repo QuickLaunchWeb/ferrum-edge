@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use dimpl::{Config, Dtls, DtlsCertificate, Output};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, trace, warn};
 
 use crate::config::types::Proxy;
@@ -40,9 +40,7 @@ const MAX_OUTPUTS_PER_DRAIN: usize = 64;
 pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
     pub certificate: DtlsCertificate,
-    pub require_client_cert: bool,
-    /// DER-encoded trusted CA certificates for client cert validation.
-    pub client_ca_certs: Vec<Vec<u8>>,
+    pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 }
 
 /// Build a DTLS client config for backend connections (gateway → backend).
@@ -54,7 +52,7 @@ pub struct FrontendDtlsConfig {
 /// Returns `(config, certificate, trusted_ca_certs, skip_verify)`.
 pub fn build_backend_dtls_config(
     proxy: &Proxy,
-    _backend_host: &str,
+    backend_host: &str,
     tls_no_verify: bool,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
     let skip_verify = !proxy.backend_tls_verify_server_cert || tls_no_verify;
@@ -69,13 +67,23 @@ pub fn build_backend_dtls_config(
         generate_ephemeral_cert()?
     };
 
-    // Load root CAs for server cert verification
-    let mut trusted_cas = Vec::new();
-    if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
-        trusted_cas = load_der_certs_from_pem(ca_path)?;
-    }
-
     let config = Arc::new(Config::default());
+    let (server_name, server_cert_verifier) = if skip_verify {
+        (None, None)
+    } else {
+        let root_store = load_backend_root_store(proxy)?;
+        let server_name = rustls::pki_types::ServerName::try_from(backend_host.to_string())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid DTLS backend host for certificate verification: {}",
+                    backend_host
+                )
+            })?;
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build DTLS server verifier: {}", e))?;
+        (Some(server_name), Some(verifier as _))
+    };
 
     debug!(
         proxy_id = %proxy.id,
@@ -86,8 +94,8 @@ pub fn build_backend_dtls_config(
     Ok(BackendDtlsParams {
         config,
         certificate,
-        trusted_cas,
-        skip_verify,
+        server_name,
+        server_cert_verifier,
     })
 }
 
@@ -95,8 +103,8 @@ pub fn build_backend_dtls_config(
 pub struct BackendDtlsParams {
     pub config: Arc<Config>,
     pub certificate: DtlsCertificate,
-    pub trusted_cas: Vec<Vec<u8>>,
-    pub skip_verify: bool,
+    pub server_name: Option<rustls::pki_types::ServerName<'static>>,
+    pub server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
 }
 
 /// Build a DTLS server config for frontend termination (client → gateway).
@@ -109,27 +117,21 @@ pub fn build_frontend_dtls_config(
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
-    let (require_client_cert, client_ca_certs) = if let Some(ca_path) = client_ca_cert_path {
-        let certs = load_der_certs_from_pem(ca_path)?;
-        if certs.is_empty() {
-            return Err(anyhow::anyhow!(
-                "No valid certificates found in DTLS client CA file: {}",
-                ca_path
-            ));
-        }
+    let (require_client_cert, client_cert_verifier) = if let Some(ca_path) = client_ca_cert_path {
+        let root_store = load_root_store_from_pem(ca_path)?;
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
         debug!(
             ca_path = %ca_path,
             "Frontend DTLS mTLS enabled: requiring and verifying client certificates"
         );
-        (true, certs)
+        (true, Some(verifier))
     } else {
-        (false, Vec::new())
+        (false, None)
     };
 
-    let mut config_builder = Config::builder();
-    if require_client_cert {
-        config_builder = config_builder.require_client_certificate(true);
-    }
+    let config_builder = Config::builder().require_client_certificate(require_client_cert);
     let config = Arc::new(
         config_builder
             .build()
@@ -139,8 +141,7 @@ pub fn build_frontend_dtls_config(
     Ok(FrontendDtlsConfig {
         dimpl_config: config,
         certificate,
-        require_client_cert,
-        client_ca_certs,
+        client_cert_verifier,
     })
 }
 
@@ -159,7 +160,7 @@ pub struct DtlsConnection {
     /// Receive decrypted application data from the DTLS engine.
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Signal the driver task to shut down.
-    _shutdown_tx: mpsc::Sender<()>,
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 impl DtlsConnection {
@@ -170,8 +171,8 @@ impl DtlsConnection {
         params: BackendDtlsParams,
     ) -> Result<Self, anyhow::Error> {
         let socket = Arc::new(socket);
-        let skip_verify = params.skip_verify;
-        let trusted_cas = params.trusted_cas;
+        let server_name = params.server_name;
+        let server_cert_verifier = params.server_cert_verifier;
         let mut dtls = Dtls::new_auto(params.config, params.certificate, Instant::now());
         dtls.set_active(true); // client role
 
@@ -187,8 +188,8 @@ impl DtlsConnection {
             &socket,
             None,
             &mut next_timeout,
-            skip_verify,
-            &trusted_cas,
+            server_name.as_ref(),
+            server_cert_verifier.as_deref(),
         )
         .await?;
 
@@ -229,8 +230,8 @@ impl DtlsConnection {
                 &socket,
                 None,
                 &mut next_timeout,
-                skip_verify,
-                &trusted_cas,
+                server_name.as_ref(),
+                server_cert_verifier.as_deref(),
             )
             .await?;
 
@@ -323,7 +324,7 @@ impl DtlsConnection {
         Self {
             app_tx,
             app_rx: tokio::sync::Mutex::new(app_rx),
-            _shutdown_tx: shutdown_tx,
+            shutdown_tx,
         }
     }
 
@@ -345,8 +346,7 @@ impl DtlsConnection {
 
     /// Gracefully shut down the DTLS connection.
     pub async fn close(&self) {
-        // Dropping _shutdown_tx signals the driver to stop
-        // (it will exit when the channel closes)
+        let _ = self.shutdown_tx.try_send(());
     }
 }
 
@@ -367,14 +367,16 @@ pub struct DtlsServer {
     /// Channel to deliver accepted (post-handshake) connections.
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<(DtlsServerConn, SocketAddr)>>,
-    require_client_cert: bool,
-    client_ca_certs: Arc<Vec<Vec<u8>>>,
+    client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 /// State for a server-side DTLS session being managed by the DtlsServer.
 struct DtlsSessionState {
     /// Send incoming UDP data to this session's driver task.
     incoming_tx: mpsc::Sender<Vec<u8>>,
+    /// Signal this session's driver task to shut down.
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 /// A server-side DTLS connection for a single accepted client.
@@ -387,12 +389,16 @@ pub struct DtlsServerConn {
     app_tx: mpsc::Sender<Vec<u8>>,
     /// Receive decrypted application data.
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Signal this connection's driver task to shut down.
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 /// A cloneable sender half of a `DtlsServerConn`, used to send data back to
 /// the DTLS client from a separate task (e.g., backend→client forwarding).
+#[derive(Clone)]
 pub struct DtlsServerSender {
     app_tx: mpsc::Sender<Vec<u8>>,
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 impl DtlsServerSender {
@@ -402,6 +408,11 @@ impl DtlsServerSender {
             .send(data.to_vec())
             .await
             .map_err(|_| anyhow::anyhow!("DTLS server connection closed"))
+    }
+
+    /// Close this client's DTLS connection.
+    pub async fn close(&self) {
+        let _ = self.shutdown_tx.try_send(());
     }
 }
 
@@ -428,12 +439,13 @@ impl DtlsServerConn {
     pub fn clone_sender(&self) -> DtlsServerSender {
         DtlsServerSender {
             app_tx: self.app_tx.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
         }
     }
 
     /// Close this client's DTLS connection.
     pub async fn close(&self) {
-        // Dropping app_tx causes the driver to see channel closed and exit
+        let _ = self.shutdown_tx.try_send(());
     }
 }
 
@@ -450,6 +462,7 @@ impl DtlsServer {
         );
 
         let (accept_tx, accept_rx) = mpsc::channel(256);
+        let (shutdown_tx, _) = watch::channel(false);
 
         Ok(Self {
             socket,
@@ -458,8 +471,8 @@ impl DtlsServer {
             sessions: Arc::new(DashMap::new()),
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
-            require_client_cert: frontend_config.require_client_cert,
-            client_ca_certs: Arc::new(frontend_config.client_ca_certs),
+            client_cert_verifier: frontend_config.client_cert_verifier,
+            shutdown_tx,
         })
     }
 
@@ -476,9 +489,16 @@ impl DtlsServer {
     /// Returns the connection handle and the client's socket address.
     pub async fn accept(&self) -> Result<(DtlsServerConn, SocketAddr), anyhow::Error> {
         let mut rx = self.accept_rx.lock().await;
-        rx.recv()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("DTLS server shut down"))
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        if *shutdown_rx.borrow() {
+            return Err(anyhow::anyhow!("DTLS server shut down"));
+        }
+        tokio::select! {
+            result = rx.recv() => {
+                result.ok_or_else(|| anyhow::anyhow!("DTLS server shut down"))
+            }
+            _ = shutdown_rx.changed() => Err(anyhow::anyhow!("DTLS server shut down")),
+        }
     }
 
     /// Run the DTLS server recv loop. Call this in a spawned task.
@@ -487,12 +507,22 @@ impl DtlsServer {
     /// DTLS state machines. New clients are delivered via `accept()`.
     pub async fn run(&self) -> Result<(), anyhow::Error> {
         let mut buf = vec![0u8; 65536];
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
         loop {
-            let (len, peer_addr) = self
-                .socket
-                .recv_from(&mut buf)
-                .await
-                .map_err(|e| anyhow::anyhow!("DTLS server recv error: {}", e))?;
+            let (len, peer_addr) = tokio::select! {
+                result = self.socket.recv_from(&mut buf) => {
+                    result.map_err(|e| anyhow::anyhow!("DTLS server recv error: {}", e))?
+                }
+                _ = shutdown_rx.changed() => {
+                    return Ok(());
+                }
+            };
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
 
             let data = buf[..len].to_vec();
 
@@ -516,11 +546,13 @@ impl DtlsServer {
         let (app_out_tx, app_out_rx) = mpsc::channel::<Vec<u8>>(256);
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
         self.sessions.insert(
             peer_addr,
             DtlsSessionState {
                 incoming_tx: incoming_tx.clone(),
+                shutdown_tx: shutdown_tx.clone(),
             },
         );
 
@@ -529,11 +561,10 @@ impl DtlsServer {
         let certificate = self.certificate.clone();
         let accept_tx = self.accept_tx.clone();
         let sessions = self.sessions.clone();
-        let require_client_cert = self.require_client_cert;
-        let client_ca_certs = self.client_ca_certs.clone();
+        let client_cert_verifier = self.client_cert_verifier.clone();
 
         tokio::spawn(async move {
-            let mut dtls = Dtls::new_12(config, certificate, Instant::now());
+            let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
             // Initialize server state (random, etc.) — required before handle_packet.
             // Drain the resulting Timeout outputs so they don't interfere with the
@@ -609,6 +640,9 @@ impl DtlsServer {
                             next_timeout = None;
                         }
                     }
+                    _ = shutdown_rx.recv() => {
+                        break;
+                    }
                 }
 
                 // Drain all pending outputs. After Connected, skip one Timeout
@@ -638,6 +672,7 @@ impl DtlsServer {
                             let conn = DtlsServerConn {
                                 app_tx: app_in_tx.clone(),
                                 app_rx: tokio::sync::Mutex::new(rx),
+                                shutdown_tx: shutdown_tx.clone(),
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
                                 // Server shut down
@@ -646,8 +681,8 @@ impl DtlsServer {
                             }
                         }
                         Output::PeerCert(der) => {
-                            if require_client_cert
-                                && let Err(e) = validate_peer_cert(der, &client_ca_certs)
+                            if let Some(verifier) = client_cert_verifier.as_deref()
+                                && let Err(e) = validate_client_cert(der, verifier)
                             {
                                 warn!(client = %peer_addr, "Client cert validation failed: {}", e);
                                 sessions.remove(&peer_addr);
@@ -673,7 +708,41 @@ impl DtlsServer {
 
     /// Shut down the server (close underlying socket).
     pub async fn close(&self) {
-        // Dropping the DtlsServer will clean up — sessions will see channel closures
+        self.shutdown_tx.send_replace(true);
+        let session_shutdowns: Vec<mpsc::Sender<()>> = self
+            .sessions
+            .iter()
+            .map(|entry| entry.shutdown_tx.clone())
+            .collect();
+        for shutdown_tx in session_shutdowns {
+            let _ = shutdown_tx.try_send(());
+        }
+
+        if let Ok(local_addr) = self.socket.local_addr() {
+            let wake_addr = if local_addr.ip().is_unspecified() {
+                if local_addr.is_ipv6() {
+                    SocketAddr::new(
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                        local_addr.port(),
+                    )
+                } else {
+                    SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        local_addr.port(),
+                    )
+                }
+            } else {
+                local_addr
+            };
+            let bind_addr = if wake_addr.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            if let Ok(waker) = UdpSocket::bind(bind_addr).await {
+                let _ = waker.send_to(&[0], wake_addr).await;
+            }
+        }
     }
 }
 
@@ -710,15 +779,33 @@ fn load_dtls_certificate(
     })
 }
 
-/// Load DER-encoded certificates from a PEM file (for CA trust stores).
-fn load_der_certs_from_pem(pem_path: &str) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+/// Load a rustls root store from a PEM file.
+fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
     let pem_data = std::fs::read(pem_path)
         .map_err(|e| anyhow::anyhow!("Failed to read PEM file {}: {}", pem_path, e))?;
-    let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut &pem_data[..])
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
         .filter_map(|r| r.ok())
-        .map(|c| c.to_vec())
         .collect();
-    Ok(certs)
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, ignored) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        return Err(anyhow::anyhow!(
+            "No valid certificates found in DTLS CA file {} (ignored: {})",
+            pem_path,
+            ignored
+        ));
+    }
+    Ok(roots)
+}
+
+fn load_backend_root_store(proxy: &Proxy) -> Result<rustls::RootCertStore, anyhow::Error> {
+    if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
+        load_root_store_from_pem(ca_path)
+    } else {
+        Ok(rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ))
+    }
 }
 
 /// Generate an ephemeral self-signed certificate for DTLS clients that don't
@@ -738,43 +825,39 @@ pub fn generate_self_signed_cert() -> Result<DtlsCertificate, anyhow::Error> {
 // Certificate Validation
 // ============================================================================
 
-/// Validate a peer's DER-encoded leaf certificate against trusted CA certs.
+/// Validate a backend server's DER-encoded leaf certificate.
 ///
-/// This is a basic fingerprint-based validation: the peer cert must match one
-/// of the trusted CA certificates. For production mTLS, you may want full
-/// chain validation using webpki.
-fn validate_peer_cert(peer_der: &[u8], trusted_cas: &[Vec<u8>]) -> Result<(), anyhow::Error> {
-    if trusted_cas.is_empty() {
-        // No trusted CAs configured — accept any cert (skip_verify mode)
-        return Ok(());
-    }
+/// `dimpl` surfaces only the peer leaf certificate, not the peer's full
+/// certificate chain. Verification therefore runs fail-closed against the leaf,
+/// the configured trust anchors, and the expected server name.
+fn validate_server_cert(
+    peer_der: &[u8],
+    server_name: &rustls::pki_types::ServerName<'static>,
+    verifier: &dyn rustls::client::danger::ServerCertVerifier,
+) -> Result<(), anyhow::Error> {
+    let cert = rustls::pki_types::CertificateDer::from(peer_der.to_vec());
+    verifier
+        .verify_server_cert(
+            &cert,
+            &[],
+            server_name,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("DTLS server certificate verification failed: {}", e))
+}
 
-    // Check if the peer cert matches any trusted CA cert directly
-    // (self-signed or direct trust model)
-    for ca in trusted_cas {
-        if peer_der == ca.as_slice() {
-            return Ok(());
-        }
-    }
-
-    // Issuer-based validation using x509-parser: check if the peer cert's issuer
-    // matches any trusted CA's subject. The cryptographic signature verification
-    // happens at the DTLS handshake layer (dimpl validates the cert chain internally
-    // when a CryptoProvider is configured).
-    let (_, peer_cert) = x509_parser::parse_x509_certificate(peer_der)
-        .map_err(|e| anyhow::anyhow!("Failed to parse peer certificate: {}", e))?;
-
-    for ca_der in trusted_cas {
-        if let Ok((_, ca_cert)) = x509_parser::parse_x509_certificate(ca_der)
-            && peer_cert.issuer() == ca_cert.subject()
-        {
-            return Ok(());
-        }
-    }
-
-    Err(anyhow::anyhow!(
-        "Peer certificate not signed by any trusted CA"
-    ))
+/// Validate a frontend client certificate when DTLS mTLS is enabled.
+fn validate_client_cert(
+    peer_der: &[u8],
+    verifier: &dyn rustls::server::danger::ClientCertVerifier,
+) -> Result<(), anyhow::Error> {
+    let cert = rustls::pki_types::CertificateDer::from(peer_der.to_vec());
+    verifier
+        .verify_client_cert(&cert, &[], rustls::pki_types::UnixTime::now())
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("DTLS client certificate verification failed: {}", e))
 }
 
 // ============================================================================
@@ -797,8 +880,8 @@ async fn drain_handshake_outputs(
     socket: &UdpSocket,
     peer: Option<SocketAddr>,
     next_timeout: &mut Option<Instant>,
-    skip_verify: bool,
-    trusted_cas: &[Vec<u8>],
+    server_name: Option<&rustls::pki_types::ServerName<'static>>,
+    server_cert_verifier: Option<&dyn rustls::client::danger::ServerCertVerifier>,
 ) -> Result<bool, anyhow::Error> {
     let mut connected = false;
     let mut saw_timeout_after_connected = false;
@@ -831,8 +914,8 @@ async fn drain_handshake_outputs(
                 connected = true;
             }
             Output::PeerCert(der) => {
-                if !skip_verify {
-                    validate_peer_cert(der, trusted_cas)?;
+                if let (Some(server_name), Some(verifier)) = (server_name, server_cert_verifier) {
+                    validate_server_cert(der, server_name, verifier)?;
                 }
             }
             Output::ApplicationData(_) => {
