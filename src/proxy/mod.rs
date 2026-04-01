@@ -996,6 +996,7 @@ async fn handle_websocket_request_authenticated(
     upstream_target: Option<UpstreamTarget>,
     lb_hash_key: String,
     sticky_cookie_needed: bool,
+    start_time: Instant,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -1047,8 +1048,16 @@ async fn handle_websocket_request_authenticated(
                     websocket_limit = state.env_config.websocket_max_connections,
                     "Rejecting WebSocket upgrade: connection limit reached"
                 );
-                state.request_count.fetch_add(1, Ordering::Relaxed);
-                record_status(&state, 503);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    503,
+                    start_time,
+                    "websocket_connection_limit",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, 503);
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -2678,6 +2687,7 @@ pub async fn handle_proxy_request(
             upstream_target,
             lb_hash_key.0,
             sticky_cookie_needed,
+            start_time,
         )
         .await;
     }
