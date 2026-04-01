@@ -11,15 +11,21 @@ service ConfigSync {
 
 message SubscribeRequest {
   string node_id = 1;
+  // Ferrum Edge binary version of the DP (e.g. "0.9.0")
+  string ferrum_version = 2;
 }
 
 message FullConfigRequest {
   string node_id = 1;
+  // Ferrum Edge binary version of the DP (e.g. "0.9.0")
+  string ferrum_version = 2;
 }
 
 message FullConfigResponse {
   string config_json = 1;
   string version = 2;
+  // Ferrum Edge binary version of the CP (e.g. "0.9.0")
+  string ferrum_version = 3;
 }
 
 message ConfigUpdate {
@@ -31,4 +37,6 @@ message ConfigUpdate {
   string config_json = 2;
   string version = 3;
   int64 timestamp = 4;
+  // Ferrum Edge binary version of the CP (e.g. "0.9.0")
+  string ferrum_version = 5;
 }

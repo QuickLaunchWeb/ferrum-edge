@@ -1,3 +1,19 @@
+//! TLS/mTLS configuration for all gateway surfaces (frontend, backend, admin, gRPC).
+//!
+//! **CA trust chain resolution** (all 8 backend protocol paths follow this):
+//! 1. Proxy-specific CA (`backend_tls_server_ca_cert_path`) → sole trust anchor
+//! 2. Global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor
+//! 3. Neither set → webpki/system roots (secure default)
+//! 4. Explicit opt-out → `backend_tls_verify_server_cert: false` skips verification
+//!
+//! **CA exclusivity**: When a custom CA is configured, it is the **sole** trust
+//! anchor — webpki/system roots are NOT added. This prevents internal backends
+//! from being MITMed via any public CA.
+//!
+//! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
+//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! both inbound listeners and outbound backend connections.
+
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
@@ -14,6 +30,7 @@ pub struct TlsPolicy {
     pub protocol_versions: Vec<&'static rustls::SupportedProtocolVersion>,
     pub crypto_provider: Arc<CryptoProvider>,
     pub prefer_server_cipher_order: bool,
+    pub session_cache_size: usize,
 }
 
 impl TlsPolicy {
@@ -95,6 +112,7 @@ impl TlsPolicy {
             protocol_versions: versions,
             crypto_provider: Arc::new(provider),
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
+            session_cache_size: env_config.tls_session_cache_size,
         })
     }
 }
@@ -287,7 +305,51 @@ pub fn load_tls_config_with_client_auth(
     // Advertise HTTP/2 and HTTP/1.1 via ALPN so clients can negotiate HTTP/2 over TLS
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
+    // Enable TLS session resumption for reduced handshake latency on reconnections.
+    // Stateless tickets (TLS 1.3): server encrypts session state into the ticket,
+    // no server-side storage needed. Tickets rotate keys every 6 hours automatically.
+    // Stateful cache (TLS 1.2 fallback): configurable LRU for session ID resumption.
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            config.ticketer = ticketer;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create TLS session ticket rotator, resumption will use stateful cache only: {}",
+                e
+            );
+        }
+    }
+    config.session_storage =
+        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+
     Ok(Arc::new(config))
+}
+
+/// Build a rustls `ClientConfig` builder for backend/outbound connections
+/// using the TLS policy's cipher suites, key exchange groups, and protocol versions.
+///
+/// This ensures outbound connections enforce the same TLS settings (cipher suites,
+/// min/max protocol versions, key exchange groups) as inbound listeners.
+///
+/// Falls back to `ClientConfig::builder()` (using the installed global default
+/// `CryptoProvider`) when no `TlsPolicy` is available — e.g., in unit tests.
+pub fn backend_client_config_builder(
+    tls_policy: Option<&TlsPolicy>,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, anyhow::Error> {
+    match tls_policy {
+        Some(policy) => rustls::ClientConfig::builder_with_provider(policy.crypto_provider.clone())
+            .with_protocol_versions(&policy.protocol_versions)
+            .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions for backend: {}", e)),
+        None => {
+            // Use the ring default provider explicitly so this works even when
+            // no global CryptoProvider is installed (e.g., in unit tests).
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| anyhow::anyhow!("Failed to set default TLS protocol versions: {}", e))
+        }
+    }
 }
 
 /// A certificate verifier that accepts any server certificate.

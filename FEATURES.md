@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 28 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, log)
+- 33 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, on WebSocket frame, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -72,20 +72,28 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Access Control** — IP/CIDR and consumer-based allow/deny lists
 - **IP Restriction** — standalone IP/CIDR filtering
-- **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure
+- **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema and XML validation
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
+- **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
+- **gRPC Deadline** — `grpc-timeout` enforcement, default injection, max capping, and gateway processing time subtraction
 
 ### AI / LLM Plugins
 
 - **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability
 - **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
-- **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses
+- **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses; supports centralized Redis-backed mode for cross-instance token budget coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
+
+### WebSocket Plugins
+
+- **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation
+- **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess; supports centralized Redis-backed mode for cross-instance frame rate coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
+- **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
 
 ### Transform Plugins
 
@@ -115,7 +123,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **SO_REUSEPORT** for kernel-level connection distribution across CPU cores
 - Configurable TCP listen backlog (default 2048) for burst absorption
 - Connection limit semaphore (default 100k) with graceful queuing under overload
-- Server-side HTTP/2 `max_concurrent_streams` (default 250) to bound per-connection resource usage
+- Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage
 - Configurable tokio worker and blocking thread counts with auto-detection
 
 ## TLS & Security
@@ -124,7 +132,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Frontend mTLS with client certificate verification
 - Backend mTLS with per-proxy certificate configuration
 - CP/DP gRPC channel TLS and mTLS (one-way TLS or mutual certificate verification)
-- DTLS frontend termination and backend origination (ECDSA P-256 / Ed25519)
+- DTLS 1.2/1.3 frontend termination and backend origination (ECDSA P-256/P-384)
 - Configurable cipher suites, key exchange groups, and protocol versions
 - Database TLS/SSL with PostgreSQL and MySQL support
 
@@ -328,7 +336,6 @@ The following are known limitations tracked for future improvement:
 | Gap | Protocol | Reason | Workaround |
 |-----|----------|--------|------------|
 | No HTTP/2 WebSocket (RFC 8441) | WebSocket | hyper's server does not implement the Extended CONNECT method (RFC 8441) for HTTP/2 WebSocket upgrades. Client-side support exists in hyper 1.x but server-side requires low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers and `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Axum added server-side support in 0.8.0 but Ferrum Edge uses hyper directly. | Clients must use HTTP/1.1 Upgrade or TLS-negotiated connections for WebSocket |
-| No DTLS 1.3 | UDP | DTLS 1.3 (RFC 9147, published April 2022) has no production-ready Rust implementation. The `webrtc-dtls` crate only supports DTLS 1.2 (RFC 6347). `rusty-dtls` exists but is early-stage (PSK-only handshakes). FFI to OpenSSL 3.2+ or WolfSSL would break the pure-Rust design. QUIC (already supported via quinn) provides TLS 1.3 over UDP but is not a transparent DTLS replacement. | Use TLS 1.3 over TCP, or use QUIC-based proxying for modern UDP security |
 
 ## Deployment
 

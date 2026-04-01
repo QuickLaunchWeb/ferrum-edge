@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
 use crate::dns::DnsCache;
@@ -34,10 +34,26 @@ struct CachedBackendTlsConfig {
 
 impl CachedBackendTlsConfig {
     /// Build a TLS client config from proxy settings, reading cert files once.
-    fn build(proxy: &Proxy, tls_no_verify: bool) -> Result<Self, anyhow::Error> {
-        // Build root certificate store
-        let mut root_store = rustls::RootCertStore::empty();
-        if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
+    /// Uses the TLS policy's cipher suites and protocol versions when available.
+    fn build(
+        proxy: &Proxy,
+        tls_no_verify: bool,
+        global_tls_ca_bundle_path: Option<&str>,
+        tls_policy: Option<&TlsPolicy>,
+    ) -> Result<Self, anyhow::Error> {
+        // Build root certificate store:
+        // - Custom CA configured → empty store + only that CA (no public roots)
+        // - No CA configured → webpki/system roots as default fallback
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .or(global_tls_ca_bundle_path);
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
+        if let Some(ca_path) = ca_path {
             let ca_data = std::fs::read(ca_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
             let certs = rustls_pemfile::certs(&mut &ca_data[..])
@@ -48,11 +64,10 @@ impl CachedBackendTlsConfig {
                     .add(cert)
                     .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
             }
-        } else {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
 
-        // Build TLS client config with optional client auth
+        // Build TLS client config with optional client auth, using TLS policy
+        let builder = crate::tls::backend_client_config_builder(tls_policy)?;
         let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
             &proxy.backend_tls_client_cert_path,
             &proxy.backend_tls_client_key_path,
@@ -65,16 +80,17 @@ impl CachedBackendTlsConfig {
             let key = rustls_pemfile::private_key(&mut &key_data[..])
                 .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
                 .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
-            rustls::ClientConfig::builder()
+            builder
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
         } else {
-            rustls::ClientConfig::builder()
+            builder
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
 
+        // Disable verification only if explicitly requested
         if !proxy.backend_tls_verify_server_cert || tls_no_verify {
             tls_config
                 .dangerous()
@@ -108,11 +124,15 @@ pub struct TcpListenerConfig {
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
+    /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
+    pub tls_ca_bundle_path: Option<String>,
     pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    pub tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -134,9 +154,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         shutdown,
         metrics,
         tls_no_verify,
+        tls_ca_bundle_path,
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         circuit_breaker_cache,
+        tls_policy,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -172,14 +194,16 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .find(|p| *p.id == *proxy_id)
             .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
             .map(|proxy| {
-                CachedBackendTlsConfig::build(proxy, tls_no_verify)
+                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_ca_bundle_path.as_deref(), tls_policy.as_deref())
                     .map(Arc::new)
                     .unwrap_or_else(|e| {
                         warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);
                         // Return a dummy config that will be rebuilt per-connection
+                        let dummy_builder = crate::tls::backend_client_config_builder(tls_policy.as_deref())
+                            .unwrap_or_else(|_| rustls::ClientConfig::builder());
                         Arc::new(CachedBackendTlsConfig {
                             config: Arc::new(
-                                rustls::ClientConfig::builder()
+                                dummy_builder
                                     .with_root_certificates(rustls::RootCertStore::empty())
                                     .with_no_client_auth()
                             ),
@@ -255,19 +279,19 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
                     let disconnected_at = chrono::Utc::now();
                     let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
-                    let (bytes_in, bytes_out, conn_error, error_class) = match &result {
-                        Ok((bi, bo, dur)) => {
-                            metrics.bytes_in.fetch_add(*bi, Ordering::Relaxed);
-                            metrics.bytes_out.fetch_add(*bo, Ordering::Relaxed);
+                    let (bytes_in, bytes_out, conn_error, error_class) = match &result.outcome {
+                        Ok(s) => {
+                            metrics.bytes_in.fetch_add(s.bytes_in, Ordering::Relaxed);
+                            metrics.bytes_out.fetch_add(s.bytes_out, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
                                 client = %remote_addr.ip(),
-                                bytes_in = bi,
-                                bytes_out = bo,
-                                duration_ms = dur.as_millis() as u64,
+                                bytes_in = s.bytes_in,
+                                bytes_out = s.bytes_out,
+                                duration_ms = s.duration.as_millis() as u64,
                                 "TCP connection completed"
                             );
-                            (*bi, *bo, None, None)
+                            (s.bytes_in, s.bytes_out, None, None)
                         }
                         Err(e) => {
                             debug!(
@@ -286,8 +310,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             proxy_id: proxy_id.to_string(),
                             proxy_name,
                             client_ip: remote_addr.ip().to_string(),
-                            backend_target: String::new(), // set by handle_tcp_connection internally
-                            backend_resolved_ip: None,
+                            backend_target: result.backend.backend_target,
+                            backend_resolved_ip: result.backend.backend_resolved_ip,
                             protocol: backend_protocol.to_string(),
                             listen_port: port,
                             duration_ms,
@@ -338,7 +362,32 @@ struct TcpConnCbInfo {
     cb_target_key: Option<String>,
 }
 
+/// Backend target info resolved during connection setup, available for logging
+/// regardless of whether the connection succeeded or failed.
+struct TcpBackendInfo {
+    /// The backend target hostname:port (e.g., "db-host:5432").
+    backend_target: String,
+    /// The DNS-resolved IP address, if resolution succeeded.
+    backend_resolved_ip: Option<String>,
+}
+
+/// Result of a TCP connection: backend info (always present) plus the outcome.
+struct TcpConnectionResult {
+    backend: TcpBackendInfo,
+    outcome: Result<TcpConnectionSuccess, anyhow::Error>,
+}
+
+struct TcpConnectionSuccess {
+    bytes_in: u64,
+    bytes_out: u64,
+    duration: Duration,
+}
+
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
+///
+/// Always returns a `TcpConnectionResult` containing backend target info (for logging)
+/// and the connection outcome. Backend info is populated as soon as the target is known,
+/// so even failed connections log which backend was attempted.
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     client_stream: TcpStream,
@@ -351,10 +400,57 @@ async fn handle_tcp_connection(
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
-) -> Result<(u64, u64, Duration), anyhow::Error> {
+) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
 
+    // Run the core connection logic, tracking backend info for logging.
+    // We use a helper closure so that `?` returns from the closure, not the
+    // outer function — allowing us to always populate backend info in the result.
+    let mut backend_info = TcpBackendInfo {
+        backend_target: String::new(),
+        backend_resolved_ip: None,
+    };
+
+    let outcome = handle_tcp_connection_inner(
+        client_stream,
+        remote_addr,
+        proxy_id,
+        config,
+        dns_cache,
+        lb_cache,
+        frontend_tls_config,
+        cached_backend_tls,
+        global_tcp_idle_timeout,
+        circuit_breaker_cache,
+        start,
+        &mut backend_info,
+    )
+    .await;
+
+    TcpConnectionResult {
+        backend: backend_info,
+        outcome,
+    }
+}
+
+/// Inner implementation of TCP connection handling that can use `?` for early returns
+/// while the caller always receives backend info for logging.
+#[allow(clippy::too_many_arguments)]
+async fn handle_tcp_connection_inner(
+    client_stream: TcpStream,
+    remote_addr: SocketAddr,
+    proxy_id: &str,
+    config: &arc_swap::ArcSwap<GatewayConfig>,
+    dns_cache: &DnsCache,
+    lb_cache: &LoadBalancerCache,
+    frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
+    cached_backend_tls: Option<&CachedBackendTlsConfig>,
+    global_tcp_idle_timeout: u64,
+    circuit_breaker_cache: &CircuitBreakerCache,
+    start: Instant,
+    backend_info: &mut TcpBackendInfo,
+) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // Look up the proxy config and extract only the fields we need.
     // The ArcSwap guard (and full Proxy) is dropped before any async work.
     let (params, cb_info) = {
@@ -366,6 +462,10 @@ async fn handle_tcp_connection(
             .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
         let (backend_host, backend_port) = resolve_backend_target(proxy, lb_cache)?;
+
+        // Populate backend target as soon as it's known — even if DNS or connect fails,
+        // the log will show which target was attempted.
+        backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
         let cb_target_key = proxy
             .upstream_id
@@ -456,6 +556,9 @@ async fn handle_tcp_connection(
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
                     };
+                    // Update backend info to reflect the retry target.
+                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
                     attempt += 1;
                     continue;
                 }
@@ -496,6 +599,9 @@ async fn handle_tcp_connection(
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
                     };
+                    // Update backend info to reflect the retry target.
+                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(anyhow::anyhow!(err_msg));
                     attempt += 1;
                     if let Some(ref retry_config) = params.retry {
@@ -507,6 +613,8 @@ async fn handle_tcp_connection(
             }
         };
         let addr = SocketAddr::new(resolved_ip, current_port);
+        // DNS succeeded — record the resolved IP for logging.
+        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
 
         // Attempt backend TCP connection (with optional TLS origination)
         let connect_result = if is_backend_tls {
@@ -547,6 +655,9 @@ async fn handle_tcp_connection(
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
                     };
+                    // Update backend info to reflect the retry target.
+                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
+                    backend_info.backend_resolved_ip = None;
                     last_connect_err = Some(e);
                     attempt += 1;
                     if let Some(ref retry_config) = params.retry {
@@ -601,7 +712,11 @@ async fn handle_tcp_connection(
         }
     }
 
-    copy_result.map(|(bytes_in, bytes_out)| (bytes_in, bytes_out, start.elapsed()))
+    copy_result.map(|(bytes_in, bytes_out)| TcpConnectionSuccess {
+        bytes_in,
+        bytes_out,
+        duration: start.elapsed(),
+    })
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.

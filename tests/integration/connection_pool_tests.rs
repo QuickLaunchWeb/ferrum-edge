@@ -63,8 +63,8 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,
         proxy_https_port: 8443,
-        proxy_tls_cert_path: None,
-        proxy_tls_key_path: None,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
         proxy_bind_address: "0.0.0.0".into(),
         admin_http_port: 9000,
         admin_https_port: 9443,
@@ -136,6 +136,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        tls_session_cache_size: 4096,
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
         stream_proxy_bind_address: "0.0.0.0".into(),
@@ -153,9 +154,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
-        server_http2_max_pending_accept_reset_streams: 64,
-        server_http2_max_local_error_reset_streams: 256,
-        websocket_max_connections: 20_000,
+        ..Default::default()
     }
 }
 
@@ -169,6 +168,7 @@ async fn test_connection_pool_creation() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -186,6 +186,7 @@ async fn test_pool_stats() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -203,6 +204,7 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy1 = create_test_proxy();
@@ -227,6 +229,7 @@ async fn test_different_protocols_produce_different_pool_keys() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy_http = create_test_proxy();
@@ -251,6 +254,7 @@ async fn test_same_proxy_reuses_cached_client() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -271,6 +275,7 @@ async fn test_dns_override_affects_pool_key() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy1 = create_test_proxy();
@@ -295,6 +300,7 @@ async fn test_pool_clear() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -311,6 +317,7 @@ async fn test_pool_with_proxy_config_overrides() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy = create_test_proxy();
@@ -331,6 +338,7 @@ async fn test_pool_websocket_protocol_creates_client() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy = create_test_proxy();
@@ -349,6 +357,7 @@ async fn test_upstream_id_pools_separately_from_backend_host() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     // Proxy with direct backend
@@ -374,6 +383,7 @@ async fn test_different_upstream_ids_pool_separately() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy1 = create_test_proxy();
@@ -400,6 +410,7 @@ async fn test_concurrent_pool_access() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     ));
 
     let mut handles = Vec::new();
@@ -429,6 +440,7 @@ async fn test_idle_timeout_does_not_fragment_pool() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     // Two proxies with same host/port/protocol but different idle timeouts

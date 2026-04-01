@@ -90,8 +90,8 @@ impl Default for PoolConfig {
             http2_keep_alive_timeout_seconds: 45, // More reasonable timeout comparable to HTTP read timeout
             http2_initial_stream_window_size: 8_388_608, // 8 MiB
             http2_initial_connection_window_size: 33_554_432, // 32 MiB
-            http2_adaptive_window: false,
-            http2_max_frame_size: 65_535,
+            http2_adaptive_window: true,
+            http2_max_frame_size: 1_048_576, // 1 MiB
             http2_max_concurrent_streams: Some(1000),
         }
     }

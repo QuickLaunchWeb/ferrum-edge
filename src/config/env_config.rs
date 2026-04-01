@@ -1,3 +1,14 @@
+//! Environment variable parsing for the gateway's 90+ configuration options.
+//!
+//! **Three-tier resolution** (highest precedence first):
+//! 1. Environment variable (`std::env::var`)
+//! 2. Conf file value (`ferrum.conf`, parsed by `ConfFile`)
+//! 3. Hardcoded default in this file
+//!
+//! The `resolve_var()` helper implements this precedence chain and logs an
+//! info message when a conf file value is overridden by an env var, helping
+//! operators debug "why isn't my conf file change taking effect?" issues.
+
 use super::conf_file::ConfFile;
 use std::collections::HashMap;
 use std::env;
@@ -71,8 +82,8 @@ pub struct EnvConfig {
     // Proxy traffic
     pub proxy_http_port: u16,
     pub proxy_https_port: u16,
-    pub proxy_tls_cert_path: Option<String>,
-    pub proxy_tls_key_path: Option<String>,
+    pub frontend_tls_cert_path: Option<String>,
+    pub frontend_tls_key_path: Option<String>,
     /// Bind address for proxy listeners (HTTP, HTTPS, HTTP/3).
     /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
     /// On most operating systems, binding to "::" accepts both IPv4 and IPv6
@@ -134,6 +145,27 @@ pub struct EnvConfig {
     /// the primary. Writes (Admin API CRUD) always go to the primary. Falls
     /// back to primary if the replica is unreachable.
     pub db_read_replica_url: Option<String>,
+
+    // Database connection pool tuning
+    /// Maximum number of connections in the database pool. Default: 10.
+    /// Increase for CP mode with many DPs or high admin API concurrency.
+    pub db_pool_max_connections: u32,
+    /// Minimum number of idle connections maintained in the pool. Default: 1.
+    /// Higher values reduce cold-start latency at the cost of holding open
+    /// connections. Set to 0 to allow the pool to shrink to zero idle.
+    pub db_pool_min_connections: u32,
+    /// Maximum time (seconds) to wait for a connection from the pool before
+    /// returning an error. Default: 30. Prevents unbounded waits when the
+    /// pool is exhausted under load.
+    pub db_pool_acquire_timeout_seconds: u64,
+    /// Maximum time (seconds) a connection can sit idle before being closed.
+    /// Default: 600 (10 minutes). Keeps the pool from holding stale connections.
+    pub db_pool_idle_timeout_seconds: u64,
+    /// Maximum lifetime (seconds) of a connection before it is closed and
+    /// replaced. Default: 300 (5 minutes). Forces DNS re-resolution and
+    /// prevents stale server-side state. Defence-in-depth alongside the
+    /// explicit DnsCache-based reconnect.
+    pub db_pool_max_lifetime_seconds: u64,
 
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
@@ -266,13 +298,17 @@ pub struct EnvConfig {
     pub tls_prefer_server_cipher_order: bool,
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
+    /// TLS session resumption cache size for TLS 1.2 stateful session IDs.
+    /// TLS 1.3 uses stateless tickets (unlimited) so this only affects TLS 1.2 clients.
+    /// (default: 4096)
+    pub tls_session_cache_size: usize,
 
     // Stream proxy (TCP/UDP)
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
     #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
 
-    // DTLS frontend certificates (ECDSA P-256 or Ed25519 required)
+    // DTLS frontend certificates (ECDSA P-256 or P-384 required)
     /// Path to DTLS server certificate (PEM) for frontend DTLS termination.
     /// If not set, a self-signed ECDSA P-256 certificate is generated at startup.
     pub dtls_cert_path: Option<String>,
@@ -329,15 +365,15 @@ pub struct EnvConfig {
     pub tcp_listen_backlog: u32,
     /// Server-side HTTP/2 max concurrent streams per inbound connection.
     /// Limits how many requests a single HTTP/2 client can multiplex.
-    /// Default: 250 (nginx=128, envoy=100, unlimited by spec).
+    /// Default: 1000 (nginx=128, envoy=100, unlimited by spec).
     pub server_http2_max_concurrent_streams: u32,
     /// Server-side HTTP/2 max pending accept-reset streams per connection.
     /// When exceeded, the server sends GOAWAY to mitigate rapid-reset abuse.
-    /// Default: 64 (h2 crate default is 20).
+    /// Default: 64.
     pub server_http2_max_pending_accept_reset_streams: usize,
     /// Server-side HTTP/2 max locally reset streams per connection.
     /// When exceeded, the server sends GOAWAY to bound repeated local reset churn.
-    /// Default: 256 (hyper default is 1024).
+    /// Default: 256.
     pub server_http2_max_local_error_reset_streams: usize,
     /// Maximum concurrently upgraded WebSocket connections.
     /// Default: 20_000. Set to 0 to disable the dedicated WebSocket cap and
@@ -353,8 +389,8 @@ impl Default for EnvConfig {
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
-            proxy_tls_cert_path: None,
-            proxy_tls_key_path: None,
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
@@ -378,6 +414,11 @@ impl Default for EnvConfig {
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
             db_read_replica_url: None,
+            db_pool_max_connections: 10,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_seconds: 30,
+            db_pool_idle_timeout_seconds: 600,
+            db_pool_max_lifetime_seconds: 300,
             cp_grpc_listen_addr: None,
             cp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
@@ -432,6 +473,7 @@ impl Default for EnvConfig {
             tls_cipher_suites: None,
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
+            tls_session_cache_size: 4096,
             trusted_proxies: String::new(),
             real_ip_header: None,
             plugin_http_slow_threshold_ms: 1000,
@@ -442,7 +484,7 @@ impl Default for EnvConfig {
             blocking_threads: None,
             max_connections: 100_000,
             tcp_listen_backlog: 2048,
-            server_http2_max_concurrent_streams: 250,
+            server_http2_max_concurrent_streams: 1000,
             server_http2_max_pending_accept_reset_streams: 64,
             server_http2_max_local_error_reset_streams: 256,
             websocket_max_connections: 20_000,
@@ -481,8 +523,8 @@ impl EnvConfig {
 
             proxy_http_port: resolve_u16(conf, "FERRUM_PROXY_HTTP_PORT", 8000),
             proxy_https_port: resolve_u16(conf, "FERRUM_PROXY_HTTPS_PORT", 8443),
-            proxy_tls_cert_path: resolve_var(conf, "FERRUM_PROXY_TLS_CERT_PATH"),
-            proxy_tls_key_path: resolve_var(conf, "FERRUM_PROXY_TLS_KEY_PATH"),
+            frontend_tls_cert_path: resolve_var(conf, "FERRUM_FRONTEND_TLS_CERT_PATH"),
+            frontend_tls_key_path: resolve_var(conf, "FERRUM_FRONTEND_TLS_KEY_PATH"),
             proxy_bind_address: resolve_var_or(conf, "FERRUM_PROXY_BIND_ADDRESS", "0.0.0.0"),
 
             admin_http_port: resolve_u16(conf, "FERRUM_ADMIN_HTTP_PORT", 9000),
@@ -517,6 +559,30 @@ impl EnvConfig {
                 })
                 .unwrap_or_default(),
             db_read_replica_url: resolve_var(conf, "FERRUM_DB_READ_REPLICA_URL"),
+
+            // Database connection pool tuning
+            db_pool_max_connections: resolve_var(conf, "FERRUM_DB_POOL_MAX_CONNECTIONS")
+                .and_then(|v| v.parse().ok())
+                .map(|v: u32| v.max(1))
+                .unwrap_or(10),
+            db_pool_min_connections: resolve_var(conf, "FERRUM_DB_POOL_MIN_CONNECTIONS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+            db_pool_acquire_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS",
+                30,
+            ),
+            db_pool_idle_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS",
+                600,
+            ),
+            db_pool_max_lifetime_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_MAX_LIFETIME_SECONDS",
+                300,
+            ),
 
             cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),
             cp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_GRPC_JWT_SECRET"),
@@ -651,6 +717,7 @@ impl EnvConfig {
             .map(|v| v == "true")
             .unwrap_or(true),
             tls_curves: resolve_var(conf, "FERRUM_TLS_CURVES"),
+            tls_session_cache_size: resolve_usize(conf, "FERRUM_TLS_SESSION_CACHE_SIZE", 4096),
 
             // Client IP resolution
             trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),
@@ -691,7 +758,7 @@ impl EnvConfig {
             )
             .and_then(|v| v.parse().ok())
             .map(|v: u32| v.max(1))
-            .unwrap_or(250),
+            .unwrap_or(1000),
             server_http2_max_pending_accept_reset_streams: resolve_var(
                 conf,
                 "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS",
@@ -1065,6 +1132,56 @@ impl EnvConfig {
                 "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
                 self.admin_bind_address
             ));
+        }
+
+        // Validate global backend TLS cert/key files exist and are parseable
+        match (
+            &self.backend_tls_client_cert_path,
+            &self.backend_tls_client_key_path,
+        ) {
+            (Some(_), None) => {
+                return Err(
+                    "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH is set but FERRUM_BACKEND_TLS_CLIENT_KEY_PATH is missing — both must be configured together".into(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH is set but FERRUM_BACKEND_TLS_CLIENT_CERT_PATH is missing — both must be configured together".into(),
+                );
+            }
+            _ => {}
+        }
+        if let Some(ref path) = self.backend_tls_client_cert_path {
+            crate::config::types::validate_pem_cert_file(
+                "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH",
+                path,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path {
+            crate::config::types::validate_pem_key_file("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH", path)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref path) = self.tls_ca_bundle_path {
+            crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Non-fatal security warnings
+        if self.tls_no_verify {
+            eprintln!(
+                "WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production."
+            );
+        }
+        if self.admin_tls_no_verify {
+            eprintln!(
+                "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
+            );
+        }
+        if self.dp_grpc_tls_no_verify {
+            eprintln!(
+                "WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production."
+            );
         }
 
         Ok(())

@@ -16,7 +16,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,7 +31,7 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -39,7 +39,7 @@ jobs:
           toolchain: stable
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.9
         continue-on-error: true
 
       - name: Configure sccache
@@ -95,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [fmt]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -104,7 +104,7 @@ jobs:
           components: clippy
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.9
         continue-on-error: true
 
       - name: Configure sccache
@@ -135,7 +135,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -143,7 +143,7 @@ jobs:
           toolchain: stable
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.9
         continue-on-error: true
 
       - name: Configure sccache
@@ -168,7 +168,7 @@ jobs:
 
       - name: Restore performance baseline cache
         id: perf-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: tests/performance/cached_baseline.json
           key: perf-baseline-${{ github.base_ref || 'main' }}-${{ hashFiles('src/**/*.rs', 'Cargo.lock') }}
@@ -283,7 +283,7 @@ jobs:
 
       - name: Save performance baseline cache
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: tests/performance/cached_baseline.json
           key: perf-baseline-main-${{ hashFiles('src/**/*.rs', 'Cargo.lock') }}
@@ -339,7 +339,7 @@ jobs:
   #           asset_name: ferrum-edge-macos-aarch64
   #
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #
   #     - name: Install Rust
   #       uses: dtolnay/rust-toolchain@stable
@@ -358,13 +358,13 @@ jobs:
   #       run: brew install protobuf
   #
   #     - name: Cache cargo registry
-  #       uses: actions/cache@v4
+  #       uses: actions/cache@v5
   #       with:
   #         path: ~/.cargo/registry
   #         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
   #
   #     - name: Cache cargo build
-  #       uses: actions/cache@v4
+  #       uses: actions/cache@v5
   #       with:
   #         path: target
   #         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -397,7 +397,7 @@ jobs:
   #   env:
   #     HAS_DOCKER_CREDS: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
   #
   #     - name: Set up Docker Buildx
   #       uses: docker/setup-buildx-action@v2

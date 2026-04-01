@@ -232,7 +232,7 @@ These settings control the gateway's ability to handle high connection concurren
 |----------|---------|-------------|
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Maximum concurrent proxy connections |
 | `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
-| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `250` | Max HTTP/2 streams per inbound connection |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max HTTP/2 streams per inbound connection |
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Max pending HTTP/2 reset streams before GOAWAY |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Max locally reset HTTP/2 streams before GOAWAY |
 | `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | `20000` | Max concurrently upgraded WebSocket connections (`0` = disabled) |
@@ -254,11 +254,11 @@ These settings control the gateway's ability to handle high connection concurren
 
 **`FERRUM_TCP_LISTEN_BACKLOG`** — The kernel queue size for connections waiting to be accepted. Under burst traffic, a small backlog causes the kernel to silently drop SYN packets. The default of 2048 handles most burst scenarios. On Linux, this is capped by `net.core.somaxconn` — ensure the sysctl value is at least as high as this setting.
 
-**`FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS`** — Limits how many requests a single HTTP/2 client connection can multiplex simultaneously. Without this, a single greedy or misbehaving client could open unlimited streams, consuming disproportionate resources. The default of 250 is generous (nginx uses 128, envoy uses 100). Lower it if you need tighter per-connection isolation; raise it for trusted internal clients that benefit from heavy multiplexing.
+**`FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS`** — Limits how many requests a single HTTP/2 client connection can multiplex simultaneously. Without this, a single greedy or misbehaving client could open unlimited streams, consuming disproportionate resources. The default of 1000 is tuned for high-throughput gRPC and HTTP/2 workloads where clients multiplex heavily (nginx uses 128, envoy uses 100). Lower it if you need tighter per-connection isolation; the default eliminates connection churn for most workloads.
 
-**`FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS`** — Bounds how many quickly reset inbound HTTP/2 streams are tolerated before Ferrum sends GOAWAY on that connection. This is the main built-in rapid-reset defense. The default of 64 is stricter than a throughput-tuned generic HTTP/2 server, but loose enough for legitimate clients that occasionally cancel requests.
+**`FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS`** — Bounds how many quickly reset inbound HTTP/2 streams are tolerated before Ferrum sends GOAWAY on that connection. This is the main built-in rapid-reset defense. The default of 64 is low enough to cut off abusive reset churn, while still tolerating normal request cancellation in high-volume APIs.
 
-**`FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS`** — Bounds repeated locally reset HTTP/2 streams on one connection, which helps contain malformed-request churn and related DoS patterns. The default of 256 is lower than hyper's default, but still high enough to avoid affecting normal traffic.
+**`FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS`** — Bounds repeated locally reset HTTP/2 streams on one connection, which helps contain malformed-request churn and related DoS patterns. The default of 256 is much lower than hyper's default, but still high enough to avoid affecting normal traffic.
 
 **`FERRUM_WEBSOCKET_MAX_CONNECTIONS`** — Caps long-lived upgraded WebSocket sessions separately from the global TCP connection pool. This protects API-heavy deployments from idle WebSocket exhaustion without adding work to the HTTP request path or the WebSocket frame-forwarding loop. Use the `rate_limiting` plugin as the companion defense for upgrade floods.
 

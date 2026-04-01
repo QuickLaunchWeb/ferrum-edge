@@ -1,3 +1,13 @@
+//! File mode — single-instance gateway backed by a YAML/JSON config file.
+//!
+//! Config is loaded once at startup. On Unix, sending SIGHUP triggers a
+//! hot reload: the file is re-parsed, validated, and atomically swapped
+//! into the running gateway without dropping connections.
+//!
+//! The admin API is always read-only in this mode (no database to write to).
+//! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
+//! any externally-crafted JWT will be rejected since nobody knows the secret.
+
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -82,9 +92,18 @@ pub async fn run(
         }
     }
 
+    // Build TLS hardening policy from environment (needed for both frontend
+    // and backend TLS — cipher suites, protocol versions, key exchange groups).
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone())?;
+    let proxy_state = ProxyState::new(
+        config,
+        dns_cache.clone(),
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
 
     // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
@@ -101,13 +120,10 @@ pub async fn run(
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
-    // Build TLS hardening policy from environment
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-
     // Validate TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.proxy_tls_cert_path,
-        &env_config.proxy_tls_key_path,
+        &env_config.frontend_tls_cert_path,
+        &env_config.frontend_tls_key_path,
     ) {
         info!("Loading TLS configuration with client certificate verification...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();

@@ -708,11 +708,16 @@ paths:
                 - request_transformer
                 - response_transformer
                 - graphql
+                - grpc_method_router
+                - grpc_deadline
                 - rate_limiting
                 - body_validator
                 - request_termination
                 - prometheus_metrics
                 - otel_tracing
+                - ws_message_size_limiting
+                - ws_frame_logging
+                - ws_rate_limiting
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -863,6 +868,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Upstream"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     post:
@@ -884,8 +891,12 @@ paths:
                 $ref: "#/components/schemas/Upstream"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -906,6 +917,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Upstream"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -929,10 +942,14 @@ paths:
                 $ref: "#/components/schemas/Upstream"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     delete:
@@ -942,6 +959,8 @@ paths:
       responses:
         "204":
           description: Upstream deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
         "404":
@@ -1227,7 +1246,7 @@ components:
           type: [boolean, "null"]
           description: |
             Enable adaptive flow-control (BDP probing) for HTTP/2 connections (overrides global).
-            Disabled by default for predictable fixed-window performance. Default: false.
+            Enabled by default — BDP probing dynamically sizes flow-control windows for optimal throughput. Default: true.
         pool_http2_max_frame_size:
           type: [integer, "null"]
           format: uint32
@@ -1235,7 +1254,7 @@ components:
           maximum: 1048576
           description: |
             Maximum HTTP/2 frame payload size in bytes (overrides global).
-            Range: 16384–1048576 (1 MiB). Default: 65535.
+            Range: 16384–1048576 (1 MiB). Default: 1048576 (1 MiB).
         pool_http2_max_concurrent_streams:
           type: [integer, "null"]
           format: uint32
@@ -1355,7 +1374,7 @@ components:
         Protocol used to communicate with the backend.
         TCP/UDP protocols (tcp, tcp_tls, udp, dtls) are raw stream proxies
         that require a `listen_port` instead of `listen_path`.
-        `dtls` encrypts UDP datagrams to the backend using DTLS 1.2 (ECDSA/Ed25519 keys only).
+        `dtls` encrypts UDP datagrams to the backend using DTLS 1.2/1.3 (ECDSA P-256/P-384 keys only, version auto-negotiated).
 
     AuthMode:
       type: string
@@ -1456,7 +1475,8 @@ components:
             instantiated at config reload time. Security plugins (key_auth,
             basic_auth, jwt_auth, hmac_auth, jwks_auth, mtls_auth,
             access_control, ip_restriction) block gateway startup if their
-            config is invalid.
+            config is invalid. See `PluginConfigs` section for per-plugin
+            schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -1491,6 +1511,109 @@ components:
         `global` — plugin applies to all proxies; `proxy_id` must be null.
         `proxy` — plugin applies only to the proxy referenced by `proxy_id`;
         `proxy_id` is required.
+
+    # ── WebSocket Plugin Configs ─────────────────────────────────────
+    WsMessageSizeLimitingConfig:
+      type: object
+      description: |
+        Configuration for the `ws_message_size_limiting` plugin. Enforces a
+        maximum frame payload size on WebSocket connections. Frames exceeding
+        the limit trigger a close frame sent to both client and backend.
+      properties:
+        max_frame_bytes:
+          type: integer
+          default: 0
+          description: >-
+            Maximum frame payload size in bytes. Required for the plugin to
+            take effect — a value of 0 means no limit is enforced.
+        close_reason:
+          type: string
+          default: "Message too large"
+          description: Close frame reason text sent when a frame exceeds the limit.
+
+    WsFrameLoggingConfig:
+      type: object
+      description: |
+        Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
+        metadata (direction, opcode, payload size) for each Text, Binary, and
+        Ping frame.
+      properties:
+        log_level:
+          type: string
+          enum: [trace, debug, info]
+          default: info
+          description: Tracing level for frame log output.
+        include_payload_preview:
+          type: boolean
+          default: false
+          description: Include a payload preview in log output.
+        payload_preview_bytes:
+          type: integer
+          default: 128
+          maximum: 65536
+          description: >-
+            Maximum number of bytes to include in the payload preview. Only
+            applies when `include_payload_preview` is true.
+        log_ping_pong:
+          type: boolean
+          default: false
+          description: Whether to log ping/pong frames in addition to text/binary frames.
+
+    WsRateLimitingConfig:
+      type: object
+      description: |
+        Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
+        frame rate limiting using a token-bucket algorithm. When the bucket is
+        exhausted, the plugin sends a close frame to both client and backend.
+        Supports centralized Redis-backed mode for cross-instance frame rate coordination.
+      properties:
+        frames_per_second:
+          type: integer
+          default: 100
+          description: Token refill rate per second.
+        burst_size:
+          type: integer
+          description: >-
+            Maximum burst capacity (tokens). Defaults to the value of
+            `frames_per_second` when not explicitly set.
+        close_reason:
+          type: string
+          default: "Frame rate exceeded"
+          description: Close frame reason text sent when the frame rate is exceeded.
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:ws_rate_limiting"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -1978,6 +2101,7 @@ components:
       description: Top-level gateway info and throughput counters.
       required:
         - mode
+        - ferrum_version
         - uptime_seconds
         - requests_per_second_current
         - status_codes_last_second
@@ -1989,6 +2113,10 @@ components:
         mode:
           type: string
           enum: [database, file, cp, dp]
+        ferrum_version:
+          type: string
+          description: Ferrum Edge binary version
+          example: "0.9.0"
           description: Operating mode (set by FERRUM_MODE)
         uptime_seconds:
           type: integer
@@ -2288,12 +2416,16 @@ components:
 
     BackupResponse:
       type: object
-      required: [version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
+      required: [version, ferrum_version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
       properties:
         version:
           type: string
           description: Configuration schema version
           example: "1"
+        ferrum_version:
+          type: string
+          description: Ferrum Edge binary version that produced this backup
+          example: "0.9.0"
         exported_at:
           type: string
           format: date-time
@@ -2379,3 +2511,906 @@ components:
           items:
             type: string
           description: Present only on 207 Multi-Status; lists per-type error messages
+
+    # ── Plugin Config Schemas ──────────────────────────────────────────
+    # Per-plugin configuration schemas. The `config` field on PluginConfig
+    # accepts one of these depending on the `plugin_name` value.
+
+    StdoutLoggingConfig:
+      type: object
+      description: "Plugin: stdout_logging — Logs JSON transaction summaries to stdout."
+      properties: {}
+
+    HttpLoggingConfig:
+      type: object
+      description: "Plugin: http_logging — Sends transaction logs to an HTTP endpoint in batches."
+      properties:
+        endpoint_url:
+          type: string
+          description: URL to POST transaction logs to
+        authorization_header:
+          type: string
+          description: Authorization header value for the logging endpoint
+        batch_size:
+          type: integer
+          default: 50
+          description: Number of entries to buffer before sending a batch
+        flush_interval_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: Max milliseconds before flushing a partial batch
+        max_retries:
+          type: integer
+          default: 3
+          description: Retry attempts on failed batch delivery
+        retry_delay_ms:
+          type: integer
+          default: 1000
+          description: Delay in milliseconds between retry attempts
+        buffer_capacity:
+          type: integer
+          default: 10000
+          description: Channel capacity — new entries are dropped when full
+
+    TransactionDebuggerConfig:
+      type: object
+      description: "Plugin: transaction_debugger — Logs verbose request/response details to stdout."
+      properties:
+        log_request_body:
+          type: boolean
+          default: false
+          description: Log incoming request body
+        log_response_body:
+          type: boolean
+          default: false
+          description: Log backend response body
+        redacted_headers:
+          type: array
+          items:
+            type: string
+          description: Additional header names to redact beyond the built-in sensitive list
+
+    CorrelationIdConfig:
+      type: object
+      description: "Plugin: correlation_id — Generates and propagates correlation IDs."
+      properties:
+        header_name:
+          type: string
+          default: X-Correlation-ID
+          description: Header name for correlation ID
+        generator:
+          type: string
+          default: uuid
+          description: ID generation strategy
+        echo_downstream:
+          type: boolean
+          default: true
+          description: Include correlation ID in response headers
+
+    PrometheusMetricsConfig:
+      type: object
+      description: "Plugin: prometheus_metrics — Exports gateway metrics in Prometheus format."
+      properties:
+        path:
+          type: string
+          default: /metrics
+          description: Metrics endpoint path
+
+    OtelTracingConfig:
+      type: object
+      description: "Plugin: otel_tracing — W3C Trace Context propagation and OTLP span export."
+      properties:
+        endpoint:
+          type: string
+          description: OTLP/HTTP collector endpoint. Omit for propagation-only mode
+        service_name:
+          type: string
+          default: ferrum-edge
+          description: Service name in spans and resource attributes
+        deployment_environment:
+          type: string
+          description: deployment.environment resource attribute
+        generate_trace_id:
+          type: boolean
+          default: true
+          description: Generate trace IDs for requests without incoming traceparent
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          default: {}
+          description: Custom HTTP headers sent with OTLP exports
+        authorization:
+          type: string
+          description: Authorization header value for OTLP exports
+        batch_size:
+          type: integer
+          default: 50
+          description: Spans per export batch
+        flush_interval_ms:
+          type: integer
+          default: 5000
+          description: Max delay before flushing a partial batch
+        buffer_capacity:
+          type: integer
+          default: 10000
+          description: Max pending spans; drops oldest when full
+        max_retries:
+          type: integer
+          default: 2
+          description: Retry attempts on export failure
+        retry_delay_ms:
+          type: integer
+          default: 1000
+          description: Delay between retries
+
+    MtlsAuthConfig:
+      type: object
+      description: "Plugin: mtls_auth — Authenticates using client TLS certificate fields."
+      properties:
+        cert_field:
+          type: string
+          default: subject_cn
+          enum: [subject_cn, subject_ou, subject_o, san_dns, san_email, fingerprint_sha256, serial]
+          description: Certificate field to use as identity
+        allowed_issuers:
+          type: array
+          items:
+            type: object
+            properties:
+              cn:
+                type: string
+              o:
+                type: string
+              ou:
+                type: string
+          description: Per-proxy issuer DN filters (AND within entry, OR across entries)
+        allowed_ca_fingerprints_sha256:
+          type: array
+          items:
+            type: string
+          description: SHA-256 fingerprints of allowed CA/intermediate certs
+
+    JwksAuthConfig:
+      type: object
+      description: "Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based authorization."
+      required: [providers]
+      properties:
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              jwks_uri:
+                type: string
+                description: Direct URL to the IdP's JWKS endpoint
+              discovery_url:
+                type: string
+                description: OIDC discovery URL (auto-discovers jwks_uri)
+              issuer:
+                type: string
+                description: Expected JWT iss claim — routes tokens to this provider
+              audience:
+                type: string
+                description: Expected JWT aud claim
+              required_scopes:
+                type: array
+                items:
+                  type: string
+                description: Scopes that must all be present in the token
+              required_roles:
+                type: array
+                items:
+                  type: string
+                description: Roles where any one must be present
+              scope_claim:
+                type: string
+                description: Per-provider override for scope claim path
+              role_claim:
+                type: string
+                description: Per-provider override for role claim path
+          description: Array of identity provider configurations
+        scope_claim:
+          type: string
+          default: scope
+          description: Global scope claim path
+        role_claim:
+          type: string
+          default: roles
+          description: Global role claim path
+        consumer_identity_claim:
+          type: string
+          default: sub
+          description: JWT claim for consumer lookup
+        consumer_header_claim:
+          type: string
+          description: JWT claim for X-Consumer-Username header (default same as consumer_identity_claim)
+        jwks_refresh_interval_secs:
+          type: integer
+          format: uint64
+          default: 300
+          description: JWKS key refresh interval in seconds
+
+    JwtAuthConfig:
+      type: object
+      description: "Plugin: jwt_auth — HS256 JWT Bearer token authentication."
+      properties:
+        token_lookup:
+          type: string
+          default: "header:Authorization"
+          description: "Where to find the token (header:<name> or query:<name>)"
+        consumer_claim_field:
+          type: string
+          default: sub
+          description: JWT claim identifying the consumer
+
+    KeyAuthConfig:
+      type: object
+      description: "Plugin: key_auth — API key authentication."
+      properties:
+        key_location:
+          type: string
+          default: "header:X-API-Key"
+          description: "Where to find the key (header:<name> or query:<name>)"
+
+    BasicAuthConfig:
+      type: object
+      description: "Plugin: basic_auth — HTTP Basic credentials (HMAC-SHA256 or bcrypt)."
+      properties: {}
+
+    HmacAuthConfig:
+      type: object
+      description: "Plugin: hmac_auth — HMAC signature verification."
+      properties:
+        secret:
+          type: string
+          description: Shared secret for HMAC computation
+        algorithm:
+          type: string
+          description: Hash algorithm (e.g., sha256)
+        header:
+          type: string
+          description: Header containing the HMAC signature
+
+    CorsConfig:
+      type: object
+      description: "Plugin: cors — Cross-Origin Resource Sharing."
+      properties:
+        allowed_origins:
+          type: array
+          items:
+            type: string
+          default: ["*"]
+          description: Permitted origins
+        allowed_methods:
+          type: array
+          items:
+            type: string
+          default: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+          description: Allowed methods
+        allowed_headers:
+          type: array
+          items:
+            type: string
+          default: ["Accept", "Authorization", "Content-Type", "Origin", "X-Requested-With"]
+          description: Allowed headers
+        exposed_headers:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Response headers exposed to browser JavaScript
+        allow_credentials:
+          type: boolean
+          default: false
+          description: "Send Access-Control-Allow-Credentials: true"
+        max_age:
+          type: integer
+          format: uint64
+          default: 86400
+          description: Preflight cache duration in seconds
+        preflight_continue:
+          type: boolean
+          default: false
+          description: Pass preflight requests to backend
+
+    AccessControlConfig:
+      type: object
+      description: "Plugin: access_control — IP/CIDR and consumer-based allow/deny."
+      properties:
+        allowed_ips:
+          type: array
+          items:
+            type: string
+          description: IP addresses or CIDR ranges allowed
+        blocked_ips:
+          type: array
+          items:
+            type: string
+          description: IP addresses or CIDR ranges explicitly denied
+        allowed_consumers:
+          type: array
+          items:
+            type: string
+          description: Usernames allowed access (empty = allow all)
+        disallowed_consumers:
+          type: array
+          items:
+            type: string
+          description: Usernames explicitly denied
+
+    IpRestrictionConfig:
+      type: object
+      description: "Plugin: ip_restriction — IP/CIDR access control."
+      properties:
+        allow:
+          type: array
+          items:
+            type: string
+          description: Allowed IP addresses or CIDR ranges
+        deny:
+          type: array
+          items:
+            type: string
+          description: Denied IP addresses or CIDR ranges
+
+    BotDetectionConfig:
+      type: object
+      description: "Plugin: bot_detection — User-Agent pattern blocking."
+      properties:
+        blocked_patterns:
+          type: array
+          items:
+            type: string
+          description: User-Agent substrings to block
+        allow_list:
+          type: array
+          items:
+            type: string
+          default: []
+          description: User-Agent substrings to always allow
+        allow_missing_user_agent:
+          type: boolean
+          default: true
+          description: Allow requests with no User-Agent header
+        custom_response_code:
+          type: integer
+          format: uint16
+          default: 403
+          description: HTTP status code for blocked requests
+
+    RequestTransformerConfig:
+      type: object
+      description: "Plugin: request_transformer — Modifies request headers, query params, and JSON body."
+      properties:
+        rules:
+          type: array
+          items:
+            type: object
+            required: [operation, key]
+            properties:
+              operation:
+                type: string
+                enum: [add, remove, update, rename]
+              target:
+                type: string
+                enum: [header, query, body]
+                default: header
+              key:
+                type: string
+                description: Header name, query param, or dot-notation body path
+              value:
+                type: string
+                description: Value to set (for add/update operations)
+              new_key:
+                type: string
+                description: New key name (for rename operations)
+
+    ResponseTransformerConfig:
+      type: object
+      description: "Plugin: response_transformer — Modifies response headers and JSON body."
+      properties:
+        rules:
+          type: array
+          items:
+            type: object
+            required: [operation, key]
+            properties:
+              operation:
+                type: string
+                enum: [add, remove, update, rename]
+              target:
+                type: string
+                enum: [header, body]
+                default: header
+              key:
+                type: string
+              value:
+                type: string
+              new_key:
+                type: string
+
+    RateLimitingConfig:
+      type: object
+      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
+      properties:
+        limit_by:
+          type: string
+          enum: [ip, consumer]
+          default: ip
+          description: "Rate limit key: ip or consumer"
+        expose_headers:
+          type: boolean
+          default: false
+          description: Inject x-ratelimit-* headers on requests and responses
+        requests_per_second:
+          type: integer
+          format: uint64
+          description: Max requests per second
+        requests_per_minute:
+          type: integer
+          format: uint64
+          description: Max requests per minute
+        requests_per_hour:
+          type: integer
+          format: uint64
+          description: Max requests per hour
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
+        redis_url:
+          type: string
+          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:rate_limiting"
+          description: Key prefix for all Redis keys (namespace isolation)
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL-based authentication (Redis 6+)
+        redis_password:
+          type: string
+          description: Redis password for authentication
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Interval in seconds for health check pings when Redis is marked unavailable
+
+    RequestSizeLimitingConfig:
+      type: object
+      description: "Plugin: request_size_limiting — Per-proxy request body size limits."
+      properties:
+        max_bytes:
+          type: integer
+          format: uint64
+          default: 0
+          description: Maximum allowed request body size in bytes (0 = disabled)
+
+    ResponseSizeLimitingConfig:
+      type: object
+      description: "Plugin: response_size_limiting — Per-proxy response body size limits."
+      properties:
+        max_bytes:
+          type: integer
+          format: uint64
+          default: 0
+          description: Maximum allowed response body size in bytes (0 = disabled)
+        require_buffered_check:
+          type: boolean
+          default: false
+          description: Force response body buffering to verify actual size
+
+    BodyValidatorConfig:
+      type: object
+      description: "Plugin: body_validator — JSON Schema and XML validation for request/response bodies."
+      properties:
+        json_schema:
+          type: object
+          description: JSON Schema for request body validation
+        required_fields:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Simple required field names in request body
+        validate_xml:
+          type: boolean
+          default: false
+          description: Enable XML well-formedness validation
+        required_xml_elements:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Required XML element names
+        content_types:
+          type: array
+          items:
+            type: string
+          default: ["application/json", "application/xml", "text/xml"]
+          description: MIME types to validate
+        response_json_schema:
+          type: object
+          description: JSON Schema for response body validation
+        response_required_fields:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Required field names in response
+        response_validate_xml:
+          type: boolean
+          default: false
+        response_required_xml_elements:
+          type: array
+          items:
+            type: string
+          default: []
+        response_content_types:
+          type: array
+          items:
+            type: string
+          default: ["application/json", "application/xml", "text/xml"]
+
+    RequestTerminationConfig:
+      type: object
+      description: "Plugin: request_termination — Returns a predefined response without proxying."
+      properties:
+        status_code:
+          type: integer
+          format: uint16
+          description: HTTP status code to return
+        body:
+          type: string
+          description: Response body
+        content_type:
+          type: string
+          description: Response Content-Type header
+        message:
+          type: string
+          description: Error message
+
+    ResponseCachingConfig:
+      type: object
+      description: "Plugin: response_caching — Response body caching (HTTP only)."
+      properties:
+        ttl_seconds:
+          type: integer
+          format: uint64
+          description: Cache entry time-to-live in seconds
+        max_entries:
+          type: integer
+          format: uint64
+          description: Maximum number of cached entries
+        cache_methods:
+          type: array
+          items:
+            type: string
+          description: HTTP methods to cache (e.g., GET, HEAD)
+
+    GraphqlConfig:
+      type: object
+      description: "Plugin: graphql — Query depth/complexity limiting, introspection control, per-operation rate limiting."
+      properties:
+        max_depth:
+          type: integer
+          format: uint32
+          description: Maximum allowed query nesting depth
+        max_complexity:
+          type: integer
+          format: uint32
+          description: Maximum allowed field count
+        max_aliases:
+          type: integer
+          format: uint32
+          description: Maximum allowed alias count
+        introspection_allowed:
+          type: boolean
+          default: true
+          description: Whether introspection queries are permitted
+        limit_by:
+          type: string
+          enum: [ip, consumer]
+          default: ip
+          description: Rate limit key
+        type_rate_limits:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RateSpec"
+          description: "Rate limits by operation type (query, mutation, subscription)"
+        operation_rate_limits:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RateSpec"
+          description: Rate limits by named operation
+
+    GrpcMethodRouterConfig:
+      type: object
+      description: >-
+        Plugin: grpc_method_router — Per-method access control and rate limiting
+        for gRPC services. Parses the gRPC path (/package.Service/Method) and
+        populates grpc_service, grpc_method, grpc_full_method metadata.
+      properties:
+        allow_methods:
+          type: array
+          items:
+            type: string
+          description: >-
+            Only these gRPC methods are permitted (allowlist). Each entry is a
+            full method path like /package.Service/Method.
+        deny_methods:
+          type: array
+          items:
+            type: string
+          default: []
+          description: >-
+            These gRPC methods are explicitly blocked. Deny takes precedence
+            over allow.
+        method_rate_limits:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/RateSpec"
+          description: >-
+            Per-method rate limits keyed by full method path
+            (e.g., /myapp.UserService/CreateUser).
+        limit_by:
+          type: string
+          enum: [ip, consumer]
+          default: ip
+          description: >-
+            Rate limit key. When consumer, uses identified_consumer then
+            authenticated_identity then client IP as fallback.
+
+    GrpcDeadlineConfig:
+      type: object
+      description: >-
+        Plugin: grpc_deadline — Manages the grpc-timeout metadata header.
+        Supports all gRPC timeout units (H, M, S, m, u, n).
+      properties:
+        max_deadline_ms:
+          type: integer
+          format: uint64
+          description: Cap incoming deadlines to this value (milliseconds)
+        default_deadline_ms:
+          type: integer
+          format: uint64
+          description: Inject grpc-timeout when client omits it
+        subtract_gateway_processing:
+          type: boolean
+          default: false
+          description: >-
+            Subtract elapsed gateway processing time before forwarding.
+            Returns gRPC DEADLINE_EXCEEDED (status 4) if remaining time is zero.
+        reject_no_deadline:
+          type: boolean
+          default: false
+          description: >-
+            Reject requests missing grpc-timeout with HTTP 400. Takes
+            precedence over default_deadline_ms.
+
+    AiTokenMetricsConfig:
+      type: object
+      description: "Plugin: ai_token_metrics — Extracts token usage from LLM response bodies."
+      properties:
+        provider:
+          type: string
+          default: auto
+          description: "LLM provider format (auto, openai, anthropic, google, cohere, mistral, bedrock)"
+        include_model:
+          type: boolean
+          default: true
+          description: Extract model name into metadata
+        include_token_details:
+          type: boolean
+          default: true
+          description: Extract prompt/completion tokens separately
+        metadata_prefix:
+          type: string
+          default: ai
+          description: Prefix for metadata keys
+        cost_per_prompt_token:
+          type: number
+          format: double
+          description: Calculate estimated cost per request (prompt tokens)
+        cost_per_completion_token:
+          type: number
+          format: double
+          description: Calculate estimated cost per request (completion tokens)
+
+    AiRequestGuardConfig:
+      type: object
+      description: "Plugin: ai_request_guard — Validates and constrains AI/LLM API requests."
+      properties:
+        max_tokens_limit:
+          type: integer
+          description: Maximum allowed max_tokens value
+        enforce_max_tokens:
+          type: string
+          enum: [reject, clamp]
+          default: reject
+          description: Reject (400 error) or clamp (silently cap) max_tokens
+        default_max_tokens:
+          type: integer
+          description: Inject max_tokens if not present
+        allowed_models:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Whitelist of allowed model names (empty = allow all)
+        blocked_models:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Blacklist of model names (takes precedence over allowed)
+        require_user_field:
+          type: boolean
+          default: false
+          description: Require user field in request body
+        max_messages:
+          type: integer
+          description: Maximum messages in the messages array
+        max_prompt_characters:
+          type: integer
+          description: Maximum total characters across messages
+        temperature_range:
+          type: array
+          items:
+            type: number
+            format: double
+          minItems: 2
+          maxItems: 2
+          description: "Allowed [min, max] range for temperature"
+        block_system_prompts:
+          type: boolean
+          default: false
+          description: "Reject requests with role: system messages"
+        required_metadata_fields:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Required fields in request body
+
+    AiRateLimiterConfig:
+      type: object
+      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination."
+      properties:
+        token_limit:
+          type: integer
+          default: 100000
+          description: Maximum tokens allowed per window
+        window_seconds:
+          type: integer
+          default: 60
+          description: Sliding window duration in seconds
+        count_mode:
+          type: string
+          enum: [total_tokens, prompt_tokens, completion_tokens]
+          default: total_tokens
+          description: What to count
+        limit_by:
+          type: string
+          enum: [consumer, ip]
+          default: consumer
+          description: Rate limit key
+        expose_headers:
+          type: boolean
+          default: false
+          description: Inject x-ai-ratelimit-* headers
+        provider:
+          type: string
+          default: auto
+          description: LLM provider format for token extraction
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:ai_rate_limiter"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
+
+    AiPromptShieldConfig:
+      type: object
+      description: "Plugin: ai_prompt_shield — PII detection and redaction in prompts."
+      properties:
+        action:
+          type: string
+          enum: [reject, redact, warn]
+          default: reject
+          description: Action when PII is detected
+        patterns:
+          type: array
+          items:
+            type: string
+          default: [ssn, credit_card, api_key, aws_key]
+          description: "Built-in patterns: ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban"
+        custom_patterns:
+          type: array
+          items:
+            type: object
+            required: [name, regex]
+            properties:
+              name:
+                type: string
+              regex:
+                type: string
+          default: []
+          description: "Custom {name, regex} patterns"
+        scan_fields:
+          type: string
+          enum: [content, all]
+          default: content
+          description: Which message fields to scan
+        exclude_roles:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Message roles to skip scanning
+        redaction_placeholder:
+          type: string
+          default: "[REDACTED:{type}]"
+          description: Template for redacted text
+        max_scan_bytes:
+          type: integer
+          default: 1048576
+          description: Skip scanning if body exceeds this size
+
+    RateSpec:
+      type: object
+      description: Rate limit specification used by graphql and grpc_method_router plugins.
+      required: [max_requests, window_seconds]
+      properties:
+        max_requests:
+          type: integer
+          format: uint64
+          description: Maximum requests allowed in the window
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Time window in seconds

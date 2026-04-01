@@ -118,8 +118,8 @@ fn create_http3_test_env_config() -> EnvConfig {
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8080,
         proxy_https_port: 8443,
-        proxy_tls_cert_path: None,
-        proxy_tls_key_path: None,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
         proxy_bind_address: "0.0.0.0".into(),
         admin_http_port: 9000,
         admin_https_port: 9443,
@@ -192,6 +192,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        tls_session_cache_size: 4096,
         stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
@@ -209,9 +210,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
-        server_http2_max_pending_accept_reset_streams: 64,
-        server_http2_max_local_error_reset_streams: 256,
-        websocket_max_connections: 20_000,
+        ..Default::default()
     }
 }
 
@@ -233,6 +232,7 @@ async fn test_http3_backend_connection() {
         pool_config,
         env_config,
         dns_cache.clone(),
+        None,
     ));
 
     // Test DNS resolution first
@@ -252,7 +252,9 @@ async fn test_http3_backend_connection() {
     info!("Resolved {} to {:?}", proxy.backend_host, resolved_ip);
 
     // Test HTTP/3 client creation and basic functionality
-    let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
+    let tls_config = connection_pool
+        .get_tls_config_for_backend(&proxy)
+        .expect("TLS config should succeed for test proxy");
     let http3_client_result = ferrum_edge::http3::client::Http3Client::new(tls_config, None);
 
     match http3_client_result {
@@ -364,6 +366,7 @@ async fn test_http3_proxy_state_creation() {
         pool_config,
         env_config,
         dns_cache.clone(),
+        None,
     ));
 
     let gc = create_http3_test_gateway_config();
@@ -382,9 +385,11 @@ async fn test_http3_proxy_state_creation() {
             circuit_breaker_cache.clone(),
             None,
             false,
+            None,
             300,
             10_000,
             10,
+            None,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -426,6 +431,8 @@ async fn test_http3_proxy_state_creation() {
         websocket_conn_limit: None,
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
+        ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tls_policy: None,
     };
 
     // Verify proxy state is created successfully
@@ -534,6 +541,7 @@ async fn test_http3_full_integration() {
         pool_config,
         env_config,
         dns_cache.clone(),
+        None,
     ));
 
     // Create proxy state with HTTP/3 support
@@ -553,9 +561,11 @@ async fn test_http3_full_integration() {
             circuit_breaker_cache.clone(),
             None,
             false,
+            None,
             300,
             10_000,
             10,
+            None,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -597,6 +607,8 @@ async fn test_http3_full_integration() {
         websocket_conn_limit: None,
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
+        ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tls_policy: None,
     };
 
     // Verify proxy state is created successfully
@@ -610,7 +622,8 @@ async fn test_http3_full_integration() {
     // Test HTTP/3 backend connection creation
     let tls_config = proxy_state
         .connection_pool
-        .get_tls_config_for_backend(&proxy);
+        .get_tls_config_for_backend(&proxy)
+        .expect("TLS config should succeed for test proxy");
     assert!(Arc::strong_count(&tls_config) > 0);
 
     // Test HTTP/3 client creation (may fail in test environment, but should not panic)
@@ -817,10 +830,13 @@ async fn test_http3_connection_performance() {
         pool_config,
         env_config,
         DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     ));
 
     // Test HTTP/3 client creation performance
-    let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
+    let tls_config = connection_pool
+        .get_tls_config_for_backend(&proxy)
+        .expect("TLS config should succeed for test proxy");
 
     let start_time = std::time::Instant::now();
     let http3_client = ferrum_edge::http3::client::Http3Client::new(tls_config, None)

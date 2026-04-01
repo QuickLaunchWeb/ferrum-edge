@@ -82,8 +82,8 @@ fn create_test_env_config_with_mtls(
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,
         proxy_https_port: 8443,
-        proxy_tls_cert_path: None,
-        proxy_tls_key_path: None,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
         proxy_bind_address: "0.0.0.0".into(),
         admin_http_port: 9000,
         admin_https_port: 9443,
@@ -155,6 +155,7 @@ fn create_test_env_config_with_mtls(
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        tls_session_cache_size: 4096,
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
         stream_proxy_bind_address: "0.0.0.0".into(),
@@ -172,9 +173,7 @@ fn create_test_env_config_with_mtls(
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
-        server_http2_max_pending_accept_reset_streams: 64,
-        server_http2_max_local_error_reset_streams: 256,
-        websocket_max_connections: 20_000,
+        ..Default::default()
     }
 }
 
@@ -210,6 +209,7 @@ async fn test_backend_mtls_global_config() {
         global_config,
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     );
 
     // Create proxy without specific mTLS config (should use global)
@@ -267,6 +267,7 @@ async fn test_backend_mtls_proxy_specific_override() {
         global_config,
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     );
 
     // Create proxy with specific mTLS config (should override global)
@@ -315,6 +316,7 @@ async fn test_backend_mtls_no_certificates() {
         global_config,
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     );
 
     // Create proxy without mTLS config
@@ -350,6 +352,7 @@ async fn test_backend_mtls_partial_config() {
         global_config,
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     );
 
     // Create proxy without mTLS config
@@ -390,6 +393,7 @@ async fn test_backend_ca_bundle_global_config() {
         global_config,
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     );
 
     // Create proxy without specific mTLS config (should use global CA bundle)

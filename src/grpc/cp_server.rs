@@ -1,3 +1,16 @@
+//! Control Plane gRPC server implementing the `ConfigSync` service.
+//!
+//! Provides two RPCs:
+//! - `Subscribe` — server-streaming: DP connects and receives a `FULL_SNAPSHOT`
+//!   (update_type=0), then incremental `DELTA` updates (update_type=1) as config changes.
+//!   If a DP lags behind the broadcast channel (capacity 128), it receives a fresh
+//!   full snapshot instead of the missed deltas.
+//! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
+//!
+//! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
+//! Required claims: `exp`, `iat`, `sub`. The CP enforces `major.minor` version
+//! compatibility — a DP running a different minor version is rejected.
+
 use arc_swap::ArcSwap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
@@ -11,6 +24,7 @@ use tracing::{error, info, warn};
 
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
+use crate::FERRUM_VERSION;
 use crate::config::types::GatewayConfig;
 
 /// CP gRPC server state.
@@ -67,6 +81,52 @@ impl CpGrpcServer {
         ConfigSyncServer::new(self)
     }
 
+    /// Check whether the DP's reported version is compatible with this CP.
+    ///
+    /// Compatibility rule: major and minor versions must match. Patch-level
+    /// differences are always allowed (bug-fix releases don't change the
+    /// config schema or gRPC wire format).
+    #[allow(clippy::result_large_err)]
+    fn check_version_compatibility(dp_version: &str) -> Result<(), Status> {
+        // Empty version means old DP that predates the version field — reject.
+        if dp_version.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "DP did not report its version. CP is running Ferrum Edge v{}. \
+                 Upgrade the DP to a version that supports version negotiation.",
+                FERRUM_VERSION
+            )));
+        }
+
+        let cp_parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        let dp_parts: Vec<&str> = dp_version.split('.').collect();
+
+        if cp_parts.len() < 2 || dp_parts.len() < 2 {
+            warn!(
+                "Unable to parse version for compatibility check (CP={}, DP={}), allowing connection",
+                FERRUM_VERSION, dp_version
+            );
+            return Ok(());
+        }
+
+        if cp_parts[0] != dp_parts[0] || cp_parts[1] != dp_parts[1] {
+            return Err(Status::failed_precondition(format!(
+                "Version mismatch: CP is v{} but DP is v{}. \
+                 Major and minor versions must match. \
+                 Upgrade the CP first, then upgrade DPs to the same major.minor version.",
+                FERRUM_VERSION, dp_version
+            )));
+        }
+
+        if cp_parts.get(2) != dp_parts.get(2) {
+            info!(
+                "DP v{} connected to CP v{} (patch difference OK)",
+                dp_version, FERRUM_VERSION
+            );
+        }
+
+        Ok(())
+    }
+
     /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
         let config_json = match serde_json::to_string(config) {
@@ -81,6 +141,7 @@ impl CpGrpcServer {
             config_json,
             version: config.loaded_at.to_rfc3339(),
             timestamp: chrono::Utc::now().timestamp(),
+            ferrum_version: FERRUM_VERSION.to_string(),
         };
         let _ = tx.send(update);
     }
@@ -106,6 +167,7 @@ impl CpGrpcServer {
             config_json,
             version: version.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
+            ferrum_version: FERRUM_VERSION.to_string(),
         };
         let _ = tx.send(update);
     }
@@ -122,8 +184,17 @@ impl ConfigSync for CpGrpcServer {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         self.verify_jwt_metadata(request.metadata())?;
 
-        let node_id = request.into_inner().node_id;
-        info!("DP node '{}' subscribed for config updates", node_id);
+        let inner = request.into_inner();
+        let node_id = inner.node_id;
+        let dp_version = inner.ferrum_version;
+
+        // Reject DPs with incompatible versions before streaming any config.
+        Self::check_version_compatibility(&dp_version)?;
+
+        info!(
+            "DP node '{}' (v{}) subscribed for config updates",
+            node_id, dp_version
+        );
 
         // Send initial full config
         let config = self.config.load_full();
@@ -136,6 +207,7 @@ impl ConfigSync for CpGrpcServer {
             config_json,
             version: config.loaded_at.to_rfc3339(),
             timestamp: chrono::Utc::now().timestamp(),
+            ferrum_version: FERRUM_VERSION.to_string(),
         };
 
         let rx = self.update_tx.subscribe();
@@ -155,6 +227,7 @@ impl ConfigSync for CpGrpcServer {
                         config_json,
                         version: current.loaded_at.to_rfc3339(),
                         timestamp: chrono::Utc::now().timestamp(),
+                        ferrum_version: FERRUM_VERSION.to_string(),
                     })),
                     Err(e) => {
                         error!("Failed to serialize recovery snapshot: {}", e);
@@ -177,6 +250,9 @@ impl ConfigSync for CpGrpcServer {
     ) -> Result<Response<FullConfigResponse>, Status> {
         self.verify_jwt_metadata(request.metadata())?;
 
+        let dp_version = &request.get_ref().ferrum_version;
+        Self::check_version_compatibility(dp_version)?;
+
         let config = self.config.load_full();
         let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
             error!("Failed to serialize config in get_full_config: {}", e);
@@ -186,6 +262,7 @@ impl ConfigSync for CpGrpcServer {
         Ok(Response::new(FullConfigResponse {
             config_json,
             version: config.loaded_at.to_rfc3339(),
+            ferrum_version: FERRUM_VERSION.to_string(),
         }))
     }
 }

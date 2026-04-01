@@ -84,8 +84,8 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,
         proxy_https_port: 8443,
-        proxy_tls_cert_path: None,
-        proxy_tls_key_path: None,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
         proxy_bind_address: "0.0.0.0".into(),
         admin_http_port: 9000,
         admin_https_port: 9443,
@@ -157,6 +157,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        tls_session_cache_size: 4096,
         stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
@@ -174,9 +175,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
-        server_http2_max_pending_accept_reset_streams: 64,
-        server_http2_max_local_error_reset_streams: 256,
-        websocket_max_connections: 20_000,
+        ..Default::default()
     }
 }
 
@@ -202,7 +201,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         upstreams: vec![],
         loaded_at: Utc::now(),
     };
-    ProxyState::new(config, dns_cache, create_test_env_config()).unwrap()
+    ProxyState::new(config, dns_cache, create_test_env_config(), None).unwrap()
 }
 
 /// Start a mock gRPC backend (h2c HTTP/2 server) that echoes requests.

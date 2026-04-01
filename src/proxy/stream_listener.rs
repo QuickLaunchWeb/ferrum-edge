@@ -15,6 +15,7 @@ use crate::config::types::{BackendProtocol, GatewayConfig};
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
+use crate::tls::TlsPolicy;
 
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
@@ -54,12 +55,16 @@ pub struct StreamListenerManager {
     frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
+    /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
+    tls_ca_bundle_path: Option<String>,
     /// Global default TCP idle timeout in seconds (per-proxy `tcp_idle_timeout_seconds` overrides).
     tcp_idle_timeout_seconds: u64,
     /// Maximum concurrent UDP sessions per proxy.
     udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds.
     udp_cleanup_interval_seconds: u64,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl StreamListenerManager {
@@ -73,9 +78,11 @@ impl StreamListenerManager {
         circuit_breaker_cache: Arc<CircuitBreakerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
+        tls_ca_bundle_path: Option<String>,
         tcp_idle_timeout_seconds: u64,
         udp_max_sessions: usize,
         udp_cleanup_interval_seconds: u64,
+        tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -89,9 +96,11 @@ impl StreamListenerManager {
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
+            tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
+            tls_policy,
         }
     }
 
@@ -281,6 +290,8 @@ impl StreamListenerManager {
                 let metrics = Arc::new(TcpProxyMetrics::default());
                 let plugin_cache = self.plugin_cache.clone();
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
+                let tls_policy = self.tls_policy.clone();
+                let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -293,9 +304,11 @@ impl StreamListenerManager {
                         shutdown: shutdown_rx,
                         metrics,
                         tls_no_verify,
+                        tls_ca_bundle_path,
                         plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
                         circuit_breaker_cache: cb_cache,
+                        tls_policy,
                     })
                     .await
                     {

@@ -35,7 +35,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
@@ -70,11 +70,17 @@ pub struct GrpcConnectionPool {
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl Default for GrpcConnectionPool {
     fn default() -> Self {
-        Self::new(PoolConfig::default(), crate::config::EnvConfig::default())
+        Self::new(
+            PoolConfig::default(),
+            crate::config::EnvConfig::default(),
+            None,
+        )
     }
 }
 
@@ -82,12 +88,14 @@ impl GrpcConnectionPool {
     pub fn new(
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
+        tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
+            tls_policy,
         };
 
         pool.start_cleanup_task();
@@ -103,11 +111,28 @@ impl GrpcConnectionPool {
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
     ///
+    /// Includes all fields that affect connection *identity*: destination,
+    /// TLS mode, DNS override, CA cert, mTLS client cert, and server cert verification.
+    /// Uses `|` as field delimiter to avoid ambiguity with `:` in IPv6 addresses.
+    ///
     /// Returns the base key (without shard suffix). For shard keys, the caller
     /// appends `#N` using `write!` to avoid extra allocations.
     fn pool_key(proxy: &Proxy) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
-        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)
+        let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let ca = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, tls, dns, ca, mtls_cert, verify as u8,
+        )
     }
 
     /// Build a shard key by appending the shard index to a pre-allocated buffer.
@@ -386,33 +411,34 @@ impl GrpcConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        // Build root certificate store
-        let mut root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        // Build root certificate store:
+        // - Custom CA configured → empty store + only that CA (no public roots)
+        // - No CA configured → webpki/system roots as default fallback
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_ref()
+            .or(self.global_env_config.tls_ca_bundle_path.as_ref());
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
         };
 
-        // Add custom CA bundle if configured (unless no_verify is set)
-        if !self.global_env_config.tls_no_verify
-            && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
-        {
-            match std::fs::read(ca_bundle_path) {
-                Ok(ca_pem) => {
-                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
-                    let certs = rustls_pemfile::certs(&mut reader);
-                    for cert in certs.flatten() {
-                        if let Err(e) = root_store.add(cert) {
-                            warn!("gRPC: failed to add CA cert from bundle: {}", e);
-                        }
-                    }
-                    debug!("gRPC: loaded custom CA bundle from {}", ca_bundle_path);
-                }
-                Err(e) => {
-                    warn!(
-                        "gRPC: failed to read CA bundle from {}: {}",
-                        ca_bundle_path, e
-                    );
+        if let Some(ca_bundle_path) = ca_path {
+            let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| {
+                GrpcProxyError::Internal(format!(
+                    "Failed to read CA bundle from {}: {}",
+                    ca_bundle_path, e
+                ))
+            })?;
+            let mut reader = std::io::BufReader::new(&ca_pem[..]);
+            let certs = rustls_pemfile::certs(&mut reader);
+            for cert in certs.flatten() {
+                if let Err(e) = root_store.add(cert) {
+                    warn!("gRPC: failed to add CA cert from bundle: {}", e);
                 }
             }
+            debug!("gRPC: loaded custom CA bundle from {}", ca_bundle_path);
         }
 
         // Load mTLS client certificate if configured (proxy-specific overrides take priority)
@@ -457,14 +483,16 @@ impl GrpcConnectionPool {
                 cert_path, key_path
             );
 
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| GrpcProxyError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
                     GrpcProxyError::Internal(format!("Invalid client certificate/key: {}", e))
                 })?
         } else {
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| GrpcProxyError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
@@ -475,7 +503,7 @@ impl GrpcConnectionPool {
         // Force HTTP/2 via ALPN
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-        // Optionally skip server cert verification
+        // Skip server cert verification only if explicitly disabled or global no_verify
         if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()

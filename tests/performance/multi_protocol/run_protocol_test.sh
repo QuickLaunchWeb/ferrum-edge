@@ -161,11 +161,11 @@ start_gateway() {
         FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
         FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
         FERRUM_TLS_NO_VERIFY=true
-        # HTTP/2 flow control tuning (8 MiB stream, 32 MiB connection, fixed windows)
+        # HTTP/2 flow control tuning (8 MiB stream, 32 MiB connection, adaptive BDP)
         FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608
         FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432
-        FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false
-        FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=65535
+        FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true
+        FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576
         FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
         # HTTP/3 QUIC transport tuning (8 MiB stream, 32 MiB connection, 8 MiB send)
         FERRUM_HTTP3_MAX_STREAMS=1000
@@ -175,8 +175,8 @@ start_gateway() {
     )
     if [ -f "$cert_dir/cert.pem" ]; then
         env_cmd+=(
-            "FERRUM_PROXY_TLS_CERT_PATH=$cert_dir/cert.pem"
-            "FERRUM_PROXY_TLS_KEY_PATH=$cert_dir/key.pem"
+            "FERRUM_FRONTEND_TLS_CERT_PATH=$cert_dir/cert.pem"
+            "FERRUM_FRONTEND_TLS_KEY_PATH=$cert_dir/key.pem"
             "FERRUM_DTLS_CERT_PATH=$cert_dir/cert.pem"
             "FERRUM_DTLS_KEY_PATH=$cert_dir/key.pem"
         )

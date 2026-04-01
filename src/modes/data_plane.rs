@@ -1,3 +1,13 @@
+//! Data Plane mode — proxy-only node that receives config from a Control Plane.
+//!
+//! The DP starts with an empty `GatewayConfig` and receives its first full
+//! snapshot from the CP within seconds of establishing the gRPC `Subscribe`
+//! stream. Subsequent updates arrive as incremental deltas (`update_type=1`).
+//!
+//! The DP has no direct database access. Its admin API is always read-only.
+//! If the gRPC connection to the CP drops, the DP continues serving with
+//! cached config and reconnects with a 5-second backoff loop.
+
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -33,8 +43,17 @@ pub async fn run(
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
+    // Build TLS hardening policy from environment (needed for both frontend
+    // and backend TLS — cipher suites, protocol versions, key exchange groups).
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+
     // Start with empty config; CP will push the real one via gRPC
-    let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone())?;
+    let proxy_state = ProxyState::new(
+        GatewayConfig::default(),
+        dns_cache,
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
 
     // Start service discovery background tasks (initially no-op with empty config;
     // tasks are reconciled when CP pushes config via update_config)
@@ -119,13 +138,10 @@ pub async fn run(
         .await;
     });
 
-    // Build TLS hardening policy from environment
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.proxy_tls_cert_path,
-        &env_config.proxy_tls_key_path,
+        &env_config.frontend_tls_cert_path,
+        &env_config.frontend_tls_key_path,
     ) {
         info!("Loading TLS configuration...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();

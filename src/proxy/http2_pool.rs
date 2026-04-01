@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::DnsCache;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -55,11 +55,17 @@ pub struct Http2ConnectionPool {
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl Default for Http2ConnectionPool {
     fn default() -> Self {
-        Self::new(PoolConfig::default(), crate::config::EnvConfig::default())
+        Self::new(
+            PoolConfig::default(),
+            crate::config::EnvConfig::default(),
+            None,
+        )
     }
 }
 
@@ -67,12 +73,14 @@ impl Http2ConnectionPool {
     pub fn new(
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
+        tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
+            tls_policy,
         };
 
         pool.start_cleanup_task();
@@ -84,13 +92,37 @@ impl Http2ConnectionPool {
         self.entries.len()
     }
 
-    /// Pool key — kept minimal to avoid fragmentation.
+    /// Pool key — includes all fields that affect connection identity.
+    /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
     fn pool_key(proxy: &Proxy) -> String {
-        format!("{}:{}", proxy.backend_host, proxy.backend_port)
+        let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let ca = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, dns, ca, mtls_cert, verify as u8,
+        )
     }
 
-    fn shard_key(base_key: &str, shard: usize) -> String {
-        format!("{base_key}#{shard}")
+    /// Build a shard key by appending the shard index to a pre-allocated buffer.
+    /// Reuses the same buffer across calls to minimize allocations.
+    fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
+        buf.clear();
+        buf.push_str(base_key);
+        buf.push('#');
+        if shard < 10 {
+            buf.push((b'0' + shard as u8) as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(buf, "{shard}");
+        }
     }
 
     /// Get or create an HTTP/2 connection to the HTTPS backend.
@@ -119,6 +151,9 @@ impl Http2ConnectionPool {
             .clone();
         let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
+        // Reusable buffer for shard key construction (avoids per-shard String allocation)
+        let mut key_buf = String::with_capacity(base_key.len() + 4);
+
         // Two-phase readiness check:
         //
         // Phase 1 (zero-cost): poll each shard's sender once without blocking.
@@ -131,12 +166,12 @@ impl Http2ConnectionPool {
         let mut first_live_key: Option<String> = None;
         for offset in 0..shard_count {
             let shard = (start + offset) % shard_count;
-            let key = Self::shard_key(&base_key, shard);
+            Self::write_shard_key(&mut key_buf, &base_key, shard);
 
-            if let Some(entry) = self.entries.get(&key) {
+            if let Some(entry) = self.entries.get(&key_buf) {
                 if entry.sender.is_closed() {
                     drop(entry);
-                    self.entries.remove(&key);
+                    self.entries.remove(&key_buf);
                     continue;
                 }
                 let mut sender = entry.sender.clone();
@@ -150,13 +185,13 @@ impl Http2ConnectionPool {
                     Some(Ok(())) => return Ok(sender),
                     Some(Err(_)) => {
                         // Connection error — evict and try next shard
-                        self.entries.remove(&key);
+                        self.entries.remove(&key_buf);
                         continue;
                     }
                     None => {
                         // Not ready yet — remember this shard for phase 2
                         if first_live_key.is_none() {
-                            first_live_key = Some(key);
+                            first_live_key = Some(key_buf.clone());
                         }
                     }
                 }
@@ -183,15 +218,15 @@ impl Http2ConnectionPool {
 
         // No existing shard was ready — create a new connection on the
         // originally selected shard.
-        let selected_key = Self::shard_key(&base_key, start);
+        Self::write_shard_key(&mut key_buf, &base_key, start);
         let sender = match self.create_connection(proxy, dns_cache).await {
             Ok(sender) => sender,
             Err(err) => {
                 // Connection failed — try to find any live shard as fallback
                 for offset in 1..shard_count {
                     let shard = (start + offset) % shard_count;
-                    let key = Self::shard_key(&base_key, shard);
-                    if let Some(entry) = self.entries.get(&key) {
+                    Self::write_shard_key(&mut key_buf, &base_key, shard);
+                    if let Some(entry) = self.entries.get(&key_buf) {
                         if !entry.sender.is_closed() {
                             entry
                                 .last_used_epoch_ms
@@ -199,13 +234,13 @@ impl Http2ConnectionPool {
                             return Ok(entry.sender.clone());
                         }
                         drop(entry);
-                        self.entries.remove(&key);
+                        self.entries.remove(&key_buf);
                     }
                 }
                 return Err(err);
             }
         };
-        let sender = match self.entries.entry(selected_key) {
+        let sender = match self.entries.entry(key_buf) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if occupied.get().sender.is_closed() {
                     occupied.insert(Http2PoolEntry {
@@ -339,36 +374,37 @@ impl Http2ConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        // Build root certificate store
-        let mut root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        // Build root certificate store:
+        // - Custom CA configured → empty store + only that CA (no public roots)
+        // - No CA configured → webpki/system roots as default fallback
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_ref()
+            .or(self.global_env_config.tls_ca_bundle_path.as_ref());
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
         };
 
-        // Add custom CA bundle if configured (unless no_verify is set)
-        if !self.global_env_config.tls_no_verify
-            && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
-        {
-            match std::fs::read(ca_bundle_path) {
-                Ok(ca_pem) => {
-                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
-                    let certs = rustls_pemfile::certs(&mut reader);
-                    for cert in certs.flatten() {
-                        if let Err(e) = root_store.add(cert) {
-                            warn!("http2_pool: failed to add CA cert from bundle: {}", e);
-                        }
-                    }
-                    debug!(
-                        "http2_pool: loaded custom CA bundle from {}",
-                        ca_bundle_path
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "http2_pool: failed to read CA bundle from {}: {}",
-                        ca_bundle_path, e
-                    );
+        if let Some(ca_bundle_path) = ca_path {
+            let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| {
+                Http2PoolError::Internal(format!(
+                    "Failed to read CA bundle from {}: {}",
+                    ca_bundle_path, e
+                ))
+            })?;
+            let mut reader = std::io::BufReader::new(&ca_pem[..]);
+            let certs = rustls_pemfile::certs(&mut reader);
+            for cert in certs.flatten() {
+                if let Err(e) = root_store.add(cert) {
+                    warn!("http2_pool: failed to add CA cert from bundle: {}", e);
                 }
             }
+            debug!(
+                "http2_pool: loaded custom CA bundle from {}",
+                ca_bundle_path
+            );
         }
 
         // Load mTLS client certificate if configured (proxy-specific overrides take priority)
@@ -413,14 +449,16 @@ impl Http2ConnectionPool {
                 cert_path, key_path
             );
 
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
                     Http2PoolError::Internal(format!("Invalid client certificate/key: {}", e))
                 })?
         } else {
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
@@ -431,7 +469,7 @@ impl Http2ConnectionPool {
         // Force HTTP/2 via ALPN
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-        // Optionally skip server cert verification
+        // Skip server cert verification only if explicitly disabled or global no_verify
         if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()

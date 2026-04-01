@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{AuthMode, BackendProtocol, Consumer, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -42,8 +42,8 @@ fn create_test_env_config() -> EnvConfig {
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8002,
         proxy_https_port: 8443,
-        proxy_tls_cert_path: None,
-        proxy_tls_key_path: None,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
         proxy_bind_address: "0.0.0.0".into(),
         admin_http_port: 9004,
         admin_https_port: 9443,
@@ -115,6 +115,7 @@ fn create_test_env_config() -> EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        tls_session_cache_size: 4096,
         stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
@@ -132,9 +133,7 @@ fn create_test_env_config() -> EnvConfig {
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
-        server_http2_max_pending_accept_reset_streams: 64,
-        server_http2_max_local_error_reset_streams: 256,
-        websocket_max_connections: 20_000,
+        ..Default::default()
     }
 }
 
@@ -221,7 +220,7 @@ fn create_proxy_state() -> ProxyState {
         slow_threshold_ms: None,
     });
     let env_config = create_test_env_config();
-    ProxyState::new(GatewayConfig::default(), dns_cache, env_config).unwrap()
+    ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None).unwrap()
 }
 
 #[ignore]
@@ -355,10 +354,18 @@ async fn test_database_connection_with_tls_config() {
 
     // Test 1: Connect without TLS (plaintext)
     println!("Test 1: Connecting to SQLite without TLS...");
-    let db =
-        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
-            .await
-            .expect("Failed to connect to plaintext SQLite database");
+    let db = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect to plaintext SQLite database");
 
     // Verify we can load config from the database
     let config = db
@@ -400,6 +407,7 @@ async fn test_database_connection_with_tls_config() {
         Some("/path/to/client.pem"),
         Some("/path/to/client-key.pem"),
         false,
+        DbPoolConfig::default(),
     )
     .await
     .expect("Failed to connect with TLS parameters");
@@ -417,10 +425,18 @@ async fn test_database_connection_with_tls_config() {
 
     // Test 5: Test TLS insecure mode
     println!("Test 5: Database connection with TLS insecure mode...");
-    let db_insecure =
-        DatabaseStore::connect_with_tls_config("sqlite", &db_url, true, None, None, None, true)
-            .await
-            .expect("Failed to connect with TLS insecure");
+    let db_insecure = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        true,
+        None,
+        None,
+        None,
+        true,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect with TLS insecure");
 
     let config = db_insecure
         .load_full_config()
@@ -488,6 +504,7 @@ async fn test_grpc_url_construction() {
         Some("/path/to/client.pem"),
         Some("/path/to/client-key.pem"),
         false,
+        DbPoolConfig::default(),
     )
     .await;
 
@@ -508,6 +525,7 @@ async fn test_grpc_url_construction() {
         None,
         None,
         false,
+        DbPoolConfig::default(),
     )
     .await;
 

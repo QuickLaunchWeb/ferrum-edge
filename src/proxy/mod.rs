@@ -1,3 +1,25 @@
+//! Core reverse proxy engine — the gateway's hot path.
+//!
+//! This module handles all HTTP/HTTPS/WebSocket proxy requests through a
+//! multi-phase plugin pipeline:
+//!
+//! 1. **Route matching** — `RouterCache::find_proxy()` (O(1) cached, longest-prefix)
+//! 2. **Plugin: on_request_received** — correlation ID, request transformer, bot detection
+//! 3. **Plugin: authenticate** — key_auth, basic_auth, jwt, hmac, jwks, mtls
+//! 4. **Plugin: authorize** — ACL, IP restriction
+//! 5. **Plugin: before_proxy** — rate limiting, body validation, request termination
+//! 6. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
+//!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
+//! 7. **Plugin: after_proxy** — response transformer, CORS
+//! 8. **Plugin: on_response_body** — AI token metrics, AI rate limiter
+//! 9. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//!
+//! Key design principles:
+//! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
+//! - **Pre-computed indexes**: Route table, plugin cache, consumer index rebuilt at config reload
+//! - **Streaming by default**: Response bodies are streamed unless a plugin requires buffering
+//! - **Atomic config reload**: `update_config()` and `apply_incremental()` swap config atomically
+
 pub mod body;
 pub mod client_ip;
 pub mod grpc_proxy;
@@ -34,7 +56,7 @@ use crate::config::types::{
 };
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
-use crate::dns::DnsCache;
+use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
@@ -47,7 +69,7 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
@@ -171,6 +193,13 @@ pub struct ProxyState {
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic instant captured at ProxyState creation for uptime calculation.
     pub started_at: Instant,
+    /// Monotonic counter for generating unique WebSocket connection IDs.
+    /// Used by frame-level plugins (e.g., ws_rate_limiting) for per-connection state.
+    pub ws_connection_counter: Arc<AtomicU64>,
+    /// TLS hardening policy for backend/outbound connections.
+    /// When set, all backend TLS connections use the same cipher suites,
+    /// protocol versions, and key exchange groups as inbound listeners.
+    pub tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl ProxyState {
@@ -178,6 +207,7 @@ impl ProxyState {
         config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
     ) -> Result<Self, anyhow::Error> {
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
@@ -200,13 +230,16 @@ impl ProxyState {
         };
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
+        let tls_policy_arc = tls_policy.map(Arc::new);
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
+            tls_policy_arc.clone(),
         ));
         let http2_pool = Arc::new(Http2ConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
+            tls_policy_arc.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
         let h3_pool = Arc::new(Http3ConnectionPool::new(env_config_arc.clone()));
@@ -214,6 +247,7 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config,
             dns_cache.clone(),
+            tls_policy_arc.clone(),
         ));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
@@ -238,7 +272,8 @@ impl ProxyState {
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
-        let mut health_checker = HealthChecker::with_pool_config(&global_pool_config);
+        let mut health_checker =
+            HealthChecker::with_pool_config(&global_pool_config, dns_cache.clone());
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
@@ -275,9 +310,11 @@ impl ProxyState {
             circuit_breaker_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
+            env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
+            tls_policy_arc.clone(),
         ));
 
         // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
@@ -314,6 +351,8 @@ impl ProxyState {
             websocket_conn_limit,
             stream_listener_manager,
             started_at: Instant::now(),
+            ws_connection_counter: Arc::new(AtomicU64::new(0)),
+            tls_policy: tls_policy_arc,
         })
     }
 
@@ -957,7 +996,7 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     }
 }
 
-fn try_acquire_websocket_connection_permit(
+pub fn try_acquire_websocket_connection_permit(
     limit: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
     match limit {
@@ -979,6 +1018,7 @@ async fn handle_websocket_request_authenticated(
     upstream_target: Option<UpstreamTarget>,
     lb_hash_key: String,
     sticky_cookie_needed: bool,
+    start_time: Instant,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -1030,8 +1070,16 @@ async fn handle_websocket_request_authenticated(
                     websocket_limit = state.env_config.websocket_max_connections,
                     "Rejecting WebSocket upgrade: connection limit reached"
                 );
-                state.request_count.fetch_add(1, Ordering::Relaxed);
-                record_status(&state, 503);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    503,
+                    start_time,
+                    "websocket_connection_limit",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, 503);
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     r#"{"error":"WebSocket connection limit exceeded"}"#,
@@ -1059,8 +1107,14 @@ async fn handle_websocket_request_authenticated(
     let mut ws_attempt = 0u32;
 
     let backend_ws_stream = loop {
-        match connect_websocket_backend(&current_backend_url, &proxy, &env_config, &client_headers)
-            .await
+        match connect_websocket_backend(
+            &current_backend_url,
+            &proxy,
+            &env_config,
+            &client_headers,
+            state.tls_policy.as_deref(),
+        )
+        .await
         {
             Ok(stream) => break stream,
             Err(e) => {
@@ -1326,6 +1380,7 @@ async fn handle_websocket_request_authenticated(
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
+    let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -1333,6 +1388,7 @@ async fn handle_websocket_request_authenticated(
                     upgraded,
                     backend_ws_stream,
                     &proxy_id,
+                    ws_conn_id,
                     ws_frame_plugins,
                     ws_connection_permit,
                 )
@@ -1437,49 +1493,63 @@ fn build_websocket_backend_url_with_target(
 
 /// Build a rustls TLS connector for WebSocket backends that respects
 /// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
+/// When `tls_policy` is provided, outbound connections use the same cipher suites,
+/// protocol versions, and key exchange groups as inbound listeners.
 fn build_websocket_tls_connector(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
-) -> Option<tokio_tungstenite::Connector> {
+    tls_policy: Option<&TlsPolicy>,
+) -> Result<Option<tokio_tungstenite::Connector>, anyhow::Error> {
     // Only build a TLS connector for wss:// backends
     if proxy.backend_protocol != BackendProtocol::Wss {
-        return None;
+        return Ok(None);
     }
 
     // Determine if we should skip server cert verification
     let skip_verify = env_config.tls_no_verify || !proxy.backend_tls_verify_server_cert;
 
-    // Build root certificate store
-    let mut root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Add custom CA bundle (proxy-level takes priority over global)
+    // Build root certificate store:
+    // - Custom CA configured → empty store + only that CA (no public roots)
+    // - No CA configured → webpki/system roots as default fallback
     let ca_path = proxy
         .backend_tls_server_ca_cert_path
         .as_ref()
         .or(env_config.tls_ca_bundle_path.as_ref());
+    let mut root_store = if ca_path.is_some() {
+        rustls::RootCertStore::empty()
+    } else {
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+    };
     if let Some(ca_path) = ca_path {
-        match std::fs::read(ca_path) {
-            Ok(ca_pem) => {
-                let mut cursor = std::io::Cursor::new(ca_pem);
-                let certs = rustls_pemfile::certs(&mut cursor);
-                for cert in certs.flatten() {
-                    if let Err(e) = root_store.add(cert) {
-                        warn!("Failed to add CA certificate for WebSocket TLS: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to read CA bundle '{}' for WebSocket TLS: {}",
-                    ca_path, e
-                );
-            }
+        let ca_pem = std::fs::read(ca_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read CA bundle '{}' for WebSocket TLS: {}",
+                ca_path,
+                e
+            )
+        })?;
+        let mut cursor = std::io::Cursor::new(ca_pem);
+        let certs = rustls_pemfile::certs(&mut cursor);
+        for cert in certs.flatten() {
+            root_store.add(cert).map_err(|e| {
+                anyhow::anyhow!("Failed to add CA certificate for WebSocket TLS: {}", e)
+            })?;
         }
     }
 
-    // Build client config
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    // Build client config with TLS policy (cipher suites, protocol versions)
+    let builder = match crate::tls::backend_client_config_builder(tls_policy) {
+        Ok(b) => b.with_root_certificates(root_store),
+        Err(e) => {
+            warn!(
+                "Failed to build WebSocket TLS config with policy: {}, using defaults",
+                e
+            );
+            rustls::ClientConfig::builder().with_root_certificates(
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            )
+        }
+    };
 
     // Add client certificate for mTLS (proxy-level overrides take priority)
     let cert_path = proxy
@@ -1492,38 +1562,42 @@ fn build_websocket_tls_connector(
         .or(env_config.backend_tls_client_key_path.as_ref());
 
     let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        match (std::fs::read(cert_path), std::fs::read(key_path)) {
-            (Ok(cert_pem), Ok(key_pem)) => {
-                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
-                    .flatten()
-                    .collect();
-                let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
-                    .ok()
-                    .flatten();
-                match key {
-                    Some(key) => match builder.clone().with_client_auth_cert(certs, key) {
-                        Ok(config) => config,
-                        Err(e) => {
-                            warn!("Failed to configure WebSocket mTLS client cert: {}", e);
-                            builder.with_no_client_auth()
-                        }
-                    },
-                    None => {
-                        warn!("No private key found in '{}' for WebSocket mTLS", key_path);
-                        builder.with_no_client_auth()
-                    }
-                }
-            }
-            _ => {
-                warn!("Failed to read client cert/key for WebSocket mTLS");
-                builder.with_no_client_auth()
-            }
-        }
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read client cert '{}' for WebSocket mTLS: {}",
+                cert_path,
+                e
+            )
+        })?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read client key '{}' for WebSocket mTLS: {}",
+                key_path,
+                e
+            )
+        })?;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+            .flatten()
+            .collect();
+        let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse private key '{}' for WebSocket mTLS: {}",
+                    key_path,
+                    e
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("No private key found in '{}' for WebSocket mTLS", key_path)
+            })?;
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("Failed to configure WebSocket mTLS client cert: {}", e))?
     } else {
         builder.with_no_client_auth()
     };
 
-    // Disable server certificate verification if configured
+    // Disable server certificate verification only if explicitly opted out
     if skip_verify {
         warn!(
             "WebSocket backend TLS certificate verification DISABLED for proxy {}",
@@ -1534,9 +1608,9 @@ fn build_websocket_tls_connector(
             .set_certificate_verifier(Arc::new(NoVerifier));
     }
 
-    Some(tokio_tungstenite::Connector::Rustls(Arc::new(
+    Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(
         client_config,
-    )))
+    ))))
 }
 
 /// Connect to backend WebSocket server before sending 101 to client.
@@ -1546,15 +1620,14 @@ async fn connect_websocket_backend(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
+    tls_policy: Option<&TlsPolicy>,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),
-        max_message_size: Some(64 << 20),
-        ..Default::default()
-    };
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(16 << 20);
+    ws_config.max_message_size = Some(64 << 20);
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -1566,7 +1639,7 @@ async fn connect_websocket_backend(
         }
     }
 
-    let connector = build_websocket_tls_connector(proxy, env_config);
+    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     let connect_future =
         connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
@@ -1598,6 +1671,7 @@ async fn connect_websocket_backend(
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
 ///
+/// `connection_id` — unique per-connection identifier for stateful frame plugins.
 /// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
 /// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
 /// when no plugin on this proxy needs frame inspection.
@@ -1605,14 +1679,13 @@ async fn run_websocket_proxy(
     upgraded: Upgraded,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     proxy_id: &str,
+    connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),
-        max_message_size: Some(64 << 20),
-        ..Default::default()
-    };
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(16 << 20);
+    ws_config.max_message_size = Some(64 << 20);
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
@@ -1632,61 +1705,86 @@ async fn run_websocket_proxy(
     let proxy_id_ctb = proxy_id.to_string();
     let proxy_id_btc = proxy_id.to_string();
 
+    // Cancellation token for clean bidirectional close when a plugin triggers Close.
+    // Each direction checks this token to know if the other side initiated a close.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_ctb = cancel.clone();
+    let cancel_btc = cancel.clone();
+
     // Forward messages from client to backend
     let client_to_backend = async move {
         debug!("Starting client -> backend message forwarding");
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
-                    let raw = msg.unwrap(); // safe: matched Ok above
-                    // Apply frame hooks when any plugin opted in (zero overhead when empty)
-                    let outgoing = if ctb_plugins.is_empty() {
-                        raw
-                    } else {
-                        let mut current = raw;
-                        for plugin in &ctb_plugins {
-                            if let Some(transformed) = plugin
-                                .on_ws_frame(
-                                    &proxy_id_ctb,
-                                    WebSocketFrameDirection::ClientToBackend,
-                                    &current,
-                                )
-                                .await
-                            {
-                                current = transformed;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_ctb.cancelled() => {
+                    debug!("Client->backend: other direction triggered close");
+                    let _ = backend_sink.send(Message::Close(None)).await;
+                    break;
+                }
+                msg = ws_stream.next() => {
+                    let Some(msg) = msg else { break };
+                    match msg {
+                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
+                            let raw = msg.unwrap(); // safe: matched Ok above
+                            // Apply frame hooks when any plugin opted in (zero overhead when empty)
+                            let outgoing = if ctb_plugins.is_empty() {
+                                raw
+                            } else {
+                                let mut current = raw;
+                                for plugin in &ctb_plugins {
+                                    if let Some(transformed) = plugin
+                                        .on_ws_frame(
+                                            &proxy_id_ctb,
+                                            connection_id,
+                                            WebSocketFrameDirection::ClientToBackend,
+                                            &current,
+                                        )
+                                        .await
+                                    {
+                                        current = transformed;
+                                    }
+                                }
+                                current
+                            };
+                            // If a plugin transformed the frame into a Close, close both sides
+                            if matches!(&outgoing, Message::Close(_)) {
+                                debug!("Plugin triggered close on client->backend frame");
+                                let _ = backend_sink.send(outgoing).await;
+                                cancel_ctb.cancel(); // signal other direction
+                                break;
+                            }
+                            match &outgoing {
+                                Message::Text(_) => trace!("Client -> Backend: Text message"),
+                                Message::Binary(d) => {
+                                    trace!(bytes = d.len(), "Client -> Backend: Binary message")
+                                }
+                                Message::Ping(_) => trace!("Client -> Backend: Ping"),
+                                _ => {}
+                            }
+                            if let Err(e) = backend_sink.send(outgoing).await {
+                                error!("Failed to send message to backend: {}", e);
+                                break;
                             }
                         }
-                        current
-                    };
-                    match &outgoing {
-                        Message::Text(_) => trace!("Client -> Backend: Text message"),
-                        Message::Binary(d) => {
-                            trace!(bytes = d.len(), "Client -> Backend: Binary message")
+                        Ok(Message::Close(close_frame)) => {
+                            debug!("Client sent close frame");
+                            if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
+                                error!("Failed to send close to backend: {}", e);
+                            }
+                            break;
                         }
-                        Message::Ping(_) => trace!("Client -> Backend: Ping"),
-                        _ => {}
+                        Ok(Message::Pong(_data)) => {
+                            trace!("Client -> Backend: Pong");
+                        }
+                        Ok(Message::Frame(_)) => {
+                            trace!("Client -> Backend: Frame");
+                        }
+                        Err(e) => {
+                            error!("Error receiving from client: {}", e);
+                            break;
+                        }
                     }
-                    if let Err(e) = backend_sink.send(outgoing).await {
-                        error!("Failed to send message to backend: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Close(close_frame)) => {
-                    debug!("Client sent close frame");
-                    if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
-                        error!("Failed to send close to backend: {}", e);
-                    }
-                    break;
-                }
-                Ok(Message::Pong(_data)) => {
-                    trace!("Client -> Backend: Pong");
-                }
-                Ok(Message::Frame(_)) => {
-                    trace!("Client -> Backend: Frame");
-                }
-                Err(e) => {
-                    error!("Error receiving from client: {}", e);
-                    break;
                 }
             }
         }
@@ -1696,58 +1794,77 @@ async fn run_websocket_proxy(
     // Forward messages from backend to client
     let backend_to_client = async move {
         debug!("Starting backend -> client message forwarding");
-        while let Some(msg) = backend_stream.next().await {
-            match msg {
-                Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
-                    let raw = msg.unwrap(); // safe: matched Ok above
-                    // Apply frame hooks when any plugin opted in (zero overhead when empty)
-                    let outgoing = if btc_plugins.is_empty() {
-                        raw
-                    } else {
-                        let mut current = raw;
-                        for plugin in &btc_plugins {
-                            if let Some(transformed) = plugin
-                                .on_ws_frame(
-                                    &proxy_id_btc,
-                                    WebSocketFrameDirection::BackendToClient,
-                                    &current,
-                                )
-                                .await
-                            {
-                                current = transformed;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_btc.cancelled() => {
+                    debug!("Backend->client: other direction triggered close");
+                    let _ = ws_sink.send(Message::Close(None)).await;
+                    break;
+                }
+                msg = backend_stream.next() => {
+                    let Some(msg) = msg else { break };
+                    match msg {
+                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
+                            let raw = msg.unwrap(); // safe: matched Ok above
+                            // Apply frame hooks when any plugin opted in (zero overhead when empty)
+                            let outgoing = if btc_plugins.is_empty() {
+                                raw
+                            } else {
+                                let mut current = raw;
+                                for plugin in &btc_plugins {
+                                    if let Some(transformed) = plugin
+                                        .on_ws_frame(
+                                            &proxy_id_btc,
+                                            connection_id,
+                                            WebSocketFrameDirection::BackendToClient,
+                                            &current,
+                                        )
+                                        .await
+                                    {
+                                        current = transformed;
+                                    }
+                                }
+                                current
+                            };
+                            // If a plugin transformed the frame into a Close, close both sides
+                            if matches!(&outgoing, Message::Close(_)) {
+                                debug!("Plugin triggered close on backend->client frame");
+                                let _ = ws_sink.send(outgoing).await;
+                                cancel_btc.cancel(); // signal other direction
+                                break;
+                            }
+                            match &outgoing {
+                                Message::Text(_) => trace!("Backend -> Client: Text message"),
+                                Message::Binary(d) => {
+                                    trace!(bytes = d.len(), "Backend -> Client: Binary message")
+                                }
+                                Message::Ping(_) => trace!("Backend -> Client: Ping"),
+                                _ => {}
+                            }
+                            if let Err(e) = ws_sink.send(outgoing).await {
+                                error!("Failed to send message to client: {}", e);
+                                break;
                             }
                         }
-                        current
-                    };
-                    match &outgoing {
-                        Message::Text(_) => trace!("Backend -> Client: Text message"),
-                        Message::Binary(d) => {
-                            trace!(bytes = d.len(), "Backend -> Client: Binary message")
+                        Ok(Message::Close(close_frame)) => {
+                            debug!("Backend sent close frame");
+                            if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
+                                error!("Failed to send close to client: {}", e);
+                            }
+                            break;
                         }
-                        Message::Ping(_) => trace!("Backend -> Client: Ping"),
-                        _ => {}
+                        Ok(Message::Pong(_data)) => {
+                            trace!("Backend -> Client: Pong");
+                        }
+                        Ok(Message::Frame(_)) => {
+                            trace!("Backend -> Client: Frame");
+                        }
+                        Err(e) => {
+                            error!("Error receiving from backend: {}", e);
+                            break;
+                        }
                     }
-                    if let Err(e) = ws_sink.send(outgoing).await {
-                        error!("Failed to send message to client: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Close(close_frame)) => {
-                    debug!("Backend sent close frame");
-                    if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
-                        error!("Failed to send close to client: {}", e);
-                    }
-                    break;
-                }
-                Ok(Message::Pong(_data)) => {
-                    trace!("Backend -> Client: Pong");
-                }
-                Ok(Message::Frame(_)) => {
-                    trace!("Backend -> Client: Frame");
-                }
-                Err(e) => {
-                    error!("Error receiving from backend: {}", e);
-                    break;
                 }
             }
         }
@@ -2592,6 +2709,7 @@ pub async fn handle_proxy_request(
             upstream_target,
             lb_hash_key.0,
             sticky_cookie_needed,
+            start_time,
         )
         .await;
     }
@@ -2820,7 +2938,12 @@ pub async fn handle_proxy_request(
                 let mut resp_builder = Response::builder()
                     .status(StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK));
                 for (k, v) in &response_headers {
-                    resp_builder = resp_builder.header(k.as_str(), v.as_str());
+                    if let (Ok(name), Ok(val)) = (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        resp_builder = resp_builder.header(name, val);
+                    }
                 }
 
                 return Ok(resp_builder
@@ -2943,7 +3066,12 @@ pub async fn handle_proxy_request(
                 let mut resp_builder = Response::builder()
                     .status(StatusCode::from_u16(grpc_resp.status).unwrap_or(StatusCode::OK));
                 for (k, v) in &response_headers {
-                    resp_builder = resp_builder.header(k.as_str(), v.as_str());
+                    if let (Ok(name), Ok(val)) = (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        resp_builder = resp_builder.header(name, val);
+                    }
                 }
 
                 return Ok(resp_builder
@@ -3454,10 +3582,15 @@ pub async fn handle_proxy_request(
             // Set-Cookie values were stored newline-separated to avoid RFC-violating
             // comma folding. Emit each value as a separate header line.
             for cookie_val in v.split('\n') {
-                resp_builder = resp_builder.header("set-cookie", cookie_val);
+                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
+                    resp_builder = resp_builder.header("set-cookie", val);
+                }
             }
-        } else {
-            resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        } else if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            resp_builder = resp_builder.header(name, val);
         }
     }
 
@@ -3921,7 +4054,8 @@ async fn proxy_to_backend(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
-            // Fallback to creating new client
+            // Fallback to creating new client with shared DNS cache
+            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -3932,6 +4066,7 @@ async fn proxy_to_backend(
                 .danger_accept_invalid_certs(
                     !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
+                .dns_resolver(Arc::new(resolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }
@@ -4953,29 +5088,6 @@ async fn proxy_to_backend_http3(
                 retained_body,
             )
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::try_acquire_websocket_connection_permit;
-    use std::sync::Arc;
-
-    #[test]
-    fn websocket_connection_permit_is_optional() {
-        let permit = try_acquire_websocket_connection_permit(None).unwrap();
-        assert!(permit.is_none());
-    }
-
-    #[test]
-    fn websocket_connection_permit_rejects_when_limit_is_exhausted() {
-        let limit = Arc::new(tokio::sync::Semaphore::new(1));
-        let _first = try_acquire_websocket_connection_permit(Some(&limit))
-            .unwrap()
-            .expect("first permit should be available");
-
-        let second = try_acquire_websocket_connection_permit(Some(&limit));
-        assert!(second.is_err(), "second permit should be rejected");
     }
 }
 

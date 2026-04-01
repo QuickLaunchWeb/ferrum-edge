@@ -1,5 +1,20 @@
+//! JWT authentication plugin with two-phase token verification.
+//!
+//! Uses a two-phase decode approach:
+//! 1. **Insecure decode** — peek at the unverified claims to extract the consumer
+//!    identity (via `consumer_claim_field`, default `"sub"`). This is safe because
+//!    the identity is only used to look up the consumer's signing secret.
+//! 2. **Full verification** — decode again with the consumer's secret to validate
+//!    the signature and expiration. Only after this succeeds is the consumer trusted.
+//!
+//! This design allows each consumer to have their own JWT secret (stored in
+//! `consumer.credentials["jwt_auth"]["secret"]`), avoiding a single shared secret.
+//!
+//! Token location is configurable via `token_lookup` (default `"header:Authorization"`).
+//! Supports `"header:<name>"` and `"query:<name>"` extraction modes.
+
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
@@ -11,13 +26,7 @@ use super::{Plugin, PluginResult, RequestContext};
 /// Unsafe validation that skips signature verification, used only to extract
 /// claims before looking up the consumer's secret for proper verification.
 fn decode_claims_only(token: &str) -> Option<serde_json::Value> {
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.insecure_disable_signature_validation();
-    validation.validate_exp = false;
-    validation.required_spec_claims.clear();
-    // Use an empty key since signature is not verified
-    let key = DecodingKey::from_secret(b"");
-    decode::<serde_json::Value>(token, &key, &validation)
+    insecure_decode::<serde_json::Value>(token)
         .ok()
         .map(|td| td.claims)
 }

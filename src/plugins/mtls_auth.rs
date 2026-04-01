@@ -1,3 +1,14 @@
+//! Mutual TLS (mTLS) client certificate authentication plugin.
+//!
+//! Extracts the client certificate from the TLS handshake (passed via the
+//! `X-Client-Cert` header by the TLS terminator) and matches a configurable
+//! certificate field (Subject CN, OU, O, SAN DNS/Email, fingerprint, or serial)
+//! against the consumer's `mtls_auth.identity` credential for O(1) lookup.
+//!
+//! Optionally validates the certificate issuer against an allow-list to ensure
+//! only certificates from trusted CAs are accepted (defense-in-depth on top
+//! of the TLS layer's CA verification).
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -393,7 +404,7 @@ impl Plugin for MtlsAuth {
                 debug!("mtls_auth: issuer constraint failed: {}", reason);
                 return PluginResult::Reject {
                     status_code: 403,
-                    body: format!(r#"{{"error":"{}"}}"#, reason),
+                    body: format!(r#"{{"error":"{}"}}"#, escape_json_string(&reason)),
                     headers: HashMap::new(),
                 };
             }
@@ -426,4 +437,12 @@ impl Plugin for MtlsAuth {
             headers: HashMap::new(),
         }
     }
+}
+
+/// Escape special characters for safe JSON string interpolation.
+fn escape_json_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
 }

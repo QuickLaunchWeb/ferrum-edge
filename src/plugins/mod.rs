@@ -1,3 +1,17 @@
+//! Plugin system — 33+ built-in plugins with a trait-based architecture.
+//!
+//! Plugins execute in priority order (lower number = runs first) through
+//! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
+//! `before_proxy` → `after_proxy` → `on_response_body` → `log` → `on_ws_frame`.
+//!
+//! Each plugin declares which protocols it supports via `supported_protocols()`.
+//! The `PluginCache` pre-filters plugins per protocol at config reload time
+//! so the hot path does zero filtering.
+//!
+//! Security plugins (auth, ACL, IP restriction) that fail config validation
+//! cause the gateway to refuse startup — they never silently degrade.
+//! Non-security plugins that fail validation are skipped with a warning.
+
 pub mod access_control;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -10,6 +24,8 @@ pub mod bot_detection;
 pub mod correlation_id;
 pub mod cors;
 pub mod graphql;
+pub mod grpc_deadline;
+pub mod grpc_method_router;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
@@ -31,6 +47,9 @@ pub mod response_transformer;
 pub mod stdout_logging;
 pub mod transaction_debugger;
 pub mod utils;
+pub mod ws_frame_logging;
+pub mod ws_message_size_limiting;
+pub mod ws_rate_limiting;
 
 pub use utils::PluginHttpClient;
 
@@ -82,6 +101,12 @@ pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyPr
 
 /// HTTP-only (single protocol).
 pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
+
+/// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
+pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
+
+/// gRPC-only (single protocol).
+pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
 
 /// Direction of a WebSocket frame being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +298,7 @@ pub mod priority {
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
+    pub const GRPC_METHOD_ROUTER: u16 = 275;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
@@ -287,6 +313,7 @@ pub mod priority {
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
+    pub const GRPC_DEADLINE: u16 = 3050;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_SIZE_LIMITING: u16 = 3950;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
@@ -296,6 +323,9 @@ pub mod priority {
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
+    pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
+    pub const WS_RATE_LIMITING: u16 = 2910;
+    pub const WS_FRAME_LOGGING: u16 = 9050;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
     pub const DEFAULT: u16 = 5000;
 }
@@ -508,10 +538,16 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    ///
+    /// `connection_id` is a unique per-connection identifier (monotonic counter) that
+    /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.
+    ///
     /// Return `Some(message)` to replace the frame, `None` to pass through unchanged.
+    /// Returning `Some(Message::Close(...))` will close the WebSocket in both directions.
     async fn on_ws_frame(
         &self,
         _proxy_id: &str,
+        _connection_id: u64,
         _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
@@ -577,7 +613,14 @@ pub fn create_plugin_with_http_client(
             response_transformer::ResponseTransformer::new(config),
         ))),
         "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)))),
-        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(config)))),
+        "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
+            config,
+        )))),
+        "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)))),
+        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
+            config,
+            http_client.clone(),
+        )))),
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config),
         ))),
@@ -603,9 +646,22 @@ pub fn create_plugin_with_http_client(
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
         )))),
-        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(config)))),
+        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
+            config,
+            http_client.clone(),
+        )))),
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
+        )))),
+        "ws_message_size_limiting" => Ok(Some(Arc::new(
+            ws_message_size_limiting::WsMessageSizeLimiting::new(config),
+        ))),
+        "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
+            config,
+        )))),
+        "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
+            config,
+            http_client.clone(),
         )))),
         _ => {
             // Fall through to custom plugins registry
@@ -656,6 +712,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "request_transformer",
         "response_transformer",
         "graphql",
+        "grpc_method_router",
+        "grpc_deadline",
         "rate_limiting",
         "request_size_limiting",
         "response_size_limiting",
@@ -668,6 +726,9 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ai_request_guard",
         "ai_rate_limiter",
         "ai_prompt_shield",
+        "ws_message_size_limiting",
+        "ws_frame_logging",
+        "ws_rate_limiting",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

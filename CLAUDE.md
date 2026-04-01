@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (28 built-in plugins including 4 AI/LLM-specific plugins), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (33 built-in plugins including 4 AI/LLM-specific plugins, 2 gRPC-specific plugins, and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -80,6 +80,41 @@ All four jobs must pass for a PR to merge.
 3. **Atomic config reload**: Config changes are loaded in background, validated, then swapped atomically via `ArcSwap`. Requests in-flight see old or new config — never partial.
 4. **Resilience**: If the config source (DB/file/gRPC) is unavailable, the gateway continues serving with cached config.
 
+### Startup Sequence
+
+1. **jemalloc** — Global allocator on non-Windows (reduces fragmentation under high concurrency)
+2. **rustls crypto provider** — Install ring as the TLS backend (must be first)
+3. **Logging** — JSON structured logging via `tracing-subscriber`
+4. **Secret resolution** — Single-threaded tokio runtime resolves `FERRUM_*_SECRET_*` env vars from Vault/AWS/Azure/GCP/file backends. Uses single-threaded runtime because `std::env::set_var` is unsafe with concurrent threads
+5. **EnvConfig parsing** — 90+ env vars parsed into `EnvConfig` (now includes resolved secrets)
+6. **Multi-threaded runtime** — tokio `new_multi_thread()` with configurable worker/blocking threads
+7. **Mode dispatch** — Runs the selected operating mode (database/file/cp/dp/migrate)
+8. **Signal handling** — SIGINT/SIGTERM trigger graceful shutdown via `watch::channel`
+
+Within each mode (database/file/dp), after config is loaded:
+
+9. **TLS policy** — `TlsPolicy::from_env_config()` builds the cipher suite, protocol version, and key exchange group constraints from `FERRUM_TLS_*` env vars
+10. **Frontend TLS** — Loads `FERRUM_FRONTEND_TLS_CERT_PATH` / `FERRUM_FRONTEND_TLS_KEY_PATH` into a rustls `ServerConfig` for HTTPS, gRPC, and WebSocket listeners. Optionally loads `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` for frontend mTLS. The gateway hard-fails if configured paths are invalid (no silent fallback to plaintext).
+11. **Admin TLS** — Loads `FERRUM_ADMIN_TLS_CERT_PATH` / `FERRUM_ADMIN_TLS_KEY_PATH` for the admin API HTTPS listener (same validation rules as frontend TLS)
+12. **DTLS certs** — Loads `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` for UDP proxy frontend DTLS termination (ECDSA P-256 / Ed25519)
+13. **Backend TLS** — Per-proxy `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` are validated at config load time (startup and each reload). Invalid paths reject the config — no silent degradation.
+14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
+
+### External Secret Resolution
+
+The gateway resolves secrets from external providers at startup, before any config is loaded. Env vars with provider-specific suffixes are resolved and the base env var is set:
+
+| Suffix | Provider | Example |
+|--------|----------|---------|
+| `_VAULT` | HashiCorp Vault | `FERRUM_DB_URL_VAULT=secret/data/db#url` |
+| `_AWS` | AWS Secrets Manager | `FERRUM_DB_URL_AWS=my-secret#password` |
+| `_AZURE` | Azure Key Vault | `FERRUM_DB_URL_AZURE=https://vault.azure.net/secrets/db-url` |
+| `_GCP` | GCP Secret Manager | `FERRUM_DB_URL_GCP=projects/P/secrets/S/versions/latest` |
+| `_FILE` | File on disk | `FERRUM_DB_URL_FILE=/run/secrets/db_url` |
+| `_ENV` | Another env var | `FERRUM_DB_URL_ENV=DATABASE_URL` |
+
+Backends are grouped so a single client is created per provider type (avoids repeated credential initialization). Conflict detection prevents two providers from setting the same base key.
+
 ### Source Layout
 
 ```
@@ -109,12 +144,16 @@ src/
 │   ├── body.rs                # ProxyBody sum type (Full vs Tracked) with StreamingMetrics
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
 │   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
+│   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
-├── plugins/                   # Plugin system (28 plugins, including 4 AI/LLM plugins)
+├── plugins/                   # Plugin system (33 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
-│   └── [plugin_name].rs       # Individual plugin implementations
+│   ├── [plugin_name].rs       # Individual plugin implementations
+│   └── utils/                 # Shared plugin infrastructure
+│       ├── http_client.rs     # Shared HTTP client for plugin outbound calls
+│       └── redis_rate_limiter.rs  # Shared Redis client for centralized rate limiting
 ├── grpc/                      # CP/DP gRPC communication
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service)
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + reconnect)
@@ -128,8 +167,16 @@ src/
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
 ├── config_delta.rs            # Incremental config updates for CP/DP
 ├── dtls/                      # DTLS support (frontend termination, backend origination, cert helpers)
-├── dns/                       # DNS resolution with caching
+├── dns/                       # DNS resolution with caching, stale-while-revalidate, background refresh
 ├── service_discovery/         # Dynamic upstream discovery (DNS-SD, Kubernetes, Consul)
+├── secrets/                   # External secret resolution (Vault, AWS, Azure, GCP, env, file)
+│   ├── mod.rs                 # Secret backend registry + conflict detection
+│   ├── vault.rs               # HashiCorp Vault KV v2
+│   ├── aws.rs                 # AWS Secrets Manager
+│   ├── azure.rs               # Azure Key Vault
+│   ├── gcp.rs                 # Google Cloud Secret Manager
+│   ├── env.rs                 # Environment variable references
+│   └── file.rs                # File-based secrets (Docker Swarm, K8s volume mounts)
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
 └── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs)
@@ -166,8 +213,43 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 5. `after_proxy` — Response transformer, CORS headers
 6. `on_response_body` — AI token metrics, AI rate limiter (token counting)
 7. `log` — Stdout logging, HTTP logging, Prometheus, OpenTelemetry
+8. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 
-Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::AI_TOKEN_METRICS = 4100`).
+Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::WS_MESSAGE_SIZE_LIMITING = 2810`).
+
+### DNS Cache (`src/dns/mod.rs`)
+
+All gateway components share a single `DnsCache` instance:
+
+- **Pre-warmed at startup**: Backend hostnames, plugin target hostnames, and upstream targets are resolved before traffic starts flowing
+- **TTL-based expiration**: Cache entries expire based on configurable TTL (default from `FERRUM_DNS_CACHE_TTL_SECONDS`)
+- **Stale-while-revalidate**: Serves the old IP while refreshing in the background, avoiding DNS latency on the hot path
+- **Background refresh**: A dedicated task refreshes entries before they expire, keeping the cache warm
+- **`DnsCacheResolver`**: Implements `reqwest::dns::Resolve` — plugged into every `reqwest::Client` for automatic cache integration
+- **Custom nameservers**: Supports `FERRUM_DNS_NAMESERVERS` for internal DNS (e.g., Consul DNS, CoreDNS) and DNS-over-TLS via `FERRUM_DNS_TLS_NAMESERVERS`
+- **Record type optimization**: Remembers whether A or AAAA succeeded last for each hostname, querying that type first on refresh
+
+### Centralized Rate Limiting (Redis)
+
+All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`) support centralized mode via `sync_mode: "redis"` in their plugin config. When enabled, rate limit counters are stored in Redis instead of in-memory DashMaps, allowing multiple gateway instances (e.g., multiple data planes) to enforce a single shared rate limit.
+
+**Architecture:**
+- **Shared client**: `src/plugins/utils/redis_rate_limiter.rs` provides `RedisRateLimitClient` — a shared Redis client with lazy connection, auto-reconnect via `ConnectionManager`, and background health checking.
+- **Algorithm**: Two-window weighted approximation using native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined in a single round-trip). No Lua scripts. `effective_count = prev_window * (1 - elapsed_fraction) + current_count`.
+- **Key design**: Keys are prefixed with `{redis_key_prefix}:{rate_key}:{window_index}` where `window_index = epoch_seconds / window_seconds`. All instances share the same window boundaries via system epoch clock.
+- **Resilience**: If Redis goes down, plugins automatically fall back to local in-memory DashMap state and log a warning. A background tokio task pings Redis every N seconds (configurable via `redis_health_check_interval_seconds`) and switches back when connectivity is restored.
+- **TLS**: Supports `rediss://` URLs. CA verification and skip-verify use gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`.
+- **Protocol compatibility**: Uses the standard RESP protocol, so works with **Redis, Valkey, DragonflyDB, KeyDB, or Garnet** — any RESP-compatible server.
+- **Per-plugin isolation**: Each plugin instance has its own Redis connection and key prefix. Different proxies can use different Redis instances.
+- **No DB schema changes**: Plugin config is stored as opaque JSON (`serde_json::Value`) in the `plugin_configs` table, so new config fields are backward-compatible.
+
+**Config fields** (same for all three plugins):
+- `sync_mode`: `"local"` (default) or `"redis"`
+- `redis_url`: Connection URL (required when `sync_mode: "redis"`)
+- `redis_tls`: Enable TLS (CA verification and skip-verify use gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`)
+- `redis_key_prefix`: Key namespace (defaults to `ferrum:{plugin_name}`)
+- `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`: Connection tuning
+- `redis_username`, `redis_password`: Authentication
 
 ### Test Structure
 
@@ -197,11 +279,14 @@ tests/
 
 ### Before Every Commit
 
-1. `cargo fmt` — format all code
-2. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
-3. `cargo test --test unit_tests --all-features` — all unit tests pass
-4. `cargo test --test integration_tests --all-features` — integration tests pass
-5. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+1. `cargo fmt --all` — format all code
+2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI enforces this)
+3. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
+4. `cargo test --test unit_tests --all-features` — all unit tests pass
+5. `cargo test --test integration_tests --all-features` — integration tests pass
+6. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+
+**All steps (1-5) must pass locally before pushing. Do not skip step 2 — `cargo fmt` can miss files that `cargo fmt --all -- --check` catches.**
 
 ### Code Quality Rules
 
@@ -212,6 +297,46 @@ tests/
 - **Validate JWT expiration** — always set `validation.validate_exp = true` when verifying JWTs.
 - **Escape user input in response bodies** — when interpolating user-provided strings into JSON/XML response bodies, escape special characters.
 
+### TLS Architecture
+
+**Backend CA Trust Chain** — all protocol paths follow this resolution order:
+
+1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA (webpki/system roots are excluded)
+2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with **only** the global CA (webpki/system roots are excluded)
+3. **Neither set** — verify with webpki/system roots (secure default)
+4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` per-proxy or `FERRUM_TLS_NO_VERIFY=true` globally skips verification
+
+**CA exclusivity**: When a custom CA is configured (proxy or global), it is the **sole** trust anchor. Webpki/system roots are not added. This prevents backends with internal CAs from being MITMed via any public CA. Webpki roots are only used as a convenience fallback when no CA is explicitly configured.
+
+**Startup validation**: Per-proxy TLS file paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are validated at config load time. The gateway refuses to start (or rejects the config reload) if configured paths cannot be read or parsed. There is no silent fallback to unauthenticated or unverified connections.
+
+**TLS path deduplication**: Multiple proxies sharing the same cert file paths result in each unique file being parsed only once during validation.
+
+**Cert/key pairing**: Client cert and key must be configured as a pair. CA is independent — you can set just a CA to verify a server without presenting client identity.
+
+**No silent fallbacks**: All protocol paths hard-error on cert load failure. No degradation to unauthenticated connections.
+
+**No hot reload for any TLS surface**: Updating a cert file on disk has no effect until restart (or config reload for per-proxy paths, which creates new pool entries but does not re-read files for existing ones). This applies to frontend, backend, admin, DTLS, and gRPC TLS surfaces. See `docs/frontend_tls.md` for the complete list.
+
+**Pool-per-cert-path**: For reqwest-based paths (HTTP/1.1, H2 via reqwest, H3 frontend-to-backend), different cert paths create different `reqwest::Client` pool entries. For rustls-based paths (gRPC pool, H2 direct pool), TLS config is built per-connection.
+
+**Protocol TLS coverage** — all 8 backend protocol paths follow the CA trust chain:
+
+| Protocol Path | TLS Library | Pool Isolation |
+|---------------|-------------|----------------|
+| HTTP/1.1 (`ConnectionPool`) | reqwest/rustls | Per `reqwest::Client` keyed by cert paths |
+| HTTP/2 via reqwest (`ConnectionPool`) | reqwest/rustls | Same as HTTP/1.1 |
+| HTTP/2 direct (`Http2ConnectionPool`) | rustls | Per-connection TLS config |
+| HTTP/3 backend (`Http3ConnectionPool`) | rustls/quinn | Per-endpoint TLS config |
+| H3 frontend-to-backend (reqwest) | reqwest/rustls | Same as HTTP/1.1 |
+| gRPC (`GrpcConnectionPool`) | rustls/hyper-h2 | Per-connection TLS config |
+| WebSocket (wss://) | rustls | Per-connection (no persistent pool) |
+| TCP/TLS | rustls | Per-listener lifecycle |
+
+See `docs/backend_mtls.md` and `docs/frontend_tls.md` for full details.
+
+**When adding new protocol paths**: Must follow the same CA trust chain (proxy CA -> global CA -> webpki roots) with CA exclusivity (custom CA = sole trust anchor, no webpki mixing). For reqwest paths use `.tls_built_in_root_certs(false)` when adding a custom CA. For rustls paths use `RootCertStore::empty()` when a custom CA is present. Must validate cert paths at config load time. Must hard-error on cert load failure with no silent fallback.
+
 ### Performance Rules
 
 - **No allocations per-request when avoidable** — use pre-computed indexes (RouterCache, PluginCache, ConsumerIndex) instead of filtering/searching at request time. Static headers like Alt-Svc are pre-computed in `ProxyState` at startup.
@@ -220,6 +345,7 @@ tests/
 - **Avoid `format!()` in hot loops** — pre-compute string keys at build time. Response headers like Alt-Svc are pre-formatted once, not per-request.
 - **Use streaming responses by default** — only buffer when a plugin explicitly requires it. The buffering requirement is pre-computed per-proxy in `PluginCache` for O(1) lookup at request time.
 - **Skip plugin phases when no plugins are configured** — guard plugin iteration loops with `plugins.is_empty()` to avoid iterator setup and async machinery overhead on the hot path.
+- **Always use the shared DNS cache for `reqwest::Client`** — every `reqwest::Client::builder()` call must include `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`. This ensures all HTTP clients (connection pool, health probes, fallback clients, plugin HTTP clients) share the gateway's pre-warmed DNS cache with TTL, stale-while-revalidate, and background refresh. Never create a `reqwest::Client` that falls back to system DNS resolution in production code paths.
 
 ### Protocol-Specific Architecture
 
@@ -244,6 +370,21 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 **HTTP/3 frontend architecture**: The H3 listener in `http3/server.rs` is a standalone QUIC server that handles its own request lifecycle (plugin phases, auth, route matching). For backend communication, it uses **reqwest** (not the `Http3ConnectionPool`). This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms QUIC for small payloads due to lower per-request crypto overhead and more mature connection pooling. The `Http3ConnectionPool` in `http3/client.rs` is used only by the main hyper-based proxy path (`mod.rs`) for H3 backend targets.
 
 **gRPC proxy architecture**: Uses hyper's HTTP/2 client directly (not reqwest) to preserve HTTP/2 trailers (`grpc-status`, `grpc-message`). The `GrpcConnectionPool` maintains sharded H2 connections with round-robin distribution. When `stream_response=true` (no retries, no body-buffering plugins), the response `Incoming` body is passed through as `ProxyBody::streaming_h2` — hyper forwards DATA and TRAILERS frames directly to the client without buffering.
+
+**Connection pool keys**: Each pool uses a string key to decide whether two proxies can share a pooled connection. The key must include every field that affects connection *identity* — destination, TLS trust, client credentials, and DNS routing. Missing a field allows two proxies with different configs to share a connection (pool poisoning); adding unnecessary fields causes fragmentation and P95 regressions. All keys use `|` as the field delimiter because `:` appears in IPv6 addresses and would create ambiguous key boundaries.
+
+| Pool | File | Key Format | Sharding | Notes |
+|------|------|-----------|----------|-------|
+| HTTP | `connection_pool.rs` | `{dest}\|{proto}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | No (reqwest internal) | `dest` is `u={upstream_id}` or `d={host}:{port}` to prevent namespace collisions. `verify` is the effective flag (proxy AND global). |
+| gRPC | `proxy/grpc_proxy.rs` | `{host}\|{port}\|{tls}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | `#N` suffix | `tls` is bool from `BackendProtocol::Grpcs`. Shard key reuses a pre-allocated buffer. |
+| HTTP/2 | `proxy/http2_pool.rs` | `{host}\|{port}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | `#N` suffix | Always TLS (no tls flag needed). |
+| HTTP/3 | `http3/client.rs` | `{host}\|{port}\|{index}\|{ca_path}\|{mtls_cert}\|{verify}` | Index in key | `index` distributes across `connections_per_backend` QUIC connections. Target-path keys use `{host}\|{port}\|{index}` only (TLS inherited from proxy). |
+
+**Rules for modifying pool keys:**
+- **Every field that affects `create_connection()` output must be in the key.** If two proxies with different values for a field would get different TLS configs, different resolved IPs, or different client identities, that field must be in the key.
+- **Never add fields that only affect policy** (timeouts, pool sizes, keepalive intervals). These don't change connection identity and adding them causes fragmentation.
+- **Empty/default values are free** — most proxies won't set per-proxy mTLS or dns_override, so these fields are empty strings and all proxies sharing a backend still share one pool entry.
+- **Keep the `|` delimiter** — do not switch to `:` or any character that can appear in hostnames, IPv6 addresses, or file paths.
 
 ### Performance Optimization Lessons
 
@@ -273,10 +414,9 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 
 ### Known Protocol Gaps
 
-Only two true gaps remain that cannot be solved without upstream library changes:
+Only one true gap remains that cannot be solved without upstream library changes:
 
 1. **No HTTP/2 WebSocket (RFC 8441)** — hyper's server doesn't support Extended CONNECT. Would require low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers.
-2. **No DTLS 1.3** — No production Rust implementation exists (RFC 9147). `webrtc-dtls` only supports DTLS 1.2. QUIC (already supported) provides TLS 1.3 over UDP as an alternative.
 
 ### Multi-Protocol Performance Testing
 
@@ -299,7 +439,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
 2. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, or `HTTP_ONLY_PROTOCOLS`
+3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, or `GRPC_ONLY_PROTOCOLS`
 4. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
 5. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs`
 6. Add the module to `tests/unit/plugins/mod.rs`
@@ -309,9 +449,10 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 
 1. Add the field to the appropriate struct in `src/config/types.rs` with `#[serde(default)]`
 2. If env-var driven: add parsing in `src/config/env_config.rs`
-3. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
-4. Add unit tests for deserialization in `tests/unit/config/`
-5. Update `openapi.yaml` if the Admin API exposes it
+3. **Update `ferrum.conf`** — every new `FERRUM_*` env var must also be added to `ferrum.conf` with a commented-out default and descriptive comment. The conf file and env vars must stay in sync.
+4. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
+5. Add unit tests for deserialization in `tests/unit/config/`
+6. Update `openapi.yaml` if the Admin API exposes it
 
 ### Database Considerations
 
@@ -343,6 +484,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 - [ ] No dead code (clippy enforces `-D dead-code`)
 - [ ] PR description includes a summary, list of changes, and test plan
 - [ ] Documentation updated if adding/changing features (FEATURES.md, README.md, docs/, openapi.yaml)
+- [ ] New `FERRUM_*` env vars added to `ferrum.conf` with commented defaults
 
 ### Commit Message Style
 
@@ -369,6 +511,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
 | `FERRUM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for proxy listeners. Set to `::` for dual-stack IPv4+IPv6 |
+| `FERRUM_FRONTEND_TLS_CERT_PATH` | (none) | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
+| `FERRUM_FRONTEND_TLS_KEY_PATH` | (none) | PEM private key for the gateway's frontend TLS certificate |
 | `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |
@@ -379,6 +523,11 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | (none) | Path to externally provided JSON config backup for startup failover when DB is unreachable |
 | `FERRUM_DB_FAILOVER_URLS` | (empty) | Comma-separated failover database URLs (tried in order when primary is unreachable) |
 | `FERRUM_DB_READ_REPLICA_URL` | (none) | Read replica URL for config polling (reduces primary load, falls back to primary) |
+| `FERRUM_DB_POOL_MAX_CONNECTIONS` | `10` | Max connections in the database pool. Increase for CP mode with many DPs |
+| `FERRUM_DB_POOL_MIN_CONNECTIONS` | `1` | Min idle connections maintained in the pool (eager warming) |
+| `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | `30` | Max seconds to wait for a pool connection before error |
+| `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | `600` | Max seconds a connection can sit idle before eviction |
+| `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | `300` | Max lifetime of a connection (forces DNS re-resolution) |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | `0.0.0.0:50051` | CP gRPC server listen address |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | (none) | PEM key for CP gRPC TLS |
@@ -391,9 +540,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CA_BUNDLE_PATH` | (none) | Path to PEM CA bundle for outbound TLS verification (internal CAs) |
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | (none) | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt) |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | `ferrum-edge-change-me-in-production` | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt). **Must be changed in production.** |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
-| `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / Ed25519) |
+| `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / P-384) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | `1000` | Threshold (ms) for warning-level logs on slow plugin HTTP calls |
@@ -408,7 +557,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
 | `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
-| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `250` | Server-side HTTP/2 max concurrent streams per inbound connection |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Server-side HTTP/2 pending reset-stream threshold before GOAWAY |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Server-side HTTP/2 local reset-stream threshold before GOAWAY |
 | `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | `20000` | Max concurrently upgraded WebSocket connections (`0` = disabled) |

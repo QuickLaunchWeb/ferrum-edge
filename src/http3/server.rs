@@ -1,4 +1,16 @@
-//! HTTP/3 server listener using Quinn (QUIC) and h3
+//! HTTP/3 server listener using Quinn (QUIC) and h3.
+//!
+//! Runs as a standalone QUIC server alongside the main hyper-based HTTP server.
+//! Handles its own request lifecycle (route matching, plugin phases, auth) but
+//! uses **reqwest** (not the `Http3ConnectionPool`) for backend communication.
+//! This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms
+//! QUIC for small payloads due to lower per-request crypto overhead and more
+//! mature connection pooling.
+//!
+//! QUIC requires TLS 1.3 exclusively (RFC 9001), so the server forces TLS 1.3
+//! and uses a separate ALPN advertisement (`h3`). 0-RTT is disabled for replay
+//! safety, but stateless session ticket resumption is enabled (saves 1 RTT on
+//! reconnects).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use crate::config::types::{AuthMode, Proxy};
+use crate::dns::DnsCacheResolver;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::ProxyState;
 use crate::tls::TlsPolicy;
@@ -103,6 +116,24 @@ pub async fn start_http3_listener(
     // 0-RTT is disabled for security: early data is replayable, which is dangerous
     // for non-idempotent operations proxied through an API gateway.
     server_tls_config.max_early_data_size = 0;
+
+    // Enable TLS 1.3 session resumption for QUIC connections.
+    // Stateless tickets allow clients to resume sessions without a full handshake,
+    // saving 1 RTT on reconnections. This is safe (no replay risk — 0-RTT is still
+    // disabled separately via max_early_data_size=0).
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            server_tls_config.ticketer = ticketer;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create QUIC session ticket rotator, resumption will use stateful cache only: {}",
+                e
+            );
+        }
+    }
+    server_tls_config.session_storage =
+        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
 
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -196,18 +227,30 @@ async fn handle_h3_connection(
 
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
 
+    // Pre-format socket IP string once per connection — shared across all streams
+    // to avoid per-request String allocation from SocketAddr::ip().to_string().
+    let socket_ip: Arc<str> = Arc::from(remote_addr.ip().to_string());
+
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let state = state.clone();
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
+                let socket_ip = Arc::clone(&socket_ip);
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) =
-                                handle_h3_request(req, stream, state, remote_addr, cert, chain)
-                                    .await
+                            if let Err(e) = handle_h3_request(
+                                req,
+                                stream,
+                                state,
+                                remote_addr,
+                                &socket_ip,
+                                cert,
+                                chain,
+                            )
+                            .await
                             {
                                 error!("HTTP/3 request error: {}", e);
                             }
@@ -238,6 +281,7 @@ async fn handle_h3_request(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: ProxyState,
     remote_addr: SocketAddr,
+    socket_ip: &str,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Result<(), anyhow::Error> {
@@ -247,15 +291,13 @@ async fn handle_h3_request(
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
-    let socket_ip = remote_addr.ip().to_string();
-
     // Build request context (client_ip resolved below after headers are parsed)
-    let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
-    ctx.headers.reserve(req.headers().keys_len());
 
     // Validate and extract headers with size limits
+    ctx.headers.reserve(req.headers().keys_len());
     let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
@@ -275,9 +317,9 @@ async fn handle_h3_request(
         }
         total_header_size += header_size;
         if let Ok(v) = value.to_str() {
-            // h3 normalizes header names to lowercase already, so avoid the
-            // extra allocation from to_lowercase() on every request header.
-            ctx.headers.insert(name.as_str().to_owned(), v.to_owned());
+            // http::HeaderName stores names in lowercase already (per HTTP/2+3 spec),
+            // so .as_str() returns lowercase — no need for .to_lowercase().
+            ctx.headers.insert(name.as_str().to_owned(), v.to_string());
         }
     }
     if total_header_size > state.max_header_size_bytes {
@@ -292,40 +334,37 @@ async fn handle_h3_request(
     }
 
     // Resolve real client IP using trusted proxy configuration.
+    // Parse socket IP once upfront to avoid redundant parsing in each branch.
     if !state.trusted_proxies.is_empty() {
-        let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
+        let socket_addr: std::net::IpAddr = remote_addr.ip();
+        let xff = ctx.headers.get("x-forwarded-for").map(|s| s.as_str());
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
+            // real_ip_header is already lowercase from env config parsing
             let header_val = ctx.headers.get(real_ip_header.as_str());
-            if let Some(val) = header_val {
-                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
-                    val.trim().to_string()
-                } else {
-                    socket_ip.to_string()
-                }
-            } else if let Some(ref addr) = socket_addr {
+            if let Some(val) = header_val
+                && state.trusted_proxies.contains(&socket_addr)
+            {
+                val.trim().to_string()
+            } else {
                 crate::proxy::client_ip::resolve_client_ip_parsed(
-                    &socket_ip,
-                    addr,
-                    ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                    socket_ip,
+                    &socket_addr,
+                    xff,
                     &state.trusted_proxies,
                 )
-            } else {
-                socket_ip.to_string()
             }
-        } else if let Some(ref addr) = socket_addr {
+        } else {
             crate::proxy::client_ip::resolve_client_ip_parsed(
-                &socket_ip,
-                addr,
-                ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                socket_ip,
+                &socket_addr,
+                xff,
                 &state.trusted_proxies,
             )
-        } else {
-            socket_ip.to_string()
         };
         ctx.client_ip = resolved;
     }
 
-    // Parse query params (skip when empty — most requests have no query string)
+    // Parse query params
     if !query_string.is_empty() {
         for pair in query_string.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
@@ -337,11 +376,11 @@ async fn handle_h3_request(
     // Extract request host for host-based routing.
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
     // Also check the host header as a fallback. Strip port and lowercase.
-    let request_host: Option<String> = ctx
-        .headers
-        .get("host")
-        .map(|h| h.as_str())
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
+    let request_host: Option<String> = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str())
+        .or_else(|| ctx.headers.get("host").map(|h| h.as_str()))
         .map(|h| {
             let without_port = h.split(':').next().unwrap_or(h);
             without_port.to_lowercase()
@@ -402,31 +441,28 @@ async fn handle_h3_request(
     let mut plugin_execution_ns: u64 = 0;
 
     // Execute on_request_received hooks
-    if !plugins.is_empty() {
-        let phase_start = std::time::Instant::now();
-        for plugin in plugins.iter() {
-            match plugin.on_request_received(&mut ctx).await {
-                PluginResult::Reject {
-                    status_code,
-                    body,
-                    headers,
-                } => {
-                    record_request(&state, status_code);
-                    send_h3_reject_response(
-                        &mut stream,
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &body,
-                        &headers,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                PluginResult::Continue => {}
+    let phase_start = std::time::Instant::now();
+    for plugin in plugins.iter() {
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                record_request(&state, status_code);
+                send_h3_reject_response(
+                    &mut stream,
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &body,
+                    &headers,
+                )
+                .await?;
+                return Ok(());
             }
+            PluginResult::Continue => {}
         }
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
+    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
     // Authentication phase
     let auth_plugins: Vec<&Arc<dyn Plugin>> =
@@ -499,7 +535,7 @@ async fn handle_h3_request(
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
     // Authorization phase
-    if !plugins.is_empty() {
+    {
         let phase_start = std::time::Instant::now();
         for plugin in plugins.iter() {
             if plugin.name() == "access_control" {
@@ -526,7 +562,8 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // before_proxy hooks — only clone headers when a plugin mutates them.
+    // before_proxy hooks — only clone headers if at least one plugin modifies them.
+    // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
     let needs_header_clone =
         !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
@@ -557,6 +594,8 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         owned_proxy_headers = Some(cloned);
     } else if !plugins.is_empty() {
+        // No plugin modifies headers — swap headers out of ctx temporarily to
+        // satisfy the borrow checker without cloning (zero allocation hot path).
         let phase_start = std::time::Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
         for plugin in plugins.iter() {
@@ -566,8 +605,8 @@ async fn handle_h3_request(
                     body,
                     headers,
                 } => {
-                    record_request(&state, status_code);
                     ctx.headers = tmp_headers;
+                    record_request(&state, status_code);
                     send_h3_reject_response(
                         &mut stream,
                         StatusCode::from_u16(status_code)
@@ -584,9 +623,31 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
+    // Inject X-Consumer-Username header when a consumer has been authenticated
+    if let Some(ref consumer) = ctx.identified_consumer {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
+        if let Some(ref custom_id) = consumer.custom_id {
+            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
+        }
+    } else if ctx.authenticated_identity.is_some() || ctx.authenticated_identity_header.is_some() {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        let header_val = ctx
+            .authenticated_identity_header
+            .as_deref()
+            .or(ctx.authenticated_identity.as_deref());
+        if let Some(val) = header_val {
+            headers.insert("X-Consumer-Username".to_string(), val.to_string());
+        }
+    }
+    // Resolve proxy_headers into an owned HashMap to avoid borrowing ctx.headers
+    // while ctx is passed as &mut to proxy functions downstream.
+    let proxy_headers: HashMap<String, String> =
+        owned_proxy_headers.unwrap_or_else(|| std::mem::take(&mut ctx.headers));
+
     // Enforce request body size limit via Content-Length fast path
     if state.max_request_body_size_bytes > 0
-        && let Some(content_length) = ctx.headers.get("content-length")
+        && let Some(content_length) = proxy_headers.get("content-length")
         && let Ok(len) = content_length.parse::<usize>()
         && len > state.max_request_body_size_bytes
     {
@@ -645,7 +706,7 @@ async fn handle_h3_request(
         && !body_data.is_empty()
         && plugins.iter().any(|p| p.modifies_request_body())
     {
-        let content_type = ctx.headers.get("content-type").map(|s| s.as_str());
+        let content_type = proxy_headers.get("content-type").map(|s| s.as_str());
         let mut current = body_data;
         for plugin in plugins.iter() {
             if plugin.modifies_request_body()
@@ -660,39 +721,25 @@ async fn handle_h3_request(
         body_data
     };
 
-    let mut passthrough_headers = if owned_proxy_headers.is_none() {
-        Some(std::mem::take(&mut ctx.headers))
-    } else {
-        None
-    };
-
     if !needs_response_buffering {
         // ===== STREAMING RESPONSE PATH =====
         // Stream response body chunks from backend directly to the H3 client
         // without collecting them in memory. This is the fast path.
         let client_ip_owned = ctx.client_ip.clone();
-        let streaming_result = {
-            let proxy_headers = owned_proxy_headers
-                .as_ref()
-                .unwrap_or(passthrough_headers.as_ref().unwrap());
-            proxy_to_backend_h3_streaming(
-                &state,
-                &proxy,
-                &backend_url,
-                &method,
-                proxy_headers,
-                body_data,
-                &client_ip_owned,
-                &mut stream,
-                &plugins,
-                &mut ctx,
-                &mut plugin_execution_ns,
-            )
-            .await
-        };
-        if let Some(headers) = passthrough_headers.take() {
-            ctx.headers = headers;
-        }
+        let streaming_result = proxy_to_backend_h3_streaming(
+            &state,
+            &proxy,
+            &backend_url,
+            &method,
+            &proxy_headers,
+            body_data,
+            &client_ip_owned,
+            &mut stream,
+            &plugins,
+            &mut ctx,
+            &mut plugin_execution_ns,
+        )
+        .await;
 
         let (response_status, _response_headers, h3_error_class) = match streaming_result {
             Ok(result) => result,
@@ -748,7 +795,7 @@ async fn handle_h3_request(
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: true,
             client_disconnected: false,
             error_class: h3_error_class,
@@ -763,24 +810,17 @@ async fn handle_h3_request(
     } else {
         // ===== BUFFERED RESPONSE PATH =====
         // Collect full response for plugin body inspection/transformation and retries.
-        let (mut response_status, response_body, mut response_headers, h3_error_class) = {
-            let proxy_headers = owned_proxy_headers
-                .as_ref()
-                .unwrap_or(passthrough_headers.as_ref().unwrap());
+        let (mut response_status, response_body, mut response_headers, h3_error_class) =
             proxy_to_backend_h3(
                 &state,
                 &proxy,
                 &backend_url,
                 &method,
-                proxy_headers,
+                &proxy_headers,
                 body_data,
                 &ctx.client_ip,
             )
-            .await
-        };
-        if let Some(headers) = passthrough_headers.take() {
-            ctx.headers = headers;
-        }
+            .await;
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -890,7 +930,7 @@ async fn handle_h3_request(
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: false,
             client_disconnected: false,
             error_class: h3_error_class,
@@ -908,7 +948,12 @@ async fn handle_h3_request(
         let mut resp_builder = Response::builder().status(status);
 
         for (k, v) in &response_headers {
-            resp_builder = resp_builder.header(k.as_str(), v.as_str());
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(v),
+            ) {
+                resp_builder = resp_builder.header(name, val);
+            }
         }
 
         if !response_headers.contains_key("content-type") {
@@ -973,6 +1018,7 @@ async fn proxy_to_backend_h3_streaming(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
+            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -983,6 +1029,7 @@ async fn proxy_to_backend_h3_streaming(
                 .danger_accept_invalid_certs(
                     !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
+                .dns_resolver(Arc::new(resolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }
@@ -1061,7 +1108,7 @@ async fn proxy_to_backend_h3_streaming(
     };
 
     let response_status = response.status().as_u16();
-    let mut response_headers = HashMap::new();
+    let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
         if let Ok(vs) = v.to_str() {
             response_headers.insert(k.as_str().to_string(), vs.to_string());
@@ -1109,7 +1156,12 @@ async fn proxy_to_backend_h3_streaming(
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status);
     for (k, v) in &response_headers {
-        resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            resp_builder = resp_builder.header(name, val);
+        }
     }
     if !response_headers.contains_key("content-type") {
         resp_builder = resp_builder.header("content-type", "application/json");
@@ -1238,6 +1290,7 @@ async fn proxy_to_backend_h3(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
+            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -1248,6 +1301,7 @@ async fn proxy_to_backend_h3(
                 .danger_accept_invalid_certs(
                     !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
+                .dns_resolver(Arc::new(resolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }
@@ -1313,7 +1367,8 @@ async fn proxy_to_backend_h3(
     match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let mut resp_headers = std::collections::HashMap::new();
+            let mut resp_headers =
+                std::collections::HashMap::with_capacity(response.headers().keys_len());
             for (k, v) in response.headers() {
                 if let Ok(vs) = v.to_str() {
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());
@@ -1413,7 +1468,12 @@ async fn send_h3_reject_response(
         .status(status)
         .header("content-type", "application/json");
     for (k, v) in headers {
-        builder = builder.header(k.as_str(), v.as_str());
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
     }
     let resp = builder
         .body(())

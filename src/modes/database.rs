@@ -1,3 +1,18 @@
+//! Database mode — single-instance gateway backed by PostgreSQL, MySQL, or SQLite.
+//!
+//! Lifecycle:
+//! 1. Connect to the primary DB (with failover URL retry)
+//! 2. Optionally connect a read replica for polling (reduces primary load)
+//! 3. Load full config from DB (falls back to on-disk JSON backup if DB is unreachable)
+//! 4. Build all caches (router, plugin, consumer, load balancer, circuit breaker)
+//! 5. Start proxy + admin listeners
+//! 6. Enter the polling loop: incremental `WHERE updated_at > ?` queries every N seconds,
+//!    with automatic fallback to full reload + DB failover on error
+//!
+//! The admin API is read/write in this mode. A `db_available` AtomicBool gates
+//! write endpoints — when the DB is unreachable, the admin API becomes temporarily
+//! read-only and returns 503 on mutations.
+
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -11,7 +26,7 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
-use crate::config::db_loader::DatabaseStore;
+use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
 use crate::tls::{self, TlsPolicy};
@@ -24,6 +39,13 @@ pub async fn run(
         .effective_db_url()
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
     let failover_urls = env_config.effective_db_failover_urls();
+    let pool_config = DbPoolConfig {
+        max_connections: env_config.db_pool_max_connections,
+        min_connections: env_config.db_pool_min_connections,
+        acquire_timeout_seconds: env_config.db_pool_acquire_timeout_seconds,
+        idle_timeout_seconds: env_config.db_pool_idle_timeout_seconds,
+        max_lifetime_seconds: env_config.db_pool_max_lifetime_seconds,
+    };
     let mut db = DatabaseStore::connect_with_failover(
         env_config.db_type.as_deref().unwrap_or("sqlite"),
         &effective_url,
@@ -33,6 +55,7 @@ pub async fn run(
         env_config.db_tls_client_cert_path.as_deref(),
         env_config.db_tls_client_key_path.as_deref(),
         env_config.db_tls_insecure,
+        pool_config,
     )
     .await?;
 
@@ -137,9 +160,18 @@ pub async fn run(
         }
     }
 
+    // Build TLS hardening policy from environment (needed for both frontend
+    // and backend TLS — cipher suites, protocol versions, key exchange groups).
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone())?;
+    let proxy_state = ProxyState::new(
+        config,
+        dns_cache.clone(),
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
 
     // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
@@ -157,13 +189,10 @@ pub async fn run(
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
     let db = Arc::new(db);
 
-    // Build TLS hardening policy from environment
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.proxy_tls_cert_path,
-        &env_config.proxy_tls_key_path,
+        &env_config.frontend_tls_cert_path,
+        &env_config.frontend_tls_key_path,
     ) {
         info!("Loading TLS configuration with client certificate verification...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
