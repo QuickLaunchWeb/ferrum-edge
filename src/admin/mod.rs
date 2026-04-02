@@ -567,21 +567,26 @@ async fn handle_create_proxy(
         ));
     }
 
-    let proxy_validation_config = GatewayConfig {
-        proxies: vec![proxy.clone()],
-        ..Default::default()
-    };
-    if let Err(errors) = proxy_validation_config.validate_hosts() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid proxy hosts: {}", errors.join("; "))}),
-        ));
+    // Validate host entries directly (no GatewayConfig wrapper needed for single-proxy paths).
+    for host in &proxy.hosts {
+        if let Err(msg) = crate::config::types::validate_host_entry(host) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid proxy hosts: {}", msg)}),
+            ));
+        }
     }
-    if let Err(errors) = proxy_validation_config.validate_regex_listen_paths() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid proxy listen_path: {}", errors.join("; "))}),
-        ));
+    if !proxy.backend_protocol.is_stream_proxy() && proxy.listen_path.starts_with('~') {
+        let pattern = &proxy.listen_path[1..];
+        if !pattern.is_empty() {
+            let anchored = crate::config::types::anchor_regex_pattern(pattern);
+            if let Err(e) = regex::Regex::new(&anchored) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid proxy listen_path: invalid regex '{}': {}", proxy.listen_path, e)}),
+                ));
+            }
+        }
     }
 
     if proxy.id.is_empty() {
@@ -878,21 +883,26 @@ async fn handle_update_proxy(
     proxy.id = id.to_string();
     proxy.updated_at = Utc::now();
 
-    let proxy_validation_config = GatewayConfig {
-        proxies: vec![proxy.clone()],
-        ..Default::default()
-    };
-    if let Err(errors) = proxy_validation_config.validate_hosts() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid proxy hosts: {}", errors.join("; "))}),
-        ));
+    // Validate host entries directly (no GatewayConfig wrapper needed for single-proxy paths).
+    for host in &proxy.hosts {
+        if let Err(msg) = crate::config::types::validate_host_entry(host) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid proxy hosts: {}", msg)}),
+            ));
+        }
     }
-    if let Err(errors) = proxy_validation_config.validate_regex_listen_paths() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid proxy listen_path: {}", errors.join("; "))}),
-        ));
+    if !proxy.backend_protocol.is_stream_proxy() && proxy.listen_path.starts_with('~') {
+        let pattern = &proxy.listen_path[1..];
+        if !pattern.is_empty() {
+            let anchored = crate::config::types::anchor_regex_pattern(pattern);
+            if let Err(e) = regex::Regex::new(&anchored) {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid proxy listen_path: invalid regex '{}': {}", proxy.listen_path, e)}),
+                ));
+            }
+        }
     }
 
     // Check host+listen_path uniqueness (excluding self) for HTTP-style routes.
@@ -2680,7 +2690,10 @@ async fn handle_batch_create(
         plugin_config.updated_at = now;
     }
 
-    let mut batch_config = GatewayConfig {
+    // Cross-resource validations require a GatewayConfig view over the batch.
+    // Individual items are already normalized and field-validated above, so skip
+    // normalize_fields() and validate_all_fields() to avoid redundant work.
+    let batch_config = GatewayConfig {
         version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: batch.proxies.clone(),
         consumers: batch.consumers.clone(),
@@ -2688,11 +2701,7 @@ async fn handle_batch_create(
         upstreams: batch.upstreams.clone(),
         loaded_at: now,
     };
-    batch_config.normalize_fields();
 
-    if let Err(errs) = batch_config.validate_all_fields() {
-        validation_errors.extend(errs);
-    }
     if let Err(errs) = batch_config.validate_unique_resource_ids() {
         validation_errors.extend(errs);
     }
