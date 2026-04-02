@@ -1,7 +1,7 @@
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::MtlsAuth;
-use ferrum_edge::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::{Plugin, RequestContext, StreamConnectionContext};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -109,6 +109,25 @@ fn create_ctx_with_cert_and_chain(cert_der: Vec<u8>, chain: Vec<Vec<u8>>) -> Req
     ctx.tls_client_cert_der = Some(Arc::new(cert_der));
     ctx.tls_client_cert_chain_der = Some(Arc::new(chain));
     ctx
+}
+
+fn create_stream_ctx_with_cert(
+    cert_der: Vec<u8>,
+    consumers: Vec<Consumer>,
+) -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: Some("TCP Proxy".to_string()),
+        listen_port: 5432,
+        backend_protocol: ferrum_edge::config::types::BackendProtocol::Tcp,
+        consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
+        identified_consumer: None,
+        authenticated_identity: None,
+        metadata: HashMap::new(),
+        tls_client_cert_der: Some(Arc::new(cert_der)),
+        tls_client_cert_chain_der: None,
+    }
 }
 
 // --- Basic auth flow tests ---
@@ -628,6 +647,7 @@ fn test_mtls_auth_supported_protocols() {
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Tcp));
     // Should NOT support raw UDP
     assert!(!protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp));
 }
@@ -732,4 +752,20 @@ async fn test_mtls_auth_does_not_overwrite_existing_consumer() {
     assert_continue(result);
     // Should keep the original consumer, not overwrite
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+}
+
+#[tokio::test]
+async fn test_mtls_auth_stream_connect_identifies_consumer() {
+    let cert_der = create_test_cert("client.example.com", None, None);
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let mut ctx = create_stream_ctx_with_cert(cert_der, vec![consumer]);
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
+    assert_eq!(
+        ctx.metadata.get("consumer_username").map(String::as_str),
+        Some("alice")
+    );
 }

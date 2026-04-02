@@ -47,6 +47,7 @@ pub mod response_caching;
 pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod stdout_logging;
+pub mod tcp_connection_throttle;
 pub mod transaction_debugger;
 pub mod utils;
 pub mod ws_frame_logging;
@@ -101,6 +102,14 @@ pub const HTTP_FAMILY_PROTOCOLS: &[ProxyProtocol] = &[
 /// HTTP + gRPC only (plugins that modify HTTP headers/body but not WebSocket frames).
 pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyProtocol::Grpc];
 
+/// HTTP-family protocols plus raw TCP streams.
+pub const HTTP_FAMILY_AND_TCP_PROTOCOLS: &[ProxyProtocol] = &[
+    ProxyProtocol::Http,
+    ProxyProtocol::Grpc,
+    ProxyProtocol::WebSocket,
+    ProxyProtocol::Tcp,
+];
+
 /// HTTP-only (single protocol).
 pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 
@@ -109,6 +118,9 @@ pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 
 /// gRPC-only (single protocol).
 pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
+
+/// TCP-only (raw stream plugins that do not apply to UDP/DTLS).
+pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 
 /// Direction of a WebSocket frame being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,7 +297,7 @@ pub struct TransactionSummary {
 ///
 /// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_protocol`
 /// are available for custom plugins to use in their `on_stream_connect` logic.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 pub struct StreamConnectionContext {
     pub client_ip: String,
@@ -293,7 +305,32 @@ pub struct StreamConnectionContext {
     pub proxy_name: Option<String>,
     pub listen_port: u16,
     pub backend_protocol: BackendProtocol,
+    /// Pre-built consumer index shared across stream connections.
+    pub consumer_index: Arc<ConsumerIndex>,
+    /// Gateway Consumer identified for this stream connection, if any.
+    pub identified_consumer: Option<Consumer>,
+    /// Identity string set by external stream auth plugins when no gateway
+    /// Consumer was mapped. Mirrors `RequestContext::authenticated_identity`.
+    pub authenticated_identity: Option<String>,
     pub metadata: HashMap<String, String>,
+    /// DER-encoded client certificate from frontend TLS handshake (first cert in chain).
+    /// Populated for TCP/TLS proxies after the TLS handshake completes.
+    /// Used by plugins like `tcp_connection_throttle` for consumer-based throttling.
+    pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    /// DER-encoded CA/intermediate certificates from the client's certificate chain.
+    /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
+    pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+}
+
+impl StreamConnectionContext {
+    /// Return the stable authenticated identity for stream policies. A mapped
+    /// Consumer username takes precedence over any external authenticated identity.
+    pub fn effective_identity(&self) -> Option<&str> {
+        self.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str())
+            .or(self.authenticated_identity.as_deref())
+    }
 }
 
 /// Transaction summary for stream proxy (TCP/UDP) logging plugins.
@@ -333,7 +370,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
@@ -353,6 +390,7 @@ pub mod priority {
     pub const BASIC_AUTH: u16 = 1300;
     pub const HMAC_AUTH: u16 = 1400;
     pub const ACCESS_CONTROL: u16 = 2000;
+    pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
@@ -718,6 +756,9 @@ pub fn create_plugin_with_http_client(
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
+        "tcp_connection_throttle" => Ok(Some(Arc::new(
+            tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
+        ))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)))),
         "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)))),
@@ -804,6 +845,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwks_auth"
             | "mtls_auth"
             | "access_control"
+            | "tcp_connection_throttle"
             | "ip_restriction"
     )
 }
@@ -821,6 +863,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "mtls_auth",
         "cors",
         "access_control",
+        "tcp_connection_throttle",
         "ip_restriction",
         "bot_detection",
         "correlation_id",

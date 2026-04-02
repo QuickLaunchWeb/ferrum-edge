@@ -1,6 +1,7 @@
 use ferrum_edge::plugins::ip_restriction::IpRestriction;
 use ferrum_edge::plugins::{Plugin, RequestContext, StreamConnectionContext};
 use serde_json::json;
+use std::sync::Arc;
 
 use super::plugin_utils;
 
@@ -15,7 +16,12 @@ fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 8080,
         backend_protocol: ferrum_edge::config::types::BackendProtocol::Tcp,
+        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+        identified_consumer: None,
+        authenticated_identity: None,
         metadata: std::collections::HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
     }
 }
 

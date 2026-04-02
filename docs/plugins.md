@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 34 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 35 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -523,7 +523,7 @@ Exported spans include OTel semantic convention attributes, gateway-specific att
 
 ### `mtls_auth`
 
-Authenticates requests using the client's TLS certificate, matching a configurable certificate field against consumer credentials.
+Authenticates requests using the client's TLS certificate, matching a configurable certificate field against consumer credentials. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake so the client certificate can be mapped to a Consumer before later stream plugins run.
 
 **Priority:** 950
 
@@ -677,7 +677,8 @@ credentials:
 Authorizes requests based on the authenticated caller. By default it checks the
 identified consumer's username. Optionally it can also allow externally
 authenticated identities (for example `jwks_auth` users without a mapped
-gateway Consumer).
+gateway Consumer). On TCP stream proxies, it uses the consumer already placed
+in the stream context by an earlier auth plugin such as [`mtls_auth`](#mtls_auth).
 
 **Priority:** 2000
 
@@ -688,6 +689,22 @@ gateway Consumer).
 | `allow_authenticated_identity` | bool | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped |
 
 Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement.
+
+### `tcp_connection_throttle`
+
+Limits concurrent TCP connections per observed client identity on a per-proxy basis.
+
+**Priority:** 2050
+
+| Parameter | Type | Description |
+|---|---|---|
+| `max_connections_per_key` | u64 | Maximum active TCP connections for one key |
+
+**Key selection:**
+- If a prior stream auth plugin identified a Consumer, the key is `consumer:<username>`
+- Otherwise the key is `ip:<client_ip>`
+
+This makes plaintext TCP listeners IP-scoped, while TCP+TLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
 ### `ip_restriction`
 
@@ -731,6 +748,7 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 **Behavior by mode:**
 - `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP.
 - `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
+- Stream (`on_stream_connect`) — When `limit_by: "consumer"` and a stream auth plugin has already identified a Consumer, the stream rate-limit key is that consumer username; otherwise it falls back to client IP.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, `x-ratelimit-identity`
 

@@ -184,6 +184,7 @@ async fn test_all_plugins_available() {
         "mtls_auth",
         "cors",
         "access_control",
+        "tcp_connection_throttle",
         "ip_restriction",
         "bot_detection",
         "correlation_id",
@@ -234,6 +235,7 @@ async fn test_plugin_creation_all_plugins() {
             }
             "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
             "access_control" => json!({"allowed_consumers": ["testuser"]}),
+            "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

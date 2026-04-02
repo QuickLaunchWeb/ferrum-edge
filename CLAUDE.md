@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (34 built-in plugins including 4 AI/LLM-specific plugins, 2 gRPC-specific plugins, and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (35 built-in plugins including 4 AI/LLM-specific plugins, 2 gRPC-specific plugins, and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -150,7 +150,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (34 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
+├── plugins/                   # Plugin system (35 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure
@@ -233,7 +233,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 
 1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), gRPC method router (275)
 2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
-3. `authorize` — Access control / ACL (2000). Supports `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
+3. `authorize` — Access control / ACL (2000), TCP connection throttle (2050). Supports `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
 4. `before_proxy` — Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), gRPC deadline (3050)
 5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites
 6. `after_proxy` — Response size limiting (3490), response caching (3500), response transformer (4000), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
@@ -241,7 +241,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
 9. `log` — Stdout logging (9000), HTTP logging (9100), transaction debugger (9200), Prometheus (9300), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
-11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for logging, metrics, and tracing plugins
+11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available
 
 **Multi-auth**: `AuthMode::Multi` recognizes both `ctx.identified_consumer` (consumer-backed auth) and `ctx.authenticated_identity` (external JWKS/OIDC identity) as successful authentication. First-success-wins semantics apply.
 
@@ -251,7 +251,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 
 **External identity support**: `ctx.authenticated_identity` (set by JWKS/OIDC) is treated as a first-class principal across rate-limit keys, cache keys, log summaries, and backend identity-header injection on all protocol paths (HTTP, HTTP/3, gRPC, WebSocket).
 
-Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`).
+Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`).
 
 ### DNS Cache (`src/dns/mod.rs`)
 

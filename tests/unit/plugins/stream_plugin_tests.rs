@@ -5,8 +5,9 @@
 
 use ferrum_edge::config::types::BackendProtocol;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin,
-    PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary, create_plugin,
+    ALL_PROTOCOLS, HTTP_FAMILY_AND_TCP_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
+    StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -15,6 +16,21 @@ use std::sync::Arc;
 /// Helper to create a plugin by name with minimal config.
 fn make_plugin(name: &str, config: serde_json::Value) -> Option<Arc<dyn Plugin>> {
     create_plugin(name, &config).ok().flatten()
+}
+
+fn empty_consumer_index() -> Arc<ferrum_edge::ConsumerIndex> {
+    Arc::new(ferrum_edge::ConsumerIndex::new(&[]))
+}
+
+fn test_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
+    ferrum_edge::config::types::Consumer {
+        id: format!("consumer-{username}"),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
 }
 
 #[tokio::test]
@@ -56,7 +72,6 @@ fn test_http_family_plugins() {
     let plugins = vec![
         ("key_auth", json!({})),
         ("basic_auth", json!({})),
-        ("access_control", json!({"allowed_consumers": ["admin"]})),
         ("bot_detection", json!({})),
         ("request_termination", json!({"status_code": 503})),
     ];
@@ -75,6 +90,36 @@ fn test_http_family_plugins() {
         assert!(
             !protocols.contains(&ProxyProtocol::Tcp),
             "Plugin {} should not support TCP",
+            name
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::Udp),
+            "Plugin {} should not support UDP",
+            name
+        );
+    }
+}
+
+#[test]
+fn test_http_family_and_tcp_plugins() {
+    let plugins = vec![
+        ("access_control", json!({"allowed_consumers": ["admin"]})),
+        ("mtls_auth", json!({})),
+    ];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols, HTTP_FAMILY_AND_TCP_PROTOCOLS,
+            "Plugin {} should support HTTP_FAMILY_AND_TCP_PROTOCOLS, got {:?}",
+            name, protocols
+        );
+        assert!(
+            protocols.contains(&ProxyProtocol::Tcp),
+            "Plugin {} should support TCP",
             name
         );
         assert!(
@@ -159,6 +204,19 @@ fn test_stream_compatible_plugins_support_tcp_udp() {
     }
 }
 
+#[test]
+fn test_tcp_only_plugins() {
+    let plugin = make_plugin(
+        "tcp_connection_throttle",
+        json!({"max_connections_per_key": 10}),
+    )
+    .unwrap();
+
+    assert_eq!(plugin.supported_protocols(), TCP_ONLY_PROTOCOLS);
+    assert!(plugin.supported_protocols().contains(&ProxyProtocol::Tcp));
+    assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Udp));
+}
+
 #[tokio::test]
 async fn test_ip_restriction_stream_connect_allowed() {
     let plugin = make_plugin(
@@ -173,7 +231,12 @@ async fn test_ip_restriction_stream_connect_allowed() {
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
         backend_protocol: BackendProtocol::Tcp,
+        consumer_index: empty_consumer_index(),
+        identified_consumer: None,
+        authenticated_identity: None,
         metadata: HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -194,7 +257,12 @@ async fn test_ip_restriction_stream_connect_denied() {
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
         backend_protocol: BackendProtocol::Tcp,
+        consumer_index: empty_consumer_index(),
+        identified_consumer: None,
+        authenticated_identity: None,
         metadata: HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -216,7 +284,12 @@ fn make_stream_ctx() -> StreamConnectionContext {
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
         backend_protocol: BackendProtocol::Tcp,
+        consumer_index: empty_consumer_index(),
+        identified_consumer: None,
+        authenticated_identity: None,
         metadata: HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
     }
 }
 
@@ -269,6 +342,42 @@ async fn test_rate_limiting_stream_connect_rejected() {
         ),
         "Second stream connection should be rate limited"
     );
+}
+
+#[tokio::test]
+async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity() {
+    let plugin = make_plugin(
+        "rate_limiting",
+        json!({"requests_per_second": 1, "limit_by": "consumer"}),
+    )
+    .unwrap();
+
+    let mut ctx1 = make_stream_ctx();
+    ctx1.client_ip = "10.0.0.1".to_string();
+    ctx1.identified_consumer = Some(test_consumer("alice"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx1).await,
+        PluginResult::Continue
+    ));
+
+    let mut ctx2 = make_stream_ctx();
+    ctx2.client_ip = "10.0.0.2".to_string();
+    ctx2.identified_consumer = Some(test_consumer("alice"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx2).await,
+        PluginResult::Reject {
+            status_code: 429,
+            ..
+        }
+    ));
+
+    let mut ctx3 = make_stream_ctx();
+    ctx3.client_ip = "10.0.0.3".to_string();
+    ctx3.identified_consumer = Some(test_consumer("bob"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx3).await,
+        PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -416,7 +525,7 @@ fn test_ws_only_plugins() {
 
 #[tokio::test]
 async fn test_http_family_plugins_complete_coverage() {
-    // Plugins missing from the base test: hmac_auth, jwks_auth, jwt_auth, mtls_auth
+    // Plugins missing from the base test: hmac_auth, jwks_auth, jwt_auth
     let plugins = vec![
         ("hmac_auth", json!({})),
         (
@@ -427,7 +536,6 @@ async fn test_http_family_plugins_complete_coverage() {
             "jwt_auth",
             json!({"secret": "test-secret-key-at-least-32-chars-long!!"}),
         ),
-        ("mtls_auth", json!({})),
     ];
 
     for (name, config) in plugins {
@@ -443,6 +551,36 @@ async fn test_http_family_plugins_complete_coverage() {
         assert!(
             !plugin.supported_protocols().contains(&ProxyProtocol::Tcp),
             "Plugin {} must NOT support TCP",
+            name
+        );
+        assert!(
+            !plugin.supported_protocols().contains(&ProxyProtocol::Udp),
+            "Plugin {} must NOT support UDP",
+            name
+        );
+    }
+}
+
+#[test]
+fn test_http_family_and_tcp_plugins_complete_coverage() {
+    let plugins = vec![
+        ("access_control", json!({"allowed_consumers": ["admin"]})),
+        ("mtls_auth", json!({})),
+    ];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        assert_eq!(
+            plugin.supported_protocols(),
+            HTTP_FAMILY_AND_TCP_PROTOCOLS,
+            "Plugin {} should support HTTP_FAMILY_AND_TCP_PROTOCOLS",
+            name
+        );
+        assert!(
+            plugin.supported_protocols().contains(&ProxyProtocol::Tcp),
+            "Plugin {} must support TCP",
             name
         );
         assert!(

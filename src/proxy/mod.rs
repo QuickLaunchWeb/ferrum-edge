@@ -735,6 +735,7 @@ impl ProxyState {
             config_arc.clone(),
             dns_cache.clone(),
             load_balancer_cache.clone(),
+            consumer_index.clone(),
             plugin_cache.clone(),
             circuit_breaker_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()

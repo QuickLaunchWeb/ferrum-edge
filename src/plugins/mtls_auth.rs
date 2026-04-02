@@ -1,9 +1,9 @@
 //! Mutual TLS (mTLS) client certificate authentication plugin.
 //!
-//! Extracts the client certificate from the TLS handshake (passed via the
-//! `X-Client-Cert` header by the TLS terminator) and matches a configurable
-//! certificate field (Subject CN, OU, O, SAN DNS/Email, fingerprint, or serial)
-//! against the consumer's `mtls_auth.identity` credential for O(1) lookup.
+//! Extracts the client certificate from the TLS handshake and matches a
+//! configurable certificate field (Subject CN, OU, O, SAN DNS/Email,
+//! fingerprint, or serial) against the consumer's `mtls_auth.identity`
+//! credential for O(1) lookup.
 //!
 //! Optionally validates the certificate issuer against an allow-list to ensure
 //! only certificates from trusted CAs are accepted (defense-in-depth on top
@@ -17,7 +17,7 @@ use x509_parser::prelude::*;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 
 /// Supported certificate fields for consumer identity matching.
 #[derive(Debug, Clone)]
@@ -348,6 +348,58 @@ impl MtlsAuth {
             CertField::Serial => Ok(cert.serial.to_str_radix(16)),
         }
     }
+
+    fn authenticate_consumer(
+        &self,
+        cert_der: &[u8],
+        chain_der: Option<&[Vec<u8>]>,
+        consumer_index: &ConsumerIndex,
+    ) -> Result<crate::config::types::Consumer, PluginResult> {
+        // Parse the certificate once for both issuer verification and identity extraction.
+        let (_, parsed_cert) = match X509Certificate::from_der(cert_der) {
+            Ok(result) => result,
+            Err(e) => {
+                debug!("mtls_auth: failed to parse certificate: {}", e);
+                return Err(PluginResult::Reject {
+                    status_code: 401,
+                    body: r#"{"error":"Invalid client certificate"}"#.into(),
+                    headers: HashMap::new(),
+                });
+            }
+        };
+
+        if self.has_issuer_constraints()
+            && let Err(reason) = self.verify_issuer_constraints(&parsed_cert, chain_der)
+        {
+            debug!("mtls_auth: issuer constraint failed: {}", reason);
+            return Err(PluginResult::Reject {
+                status_code: 403,
+                body: serde_json::json!({ "error": reason }).to_string(),
+                headers: HashMap::new(),
+            });
+        }
+
+        let identity = match self.extract_cert_identity(cert_der) {
+            Ok(id) => id,
+            Err(e) => {
+                debug!("mtls_auth: failed to extract identity: {}", e);
+                return Err(PluginResult::Reject {
+                    status_code: 401,
+                    body: r#"{"error":"Invalid client certificate"}"#.into(),
+                    headers: HashMap::new(),
+                });
+            }
+        };
+
+        match consumer_index.find_by_mtls_identity(&identity) {
+            Some(consumer) => Ok((*consumer).clone()),
+            None => Err(PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"No consumer found for client certificate"}"#.into(),
+                headers: HashMap::new(),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -365,7 +417,7 @@ impl Plugin for MtlsAuth {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
+        super::HTTP_FAMILY_AND_TCP_PROTOCOLS
     }
 
     async fn authenticate(
@@ -384,57 +436,53 @@ impl Plugin for MtlsAuth {
             }
         };
 
-        // Parse the certificate once for both issuer verification and identity extraction.
-        let (_, parsed_cert) = match X509Certificate::from_der(cert_der) {
-            Ok(result) => result,
-            Err(e) => {
-                debug!("mtls_auth: failed to parse certificate: {}", e);
+        match self.authenticate_consumer(
+            cert_der,
+            ctx.tls_client_cert_chain_der.as_ref().map(|c| c.as_slice()),
+            consumer_index,
+        ) {
+            Ok(consumer) => {
+                if ctx.identified_consumer.is_none() {
+                    debug!("mtls_auth: identified consumer '{}'", consumer.username);
+                    ctx.identified_consumer = Some(consumer);
+                }
+                PluginResult::Continue
+            }
+            Err(reject) => reject,
+        }
+    }
+
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        let cert_der = match &ctx.tls_client_cert_der {
+            Some(der) => der,
+            None => {
                 return PluginResult::Reject {
                     status_code: 401,
-                    body: r#"{"error":"Invalid client certificate"}"#.into(),
+                    body: r#"{"error":"No client certificate presented"}"#.into(),
                     headers: HashMap::new(),
                 };
             }
         };
 
-        // Verify issuer constraints (allowed_issuers + allowed_ca_fingerprints_sha256).
-        if self.has_issuer_constraints() {
-            let chain = ctx.tls_client_cert_chain_der.as_ref().map(|c| c.as_slice());
-            if let Err(reason) = self.verify_issuer_constraints(&parsed_cert, chain) {
-                debug!("mtls_auth: issuer constraint failed: {}", reason);
-                return PluginResult::Reject {
-                    status_code: 403,
-                    body: serde_json::json!({ "error": reason }).to_string(),
-                    headers: HashMap::new(),
-                };
+        match self.authenticate_consumer(
+            cert_der,
+            ctx.tls_client_cert_chain_der.as_ref().map(|c| c.as_slice()),
+            ctx.consumer_index.as_ref(),
+        ) {
+            Ok(consumer) => {
+                if ctx.identified_consumer.is_none() {
+                    debug!(
+                        "mtls_auth: identified stream consumer '{}'",
+                        consumer.username
+                    );
+                    ctx.metadata
+                        .entry("consumer_username".to_string())
+                        .or_insert_with(|| consumer.username.clone());
+                    ctx.identified_consumer = Some(consumer);
+                }
+                PluginResult::Continue
             }
-        }
-
-        let identity = match self.extract_cert_identity(cert_der) {
-            Ok(id) => id,
-            Err(e) => {
-                debug!("mtls_auth: failed to extract identity: {}", e);
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid client certificate"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // O(1) lookup by mTLS identity via ConsumerIndex
-        if let Some(consumer) = consumer_index.find_by_mtls_identity(&identity) {
-            if ctx.identified_consumer.is_none() {
-                debug!("mtls_auth: identified consumer '{}'", consumer.username);
-                ctx.identified_consumer = Some((*consumer).clone());
-            }
-            return PluginResult::Continue;
-        }
-
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"No consumer found for client certificate"}"#.into(),
-            headers: HashMap::new(),
+            Err(reject) => reject,
         }
     }
 }

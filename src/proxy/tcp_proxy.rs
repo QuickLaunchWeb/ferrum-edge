@@ -19,6 +19,7 @@ use crate::circuit_breaker::CircuitBreakerCache;
 use crate::tls::{NoVerifier, TlsPolicy};
 
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
@@ -124,6 +125,7 @@ pub struct TcpListenerConfig {
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub load_balancer_cache: Arc<LoadBalancerCache>,
+    pub consumer_index: Arc<ConsumerIndex>,
     pub frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<TcpProxyMetrics>,
@@ -156,6 +158,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         config,
         dns_cache,
         load_balancer_cache,
+        consumer_index,
         frontend_tls_config,
         shutdown,
         metrics,
@@ -240,6 +243,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let config = config.clone();
                 let dns_cache = dns_cache.clone();
                 let lb_cache = load_balancer_cache.clone();
+                let consumer_index = consumer_index.clone();
                 let frontend_tls = frontend_tls_config.clone();
                 let metrics = metrics.clone();
                 let backend_tls = backend_tls_cache.clone();
@@ -250,26 +254,21 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 tokio::spawn(async move {
                     let connected_at = chrono::Utc::now();
 
-                    // Run on_stream_connect plugins (ip_restriction, rate_limiting, etc.)
+                    // Build stream context — plugins run inside handle_tcp_connection
+                    // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext {
                         client_ip: remote_addr.ip().to_string(),
                         proxy_id: proxy_id.to_string(),
                         proxy_name: proxy_name.clone(),
                         listen_port: port,
                         backend_protocol,
+                        consumer_index,
+                        identified_consumer: None,
+                        authenticated_identity: None,
                         metadata: std::collections::HashMap::new(),
+                        tls_client_cert_der: None,
+                        tls_client_cert_chain_der: None,
                     };
-                    for plugin in plugins.iter() {
-                        if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
-                            debug!(
-                                proxy_id = %proxy_id,
-                                client = %remote_addr.ip(),
-                                "TCP connection rejected by plugin"
-                            );
-                            metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
-                    }
 
                     let result = handle_tcp_connection(
                         stream,
@@ -282,6 +281,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
                         &cb_cache,
+                        &plugins,
+                        &mut stream_ctx,
                     )
                     .await;
 
@@ -414,6 +415,8 @@ async fn handle_tcp_connection(
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    stream_ctx: &mut StreamConnectionContext,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -439,6 +442,8 @@ async fn handle_tcp_connection(
         circuit_breaker_cache,
         start,
         &mut backend_info,
+        plugins,
+        stream_ctx,
     )
     .await;
 
@@ -464,6 +469,8 @@ async fn handle_tcp_connection_inner(
     circuit_breaker_cache: &CircuitBreakerCache,
     start: Instant,
     backend_info: &mut TcpBackendInfo,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
+    stream_ctx: &mut StreamConnectionContext,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // Look up the proxy config and extract only the fields we need.
     // The ArcSwap guard (and full Proxy) is dropped before any async work.
@@ -515,6 +522,21 @@ async fn handle_tcp_connection_inner(
     } else {
         None
     };
+
+    // For non-TLS proxies, run on_stream_connect plugins before backend connection.
+    // TLS proxies defer this until after the TLS handshake so client cert is available.
+    if frontend_tls_config.is_none() && !plugins.is_empty() {
+        for plugin in plugins {
+            if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+                debug!(
+                    proxy_id = %proxy_id,
+                    client = %remote_addr.ip(),
+                    "TCP connection rejected by plugin"
+                );
+                return Err(anyhow::anyhow!("Connection rejected by plugin"));
+            }
+        }
+    }
 
     // Helper: record circuit breaker failure for the current target.
     let record_cb_failure = |cb_cache: &CircuitBreakerCache,
@@ -701,6 +723,42 @@ async fn handle_tcp_connection_inner(
                 ));
             }
         };
+
+        // Extract peer certificate DER from TLS handshake for plugin use.
+        let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {
+            certs
+                .iter()
+                .map(|cert| cert.to_vec())
+                .collect::<Vec<Vec<u8>>>()
+        });
+        let peer_cert_der = peer_chain_der
+            .as_ref()
+            .and_then(|certs| certs.first().cloned())
+            .map(Arc::new);
+        let peer_chain_tail_der = peer_chain_der.and_then(|mut certs| {
+            if certs.len() <= 1 {
+                None
+            } else {
+                certs.remove(0);
+                Some(Arc::new(certs))
+            }
+        });
+        stream_ctx.tls_client_cert_der = peer_cert_der;
+        stream_ctx.tls_client_cert_chain_der = peer_chain_tail_der;
+
+        // Run on_stream_connect plugins after TLS handshake so client cert is available.
+        if !plugins.is_empty() {
+            for plugin in plugins {
+                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+                    debug!(
+                        proxy_id = %proxy_id,
+                        client = %remote_addr.ip(),
+                        "TCP/TLS connection rejected by plugin"
+                    );
+                    return Err(anyhow::anyhow!("Connection rejected by plugin"));
+                }
+            }
+        }
 
         match backend_stream {
             BackendStream::Tls(bs) => bidirectional_copy(tls_stream, bs, idle_timeout).await,

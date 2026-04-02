@@ -609,8 +609,14 @@ impl Plugin for RateLimiting {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        let ip_key = format!("ip:{}", ctx.client_ip);
-        self.check_rate_stream(&ip_key).await
+        let key = if self.limit_by == "consumer" {
+            ctx.effective_identity()
+                .map(|identity| format!("consumer:{identity}"))
+                .unwrap_or_else(|| format!("ip:{}", ctx.client_ip))
+        } else {
+            format!("ip:{}", ctx.client_ip)
+        };
+        self.check_rate_stream(&key).await
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

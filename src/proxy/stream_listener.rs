@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendProtocol, GatewayConfig};
+use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
@@ -42,6 +43,7 @@ pub struct StreamListenerManager {
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
     load_balancer_cache: Arc<LoadBalancerCache>,
+    consumer_index: Arc<ConsumerIndex>,
     plugin_cache: Arc<PluginCache>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
@@ -77,6 +79,7 @@ impl StreamListenerManager {
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
         dns_cache: DnsCache,
         load_balancer_cache: Arc<LoadBalancerCache>,
+        consumer_index: Arc<ConsumerIndex>,
         plugin_cache: Arc<PluginCache>,
         circuit_breaker_cache: Arc<CircuitBreakerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -93,6 +96,7 @@ impl StreamListenerManager {
             config,
             dns_cache,
             load_balancer_cache,
+            consumer_index,
             plugin_cache,
             circuit_breaker_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
@@ -286,6 +290,7 @@ impl StreamListenerManager {
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 let udp_max_sessions = self.udp_max_sessions;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
+                let consumer_index = self.consumer_index.clone();
                 let plugin_cache = self.plugin_cache.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
@@ -295,6 +300,7 @@ impl StreamListenerManager {
                         config,
                         dns_cache,
                         load_balancer_cache: lb_cache,
+                        consumer_index,
                         shutdown: shutdown_rx,
                         metrics,
                         frontend_dtls_config,
@@ -324,6 +330,7 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
+                let consumer_index = self.consumer_index.clone();
                 let plugin_cache = self.plugin_cache.clone();
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tls_policy = self.tls_policy.clone();
@@ -336,6 +343,7 @@ impl StreamListenerManager {
                         config,
                         dns_cache,
                         load_balancer_cache: lb_cache,
+                        consumer_index,
                         frontend_tls_config: tls_config,
                         shutdown: shutdown_rx,
                         metrics,
