@@ -222,7 +222,7 @@ Given all built-in plugins enabled, the execution order is:
 | 32 | `ws_frame_logging` | 9050 | on_ws_frame |
 | 33 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 34 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 34 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 35 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
