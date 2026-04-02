@@ -2,7 +2,9 @@
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
-//! `before_proxy` → `after_proxy` → `on_response_body` → `log` → `on_ws_frame`.
+//! `before_proxy` → `transform_request_body` → `on_final_request_body` →
+//! `after_proxy` → `on_response_body` → `transform_response_body` →
+//! `on_final_response_body` → `log` → `on_ws_frame`.
 //!
 //! Each plugin declares which protocols it supports via `supported_protocols()`.
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
@@ -168,6 +170,50 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
+
+    /// Return the stable authenticated identity for downstream policy and
+    /// observability. Gateway-mapped Consumers take precedence over external
+    /// identities emitted by plugins like `jwks_auth`.
+    pub fn effective_identity(&self) -> Option<&str> {
+        self.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str())
+            .or(self.authenticated_identity.as_deref())
+    }
+
+    /// Return the identity value to forward to the backend in
+    /// `X-Consumer-Username`. This prefers the gateway Consumer username, then
+    /// a plugin-provided display/header identity, then the raw external auth
+    /// identity.
+    pub fn backend_consumer_username(&self) -> Option<&str> {
+        self.identified_consumer
+            .as_ref()
+            .map(|consumer| consumer.username.as_str())
+            .or(self.authenticated_identity_header.as_deref())
+            .or(self.authenticated_identity.as_deref())
+    }
+
+    /// Return the Consumer custom ID to forward to the backend, if a gateway
+    /// Consumer was resolved.
+    pub fn backend_consumer_custom_id(&self) -> Option<&str> {
+        self.identified_consumer
+            .as_ref()
+            .and_then(|consumer| consumer.custom_id.as_deref())
+    }
+}
+
+/// Strip an HTTP auth scheme prefix from a header value using ASCII
+/// case-insensitive matching. Returns the remaining credentials/token when the
+/// scheme matches and a non-empty payload follows.
+pub(crate) fn strip_auth_scheme<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    let boundary = value.find(|c: char| c.is_ascii_whitespace())?;
+    let (prefix, remainder) = value.split_at(boundary);
+    if !prefix.eq_ignore_ascii_case(scheme) {
+        return None;
+    }
+
+    let payload = remainder.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    (!payload.is_empty()).then_some(payload)
 }
 
 /// Result of a plugin execution.
@@ -206,7 +252,8 @@ pub struct TransactionSummary {
     /// use `latency_backend_ttfb_ms` for alerting).
     pub latency_backend_total_ms: f64,
     /// Wall-clock time spent executing all plugin hooks (on_request_received
-    /// through after_proxy/on_response_body/transform_response_body).
+    /// through after_proxy/on_response_body/transform_response_body/
+    /// on_final_response_body).
     /// Includes any external I/O that plugins performed synchronously.
     pub latency_plugin_execution_ms: f64,
     /// Subset of plugin execution time spent on external HTTP calls
@@ -282,19 +329,19 @@ pub struct StreamTransactionSummary {
 /// phase. Plugins at the same priority have no guaranteed relative order.
 /// Gaps between bands leave room for future plugins to slot in.
 ///
-/// | Band    | Range       | Purpose                                      | Plugins                          |
-/// |---------|-------------|----------------------------------------------|----------------------------------|
-/// | Early   | 0–999       | Pre-processing: CORS preflight               | cors (100)                       |
-/// | AuthN   | 950–1999    | Authentication: identity verification         | mtls (950), jwks (1000), jwt (1100), key (1200), basic (1300) |
-/// | AuthZ   | 2000–2999   | Authorization & post-auth enforcement         | access_control (2000), rate_limiting (2900) |
-/// | Transform | 3000–3999 | Request transformation & caching              | request_transformer (3000), response_caching (3500) |
-/// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
-/// | Logging | 9000–9999   | Logging & observability (fire-and-forget)     | stdout (9000), http (9100), debugger (9200) |
+/// | Band      | Range       | Purpose                                   | Plugins |
+/// |-----------|-------------|-------------------------------------------|---------|
+/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
+/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
+/// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), response_size_limiting (3490), response_caching (3500) |
+/// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
     pub const CORRELATION_ID: u16 = 50;
-    pub const REQUEST_TERMINATION: u16 = 75;
+    pub const REQUEST_TERMINATION: u16 = 125;
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
@@ -314,8 +361,8 @@ pub mod priority {
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const GRPC_DEADLINE: u16 = 3050;
+    pub const RESPONSE_SIZE_LIMITING: u16 = 3490;
     pub const RESPONSE_CACHING: u16 = 3500;
-    pub const RESPONSE_SIZE_LIMITING: u16 = 3950;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
@@ -383,6 +430,27 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs the raw request body to be available
+    /// during `before_proxy`.
+    ///
+    /// This is narrower than `requires_request_body_buffering()`: body
+    /// transformers can buffer later, after `before_proxy` rejects have had a
+    /// chance to short-circuit. Override this only for plugins that read
+    /// `ctx.metadata["request_body"]` inside `before_proxy`.
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` if this plugin may require the request body to be
+    /// buffered instead of streamed for at least some requests.
+    ///
+    /// The gateway uses this as a config-time upper bound in `PluginCache`.
+    /// Request-time body buffering can still remain disabled when
+    /// `should_buffer_request_body()` returns `false` for the current request.
+    fn requires_request_body_buffering(&self) -> bool {
+        self.modifies_request_body() || self.requires_request_body_before_before_proxy()
+    }
+
     /// Called just before the request is proxied to the backend.
     async fn before_proxy(
         &self,
@@ -390,6 +458,16 @@ pub trait Plugin: Send + Sync {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` when the current request should buffer the request body
+    /// for this plugin.
+    ///
+    /// Override this for config-sensitive or header-sensitive plugins so the
+    /// gateway can keep streaming requests that clearly do not need body access
+    /// (for example, non-JSON requests on an AI policy plugin).
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
+        self.requires_request_body_buffering()
     }
 
     /// Called after the response is received from the backend.
@@ -400,6 +478,16 @@ pub trait Plugin: Send + Sync {
         _response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Returns `true` if this plugin should also run its `after_proxy`
+    /// header decoration logic for gateway-generated rejection responses.
+    ///
+    /// Intended for response-header plugins like CORS, tracing propagation,
+    /// and correlation IDs. Plugins that rely on a real backend response
+    /// should leave the default `false`.
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        false
     }
 
     /// Returns `true` if this plugin needs the entire response body buffered
@@ -453,6 +541,18 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Called after all `transform_request_body` hooks on buffered requests.
+    ///
+    /// Use this hook when the plugin must inspect or validate the final
+    /// backend-visible request body after all request transformations have run.
+    async fn on_final_request_body(
+        &self,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
     /// Transform the response body before it is sent to the client.
     ///
     /// Called after `on_response_body` hooks, only for buffered responses
@@ -468,6 +568,21 @@ pub trait Plugin: Send + Sync {
         _content_type: Option<&str>,
     ) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Called after all `transform_response_body` hooks on buffered responses.
+    ///
+    /// Use this hook when the plugin must inspect or act on the final
+    /// client-visible response body, such as for outbound validation,
+    /// post-transform size checks, or caching the transformed payload.
+    async fn on_final_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Called for transaction logging.

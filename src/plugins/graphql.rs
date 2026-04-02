@@ -105,6 +105,7 @@ pub struct GraphqlPlugin {
     operation_rate_limits: HashMap<String, RateSpec>,
     /// Token bucket state: key -> bucket
     state: Arc<DashMap<String, TokenBucket>>,
+    has_any_config: bool,
 }
 
 impl GraphqlPlugin {
@@ -174,6 +175,7 @@ impl GraphqlPlugin {
             type_rate_limits,
             operation_rate_limits,
             state: Arc::new(DashMap::new()),
+            has_any_config,
         }
     }
 
@@ -205,12 +207,9 @@ impl GraphqlPlugin {
     /// Build the rate limit key based on `limit_by` config.
     fn rate_key(&self, ctx: &RequestContext, suffix: &str) -> String {
         let identity = if self.limit_by == "consumer" {
-            ctx.identified_consumer
-                .as_ref()
-                .map(|c| c.username.as_str())
-                .unwrap_or(&ctx.client_ip)
+            ctx.effective_identity().unwrap_or(ctx.client_ip.as_str())
         } else {
-            &ctx.client_ip
+            ctx.client_ip.as_str()
         };
         format!("gql:{}:{}", identity, suffix)
     }
@@ -457,10 +456,23 @@ impl Plugin for GraphqlPlugin {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.has_any_config
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.has_any_config
+            && ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only process POST requests (standard GraphQL transport)
         if ctx.method != "POST" {
@@ -468,9 +480,9 @@ impl Plugin for GraphqlPlugin {
         }
 
         // Check content type
-        let content_type = ctx
-            .headers
+        let content_type = headers
             .get("content-type")
+            .or_else(|| ctx.headers.get("content-type"))
             .cloned()
             .unwrap_or_default()
             .to_lowercase();

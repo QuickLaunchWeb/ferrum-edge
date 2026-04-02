@@ -18,6 +18,8 @@ use tracing::debug;
 
 use super::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
 
+const MAX_GRPC_TIMEOUT_VALUE: u64 = 99_999_999;
+
 pub struct GrpcDeadline {
     max_deadline_ms: Option<u64>,
     default_deadline_ms: Option<u64>,
@@ -60,10 +62,32 @@ fn parse_grpc_timeout(val: &str) -> Option<Duration> {
     }
 }
 
-/// Format a Duration as a `grpc-timeout` value using milliseconds.
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(!value.is_multiple_of(divisor))
+}
+
+/// Format a Duration as a valid `grpc-timeout` value.
+///
+/// The gRPC wire format allows at most 8 digits. We preserve exact
+/// millisecond precision whenever it fits, and only coarsen the unit when the
+/// 8-digit limit would otherwise be exceeded.
 fn format_grpc_timeout(d: Duration) -> String {
-    let ms = d.as_millis();
-    format!("{}m", ms)
+    let ms = d.as_millis().min(u128::from(u64::MAX)) as u64;
+    let candidates = [
+        ('m', 1_u64),
+        ('S', 1_000_u64),
+        ('M', 60_000_u64),
+        ('H', 3_600_000_u64),
+    ];
+
+    for (unit, divisor) in candidates {
+        let value = ceil_div_u64(ms, divisor);
+        if value <= MAX_GRPC_TIMEOUT_VALUE {
+            return format!("{value}{unit}");
+        }
+    }
+
+    format!("{MAX_GRPC_TIMEOUT_VALUE}H")
 }
 
 /// Returns a header map with `content-type: application/grpc`.
@@ -96,11 +120,8 @@ impl Plugin for GrpcDeadline {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let existing_timeout = ctx
-            .headers
-            .get("grpc-timeout")
-            .or_else(|| headers.get("grpc-timeout"))
-            .cloned();
+        let existing_timeout = ctx.headers.get("grpc-timeout");
+        let existing_timeout = headers.get("grpc-timeout").or(existing_timeout).cloned();
 
         let mut deadline_ms: Option<u64> = match &existing_timeout {
             Some(val) => match parse_grpc_timeout(val) {

@@ -1,11 +1,22 @@
 use ferrum_edge::plugins::ip_restriction::IpRestriction;
-use ferrum_edge::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::{Plugin, RequestContext, StreamConnectionContext};
 use serde_json::json;
 
 use super::plugin_utils;
 
 fn create_context_with_ip(ip: &str) -> RequestContext {
     RequestContext::new(ip.to_string(), "GET".to_string(), "/test".to_string())
+}
+
+fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: ip.to_string(),
+        proxy_id: "test-proxy".to_string(),
+        proxy_name: Some("Test Proxy".to_string()),
+        listen_port: 8080,
+        backend_protocol: ferrum_edge::config::types::BackendProtocol::Tcp,
+        metadata: std::collections::HashMap::new(),
+    }
 }
 
 // ── Allow mode tests ────────────────────────────────────────────────
@@ -233,10 +244,8 @@ async fn default_config_rejects_creation_for_any_ip() {
 
 #[tokio::test]
 async fn allow_first_deny_takes_precedence_when_ip_in_both_lists() {
-    // In allow_first mode: if allow list is non-empty, IP must be in it first.
-    // If IP matches allow, it returns Continue before checking deny.
-    // So we test: IP in allow but also in deny -> allow_first returns Continue
-    // because allow check passes first and returns early.
+    // Deny rules override allow rules even in allow_first mode, matching the
+    // stream path and avoiding protocol-specific bypasses.
     let plugin = IpRestriction::new(&json!({
         "allow": ["192.168.1.100"],
         "deny": ["192.168.1.100"]
@@ -245,8 +254,7 @@ async fn allow_first_deny_takes_precedence_when_ip_in_both_lists() {
 
     let mut ctx = create_context_with_ip("192.168.1.100");
     let result = plugin.on_request_received(&mut ctx).await;
-    // In allow_first mode, the allow check returns Continue before deny is checked
-    plugin_utils::assert_continue(result);
+    plugin_utils::assert_reject(result, Some(403));
 }
 
 #[tokio::test]
@@ -452,4 +460,48 @@ async fn deny_list_with_multiple_entries() {
     let mut ctx = create_context_with_ip("192.168.1.1");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn allow_first_stream_connect_matches_http_when_ip_in_both_lists() {
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["192.168.1.100"],
+        "deny": ["192.168.1.100"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_stream_context_with_ip("192.168.1.100");
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[test]
+fn invalid_allow_rule_rejects_creation() {
+    let result = IpRestriction::new(&json!({
+        "allow": ["not-an-ip"]
+    }));
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .contains("invalid allow rule 'not-an-ip'"),
+    );
+}
+
+#[test]
+fn invalid_deny_cidr_rule_rejects_creation() {
+    let result = IpRestriction::new(&json!({
+        "deny": ["10.0.0.0/99"],
+        "mode": "deny_first"
+    }));
+
+    assert!(result.is_err());
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .contains("invalid deny rule '10.0.0.0/99'"),
+    );
 }

@@ -177,6 +177,24 @@ async fn test_basic_auth_case_insensitive_scheme() {
 }
 
 #[tokio::test]
+async fn test_basic_auth_uppercase_scheme() {
+    let plugin = BasicAuth::new(&json!({}));
+    let consumer = create_basic_auth_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx();
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode("testuser:password");
+    ctx.headers
+        .insert("authorization".to_string(), format!("BASIC {}", encoded));
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+}
+
+#[tokio::test]
 async fn test_basic_auth_empty_consumers() {
     let plugin = BasicAuth::new(&json!({}));
     let consumer_index = ConsumerIndex::new(&[]);

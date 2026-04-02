@@ -31,9 +31,6 @@ pub(super) enum ParsedRule {
     ExactV6(u128),
     /// IPv6 CIDR range (network & mask pre-computed).
     CidrV6 { network: u128, mask: u128 },
-    /// Unparseable rule — kept as a raw string for exact string comparison.
-    /// This ensures backwards compatibility if someone passes a rule we can't parse.
-    Raw(String),
 }
 
 /// The client IP parsed once per request for matching against all rules.
@@ -41,8 +38,8 @@ pub(super) enum ParsedRule {
 pub(super) enum ParsedClientIp {
     V4(u32),
     V6(u128),
-    /// Unparseable — can only match Raw rules via string comparison.
-    Unknown(String),
+    /// Unparseable client IP string — never matches validated rules.
+    Unknown,
 }
 
 pub struct IpRestriction {
@@ -53,8 +50,8 @@ pub struct IpRestriction {
 
 impl IpRestriction {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let allow = Self::parse_rule_list(config, "allow");
-        let deny = Self::parse_rule_list(config, "deny");
+        let allow = Self::parse_rule_list(config, "allow")?;
+        let deny = Self::parse_rule_list(config, "deny")?;
 
         if allow.is_empty() && deny.is_empty() {
             return Err(
@@ -79,6 +76,7 @@ impl IpRestriction {
                 if !self.allow.is_empty()
                     && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
                 {
+                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address not allowed"}"#.to_string(),
@@ -86,6 +84,7 @@ impl IpRestriction {
                     };
                 }
                 if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
+                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address denied"}"#.to_string(),
@@ -95,6 +94,7 @@ impl IpRestriction {
             }
             Mode::DenyFirst => {
                 if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
+                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address denied"}"#.to_string(),
@@ -104,6 +104,7 @@ impl IpRestriction {
                 if !self.allow.is_empty()
                     && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
                 {
+                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address not allowed"}"#.to_string(),
@@ -116,16 +117,21 @@ impl IpRestriction {
     }
 
     /// Parse a JSON array of IP/CIDR strings into pre-computed rules at config load time.
-    fn parse_rule_list(config: &Value, key: &str) -> Vec<ParsedRule> {
-        config[key]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .map(parse_rule)
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn parse_rule_list(config: &Value, key: &str) -> Result<Vec<ParsedRule>, String> {
+        let Some(arr) = config[key].as_array() else {
+            return Ok(Vec::new());
+        };
+
+        let mut rules = Vec::with_capacity(arr.len());
+        for value in arr {
+            let rule = value
+                .as_str()
+                .ok_or_else(|| format!("ip_restriction: '{key}' entries must be strings"))?;
+            rules.push(parse_rule(rule).ok_or_else(|| {
+                format!("ip_restriction: invalid {key} rule '{rule}' — expected exact IP or CIDR")
+            })?);
+        }
+        Ok(rules)
     }
 }
 
@@ -154,75 +160,25 @@ impl Plugin for IpRestriction {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let client_ip = parse_client_ip(&ctx.client_ip);
-
-        match self.mode {
-            Mode::AllowFirst => {
-                // If allow list is configured, IP must be in it
-                if !self.allow.is_empty() {
-                    if self.allow.iter().any(|rule| rule_matches(&client_ip, rule)) {
-                        return PluginResult::Continue;
-                    }
-                    warn!(client_ip = %ctx.client_ip, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address not allowed"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-                // Then check deny list
-                if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
-                    warn!(client_ip = %ctx.client_ip, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address denied"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-            }
-            Mode::DenyFirst => {
-                // Check deny list first
-                if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
-                    warn!(client_ip = %ctx.client_ip, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address denied"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-                // If allow list is configured and IP is not in it, deny
-                if !self.allow.is_empty()
-                    && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
-                {
-                    warn!(client_ip = %ctx.client_ip, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address not allowed"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-            }
-        }
-
-        PluginResult::Continue
+        self.check_ip(&ctx.client_ip)
     }
 }
 
 // ── Pre-parsing (config load time) ──────────────────────────────────
 
 /// Parse a single rule string into a `ParsedRule` at config load time.
-pub(super) fn parse_rule(rule: &str) -> ParsedRule {
+pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
     if let Some((network_str, prefix_str)) = rule.split_once('/') {
         // CIDR rule
         let prefix_len: u8 = match prefix_str.parse() {
             Ok(p) => p,
-            Err(_) => return ParsedRule::Raw(rule.to_string()),
+            Err(_) => return None,
         };
 
         // Try IPv4 CIDR
         if let Some(octets) = parse_ipv4(network_str) {
             if prefix_len > 32 {
-                return ParsedRule::Raw(rule.to_string());
+                return None;
             }
             let network = u32::from_be_bytes(octets);
             let mask = if prefix_len == 0 {
@@ -230,16 +186,16 @@ pub(super) fn parse_rule(rule: &str) -> ParsedRule {
             } else {
                 !0u32 << (32 - prefix_len)
             };
-            return ParsedRule::CidrV4 {
+            return Some(ParsedRule::CidrV4 {
                 network: network & mask,
                 mask,
-            };
+            });
         }
 
         // Try IPv6 CIDR
         if let Some(parts) = parse_ipv6(network_str) {
             if prefix_len > 128 {
-                return ParsedRule::Raw(rule.to_string());
+                return None;
             }
             let network = ipv6_to_u128(&parts);
             let mask = if prefix_len == 0 {
@@ -247,23 +203,22 @@ pub(super) fn parse_rule(rule: &str) -> ParsedRule {
             } else {
                 !0u128 << (128 - prefix_len)
             };
-            return ParsedRule::CidrV6 {
+            return Some(ParsedRule::CidrV6 {
                 network: network & mask,
                 mask,
-            };
+            });
         }
 
-        ParsedRule::Raw(rule.to_string())
+        None
     } else {
         // Exact IP rule
         if let Some(octets) = parse_ipv4(rule) {
-            return ParsedRule::ExactV4(u32::from_be_bytes(octets));
+            return Some(ParsedRule::ExactV4(u32::from_be_bytes(octets)));
         }
         if let Some(parts) = parse_ipv6(rule) {
-            return ParsedRule::ExactV6(ipv6_to_u128(&parts));
+            return Some(ParsedRule::ExactV6(ipv6_to_u128(&parts)));
         }
-        // Unparseable — keep raw for string comparison
-        ParsedRule::Raw(rule.to_string())
+        None
     }
 }
 
@@ -275,7 +230,7 @@ pub(super) fn parse_client_ip(ip: &str) -> ParsedClientIp {
     if let Some(parts) = parse_ipv6(ip) {
         return ParsedClientIp::V6(ipv6_to_u128(&parts));
     }
-    ParsedClientIp::Unknown(ip.to_string())
+    ParsedClientIp::Unknown
 }
 
 // ── Request-time matching (integer ops only) ────────────────────────
@@ -299,9 +254,7 @@ pub(super) fn rule_matches(client: &ParsedClientIp, rule: &ParsedRule) -> bool {
         (ParsedClientIp::V6(client_bits), ParsedRule::CidrV6 { network, mask }) => {
             (client_bits & mask) == *network
         }
-        // Raw fallback — string comparison
-        (ParsedClientIp::Unknown(client_str), ParsedRule::Raw(rule_str)) => client_str == rule_str,
-        // Cross-family or mismatched types never match
+        // Unknown or cross-family types never match validated rules.
         _ => false,
     }
 }
@@ -315,8 +268,9 @@ pub(super) fn rule_matches(client: &ParsedClientIp, rule: &ParsedRule) -> bool {
 #[allow(dead_code)]
 pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
     let parsed_client = parse_client_ip(client_ip);
-    let parsed_rule = parse_rule(rule);
-    rule_matches(&parsed_client, &parsed_rule)
+    parse_rule(rule)
+        .map(|parsed_rule| rule_matches(&parsed_client, &parsed_rule))
+        .unwrap_or(false)
 }
 
 // ── IP parsing helpers ──────────────────────────────────────────────

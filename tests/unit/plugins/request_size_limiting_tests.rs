@@ -158,6 +158,31 @@ async fn test_no_buffered_body_passes() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+#[tokio::test]
+async fn test_final_request_body_under_limit_passes() {
+    let plugin = RequestSizeLimiting::new(&json!({"max_bytes": 10}));
+    let headers = HashMap::new();
+
+    let result = plugin.on_final_request_body(&headers, b"1234567890").await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_final_request_body_over_limit_rejects() {
+    let plugin = RequestSizeLimiting::new(&json!({"max_bytes": 10}));
+    let headers = HashMap::new();
+
+    match plugin.on_final_request_body(&headers, b"12345678901").await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 413);
+            assert!(body.contains("Request body too large"));
+        }
+        _ => panic!("Expected Reject"),
+    }
+}
+
 // === Protocol support ===
 
 #[tokio::test]

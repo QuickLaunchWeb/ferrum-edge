@@ -50,6 +50,36 @@ async fn test_first_request_passes() {
 }
 
 #[tokio::test]
+async fn test_provider_is_case_insensitive() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "provider": " OpenAI "
+        }),
+        PluginHttpClient::default(),
+    );
+    let resp_headers = json_headers();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let body = openai_response(80, 30);
+    plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, &body)
+        .await;
+
+    let mut ctx2 = create_test_context();
+    let mut headers2 = HashMap::new();
+    assert_reject(
+        plugin.before_proxy(&mut ctx2, &mut headers2).await,
+        Some(429),
+    );
+}
+
+#[tokio::test]
 async fn test_token_accumulation_and_limit() {
     let plugin = AiRateLimiter::new(
         &json!({

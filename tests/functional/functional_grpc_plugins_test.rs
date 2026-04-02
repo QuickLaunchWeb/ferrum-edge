@@ -1,4 +1,4 @@
-//! Functional tests for gRPC-specific plugins (grpc_method_router, grpc_deadline).
+//! Functional tests for gRPC-specific plugins and gRPC-specific reject handling.
 //!
 //! These tests:
 //! 1. Start a local gRPC echo backend (h2c HTTP/2 server)
@@ -352,6 +352,40 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write config with response_size_limiting plugin for gRPC responses.
+fn write_response_size_limit_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+proxies:
+  - id: "grpc-size-limit-proxy"
+    listen_path: "/"
+    backend_protocol: grpc
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: false
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "grpc-response-size-limit"
+
+consumers: []
+
+plugin_configs:
+  - id: "grpc-response-size-limit"
+    plugin_name: "response_size_limiting"
+    scope: proxy
+    proxy_id: "grpc-size-limit-proxy"
+    enabled: true
+    config:
+      max_bytes: 4
+      require_buffered_check: true
+"#
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 // ============================================================================
 // grpc_method_router tests
 // ============================================================================
@@ -398,20 +432,21 @@ async fn test_grpc_method_router_allow_list() {
             .await
             .expect("Disallowed method request should complete");
 
+    assert_eq!(status2, 200, "gRPC method rejection should return HTTP 200");
+    assert!(
+        body2.is_empty(),
+        "gRPC method rejection should be trailers-only"
+    );
     assert_eq!(
-        status2, 403,
-        "Disallowed gRPC method should return HTTP 403"
+        headers2.get("grpc-status").map(|s| s.as_str()),
+        Some("7"),
+        "Disallowed method should map to grpc-status 7 (PERMISSION_DENIED)"
     );
-    let body_str = String::from_utf8_lossy(&body2);
     assert!(
-        body_str.contains("not permitted"),
-        "Response should indicate method not allowed, got: {}",
-        body_str
-    );
-    // Verify no grpc-status since rejection is pre-proxy
-    assert!(
-        !headers2.contains_key("grpc-status"),
-        "Pre-proxy rejection should not have grpc-status header"
+        headers2
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("not permitted")),
+        "gRPC rejection should preserve the plugin message"
     );
 
     let _ = gateway.kill();
@@ -462,12 +497,21 @@ async fn test_grpc_method_router_deny_list() {
             .await
             .expect("Denied method request should complete");
 
-    assert_eq!(status2, 403, "Denied gRPC method should return HTTP 403");
-    let body_str = String::from_utf8_lossy(&body2);
+    assert_eq!(status2, 200, "gRPC method rejection should return HTTP 200");
     assert!(
-        body_str.contains("not permitted"),
-        "Response should indicate method denied, got: {}",
-        body_str
+        body2.is_empty(),
+        "gRPC method rejection should be trailers-only"
+    );
+    assert_eq!(
+        _headers2.get("grpc-status").map(|s| s.as_str()),
+        Some("7"),
+        "Denied method should map to grpc-status 7 (PERMISSION_DENIED)"
+    );
+    assert!(
+        _headers2
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("not permitted")),
+        "Denied method should preserve the plugin message"
     );
 
     let _ = gateway.kill();
@@ -516,20 +560,26 @@ async fn test_grpc_method_router_rate_limiting() {
     }
 
     // 4th request should be rate-limited
-    let (status, _headers, body) =
+    let (status, headers, body) =
         send_grpc_request(&gateway_addr, "/my.EchoService/Limited", b"", &[])
             .await
             .expect("Rate-limited request should complete");
 
-    assert_eq!(
-        status, 429,
-        "Request exceeding rate limit should return HTTP 429"
-    );
-    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(status, 200, "gRPC rate limiting should return HTTP 200");
     assert!(
-        body_str.contains("Rate limit exceeded"),
-        "Response should indicate rate limit exceeded, got: {}",
-        body_str
+        body.is_empty(),
+        "gRPC rate limiting should be trailers-only"
+    );
+    assert_eq!(
+        headers.get("grpc-status").map(|s| s.as_str()),
+        Some("8"),
+        "Rate-limited method should map to grpc-status 8 (RESOURCE_EXHAUSTED)"
+    );
+    assert!(
+        headers
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("Rate limit exceeded")),
+        "Rate limit rejection should preserve the plugin message"
     );
 
     // Non-rate-limited method should still work
@@ -552,6 +602,59 @@ async fn test_grpc_method_router_rate_limiting() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_grpc_method_router_rate_limiting PASSED");
+}
+
+/// Response-path plugin rejections are translated into gRPC trailers-only errors.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_response_size_limiting_returns_grpc_error() {
+    let backend_port = free_port().await;
+    let gateway_port = free_port().await;
+
+    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_response_size_limit_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
+        .expect("Failed to start gateway");
+    wait_for_gateway(gateway_port)
+        .await
+        .expect("Gateway did not become healthy");
+
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+    let (status, headers, body) =
+        send_grpc_request(&gateway_addr, "/my.EchoService/Echo", b"1234567890", &[])
+            .await
+            .expect("Size-limited request should complete");
+
+    assert_eq!(
+        status, 200,
+        "gRPC response rejection should return HTTP 200"
+    );
+    assert!(
+        body.is_empty(),
+        "gRPC response rejection should be trailers-only"
+    );
+    assert_eq!(
+        headers.get("grpc-status").map(|s| s.as_str()),
+        Some("14"),
+        "Gateway-generated response rejection should map to grpc-status 14 (UNAVAILABLE)"
+    );
+    assert!(
+        headers
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("Response body too large")),
+        "gRPC response rejection should preserve the plugin message"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_grpc_response_size_limiting_returns_grpc_error PASSED");
 }
 
 // ============================================================================

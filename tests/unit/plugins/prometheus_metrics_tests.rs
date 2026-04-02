@@ -3,7 +3,7 @@
 use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
-use ferrum_edge::plugins::{Plugin, TransactionSummary};
+use ferrum_edge::plugins::{Plugin, StreamTransactionSummary, TransactionSummary};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -37,6 +37,26 @@ fn make_summary(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        metadata: HashMap::new(),
+    }
+}
+
+fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        proxy_id: proxy_id.to_string(),
+        proxy_name: Some("Stream Test".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "127.0.0.1:9000".to_string(),
+        backend_resolved_ip: None,
+        protocol: protocol.to_string(),
+        listen_port: 8080,
+        duration_ms: 15.0,
+        bytes_sent: 128,
+        bytes_received: 256,
+        connection_error: None,
+        error_class: None,
+        timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         metadata: HashMap::new(),
     }
 }
@@ -349,4 +369,26 @@ async fn test_render_empty_registry() {
     assert!(output.contains("ferrum_rate_limit_exceeded_total 0"));
     // No actual data lines for counters or histograms
     assert!(!output.contains("proxy_id="));
+}
+
+#[tokio::test]
+async fn test_registry_render_escapes_prometheus_label_values() {
+    let registry = MetricsRegistry::new();
+    registry.record(&make_summary(
+        "proxy\"line\nslash\\id",
+        "PO\"ST",
+        200,
+        42.0,
+        35.0,
+    ));
+    registry.record_stream(&make_stream_summary("stream\"proxy\nid", "tc\\p"));
+
+    let output = registry.render();
+
+    assert!(output.contains(
+        "ferrum_requests_total{proxy_id=\"proxy\\\"line\\nslash\\\\id\",method=\"PO\\\"ST\",status_code=\"200\"} 1"
+    ));
+    assert!(output.contains(
+        "ferrum_stream_connections_total{proxy_id=\"stream\\\"proxy\\nid\",protocol=\"tc\\\\p\"} 1"
+    ));
 }

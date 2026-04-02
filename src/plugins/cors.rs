@@ -354,4 +354,8 @@ impl Plugin for CorsPlugin {
 
         PluginResult::Continue
     }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
 }

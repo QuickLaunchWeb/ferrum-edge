@@ -30,8 +30,8 @@
 //!
 //! # TLS
 //!
-//! Supports TLS via `rediss://` URL scheme (note the double-s). Custom CA certs
-//! and skip-verify are configurable per plugin instance.
+//! Supports TLS via `rediss://` URL scheme (note the double-s). CA verification
+//! and skip-verify are inherited from the gateway-level TLS settings.
 //!
 //! # Resilience
 //!
@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
+use url::Url;
 
 /// Configuration parsed from a plugin's JSON config for Redis connectivity.
 ///
@@ -132,30 +133,8 @@ impl RedisConfig {
     /// Parses the URL to extract just the hostname (no port, no scheme).
     /// Returns `None` if the URL cannot be parsed or uses an IP address directly.
     pub fn hostname(&self) -> Option<String> {
-        let url = self.effective_url();
-        // Strip scheme (redis:// or rediss://)
-        let after_scheme = url
-            .strip_prefix("rediss://")
-            .or_else(|| url.strip_prefix("redis://"))?;
-        // Strip credentials (user:pass@)
-        let after_auth = after_scheme
-            .rsplit_once('@')
-            .map(|(_, rest)| rest)
-            .unwrap_or(after_scheme);
-        // IPv6 bracket notation (e.g., [::1]:6379) — always an IP, return None
-        if after_auth.starts_with('[') {
-            return None;
-        }
-        // Extract host (before : or / or end of string)
-        let host = after_auth
-            .split_once(':')
-            .map(|(h, _)| h)
-            .or_else(|| after_auth.split_once('/').map(|(h, _)| h))
-            .unwrap_or(after_auth);
-
-        if host.is_empty() {
-            return None;
-        }
+        let url = Url::parse(&self.effective_url()).ok()?;
+        let host = url.host_str()?;
 
         // Skip if it's already an IP address
         if host.parse::<std::net::IpAddr>().is_ok() {
@@ -181,16 +160,20 @@ impl RedisConfig {
             return url;
         }
 
-        if let Some(hostname) = self.hostname() {
-            // IPv6 resolved addresses need bracket notation in URLs
-            let ip_str = match resolved_ip {
-                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-                std::net::IpAddr::V4(v4) => v4.to_string(),
-            };
-            url.replacen(&hostname, &ip_str, 1)
-        } else {
-            url
+        let mut parsed = match Url::parse(&url) {
+            Ok(parsed) => parsed,
+            Err(_) => return url,
+        };
+
+        if parsed.host_str().is_none() {
+            return url;
         }
+
+        if parsed.set_ip_host(resolved_ip).is_err() {
+            return url;
+        }
+
+        parsed.to_string()
     }
 }
 
@@ -703,5 +686,58 @@ impl std::fmt::Debug for RedisRateLimitClient {
             .field("key_prefix", &self.config.key_prefix)
             .field("available", &self.available.load(Ordering::Relaxed))
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedisConfig;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn make_config(url: &str, tls: bool) -> RedisConfig {
+        RedisConfig {
+            url: url.to_string(),
+            tls,
+            key_prefix: "ferrum:test".to_string(),
+            pool_size: 4,
+            connect_timeout_seconds: 5,
+            health_check_interval_seconds: 5,
+            username: None,
+            password: None,
+        }
+    }
+
+    #[test]
+    fn test_hostname_uses_url_parser_and_preserves_credentials() {
+        let config = make_config("redis://user:pass@redis:6379/15", false);
+        assert_eq!(config.hostname().as_deref(), Some("redis"));
+    }
+
+    #[test]
+    fn test_url_with_resolved_ip_replaces_host_not_scheme() {
+        let config = make_config("redis://redis:6379/0", false);
+        let url = config.url_with_resolved_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(url, "redis://127.0.0.1:6379/0");
+    }
+
+    #[test]
+    fn test_url_with_resolved_ip_preserves_credentials_and_path() {
+        let config = make_config("redis://user:pass@redis:6379/15", false);
+        let url = config.url_with_resolved_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(url, "redis://user:pass@10.0.0.5:6379/15");
+    }
+
+    #[test]
+    fn test_url_with_resolved_ip_formats_ipv6_authority() {
+        let config = make_config("redis://cache.internal:6379/0", false);
+        let url = config.url_with_resolved_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(url, "redis://[::1]:6379/0");
+    }
+
+    #[test]
+    fn test_url_with_resolved_ip_preserves_tls_hostname_for_sni() {
+        let config = make_config("redis://cache.internal:6379/0", true);
+        let url = config.url_with_resolved_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(url, "rediss://cache.internal:6379/0");
     }
 }

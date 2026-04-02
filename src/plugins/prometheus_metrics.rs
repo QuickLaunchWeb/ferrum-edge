@@ -21,6 +21,19 @@ pub fn global_registry() -> Arc<MetricsRegistry> {
         .clone()
 }
 
+fn escape_label_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Composite key for request counter: (proxy_id, method, status_code).
 /// Avoids `format!()` string allocation on every request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -192,9 +205,11 @@ impl MetricsRegistry {
         for entry in self.request_counter.iter() {
             let key = entry.key();
             let count = entry.value().load(Ordering::Relaxed);
+            let proxy_id = escape_label_value(&key.proxy_id);
+            let method = escape_label_value(&key.method);
             output.push_str(&format!(
                 "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
-                key.proxy_id, key.method, key.status_code, count
+                proxy_id, method, key.status_code, count
             ));
         }
 
@@ -202,7 +217,7 @@ impl MetricsRegistry {
         output.push_str("# HELP ferrum_request_duration_ms Request duration in milliseconds.\n");
         output.push_str("# TYPE ferrum_request_duration_ms histogram\n");
         for entry in self.request_duration_buckets.iter() {
-            let proxy_id = entry.key();
+            let proxy_id = escape_label_value(entry.key());
             let histogram = entry.value();
             for (i, boundary) in histogram.boundaries.iter().enumerate() {
                 let count = histogram.counts[i].load(Ordering::Relaxed);
@@ -232,7 +247,7 @@ impl MetricsRegistry {
             .push_str("# HELP ferrum_backend_duration_ms Backend response time in milliseconds.\n");
         output.push_str("# TYPE ferrum_backend_duration_ms histogram\n");
         for entry in self.backend_duration_buckets.iter() {
-            let proxy_id = entry.key();
+            let proxy_id = escape_label_value(entry.key());
             let histogram = entry.value();
             for (i, boundary) in histogram.boundaries.iter().enumerate() {
                 let count = histogram.counts[i].load(Ordering::Relaxed);
@@ -263,7 +278,7 @@ impl MetricsRegistry {
         );
         output.push_str("# TYPE ferrum_edge_overhead_ms histogram\n");
         for entry in self.gateway_overhead_buckets.iter() {
-            let proxy_id = entry.key();
+            let proxy_id = escape_label_value(entry.key());
             let histogram = entry.value();
             for (i, boundary) in histogram.boundaries.iter().enumerate() {
                 let count = histogram.counts[i].load(Ordering::Relaxed);
@@ -305,9 +320,11 @@ impl MetricsRegistry {
             for entry in self.stream_connection_counter.iter() {
                 let key = entry.key();
                 let count = entry.value().load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                let protocol = escape_label_value(&key.protocol);
                 output.push_str(&format!(
                     "ferrum_stream_connections_total{{proxy_id=\"{}\",protocol=\"{}\"}} {}\n",
-                    key.proxy_id, key.protocol, count
+                    proxy_id, protocol, count
                 ));
             }
         }
@@ -319,7 +336,7 @@ impl MetricsRegistry {
             );
             output.push_str("# TYPE ferrum_stream_duration_ms histogram\n");
             for entry in self.stream_duration_buckets.iter() {
-                let proxy_id = entry.key();
+                let proxy_id = escape_label_value(entry.key());
                 let histogram = entry.value();
                 for (i, boundary) in histogram.boundaries.iter().enumerate() {
                     let count = histogram.counts[i].load(Ordering::Relaxed);

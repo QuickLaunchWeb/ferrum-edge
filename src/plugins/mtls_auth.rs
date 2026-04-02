@@ -404,7 +404,7 @@ impl Plugin for MtlsAuth {
                 debug!("mtls_auth: issuer constraint failed: {}", reason);
                 return PluginResult::Reject {
                     status_code: 403,
-                    body: format!(r#"{{"error":"{}"}}"#, escape_json_string(&reason)),
+                    body: serde_json::json!({ "error": reason }).to_string(),
                     headers: HashMap::new(),
                 };
             }
@@ -437,12 +437,4 @@ impl Plugin for MtlsAuth {
             headers: HashMap::new(),
         }
     }
-}
-
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
 }

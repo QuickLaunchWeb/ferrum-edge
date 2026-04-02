@@ -194,6 +194,40 @@ async fn test_jwt_auth_bearer_lowercase() {
 }
 
 #[tokio::test]
+async fn test_jwt_auth_bearer_uppercase() {
+    let plugin = JwtAuth::new(&json!({}));
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("BEARER {}", token));
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_jwt_auth_custom_header_strips_bearer_case_insensitively() {
+    let plugin = JwtAuth::new(&json!({"token_lookup": "header:X-Token"}));
+    let consumer = create_test_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-token".to_string(), format!("BeArEr {}", token));
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
 async fn test_jwt_auth_empty_consumers() {
     let plugin = JwtAuth::new(&json!({}));
     let consumer_index = ConsumerIndex::new(&[]);

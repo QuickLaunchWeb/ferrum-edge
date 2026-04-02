@@ -31,9 +31,6 @@ impl CorrelationId {
     }
 }
 
-/// Plugin priority: very early, before everything else.
-pub const CORRELATION_ID_PRIORITY: u16 = 50;
-
 #[async_trait]
 impl Plugin for CorrelationId {
     fn name(&self) -> &str {
@@ -41,7 +38,7 @@ impl Plugin for CorrelationId {
     }
 
     fn priority(&self) -> u16 {
-        CORRELATION_ID_PRIORITY
+        super::priority::CORRELATION_ID
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -106,5 +103,9 @@ impl Plugin for CorrelationId {
             response_headers.insert(self.header_name.clone(), request_id.clone());
         }
         PluginResult::Continue
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.echo_downstream
     }
 }

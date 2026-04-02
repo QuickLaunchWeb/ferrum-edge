@@ -585,6 +585,52 @@ async fn test_rfc3339_date_format() {
 }
 
 #[tokio::test]
+async fn test_algorithm_name_is_case_insensitive() {
+    let plugin = HmacAuth::new(&json!({}));
+    let consumer = create_hmac_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let method = "GET";
+    let path = "/test";
+    let date = current_date();
+    let signature = sign_sha512(TEST_SECRET, method, path, &date);
+
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("hmacuser", Some("HMAC-SHA512"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_unknown_algorithm_rejected() {
+    let plugin = HmacAuth::new(&json!({}));
+    let consumer = create_hmac_consumer();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let method = "GET";
+    let path = "/test";
+    let date = current_date();
+    let signature = sign_sha256(TEST_SECRET, method, path, &date);
+
+    let mut ctx = make_ctx(method, path);
+    ctx.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header("hmacuser", Some("sha1"), &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
 async fn test_sha512_with_default_algorithm_fails() {
     let plugin = HmacAuth::new(&json!({}));
     let consumer = create_hmac_consumer();

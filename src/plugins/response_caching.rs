@@ -212,10 +212,7 @@ impl ResponseCaching {
         };
 
         let consumer_part = if self.config.cache_key_include_consumer {
-            ctx.identified_consumer
-                .as_ref()
-                .map(|c| c.username.as_str())
-                .unwrap_or("_anon")
+            ctx.effective_identity().unwrap_or("_anon")
         } else {
             ""
         };
@@ -509,13 +506,13 @@ impl Plugin for ResponseCaching {
             }
         }
 
-        // Store TTL in metadata for on_response_body
+        // Store TTL in metadata for on_final_response_body
         ctx.metadata
             .insert("cache_ttl_secs".to_string(), ttl.as_secs().to_string());
-        // Keep cache_key in metadata for on_response_body
+        // Keep cache_key in metadata for on_final_response_body
 
         // Store response headers in metadata (serialized as JSON)
-        // so on_response_body can reconstruct the cache entry.
+        // so on_final_response_body can reconstruct the cache entry.
         if let Ok(headers_json) = serde_json::to_string(response_headers) {
             ctx.metadata
                 .insert("cache_response_headers".to_string(), headers_json);
@@ -528,7 +525,7 @@ impl Plugin for ResponseCaching {
         PluginResult::Continue
     }
 
-    async fn on_response_body(
+    async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
         _response_status: u16,

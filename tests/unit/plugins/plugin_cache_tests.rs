@@ -5,7 +5,7 @@ use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
     AuthMode, BackendProtocol, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
 };
-use ferrum_edge::plugins::ProxyProtocol;
+use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use serde_json::json;
 
 fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
@@ -286,6 +286,75 @@ fn test_proxy_count() {
     assert_eq!(cache.proxy_count(), 3);
 }
 
+#[test]
+fn test_request_body_buffering_upper_bound_is_config_sensitive() {
+    let config = make_config(
+        vec![
+            make_proxy("graphql-empty", "/gql-empty", vec!["graphql-empty-plugin"]),
+            make_proxy(
+                "graphql-guarded",
+                "/gql-guarded",
+                vec!["graphql-guarded-plugin"],
+            ),
+            make_proxy(
+                "response-only",
+                "/response-only",
+                vec!["response-only-plugin"],
+            ),
+            make_proxy("request-xml", "/request-xml", vec!["request-xml-plugin"]),
+        ],
+        vec![
+            PluginConfig {
+                id: "graphql-empty-plugin".to_string(),
+                plugin_name: "graphql".to_string(),
+                config: json!({}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("graphql-empty".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PluginConfig {
+                id: "graphql-guarded-plugin".to_string(),
+                plugin_name: "graphql".to_string(),
+                config: json!({"max_depth": 4}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("graphql-guarded".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PluginConfig {
+                id: "response-only-plugin".to_string(),
+                plugin_name: "body_validator".to_string(),
+                config: json!({"response_required_fields": ["id"]}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("response-only".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PluginConfig {
+                id: "request-xml-plugin".to_string(),
+                plugin_name: "body_validator".to_string(),
+                config: json!({"validate_xml": true}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("request-xml".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+    );
+
+    let cache = PluginCache::new(&config).unwrap();
+
+    assert!(!cache.requires_request_body_buffering("graphql-empty"));
+    assert!(cache.requires_request_body_buffering("graphql-guarded"));
+    assert!(!cache.requires_request_body_buffering("response-only"));
+    assert!(cache.requires_request_body_buffering("request-xml"));
+}
+
 // ---- Plugin priority ordering ----
 
 #[test]
@@ -364,6 +433,76 @@ fn test_full_plugin_priority_chain() {
             "stdout_logging",       // 9000 — Logging
         ]
     );
+}
+
+#[tokio::test]
+async fn test_cors_preflight_runs_before_request_termination() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            PluginConfig {
+                id: "ps1".to_string(),
+                plugin_name: "request_termination".to_string(),
+                config: json!({"status_code": 503, "message": "maintenance"}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("p1".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            PluginConfig {
+                id: "ps2".to_string(),
+                plugin_name: "cors".to_string(),
+                config: json!({"allowed_origins": ["https://app.example.com"]}),
+                scope: PluginScope::Proxy,
+                proxy_id: Some("p1".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+    let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
+
+    assert_eq!(names, vec!["cors", "request_termination"]);
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "OPTIONS".to_string(),
+        "/api/status".to_string(),
+    );
+    ctx.headers
+        .insert("origin".to_string(), "https://app.example.com".to_string());
+    ctx.headers.insert(
+        "access-control-request-method".to_string(),
+        "GET".to_string(),
+    );
+
+    for plugin in plugins.iter() {
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Continue => continue,
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(plugin.name(), "cors");
+                assert_eq!(status_code, 204);
+                assert!(body.is_empty());
+                assert_eq!(
+                    headers
+                        .get("access-control-allow-origin")
+                        .map(String::as_str),
+                    Some("https://app.example.com")
+                );
+                return;
+            }
+        }
+    }
+
+    panic!("expected preflight to be handled before request termination");
 }
 
 #[test]

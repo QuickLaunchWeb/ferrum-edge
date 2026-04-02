@@ -197,6 +197,24 @@ async fn test_explicit_provider_openai() {
 }
 
 #[tokio::test]
+async fn test_explicit_provider_is_case_insensitive() {
+    let plugin = AiTokenMetrics::new(&json!({"provider": " OpenAI "}));
+    let mut ctx = create_test_context();
+    let headers = json_headers();
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    }))
+    .unwrap();
+
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    assert_eq!(ctx.metadata.get("ai_provider").unwrap(), "openai");
+    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "15");
+}
+
+#[tokio::test]
 async fn test_explicit_provider_mistral() {
     let plugin = AiTokenMetrics::new(&json!({"provider": "mistral"}));
     let mut ctx = create_test_context();

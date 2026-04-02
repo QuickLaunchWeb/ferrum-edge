@@ -19,7 +19,7 @@ fn make_ctx() -> RequestContext {
 async fn test_creation_defaults() {
     let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
     assert_eq!(plugin.name(), "response_size_limiting");
-    assert_eq!(plugin.priority(), 3950);
+    assert_eq!(plugin.priority(), 3490);
 }
 
 #[tokio::test]
@@ -97,7 +97,7 @@ async fn test_invalid_content_length_passes() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
-// === Buffered body check (on_response_body) ===
+// === Final body check (on_final_response_body) ===
 
 #[tokio::test]
 async fn test_buffered_body_under_limit_passes() {
@@ -107,7 +107,9 @@ async fn test_buffered_body_under_limit_passes() {
     let headers = HashMap::new();
     let body = b"short";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -119,7 +121,10 @@ async fn test_buffered_body_over_limit_rejects() {
     let headers = HashMap::new();
     let body = b"this response body is definitely longer than ten bytes";
 
-    match plugin.on_response_body(&mut ctx, 200, &headers, body).await {
+    match plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await
+    {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -137,7 +142,9 @@ async fn test_buffered_body_at_limit_passes() {
     let headers = HashMap::new();
     let body = b"12345";
 
-    let result = plugin.on_response_body(&mut ctx, 200, &headers, body).await;
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
     assert!(matches!(result, PluginResult::Continue));
 }
 

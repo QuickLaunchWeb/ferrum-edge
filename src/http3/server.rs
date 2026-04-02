@@ -26,7 +26,7 @@ use super::config::Http3ServerConfig;
 use crate::config::types::{AuthMode, Proxy};
 use crate::dns::DnsCacheResolver;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
-use crate::proxy::ProxyState;
+use crate::proxy::{ProxyState, apply_after_proxy_hooks_to_rejection, run_after_proxy_hooks};
 use crate::tls::TlsPolicy;
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
@@ -488,9 +488,11 @@ async fn handle_h3_request(
             PluginResult::Reject {
                 status_code,
                 body,
-                headers,
+                mut headers,
             } => {
                 record_request(&state, status_code);
+                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers)
+                    .await;
                 send_h3_reject_response(
                     &mut stream,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -529,21 +531,15 @@ async fn handle_h3_request(
             if !any_success && !auth_plugins.is_empty() {
                 // All auth plugins rejected — deny access
                 record_request(&state, 401);
-                let status = StatusCode::UNAUTHORIZED;
-                let mut resp_builder = Response::builder().status(status);
-                resp_builder = resp_builder.header("content-type", "application/json");
-                let resp = match resp_builder.body(()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Failed to build HTTP/3 response: {}", e);
-                        return Ok(());
-                    }
-                };
-                stream.send_response(resp).await?;
-                stream
-                    .send_data(Bytes::from(r#"{"error":"Unauthorized"}"#.as_bytes()))
-                    .await?;
-                stream.finish().await?;
+                let mut headers = HashMap::new();
+                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 401, &mut headers).await;
+                send_h3_reject_response(
+                    &mut stream,
+                    StatusCode::UNAUTHORIZED,
+                    r#"{"error":"Unauthorized"}"#,
+                    &headers,
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -556,9 +552,16 @@ async fn handle_h3_request(
                     PluginResult::Reject {
                         status_code,
                         body,
-                        headers,
+                        mut headers,
                     } => {
                         record_request(&state, status_code);
+                        apply_after_proxy_hooks_to_rejection(
+                            &plugins,
+                            &mut ctx,
+                            status_code,
+                            &mut headers,
+                        )
+                        .await;
                         send_h3_reject_response(
                             &mut stream,
                             StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
@@ -584,9 +587,16 @@ async fn handle_h3_request(
                     PluginResult::Reject {
                         status_code,
                         body,
-                        headers,
+                        mut headers,
                     } => {
                         record_request(&state, status_code);
+                        apply_after_proxy_hooks_to_rejection(
+                            &plugins,
+                            &mut ctx,
+                            status_code,
+                            &mut headers,
+                        )
+                        .await;
                         send_h3_reject_response(
                             &mut stream,
                             StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
@@ -603,6 +613,43 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    let maybe_needs_request_buffering = state
+        .plugin_cache
+        .requires_request_body_buffering(&proxy.id);
+    let plugin_needs_request_buffering = maybe_needs_request_buffering
+        && plugins
+            .iter()
+            .any(|plugin| plugin.should_buffer_request_body(&ctx));
+    let needs_request_body_before_before_proxy = plugin_needs_request_buffering
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_before_proxy()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    let mut prebuffered_body_data = if needs_request_body_before_before_proxy {
+        let mut body_data = Vec::new();
+        while let Some(chunk) = stream.recv_data().await? {
+            let bytes = chunk.chunk();
+            if state.max_request_body_size_bytes > 0
+                && body_data.len() + bytes.len() > state.max_request_body_size_bytes
+            {
+                record_request(&state, 413);
+                send_h3_response(
+                    &mut stream,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                )
+                .await?;
+                return Ok(());
+            }
+            body_data.extend_from_slice(bytes);
+        }
+        crate::proxy::store_request_body_metadata(&mut ctx, &body_data);
+        Some(body_data)
+    } else {
+        None
+    };
+
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
     let needs_header_clone =
@@ -616,9 +663,16 @@ async fn handle_h3_request(
                 PluginResult::Reject {
                     status_code,
                     body,
-                    headers,
+                    mut headers,
                 } => {
                     record_request(&state, status_code);
+                    apply_after_proxy_hooks_to_rejection(
+                        &plugins,
+                        &mut ctx,
+                        status_code,
+                        &mut headers,
+                    )
+                    .await;
                     send_h3_reject_response(
                         &mut stream,
                         StatusCode::from_u16(status_code)
@@ -644,10 +698,17 @@ async fn handle_h3_request(
                 PluginResult::Reject {
                     status_code,
                     body,
-                    headers,
+                    mut headers,
                 } => {
                     ctx.headers = tmp_headers;
                     record_request(&state, status_code);
+                    apply_after_proxy_hooks_to_rejection(
+                        &plugins,
+                        &mut ctx,
+                        status_code,
+                        &mut headers,
+                    )
+                    .await;
                     send_h3_reject_response(
                         &mut stream,
                         StatusCode::from_u16(status_code)
@@ -664,21 +725,12 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
-    // Inject X-Consumer-Username header when a consumer has been authenticated
-    if let Some(ref consumer) = ctx.identified_consumer {
+    // Inject identity headers when authentication resolved a principal.
+    if let Some(username) = ctx.backend_consumer_username() {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
-        if let Some(ref custom_id) = consumer.custom_id {
-            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
-        }
-    } else if ctx.authenticated_identity.is_some() || ctx.authenticated_identity_header.is_some() {
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        let header_val = ctx
-            .authenticated_identity_header
-            .as_deref()
-            .or(ctx.authenticated_identity.as_deref());
-        if let Some(val) = header_val {
-            headers.insert("X-Consumer-Username".to_string(), val.to_string());
+        headers.insert("X-Consumer-Username".to_string(), username.to_string());
+        if let Some(custom_id) = ctx.backend_consumer_custom_id() {
+            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.to_string());
         }
     }
     // Resolve proxy_headers into an owned HashMap to avoid borrowing ctx.headers
@@ -706,10 +758,7 @@ async fn handle_h3_request(
     // Stream by default; buffer only when plugins need to inspect/modify the body
     // or when retries are configured (need to replay the request body).
     let has_retry = proxy.retry.is_some();
-    let needs_request_buffering = has_retry
-        || state
-            .plugin_cache
-            .requires_request_body_buffering(&proxy.id);
+    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
     let needs_response_buffering = has_retry
         || state
             .plugin_cache
@@ -724,22 +773,25 @@ async fn handle_h3_request(
     // When request buffering is needed, we collect into Vec<u8> for plugin transforms
     // and potential retry replay. Otherwise we still collect for reqwest but avoid
     // plugin body transforms.
-    let mut body_data = Vec::new();
-    while let Some(chunk) = stream.recv_data().await? {
-        let bytes = chunk.chunk();
-        if state.max_request_body_size_bytes > 0
-            && body_data.len() + bytes.len() > state.max_request_body_size_bytes
-        {
-            record_request(&state, 413);
-            send_h3_response(
-                &mut stream,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                r#"{"error":"Request body exceeds maximum size"}"#,
-            )
-            .await?;
-            return Ok(());
+    let body_was_prebuffered = prebuffered_body_data.is_some();
+    let mut body_data = prebuffered_body_data.take().unwrap_or_default();
+    if !body_was_prebuffered {
+        while let Some(chunk) = stream.recv_data().await? {
+            let bytes = chunk.chunk();
+            if state.max_request_body_size_bytes > 0
+                && body_data.len() + bytes.len() > state.max_request_body_size_bytes
+            {
+                record_request(&state, 413);
+                send_h3_response(
+                    &mut stream,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                )
+                .await?;
+                return Ok(());
+            }
+            body_data.extend_from_slice(bytes);
         }
-        body_data.extend_from_slice(bytes);
     }
 
     // Transform request body via plugins when buffering is active
@@ -761,6 +813,27 @@ async fn handle_h3_request(
     } else {
         body_data
     };
+
+    match crate::proxy::run_final_request_body_hooks(&plugins, &proxy_headers, &body_data).await {
+        crate::plugins::PluginResult::Continue => {}
+        crate::plugins::PluginResult::Reject {
+            status_code,
+            body,
+            mut headers,
+        } => {
+            record_request(&state, status_code);
+            apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers)
+                .await;
+            send_h3_reject_response(
+                &mut stream,
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE),
+                &body,
+                &headers,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
     if !needs_response_buffering {
         // ===== STREAMING RESPONSE PATH =====
@@ -817,11 +890,7 @@ async fn handle_h3_request(
         let summary = TransactionSummary {
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx
-                .identified_consumer
-                .as_ref()
-                .map(|c| c.username.clone())
-                .or_else(|| ctx.authenticated_identity.clone()),
+            consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method,
             request_path: path,
             matched_proxy_id: Some(proxy.id.clone()),
@@ -865,22 +934,30 @@ async fn handle_h3_request(
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+        let mut response_body = response_body;
 
         // after_proxy hooks
+        let mut after_proxy_rejected = false;
         {
             let phase_start = std::time::Instant::now();
-            for plugin in plugins.iter() {
-                let _ = plugin
-                    .after_proxy(&mut ctx, response_status, &mut response_headers)
-                    .await;
+            if let Some(reject) =
+                run_after_proxy_hooks(&plugins, &mut ctx, response_status, &mut response_headers)
+                    .await
+            {
+                response_status = reject.status_code;
+                response_headers = reject.headers;
+                response_headers
+                    .entry("content-type".to_string())
+                    .or_insert_with(|| "application/json".to_string());
+                response_body = reject.body.into_bytes();
+                after_proxy_rejected = true;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
         // on_response_body hooks — only for buffered responses when plugins exist.
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
-        let mut response_body = response_body;
-        if !plugins.is_empty() {
+        if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
             for plugin in plugins.iter() {
                 let result = plugin
@@ -913,7 +990,7 @@ async fn handle_h3_request(
         }
 
         // transform_response_body hooks — only for buffered responses.
-        if !plugins.is_empty() {
+        if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
             let content_type = response_headers.get("content-type").cloned();
             let ct_ref = content_type.as_deref();
@@ -924,6 +1001,43 @@ async fn handle_h3_request(
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
+                }
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
+        if !after_proxy_rejected && !plugins.is_empty() {
+            let phase_start = std::time::Instant::now();
+            for plugin in plugins.iter() {
+                let result = plugin
+                    .on_final_response_body(
+                        &mut ctx,
+                        response_status,
+                        &response_headers,
+                        &response_body,
+                    )
+                    .await;
+                match result {
+                    PluginResult::Continue => {}
+                    PluginResult::Reject {
+                        status_code,
+                        body: reject_body,
+                        headers: reject_headers,
+                    } => {
+                        debug!(
+                            plugin = plugin.name(),
+                            status_code, "Plugin rejected finalized response body (HTTP/3)"
+                        );
+                        response_status = status_code;
+                        response_headers.clear();
+                        response_headers
+                            .insert("content-type".to_string(), "application/json".to_string());
+                        for (k, v) in reject_headers {
+                            response_headers.insert(k, v);
+                        }
+                        response_body = reject_body.into_bytes();
+                        break;
+                    }
                 }
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -952,11 +1066,7 @@ async fn handle_h3_request(
         let summary = TransactionSummary {
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx
-                .identified_consumer
-                .as_ref()
-                .map(|c| c.username.clone())
-                .or_else(|| ctx.authenticated_identity.clone()),
+            consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method,
             request_path: path,
             matched_proxy_id: Some(proxy.id.clone()),
@@ -1111,7 +1221,7 @@ async fn proxy_to_backend_h3_streaming(
                     req_builder = req_builder.header("Host", &proxy.backend_host);
                 }
             }
-            "connection" | "transfer-encoding" => continue,
+            "connection" | "content-length" | "transfer-encoding" => continue,
             k if k.starts_with(':') => continue,
             _ => {
                 req_builder = req_builder.header(k, v.as_str());
@@ -1382,7 +1492,7 @@ async fn proxy_to_backend_h3(
                     req_builder = req_builder.header("Host", &proxy.backend_host);
                 }
             }
-            "connection" | "transfer-encoding" => continue,
+            "connection" | "content-length" | "transfer-encoding" => continue,
             k if k.starts_with(':') => continue, // Skip HTTP/3 pseudo-headers
             _ => {
                 req_builder = req_builder.header(k, v.as_str());

@@ -8,7 +8,7 @@
 //!    the signature and expiration. Only after this succeeds is the consumer trusted.
 //!
 //! This design allows each consumer to have their own JWT secret (stored in
-//! `consumer.credentials["jwt_auth"]["secret"]`), avoiding a single shared secret.
+//! `consumer.credentials["jwt"]["secret"]`), avoiding a single shared secret.
 //!
 //! Token location is configurable via `token_lookup` (default `"header:Authorization"`).
 //! Supports `"header:<name>"` and `"query:<name>"` extraction modes.
@@ -21,7 +21,7 @@ use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
 /// claims before looking up the consumer's secret for proper verification.
@@ -54,23 +54,17 @@ impl JwtAuth {
         if self.token_lookup.starts_with("header:") {
             let header_name = &self.token_lookup["header:".len()..];
             ctx.headers.get(&header_name.to_lowercase()).map(|v| {
-                if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                    v[7..].to_string()
-                } else {
-                    v.clone()
-                }
+                strip_auth_scheme(v, "Bearer")
+                    .unwrap_or(v.as_str())
+                    .to_string()
             })
         } else if self.token_lookup.starts_with("query:") {
             let param_name = &self.token_lookup["query:".len()..];
             ctx.query_params.get(param_name).cloned()
         } else {
-            ctx.headers.get("authorization").and_then(|v| {
-                if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                    Some(v[7..].to_string())
-                } else {
-                    None
-                }
-            })
+            ctx.headers
+                .get("authorization")
+                .and_then(|v| strip_auth_scheme(v, "Bearer").map(str::to_string))
         }
     }
 }

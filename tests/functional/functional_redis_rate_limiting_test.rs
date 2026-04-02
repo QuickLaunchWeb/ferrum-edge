@@ -1,8 +1,9 @@
 //! Functional tests for centralized Redis rate limiting.
 //!
-//! Tests all three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`,
-//! `ws_rate_limiting`) with `sync_mode: "redis"` to verify centralized counters
-//! work end-to-end through a real gateway binary.
+//! Tests the Redis-backed rate limiting plugins end-to-end through a real gateway
+//! binary. `rate_limiting` and `ai_rate_limiter` should share counters across
+//! gateway instances; `ws_rate_limiting` uses Redis as an externalized per-
+//! connection counter backend and has a separate cross-instance namespacing test.
 //!
 //! ## Requirements
 //!
@@ -728,6 +729,167 @@ async fn test_ai_rate_limiter_redis_centralized() {
     println!("test_ai_rate_limiter_redis_centralized PASSED");
 }
 
+/// Verify that ai_rate_limiter shares token budgets across gateway instances.
+#[tokio::test]
+#[ignore]
+async fn test_ai_rate_limiter_redis_shared_across_instances() {
+    if !redis_is_available().await {
+        return;
+    }
+    flush_redis_db().await;
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_ai_backend(backend_port, 500).await.unwrap();
+
+    let unique_prefix = format!("ferrum:test:ai:shared:{}", Uuid::new_v4().simple());
+    let temp_dir = TempDir::new().unwrap();
+
+    let start_instance = |instance_num: u16, proxy_port: u16, prefix: String| {
+        let config_path = temp_dir
+            .path()
+            .join(format!("ai_shared_config_{}.yaml", instance_num));
+        let config = format!(
+            r#"
+proxies:
+  - id: "shared-ai-proxy"
+    listen_path: "/shared-ai"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "shared-ai-plugin"
+
+consumers: []
+
+plugin_configs:
+  - id: "shared-ai-plugin"
+    plugin_name: "ai_rate_limiter"
+    scope: "proxy"
+    proxy_id: "shared-ai-proxy"
+    enabled: true
+    config:
+      token_limit: 1000
+      window_seconds: 60
+      limit_by: "ip"
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix}"
+"#,
+        );
+        std::fs::write(&config_path, config).expect("Failed to write config");
+
+        Command::new(gateway_binary_path())
+            .env("FERRUM_MODE", "file")
+            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("RUST_LOG", "ferrum_edge=debug")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to start gateway instance")
+    };
+
+    let port1 = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let port2 = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let mut gw1 = start_instance(1, port1, unique_prefix.clone());
+    let mut gw2 = start_instance(2, port2, unique_prefix.clone());
+
+    sleep(Duration::from_secs(5)).await;
+
+    let client = reqwest::Client::new();
+    let request_body = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
+
+    for port in [port1, port2] {
+        let deadline = SystemTime::now() + Duration::from_secs(10);
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!("Gateway on port {} did not start", port);
+            }
+            match client
+                .get(format!(
+                    "http://127.0.0.1:{}/health-probe-nonexistent",
+                    port
+                ))
+                .send()
+                .await
+            {
+                Ok(_) => break,
+                Err(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    flush_redis_db().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/shared-ai/v1/chat/completions",
+            port1
+        ))
+        .header("Content-Type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("GW1 AI request failed");
+    assert_eq!(resp.status().as_u16(), 200, "GW1 request should succeed");
+    let _ = resp.text().await;
+
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/shared-ai/v1/chat/completions",
+            port2
+        ))
+        .header("Content-Type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("GW2 AI request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "GW2 request should succeed and consume the shared budget"
+    );
+    let _ = resp.text().await;
+
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/shared-ai/v1/chat/completions",
+            port1
+        ))
+        .header("Content-Type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("Third shared AI request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        429,
+        "3rd shared AI request should be rejected after both instances consume 1000 tokens"
+    );
+
+    let _ = gw1.kill();
+    let _ = gw1.wait();
+    let _ = gw2.kill();
+    let _ = gw2.wait();
+    println!("test_ai_rate_limiter_redis_shared_across_instances PASSED");
+}
+
 // ============================================================================
 // Test: ws_rate_limiting plugin with Redis centralized mode
 // ============================================================================
@@ -865,6 +1027,163 @@ plugin_configs:
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_rate_limiting_redis_centralized PASSED");
+}
+
+/// Verify that Redis-backed WebSocket frame rate limiting does not collide
+/// across gateway instances that reuse the same local connection IDs.
+#[tokio::test]
+#[ignore]
+async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
+    if !redis_is_available().await {
+        return;
+    }
+    flush_redis_db().await;
+
+    let backend_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let port1 = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let port2 = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let unique_prefix = format!("ferrum:test:ws-shared:{}", Uuid::new_v4().simple());
+    let temp_dir = TempDir::new().unwrap();
+
+    let start_instance = |instance_num: u16, proxy_port: u16, prefix: String| {
+        let config_path = temp_dir
+            .path()
+            .join(format!("ws_config_{}.yaml", instance_num));
+        let config = format!(
+            r#"
+proxies:
+  - id: "ws-shared-redis-proxy"
+    listen_path: "/ws-shared"
+    backend_protocol: ws
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "ws-shared-redis-rl"
+
+consumers: []
+
+plugin_configs:
+  - id: "ws-shared-redis-rl"
+    plugin_name: "ws_rate_limiting"
+    scope: "proxy"
+    proxy_id: "ws-shared-redis-proxy"
+    enabled: true
+    config:
+      frames_per_second: 5
+      burst_size: 5
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+      redis_key_prefix: "{prefix}"
+"#,
+        );
+        std::fs::write(&config_path, config).expect("Failed to write config");
+
+        Command::new(gateway_binary_path())
+            .env("FERRUM_MODE", "file")
+            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("RUST_LOG", "ferrum_edge=debug")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Failed to start gateway instance")
+    };
+
+    let mut gw1 = start_instance(1, port1, unique_prefix.clone());
+    let mut gw2 = start_instance(2, port2, unique_prefix.clone());
+
+    sleep(Duration::from_secs(5)).await;
+
+    let http_client = reqwest::Client::new();
+    for port in [port1, port2] {
+        let deadline = SystemTime::now() + Duration::from_secs(10);
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!("Gateway on port {} did not start", port);
+            }
+            match http_client
+                .get(format!(
+                    "http://127.0.0.1:{}/health-probe-nonexistent",
+                    port
+                ))
+                .send()
+                .await
+            {
+                Ok(_) => break,
+                Err(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    flush_redis_db().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let url1 = format!("ws://127.0.0.1:{}/ws-shared", port1);
+    let url2 = format!("ws://127.0.0.1:{}/ws-shared", port2);
+    let (mut ws1, _) = tokio_tungstenite::connect_async(&url1)
+        .await
+        .expect("Failed to connect WebSocket to gateway 1");
+    let (mut ws2, _) = tokio_tungstenite::connect_async(&url2)
+        .await
+        .expect("Failed to connect WebSocket to gateway 2");
+
+    // Each echoed message consumes two frame budget units (client->backend and
+    // backend->client). Two round-trips leave GW1 near the limit without
+    // tripping it, so an old shared-key collision would still break GW2.
+    for i in 0..2 {
+        let msg = format!("gw1 msg {}", i);
+        ws1.send(Message::Text(msg.clone().into())).await.unwrap();
+        let reply = ws1.next().await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            Message::Text(format!("Echo: {}", msg).into()),
+            "Gateway 1 frame {} should stay within its own Redis-backed limit",
+            i
+        );
+    }
+
+    let msg = "gw2 independent msg".to_string();
+    ws2.send(Message::Text(msg.clone().into())).await.unwrap();
+    let reply = ws2
+        .next()
+        .await
+        .expect("Gateway 2 should still have an open connection")
+        .expect("Gateway 2 read failed");
+    assert_eq!(
+        reply,
+        Message::Text(format!("Echo: {}", msg).into()),
+        "Gateway 2's first connection should not inherit Gateway 1's Redis bucket"
+    );
+
+    let _ = ws1.close(None).await;
+    let _ = ws2.close(None).await;
+    let _ = gw1.kill();
+    let _ = gw1.wait();
+    let _ = gw2.kill();
+    let _ = gw2.wait();
+    echo_handle.abort();
+    println!("test_ws_rate_limiting_redis_namespaces_instance_connections PASSED");
 }
 
 // ============================================================================

@@ -132,6 +132,10 @@ impl Plugin for ResponseTransformer {
         PluginResult::Continue
     }
 
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
     async fn transform_response_body(
         &self,
         body: &[u8],

@@ -43,6 +43,8 @@ pub struct BodyValidator {
     response_content_types: Vec<String>,
     /// Pre-compiled regexes for response JSON Schema `pattern` constraints.
     response_compiled_patterns: HashMap<String, regex::Regex>,
+    /// Whether any request validation is configured (cached for O(1) checks).
+    has_request_validation: bool,
     /// Whether any response validation is configured (cached for O(1) check).
     has_response_validation: bool,
 }
@@ -163,6 +165,7 @@ impl BodyValidator {
             response_required_xml_elements,
             response_content_types,
             response_compiled_patterns,
+            has_request_validation,
             has_response_validation,
         }
     }
@@ -726,10 +729,34 @@ impl Plugin for BodyValidator {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.has_request_validation
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        if !self.has_request_validation
+            || matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE")
+        {
+            return false;
+        }
+
+        let content_type = ctx
+            .headers
+            .get("content-type")
+            .map(|value| value.to_lowercase())
+            .unwrap_or_default();
+
+        self.content_types.is_empty()
+            || self
+                .content_types
+                .iter()
+                .any(|ct| content_type.contains(ct.as_str()))
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only validate methods that typically have a body
         if matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "DELETE") {
@@ -737,9 +764,9 @@ impl Plugin for BodyValidator {
         }
 
         // Check content type
-        let content_type = ctx
-            .headers
+        let content_type = headers
             .get("content-type")
+            .or_else(|| ctx.headers.get("content-type"))
             .cloned()
             .unwrap_or_default()
             .to_lowercase();
@@ -803,7 +830,7 @@ impl Plugin for BodyValidator {
         self.has_response_validation
     }
 
-    async fn on_response_body(
+    async fn on_final_response_body(
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,

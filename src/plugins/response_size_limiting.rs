@@ -7,10 +7,10 @@
 //! Two enforcement paths:
 //! 1. **Content-Length fast path** (`after_proxy`): rejects immediately when the
 //!    backend response Content-Length header declares a body larger than allowed.
-//! 2. **Buffered body check** (`on_response_body`): when response buffering is
+//! 2. **Final body check** (`on_final_response_body`): when response buffering is
 //!    active (either from `require_buffered_check: true` or because another plugin
-//!    requires buffering), the actual byte length is verified before the response
-//!    reaches the client.
+//!    requires buffering), the final client-visible byte length is verified after
+//!    any body transforms have run.
 //!
 //! Set `require_buffered_check: true` to force response body buffering so that
 //! chunked/streaming responses without Content-Length are also checked. This adds
@@ -98,7 +98,7 @@ impl Plugin for ResponseSizeLimiting {
         PluginResult::Continue
     }
 
-    async fn on_response_body(
+    async fn on_final_response_body(
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,

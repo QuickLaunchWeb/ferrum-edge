@@ -8,7 +8,8 @@
 //! Each proxy gets a merged plugin list: global plugins + proxy-scoped plugins,
 //! sorted by priority. Pre-computed flags (`requires_response_body_buffering`,
 //! `requires_request_body_buffering`, `requires_ws_frame_hooks`) enable O(1)
-//! decisions on the hot path instead of per-request plugin iteration.
+//! upper-bound decisions on the hot path instead of per-request plugin
+//! iteration.
 //!
 //! Incremental updates via `apply_delta()` preserve unchanged proxy plugin
 //! lists (including their stateful instances) and only rebuild affected proxies.
@@ -68,8 +69,8 @@ type PluginList = Arc<Vec<Arc<dyn Plugin>>>;
 type ProxyPluginMap = HashMap<String, PluginList>;
 /// Map from proxy_id to whether any plugin requires response body buffering.
 type BufferingMap = HashMap<String, bool>;
-/// Map from proxy_id to whether any plugin requires request body buffering
-/// (i.e., modifies the request body before forwarding to the backend).
+/// Map from proxy_id to whether any plugin may require request body buffering
+/// for at least some requests.
 type RequestBufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin requires per-frame WebSocket hooks.
 type WsFrameMap = HashMap<String, bool>;
@@ -141,9 +142,9 @@ pub struct PluginCache {
     requires_buffering: ArcSwap<BufferingMap>,
     /// Whether global-only plugins require response body buffering (fallback).
     global_requires_buffering: ArcSwap<bool>,
-    /// Pre-computed: does any plugin for this proxy modify the request body?
-    /// When false, request bodies can be streamed directly to the backend
-    /// without collecting into memory first.
+    /// Pre-computed: does any plugin for this proxy ever require request body
+    /// buffering? When false, request bodies can be streamed directly to the
+    /// backend without further per-request checks.
     requires_request_buffering: ArcSwap<RequestBufferingMap>,
     /// Whether global-only plugins require request body buffering (fallback).
     global_requires_request_buffering: ArcSwap<bool>,
@@ -365,7 +366,7 @@ impl PluginCache {
                 );
                 new_req_buffering.insert(
                     proxy.id.clone(),
-                    plugins.iter().any(|p| p.modifies_request_body()),
+                    plugins.iter().any(|p| p.requires_request_body_buffering()),
                 );
                 new_ws_frame.insert(
                     proxy.id.clone(),
@@ -421,7 +422,9 @@ impl PluginCache {
                     .any(|p| p.requires_response_body_buffering()),
             ));
             self.global_requires_request_buffering.store(Arc::new(
-                new_globals.iter().any(|p| p.modifies_request_body()),
+                new_globals
+                    .iter()
+                    .any(|p| p.requires_request_body_buffering()),
             ));
             self.global_requires_ws_frame.store(Arc::new(
                 new_globals.iter().any(|p| p.requires_ws_frame_hooks()),
@@ -488,10 +491,9 @@ impl PluginCache {
         }
     }
 
-    /// Check whether any plugin for this proxy modifies the request body.
-    /// When true, the request body must be fully collected into memory before
-    /// forwarding so plugins can transform it. When false, the body can be
-    /// streamed directly to the backend without buffering.
+    /// Check whether any plugin for this proxy may require request body
+    /// buffering. This is a config-time upper bound used to skip per-request
+    /// plugin scans entirely when body-aware plugins are absent.
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     pub fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
         let map = self.requires_request_buffering.load();
@@ -678,8 +680,8 @@ impl PluginCache {
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
             buffering_map.insert(proxy.id.clone(), needs_buffering);
 
-            // Pre-compute whether any plugin modifies the request body
-            let needs_req_buffering = merged.iter().any(|p| p.modifies_request_body());
+            // Pre-compute whether any plugin may require request body buffering
+            let needs_req_buffering = merged.iter().any(|p| p.requires_request_body_buffering());
             req_buffering_map.insert(proxy.id.clone(), needs_req_buffering);
 
             // Pre-compute whether any plugin requires per-frame WebSocket hooks
@@ -705,7 +707,9 @@ impl PluginCache {
         let global_needs_buffering = global_plugins
             .iter()
             .any(|p| p.requires_response_body_buffering());
-        let global_needs_req_buffering = global_plugins.iter().any(|p| p.modifies_request_body());
+        let global_needs_req_buffering = global_plugins
+            .iter()
+            .any(|p| p.requires_request_body_buffering());
         let global_needs_ws_frame = global_plugins.iter().any(|p| p.requires_ws_frame_hooks());
 
         Ok((

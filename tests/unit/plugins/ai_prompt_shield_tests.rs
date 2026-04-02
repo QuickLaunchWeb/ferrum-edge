@@ -33,6 +33,40 @@ async fn test_plugin_name_and_priority() {
     assert_eq!(plugin.name(), "ai_prompt_shield");
     assert_eq!(plugin.priority(), 2925);
     assert!(!plugin.requires_response_body_buffering());
+    assert!(plugin.requires_request_body_buffering());
+}
+
+#[test]
+fn test_request_buffering_only_for_matching_json_requests() {
+    let plugin = AiPromptShield::new(&json!({
+        "action": "warn",
+        "patterns": ["ssn"]
+    }));
+    assert!(plugin.requires_request_body_buffering());
+
+    let post_ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
+    assert!(plugin.should_buffer_request_body(&post_ctx));
+
+    let mut get_ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
+    get_ctx.method = "GET".to_string();
+    assert!(!plugin.should_buffer_request_body(&get_ctx));
+
+    let mut text_ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
+    text_ctx
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.should_buffer_request_body(&text_ctx));
+}
+
+#[test]
+fn test_invalid_pattern_config_does_not_force_request_buffering() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": [],
+        "custom_patterns": [
+            {"name": "bad", "regex": "[invalid("}
+        ]
+    }));
+    assert!(!plugin.requires_request_body_buffering());
 }
 
 // ─── SSN detection ──────────────────────────────────────────────────────

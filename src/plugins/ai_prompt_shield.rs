@@ -47,6 +47,8 @@ pub struct AiPromptShield {
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
     needs_body_transform: bool,
+    /// True when the plugin has valid patterns and may need to inspect bodies.
+    requires_request_body: bool,
 }
 
 /// Built-in PII pattern definitions.
@@ -170,6 +172,7 @@ impl AiPromptShield {
         }
 
         let needs_body_transform = action == ShieldAction::Redact;
+        let requires_request_body = !patterns.is_empty();
 
         Self {
             action,
@@ -179,6 +182,7 @@ impl AiPromptShield {
             redaction_template,
             max_scan_bytes,
             needs_body_transform,
+            requires_request_body,
         }
     }
 
@@ -322,10 +326,23 @@ impl Plugin for AiPromptShield {
         self.needs_body_transform
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.requires_request_body
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.requires_request_body
+            && ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only process POST requests
         if ctx.method != "POST" {
@@ -333,9 +350,9 @@ impl Plugin for AiPromptShield {
         }
 
         // Check content-type
-        let content_type = ctx
-            .headers
+        let content_type = headers
             .get("content-type")
+            .or_else(|| ctx.headers.get("content-type"))
             .map(|s| s.as_str())
             .unwrap_or("");
         if !content_type.contains("json") {

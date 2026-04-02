@@ -94,9 +94,6 @@ impl RequestTermination {
     }
 }
 
-/// Plugin priority: very early, before auth.
-pub const REQUEST_TERMINATION_PRIORITY: u16 = 75;
-
 #[async_trait]
 impl Plugin for RequestTermination {
     fn name(&self) -> &str {
@@ -104,7 +101,7 @@ impl Plugin for RequestTermination {
     }
 
     fn priority(&self) -> u16 {
-        REQUEST_TERMINATION_PRIORITY
+        super::priority::REQUEST_TERMINATION
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

@@ -26,6 +26,26 @@ async fn test_plugin_name_and_priority() {
     assert_eq!(plugin.name(), "ai_request_guard");
     assert_eq!(plugin.priority(), 2975);
     assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.requires_request_body_buffering());
+}
+
+#[test]
+fn test_request_buffering_only_for_matching_json_requests() {
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 2}));
+    assert!(plugin.requires_request_body_buffering());
+
+    let post_ctx = make_post_ctx(&json!({"messages": []}));
+    assert!(plugin.should_buffer_request_body(&post_ctx));
+
+    let mut get_ctx = make_post_ctx(&json!({"messages": []}));
+    get_ctx.method = "GET".to_string();
+    assert!(!plugin.should_buffer_request_body(&get_ctx));
+
+    let mut text_ctx = make_post_ctx(&json!({"messages": []}));
+    text_ctx
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.should_buffer_request_body(&text_ctx));
 }
 
 // ─── Model blocking ────────────────────────────────────────────────────

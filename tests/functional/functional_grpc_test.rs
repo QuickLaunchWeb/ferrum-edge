@@ -243,6 +243,31 @@ plugin_configs:
         .expect("Failed to write config");
 }
 
+/// Write a YAML config with a gRPC proxy whose allowed_methods excludes POST.
+fn write_grpc_method_filter_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+proxies:
+  - id: "grpc-method-filter-proxy"
+    listen_path: "/grpc-method-filter"
+    backend_protocol: grpc
+    backend_host: "127.0.0.1"
+    backend_port: {}
+    strip_listen_path: true
+    allowed_methods:
+      - "GET"
+
+consumers: []
+plugin_configs: []
+"#,
+        backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
 /// Send a gRPC request through the gateway using hyper's HTTP/2 client (h2c).
 async fn send_grpc_request(
     gateway_addr: &str,
@@ -690,20 +715,21 @@ async fn test_grpc_key_auth_rejects_missing_key() {
     .await
     .expect("Request should complete");
 
+    assert_eq!(status, 200, "gRPC auth rejection should return HTTP 200");
+    assert!(
+        body.is_empty(),
+        "gRPC auth rejection should be trailers-only"
+    );
     assert_eq!(
-        status, 401,
-        "Missing API key should return HTTP 401 Unauthorized"
+        headers.get("grpc-status").map(|s| s.as_str()),
+        Some("16"),
+        "Missing API key should map to grpc-status 16 (UNAUTHENTICATED)"
     );
-    let body_str = String::from_utf8_lossy(&body);
     assert!(
-        body_str.contains("Missing API key") || body_str.contains("error"),
-        "Response body should indicate missing API key, got: {}",
-        body_str
-    );
-    // Auth rejection happens before gRPC proxy path, so no grpc-status header
-    assert!(
-        !headers.contains_key("grpc-status"),
-        "Auth rejection should not include grpc-status (it's a pre-proxy rejection)"
+        headers
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("Missing API key")),
+        "gRPC auth rejection should expose the plugin message"
     );
 
     // Also verify an INVALID key is rejected
@@ -716,15 +742,21 @@ async fn test_grpc_key_auth_rejects_missing_key() {
     .await
     .expect("Request should complete");
 
-    assert_eq!(
-        status2, 401,
-        "Invalid API key should return HTTP 401 Unauthorized"
-    );
-    let body_str2 = String::from_utf8_lossy(&body2);
+    assert_eq!(status2, 200, "gRPC auth rejection should return HTTP 200");
     assert!(
-        body_str2.contains("Invalid API key") || body_str2.contains("error"),
-        "Response body should indicate invalid API key, got: {}",
-        body_str2
+        body2.is_empty(),
+        "gRPC auth rejection should be trailers-only"
+    );
+    assert_eq!(
+        _headers2.get("grpc-status").map(|s| s.as_str()),
+        Some("16"),
+        "Invalid API key should map to grpc-status 16 (UNAUTHENTICATED)"
+    );
+    assert!(
+        _headers2
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("Invalid API key")),
+        "Invalid key rejection should preserve the plugin message"
     );
 
     let _ = gateway.kill();
@@ -793,4 +825,77 @@ async fn test_grpc_key_auth_accepts_valid_key() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_grpc_key_auth_accepts_valid_key PASSED");
+}
+
+/// End-to-end test: early non-plugin gRPC rejects (route miss and method filter)
+/// are translated into trailers-only gRPC errors.
+#[ignore]
+#[tokio::test]
+async fn test_grpc_early_rejects_use_grpc_error_shape() {
+    let backend_port = free_port().await;
+    let gateway_port = free_port().await;
+
+    let echo_handle = start_grpc_echo_backend(backend_port).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_grpc_method_filter_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
+        .expect("Failed to start gateway");
+    wait_for_gateway(gateway_port)
+        .await
+        .expect("Gateway did not become healthy");
+
+    let gateway_addr = format!("127.0.0.1:{}", gateway_port);
+
+    let (status, headers, body) = send_grpc_request(
+        &gateway_addr,
+        "/grpc-route-miss/my.EchoService/Echo",
+        b"",
+        &[],
+    )
+    .await
+    .expect("Route-miss request should complete");
+
+    assert_eq!(status, 200, "gRPC route miss should return HTTP 200");
+    assert!(body.is_empty(), "gRPC route miss should be trailers-only");
+    assert_eq!(
+        headers.get("grpc-status").map(|s| s.as_str()),
+        Some("5"),
+        "Missing route should map to grpc-status 5 (NOT_FOUND)"
+    );
+
+    let (status2, headers2, body2) = send_grpc_request(
+        &gateway_addr,
+        "/grpc-method-filter/my.EchoService/Echo",
+        b"",
+        &[],
+    )
+    .await
+    .expect("Method-filter request should complete");
+
+    assert_eq!(status2, 200, "gRPC method filter should return HTTP 200");
+    assert!(
+        body2.is_empty(),
+        "gRPC method filter rejection should be trailers-only"
+    );
+    assert_eq!(
+        headers2.get("grpc-status").map(|s| s.as_str()),
+        Some("12"),
+        "Method filter rejection should map to grpc-status 12 (UNIMPLEMENTED)"
+    );
+    assert!(
+        headers2
+            .get("grpc-message")
+            .is_some_and(|msg| msg.contains("Method Not Allowed")),
+        "Method filter rejection should preserve the reject message"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+    println!("test_grpc_early_rejects_use_grpc_error_shape PASSED");
 }

@@ -10,13 +10,14 @@
 //!
 //! # Centralized mode (`sync_mode: "redis"`)
 //!
-//! When configured with Redis, frame counters are shared across gateway instances.
-//! This is useful when a load balancer may reconnect a WebSocket client to a
-//! different instance — the rate limit state follows the connection ID.
+//! When configured with Redis, frame counters are stored in Redis instead of
+//! in-memory state. Because `connection_id` is process-local, each plugin
+//! instance namespaces its Redis keys with a unique instance identifier to
+//! avoid cross-instance collisions.
 //!
-//! Note: Since WebSocket connections are typically pinned to a single gateway
-//! instance, centralized mode is most useful for connection ID-based tracking
-//! across reconnects or for aggregate rate limiting with a shared key prefix.
+//! Note: This mode externalizes the counter backend and preserves fallback
+//! behavior, but it does not make per-connection limits portable across
+//! reconnects to a different gateway instance.
 //!
 //! Config:
 //! ```json
@@ -40,6 +41,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::warn;
+use uuid::Uuid;
 
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 
@@ -107,6 +109,9 @@ pub struct WsRateLimiting {
     frame_counter: std::sync::atomic::AtomicU64,
     /// Redis-backed rate limiter for centralized mode.
     redis_client: Option<Arc<RedisRateLimitClient>>,
+    /// Unique namespace for Redis-backed counters so process-local
+    /// connection IDs do not collide across gateway instances.
+    redis_instance_id: String,
 }
 
 impl WsRateLimiting {
@@ -154,7 +159,12 @@ impl WsRateLimiting {
             state: Arc::new(DashMap::new()),
             frame_counter: std::sync::atomic::AtomicU64::new(0),
             redis_client,
+            redis_instance_id: Uuid::new_v4().simple().to_string(),
         }
+    }
+
+    fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
+        format!("{}:{}:{}", self.redis_instance_id, proxy_id, connection_id)
     }
 
     /// Evict stale entries to prevent unbounded memory growth.
@@ -180,7 +190,7 @@ impl WsRateLimiting {
 
     /// Check frame rate against Redis. Returns `Some(true)` if allowed,
     /// `Some(false)` if rate exceeded, `None` if Redis unavailable.
-    async fn check_rate_redis(&self, connection_id: u64) -> Option<bool> {
+    async fn check_rate_redis(&self, proxy_id: &str, connection_id: u64) -> Option<bool> {
         let redis = self.redis_client.as_ref()?;
         if !redis.is_available() {
             return None;
@@ -188,7 +198,8 @@ impl WsRateLimiting {
 
         // Use 1-second fixed windows for frame rate limiting
         let window_idx = RedisRateLimitClient::window_index(1);
-        let key = redis.make_key(&[&connection_id.to_string(), &window_idx.to_string()]);
+        let scope_key = self.redis_connection_scope_key(proxy_id, connection_id);
+        let key = redis.make_key(&[scope_key.as_str(), &window_idx.to_string()]);
 
         // INCR + EXPIRE with 2s TTL (current + previous window)
         match redis.incr_with_expire(&key, 2).await {
@@ -239,7 +250,7 @@ impl Plugin for WsRateLimiting {
 
         // Try Redis first if configured
         if self.redis_client.is_some()
-            && let Some(allowed) = self.check_rate_redis(connection_id).await
+            && let Some(allowed) = self.check_rate_redis(proxy_id, connection_id).await
         {
             if !allowed {
                 let dir_label = match direction {
@@ -286,5 +297,23 @@ impl Plugin for WsRateLimiting {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redis_connection_scope_key_is_namespaced_per_instance() {
+        let plugin_a = WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default());
+        let plugin_b = WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default());
+
+        let key_a = plugin_a.redis_connection_scope_key("proxy-a", 7);
+        let key_b = plugin_b.redis_connection_scope_key("proxy-a", 7);
+
+        assert_ne!(key_a, key_b);
+        assert!(key_a.ends_with(":proxy-a:7"));
+        assert!(key_b.ends_with(":proxy-a:7"));
     }
 }

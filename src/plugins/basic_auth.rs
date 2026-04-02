@@ -23,7 +23,7 @@ use tracing::{debug, error, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -137,15 +137,16 @@ impl Plugin for BasicAuth {
             }
         };
 
-        if !auth_header.starts_with("Basic ") && !auth_header.starts_with("basic ") {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid Basic auth format"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-
-        let encoded = &auth_header[6..];
+        let encoded = match strip_auth_scheme(&auth_header, "Basic") {
+            Some(encoded) => encoded,
+            None => {
+                return PluginResult::Reject {
+                    status_code: 401,
+                    body: r#"{"error":"Invalid Basic auth format"}"#.into(),
+                    headers: HashMap::new(),
+                };
+            }
+        };
         let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
             Ok(d) => d,
             Err(_) => {
