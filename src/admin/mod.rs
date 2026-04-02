@@ -1840,6 +1840,14 @@ async fn handle_list_plugin_configs(
     }
 }
 
+fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
+    match plugins::create_plugin(&pc.plugin_name, &pc.config) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(format!("Unknown plugin name '{}'", pc.plugin_name)),
+        Err(err) => Err(err),
+    }
+}
+
 async fn handle_create_plugin_config(
     state: &AdminState,
     body: &[u8],
@@ -1943,6 +1951,13 @@ async fn handle_create_plugin_config(
                 ));
             }
         }
+    }
+
+    if let Err(err) = validate_plugin_config_definition(&pc) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid plugin config: {}", err)}),
+        ));
     }
 
     pc.created_at = Utc::now();
@@ -2078,6 +2093,13 @@ async fn handle_update_plugin_config(
                 ));
             }
         }
+    }
+
+    if let Err(err) = validate_plugin_config_definition(&pc) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid plugin config: {}", err)}),
+        ));
     }
 
     match db.update_plugin_config(&pc).await {
@@ -2888,6 +2910,9 @@ async fn handle_batch_create(
                         for e in field_errs {
                             errors.push(format!("PluginConfig '{}': {}", pc.id, e));
                         }
+                    }
+                    if let Err(err) = validate_plugin_config_definition(pc) {
+                        errors.push(format!("PluginConfig '{}': invalid config: {}", pc.id, err));
                     }
                     pc.created_at = now;
                     pc.updated_at = now;

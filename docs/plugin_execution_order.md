@@ -91,7 +91,7 @@ Connection/Session In
 
 Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validator`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
 
-**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). Plugins can reject to close the connection immediately. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
+**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). For TCP+TLS listeners it runs after the frontend TLS handshake, so plugins can inspect the client certificate. Plugins can reject to close the connection immediately. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
@@ -100,7 +100,10 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | Plugin | `on_stream_connect` | `on_stream_disconnect` | Behavior |
 |--------|:-------------------:|:----------------------:|----------|
 | `ip_restriction` | ✓ | | Rejects connections from denied IPs |
-| `rate_limiting` | ✓ | | IP-based rate limiting per connection/session |
+| `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS |
+| `access_control` | ✓ | | Applies consumer allow/deny rules once a stream Consumer exists |
+| `tcp_connection_throttle` | ✓ | ✓ | Caps active TCP connections per Consumer, else per client IP |
+| `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
 | `otel_tracing` | ✓ | ✓ | Generates trace/span IDs; emits structured trace log |
 | `stdout_logging` | | ✓ | JSON access log for stream connections |
@@ -113,7 +116,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | Protocol | `on_stream_connect` fires | `on_stream_disconnect` fires |
 |----------|--------------------------|------------------------------|
 | **TCP** | After `accept()`, before backend connection | After bidirectional copy completes |
-| **TCP+TLS** | After `accept()`, before TLS handshake | After bidirectional copy completes |
+| **TCP+TLS** | After TLS handshake, before backend connection | After bidirectional copy completes |
 | **UDP** | On first datagram from new client (session creation) | When session is cleaned up (idle timeout) |
 | **UDP+DTLS** | After DTLS `accept()`, before backend connection | When DTLS handler exits |
 
@@ -173,7 +176,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation and AI accounting | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -192,32 +195,33 @@ Given all built-in plugins enabled, the execution order is:
 | 5 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 6 | `bot_detection` | 200 | on_request_received |
 | 7 | `grpc_method_router` | 275 | on_request_received, before_proxy |
-| 8 | `mtls_auth` | 950 | authenticate |
+| 8 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 9 | `jwks_auth` | 1000 | authenticate |
 | 10 | `jwt_auth` | 1100 | authenticate |
 | 11 | `key_auth` | 1200 | authenticate |
 | 12 | `basic_auth` | 1300 | authenticate |
 | 13 | `hmac_auth` | 1400 | authenticate |
-| 14 | `access_control` | 2000 | authorize |
-| 15 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
-| 16 | `ws_message_size_limiting` | 2810 | on_ws_frame |
-| 17 | `graphql` | 2850 | before_proxy |
-| 18 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
-| 19 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 20 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 21 | `body_validator` | 2950 | before_proxy, on_final_response_body |
-| 22 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 23 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 24 | `grpc_deadline` | 3050 | before_proxy |
-| 25 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 26 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 27 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 28 | `ai_token_metrics` | 4100 | on_response_body |
-| 29 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 30 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 31 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 32 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 33 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 14 | `access_control` | 2000 | authorize, on_stream_connect |
+| 15 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
+| 16 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
+| 17 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 18 | `graphql` | 2850 | before_proxy |
+| 19 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 20 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 21 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 22 | `body_validator` | 2950 | before_proxy, on_final_response_body |
+| 23 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 24 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 25 | `grpc_deadline` | 3050 | before_proxy |
+| 26 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 27 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 28 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 29 | `ai_token_metrics` | 4100 | on_response_body |
+| 30 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 31 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 32 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 33 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 34 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
 | 34 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
@@ -360,13 +364,14 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
-| `mtls_auth` | ✓ | ✓ | ✓ | | | Requires TLS client certificate |
+| `mtls_auth` | ✓ | ✓ | ✓ | ✓ | | Requires TLS client certificate |
 | `jwks_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `access_control` | ✓ | ✓ | ✓ | | | Needs authenticated identity from an auth plugin; consumer rules remain primary |
+| `access_control` | ✓ | ✓ | ✓ | ✓ | | Needs authenticated identity from an auth plugin; consumer rules remain primary |
+| `tcp_connection_throttle` | | | | ✓ | | Tracks active TCP connections per Consumer or client IP |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
 | `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |

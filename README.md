@@ -9,7 +9,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 **Key highlights:**
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
-- **34 built-in plugins**: Authentication, authorization, rate limiting, transformation, AI/LLM-specific plugins, and observability
+- **35 built-in plugins**: Authentication, authorization, rate limiting, transformation, AI/LLM-specific plugins, and observability
 - **Four operating modes**: Database, File, Control Plane, Data Plane
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
@@ -217,7 +217,7 @@ Plugins execute in a defined pipeline with priority ordering (lower = runs first
 | **Early** (100) | `cors`, `ip_restriction`, `bot_detection` |
 | **Authentication** (950-1400) | `mtls_auth`, `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
 | **gRPC** (275) | `grpc_method_router` |
-| **Authorization** (2000-2900) | `access_control`, `graphql`, `rate_limiting` |
+| **Authorization** (2000-2900) | `access_control`, `tcp_connection_throttle`, `graphql`, `rate_limiting` |
 | **AI Pre-proxy** (2925-2975) | `ai_prompt_shield`, `ai_request_guard` |
 | **Transform** (3000-3050) | `request_transformer`, `body_validator`, `request_size_limiting`, `request_termination`, `grpc_deadline` |
 | **WebSocket** (2810-2910) | `ws_message_size_limiting`, `ws_rate_limiting` |

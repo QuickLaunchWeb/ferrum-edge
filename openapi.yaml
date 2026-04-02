@@ -695,6 +695,7 @@ paths:
                 - stdout_logging
                 - http_logging
                 - transaction_debugger
+                - mtls_auth
                 - jwks_auth
                 - jwt_auth
                 - key_auth
@@ -702,6 +703,7 @@ paths:
                 - hmac_auth
                 - cors
                 - access_control
+                - tcp_connection_throttle
                 - ip_restriction
                 - bot_detection
                 - correlation_id
@@ -1474,12 +1476,12 @@ components:
           type: object
           default: {}
           description: >-
-            Plugin-specific JSON configuration. Validated when the plugin is
-            instantiated at config reload time. Security plugins (key_auth,
-            basic_auth, jwt_auth, hmac_auth, jwks_auth, mtls_auth,
-            access_control, ip_restriction) block gateway startup if their
-            config is invalid. See `PluginConfigs` section for per-plugin
-            schema definitions.
+            Plugin-specific JSON configuration. Validated on create/update and
+            again when the plugin is instantiated at config reload time.
+            Security plugins (key_auth, basic_auth, jwt_auth, hmac_auth,
+            jwks_auth, mtls_auth, access_control, tcp_connection_throttle,
+            ip_restriction) block gateway startup if their config is invalid.
+            See `PluginConfigs` section for per-plugin schema definitions.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -2650,7 +2652,7 @@ components:
 
     MtlsAuthConfig:
       type: object
-      description: "Plugin: mtls_auth — Authenticates using client TLS certificate fields."
+      description: "Plugin: mtls_auth — Authenticates using client TLS certificate fields for HTTP-family and TCP+TLS proxies."
       properties:
         cert_field:
           type: string
@@ -2820,7 +2822,7 @@ components:
 
     AccessControlConfig:
       type: object
-      description: "Plugin: access_control — consumer-based allow/deny. Use ip_restriction for IP/CIDR rules."
+      description: "Plugin: access_control — consumer-based allow/deny for HTTP-family and TCP stream proxies. Use ip_restriction for IP/CIDR rules."
       properties:
         allowed_consumers:
           type: array
@@ -2832,6 +2834,17 @@ components:
           items:
             type: string
           description: Usernames explicitly denied
+
+    TcpConnectionThrottleConfig:
+      type: object
+      description: "Plugin: tcp_connection_throttle — Caps active TCP connections per Consumer when a stream auth plugin identified one, else per client IP."
+      required: [max_connections_per_key]
+      properties:
+        max_connections_per_key:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum active TCP connections allowed for one Consumer/IP key
 
     IpRestrictionConfig:
       type: object
@@ -2926,7 +2939,7 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
+      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
       properties:
         limit_by:
           type: string
