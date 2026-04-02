@@ -23,10 +23,13 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
-use crate::config::types::{AuthMode, Proxy};
+use crate::config::types::Proxy;
 use crate::dns::DnsCacheResolver;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
-use crate::proxy::{ProxyState, apply_after_proxy_hooks_to_rejection, run_after_proxy_hooks};
+use crate::proxy::{
+    ProxyState, apply_after_proxy_hooks_to_rejection, run_after_proxy_hooks,
+    run_authentication_phase,
+};
 use crate::tls::TlsPolicy;
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
@@ -512,69 +515,24 @@ async fn handle_h3_request(
         plugins.iter().filter(|p| p.is_auth_plugin()).collect();
 
     let auth_phase_start = std::time::Instant::now();
-    match proxy.auth_mode {
-        AuthMode::Multi => {
-            // Multi auth mode: try each auth plugin, first success wins
-            let mut any_success = false;
-            for auth_plugin in &auth_plugins {
-                match auth_plugin
-                    .authenticate(&mut ctx, &state.consumer_index)
-                    .await
-                {
-                    PluginResult::Continue => {
-                        any_success = true;
-                        break;
-                    }
-                    PluginResult::Reject { .. } => continue,
-                }
-            }
-            if !any_success && !auth_plugins.is_empty() {
-                // All auth plugins rejected — deny access
-                record_request(&state, 401);
-                let mut headers = HashMap::new();
-                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 401, &mut headers).await;
-                send_h3_reject_response(
-                    &mut stream,
-                    StatusCode::UNAUTHORIZED,
-                    r#"{"error":"Unauthorized"}"#,
-                    &headers,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-        AuthMode::Single => {
-            for auth_plugin in &auth_plugins {
-                match auth_plugin
-                    .authenticate(&mut ctx, &state.consumer_index)
-                    .await
-                {
-                    PluginResult::Reject {
-                        status_code,
-                        body,
-                        mut headers,
-                    } => {
-                        record_request(&state, status_code);
-                        apply_after_proxy_hooks_to_rejection(
-                            &plugins,
-                            &mut ctx,
-                            status_code,
-                            &mut headers,
-                        )
-                        .await;
-                        send_h3_reject_response(
-                            &mut stream,
-                            StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
-                            &body,
-                            &headers,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    PluginResult::Continue => {}
-                }
-            }
-        }
+    if let Some((status_code, body, mut headers)) = run_authentication_phase(
+        proxy.auth_mode.clone(),
+        &auth_plugins,
+        &mut ctx,
+        &state.consumer_index,
+    )
+    .await
+    {
+        record_request(&state, status_code);
+        apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers).await;
+        send_h3_reject_response(
+            &mut stream,
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
+            &body,
+            &headers,
+        )
+        .await?;
+        return Ok(());
     }
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
