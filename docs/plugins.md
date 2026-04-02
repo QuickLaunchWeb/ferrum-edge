@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 33 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 34 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -10,10 +10,12 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, Basic Auth)
 3. **`authorize`** — Checks consumer permissions (Access Control)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
-5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
-6. **`on_response_body`** — Processes response body (AI token metrics, AI rate limiter)
-7. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
-8. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
+5. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
+6. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
+7. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
+8. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
+9. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
+10. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Scope
 
@@ -30,8 +32,8 @@ When a request is successfully authenticated, the gateway automatically injects 
 
 | Header | Value | Present |
 |--------|-------|---------|
-| `X-Consumer-Username` | The consumer's `username` field | Always (when authenticated) |
-| `X-Consumer-Custom-Id` | The consumer's `custom_id` field | Only when `custom_id` is set |
+| `X-Consumer-Username` | Mapped Consumer `username`, otherwise external auth header/display identity, otherwise external `authenticated_identity` | Always (when authenticated) |
+| `X-Consumer-Custom-Id` | The Consumer's `custom_id` field | Only when a gateway Consumer is mapped and `custom_id` is set |
 
 These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
@@ -68,6 +70,8 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
+
+`endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
 ```yaml
 plugin_name: http_logging
@@ -128,7 +132,7 @@ Both `stdout_logging` and `http_logging` emit the same JSON structures. HTTP-fam
 |-------|------|-------------|
 | `timestamp_received` | String (RFC 3339) | Request arrival time (UTC) |
 | `client_ip` | String | Client IP after trusted-proxy resolution |
-| `consumer_username` | String or null | Authenticated consumer identity (null if unauthenticated) |
+| `consumer_username` | String or null | Authenticated identity used for policy/logging: mapped Consumer username when present, otherwise external `authenticated_identity`; null if unauthenticated |
 | `http_method` | String | HTTP method (e.g., `GET`, `POST`) |
 | `request_path` | String | Request path (query string stripped) |
 | `matched_proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
@@ -286,7 +290,7 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend a
 }
 ```
 
-gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trailers. The `response_status_code` in the log reflects the HTTP status (200), not the gRPC status code. When the gateway cannot reach the gRPC backend, `error_class` is populated and `response_status_code` is 502 or 503.
+gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trailers. This includes gateway-generated plugin rejections, which are translated into trailers-only gRPC errors unless the plugin already returned explicit gRPC error metadata. The `response_status_code` in the log reflects the HTTP status (200), not the gRPC status code. When the gateway cannot reach the gRPC backend, `error_class` is populated while the downstream HTTP status remains 200.
 
 #### Example: WebSocket (Upgrade Handshake)
 
@@ -367,7 +371,7 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target_url: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`.
+Rejected requests have `backend_target_url: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
 
 #### Example: TCP Stream
 
@@ -471,23 +475,21 @@ Logs verbose request/response details to stdout. Sensitive headers are automatic
 
 Generates and propagates correlation IDs for request tracing across services.
 
-**Priority:** 9000
+**Priority:** 50
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String | `X-Correlation-ID` | Header name for correlation ID |
-| `generator` | String | `uuid` | ID generation strategy |
+| `header_name` | String | `x-request-id` | Header name used for inbound, outbound, and echoed IDs |
 | `echo_downstream` | bool | `true` | Include correlation ID in response headers |
 
 ### `prometheus_metrics`
 
-Exports gateway metrics in Prometheus exposition format.
+Records gateway metrics in Prometheus exposition format. The admin API serves
+the `/metrics` endpoint; this plugin only records request and stream metrics.
 
 **Priority:** 9300
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `path` | String | `/metrics` | Metrics endpoint path |
+This plugin has no plugin-specific configuration.
 
 ### `otel_tracing`
 
@@ -509,7 +511,7 @@ Supports two modes:
 | `authorization` | String | _(none)_ | Authorization header value for OTLP exports |
 | `batch_size` | Integer | `50` | Spans per export batch |
 | `flush_interval_ms` | Integer | `5000` | Max delay before flushing a partial batch |
-| `buffer_capacity` | Integer | `10000` | Max pending spans; drops oldest when full |
+| `buffer_capacity` | Integer | `10000` | Max pending spans; new spans are dropped when the buffer is full |
 | `max_retries` | Integer | `2` | Retry attempts on export failure |
 | `retry_delay_ms` | Integer | `1000` | Delay between retries |
 
@@ -555,6 +557,8 @@ config:
 
 **CA Fingerprint Filtering:**
 When `allowed_ca_fingerprints_sha256` is configured, at least one certificate in the client's TLS chain must match a configured SHA-256 fingerprint. When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, both constraints must pass (AND logic).
+
+Issuer-constraint rejection bodies are always emitted as valid JSON even when certificate subject fields contain quotes, newlines, or other control characters.
 
 Works with `auth_mode: multi` — if the mTLS check fails, the gateway continues to the next auth plugin.
 
@@ -642,11 +646,27 @@ Authenticates requests using HMAC signatures.
 
 **Priority:** 1400
 
-| Parameter | Type | Description |
-|---|---|---|
-| `secret` | String | Shared secret for HMAC computation |
-| `algorithm` | String | Hash algorithm (e.g., `sha256`) |
-| `header` | String | Header containing the HMAC signature |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
+
+Expected `Authorization` header format:
+
+```text
+hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
+```
+
+- `algorithm` is optional and defaults to `hmac-sha256`
+- Supported algorithms: `hmac-sha256`, `hmac-sha512`
+- Unknown algorithms are rejected
+- Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
+
+**Consumer credential** (`hmac_auth`):
+```yaml
+credentials:
+  hmac_auth:
+    secret: "shared-secret"
+```
 
 ---
 
@@ -654,7 +674,10 @@ Authenticates requests using HMAC signatures.
 
 ### `access_control`
 
-Authorizes requests based on the identified consumer's username.
+Authorizes requests based on the authenticated caller. By default it checks the
+identified consumer's username. Optionally it can also allow externally
+authenticated identities (for example `jwks_auth` users without a mapped
+gateway Consumer).
 
 **Priority:** 2000
 
@@ -662,6 +685,7 @@ Authorizes requests based on the identified consumer's username.
 |---|---|---|
 | `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
 | `disallowed_consumers` | String[] | Usernames explicitly denied |
+| `allow_authenticated_identity` | bool | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped |
 
 Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement.
 
@@ -669,12 +693,15 @@ Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement
 
 Restricts access based on client IP address or CIDR range.
 
-**Priority:** 100
+**Priority:** 150
 
 | Parameter | Type | Description |
 |---|---|---|
 | `allow` | String[] | Allowed IP addresses or CIDR ranges |
 | `deny` | String[] | Denied IP addresses or CIDR ranges |
+| `mode` | String | `allow_first` (default) or `deny_first` |
+
+Rules are validated at config load time. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
 ### `rate_limiting`
 
@@ -703,7 +730,7 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 
 **Behavior by mode:**
 - `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP.
-- `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by consumer username. Falls back to client IP if no consumer.
+- `limit_by: "consumer"` — Enforces in `authorize` phase (after auth), keyed by the authenticated identity: mapped consumer username when present, otherwise external `authenticated_identity`. Falls back to client IP if neither exists.
 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, `x-ratelimit-identity`
 
@@ -749,7 +776,7 @@ See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshoot
 
 Detects and blocks bot traffic based on User-Agent patterns.
 
-**Priority:** 100
+**Priority:** 200
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -760,16 +787,19 @@ Detects and blocks bot traffic based on User-Agent patterns.
 
 ### `request_termination`
 
-Returns a predefined response without proxying to the backend. Useful for maintenance mode.
+Returns a predefined response without proxying to the backend. Useful for maintenance mode, mocking, or header/path-based short-circuiting. It runs immediately after CORS so browser preflight requests still receive valid CORS responses, and opted-in header plugins such as CORS can still decorate the rejected response.
 
-**Priority:** 3000
+**Priority:** 125
 
-| Parameter | Type | Description |
-|---|---|---|
-| `status_code` | u16 | HTTP status code to return |
-| `body` | String | Response body |
-| `content_type` | String | Response Content-Type header |
-| `message` | String | Error message |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `status_code` | u16 | `503` | HTTP status code to return |
+| `body` | String | `""` | Explicit response body. When set, `message` is ignored |
+| `content_type` | String | `application/json` | Response `Content-Type` header |
+| `message` | String | `"Service unavailable"` | Message used to build the default JSON/XML/plain-text body |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix |
+| `trigger.header` | String | _(none)_ | Only terminate when this request header is present |
+| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`; empty means any value |
 
 ---
 
@@ -798,6 +828,8 @@ config:
 ```
 
 Body rules use dot-notation paths for nested JSON. Values are auto-parsed as JSON when possible. Body transformation only applies to `application/json` content types.
+When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically.
+On HTTPS backends, body-transforming requests also bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
 
 ### `response_transformer`
 
@@ -827,7 +859,9 @@ Header rules default to `target: header` (no `target` field required). Body rule
 
 Validates JSON and XML request and response bodies against schemas. Supports comprehensive JSON Schema validation.
 
-**Priority:** 3000
+Request-side validation only buffers matching request bodies: methods that can carry a body and whose `content-type` matches `content_types`. Response-only configs do not force request buffering.
+
+**Priority:** 2950
 
 **Request validation:**
 
@@ -855,26 +889,33 @@ Validates JSON and XML request and response bodies against schemas. Supports com
 
 Enforces per-proxy request body size limits. Rejects with HTTP 413.
 
-**Priority:** 3000
+**Priority:** 2800
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | `0` (disabled) | Maximum allowed request body size in bytes |
 
+Enforcement happens in three places:
+- `on_request_received` rejects oversized `Content-Length` headers without reading the body.
+- `before_proxy` checks the buffered raw body when another plugin already needed early body access.
+- `on_final_request_body` re-checks the final buffered body after request transforms, so body-rewriting plugins cannot expand the request past the configured limit before it reaches the backend.
+
 ### `response_size_limiting`
 
 Enforces per-proxy response body size limits. Rejects with HTTP 502.
 
-**Priority:** 4000
+**Priority:** 3490
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
-| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual size |
+| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent |
 
 ### `graphql`
 
 GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting.
+
+Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`.
 
 **Priority:** 2850
 
@@ -884,7 +925,7 @@ GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-o
 | `max_complexity` | u32 (optional) | — | Maximum allowed field count |
 | `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
+| `limit_by` | String | `ip` | Rate limit key: `ip` or authenticated identity (`consumer`) |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
 
@@ -920,7 +961,7 @@ Parses the gRPC path (`/package.Service/Method`) and enables per-method access c
 | `allow_methods` | String[] | *(none)* | Only these gRPC methods are permitted (allowlist) |
 | `deny_methods` | String[] | `[]` | These gRPC methods are explicitly blocked (checked before allow) |
 | `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
+| `limit_by` | String | `ip` | Rate limit key: `ip` or authenticated identity (`consumer`) |
 
 Each rate limit entry: `{max_requests: u64, window_seconds: u64}`.
 
@@ -955,9 +996,11 @@ Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum d
 | `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds) |
 | `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it |
 | `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
-| `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` with HTTP 400 |
+| `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` (gRPC clients receive normalized `grpc-status`) |
 
 Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds).
+
+Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
 When `subtract_gateway_processing` is true and the remaining deadline is zero or negative, returns gRPC status `DEADLINE_EXCEEDED` (status code 4) using the trailers-only response pattern.
 
@@ -994,6 +1037,8 @@ Extracts token usage from LLM response bodies and writes it to request metadata 
 
 **Note**: Requires response body buffering. Set `response_body_mode: buffer` on the proxy.
 
+`provider` is parsed case-insensitively and ignores surrounding whitespace.
+
 ```yaml
 plugin_name: ai_token_metrics
 config:
@@ -1005,6 +1050,8 @@ config:
 ### `ai_request_guard`
 
 Validates and constrains AI/LLM API requests before they reach the backend.
+
+Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured.
 
 **Priority:** 2975
 
@@ -1043,7 +1090,7 @@ Rate-limits consumers by LLM token consumption instead of request count.
 | `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens` |
-| `limit_by` | String | `"consumer"` | Rate limit key: `consumer` or `ip` |
+| `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip` |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers |
 | `provider` | String | `"auto"` | LLM provider format for token extraction |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
@@ -1057,6 +1104,8 @@ Rate-limits consumers by LLM token consumption instead of request count.
 | `redis_password` | String (optional) | — | Redis password |
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
+
+`provider` is parsed case-insensitively and ignores surrounding whitespace.
 
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
@@ -1074,6 +1123,8 @@ config:
 ### `ai_prompt_shield`
 
 Scans AI/LLM request bodies for PII and either rejects, redacts, or warns.
+
+Request buffering is only enabled for matching JSON `POST` requests when the plugin has at least one valid pattern to scan.
 
 **Priority:** 2925
 
@@ -1158,6 +1209,8 @@ Enforces maximum frame size for WebSocket connections. Closes the connection wit
 | `max_frame_bytes` | u64 | `0` | Maximum allowed frame size in bytes (0 = no effect) |
 | `close_reason` | String | `"Message too large"` | Close frame reason text |
 
+`close_reason` is truncated to the WebSocket protocol limit for close-frame reason strings (123 UTF-8 bytes).
+
 ```yaml
 plugin_name: ws_message_size_limiting
 config:
@@ -1187,7 +1240,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-**Centralized mode** (`sync_mode: "redis"`): Frame counters are shared across gateway instances. This is useful when a load balancer may reconnect a WebSocket client to a different instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands. If Redis becomes unreachable, falls back to local in-memory rate limiting automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, Redis keys are namespaced per gateway instance to avoid cross-instance collisions; this mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands. If Redis becomes unreachable, falls back to local in-memory rate limiting automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 ```yaml
 plugin_name: ws_rate_limiting

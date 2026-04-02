@@ -10,6 +10,9 @@
 //! 2. **Buffered body check** (`before_proxy`): if another plugin caused the
 //!    request body to be buffered (stored in `ctx.metadata["request_body"]`),
 //!    the actual byte length is verified before proxying.
+//! 3. **Final buffered body check** (`on_final_request_body`): re-checks the
+//!    body after request transforms so the backend-visible payload still
+//!    respects the configured limit.
 //!
 //! For chunked/streaming requests without Content-Length where no other plugin
 //! buffers the body, the global limit still applies at the proxy layer.
@@ -110,6 +113,36 @@ impl Plugin for RequestSizeLimiting {
                     headers: HashMap::new(),
                 };
             }
+        }
+
+        PluginResult::Continue
+    }
+
+    async fn on_final_request_body(
+        &self,
+        _headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if self.max_bytes == 0 {
+            return PluginResult::Continue;
+        }
+
+        let len = body.len() as u64;
+        if len > self.max_bytes {
+            debug!(
+                plugin = "request_size_limiting",
+                body_len = len,
+                max_bytes = self.max_bytes,
+                "Request rejected: final request body exceeds limit"
+            );
+            return PluginResult::Reject {
+                status_code: 413,
+                body: format!(
+                    r#"{{"error":"Request body too large","limit":{}}}"#,
+                    self.max_bytes
+                ),
+                headers: HashMap::new(),
+            };
         }
 
         PluginResult::Continue

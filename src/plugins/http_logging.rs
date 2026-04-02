@@ -53,6 +53,21 @@ impl HttpLogging {
                     .to_string()
             })?
             .to_string();
+        let parsed_url = Url::parse(&endpoint_url)
+            .map_err(|e| format!("http_logging: invalid 'endpoint_url': {e}"))?;
+        match parsed_url.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(format!(
+                    "http_logging: 'endpoint_url' must use http:// or https:// (got '{scheme}')"
+                ));
+            }
+        }
+        if parsed_url.host_str().is_none() {
+            return Err(
+                "http_logging: 'endpoint_url' must include a hostname or IP address".to_string(),
+            );
+        }
 
         let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
         let flush_interval_ms = config["flush_interval_ms"]
@@ -73,9 +88,7 @@ impl HttpLogging {
             retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
         };
 
-        let endpoint_hostname = Url::parse(&batch_config.endpoint_url)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
 
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         tokio::spawn(flush_loop(receiver, batch_config));

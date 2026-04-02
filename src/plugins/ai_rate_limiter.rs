@@ -109,7 +109,12 @@ impl AiRateLimiter {
             .unwrap_or("consumer")
             .to_string();
         let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
-        let provider = config["provider"].as_str().unwrap_or("auto").to_string();
+        let provider = config["provider"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("auto")
+            .to_ascii_lowercase();
 
         let dns_cache = http_client.dns_cache().cloned();
         let tls_no_verify = http_client.tls_no_verify();
@@ -143,13 +148,10 @@ impl AiRateLimiter {
 
     /// Build the rate limit key from the request context.
     fn rate_key(&self, ctx: &RequestContext) -> String {
-        if self.limit_by == "consumer" {
-            if let Some(ref consumer) = ctx.identified_consumer {
-                return format!("consumer:{}", consumer.username);
-            }
-            if let Some(ref identity) = ctx.authenticated_identity {
-                return format!("consumer:{}", identity);
-            }
+        if self.limit_by == "consumer"
+            && let Some(identity) = ctx.effective_identity()
+        {
+            return format!("consumer:{}", identity);
         }
         format!("ip:{}", ctx.client_ip)
     }

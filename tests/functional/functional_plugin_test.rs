@@ -15,10 +15,17 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_plugin
 
+use bytes::Bytes;
 use chrono::Utc;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -291,6 +298,81 @@ async fn start_header_echo_backend(
             });
         }
     });
+    Ok(handle)
+}
+
+/// HTTPS + HTTP/2 echo backend that returns request headers and body as JSON.
+async fn start_h2_tls_header_echo_backend(
+    port: u16,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let cert_pem = include_str!("../certs/server.crt");
+    let key_pem = include_str!("../certs/server.key");
+
+    let mut cert_reader = cert_pem.as_bytes();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .filter_map(|cert| cert.ok())
+        .collect();
+    let mut key_reader = key_pem.as_bytes();
+    let private_key =
+        rustls_pemfile::private_key(&mut key_reader)?.ok_or("missing private key in test cert")?;
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)?;
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    let handle = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                };
+                let io = TokioIo::new(tls_stream);
+                let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                let service = service_fn(|req: Request<Incoming>| async move {
+                    let method = req.method().to_string();
+                    let path = req.uri().path().to_string();
+                    let mut headers = serde_json::Map::new();
+                    for (name, value) in req.headers() {
+                        if let Ok(value_str) = value.to_str() {
+                            headers.insert(
+                                name.as_str().to_string(),
+                                serde_json::Value::String(value_str.to_string()),
+                            );
+                        }
+                    }
+                    let body = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|collected| collected.to_bytes())
+                        .unwrap_or_default();
+                    let echoed = json!({
+                        "method": method,
+                        "path": path,
+                        "headers": headers,
+                        "body": String::from_utf8_lossy(&body).to_string(),
+                    })
+                    .to_string();
+                    let response = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(echoed)))
+                        .unwrap();
+                    Ok::<_, hyper::Error>(response)
+                });
+
+                let _ = builder.serve_connection(io, service).await;
+            });
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(handle)
 }
 
@@ -762,6 +844,114 @@ async fn test_plugin_request_termination() {
     assert_eq!(body, "Unavailable for legal reasons");
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_plugin_request_termination_preserves_cors_preflight() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-cors-maintenance",
+        "/cors-maintenance",
+        backend_port,
+        vec![
+            json!({
+                "id": "plugin-cors-maintenance-cors",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "proxy-cors-maintenance",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": ["https://example.com"],
+                    "allowed_methods": ["GET", "OPTIONS"],
+                    "allowed_headers": ["Content-Type", "Authorization"],
+                    "allow_credentials": true,
+                    "max_age": 600
+                }
+            }),
+            json!({
+                "id": "plugin-cors-maintenance-termination",
+                "plugin_name": "request_termination",
+                "scope": "proxy",
+                "proxy_id": "proxy-cors-maintenance",
+                "enabled": true,
+                "config": {
+                    "status_code": 503,
+                    "content_type": "application/json",
+                    "message": "Service under maintenance"
+                }
+            }),
+        ],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let preflight = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/cors-maintenance/api", harness.proxy_base_url),
+        )
+        .header("Origin", "https://example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "Authorization")
+        .send()
+        .await
+        .expect("Preflight request failed");
+
+    assert_eq!(
+        preflight.status().as_u16(),
+        204,
+        "CORS preflight should short-circuit before request termination"
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap_or("")),
+        Some("https://example.com"),
+        "Preflight should still include CORS headers"
+    );
+
+    let maintenance = client
+        .get(format!("{}/cors-maintenance/api", harness.proxy_base_url))
+        .header("Origin", "https://example.com")
+        .send()
+        .await
+        .expect("Maintenance request failed");
+
+    assert_eq!(
+        maintenance.status().as_u16(),
+        503,
+        "Non-preflight requests should still be terminated"
+    );
+    assert_eq!(
+        maintenance
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap_or("")),
+        Some("https://example.com"),
+        "Gateway-generated rejection should still carry CORS headers for allowed origins"
+    );
+    let body = maintenance.text().await.unwrap();
+    assert!(
+        body.contains("Service under maintenance"),
+        "Maintenance body should still come from request_termination, got: {}",
+        body
+    );
+}
+
 // ============================================================================
 // Correlation ID Plugin Test
 // ============================================================================
@@ -935,9 +1125,227 @@ async fn test_plugin_request_size_limiting() {
     );
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_plugin_request_size_limiting_checks_transformed_body() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-sizelimit-transform",
+        "/sizelimit-transform",
+        backend_port,
+        vec![
+            json!({
+                "id": "plugin-sizelimit-transform-limit",
+                "plugin_name": "request_size_limiting",
+                "scope": "proxy",
+                "proxy_id": "proxy-sizelimit-transform",
+                "enabled": true,
+                "config": {
+                    "max_bytes": 20
+                }
+            }),
+            json!({
+                "id": "plugin-sizelimit-transform-transformer",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "proxy_id": "proxy-sizelimit-transform",
+                "enabled": true,
+                "config": {
+                    "rules": [
+                        {
+                            "operation": "add",
+                            "target": "body",
+                            "key": "padding",
+                            "value": "abcdefghijklmnopqrstuvwxyz"
+                        }
+                    ]
+                }
+            }),
+        ],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let resp = client
+        .post(format!(
+            "{}/sizelimit-transform/test",
+            harness.proxy_base_url
+        ))
+        .header("content-type", "application/json")
+        .json(&json!({"ok": true}))
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        413,
+        "Transformed body exceeding the limit should be rejected with 413"
+    );
+}
+
 // ============================================================================
 // Request Transformer Plugin Test
 // ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_response_size_limiting_fast_path() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-response-sizelimit",
+        "/response-sizelimit",
+        backend_port,
+        vec![json!({
+            "id": "plugin-response-sizelimit",
+            "plugin_name": "response_size_limiting",
+            "scope": "proxy",
+            "proxy_id": "proxy-response-sizelimit",
+            "enabled": true,
+            "config": {
+                "max_bytes": 300
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let small = client
+        .get(format!("{}/response-sizelimit/ok", harness.proxy_base_url))
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(small.status().as_u16(), 200, "small response should pass");
+
+    let large = client
+        .get(format!(
+            "{}/response-sizelimit/too-large",
+            harness.proxy_base_url
+        ))
+        .header("X-Pad", "x".repeat(1024))
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        large.status().as_u16(),
+        502,
+        "oversized backend response should be rejected"
+    );
+    let body = large.text().await.unwrap();
+    assert!(
+        body.contains("Response body too large"),
+        "response should explain the size rejection, got: {}",
+        body
+    );
+}
+
+// ============================================================================
+// Request Transformer Plugin Test
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_body_validator_request_validation_without_transformer() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-body-validator-request",
+        "/body-validator-request",
+        backend_port,
+        vec![json!({
+            "id": "plugin-body-validator-request",
+            "plugin_name": "body_validator",
+            "scope": "proxy",
+            "proxy_id": "proxy-body-validator-request",
+            "enabled": true,
+            "config": {
+                "required_fields": ["name"]
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let rejected = client
+        .post(format!(
+            "{}/body-validator-request/test",
+            harness.proxy_base_url
+        ))
+        .header("content-type", "application/json")
+        .json(&json!({"missing": "field"}))
+        .send()
+        .await
+        .expect("Request failed");
+    let rejected_status = rejected.status();
+    let rejected_body = rejected.text().await.unwrap();
+    assert_eq!(
+        rejected_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "expected body_validator to reject before proxying, got status {} body {}",
+        rejected_status,
+        rejected_body
+    );
+    assert!(
+        rejected_body.contains("Request body validation failed"),
+        "expected request validator rejection, got: {}",
+        rejected_body
+    );
+
+    let allowed = client
+        .post(format!(
+            "{}/body-validator-request/test",
+            harness.proxy_base_url
+        ))
+        .header("content-type", "application/json")
+        .json(&json!({"name": "alice"}))
+        .send()
+        .await
+        .expect("Request failed");
+    assert!(allowed.status().is_success());
+
+    let echo_body: serde_json::Value = allowed.json().await.unwrap();
+    assert_eq!(echo_body["body"], json!(r#"{"name":"alice"}"#));
+}
 
 #[tokio::test]
 #[ignore]
@@ -1011,6 +1419,207 @@ async fn test_plugin_request_transformer() {
     assert!(
         echo_headers.get("x-remove-me").is_none() || echo_headers["x-remove-me"].is_null(),
         "Backend should NOT receive the removed header"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_request_transformer_updates_body_content_length() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-reqtransform-body",
+        "/reqtransform-body",
+        backend_port,
+        vec![json!({
+            "id": "plugin-reqtransform-body",
+            "plugin_name": "request_transformer",
+            "scope": "proxy",
+            "proxy_id": "proxy-reqtransform-body",
+            "enabled": true,
+            "config": {
+                "rules": [
+                    {
+                        "operation": "add",
+                        "target": "body",
+                        "key": "gateway_added",
+                        "value": "transformed-by-ferrum"
+                    }
+                ]
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let resp = client
+        .post(format!("{}/reqtransform-body/test", harness.proxy_base_url))
+        .header("content-type", "application/json")
+        .json(&json!({"name": "alice"}))
+        .send()
+        .await
+        .expect("Request failed");
+    assert!(resp.status().is_success());
+
+    let echo_body: serde_json::Value = resp.json().await.unwrap();
+    let echoed_body = echo_body["body"].as_str().unwrap_or("");
+    let transformed: serde_json::Value = serde_json::from_str(echoed_body).unwrap_or_else(|e| {
+        panic!(
+            "backend should receive valid transformed JSON: {} | body={} | headers={}",
+            e, echoed_body, echo_body["headers"]
+        )
+    });
+
+    assert_eq!(transformed["name"], "alice");
+    assert_eq!(transformed["gateway_added"], "transformed-by-ferrum");
+
+    let echoed_length = echo_body["headers"]["content-length"]
+        .as_str()
+        .expect("backend should receive content-length header")
+        .parse::<usize>()
+        .expect("content-length should be numeric");
+    assert_eq!(
+        echoed_length,
+        echoed_body.len(),
+        "forwarded content-length must match transformed body size"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_request_transformer_body_rules_bypass_direct_h2_pool() {
+    let harness = PluginTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_h2_tls_header_echo_backend(backend_port)
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let proxy_id = "proxy-reqtransform-body-h2";
+    let listen_path = "/reqtransform-body-h2";
+
+    harness
+        .create_proxy(
+            &client,
+            &json!({
+                "id": proxy_id,
+                "listen_path": listen_path,
+                "backend_protocol": "https",
+                "backend_host": "localhost",
+                "backend_port": backend_port,
+                "strip_listen_path": true,
+                "pool_enable_http2": true,
+                "backend_tls_verify_server_cert": false,
+            }),
+        )
+        .await
+        .unwrap();
+
+    harness
+        .create_plugin(
+            &client,
+            &json!({
+                "id": "plugin-reqtransform-body-h2",
+                "plugin_name": "request_transformer",
+                "scope": "proxy",
+                "proxy_id": proxy_id,
+                "enabled": true,
+                "config": {
+                    "rules": [
+                        {
+                            "operation": "add",
+                            "target": "body",
+                            "key": "gateway_added",
+                            "value": "transformed-by-ferrum"
+                        }
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    harness
+        .update_proxy(
+            &client,
+            proxy_id,
+            &json!({
+                "id": proxy_id,
+                "listen_path": listen_path,
+                "backend_protocol": "https",
+                "backend_host": "localhost",
+                "backend_port": backend_port,
+                "strip_listen_path": true,
+                "pool_enable_http2": true,
+                "backend_tls_verify_server_cert": false,
+                "plugins": [
+                    {"plugin_config_id": "plugin-reqtransform-body-h2"}
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let resp = client
+        .post(format!(
+            "{}/reqtransform-body-h2/test",
+            harness.proxy_base_url
+        ))
+        .header("content-type", "application/json")
+        .json(&json!({"name": "alice"}))
+        .send()
+        .await
+        .expect("Request failed");
+    let status = resp.status();
+    let resp_body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "HTTPS/H2 request should succeed: status={} body={}",
+        status,
+        resp_body
+    );
+
+    let echo_body: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+    let echoed_body = echo_body["body"].as_str().unwrap_or("");
+    let transformed: serde_json::Value = serde_json::from_str(echoed_body).unwrap_or_else(|e| {
+        panic!(
+            "HTTPS/H2 backend should receive valid transformed JSON: {} | body={} | headers={}",
+            e, echoed_body, echo_body["headers"]
+        )
+    });
+
+    assert_eq!(transformed["name"], "alice");
+    assert_eq!(transformed["gateway_added"], "transformed-by-ferrum");
+
+    let echoed_length = echo_body["headers"]["content-length"]
+        .as_str()
+        .expect("HTTPS/H2 backend should receive content-length header")
+        .parse::<usize>()
+        .expect("content-length should be numeric");
+    assert_eq!(
+        echoed_length,
+        echoed_body.len(),
+        "forwarded content-length must match transformed HTTPS/H2 body size"
     );
 }
 

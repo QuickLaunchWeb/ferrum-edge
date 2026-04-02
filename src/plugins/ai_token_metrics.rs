@@ -64,7 +64,12 @@ pub struct AiTokenMetrics {
 
 impl AiTokenMetrics {
     pub fn new(config: &Value) -> Self {
-        let provider = config["provider"].as_str().unwrap_or("auto").to_string();
+        let provider = config["provider"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("auto")
+            .to_ascii_lowercase();
         let include_model = config["include_model"].as_bool().unwrap_or(true);
         let include_token_details = config["include_token_details"].as_bool().unwrap_or(true);
         let metadata_prefix = config["metadata_prefix"]

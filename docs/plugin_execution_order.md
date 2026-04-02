@@ -4,7 +4,7 @@ Ferrum Edge executes plugins in a deterministic order based on two dimensions: *
 
 ## Lifecycle Phases
 
-Every request passes through six phases in strict order. Each phase has a specific purpose, and plugins only run in the phases they implement:
+Every HTTP-family request passes through nine main request/response phases in strict order. WebSocket connections optionally enter a tenth frame phase after the HTTP upgrade completes. Plugins only run in the phases they implement:
 
 ```
 Request In
@@ -36,16 +36,35 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 5. after_proxy          │  Response transformation, CORS headers
+│ 5. after_proxy          │  Response headers, fast-path rejection, CORS
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 6. log                  │  Logging & observability (fire-and-forget)
+│ 6. on_response_body     │  Raw buffered backend body inspection
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 7. transform_response_body │ Buffered body rewrites
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 8. on_final_response_body │ Final client-visible body validation/storage
+└────────────┬────────────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 9. log                  │  Logging & observability (fire-and-forget)
 └─────────────────────────┘
 ```
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
+
+For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
+
+`after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 
@@ -70,9 +89,11 @@ Connection/Session In
 └─────────────────────────┘
 ```
 
+Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validator`, `ai_request_guard`, and `ai_prompt_shield` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
+
 **Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). Plugins can reject to close the connection immediately. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
 
-**Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or UDP session expired/cleaned up). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
+**Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
 ### Stream Hook Implementations by Plugin
 
@@ -150,13 +171,13 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–949 | Pre-processing that must run before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
+| **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925) |
-| **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `grpc_deadline` (3050), `request_termination` (3200), `response_size_limiting` (3950) |
-| **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
+| **Response** | 4000–4999 | Response transformation and AI accounting | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `ws_frame_logging` (9050), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 ## Complete Execution Order
 
@@ -165,38 +186,39 @@ Given all built-in plugins enabled, the execution order is:
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
 | 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect |
-| 2 | `cors` | 100 | on_request_received, after_proxy |
-| 3 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
-| 4 | `bot_detection` | 200 | on_request_received |
-| 5 | `grpc_method_router` | 275 | on_request_received, before_proxy |
-| 6 | `mtls_auth` | 950 | authenticate |
-| 7 | `jwks_auth` | 1000 | authenticate |
-| 8 | `jwt_auth` | 1100 | authenticate |
-| 9 | `key_auth` | 1200 | authenticate |
-| 10 | `basic_auth` | 1300 | authenticate |
-| 11 | `hmac_auth` | 1400 | authenticate |
-| 12 | `access_control` | 2000 | authorize |
-| 13 | `request_size_limiting` | 2800 | on_request_received, before_proxy |
-| 14 | `ws_message_size_limiting` | 2810 | on_ws_frame |
-| 15 | `graphql` | 2850 | before_proxy |
-| 16 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
-| 17 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 18 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 19 | `body_validator` | 2950 | before_proxy, on_response_body |
-| 20 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 21 | `request_transformer` | 3000 | before_proxy |
-| 22 | `grpc_deadline` | 3050 | before_proxy |
-| 23 | `request_termination` | 3200 | before_proxy |
-| 24 | `response_size_limiting` | 3950 | after_proxy, on_response_body |
-| 25 | `response_transformer` | 4000 | after_proxy |
-| 26 | `ai_token_metrics` | 4100 | on_response_body |
-| 27 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
-| 28 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 29 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 30 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
-| 31 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 32 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 33 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
+| 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, on_stream_connect |
+| 3 | `cors` | 100 | on_request_received, after_proxy |
+| 4 | `request_termination` | 125 | on_request_received |
+| 5 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
+| 6 | `bot_detection` | 200 | on_request_received |
+| 7 | `grpc_method_router` | 275 | on_request_received, before_proxy |
+| 8 | `mtls_auth` | 950 | authenticate |
+| 9 | `jwks_auth` | 1000 | authenticate |
+| 10 | `jwt_auth` | 1100 | authenticate |
+| 11 | `key_auth` | 1200 | authenticate |
+| 12 | `basic_auth` | 1300 | authenticate |
+| 13 | `hmac_auth` | 1400 | authenticate |
+| 14 | `access_control` | 2000 | authorize |
+| 15 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
+| 16 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 17 | `graphql` | 2850 | before_proxy |
+| 18 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 19 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 20 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 21 | `body_validator` | 2950 | before_proxy, on_final_response_body |
+| 22 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 23 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 24 | `grpc_deadline` | 3050 | before_proxy |
+| 25 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 26 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 27 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 28 | `ai_token_metrics` | 4100 | on_response_body |
+| 29 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 30 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 31 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 32 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 33 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 34 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -208,23 +230,27 @@ OpenTelemetry tracing runs at priority 25 — the earliest of any plugin — so 
 
 Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 100 ensures preflight responses are returned immediately.
 
+### Request termination runs immediately after CORS (priority 125)
+
+`request_termination` still short-circuits before authentication, but it now sits behind CORS so maintenance and mock responses do not break browser preflight. That keeps browser clients functional while preserving the low-cost fast path for intentionally terminated requests.
+
 ### Authentication before authorization (1000s before 2000s)
 
-Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer`). Authorization plugins like `access_control` then decide *whether* that consumer is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
+Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` then decide *whether* that identity is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
 
-After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller.
+After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
 ### Rate limiting runs after auth (priority 2900)
 
-Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated consumer identity**, not just by IP address. When `limit_by: "consumer"`, the plugin needs `ctx.identified_consumer` which is only available after the authenticate phase.
+Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforce limits by **authenticated identity**, not just by IP address. When `limit_by: "consumer"`, the plugin uses the mapped Consumer username when available, otherwise external `ctx.authenticated_identity`; those values only exist after the authenticate phase.
 
 **Dual-phase behavior:**
 - `limit_by: "ip"` — enforces IP-based limits in `on_request_received` (phase 1, before auth). This protects auth endpoints from brute-force attacks.
-- `limit_by: "consumer"` — enforces consumer-based limits in `authorize` (phase 3, after auth). If no consumer is identified (unauthenticated request), falls back to IP-based keying.
+- `limit_by: "consumer"` — enforces identity-based limits in `authorize` (phase 3, after auth). Uses mapped Consumer username first, then external `authenticated_identity`, and falls back to IP-based keying only when no authenticated identity exists.
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, and `x-ratelimit-identity` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed.
 
-**Centralized mode** (`sync_mode: "redis"`): All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`) support storing counters in Redis for coordinated rate limiting across multiple gateway instances. When Redis is unavailable, they automatically fall back to local in-memory state and switch back when connectivity is restored. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Each plugin instance has its own Redis connection and key prefix for isolation.
+**Redis mode** (`sync_mode: "redis"`): `rate_limiting` and `ai_rate_limiter` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, all three plugins automatically fall back to local in-memory state and switch back when connectivity is restored. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 ### AI Plugins: PII shield before guard, metrics before rate limiter (2925–4200)
 
@@ -239,9 +265,11 @@ The four AI plugins are ordered to compose correctly:
 
 Request transformers run after authentication and authorization, so they only modify requests that are already permitted. This prevents wasted transformation work on requests that will be rejected.
 
+`request_size_limiting` participates again after request transforms on buffered requests, so transformed bodies are re-checked before backend dispatch.
+
 ### Logging runs last (9000+)
 
-Logging plugins run in phase 6 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9200) does not impact behavior.
+Logging plugins run in phase 7 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9200) does not impact behavior.
 
 All logging plugins receive the `TransactionSummary` struct which includes an `error_class` field for failed transactions. This field classifies gateway-level errors (e.g., `ConnectionTimeout`, `TlsError`, `DnsLookupError`) to help operators quickly identify root causes. See [docs/error_classification.md](error_classification.md) for the full list of error classes and debugging guidance.
 
@@ -338,7 +366,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
+| `access_control` | ✓ | ✓ | ✓ | | | Needs authenticated identity from an auth plugin; consumer rules remain primary |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
 | `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
@@ -429,6 +457,7 @@ All plugins in the execution pipeline work transparently with gRPC requests. gRP
 - **Authentication plugins** (JWKS, JWT, API key, Basic) inspect the `authorization` header, which gRPC clients send as metadata.
 - **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.
 - **Request/Response transformers** can add, modify, or remove gRPC metadata (HTTP/2 headers).
-- **Logging plugins** receive the same `TransactionSummary` with the gRPC path (e.g., `/my.Service/MyMethod`) and HTTP status.
+- **Logging plugins** receive the same `TransactionSummary` with the gRPC path (e.g., `/my.Service/MyMethod`) and HTTP status. For gateway-generated gRPC errors, `metadata.grpc_status` and `metadata.grpc_message` are also populated so sinks can distinguish gRPC failures despite the HTTP `200`.
+- **Plugin rejections** are translated into trailers-only gRPC errors (`HTTP 200` with `grpc-status` / `grpc-message`) unless a plugin already supplied explicit gRPC error metadata.
 
 gRPC requests are detected by their `content-type: application/grpc` header and routed to the dedicated gRPC proxy path, which uses hyper's HTTP/2 client for trailer forwarding. The plugin pipeline runs before and after the gRPC backend call, just like HTTP requests.

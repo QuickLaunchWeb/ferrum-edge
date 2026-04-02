@@ -2,24 +2,186 @@
 //! Tests plugin creation, scope configuration, and error handling
 
 use ferrum_edge::config::types::{PluginConfig, PluginScope};
-use ferrum_edge::plugins::{available_plugins, create_plugin};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, available_plugins, create_plugin,
+};
 use serde_json::json;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use super::plugin_utils::{create_test_consumer, create_test_context};
+use super::plugin_utils::{create_test_consumer, create_test_context, create_test_proxy};
+
+fn create_response_context(path: &str) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.path = path.to_string();
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx
+}
+
+fn sort_plugins(mut plugins: Vec<Arc<dyn Plugin>>) -> Vec<Arc<dyn Plugin>> {
+    plugins.sort_by_key(|plugin| plugin.priority());
+    plugins
+}
+
+async fn run_buffered_response_lifecycle(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    mut response_status: u16,
+    mut response_headers: HashMap<String, String>,
+    mut response_body: Vec<u8>,
+) -> (u16, HashMap<String, String>, Vec<u8>) {
+    let mut proxy_headers = HashMap::new();
+    for plugin in plugins {
+        if let PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } = plugin.before_proxy(ctx, &mut proxy_headers).await
+        {
+            return (status_code, headers, body.into_bytes());
+        }
+    }
+
+    for plugin in plugins {
+        if let PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } = plugin
+            .after_proxy(ctx, response_status, &mut response_headers)
+            .await
+        {
+            response_status = status_code;
+            response_headers = headers;
+            response_headers
+                .entry("content-type".to_string())
+                .or_insert_with(|| "application/json".to_string());
+            response_body = body.into_bytes();
+            return (response_status, response_headers, response_body);
+        }
+    }
+
+    for plugin in plugins {
+        match plugin
+            .on_response_body(ctx, response_status, &response_headers, &response_body)
+            .await
+        {
+            PluginResult::Continue => {}
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                response_status = status_code;
+                response_headers.clear();
+                response_headers.insert("content-type".to_string(), "application/json".to_string());
+                for (key, value) in headers {
+                    response_headers.insert(key, value);
+                }
+                response_body = body.into_bytes();
+                break;
+            }
+        }
+    }
+
+    let content_type = response_headers.get("content-type").cloned();
+    let content_type = content_type.as_deref();
+    for plugin in plugins {
+        if let Some(transformed) = plugin
+            .transform_response_body(&response_body, content_type)
+            .await
+        {
+            response_headers.insert("content-length".to_string(), transformed.len().to_string());
+            response_body = transformed;
+        }
+    }
+
+    for plugin in plugins {
+        match plugin
+            .on_final_response_body(ctx, response_status, &response_headers, &response_body)
+            .await
+        {
+            PluginResult::Continue => {}
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                response_status = status_code;
+                response_headers.clear();
+                response_headers.insert("content-type".to_string(), "application/json".to_string());
+                for (key, value) in headers {
+                    response_headers.insert(key, value);
+                }
+                response_body = body.into_bytes();
+                break;
+            }
+        }
+    }
+
+    (response_status, response_headers, response_body)
+}
+
+async fn run_buffered_request_lifecycle(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    mut request_headers: HashMap<String, String>,
+    mut request_body: Vec<u8>,
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin.before_proxy(ctx, &mut request_headers).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } => return reject,
+        }
+    }
+
+    let content_type = request_headers.get("content-type").cloned();
+    let content_type = content_type.as_deref();
+    for plugin in plugins {
+        if let Some(transformed) = plugin
+            .transform_request_body(&request_body, content_type)
+            .await
+        {
+            request_headers.insert("content-length".to_string(), transformed.len().to_string());
+            request_body = transformed;
+        }
+    }
+
+    for plugin in plugins {
+        match plugin
+            .on_final_request_body(&request_headers, &request_body)
+            .await
+        {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } => return reject,
+        }
+    }
+
+    PluginResult::Continue
+}
 
 #[tokio::test]
 async fn test_all_plugins_available() {
     let plugins = available_plugins();
+    let custom_plugins: BTreeSet<_> = ferrum_edge::custom_plugins::custom_plugin_names()
+        .into_iter()
+        .collect();
+    let builtins: BTreeSet<_> = plugins
+        .iter()
+        .copied()
+        .filter(|name| !custom_plugins.contains(name))
+        .collect();
 
-    // 20 built-in + custom plugins from custom_plugins/mod.rs
-    let expected_builtins = vec![
+    let expected_builtins: BTreeSet<_> = [
         "stdout_logging",
         "http_logging",
         "transaction_debugger",
+        "jwks_auth",
         "jwt_auth",
         "key_auth",
         "basic_auth",
         "hmac_auth",
+        "mtls_auth",
         "cors",
         "access_control",
         "ip_restriction",
@@ -27,26 +189,37 @@ async fn test_all_plugins_available() {
         "correlation_id",
         "request_transformer",
         "response_transformer",
+        "graphql",
+        "grpc_method_router",
+        "grpc_deadline",
         "rate_limiting",
+        "request_size_limiting",
+        "response_size_limiting",
         "body_validator",
         "request_termination",
+        "response_caching",
         "prometheus_metrics",
         "otel_tracing",
-    ];
+        "ai_token_metrics",
+        "ai_request_guard",
+        "ai_rate_limiter",
+        "ai_prompt_shield",
+        "ws_message_size_limiting",
+        "ws_frame_logging",
+        "ws_rate_limiting",
+    ]
+    .into_iter()
+    .collect();
 
-    // Verify all built-in plugins are present
-    assert!(
-        plugins.len() >= expected_builtins.len(),
-        "Expected at least {} plugins, got {}",
-        expected_builtins.len(),
-        plugins.len()
+    assert_eq!(
+        builtins, expected_builtins,
+        "built-in plugin registry drifted"
     );
-
-    let expected_plugins = expected_builtins;
-
-    for expected in expected_plugins {
-        assert!(plugins.contains(&expected), "Missing plugin: {}", expected);
-    }
+    assert_eq!(
+        plugins.len(),
+        expected_builtins.len() + custom_plugins.len(),
+        "available_plugins() should be built-ins plus discovered custom plugins"
+    );
 }
 
 #[tokio::test]
@@ -204,5 +377,161 @@ async fn test_plugin_complex_configurations() {
             plugin_name
         );
         assert_eq!(plugin.unwrap().name(), plugin_name);
+    }
+}
+
+#[tokio::test]
+async fn test_response_caching_stores_transformed_body() {
+    let plugins = sort_plugins(vec![
+        create_plugin(
+            "response_caching",
+            &json!({"ttl_seconds": 60, "add_cache_status_header": true}),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({
+                "rules": [
+                    {
+                        "operation": "update",
+                        "target": "body",
+                        "key": "message",
+                        "value": "gateway"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let mut ctx = create_response_context("/cache-transform");
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let (status, _, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut ctx,
+        200,
+        response_headers,
+        br#"{"message":"backend"}"#.to_vec(),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8(body).unwrap(), r#"{"message":"gateway"}"#);
+
+    let mut hit_ctx = create_response_context("/cache-transform");
+    let mut proxy_headers = HashMap::new();
+    let mut cache_hit = None;
+    for plugin in &plugins {
+        match plugin.before_proxy(&mut hit_ctx, &mut proxy_headers).await {
+            PluginResult::Continue => {}
+            result @ PluginResult::Reject { .. } => {
+                cache_hit = Some(result);
+                break;
+            }
+        }
+    }
+
+    match cache_hit.expect("expected response_caching cache HIT") {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body, r#"{"message":"gateway"}"#);
+            assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
+        }
+        PluginResult::Continue => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn test_response_size_limiting_checks_transformed_body() {
+    let plugins = sort_plugins(vec![
+        create_plugin(
+            "response_size_limiting",
+            &json!({"max_bytes": 20, "require_buffered_check": true}),
+        )
+        .unwrap()
+        .unwrap(),
+        create_plugin(
+            "response_transformer",
+            &json!({
+                "rules": [
+                    {
+                        "operation": "add",
+                        "target": "body",
+                        "key": "padding",
+                        "value": "abcdefghijklmnopqrstuvwxyz"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let mut ctx = create_response_context("/transform-limit");
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let (status, _, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut ctx,
+        200,
+        response_headers,
+        br#"{"ok":true}"#.to_vec(),
+    )
+    .await;
+
+    assert_eq!(status, 502);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "Response body too large");
+    assert_eq!(parsed["limit"], 20);
+}
+
+#[tokio::test]
+async fn test_request_size_limiting_checks_transformed_body() {
+    let plugins = sort_plugins(vec![
+        create_plugin("request_size_limiting", &json!({"max_bytes": 20}))
+            .unwrap()
+            .unwrap(),
+        create_plugin(
+            "request_transformer",
+            &json!({
+                "rules": [
+                    {
+                        "operation": "add",
+                        "target": "body",
+                        "key": "padding",
+                        "value": "abcdefghijklmnopqrstuvwxyz"
+                    }
+                ]
+            }),
+        )
+        .unwrap()
+        .unwrap(),
+    ]);
+
+    let mut ctx = create_test_context();
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let result =
+        run_buffered_request_lifecycle(&plugins, &mut ctx, headers, br#"{"ok":true}"#.to_vec())
+            .await;
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 413);
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["error"], "Request body too large");
+            assert_eq!(parsed["limit"], 20);
+        }
+        PluginResult::Continue => panic!("expected transformed request body to be rejected"),
     }
 }

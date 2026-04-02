@@ -147,11 +147,31 @@ impl OtelTracing {
         if parts.len() != 4 {
             return None;
         }
+        let version = parts[0];
+        let trace_id = parts[1];
+        let parent_span_id = parts[2];
+        let flags = parts[3];
+
+        if version.len() != 2
+            || trace_id.len() != 32
+            || parent_span_id.len() != 16
+            || flags.len() != 2
+            || version.eq_ignore_ascii_case("ff")
+            || !version.chars().all(|c| c.is_ascii_hexdigit())
+            || !trace_id.chars().all(|c| c.is_ascii_hexdigit())
+            || !parent_span_id.chars().all(|c| c.is_ascii_hexdigit())
+            || !flags.chars().all(|c| c.is_ascii_hexdigit())
+            || trace_id.chars().all(|c| c == '0')
+            || parent_span_id.chars().all(|c| c == '0')
+        {
+            return None;
+        }
+
         Some((
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2].to_string(),
-            parts[3].to_string(),
+            version.to_string(),
+            trace_id.to_string(),
+            parent_span_id.to_string(),
+            flags.to_string(),
         ))
     }
 
@@ -240,7 +260,16 @@ impl Plugin for OtelTracing {
 
                 format!("{}-{}-{}-{}", version, trace_id, gateway_span, flags)
             } else {
-                Self::generate_traceparent()
+                if !self.generate_trace_id {
+                    return PluginResult::Continue;
+                }
+
+                let traceparent = Self::generate_traceparent();
+                if let Some((_, trace_id, span_id, _)) = Self::parse_traceparent(&traceparent) {
+                    ctx.metadata.insert("trace_id".to_string(), trace_id);
+                    ctx.metadata.insert("span_id".to_string(), span_id);
+                }
+                traceparent
             }
         } else if self.generate_trace_id {
             let traceparent = Self::generate_traceparent();
@@ -290,6 +319,10 @@ impl Plugin for OtelTracing {
             response_headers.insert("traceparent".to_string(), traceparent.clone());
         }
         PluginResult::Continue
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
     }
 
     async fn log(&self, summary: &TransactionSummary) {

@@ -4,15 +4,25 @@
 //! multi-phase plugin pipeline:
 //!
 //! 1. **Route matching** — `RouterCache::find_proxy()` (O(1) cached, longest-prefix)
-//! 2. **Plugin: on_request_received** — correlation ID, request transformer, bot detection
-//! 3. **Plugin: authenticate** — key_auth, basic_auth, jwt, hmac, jwks, mtls
-//! 4. **Plugin: authorize** — ACL, IP restriction
-//! 5. **Plugin: before_proxy** — rate limiting, body validation, request termination
-//! 6. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
+//! 2. **Plugin: on_request_received** — tracing, correlation ID, CORS preflight,
+//!    early termination, IP restriction, bot detection
+//! 3. **Plugin: authenticate** — mtls_auth, jwks_auth, jwt_auth, key_auth, basic_auth, hmac_auth
+//! 4. **Plugin: authorize** — access_control, rate_limiting (consumer mode)
+//! 5. **Plugin: before_proxy** — request/response policy before backend dispatch:
+//!    request size limiting, GraphQL guardrails, AI plugins, request transformation,
+//!    response caching preparation, gRPC deadline injection
+//! 6. **Plugin: transform_request_body / on_final_request_body** — buffered request-body
+//!    rewrites and final validation before backend dispatch
+//! 7. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
 //!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
-//! 7. **Plugin: after_proxy** — response transformer, CORS
-//! 8. **Plugin: on_response_body** — AI token metrics, AI rate limiter
-//! 9. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//! 8. **Plugin: after_proxy** — CORS headers, response caching metadata, response transforms,
+//!    response size limiting, AI rate limiter
+//! 9. **Plugin: on_response_body** — raw backend body inspection before transforms:
+//!    AI token metrics, AI rate limiter
+//! 10. **Plugin: transform_response_body** — body rewrites (e.g., response_transformer)
+//! 11. **Plugin: on_final_response_body** — final client-visible body validation/storage:
+//!     body validation, response size limiting, response caching
+//! 12. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
 //!
 //! Key design principles:
 //! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
@@ -119,6 +129,369 @@ fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
     }
 }
 
+/// Whether HTTPS requests may use the direct hyper HTTP/2 backend pool.
+///
+/// Request-body plugins require buffering and transformation before forwarding,
+/// which the direct H2 path does not implement. Those requests must stay on the
+/// reqwest path so the final backend body matches the plugin output.
+fn can_use_direct_http2_pool(
+    enable_http2: bool,
+    retain_request_body: bool,
+    requires_request_body_buffering: bool,
+) -> bool {
+    enable_http2 && !retain_request_body && !requires_request_body_buffering
+}
+
+enum ClientRequestBody {
+    Streaming(Box<Request<Incoming>>),
+    Buffered(Vec<u8>),
+}
+
+enum RequestBodyBufferError {
+    TooLarge,
+    ClientDisconnected(String),
+}
+
+fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
+    !matches!(method, "GET" | "HEAD" | "OPTIONS")
+        || headers.contains_key("content-length")
+        || headers.contains_key("transfer-encoding")
+}
+
+async fn buffer_request_body_for_before_proxy(
+    request: Request<Incoming>,
+    method: &str,
+    headers: &HashMap<String, String>,
+    max_request_body_size_bytes: usize,
+) -> Result<ClientRequestBody, RequestBodyBufferError> {
+    if !request_may_have_body(method, headers) {
+        return Ok(ClientRequestBody::Streaming(Box::new(request)));
+    }
+
+    if max_request_body_size_bytes > 0
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > max_request_body_size_bytes
+    {
+        return Err(RequestBodyBufferError::TooLarge);
+    }
+
+    let (_parts, body) = request.into_parts();
+    let body_bytes = if max_request_body_size_bytes > 0 {
+        let limited = http_body_util::Limited::new(body, max_request_body_size_bytes);
+        limited
+            .collect()
+            .await
+            .map_err(|_| RequestBodyBufferError::TooLarge)?
+            .to_bytes()
+            .to_vec()
+    } else {
+        body.collect()
+            .await
+            .map_err(|e| RequestBodyBufferError::ClientDisconnected(e.to_string()))?
+            .to_bytes()
+            .to_vec()
+    };
+
+    Ok(ClientRequestBody::Buffered(body_bytes))
+}
+
+pub(crate) fn store_request_body_metadata(ctx: &mut RequestContext, body: &[u8]) {
+    ctx.metadata.insert(
+        "request_body_size_bytes".to_string(),
+        body.len().to_string(),
+    );
+    if let Ok(body_str) = std::str::from_utf8(body) {
+        ctx.metadata
+            .insert("request_body".to_string(), body_str.to_string());
+    } else {
+        ctx.metadata.remove("request_body");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_request_body_plugins, can_use_direct_http2_pool, extract_grpc_reject_message,
+        insert_grpc_error_metadata, map_http_reject_status_to_grpc_status,
+        normalize_reject_response, request_may_have_body, run_authentication_phase,
+    };
+    use crate::config::types::{AuthMode, Consumer};
+    use crate::consumer_index::ConsumerIndex;
+    use crate::plugins::{Plugin, PluginResult, RequestContext};
+    use crate::proxy::grpc_proxy;
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use hyper::StatusCode;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct ExternalIdentityAuth;
+
+    #[async_trait]
+    impl Plugin for ExternalIdentityAuth {
+        fn name(&self) -> &str {
+            "external_identity_auth"
+        }
+
+        fn is_auth_plugin(&self) -> bool {
+            true
+        }
+
+        async fn authenticate(
+            &self,
+            ctx: &mut RequestContext,
+            _consumer_index: &ConsumerIndex,
+        ) -> PluginResult {
+            ctx.authenticated_identity = Some("external-user".to_string());
+            ctx.authenticated_identity_header = Some("external@example.com".to_string());
+            PluginResult::Continue
+        }
+    }
+
+    struct RejectingAuth;
+
+    #[async_trait]
+    impl Plugin for RejectingAuth {
+        fn name(&self) -> &str {
+            "rejecting_auth"
+        }
+
+        fn is_auth_plugin(&self) -> bool {
+            true
+        }
+
+        async fn authenticate(
+            &self,
+            _ctx: &mut RequestContext,
+            _consumer_index: &ConsumerIndex,
+        ) -> PluginResult {
+            PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"Missing credentials"}"#.to_string(),
+                headers: HashMap::new(),
+            }
+        }
+    }
+
+    struct BodySuffixPlugin {
+        suffix: &'static str,
+    }
+
+    #[async_trait]
+    impl Plugin for BodySuffixPlugin {
+        fn name(&self) -> &str {
+            "body_suffix"
+        }
+
+        fn modifies_request_body(&self) -> bool {
+            true
+        }
+
+        async fn transform_request_body(
+            &self,
+            body: &[u8],
+            _content_type: Option<&str>,
+        ) -> Option<Vec<u8>> {
+            let mut transformed = body.to_vec();
+            transformed.extend_from_slice(self.suffix.as_bytes());
+            Some(transformed)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multi_auth_accepts_external_identity_without_consumer() {
+        let external_identity: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
+        let rejecting: Arc<dyn Plugin> = Arc::new(RejectingAuth);
+        let auth_plugins = vec![&external_identity, &rejecting];
+        let consumer_index = ConsumerIndex::new(&[]);
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/jwks".to_string(),
+        );
+
+        let result =
+            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
+                .await;
+
+        assert!(
+            result.is_none(),
+            "multi-auth should stop after external auth success"
+        );
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
+        assert!(ctx.identified_consumer.is_none());
+    }
+
+    #[test]
+    fn test_request_context_effective_identity_prefers_consumer_then_external_identity() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/jwks".to_string(),
+        );
+        assert_eq!(ctx.effective_identity(), None);
+
+        ctx.authenticated_identity = Some("external-user".to_string());
+        assert_eq!(ctx.effective_identity(), Some("external-user"));
+
+        ctx.identified_consumer = Some(Consumer {
+            id: "consumer-1".to_string(),
+            username: "mapped-consumer".to_string(),
+            custom_id: None,
+            credentials: HashMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        assert_eq!(ctx.effective_identity(), Some("mapped-consumer"));
+    }
+
+    #[test]
+    fn test_request_context_backend_consumer_username_prefers_consumer_then_header_then_identity() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/jwks".to_string(),
+        );
+        assert_eq!(ctx.backend_consumer_username(), None);
+
+        ctx.authenticated_identity = Some("external-user".to_string());
+        assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
+
+        ctx.authenticated_identity_header = Some("user@example.com".to_string());
+        assert_eq!(ctx.backend_consumer_username(), Some("user@example.com"));
+
+        ctx.identified_consumer = Some(Consumer {
+            id: "consumer-1".to_string(),
+            username: "mapped-consumer".to_string(),
+            custom_id: Some("custom-123".to_string()),
+            credentials: HashMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        assert_eq!(ctx.backend_consumer_username(), Some("mapped-consumer"));
+        assert_eq!(ctx.backend_consumer_custom_id(), Some("custom-123"));
+    }
+
+    #[test]
+    fn test_map_http_reject_status_to_grpc_status_uses_semantic_codes() {
+        assert_eq!(
+            map_http_reject_status_to_grpc_status(StatusCode::UNAUTHORIZED),
+            grpc_proxy::grpc_status::UNAUTHENTICATED
+        );
+        assert_eq!(
+            map_http_reject_status_to_grpc_status(StatusCode::FORBIDDEN),
+            grpc_proxy::grpc_status::PERMISSION_DENIED
+        );
+        assert_eq!(
+            map_http_reject_status_to_grpc_status(StatusCode::TOO_MANY_REQUESTS),
+            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
+        );
+        assert_eq!(
+            map_http_reject_status_to_grpc_status(StatusCode::BAD_GATEWAY),
+            grpc_proxy::grpc_status::UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_extract_grpc_reject_message_prefers_json_error_fields() {
+        let body = r#"{"error":"Rate limit exceeded","details":"retry later"}"#;
+        assert_eq!(
+            extract_grpc_reject_message(body).as_deref(),
+            Some("Rate limit exceeded")
+        );
+    }
+
+    #[test]
+    fn test_normalize_reject_response_converts_grpc_requests_to_trailers_only_errors() {
+        let mut headers = HashMap::new();
+        headers.insert("x-ratelimit-limit".to_string(), "5".to_string());
+
+        let normalized = normalize_reject_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":"Rate limit exceeded"}"#,
+            &headers,
+            true,
+        );
+
+        assert_eq!(normalized.http_status, StatusCode::OK);
+        assert!(normalized.body.is_empty());
+        assert_eq!(
+            normalized.grpc_status,
+            Some(grpc_proxy::grpc_status::RESOURCE_EXHAUSTED)
+        );
+        assert_eq!(
+            normalized.grpc_message.as_deref(),
+            Some("Rate limit exceeded")
+        );
+        assert_eq!(
+            normalized.headers.get("content-type").map(|s| s.as_str()),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            normalized.headers.get("grpc-status").map(|s| s.as_str()),
+            Some("8")
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("x-ratelimit-limit")
+                .map(|s| s.as_str()),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn test_insert_grpc_error_metadata_sanitizes_message() {
+        let mut metadata = HashMap::new();
+        insert_grpc_error_metadata(
+            &mut metadata,
+            grpc_proxy::grpc_status::UNAVAILABLE,
+            "backend unavailable\nretry later",
+        );
+
+        assert_eq!(
+            metadata.get("grpc_status").map(|value| value.as_str()),
+            Some("14")
+        );
+        assert_eq!(
+            metadata.get("grpc_message").map(|value| value.as_str()),
+            Some("backend unavailable retry later")
+        );
+    }
+
+    #[test]
+    fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() {
+        assert!(can_use_direct_http2_pool(true, false, false));
+        assert!(!can_use_direct_http2_pool(false, false, false));
+        assert!(!can_use_direct_http2_pool(true, true, false));
+        assert!(!can_use_direct_http2_pool(true, false, true));
+    }
+
+    #[test]
+    fn test_request_may_have_body_uses_method_and_body_headers() {
+        let no_headers = HashMap::new();
+        assert!(!request_may_have_body("GET", &no_headers));
+        assert!(request_may_have_body("POST", &no_headers));
+        assert!(request_may_have_body(
+            "GET",
+            &HashMap::from([("content-length".to_string(), "0".to_string())])
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_apply_request_body_plugins_preserves_plugin_order() {
+        let first: Arc<dyn Plugin> = Arc::new(BodySuffixPlugin { suffix: "-first" });
+        let second: Arc<dyn Plugin> = Arc::new(BodySuffixPlugin { suffix: "-second" });
+        let plugins = vec![first, second];
+        let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        let transformed = apply_request_body_plugins(&plugins, &headers, b"body".to_vec()).await;
+
+        assert_eq!(transformed, b"body-first-second");
+    }
+}
+
 /// Parse an HTTP method string into a `hyper::Method`.
 fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
     match method {
@@ -145,6 +518,62 @@ fn build_xff_value(existing_xff: Option<&str>, client_ip: &str) -> String {
             val
         }
         None => client_ip.to_string(),
+    }
+}
+
+async fn apply_request_body_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    headers: &HashMap<String, String>,
+    body_bytes: Vec<u8>,
+) -> Vec<u8> {
+    if body_bytes.is_empty() || !plugins.iter().any(|plugin| plugin.modifies_request_body()) {
+        return body_bytes;
+    }
+
+    let content_type = headers.get("content-type").map(|value| value.as_str());
+    let mut current = body_bytes;
+    for plugin in plugins {
+        if plugin.modifies_request_body()
+            && let Some(transformed) = plugin.transform_request_body(&current, content_type).await
+        {
+            current = transformed;
+        }
+    }
+    current
+}
+
+pub(crate) async fn run_final_request_body_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    for plugin in plugins {
+        match plugin.on_final_request_body(headers, body).await {
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } => return reject,
+        }
+    }
+    PluginResult::Continue
+}
+
+fn reject_result_to_backend_response(
+    reject: PluginResult,
+    backend_resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    match reject {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => retry::BackendResponse {
+            status_code,
+            body: ResponseBody::Buffered(body.into_bytes()),
+            headers,
+            connection_error: false,
+            backend_resolved_ip,
+            error_class: (status_code == 413).then_some(retry::ErrorClass::RequestBodyTooLarge),
+        },
+        PluginResult::Continue => unreachable!("continue result cannot be converted to a reject"),
     }
 }
 
@@ -1166,12 +1595,12 @@ async fn handle_websocket_request_authenticated(
     // Collect client headers to forward to backend
     let mut client_headers = collect_forwardable_headers(&parts.headers);
 
-    // Inject consumer identity headers for WebSocket connections
-    if let Some(ref consumer) = ctx.identified_consumer {
-        client_headers.push(("x-consumer-username".to_string(), consumer.username.clone()));
-        if let Some(ref custom_id) = consumer.custom_id {
-            client_headers.push(("x-consumer-custom-id".to_string(), custom_id.clone()));
-        }
+    // Inject authenticated identity headers for WebSocket connections.
+    if let Some(username) = ctx.backend_consumer_username() {
+        client_headers.push(("x-consumer-username".to_string(), username.to_string()));
+    }
+    if let Some(custom_id) = ctx.backend_consumer_custom_id() {
+        client_headers.push(("x-consumer-custom-id".to_string(), custom_id.to_string()));
     }
 
     // Connect to backend BEFORE sending 101 to client.
@@ -1301,10 +1730,7 @@ async fn handle_websocket_request_authenticated(
                         let summary = TransactionSummary {
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
-                            consumer_username: ctx
-                                .identified_consumer
-                                .as_ref()
-                                .map(|c| c.username.clone()),
+                            consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: "GET".to_string(),
                             request_path: ctx.path.clone(),
                             matched_proxy_id: Some(proxy.id.clone()),
@@ -1370,11 +1796,7 @@ async fn handle_websocket_request_authenticated(
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx
-            .identified_consumer
-            .as_ref()
-            .map(|c| c.username.clone())
-            .or_else(|| ctx.authenticated_identity.clone()),
+        consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: "GET".to_string(),
         request_path: ctx.path.clone(),
         matched_proxy_id: Some(proxy.id.clone()),
@@ -1801,8 +2223,7 @@ async fn run_websocket_proxy(
                 msg = ws_stream.next() => {
                     let Some(msg) = msg else { break };
                     match msg {
-                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
-                            let raw = msg.unwrap(); // safe: matched Ok above
+                        Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
                             let outgoing = if ctb_plugins.is_empty() {
                                 raw
@@ -1881,8 +2302,7 @@ async fn run_websocket_proxy(
                 msg = backend_stream.next() => {
                     let Some(msg) = msg else { break };
                     match msg {
-                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
-                            let raw = msg.unwrap(); // safe: matched Ok above
+                        Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
                             let outgoing = if btc_plugins.is_empty() {
                                 raw
@@ -2216,11 +2636,7 @@ pub async fn log_rejected_request(
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx
-            .identified_consumer
-            .as_ref()
-            .map(|c| c.username.clone())
-            .or_else(|| ctx.authenticated_identity.clone()),
+        consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ctx.method.clone(),
         request_path: ctx.path.clone(),
         matched_proxy_id: proxy.map(|p| p.id.clone()),
@@ -2247,6 +2663,322 @@ pub async fn log_rejected_request(
 
     for plugin in &logging_plugins {
         plugin.log(&summary).await;
+    }
+}
+
+pub(crate) async fn apply_after_proxy_hooks_to_rejection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status_code: u16,
+    response_headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins.iter().filter(|p| p.applies_after_proxy_on_reject()) {
+        if let PluginResult::Reject {
+            status_code: reject_status,
+            ..
+        } = plugin.after_proxy(ctx, status_code, response_headers).await
+        {
+            warn!(
+                "after_proxy plugin '{}' returned Reject (status {}) during rejection handling; ignoring",
+                plugin.name(),
+                reject_status,
+            );
+        }
+    }
+}
+
+pub(crate) struct AfterProxyReject {
+    pub status_code: u16,
+    pub body: String,
+    pub headers: HashMap<String, String>,
+}
+
+pub(crate) async fn run_after_proxy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) -> Option<AfterProxyReject> {
+    for plugin in plugins.iter() {
+        match plugin
+            .after_proxy(ctx, response_status, response_headers)
+            .await
+        {
+            PluginResult::Continue => {}
+            PluginResult::Reject {
+                status_code,
+                body,
+                mut headers,
+            } => {
+                warn!(
+                    "after_proxy plugin '{}' rejected response before downstream commit (status {})",
+                    plugin.name(),
+                    status_code,
+                );
+                apply_after_proxy_hooks_to_rejection(plugins, ctx, status_code, &mut headers).await;
+                return Some(AfterProxyReject {
+                    status_code,
+                    body,
+                    headers,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+struct NormalizedRejectResponse {
+    http_status: StatusCode,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+    grpc_status: Option<u32>,
+    grpc_message: Option<String>,
+}
+
+fn grpc_status_reason(status: u32) -> &'static str {
+    match status {
+        grpc_proxy::grpc_status::INVALID_ARGUMENT => "Invalid argument",
+        grpc_proxy::grpc_status::DEADLINE_EXCEEDED => "Deadline exceeded",
+        grpc_proxy::grpc_status::NOT_FOUND => "Not found",
+        grpc_proxy::grpc_status::PERMISSION_DENIED => "Permission denied",
+        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED => "Resource exhausted",
+        grpc_proxy::grpc_status::FAILED_PRECONDITION => "Failed precondition",
+        grpc_proxy::grpc_status::ABORTED => "Aborted",
+        grpc_proxy::grpc_status::UNIMPLEMENTED => "Unimplemented",
+        grpc_proxy::grpc_status::INTERNAL => "Internal error",
+        grpc_proxy::grpc_status::UNAVAILABLE => "Service unavailable",
+        grpc_proxy::grpc_status::UNAUTHENTICATED => "Unauthenticated",
+        _ => "Gateway rejected request",
+    }
+}
+
+fn sanitize_grpc_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn extract_grpc_reject_message(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        for key in ["grpc_message", "message", "error", "details"] {
+            if let Some(msg) = parsed.get(key).and_then(|v| v.as_str()) {
+                let sanitized = sanitize_grpc_message(msg);
+                if !sanitized.is_empty() {
+                    return Some(sanitized);
+                }
+            }
+        }
+    }
+
+    let sanitized = sanitize_grpc_message(trimmed);
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
+    match status {
+        StatusCode::BAD_REQUEST => grpc_proxy::grpc_status::INVALID_ARGUMENT,
+        StatusCode::METHOD_NOT_ALLOWED => grpc_proxy::grpc_status::UNIMPLEMENTED,
+        StatusCode::UNAUTHORIZED => grpc_proxy::grpc_status::UNAUTHENTICATED,
+        StatusCode::FORBIDDEN => grpc_proxy::grpc_status::PERMISSION_DENIED,
+        StatusCode::NOT_FOUND => grpc_proxy::grpc_status::NOT_FOUND,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+        }
+        StatusCode::CONFLICT => grpc_proxy::grpc_status::ABORTED,
+        StatusCode::PRECONDITION_FAILED => grpc_proxy::grpc_status::FAILED_PRECONDITION,
+        StatusCode::PAYLOAD_TOO_LARGE
+        | StatusCode::URI_TOO_LONG
+        | StatusCode::TOO_MANY_REQUESTS => grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+        StatusCode::NOT_IMPLEMENTED => grpc_proxy::grpc_status::UNIMPLEMENTED,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
+            grpc_proxy::grpc_status::UNAVAILABLE
+        }
+        _ => grpc_proxy::grpc_status::INTERNAL,
+    }
+}
+
+fn normalize_reject_response(
+    status: StatusCode,
+    body: &str,
+    headers: &HashMap<String, String>,
+    is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    if !is_grpc_request {
+        let mut normalized_headers = headers.clone();
+        normalized_headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
+        return NormalizedRejectResponse {
+            http_status: status,
+            headers: normalized_headers,
+            body: body.as_bytes().to_vec(),
+            grpc_status: None,
+            grpc_message: None,
+        };
+    }
+
+    let grpc_status = headers
+        .get("grpc-status")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_else(|| map_http_reject_status_to_grpc_status(status));
+    let grpc_message = headers
+        .get("grpc-message")
+        .cloned()
+        .or_else(|| extract_grpc_reject_message(body))
+        .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
+    let grpc_message = sanitize_grpc_message(&grpc_message);
+
+    let mut normalized_headers = HashMap::with_capacity(headers.len() + 3);
+    for (key, value) in headers {
+        if key.eq_ignore_ascii_case("content-type")
+            || key.eq_ignore_ascii_case("grpc-status")
+            || key.eq_ignore_ascii_case("grpc-message")
+        {
+            continue;
+        }
+        normalized_headers.insert(key.clone(), value.clone());
+    }
+    normalized_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    normalized_headers.insert("grpc-status".to_string(), grpc_status.to_string());
+    if !grpc_message.is_empty() {
+        normalized_headers.insert("grpc-message".to_string(), grpc_message.clone());
+    }
+
+    NormalizedRejectResponse {
+        http_status: StatusCode::OK,
+        headers: normalized_headers,
+        body: Vec::new(),
+        grpc_status: Some(grpc_status),
+        grpc_message: Some(grpc_message),
+    }
+}
+
+fn insert_grpc_error_metadata(
+    metadata: &mut HashMap<String, String>,
+    grpc_status: u32,
+    grpc_message: &str,
+) {
+    metadata.insert("grpc_status".to_string(), grpc_status.to_string());
+    let grpc_message = sanitize_grpc_message(grpc_message);
+    if grpc_message.is_empty() {
+        metadata.remove("grpc_message");
+    } else {
+        metadata.insert("grpc_message".to_string(), grpc_message);
+    }
+}
+
+fn apply_grpc_reject_metadata(ctx: &mut RequestContext, reject: &NormalizedRejectResponse) {
+    if let Some(grpc_status) = reject.grpc_status {
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            grpc_status,
+            reject.grpc_message.as_deref().unwrap_or(""),
+        );
+    }
+}
+
+fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
+    let is_grpc_error = reject.grpc_status.is_some();
+    let mut builder = Response::builder().status(reject.http_status);
+    for (key, value) in &reject.headers {
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(key.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+
+    let body = if reject.body.is_empty() {
+        ProxyBody::empty()
+    } else {
+        ProxyBody::full(Bytes::from(reject.body))
+    };
+
+    builder.body(body).unwrap_or_else(|_| {
+        if is_grpc_error {
+            grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::INTERNAL,
+                "Internal gateway error",
+            )
+        } else {
+            build_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"Internal server error"}"#,
+            )
+        }
+    })
+}
+
+async fn finalize_reject_response_with_after_proxy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    status: StatusCode,
+    body: &str,
+    mut headers: HashMap<String, String>,
+    is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    apply_after_proxy_hooks_to_rejection(plugins, ctx, status.as_u16(), &mut headers).await;
+    normalize_reject_response(status, body, &headers, is_grpc_request)
+}
+
+pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
+    ctx.effective_identity().is_some()
+}
+
+pub async fn run_authentication_phase(
+    auth_mode: AuthMode,
+    auth_plugins: &[&Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    consumer_index: &ConsumerIndex,
+) -> Option<(u16, String, HashMap<String, String>)> {
+    match auth_mode {
+        AuthMode::Multi => {
+            // Execute auth plugins; first success stops iteration.
+            // Multi-auth success includes external identity auth (e.g. jwks_auth)
+            // even when no gateway Consumer record exists.
+            let mut last_reject: Option<(u16, String, HashMap<String, String>)> = None;
+            for auth_plugin in auth_plugins {
+                match auth_plugin.authenticate(ctx, consumer_index).await {
+                    PluginResult::Reject {
+                        status_code,
+                        body,
+                        headers,
+                    } => {
+                        last_reject = Some((status_code, body, headers));
+                    }
+                    PluginResult::Continue => {
+                        if request_is_authenticated(ctx) {
+                            last_reject = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            last_reject.filter(|_| !auth_plugins.is_empty() && !request_is_authenticated(ctx))
+        }
+        AuthMode::Single => {
+            for auth_plugin in auth_plugins {
+                match auth_plugin.authenticate(ctx, consumer_index).await {
+                    PluginResult::Reject {
+                        status_code,
+                        body,
+                        headers,
+                    } => return Some((status_code, body, headers)),
+                    PluginResult::Continue => {}
+                }
+            }
+            None
+        }
     }
 }
 
@@ -2372,6 +3104,7 @@ pub async fn handle_proxy_request(
             let without_port = h.split(':').next().unwrap_or(h);
             without_port.to_lowercase()
         });
+    let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
     let route_match = state
@@ -2392,11 +3125,14 @@ pub async fn handle_proxy_request(
         None => {
             debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
             state.request_count.fetch_add(1, Ordering::Relaxed);
-            record_status(&state, 404);
-            return Ok(build_response(
+            let reject = normalize_reject_response(
                 StatusCode::NOT_FOUND,
                 r#"{"error":"Not Found"}"#,
-            ));
+                &HashMap::new(),
+                request_uses_grpc_content_type,
+            );
+            record_status(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
         }
     };
 
@@ -2408,18 +3144,17 @@ pub async fn handle_proxy_request(
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
         state.request_count.fetch_add(1, Ordering::Relaxed);
-        record_status(&state, 405);
         let allow_header = allowed.join(", ");
-        let mut resp = build_response(
+        let mut reject_headers = HashMap::new();
+        reject_headers.insert("allow".to_string(), allow_header);
+        let reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"Method Not Allowed"}"#,
+            &reject_headers,
+            request_uses_grpc_content_type,
         );
-        resp.headers_mut().insert(
-            hyper::header::ALLOW,
-            hyper::header::HeaderValue::from_str(&allow_header)
-                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("")),
-        );
-        return Ok(resp);
+        record_status(&state, reject.http_status.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
     }
 
     // Detect request protocol early so we fetch only plugins that support it.
@@ -2430,7 +3165,7 @@ pub async fn handle_proxy_request(
             BackendProtocol::Ws | BackendProtocol::Wss
         ) {
         ProxyProtocol::WebSocket
-    } else if grpc_proxy::is_grpc_request(&req)
+    } else if request_uses_grpc_content_type
         && matches!(
             proxy.backend_protocol,
             BackendProtocol::Grpc | BackendProtocol::Grpcs
@@ -2440,11 +3175,13 @@ pub async fn handle_proxy_request(
     } else {
         ProxyProtocol::Http
     };
+    let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = state
         .plugin_cache
         .get_plugins_for_protocol(&proxy.id, request_protocol);
+    let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
     // Stored as nanoseconds in u64 to avoid floating-point precision loss across
@@ -2462,22 +3199,28 @@ pub async fn handle_proxy_request(
                     headers,
                 } => {
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        headers,
+                        is_grpc_request,
+                    )
+                    .await;
+                    apply_grpc_reject_metadata(&mut ctx, &reject);
                     log_rejected_request(
                         &plugins,
                         &ctx,
-                        status_code,
+                        reject.http_status.as_u16(),
                         start_time,
                         "on_request_received",
                         plugin_execution_ns,
                     )
                     .await;
-                    record_request(&state, status_code);
-                    return Ok(build_reject_response(
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &body,
-                        &headers,
-                    ));
+                    record_request(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
                 }
                 PluginResult::Continue => {}
             }
@@ -2491,86 +3234,36 @@ pub async fn handle_proxy_request(
 
     {
         let auth_phase_start = Instant::now();
-        match proxy.auth_mode {
-            AuthMode::Multi => {
-                // Execute auth plugins; first success (consumer identified) stops iteration.
-                // If all fail and auth plugins were configured, reject with 401.
-                let mut last_reject: Option<(u16, String, HashMap<String, String>)> = None;
-                for auth_plugin in &auth_plugins {
-                    match auth_plugin
-                        .authenticate(&mut ctx, &state.consumer_index)
-                        .await
-                    {
-                        PluginResult::Reject {
-                            status_code,
-                            body,
-                            headers,
-                        } => {
-                            last_reject = Some((status_code, body, headers));
-                        }
-                        PluginResult::Continue => {
-                            if ctx.identified_consumer.is_some() {
-                                last_reject = None;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some((status_code, body, headers)) = last_reject
-                    .filter(|_| !auth_plugins.is_empty() && ctx.identified_consumer.is_none())
-                {
-                    plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-                    log_rejected_request(
-                        &plugins,
-                        &ctx,
-                        status_code,
-                        start_time,
-                        "authenticate",
-                        plugin_execution_ns,
-                    )
-                    .await;
-                    record_request(&state, status_code);
-                    return Ok(build_reject_response(
-                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
-                        &body,
-                        &headers,
-                    ));
-                }
-            }
-            AuthMode::Single => {
-                // Execute auth plugins sequentially; first failure rejects
-                for auth_plugin in &auth_plugins {
-                    match auth_plugin
-                        .authenticate(&mut ctx, &state.consumer_index)
-                        .await
-                    {
-                        PluginResult::Reject {
-                            status_code,
-                            body,
-                            headers,
-                        } => {
-                            plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
-                            log_rejected_request(
-                                &plugins,
-                                &ctx,
-                                status_code,
-                                start_time,
-                                "authenticate",
-                                plugin_execution_ns,
-                            )
-                            .await;
-                            record_request(&state, status_code);
-                            return Ok(build_reject_response(
-                                StatusCode::from_u16(status_code)
-                                    .unwrap_or(StatusCode::UNAUTHORIZED),
-                                &body,
-                                &headers,
-                            ));
-                        }
-                        PluginResult::Continue => {}
-                    }
-                }
-            }
+        if let Some((status_code, body, headers)) = run_authentication_phase(
+            proxy.auth_mode.clone(),
+            &auth_plugins,
+            &mut ctx,
+            &state.consumer_index,
+        )
+        .await
+        {
+            plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                &plugins,
+                &mut ctx,
+                StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
+                &body,
+                headers,
+                is_grpc_request,
+            )
+            .await;
+            apply_grpc_reject_metadata(&mut ctx, &reject);
+            log_rejected_request(
+                &plugins,
+                &ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                "authenticate",
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(&state, reject.http_status.as_u16());
+            return Ok(build_response_from_normalized_reject(reject));
         }
         plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
     }
@@ -2586,26 +3279,89 @@ pub async fn handle_proxy_request(
                     headers,
                 } => {
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                        &body,
+                        headers,
+                        is_grpc_request,
+                    )
+                    .await;
+                    apply_grpc_reject_metadata(&mut ctx, &reject);
                     log_rejected_request(
                         &plugins,
                         &ctx,
-                        status_code,
+                        reject.http_status.as_u16(),
                         start_time,
                         "authorize",
                         plugin_execution_ns,
                     )
                     .await;
-                    record_request(&state, status_code);
-                    return Ok(build_reject_response(
-                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
-                        &body,
-                        &headers,
-                    ));
+                    record_request(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
                 }
                 PluginResult::Continue => {}
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    let maybe_requires_request_body_buffering = state
+        .plugin_cache
+        .requires_request_body_buffering(&proxy.id);
+    let requires_request_body_buffering = maybe_requires_request_body_buffering
+        && plugins
+            .iter()
+            .any(|plugin| plugin.should_buffer_request_body(&ctx));
+    let requires_request_body_before_before_proxy = requires_request_body_buffering
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_before_proxy()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    if requires_request_body_before_before_proxy {
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &ctx.headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(buffered) => {
+                        if let ClientRequestBody::Buffered(body) = &buffered {
+                            store_request_body_metadata(&mut ctx, body);
+                        }
+                        buffered
+                    }
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while buffering request body before before_proxy"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            already_buffered => already_buffered,
+        };
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
@@ -2625,22 +3381,28 @@ pub async fn handle_proxy_request(
                     headers,
                 } => {
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        headers,
+                        is_grpc_request,
+                    )
+                    .await;
+                    apply_grpc_reject_metadata(&mut ctx, &reject);
                     log_rejected_request(
                         &plugins,
                         &ctx,
-                        status_code,
+                        reject.http_status.as_u16(),
                         start_time,
                         "before_proxy",
                         plugin_execution_ns,
                     )
                     .await;
-                    record_request(&state, status_code);
-                    return Ok(build_reject_response(
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &body,
-                        &headers,
-                    ));
+                    record_request(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
                 }
                 PluginResult::Continue => {}
             }
@@ -2662,22 +3424,28 @@ pub async fn handle_proxy_request(
                 } => {
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     ctx.headers = tmp_headers;
+                    let reject = finalize_reject_response_with_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        headers,
+                        is_grpc_request,
+                    )
+                    .await;
+                    apply_grpc_reject_metadata(&mut ctx, &reject);
                     log_rejected_request(
                         &plugins,
                         &ctx,
-                        status_code,
+                        reject.http_status.as_u16(),
                         start_time,
                         "before_proxy",
                         plugin_execution_ns,
                     )
                     .await;
-                    record_request(&state, status_code);
-                    return Ok(build_reject_response(
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &body,
-                        &headers,
-                    ));
+                    record_request(&state, reject.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(reject));
                 }
                 PluginResult::Continue => {}
             }
@@ -2685,22 +3453,12 @@ pub async fn handle_proxy_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
-    // Inject X-Consumer-Username header when a consumer has been authenticated
-    if let Some(ref consumer) = ctx.identified_consumer {
+    // Inject identity headers when authentication resolved a principal.
+    if let Some(username) = ctx.backend_consumer_username() {
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
-        if let Some(ref custom_id) = consumer.custom_id {
-            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
-        }
-    } else if ctx.authenticated_identity.is_some() || ctx.authenticated_identity_header.is_some() {
-        // External auth (e.g. jwks_auth) identified a user without a gateway Consumer
-        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
-        let header_val = ctx
-            .authenticated_identity_header
-            .as_deref()
-            .or(ctx.authenticated_identity.as_deref());
-        if let Some(val) = header_val {
-            headers.insert("X-Consumer-Username".to_string(), val.to_string());
+        headers.insert("X-Consumer-Username".to_string(), username.to_string());
+        if let Some(custom_id) = ctx.backend_consumer_custom_id() {
+            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.to_string());
         }
     }
     let proxy_headers: &HashMap<String, String> =
@@ -2766,32 +3524,53 @@ pub async fn handle_proxy_request(
             .is_err()
     {
         warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+            HashMap::new(),
+            is_grpc_request,
+        )
+        .await;
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         log_rejected_request(
             &plugins,
             &ctx,
-            503,
+            reject.http_status.as_u16(),
             start_time,
             "circuit_breaker_open",
             plugin_execution_ns,
         )
         .await;
-        record_request(&state, 503);
-        return Ok(build_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
-        ));
+        record_request(&state, reject.http_status.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
     }
 
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
     // This check happens AFTER authentication and authorization plugins have run
-    if is_websocket_upgrade(&req)
+    if request_protocol == ProxyProtocol::WebSocket
         && matches!(
             proxy.backend_protocol,
             BackendProtocol::Ws | BackendProtocol::Wss
         )
     {
+        let request = match client_request_body {
+            ClientRequestBody::Streaming(request) => *request,
+            ClientRequestBody::Buffered(_) => {
+                debug_assert!(
+                    false,
+                    "websocket requests should never be pre-buffered for before_proxy"
+                );
+                record_request(&state, 500);
+                return Ok(build_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"WebSocket request buffering invariant violated"}"#,
+                ));
+            }
+        };
         return handle_websocket_request_authenticated(
-            req,
+            request,
             state,
             remote_addr,
             proxy,
@@ -2807,12 +3586,26 @@ pub async fn handle_proxy_request(
     }
 
     // Check if this is a gRPC request and the proxy supports gRPC
-    if grpc_proxy::is_grpc_request(&req)
+    if is_grpc_request
         && matches!(
             proxy.backend_protocol,
             BackendProtocol::Grpc | BackendProtocol::Grpcs
         )
     {
+        let request = match client_request_body {
+            ClientRequestBody::Streaming(request) => *request,
+            ClientRequestBody::Buffered(_) => {
+                debug_assert!(
+                    false,
+                    "gRPC requests should not be pre-buffered by HTTP body plugins"
+                );
+                record_request(&state, 500);
+                return Ok(build_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"gRPC request buffering invariant violated"}"#,
+                ));
+            }
+        };
         let (grpc_effective_host, grpc_effective_port) = if let Some(ref target) = upstream_target {
             (target.host.as_str(), target.port)
         } else {
@@ -2839,7 +3632,7 @@ pub async fn handle_proxy_request(
 
         // First attempt — also captures the buffered body for potential retries
         let (mut grpc_result, grpc_body_bytes) = grpc_proxy::proxy_grpc_request(
-            req,
+            request,
             &proxy,
             &grpc_backend_url,
             &state.grpc_pool,
@@ -2956,17 +3749,34 @@ pub async fn handle_proxy_request(
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
                 {
                     let phase_start = Instant::now();
-                    for plugin in plugins.iter() {
-                        if let PluginResult::Reject { status_code, .. } = plugin
-                            .after_proxy(&mut ctx, grpc_streaming.status, &mut response_headers)
-                            .await
-                        {
-                            warn!(
-                                "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
-                                plugin.name(),
-                                status_code,
-                            );
-                        }
+                    if let Some(reject) = run_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        grpc_streaming.status,
+                        &mut response_headers,
+                    )
+                    .await
+                    {
+                        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                        let normalized = normalize_reject_response(
+                            StatusCode::from_u16(reject.status_code)
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            &reject.body,
+                            &reject.headers,
+                            true,
+                        );
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        log_rejected_request(
+                            &plugins,
+                            &ctx,
+                            normalized.http_status.as_u16(),
+                            start_time,
+                            "after_proxy",
+                            plugin_execution_ns,
+                        )
+                        .await;
+                        record_request(&state, normalized.http_status.as_u16());
+                        return Ok(build_response_from_normalized_reject(normalized));
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
@@ -2994,10 +3804,7 @@ pub async fn handle_proxy_request(
                     let summary = TransactionSummary {
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
-                        consumer_username: ctx
-                            .identified_consumer
-                            .as_ref()
-                            .map(|c| c.username.clone()),
+                        consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
                         matched_proxy_id: Some(proxy.id.clone()),
@@ -3048,7 +3855,9 @@ pub async fn handle_proxy_request(
                     }));
             }
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
+                let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
+                let mut response_body = grpc_resp.body;
 
                 // Forward trailers as response headers (gRPC Trailers-Only encoding)
                 for (k, v) in &grpc_resp.trailers {
@@ -3056,18 +3865,126 @@ pub async fn handle_proxy_request(
                 }
 
                 // after_proxy hooks
+                let mut after_proxy_rejected = false;
                 {
                     let phase_start = Instant::now();
+                    if let Some(reject) = run_after_proxy_hooks(
+                        &plugins,
+                        &mut ctx,
+                        response_status,
+                        &mut response_headers,
+                    )
+                    .await
+                    {
+                        let normalized = normalize_reject_response(
+                            StatusCode::from_u16(reject.status_code)
+                                .unwrap_or(StatusCode::BAD_GATEWAY),
+                            &reject.body,
+                            &reject.headers,
+                            true,
+                        );
+                        apply_grpc_reject_metadata(&mut ctx, &normalized);
+                        response_status = normalized.http_status.as_u16();
+                        response_headers = normalized.headers;
+                        response_body = normalized.body;
+                        after_proxy_rejected = true;
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                if !after_proxy_rejected {
+                    let phase_start = Instant::now();
                     for plugin in plugins.iter() {
-                        if let PluginResult::Reject { status_code, .. } = plugin
-                            .after_proxy(&mut ctx, grpc_resp.status, &mut response_headers)
-                            .await
-                        {
-                            warn!(
-                                "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
-                                plugin.name(),
+                        let result = plugin
+                            .on_response_body(
+                                &mut ctx,
+                                response_status,
+                                &response_headers,
+                                &response_body,
+                            )
+                            .await;
+                        match result {
+                            PluginResult::Continue => {}
+                            PluginResult::Reject {
                                 status_code,
+                                body: reject_body,
+                                headers: reject_headers,
+                            } => {
+                                debug!(
+                                    plugin = plugin.name(),
+                                    status_code, "Plugin rejected gRPC response body"
+                                );
+                                let normalized = normalize_reject_response(
+                                    StatusCode::from_u16(status_code)
+                                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                                    &reject_body,
+                                    &reject_headers,
+                                    true,
+                                );
+                                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                                response_status = normalized.http_status.as_u16();
+                                response_headers = normalized.headers;
+                                response_body = normalized.body;
+                                break;
+                            }
+                        }
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                if !after_proxy_rejected {
+                    let phase_start = Instant::now();
+                    let content_type = response_headers.get("content-type").cloned();
+                    let ct_ref = content_type.as_deref();
+                    for plugin in plugins.iter() {
+                        if let Some(transformed) =
+                            plugin.transform_response_body(&response_body, ct_ref).await
+                        {
+                            response_headers.insert(
+                                "content-length".to_string(),
+                                transformed.len().to_string(),
                             );
+                            response_body = transformed;
+                        }
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                if !after_proxy_rejected {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        let result = plugin
+                            .on_final_response_body(
+                                &mut ctx,
+                                response_status,
+                                &response_headers,
+                                &response_body,
+                            )
+                            .await;
+                        match result {
+                            PluginResult::Continue => {}
+                            PluginResult::Reject {
+                                status_code,
+                                body: reject_body,
+                                headers: reject_headers,
+                            } => {
+                                debug!(
+                                    plugin = plugin.name(),
+                                    status_code, "Plugin rejected finalized gRPC response body"
+                                );
+                                let normalized = normalize_reject_response(
+                                    StatusCode::from_u16(status_code)
+                                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                                    &reject_body,
+                                    &reject_headers,
+                                    true,
+                                );
+                                apply_grpc_reject_metadata(&mut ctx, &normalized);
+                                response_status = normalized.http_status.as_u16();
+                                response_headers = normalized.headers;
+                                response_body = normalized.body;
+                                break;
+                            }
                         }
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -3098,17 +4015,14 @@ pub async fn handle_proxy_request(
                     let summary = TransactionSummary {
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
-                        consumer_username: ctx
-                            .identified_consumer
-                            .as_ref()
-                            .map(|c| c.username.clone()),
+                        consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
                         matched_proxy_id: Some(proxy.id.clone()),
                         matched_proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
-                        response_status_code: grpc_resp.status,
+                        response_status_code: response_status,
                         latency_total_ms: total_ms,
                         latency_gateway_processing_ms: gateway_processing_ms,
                         latency_backend_ttfb_ms: backend_total_ms,
@@ -3152,11 +4066,11 @@ pub async fn handle_proxy_request(
                     }
                 }
 
-                record_request(&state, grpc_resp.status);
+                record_request(&state, response_status);
 
                 // Build gRPC response with headers and trailers
                 let mut resp_builder = Response::builder()
-                    .status(StatusCode::from_u16(grpc_resp.status).unwrap_or(StatusCode::OK));
+                    .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK));
                 for (k, v) in &response_headers {
                     if let (Ok(name), Ok(val)) = (
                         hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -3167,7 +4081,7 @@ pub async fn handle_proxy_request(
                 }
 
                 return Ok(resp_builder
-                    .body(ProxyBody::full(Bytes::from(grpc_resp.body)))
+                    .body(ProxyBody::full(Bytes::from(response_body)))
                     .unwrap_or_else(|_| {
                         grpc_proxy::build_grpc_error_response(
                             grpc_proxy::grpc_status::UNAVAILABLE,
@@ -3209,13 +4123,11 @@ pub async fn handle_proxy_request(
                             "rejection_phase".to_string(),
                             "grpc_backend_error".to_string(),
                         );
+                        insert_grpc_error_metadata(&mut metadata, grpc_code, msg);
                         let summary = TransactionSummary {
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
-                            consumer_username: ctx
-                                .identified_consumer
-                                .as_ref()
-                                .map(|c| c.username.clone()),
+                            consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ctx.method.clone(),
                             request_path: ctx.path.clone(),
                             matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
@@ -3287,15 +4199,12 @@ pub async fn handle_proxy_request(
     };
 
     // Determine if we can stream the request body to the backend without
-    // collecting it into memory. This is safe when no plugin modifies the
-    // request body (e.g., request_transformer with body rules).
-    // When retries are configured, we force buffered mode so the collected
-    // body bytes can be replayed on connection failures.
+    // collecting it into memory. When retries are configured, we force
+    // buffered mode so the collected body bytes can be replayed on connection
+    // failures.
     let has_retry = proxy.retry.is_some();
-    let stream_request_body = !has_retry
-        && !state
-            .plugin_cache
-            .requires_request_body_buffering(&proxy.id);
+    let stream_request_body = !has_retry && !requires_request_body_buffering;
+    let request_client_ip = ctx.client_ip.clone();
 
     // Perform the backend request with retry logic.
     // Returns the response and the final CB target key (may differ from the
@@ -3311,13 +4220,14 @@ pub async fn handle_proxy_request(
             &current_url,
             &method,
             proxy_headers,
-            req,
+            client_request_body,
             upstream_target.as_ref(),
             &plugins,
             should_stream,
+            requires_request_body_buffering,
             stream_request_body,
             has_retry,
-            &ctx.client_ip,
+            &request_client_ip,
             is_tls,
         )
         .await;
@@ -3410,13 +4320,14 @@ pub async fn handle_proxy_request(
             &backend_url,
             &method,
             proxy_headers,
-            req,
+            client_request_body,
             upstream_target.as_ref(),
             &plugins,
             should_stream,
+            requires_request_body_buffering,
             stream_request_body,
             false, // no retry — don't retain body
-            &ctx.client_ip,
+            &request_client_ip,
             is_tls,
         )
         .await
@@ -3513,30 +4424,31 @@ pub async fn handle_proxy_request(
         backend_elapsed
     };
 
-    // after_proxy hooks (these only modify headers, not the body,
-    // so they are compatible with both streaming and buffered modes)
+    // after_proxy hooks run before anything is sent downstream, so a plugin may
+    // still replace the backend response here (for example, content-length fast-path
+    // enforcement in response_size_limiting).
+    let mut after_proxy_rejected = false;
     if !plugins.is_empty() {
         let phase_start = Instant::now();
-        for plugin in plugins.iter() {
-            if let PluginResult::Reject { status_code, .. } = plugin
-                .after_proxy(&mut ctx, response_status, &mut response_headers)
-                .await
-            {
-                warn!(
-                    "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
-                    plugin.name(),
-                    status_code,
-                );
-            }
+        if let Some(reject) =
+            run_after_proxy_hooks(&plugins, &mut ctx, response_status, &mut response_headers).await
+        {
+            response_status = reject.status_code;
+            response_headers = reject.headers;
+            response_headers
+                .entry("content-type".to_string())
+                .or_insert_with(|| "application/json".to_string());
+            response_body = ResponseBody::Buffered(reject.body.into_bytes());
+            after_proxy_rejected = true;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
-    // This allows plugins (e.g., response_caching, body_validator) to inspect,
-    // validate, or store the full response body after after_proxy headers are
-    // finalized. A Reject result replaces the response before it reaches the client.
-    if !plugins.is_empty()
+    // This phase sees the raw backend body before any response transformations.
+    // A Reject result replaces the response before it reaches the client.
+    if !after_proxy_rejected
+        && !plugins.is_empty()
         && let ResponseBody::Buffered(ref data) = response_body
     {
         let phase_start = Instant::now();
@@ -3573,7 +4485,8 @@ pub async fn handle_proxy_request(
     // transform_response_body hooks — only for buffered responses.
     // Allows plugins (e.g., response_transformer with body rules) to rewrite
     // JSON fields in the response body before it is sent to the client.
-    if !plugins.is_empty()
+    if !after_proxy_rejected
+        && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
@@ -3586,6 +4499,43 @@ pub async fn handle_proxy_request(
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
                 *data = transformed;
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // on_final_response_body hooks — buffered responses after all body transforms.
+    // This lets plugins validate or persist the final client-visible payload.
+    if !after_proxy_rejected
+        && !plugins.is_empty()
+        && let ResponseBody::Buffered(ref data) = response_body
+    {
+        let phase_start = Instant::now();
+        for plugin in plugins.iter() {
+            let result = plugin
+                .on_final_response_body(&mut ctx, response_status, &response_headers, data)
+                .await;
+            match result {
+                PluginResult::Continue => {}
+                PluginResult::Reject {
+                    status_code,
+                    body: reject_body,
+                    headers: reject_headers,
+                } => {
+                    debug!(
+                        plugin = plugin.name(),
+                        status_code, "Plugin rejected finalized response body"
+                    );
+                    response_status = status_code;
+                    response_headers.clear();
+                    response_headers
+                        .insert("content-type".to_string(), "application/json".to_string());
+                    for (k, v) in reject_headers {
+                        response_headers.insert(k, v);
+                    }
+                    response_body = ResponseBody::Buffered(reject_body.into_bytes());
+                    break;
+                }
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -3608,11 +4558,7 @@ pub async fn handle_proxy_request(
         let summary = TransactionSummary {
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx
-                .identified_consumer
-                .as_ref()
-                .map(|c| c.username.clone())
-                .or_else(|| ctx.authenticated_identity.clone()),
+            consumer_username: ctx.effective_identity().map(str::to_owned),
             http_method: method,
             request_path: path,
             matched_proxy_id: Some(proxy.id.clone()),
@@ -3943,6 +4889,7 @@ async fn proxy_to_backend_retry(
             }
             // Hop-by-hop headers per RFC 7230 Section 6.1
             "connection"
+            | "content-length"
             | "transfer-encoding"
             | "keep-alive"
             | "te"
@@ -4046,10 +4993,11 @@ async fn proxy_to_backend(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
-    original_req: Request<Incoming>,
+    client_request_body: ClientRequestBody,
     upstream_target: Option<&UpstreamTarget>,
     #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_response: bool,
+    requires_request_body_buffering: bool,
     stream_request_body: bool,
     retain_request_body: bool,
     client_ip: &str,
@@ -4091,7 +5039,8 @@ async fn proxy_to_backend(
             backend_url,
             method,
             headers,
-            original_req,
+            client_request_body,
+            plugins,
             upstream_target,
             client_ip,
             retain_request_body,
@@ -4112,7 +5061,35 @@ async fn proxy_to_backend(
     // auto-negotiates HTTP/2 via ALPN on TLS and supports body replay natively.
     if matches!(proxy.backend_protocol, BackendProtocol::Https) {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
-        if pool_config.enable_http2 && !retain_request_body {
+        if can_use_direct_http2_pool(
+            pool_config.enable_http2,
+            retain_request_body,
+            requires_request_body_buffering,
+        ) {
+            let request = match client_request_body {
+                ClientRequestBody::Streaming(request) => *request,
+                ClientRequestBody::Buffered(_) => {
+                    debug_assert!(
+                        false,
+                        "direct HTTP/2 pool should not be used when request body is pre-buffered"
+                    );
+                    return (
+                        retry::BackendResponse {
+                            status_code: 500,
+                            body: ResponseBody::Buffered(
+                                r#"{"error":"Request buffering invariant violated"}"#
+                                    .as_bytes()
+                                    .to_vec(),
+                            ),
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip,
+                            error_class: None,
+                        },
+                        None,
+                    );
+                }
+            };
             return (
                 proxy_to_backend_http2(
                     state,
@@ -4120,7 +5097,7 @@ async fn proxy_to_backend(
                     backend_url,
                     method,
                     headers,
-                    original_req,
+                    request,
                     stream_response,
                     client_ip,
                     is_tls,
@@ -4130,10 +5107,12 @@ async fn proxy_to_backend(
                 None,
             );
         }
-        if pool_config.enable_http2 && retain_request_body {
+        if pool_config.enable_http2 && (retain_request_body || requires_request_body_buffering) {
             debug!(
                 proxy_id = %proxy.id,
-                "H2 pool bypassed for retry support — using reqwest (ALPN HTTP/2)"
+                retain_request_body = retain_request_body,
+                requires_request_body_buffering = requires_request_body_buffering,
+                "H2 pool bypassed for request buffering support — using reqwest (ALPN HTTP/2)"
             );
         }
     }
@@ -4200,6 +5179,7 @@ async fn proxy_to_backend(
             }
             // Hop-by-hop headers per RFC 7230 Section 6.1
             "connection"
+            | "content-length"
             | "transfer-encoding"
             | "keep-alive"
             | "te"
@@ -4224,8 +5204,7 @@ async fn proxy_to_backend(
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
 
-    // Fast path: skip body collection for methods that typically have no body
-    let has_body = !matches!(method, "GET" | "HEAD" | "DELETE" | "OPTIONS");
+    let has_body = request_may_have_body(method, headers);
 
     // Shared flag for detecting size-limit exceeded during streaming.
     // Only allocated when we actually stream a request body.
@@ -4253,111 +5232,119 @@ async fn proxy_to_backend(
             );
         }
 
-        // Refine body presence check: skip for methods that typically carry no body
-        // unless Content-Length or Transfer-Encoding indicates otherwise.
-        let has_body = !matches!(method, "GET" | "HEAD" | "OPTIONS")
-            || headers.contains_key("content-length")
-            || headers.get("transfer-encoding").is_some();
-
-        if !has_body {
-            // No body to forward — skip entirely
-        } else if stream_request_body {
-            // Stream the request body directly to the backend without collecting
-            // into memory. Size limit is enforced during streaming via
-            // SizeLimitedIncoming which sets body_size_exceeded on overflow.
-            let incoming = original_req.into_body();
-            if state.max_request_body_size_bytes > 0 {
-                let limited = body::SizeLimitedIncoming::new(
-                    incoming,
-                    state.max_request_body_size_bytes,
-                    Arc::clone(&body_size_exceeded),
-                );
-                req_builder = req_builder.body(limited.into_reqwest_body());
-            } else {
-                // No size limit — stream body directly via wrap_stream
-                use futures_util::TryStreamExt;
-                let stream = http_body_util::BodyStream::new(incoming)
-                    .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
-                req_builder = req_builder.body(reqwest::Body::wrap_stream(stream));
+        match client_request_body {
+            ClientRequestBody::Buffered(body_bytes) => {
+                let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
+                match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. } => {
+                        return (
+                            reject_result_to_backend_response(reject, resolved_ip.clone()),
+                            None,
+                        );
+                    }
+                }
+                if !body_bytes.is_empty() {
+                    if retain_request_body {
+                        retained_body = Some(body_bytes.clone());
+                    }
+                    req_builder = req_builder.body(body_bytes);
+                }
             }
-        } else {
-            // Buffered path: collect body into memory for plugin transformation.
-            let body_bytes = if state.max_request_body_size_bytes > 0 {
-                let limited = http_body_util::Limited::new(
-                    original_req.into_body(),
-                    state.max_request_body_size_bytes,
-                );
-                match limited.collect().await {
-                    Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(_) => {
-                        return (
-                            retry::BackendResponse {
-                                status_code: 413,
-                                body: ResponseBody::Buffered(
-                                    r#"{"error":"Request body exceeds maximum size"}"#
-                                        .as_bytes()
-                                        .to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: false,
-                                backend_resolved_ip: resolved_ip.clone(),
-                                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                            },
-                            None,
-                        );
-                    }
+            ClientRequestBody::Streaming(original_req) if stream_request_body => {
+                // Stream the request body directly to the backend without collecting
+                // into memory. Size limit is enforced during streaming via
+                // SizeLimitedIncoming which sets body_size_exceeded on overflow.
+                let incoming = (*original_req).into_body();
+                if state.max_request_body_size_bytes > 0 {
+                    let limited = body::SizeLimitedIncoming::new(
+                        incoming,
+                        state.max_request_body_size_bytes,
+                        Arc::clone(&body_size_exceeded),
+                    );
+                    req_builder = req_builder.body(limited.into_reqwest_body());
+                } else {
+                    // No size limit — stream body directly via wrap_stream
+                    use futures_util::TryStreamExt;
+                    let stream = http_body_util::BodyStream::new(incoming)
+                        .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
+                    req_builder = req_builder.body(reqwest::Body::wrap_stream(stream));
                 }
-            } else {
-                match original_req.into_body().collect().await {
-                    Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(e) => {
-                        error!(
-                            proxy_id = %proxy.id,
-                            backend_url = %backend_url,
-                            error_kind = "client_disconnect",
-                            error = %e,
-                            "Client disconnected while sending request body"
-                        );
-                        return (
-                            retry::BackendResponse {
-                                status_code: 499,
-                                body: ResponseBody::Buffered(
-                                    r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
-                                ),
-                                headers: HashMap::new(),
-                                connection_error: true,
-                                backend_resolved_ip: resolved_ip.clone(),
-                                error_class: Some(retry::ErrorClass::ClientDisconnect),
-                            },
-                            None,
-                        );
-                    }
-                }
-            };
-
-            // Transform request body via plugins (JSON field rename, add, remove, etc.)
-            let body_bytes =
-                if !body_bytes.is_empty() && plugins.iter().any(|p| p.modifies_request_body()) {
-                    let content_type = headers.get("content-type").map(|s| s.as_str());
-                    let mut current = body_bytes;
-                    for plugin in plugins {
-                        if plugin.modifies_request_body()
-                            && let Some(transformed) =
-                                plugin.transform_request_body(&current, content_type).await
-                        {
-                            current = transformed;
+            }
+            ClientRequestBody::Streaming(original_req) => {
+                // Buffered path: collect body into memory for plugin transformation.
+                let body_bytes = if state.max_request_body_size_bytes > 0 {
+                    let limited = http_body_util::Limited::new(
+                        (*original_req).into_body(),
+                        state.max_request_body_size_bytes,
+                    );
+                    match limited.collect().await {
+                        Ok(collected) => collected.to_bytes().to_vec(),
+                        Err(_) => {
+                            return (
+                                retry::BackendResponse {
+                                    status_code: 413,
+                                    body:
+                                        ResponseBody::Buffered(
+                                            r#"{"error":"Request body exceeds maximum size"}"#
+                                                .as_bytes()
+                                                .to_vec(),
+                                        ),
+                                    headers: HashMap::new(),
+                                    connection_error: false,
+                                    backend_resolved_ip: resolved_ip.clone(),
+                                    error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                                },
+                                None,
+                            );
                         }
                     }
-                    current
                 } else {
-                    body_bytes
+                    match (*original_req).into_body().collect().await {
+                        Ok(collected) => collected.to_bytes().to_vec(),
+                        Err(e) => {
+                            error!(
+                                proxy_id = %proxy.id,
+                                backend_url = %backend_url,
+                                error_kind = "client_disconnect",
+                                error = %e,
+                                "Client disconnected while sending request body"
+                            );
+                            return (
+                                retry::BackendResponse {
+                                    status_code: 499,
+                                    body: ResponseBody::Buffered(
+                                        r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
+                                    ),
+                                    headers: HashMap::new(),
+                                    connection_error: true,
+                                    backend_resolved_ip: resolved_ip.clone(),
+                                    error_class: Some(retry::ErrorClass::ClientDisconnect),
+                                },
+                                None,
+                            );
+                        }
+                    }
                 };
 
-            if !body_bytes.is_empty() {
-                if retain_request_body {
-                    retained_body = Some(body_bytes.clone());
+                // Transform request body via plugins (JSON field rename, add, remove, etc.)
+                let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
+                match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. } => {
+                        return (
+                            reject_result_to_backend_response(reject, resolved_ip.clone()),
+                            None,
+                        );
+                    }
                 }
-                req_builder = req_builder.body(body_bytes);
+
+                if !body_bytes.is_empty() {
+                    if retain_request_body {
+                        retained_body = Some(body_bytes.clone());
+                    }
+                    req_builder = req_builder.body(body_bytes);
+                }
             }
         }
     }
@@ -4730,23 +5717,6 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         })
 }
 
-fn build_reject_response(
-    status: StatusCode,
-    body: &str,
-    headers: &HashMap<String, String>,
-) -> Response<ProxyBody> {
-    let mut resp = build_response(status, body);
-    for (k, v) in headers {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-            hyper::header::HeaderValue::from_str(v),
-        ) {
-            resp.headers_mut().insert(name, val);
-        }
-    }
-    resp
-}
-
 /// Proxy the request to an HTTPS backend using the HTTP/2 multiplexing pool.
 ///
 /// Uses hyper's HTTP/2 client directly to multiplex concurrent requests over
@@ -4971,7 +5941,8 @@ async fn proxy_to_backend_http3(
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
-    original_req: Request<Incoming>,
+    client_request_body: ClientRequestBody,
+    plugins: &[Arc<dyn crate::plugins::Plugin>],
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     retain_request_body: bool,
@@ -4995,77 +5966,96 @@ async fn proxy_to_backend_http3(
 
     // Read request body with size limit. HTTP/3 is always buffered — the h3
     // crate requires the full body before sending the request.
-    let (_parts, body) = original_req.into_parts();
-    let request_body = if state.max_request_body_size_bytes > 0 {
-        // Check Content-Length fast path
-        if let Some(content_length) = headers.get("content-length")
-            && let Ok(len) = content_length.parse::<usize>()
-            && len > state.max_request_body_size_bytes
-        {
-            return (
-                retry::BackendResponse {
-                    status_code: 413,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                },
-                None,
-            );
-        }
-        let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
-        match limited.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => {
-                return (
-                    retry::BackendResponse {
-                        status_code: 413,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                    },
-                    None,
-                );
-            }
-        }
-    } else {
-        match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                error!(
-                    proxy_id = %proxy.id,
-                    backend_url = %backend_url,
-                    error_kind = "client_disconnect",
-                    error = %e,
-                    "Client disconnected while sending request body (HTTP/3)"
-                );
-                return (
-                    retry::BackendResponse {
-                        status_code: 499,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: true,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ClientDisconnect),
-                    },
-                    None,
-                );
+    let request_body = match client_request_body {
+        ClientRequestBody::Buffered(body) => body,
+        ClientRequestBody::Streaming(original_req) => {
+            let (_parts, body) = (*original_req).into_parts();
+            if state.max_request_body_size_bytes > 0 {
+                // Check Content-Length fast path
+                if let Some(content_length) = headers.get("content-length")
+                    && let Ok(len) = content_length.parse::<usize>()
+                    && len > state.max_request_body_size_bytes
+                {
+                    return (
+                        retry::BackendResponse {
+                            status_code: 413,
+                            body: ResponseBody::Buffered(
+                                r#"{"error":"Request body exceeds maximum size"}"#
+                                    .as_bytes()
+                                    .to_vec(),
+                            ),
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip,
+                            error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                        },
+                        None,
+                    );
+                }
+                let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
+                match limited.collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(_) => {
+                        return (
+                            retry::BackendResponse {
+                                status_code: 413,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Request body exceeds maximum size"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip,
+                                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                            },
+                            None,
+                        );
+                    }
+                }
+            } else {
+                match body.collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(e) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            backend_url = %backend_url,
+                            error_kind = "client_disconnect",
+                            error = %e,
+                            "Client disconnected while sending request body (HTTP/3)"
+                        );
+                        return (
+                            retry::BackendResponse {
+                                status_code: 499,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: true,
+                                backend_resolved_ip: resolved_ip,
+                                error_class: Some(retry::ErrorClass::ClientDisconnect),
+                            },
+                            None,
+                        );
+                    }
+                }
             }
         }
     };
+    let request_body = apply_request_body_plugins(plugins, headers, request_body).await;
+    match run_final_request_body_hooks(plugins, headers, &request_body).await {
+        PluginResult::Continue => {}
+        reject @ PluginResult::Reject { .. } => {
+            return (
+                reject_result_to_backend_response(reject, resolved_ip.clone()),
+                None,
+            );
+        }
+    }
 
     // Retain the body for retries (always safe for H3 since we always buffer)
     let retained_body = if retain_request_body && !request_body.is_empty() {
-        Some(request_body.to_vec())
+        Some(request_body.clone())
     } else {
         None
     };
@@ -5074,7 +6064,7 @@ async fn proxy_to_backend_http3(
     let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
         Vec::new();
     for (name, value) in headers {
-        if name == "connection" || name == "transfer-encoding" {
+        if name == "connection" || name == "content-length" || name == "transfer-encoding" {
             continue;
         }
         if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
@@ -5082,6 +6072,12 @@ async fn proxy_to_backend_http3(
         } else {
             debug!("Skipping invalid HTTP/3 header: {}={}", name, value);
         }
+    }
+
+    if !request_body.is_empty()
+        && let Ok(content_length) = request_body.len().to_string().parse()
+    {
+        http3_headers.push((hyper::header::CONTENT_LENGTH, content_length));
     }
 
     // Add X-Forwarded-* headers (matching HTTP/1.1 and HTTP/2 paths)
@@ -5123,7 +6119,7 @@ async fn proxy_to_backend_http3(
                 method,
                 backend_url,
                 &http3_headers,
-                request_body,
+                request_body.into(),
                 move || connection_pool.get_tls_config_for_backend(&proxy_clone),
             )
             .await
@@ -5135,7 +6131,7 @@ async fn proxy_to_backend_http3(
                 method,
                 backend_url,
                 &http3_headers,
-                request_body,
+                request_body.into(),
                 move || connection_pool.get_tls_config_for_backend(&proxy_clone),
             )
             .await

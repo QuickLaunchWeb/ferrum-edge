@@ -1,8 +1,10 @@
 //! Access Control List (ACL) plugin — post-authentication authorization.
 //!
 //! Runs in the `authorize` phase after authentication plugins have identified
-//! the consumer. This plugin is consumer-based only:
+//! the caller. By default this plugin is consumer-based only:
 //! 1. **Consumer-based**: Allow/deny lists checked by consumer username (O(1) HashSet).
+//! 2. **Optional external-auth bypass**: `allow_authenticated_identity` permits
+//!    requests that have `ctx.authenticated_identity` set but no mapped Consumer.
 //!
 //! IP-based access control lives in the `ip_restriction` plugin so all client-IP
 //! enforcement is centralized in one place.
@@ -22,6 +24,9 @@ pub struct AccessControl {
     allowed_consumers: HashSet<String>,
     /// O(1) consumer deny list.
     disallowed_consumers: HashSet<String>,
+    /// When true, allow requests authenticated by an external auth plugin
+    /// (for example `jwks_auth`) even if no gateway Consumer was mapped.
+    allow_authenticated_identity: bool,
 }
 
 impl AccessControl {
@@ -43,16 +48,20 @@ impl AccessControl {
                     .collect()
             })
             .unwrap_or_default();
+        let allow_authenticated_identity = config["allow_authenticated_identity"]
+            .as_bool()
+            .unwrap_or(false);
 
-        if allowed.is_empty() && disallowed.is_empty() {
+        if allowed.is_empty() && disallowed.is_empty() && !allow_authenticated_identity {
             return Err(
-                "access_control: at least one of 'allowed_consumers' or 'disallowed_consumers' is required".to_string()
+                "access_control: at least one of 'allowed_consumers', 'disallowed_consumers', or 'allow_authenticated_identity=true' is required".to_string()
             );
         }
 
         Ok(Self {
             allowed_consumers: allowed,
             disallowed_consumers: disallowed,
+            allow_authenticated_identity,
         })
     }
 }
@@ -75,6 +84,9 @@ impl Plugin for AccessControl {
         let consumer = match &ctx.identified_consumer {
             Some(c) => c,
             None => {
+                if self.allow_authenticated_identity && ctx.authenticated_identity.is_some() {
+                    return PluginResult::Continue;
+                }
                 warn!(client_ip = %ctx.client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
                 return PluginResult::Reject {
                     status_code: 401,

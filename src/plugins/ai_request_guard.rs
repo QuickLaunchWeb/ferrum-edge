@@ -36,6 +36,8 @@ pub struct AiRequestGuard {
     required_metadata_fields: Vec<String>,
     /// True when the plugin needs to modify the request body (clamp or inject defaults).
     needs_body_transform: bool,
+    /// True when any configured policy needs the request body to be inspected.
+    requires_request_body: bool,
 }
 
 impl AiRequestGuard {
@@ -96,6 +98,16 @@ impl AiRequestGuard {
         let needs_body_transform = (max_tokens_limit.is_some()
             && enforce_max_tokens == MaxTokensAction::Clamp)
             || default_max_tokens.is_some();
+        let requires_request_body = needs_body_transform
+            || max_tokens_limit.is_some()
+            || !allowed_models.is_empty()
+            || !blocked_models.is_empty()
+            || require_user_field
+            || max_messages.is_some()
+            || max_prompt_characters.is_some()
+            || temperature_range.is_some()
+            || block_system_prompts
+            || !required_metadata_fields.is_empty();
 
         Self {
             max_tokens_limit,
@@ -110,6 +122,7 @@ impl AiRequestGuard {
             block_system_prompts,
             required_metadata_fields,
             needs_body_transform,
+            requires_request_body,
         }
     }
 
@@ -292,10 +305,23 @@ impl Plugin for AiRequestGuard {
         self.needs_body_transform
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.requires_request_body
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.requires_request_body
+            && ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only validate POST requests (AI APIs are always POST)
         if ctx.method != "POST" {
@@ -303,9 +329,9 @@ impl Plugin for AiRequestGuard {
         }
 
         // Check content-type
-        let content_type = ctx
-            .headers
+        let content_type = headers
             .get("content-type")
+            .or_else(|| ctx.headers.get("content-type"))
             .map(|s| s.as_str())
             .unwrap_or("");
         if !content_type.contains("json") {

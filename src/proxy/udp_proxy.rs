@@ -70,6 +70,103 @@ struct UdpSession {
 
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>>>;
 
+struct UdpDisconnectContext<'a> {
+    proxy_id: &'a str,
+    proxy_name: Option<&'a str>,
+    client_addr: SocketAddr,
+    session: &'a UdpSession,
+    backend_protocol: BackendProtocol,
+    listen_port: u16,
+    disconnected_ms: u64,
+    connection_error: Option<String>,
+    error_class: Option<crate::retry::ErrorClass>,
+}
+
+fn rfc3339_from_epoch_millis(ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransactionSummary {
+    let created_ms = context.session.created_at.load(Ordering::Relaxed);
+    let metadata = context
+        .session
+        .metadata
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+
+    StreamTransactionSummary {
+        proxy_id: context.proxy_id.to_string(),
+        proxy_name: context.proxy_name.map(|name| name.to_string()),
+        client_ip: context.client_addr.ip().to_string(),
+        backend_target: context.session.backend_target.clone(),
+        backend_resolved_ip: Some(context.session.backend_resolved_ip.clone()),
+        protocol: context.backend_protocol.to_string(),
+        listen_port: context.listen_port,
+        duration_ms: context.disconnected_ms.saturating_sub(created_ms) as f64,
+        bytes_sent: context.session.bytes_sent.load(Ordering::Relaxed),
+        bytes_received: context.session.bytes_received.load(Ordering::Relaxed),
+        connection_error: context.connection_error,
+        error_class: context.error_class,
+        timestamp_connected: rfc3339_from_epoch_millis(created_ms),
+        timestamp_disconnected: rfc3339_from_epoch_millis(context.disconnected_ms),
+        metadata,
+    }
+}
+
+async fn emit_udp_stream_disconnect(
+    plugins: &[Arc<dyn Plugin>],
+    context: UdpDisconnectContext<'_>,
+) {
+    if plugins.is_empty() {
+        return;
+    }
+
+    let summary = build_udp_stream_summary(context);
+    for plugin in plugins {
+        plugin.on_stream_disconnect(&summary).await;
+    }
+}
+
+struct DtlsDisconnectContext<'a> {
+    proxy_id: &'a str,
+    proxy_name: Option<&'a str>,
+    client_addr: SocketAddr,
+    backend_target: &'a str,
+    backend_resolved_ip: Option<&'a str>,
+    backend_protocol: BackendProtocol,
+    listen_port: u16,
+    connected_at: chrono::DateTime<chrono::Utc>,
+    disconnected_at: chrono::DateTime<chrono::Utc>,
+    bytes_sent: u64,
+    bytes_received: u64,
+    connection_error: Option<String>,
+    error_class: Option<crate::retry::ErrorClass>,
+    metadata: &'a std::collections::HashMap<String, String>,
+}
+
+fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        proxy_id: context.proxy_id.to_string(),
+        proxy_name: context.proxy_name.map(|name| name.to_string()),
+        client_ip: context.client_addr.ip().to_string(),
+        backend_target: context.backend_target.to_string(),
+        backend_resolved_ip: context.backend_resolved_ip.map(str::to_string),
+        protocol: context.backend_protocol.to_string(),
+        listen_port: context.listen_port,
+        duration_ms: (context.disconnected_at - context.connected_at).num_milliseconds() as f64,
+        bytes_sent: context.bytes_sent,
+        bytes_received: context.bytes_received,
+        connection_error: context.connection_error,
+        error_class: context.error_class,
+        timestamp_connected: context.connected_at.to_rfc3339(),
+        timestamp_disconnected: context.disconnected_at.to_rfc3339(),
+        metadata: context.metadata.clone(),
+    }
+}
+
 /// Configuration for starting a UDP proxy listener.
 pub struct UdpListenerConfig {
     pub port: u16,
@@ -502,39 +599,21 @@ fn spawn_session_cleanup(
                                 "UDP session expired (idle timeout)"
                             );
 
-                            // Fire on_stream_disconnect plugins
-                            if !plugins.is_empty() {
-                                let created_ms = session.created_at.load(Ordering::Relaxed);
-                                let duration_ms = (now.saturating_sub(created_ms)) as f64;
-                                let metadata = session.metadata.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                // Convert epoch millis to RFC3339 timestamps for logging.
-                                let ts_connected = chrono::DateTime::from_timestamp_millis(created_ms as i64)
-                                    .map(|dt| dt.to_rfc3339())
-                                    .unwrap_or_default();
-                                let ts_disconnected = chrono::DateTime::from_timestamp_millis(now as i64)
-                                    .map(|dt| dt.to_rfc3339())
-                                    .unwrap_or_default();
-                                let summary = StreamTransactionSummary {
-                                    proxy_id: proxy_id.clone(),
-                                    proxy_name: proxy_name.clone(),
-                                    client_ip: addr.ip().to_string(),
-                                    backend_target: session.backend_target.clone(),
-                                    backend_resolved_ip: Some(session.backend_resolved_ip.clone()),
-                                    protocol: backend_protocol.to_string(),
+                            emit_udp_stream_disconnect(
+                                &plugins,
+                                UdpDisconnectContext {
+                                    proxy_id: &proxy_id,
+                                    proxy_name: proxy_name.as_deref(),
+                                    client_addr: *addr,
+                                    session: &session,
+                                    backend_protocol,
                                     listen_port,
-                                    duration_ms,
-                                    bytes_sent: bs,
-                                    bytes_received: br,
+                                    disconnected_ms: now,
                                     connection_error: None,
                                     error_class: None,
-                                    timestamp_connected: ts_connected,
-                                    timestamp_disconnected: ts_disconnected,
-                                    metadata,
-                                };
-                                for plugin in plugins.iter() {
-                                    plugin.on_stream_disconnect(&summary).await;
-                                }
-                            }
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
@@ -682,8 +761,8 @@ async fn start_dtls_frontend_listener(
                         &handler_cb_cache,
                     )
                     .await;
-                    let err_msg = match &result.outcome {
-                        Ok(()) => None,
+                    let (err_msg, error_class) = match &result.outcome {
+                        Ok(()) => (None, None),
                         Err(e) => {
                             debug!(
                                 proxy_id = %handler_proxy_id,
@@ -691,30 +770,32 @@ async fn start_dtls_frontend_listener(
                                 "DTLS client session ended: {}",
                                 e
                             );
-                            Some(e.to_string())
+                            (
+                                Some(e.to_string()),
+                                Some(crate::retry::classify_boxed_error(e.as_ref())),
+                            )
                         }
                     };
 
                     // Fire on_stream_disconnect plugins
                     if !handler_plugins.is_empty() {
                         let disconnected_at = chrono::Utc::now();
-                        let summary = StreamTransactionSummary {
-                            proxy_id: handler_proxy_id.to_string(),
-                            proxy_name: handler_proxy_name,
-                            client_ip: client_addr.ip().to_string(),
-                            backend_target: result.backend.backend_target,
-                            backend_resolved_ip: result.backend.backend_resolved_ip,
-                            protocol: backend_protocol.to_string(),
+                        let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+                            proxy_id: &handler_proxy_id,
+                            proxy_name: handler_proxy_name.as_deref(),
+                            client_addr,
+                            backend_target: &result.backend.backend_target,
+                            backend_resolved_ip: result.backend.backend_resolved_ip.as_deref(),
+                            backend_protocol,
                             listen_port: port,
-                            duration_ms: (disconnected_at - connected_at).num_milliseconds() as f64,
-                            bytes_sent: 0,
-                            bytes_received: 0,
+                            connected_at,
+                            disconnected_at,
+                            bytes_sent: result.bytes_sent,
+                            bytes_received: result.bytes_received,
                             connection_error: err_msg,
-                            error_class: None,
-                            timestamp_connected: connected_at.to_rfc3339(),
-                            timestamp_disconnected: disconnected_at.to_rfc3339(),
-                            metadata: handler_metadata,
-                        };
+                            error_class,
+                            metadata: &handler_metadata,
+                        });
                         for plugin in handler_plugins.iter() {
                             plugin.on_stream_disconnect(&summary).await;
                         }
@@ -747,6 +828,8 @@ struct DtlsBackendInfo {
 /// Result of a DTLS client handler: backend info (always present) plus the outcome.
 struct DtlsHandlerResult {
     backend: DtlsBackendInfo,
+    bytes_sent: u64,
+    bytes_received: u64,
     outcome: Result<(), anyhow::Error>,
 }
 
@@ -774,6 +857,8 @@ async fn handle_dtls_client(
         backend_target: String::new(),
         backend_resolved_ip: None,
     };
+    let bytes_sent = Arc::new(AtomicU64::new(0));
+    let bytes_received = Arc::new(AtomicU64::new(0));
     let outcome = handle_dtls_client_inner(
         client_conn,
         client_addr,
@@ -785,10 +870,14 @@ async fn handle_dtls_client(
         tls_no_verify,
         circuit_breaker_cache,
         &mut backend_info,
+        Arc::clone(&bytes_sent),
+        Arc::clone(&bytes_received),
     )
     .await;
     DtlsHandlerResult {
         backend: backend_info,
+        bytes_sent: bytes_sent.load(Ordering::Relaxed),
+        bytes_received: bytes_received.load(Ordering::Relaxed),
         outcome,
     }
 }
@@ -805,6 +894,8 @@ async fn handle_dtls_client_inner(
     tls_no_verify: bool,
     circuit_breaker_cache: &CircuitBreakerCache,
     backend_info: &mut DtlsBackendInfo,
+    bytes_sent: Arc<AtomicU64>,
+    bytes_received: Arc<AtomicU64>,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let current_config = config.load();
@@ -987,6 +1078,7 @@ async fn handle_dtls_client_inner(
     let backend_dtls_cleanup = backend_dtls.clone();
     let metrics_fwd = metrics.clone();
     let proxy_id_fwd = proxy_id.to_string();
+    let bytes_sent_fwd = Arc::clone(&bytes_sent);
 
     // Client → Backend
     let client_to_backend = tokio::spawn(async move {
@@ -1026,12 +1118,14 @@ async fn handle_dtls_client_inner(
             metrics_fwd
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
+            bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
         }
     });
 
     // Backend → Client
     let metrics_rev = metrics.clone();
     let proxy_id_rev = proxy_id.to_string();
+    let bytes_received_rev = Arc::clone(&bytes_received);
 
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -1070,6 +1164,7 @@ async fn handle_dtls_client_inner(
             metrics_rev
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
+            bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
         }
     });
 
@@ -1311,9 +1406,14 @@ async fn create_session(
     let reply_metrics = metrics.clone();
     let reply_sessions = sessions.clone();
     let reply_dtls = dtls_conn;
+    let reply_plugins = plugins.to_vec();
+    let reply_proxy_name = proxy_name.map(str::to_string);
+    let reply_backend_protocol = backend_protocol;
+    let reply_listen_port = listen_port;
     let is_dtls = reply_dtls.is_some();
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
+        let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
         loop {
             // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
             let (data_slice, data_vec);
@@ -1333,6 +1433,13 @@ async fn create_session(
                             "UDP backend DTLS recv error: {}",
                             e
                         );
+                        let error_message = e.to_string();
+                        disconnect_error = Some((
+                            error_message.clone(),
+                            crate::retry::classify_boxed_error(
+                                anyhow::anyhow!(error_message).as_ref(),
+                            ),
+                        ));
                         break;
                     }
                 }
@@ -1351,6 +1458,13 @@ async fn create_session(
                             "UDP backend recv error: {}",
                             e
                         );
+                        let error_message = e.to_string();
+                        disconnect_error = Some((
+                            error_message.clone(),
+                            crate::retry::classify_boxed_error(
+                                anyhow::anyhow!(error_message).as_ref(),
+                            ),
+                        ));
                         break;
                     }
                 }
@@ -1379,6 +1493,11 @@ async fn create_session(
                     "UDP send to client failed: {}",
                     e
                 );
+                let error_message = e.to_string();
+                disconnect_error = Some((
+                    error_message.clone(),
+                    crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
+                ));
                 break;
             }
 
@@ -1422,6 +1541,24 @@ async fn create_session(
                                     reply_metrics
                                         .active_sessions
                                         .fetch_sub(1, Ordering::Relaxed);
+                                    let error_message = e.to_string();
+                                    emit_udp_stream_disconnect(
+                                        &reply_plugins,
+                                        UdpDisconnectContext {
+                                            proxy_id: &reply_proxy_id,
+                                            proxy_name: reply_proxy_name.as_deref(),
+                                            client_addr,
+                                            session: &reply_session,
+                                            backend_protocol: reply_backend_protocol,
+                                            listen_port: reply_listen_port,
+                                            disconnected_ms: now,
+                                            connection_error: Some(error_message.clone()),
+                                            error_class: Some(crate::retry::classify_boxed_error(
+                                                anyhow::anyhow!(error_message).as_ref(),
+                                            )),
+                                        },
+                                    )
+                                    .await;
                                 }
                                 return;
                             }
@@ -1454,6 +1591,26 @@ async fn create_session(
             reply_metrics
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
+            let disconnected_ms = coarse_epoch_millis();
+            let (connection_error, error_class) = match disconnect_error {
+                Some((message, error_class)) => (Some(message), Some(error_class)),
+                None => (None, None),
+            };
+            emit_udp_stream_disconnect(
+                &reply_plugins,
+                UdpDisconnectContext {
+                    proxy_id: &reply_proxy_id,
+                    proxy_name: reply_proxy_name.as_deref(),
+                    client_addr,
+                    session: &reply_session,
+                    backend_protocol: reply_backend_protocol,
+                    listen_port: reply_listen_port,
+                    disconnected_ms,
+                    connection_error,
+                    error_class,
+                },
+            )
+            .await;
         }
     });
 
@@ -1512,4 +1669,196 @@ fn epoch_millis_precise() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DtlsDisconnectContext, UdpDisconnectContext, UdpSession, build_dtls_stream_summary,
+        build_udp_stream_summary, emit_udp_stream_disconnect,
+    };
+    use crate::config::types::BackendProtocol;
+    use crate::plugins::{Plugin, StreamTransactionSummary};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard};
+
+    fn make_udp_session() -> UdpSession {
+        UdpSession {
+            backend_socket: None,
+            dtls_conn: None,
+            last_activity: AtomicU64::new(1_710_000_000_500),
+            created_at: AtomicU64::new(1_710_000_000_000),
+            bytes_sent: AtomicU64::new(128),
+            bytes_received: AtomicU64::new(256),
+            backend_target: "10.0.0.50:5353".to_string(),
+            backend_resolved_ip: "10.0.0.50".to_string(),
+            metadata: std::sync::Mutex::new(HashMap::from([(
+                "request_id".to_string(),
+                "stream-123".to_string(),
+            )])),
+        }
+    }
+
+    #[test]
+    fn test_build_dtls_stream_summary_preserves_bytes_error_and_metadata() {
+        let client_addr: SocketAddr = "127.0.0.1:54000".parse().unwrap();
+        let connected_at = chrono::Utc::now() - chrono::TimeDelta::milliseconds(750);
+        let disconnected_at = chrono::Utc::now();
+        let metadata = HashMap::from([("request_id".to_string(), "dtls-123".to_string())]);
+
+        let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            proxy_id: "dtls-proxy",
+            proxy_name: Some("DTLS Proxy"),
+            client_addr,
+            backend_target: "10.0.0.60:7443",
+            backend_resolved_ip: Some("10.0.0.60"),
+            backend_protocol: BackendProtocol::Dtls,
+            listen_port: 7443,
+            connected_at,
+            disconnected_at,
+            bytes_sent: 321,
+            bytes_received: 654,
+            connection_error: Some("tls alert".to_string()),
+            error_class: Some(crate::retry::ErrorClass::TlsError),
+            metadata: &metadata,
+        });
+
+        assert_eq!(summary.proxy_id, "dtls-proxy");
+        assert_eq!(summary.proxy_name.as_deref(), Some("DTLS Proxy"));
+        assert_eq!(summary.client_ip, "127.0.0.1");
+        assert_eq!(summary.backend_target, "10.0.0.60:7443");
+        assert_eq!(summary.backend_resolved_ip.as_deref(), Some("10.0.0.60"));
+        assert_eq!(summary.protocol, "dtls");
+        assert_eq!(summary.listen_port, 7443);
+        assert_eq!(summary.bytes_sent, 321);
+        assert_eq!(summary.bytes_received, 654);
+        assert_eq!(summary.connection_error.as_deref(), Some("tls alert"));
+        assert_eq!(
+            summary.error_class,
+            Some(crate::retry::ErrorClass::TlsError)
+        );
+        assert_eq!(
+            summary.metadata.get("request_id").map(String::as_str),
+            Some("dtls-123")
+        );
+        assert!(summary.duration_ms >= 0.0);
+    }
+
+    struct CapturePlugin {
+        summaries: Arc<Mutex<Vec<StreamTransactionSummary>>>,
+    }
+
+    #[async_trait]
+    impl Plugin for CapturePlugin {
+        fn name(&self) -> &str {
+            "capture"
+        }
+
+        async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+            lock(&self.summaries).push(summary.clone());
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_build_udp_stream_summary_preserves_bytes_error_and_metadata() {
+        let client_addr: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let session = make_udp_session();
+
+        let summary = build_udp_stream_summary(UdpDisconnectContext {
+            proxy_id: "udp-proxy",
+            proxy_name: Some("UDP Proxy"),
+            client_addr,
+            session: &session,
+            backend_protocol: BackendProtocol::Udp,
+            listen_port: 5353,
+            disconnected_ms: 1_710_000_001_500,
+            connection_error: Some("connection reset by peer".to_string()),
+            error_class: Some(crate::retry::ErrorClass::ConnectionReset),
+        });
+
+        assert_eq!(summary.proxy_id, "udp-proxy");
+        assert_eq!(summary.proxy_name.as_deref(), Some("UDP Proxy"));
+        assert_eq!(summary.client_ip, "127.0.0.1");
+        assert_eq!(summary.backend_target, "10.0.0.50:5353");
+        assert_eq!(summary.backend_resolved_ip.as_deref(), Some("10.0.0.50"));
+        assert_eq!(summary.protocol, "udp");
+        assert_eq!(summary.listen_port, 5353);
+        assert_eq!(summary.duration_ms, 1500.0);
+        assert_eq!(summary.bytes_sent, 128);
+        assert_eq!(summary.bytes_received, 256);
+        assert_eq!(
+            summary.connection_error.as_deref(),
+            Some("connection reset by peer")
+        );
+        assert_eq!(
+            summary.error_class,
+            Some(crate::retry::ErrorClass::ConnectionReset)
+        );
+        assert_eq!(
+            summary.metadata.get("request_id").map(String::as_str),
+            Some("stream-123")
+        );
+        assert!(
+            summary.timestamp_connected.ends_with("+00:00")
+                || summary.timestamp_connected.ends_with('Z')
+        );
+        assert!(
+            summary.timestamp_disconnected.ends_with("+00:00")
+                || summary.timestamp_disconnected.ends_with('Z')
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emit_udp_stream_disconnect_notifies_plugins() {
+        let client_addr: SocketAddr = "127.0.0.1:53001".parse().unwrap();
+        let session = make_udp_session();
+        session.bytes_sent.store(512, Ordering::Relaxed);
+        session.bytes_received.store(1024, Ordering::Relaxed);
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(CapturePlugin {
+            summaries: Arc::clone(&captured),
+        })];
+
+        emit_udp_stream_disconnect(
+            &plugins,
+            UdpDisconnectContext {
+                proxy_id: "udp-proxy",
+                proxy_name: Some("UDP Proxy"),
+                client_addr,
+                session: &session,
+                backend_protocol: BackendProtocol::Dtls,
+                listen_port: 7443,
+                disconnected_ms: 1_710_000_002_000,
+                connection_error: Some("Backend DTLS handshake failed".to_string()),
+                error_class: Some(crate::retry::ErrorClass::TlsError),
+            },
+        )
+        .await;
+
+        let summaries = lock(&captured);
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.protocol, "dtls");
+        assert_eq!(summary.bytes_sent, 512);
+        assert_eq!(summary.bytes_received, 1024);
+        assert_eq!(summary.listen_port, 7443);
+        assert_eq!(
+            summary.connection_error.as_deref(),
+            Some("Backend DTLS handshake failed")
+        );
+        assert_eq!(
+            summary.error_class,
+            Some(crate::retry::ErrorClass::TlsError)
+        );
+    }
 }

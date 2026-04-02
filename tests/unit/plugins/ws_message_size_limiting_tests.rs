@@ -241,6 +241,29 @@ async fn test_custom_close_reason() {
     }
 }
 
+#[tokio::test]
+async fn test_close_reason_is_truncated_to_websocket_limit() {
+    let long_reason = "payload-".repeat(20);
+    let plugin =
+        WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 5, "close_reason": long_reason}));
+    let msg = Message::Text("123456".into());
+    let result = plugin
+        .on_ws_frame(
+            "test-proxy",
+            1,
+            WebSocketFrameDirection::ClientToBackend,
+            &msg,
+        )
+        .await;
+    match result.unwrap() {
+        Message::Close(Some(cf)) => {
+            assert!(cf.reason.as_str().len() <= 123);
+            assert!(cf.reason.as_str().starts_with("payload-"));
+        }
+        other => panic!("Expected Close frame, got {:?}", other),
+    }
+}
+
 // === Close/Pong frames are not checked ===
 
 #[tokio::test]

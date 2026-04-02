@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (33 built-in plugins including 4 AI/LLM-specific plugins, 2 gRPC-specific plugins, and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (34 built-in plugins including 4 AI/LLM-specific plugins, 2 gRPC-specific plugins, and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -150,7 +150,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (33 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
+├── plugins/                   # Plugin system (34 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure
@@ -231,16 +231,27 @@ TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts ar
 
 Plugins execute in priority order (lower number = runs first). The lifecycle phases are:
 
-1. `on_request_received` — Correlation ID, request transformer, bot detection
-2. `authenticate` — Key auth, basic auth, JWT, HMAC, JWKS
-3. `authorize` — Access control (ACL), IP restriction
-4. `before_proxy` — Rate limiting, AI prompt shield, body validation, AI request guard, request termination
-5. `after_proxy` — Response transformer, CORS headers
-6. `on_response_body` — AI token metrics, AI rate limiter (token counting)
-7. `log` — Stdout logging, HTTP logging, Prometheus, OpenTelemetry
-8. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
+1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), gRPC method router (275)
+2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
+3. `authorize` — Access control / ACL (2000). Supports `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
+4. `before_proxy` — Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), gRPC deadline (3050)
+5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites
+6. `after_proxy` — Response size limiting (3490), response caching (3500), response transformer (4000), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
+7. `on_final_response_body` — Post-transform response body hooks. Response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
+8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
+9. `log` — Stdout logging (9000), HTTP logging (9100), transaction debugger (9200), Prometheus (9300), OTel tracing (25)
+10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
+11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for logging, metrics, and tracing plugins
 
-Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::WS_MESSAGE_SIZE_LIMITING = 2810`).
+**Multi-auth**: `AuthMode::Multi` recognizes both `ctx.identified_consumer` (consumer-backed auth) and `ctx.authenticated_identity` (external JWKS/OIDC identity) as successful authentication. First-success-wins semantics apply.
+
+**gRPC rejection normalization**: Plugin rejects for `application/grpc` requests are converted to trailers-only gRPC errors (`HTTP 200` + `grpc-status` / `grpc-message`) rather than raw HTTP error responses. This includes pre-proxy rejects, response-path rejects, route misses, and method filtering.
+
+**Request body buffering**: Two-tier system — config-time upper bound (`requires_request_body_buffering()`) determines if a proxy _may_ need buffering, then request-time check (`should_buffer_request_body()`) decides per-request. Only plugins that read the body (graphql, body_validator, ai_request_guard, ai_prompt_shield) trigger buffering; transform-only plugins do not force early prebuffering.
+
+**External identity support**: `ctx.authenticated_identity` (set by JWKS/OIDC) is treated as a first-class principal across rate-limit keys, cache keys, log summaries, and backend identity-header injection on all protocol paths (HTTP, HTTP/3, gRPC, WebSocket).
+
+Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`).
 
 ### DNS Cache (`src/dns/mod.rs`)
 

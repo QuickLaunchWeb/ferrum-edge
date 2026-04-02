@@ -19,7 +19,7 @@ use sha2::{Sha256, Sha512};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
 use crate::consumer_index::ConsumerIndex;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -43,12 +43,12 @@ impl HmacAuth {
                 mac.update(data);
                 Some(mac.finalize().into_bytes().to_vec())
             }
-            _ => {
-                // Default to hmac-sha256
+            "hmac-sha256" => {
                 let mut mac = HmacSha256::new_from_slice(secret).ok()?;
                 mac.update(data);
                 Some(mac.finalize().into_bytes().to_vec())
             }
+            _ => None,
         }
     }
 
@@ -126,15 +126,16 @@ impl Plugin for HmacAuth {
         };
 
         // Parse: hmac username="...", algorithm="...", signature="..."
-        if !auth_header.to_lowercase().starts_with("hmac ") {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid HMAC authorization format"}"#.to_string(),
-                headers: HashMap::new(),
-            };
-        }
-
-        let params_str = &auth_header[5..];
+        let params_str = match strip_auth_scheme(&auth_header, "hmac") {
+            Some(params) => params,
+            None => {
+                return PluginResult::Reject {
+                    status_code: 401,
+                    body: r#"{"error":"Invalid HMAC authorization format"}"#.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
+        };
         let mut username = None;
         let mut algorithm = None;
         let mut signature = None;
@@ -164,7 +165,16 @@ impl Plugin for HmacAuth {
             }
         };
 
-        let algorithm = algorithm.unwrap_or_else(|| "hmac-sha256".to_string());
+        let algorithm = algorithm
+            .unwrap_or_else(|| "hmac-sha256".to_string())
+            .to_ascii_lowercase();
+        if !matches!(algorithm.as_str(), "hmac-sha256" | "hmac-sha512") {
+            return PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"Unsupported HMAC algorithm"}"#.to_string(),
+                headers: HashMap::new(),
+            };
+        }
 
         let signature = match signature {
             Some(s) => s,

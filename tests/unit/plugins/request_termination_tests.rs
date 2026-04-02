@@ -24,7 +24,10 @@ fn make_ctx_with_header(method: &str, path: &str, header: &str, value: &str) -> 
 async fn test_creation_defaults() {
     let plugin = RequestTermination::new(&json!({}));
     assert_eq!(plugin.name(), "request_termination");
-    assert_eq!(plugin.priority(), 75);
+    assert_eq!(
+        plugin.priority(),
+        ferrum_edge::plugins::priority::REQUEST_TERMINATION
+    );
 }
 
 // === Always trigger ===

@@ -31,6 +31,8 @@ pub struct WsMessageSizeLimiting {
 }
 
 impl WsMessageSizeLimiting {
+    const MAX_CLOSE_REASON_BYTES: usize = 123;
+
     pub fn new(config: &Value) -> Self {
         let max_frame_bytes = config["max_frame_bytes"].as_u64().unwrap_or(0) as usize;
 
@@ -40,15 +42,33 @@ impl WsMessageSizeLimiting {
             );
         }
 
-        let close_reason = config["close_reason"]
+        let mut close_reason = config["close_reason"]
             .as_str()
             .unwrap_or("Message too large")
             .to_string();
+        if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
+            tracing::warn!(
+                max_bytes = Self::MAX_CLOSE_REASON_BYTES,
+                "ws_message_size_limiting: 'close_reason' exceeds WebSocket limit — truncating"
+            );
+            close_reason.truncate(Self::truncate_utf8_boundary(
+                &close_reason,
+                Self::MAX_CLOSE_REASON_BYTES,
+            ));
+        }
 
         Self {
             max_frame_bytes,
             close_reason,
         }
+    }
+
+    fn truncate_utf8_boundary(value: &str, max_bytes: usize) -> usize {
+        let mut end = value.len().min(max_bytes);
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
     }
 
     /// Returns the byte length of a WebSocket message payload.

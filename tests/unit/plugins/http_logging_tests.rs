@@ -75,6 +75,34 @@ async fn test_http_logging_invalid_url_does_not_panic() {
 }
 
 #[tokio::test]
+async fn test_http_logging_rejects_malformed_endpoint_url() {
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "not a valid url"
+        }),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
+        Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_logging_rejects_non_http_scheme() {
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "tcp://127.0.0.1:9000/logs"
+        }),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(e.contains("http:// or https://")),
+        Ok(_) => panic!("Expected non-http endpoint_url to be rejected"),
+    }
+}
+
+#[tokio::test]
 async fn test_http_logging_with_authorization_header() {
     let plugin = HttpLogging::new(
         &json!({

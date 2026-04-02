@@ -1,8 +1,7 @@
 //! Request transformer plugin — modifies headers, query params, and body before proxying.
 //!
-//! Header/query rules execute in `on_request_received` (before auth) for operations
-//! like add/remove/update/rename. Body rules execute in `before_proxy` (after auth)
-//! because they require the request body to be buffered.
+//! Header/query rules execute in `before_proxy` before the backend request is built.
+//! Body rules also execute there because they require the request body to be buffered.
 //!
 //! Header keys are pre-lowercased at config parse time to avoid per-request
 //! `to_lowercase()` allocations on the hot path.

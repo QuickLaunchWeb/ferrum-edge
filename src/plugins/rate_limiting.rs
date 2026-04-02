@@ -628,11 +628,7 @@ impl Plugin for RateLimiting {
             return PluginResult::Continue;
         }
 
-        if let Some(consumer) = &ctx.identified_consumer {
-            let key = format!("consumer:{}", consumer.username);
-            self.check_rate(&key, ctx).await
-        } else if let Some(ref identity) = ctx.authenticated_identity {
-            // External auth (e.g. jwks_auth) identified a user without a gateway Consumer
+        if let Some(identity) = ctx.effective_identity() {
             let key = format!("consumer:{}", identity);
             self.check_rate(&key, ctx).await
         } else {

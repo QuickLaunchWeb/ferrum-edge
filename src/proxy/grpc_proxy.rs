@@ -588,8 +588,17 @@ pub enum GrpcProxyError {
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
+    pub const INVALID_ARGUMENT: u32 = 3;
     pub const DEADLINE_EXCEEDED: u32 = 4;
+    pub const NOT_FOUND: u32 = 5;
+    pub const PERMISSION_DENIED: u32 = 7;
+    pub const RESOURCE_EXHAUSTED: u32 = 8;
+    pub const FAILED_PRECONDITION: u32 = 9;
+    pub const ABORTED: u32 = 10;
+    pub const UNIMPLEMENTED: u32 = 12;
+    pub const INTERNAL: u32 = 13;
     pub const UNAVAILABLE: u32 = 14;
+    pub const UNAUTHENTICATED: u32 = 16;
 }
 
 /// Build a gRPC error response with proper Trailers-Only encoding.

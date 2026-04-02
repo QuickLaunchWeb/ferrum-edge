@@ -212,10 +212,7 @@ impl ResponseCaching {
         };
 
         let consumer_part = if self.config.cache_key_include_consumer {
-            ctx.identified_consumer
-                .as_ref()
-                .map(|c| c.username.as_str())
-                .unwrap_or("_anon")
+            ctx.effective_identity().unwrap_or("_anon")
         } else {
             ""
         };
@@ -509,30 +506,20 @@ impl Plugin for ResponseCaching {
             }
         }
 
-        // Store TTL in metadata for on_response_body
+        // Store TTL in metadata for on_final_response_body.
+        // cache_key is already stored above. Headers and status are passed
+        // directly as parameters to on_final_response_body (post-transform).
         ctx.metadata
             .insert("cache_ttl_secs".to_string(), ttl.as_secs().to_string());
-        // Keep cache_key in metadata for on_response_body
-
-        // Store response headers in metadata (serialized as JSON)
-        // so on_response_body can reconstruct the cache entry.
-        if let Ok(headers_json) = serde_json::to_string(response_headers) {
-            ctx.metadata
-                .insert("cache_response_headers".to_string(), headers_json);
-        }
-        ctx.metadata.insert(
-            "cache_response_status".to_string(),
-            response_status.to_string(),
-        );
 
         PluginResult::Continue
     }
 
-    async fn on_response_body(
+    async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
         // Check if we should cache this response
@@ -562,18 +549,11 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        // Reconstruct cached headers from metadata
-        let cached_headers: HashMap<String, String> = ctx
-            .metadata
-            .get("cache_response_headers")
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or_default();
-
-        let status_code: u16 = ctx
-            .metadata
-            .get("cache_response_status")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(200);
+        // Use the post-transform headers and status passed into this phase,
+        // not the stale pre-transform snapshot from after_proxy metadata.
+        // This ensures cached entries include response_transformer modifications
+        // (header add/update/remove/rename) and correct content-length.
+        let status_code: u16 = response_status;
 
         let ttl_secs: u64 = ctx
             .metadata
@@ -583,7 +563,7 @@ impl Plugin for ResponseCaching {
 
         let entry = CacheEntry {
             status_code,
-            headers: cached_headers,
+            headers: response_headers.clone(),
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
             ttl: Duration::from_secs(ttl_secs),

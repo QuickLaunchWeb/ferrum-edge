@@ -39,6 +39,33 @@ fn test_graphql_plugin_creation() {
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
     assert_eq!(plugin.name(), "graphql");
     assert_eq!(plugin.priority(), 2850);
+    assert!(plugin.requires_request_body_buffering());
+}
+
+#[test]
+fn test_graphql_empty_config_does_not_force_request_buffering() {
+    let plugin = create_plugin("graphql", &json!({})).unwrap().unwrap();
+    assert!(!plugin.requires_request_body_buffering());
+}
+
+#[test]
+fn test_graphql_only_buffers_matching_post_json_requests() {
+    let plugin = create_plugin("graphql", &json!({"max_depth": 5}))
+        .unwrap()
+        .unwrap();
+
+    let post_json_ctx = create_graphql_context("{ user { id } }", None);
+    assert!(plugin.should_buffer_request_body(&post_json_ctx));
+
+    let mut get_ctx = create_graphql_context("{ user { id } }", None);
+    get_ctx.method = "GET".to_string();
+    assert!(!plugin.should_buffer_request_body(&get_ctx));
+
+    let mut text_ctx = create_graphql_context("{ user { id } }", None);
+    text_ctx
+        .headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!plugin.should_buffer_request_body(&text_ctx));
 }
 
 #[test]
@@ -323,6 +350,39 @@ async fn test_named_operation_rate_limiting() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(429));
+}
+
+#[tokio::test]
+async fn test_consumer_rate_limiting_uses_authenticated_identity_fallback() {
+    let config = json!({
+        "limit_by": "consumer",
+        "type_rate_limits": {
+            "mutation": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+    let query = "mutation { createUser(name: \"a\") { id } }";
+
+    let mut ctx = create_graphql_context(query, None);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("oidc-user-a".to_string());
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let mut ctx = create_graphql_context(query, None);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("oidc-user-a".to_string());
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(429));
+
+    let mut ctx = create_graphql_context(query, None);
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("oidc-user-b".to_string());
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
 }
 
 // ── Non-GraphQL requests pass through ──

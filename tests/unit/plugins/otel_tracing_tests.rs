@@ -203,6 +203,40 @@ async fn test_otel_tracing_no_traceparent_when_generate_disabled() {
 }
 
 #[tokio::test]
+async fn test_otel_tracing_malformed_traceparent_does_not_generate_when_disabled() {
+    let plugin = new_otel(&json!({"generate_trace_id": false}));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "traceparent".to_string(),
+        "not-a-valid-traceparent".to_string(),
+    );
+
+    plugin.on_request_received(&mut ctx).await;
+
+    assert!(!ctx.metadata.contains_key("traceparent"));
+    assert!(!ctx.metadata.contains_key("trace_id"));
+    assert!(!ctx.metadata.contains_key("span_id"));
+}
+
+#[tokio::test]
+async fn test_otel_tracing_malformed_traceparent_generates_and_stores_context() {
+    let plugin = new_otel(&json!({}));
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "traceparent".to_string(),
+        "not-a-valid-traceparent".to_string(),
+    );
+
+    plugin.on_request_received(&mut ctx).await;
+
+    let traceparent = ctx.metadata.get("traceparent").unwrap();
+    assert!(traceparent.starts_with("00-"));
+    assert!(ctx.metadata.contains_key("trace_id"));
+    assert!(ctx.metadata.contains_key("span_id"));
+    assert!(!ctx.metadata.contains_key("parent_span_id"));
+}
+
+#[tokio::test]
 async fn test_otel_tracing_log_emits_without_otlp() {
     // Propagation-only mode: no endpoint configured
     let plugin =

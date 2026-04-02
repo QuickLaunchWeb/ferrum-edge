@@ -51,6 +51,15 @@ async fn test_access_control_empty_consumer_lists_reject_creation() {
 }
 
 #[tokio::test]
+async fn test_access_control_creation_with_allow_authenticated_identity_only() {
+    let config = json!({
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+    assert_eq!(plugin.name(), "access_control");
+}
+
+#[tokio::test]
 async fn test_access_control_allowed_consumer() {
     let config = json!({
         "allowed_consumers": ["testuser"]
@@ -98,6 +107,62 @@ async fn test_access_control_no_consumer_identified() {
     ctx.identified_consumer = None;
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_access_control_allows_authenticated_identity_when_enabled() {
+    let config = json!({
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("oidc-user-123".to_string());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_access_control_authenticated_identity_still_rejected_when_disabled() {
+    let config = json!({
+        "allowed_consumers": ["admin"]
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("oidc-user-123".to_string());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_access_control_enabled_but_no_authenticated_identity_still_rejects() {
+    let config = json!({
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    let result = plugin.authorize(&mut ctx).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_access_control_consumer_rules_still_apply_when_authenticated_identity_also_present() {
+    let config = json!({
+        "disallowed_consumers": ["testuser"],
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.authenticated_identity = Some("external-user".to_string());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_reject(result, Some(403));
 }
 
 #[tokio::test]

@@ -349,6 +349,24 @@ async fn test_empty_config_passes_through() {
 }
 
 #[tokio::test]
+async fn test_modified_timeout_header_takes_precedence_over_original_request() {
+    let config = json!({ "max_deadline_ms": 999999999 });
+    let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(Some("60S"));
+    let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000m".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.metadata.get("grpc_original_deadline_ms").unwrap(),
+        "5000"
+    );
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "5000m");
+}
+
+#[tokio::test]
 async fn test_empty_config_no_timeout_passes() {
     let config = json!({});
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
@@ -459,6 +477,7 @@ async fn test_very_large_hour_timeout_saturates() {
 
     // Should not panic — saturating_mul prevents overflow
     assert!(ctx.metadata.contains_key("grpc_original_deadline_ms"));
+    assert_eq!(headers.get("grpc-timeout").unwrap(), "1000000S");
 }
 
 // ── subtract_gateway_processing + max_deadline_ms combined ──

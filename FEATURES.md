@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 33 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, on WebSocket frame, log)
+- 34 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification

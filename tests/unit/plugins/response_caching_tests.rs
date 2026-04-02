@@ -45,7 +45,7 @@ fn plugin_with_config(config: serde_json::Value) -> ResponseCaching {
     ResponseCaching::new(&config)
 }
 
-// Helper to simulate a full cache flow: before_proxy (miss) -> after_proxy -> on_response_body
+// Helper to simulate a full cache flow: before_proxy (miss) -> after_proxy -> on_final_response_body
 async fn cache_response(
     plugin: &ResponseCaching,
     method: &str,
@@ -66,9 +66,9 @@ async fn cache_response(
         .after_proxy(&mut ctx, status, &mut resp_headers)
         .await;
 
-    // on_response_body
+    // on_final_response_body
     plugin
-        .on_response_body(&mut ctx, status, &resp_headers, body)
+        .on_final_response_body(&mut ctx, status, &resp_headers, body)
         .await;
 }
 
@@ -453,7 +453,7 @@ async fn test_vary_by_headers() {
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     plugin
-        .on_response_body(&mut ctx, 200, &resp_headers, b"{\"json\":true}")
+        .on_final_response_body(&mut ctx, 200, &resp_headers, b"{\"json\":true}")
         .await;
 
     // Cache XML response (different Accept header = different cache key)
@@ -467,7 +467,7 @@ async fn test_vary_by_headers() {
     resp_headers2.insert("content-type".to_string(), "application/xml".to_string());
     plugin.after_proxy(&mut ctx2, 200, &mut resp_headers2).await;
     plugin
-        .on_response_body(&mut ctx2, 200, &resp_headers2, b"<xml/>")
+        .on_final_response_body(&mut ctx2, 200, &resp_headers2, b"<xml/>")
         .await;
 
     // JSON accept should get JSON response
@@ -544,7 +544,7 @@ async fn test_consumer_keyed_caching() {
     let mut rh = HashMap::new();
     plugin.after_proxy(&mut ctx_a, 200, &mut rh).await;
     plugin
-        .on_response_body(&mut ctx_a, 200, &rh, b"alice-data")
+        .on_final_response_body(&mut ctx_a, 200, &rh, b"alice-data")
         .await;
 
     // User B should get a MISS (different consumer = different cache key)
@@ -566,6 +566,42 @@ async fn test_consumer_keyed_caching() {
     }
 }
 
+#[tokio::test]
+async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
+    let plugin = plugin_with_config(json!({
+        "cache_key_include_consumer": true
+    }));
+
+    let mut ctx_external = make_ctx("GET", "/api/data");
+    ctx_external.authenticated_identity = Some("oidc-alice".to_string());
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx_external, &mut headers).await;
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx_external, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx_external, 200, &response_headers, b"alice-data")
+        .await;
+
+    let mut ctx_other = make_ctx("GET", "/api/data");
+    ctx_other.authenticated_identity = Some("oidc-bob".to_string());
+    let mut miss_headers = HashMap::new();
+    let miss = plugin.before_proxy(&mut ctx_other, &mut miss_headers).await;
+    assert!(matches!(miss, PluginResult::Continue));
+
+    let mut ctx_external_again = make_ctx("GET", "/api/data");
+    ctx_external_again.authenticated_identity = Some("oidc-alice".to_string());
+    let mut hit_headers = HashMap::new();
+    match plugin
+        .before_proxy(&mut ctx_external_again, &mut hit_headers)
+        .await
+    {
+        PluginResult::Reject { body, .. } => assert_eq!(body, "alice-data"),
+        _ => panic!("Expected cache HIT for authenticated_identity fallback"),
+    }
+}
+
 // === Query string caching ===
 
 #[tokio::test]
@@ -580,7 +616,7 @@ async fn test_different_query_params_different_cache() {
     let mut rh = HashMap::new();
     plugin.after_proxy(&mut ctx1, 200, &mut rh).await;
     plugin
-        .on_response_body(&mut ctx1, 200, &rh, b"page-1-data")
+        .on_final_response_body(&mut ctx1, 200, &rh, b"page-1-data")
         .await;
 
     // ?page=2 should be a MISS
@@ -618,7 +654,7 @@ async fn test_query_excluded_from_cache_key() {
     let mut rh = HashMap::new();
     plugin.after_proxy(&mut ctx1, 200, &mut rh).await;
     plugin
-        .on_response_body(&mut ctx1, 200, &rh, b"same-data")
+        .on_final_response_body(&mut ctx1, 200, &rh, b"same-data")
         .await;
 
     // ?page=2 should be a HIT (query excluded from key)

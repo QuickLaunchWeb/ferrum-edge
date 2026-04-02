@@ -1,7 +1,6 @@
 //! Tests for the Correlation ID plugin
 
-use ferrum_edge::plugins::correlation_id::{CORRELATION_ID_PRIORITY, CorrelationId};
-use ferrum_edge::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::{Plugin, RequestContext, correlation_id::CorrelationId, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -26,7 +25,7 @@ fn test_plugin_name() {
 #[test]
 fn test_plugin_priority() {
     let plugin = CorrelationId::new(&json!({}));
-    assert_eq!(plugin.priority(), CORRELATION_ID_PRIORITY);
+    assert_eq!(plugin.priority(), priority::CORRELATION_ID);
     assert_eq!(plugin.priority(), 50);
 }
 

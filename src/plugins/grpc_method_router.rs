@@ -176,13 +176,9 @@ impl GrpcMethodRouter {
     /// where no gateway Consumer exists), then to client IP.
     fn rate_key(&self, ctx: &RequestContext, method_path: &str) -> String {
         let identity = if self.limit_by == "consumer" {
-            ctx.identified_consumer
-                .as_ref()
-                .map(|c| c.username.as_str())
-                .or(ctx.authenticated_identity.as_deref())
-                .unwrap_or(&ctx.client_ip)
+            ctx.effective_identity().unwrap_or(ctx.client_ip.as_str())
         } else {
-            &ctx.client_ip
+            ctx.client_ip.as_str()
         };
         format!("grpc_method:{}:{}", identity, method_path)
     }

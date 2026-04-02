@@ -112,10 +112,9 @@ impl JwksAuth {
             .to_string();
 
         let providers_val = &config["providers"];
-        if !providers_val.is_array() {
+        let Some(providers_arr) = providers_val.as_array() else {
             return Err("jwks_auth: 'providers' must be a non-empty array".to_string());
-        }
-        let providers_arr = providers_val.as_array().unwrap();
+        };
         if providers_arr.is_empty() {
             return Err("jwks_auth: 'providers' array must not be empty".to_string());
         }
@@ -227,7 +226,7 @@ impl JwksAuth {
     ///
     /// Returns `Ok((claims, provider_index))` on first successful validation,
     /// or `Err(status_code, body)` if no provider validates the token.
-    fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
+    async fn validate_token(&self, token: &str) -> Result<(Value, usize), (u16, &'static str)> {
         // Peek at the unverified issuer to try matching a specific provider first
         let unverified_issuer = peek_issuer(token);
 
@@ -235,7 +234,7 @@ impl JwksAuth {
         if let Some(ref iss) = unverified_issuer {
             for (idx, prov) in self.providers.iter().enumerate() {
                 if prov.issuer.as_deref() == Some(iss.as_str())
-                    && let Some(claims) = try_validate_with_provider(prov, token)
+                    && let Some(claims) = try_validate_with_provider(prov, token).await
                 {
                     return Ok((claims, idx));
                 }
@@ -244,7 +243,7 @@ impl JwksAuth {
 
         // Fall through: try all providers (handles no-issuer tokens or issuer mismatch)
         for (idx, prov) in self.providers.iter().enumerate() {
-            if let Some(claims) = try_validate_with_provider(prov, token) {
+            if let Some(claims) = try_validate_with_provider(prov, token).await {
                 return Ok((claims, idx));
             }
         }
@@ -336,7 +335,7 @@ impl Plugin for JwksAuth {
         };
 
         // 1. Validate JWT against configured providers
-        let (claims, provider_idx) = match self.validate_token(&token) {
+        let (claims, provider_idx) = match self.validate_token(&token).await {
             Ok(result) => result,
             Err((status, body)) => {
                 return PluginResult::Reject {
@@ -419,11 +418,14 @@ impl Plugin for JwksAuth {
 // ---------------------------------------------------------------------------
 
 /// Try to validate a JWT against a single provider's JWKS store.
-fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
+async fn try_validate_with_provider(provider: &JwksProvider, token: &str) -> Option<Value> {
     let guard = provider.jwks_store.load();
     let store = guard.as_ref().as_ref()?;
 
-    if !store.has_keys() {
+    if !store.has_keys()
+        && let Err(e) = store.fetch_keys().await
+    {
+        debug!("jwks_auth: on-demand JWKS fetch failed: {}", e);
         return None;
     }
 

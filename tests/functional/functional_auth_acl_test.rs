@@ -23,6 +23,152 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+fn create_rs256_token(claims: &serde_json::Value, private_key_pem: &[u8]) -> String {
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("test-key-1".to_string());
+    encode(
+        &header,
+        claims,
+        &EncodingKey::from_rsa_pem(private_key_pem).expect("Failed to parse RSA private key"),
+    )
+    .expect("Failed to encode RS256 token")
+}
+
+fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let pem_str = std::str::from_utf8(public_key_pem).expect("Invalid public key PEM");
+    let der = extract_der_from_pem(pem_str);
+    let (n, e) = parse_rsa_public_key_der(&der);
+
+    json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "test-key-1",
+            "use": "sig",
+            "alg": "RS256",
+            "n": URL_SAFE_NO_PAD.encode(&n),
+            "e": URL_SAFE_NO_PAD.encode(&e)
+        }]
+    })
+}
+
+fn extract_der_from_pem(pem: &str) -> Vec<u8> {
+    use base64::engine::general_purpose::STANDARD;
+
+    let b64: String = pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    STANDARD.decode(&b64).expect("Invalid PEM base64")
+}
+
+fn parse_rsa_public_key_der(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut pos = 0;
+    assert_eq!(der[pos], 0x30);
+    pos += 1;
+    let (_outer_len, consumed) = parse_asn1_length(&der[pos..]);
+    pos += consumed;
+    assert_eq!(der[pos], 0x30);
+    pos += 1;
+    let (algo_len, consumed) = parse_asn1_length(&der[pos..]);
+    pos += consumed;
+    pos += algo_len;
+    assert_eq!(der[pos], 0x03);
+    pos += 1;
+    let (_bs_len, consumed) = parse_asn1_length(&der[pos..]);
+    pos += consumed;
+    pos += 1;
+    assert_eq!(der[pos], 0x30);
+    pos += 1;
+    let (_inner_len, consumed) = parse_asn1_length(&der[pos..]);
+    pos += consumed;
+    assert_eq!(der[pos], 0x02);
+    pos += 1;
+    let (n_len, consumed) = parse_asn1_length(&der[pos..]);
+    pos += consumed;
+    let mut n = der[pos..pos + n_len].to_vec();
+    pos += n_len;
+    if !n.is_empty() && n[0] == 0 {
+        n.remove(0);
+    }
+    assert_eq!(der[pos], 0x02);
+    pos += 1;
+    let (e_len, consumed) = parse_asn1_length(&der[pos..]);
+    pos += consumed;
+    let e = der[pos..pos + e_len].to_vec();
+    (n, e)
+}
+
+fn parse_asn1_length(data: &[u8]) -> (usize, usize) {
+    if data[0] < 0x80 {
+        (data[0] as usize, 1)
+    } else {
+        let num_bytes = (data[0] & 0x7f) as usize;
+        let mut length = 0usize;
+        for &byte in &data[1..=num_bytes] {
+            length = (length << 8) | byte as usize;
+        }
+        (length, 1 + num_bytes)
+    }
+}
+
+async fn start_jwks_server(
+    public_key_pem: &[u8],
+) -> Result<(tokio::task::JoinHandle<()>, String), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let jwks_url = format!(
+        "http://127.0.0.1:{}/.well-known/jwks.json",
+        listener.local_addr()?.port()
+    );
+    let jwks_json = build_rsa_jwks_from_pem(public_key_pem).to_string();
+
+    let handle = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let jwks_json = jwks_json.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let (reader, mut writer) = socket.into_split();
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                let mut request_line = String::new();
+                if buf_reader.read_line(&mut request_line).await.is_err() {
+                    return;
+                }
+
+                loop {
+                    let mut line = String::new();
+                    if buf_reader.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+
+                let (status_line, body) = if request_line.starts_with("GET /.well-known/jwks.json ")
+                {
+                    ("HTTP/1.1 200 OK", jwks_json)
+                } else {
+                    (
+                        "HTTP/1.1 404 Not Found",
+                        r#"{"error":"not found"}"#.to_string(),
+                    )
+                };
+
+                let response = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    Ok((handle, jwks_url))
+}
+
 /// Test harness for auth/ACL functional testing
 struct AuthTestHarness {
     temp_dir: TempDir,
@@ -295,6 +441,29 @@ async fn create_plugin_config(
     Ok(())
 }
 
+async fn update_proxy(
+    client: &reqwest::Client,
+    admin_url: &str,
+    auth_header: &str,
+    proxy_data: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy_id = proxy_data["id"].as_str().unwrap_or("<missing-id>");
+    let resp = client
+        .put(format!("{}/proxies/{}", admin_url, proxy_id))
+        .header("Authorization", auth_header)
+        .json(proxy_data)
+        .send()
+        .await?;
+    assert!(
+        resp.status().is_success(),
+        "Failed to update proxy {}: {} - {}",
+        proxy_id,
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+    Ok(())
+}
+
 /// Generate a consumer JWT token signed with the consumer's secret
 fn generate_consumer_jwt(consumer_username: &str, secret: &str, exp_offset_secs: i64) -> String {
     let now = Utc::now();
@@ -315,6 +484,197 @@ fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -
         HmacSha256::new_from_slice(secret.as_bytes()).expect("Failed to create HMAC instance");
     mac.update(signing_string.as_bytes());
     base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
+    let mut harness = AuthTestHarness::new()
+        .await
+        .expect("Failed to create test harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port)
+        .await
+        .expect("Failed to start echo backend");
+
+    harness
+        .start_gateway()
+        .await
+        .expect("Failed to start gateway");
+
+    let client = reqwest::Client::new();
+    let admin_token = harness
+        .generate_admin_token()
+        .expect("Failed to generate admin token");
+    let auth_header = format!("Bearer {}", admin_token);
+    let admin_url = &harness.admin_base_url;
+    let proxy_url = &harness.proxy_base_url;
+
+    let private_key_pem = include_bytes!("../fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../fixtures/test_rsa_public.pem");
+    let (_jwks_server, jwks_uri) = start_jwks_server(public_key_pem)
+        .await
+        .expect("Failed to start JWKS server");
+
+    for (id, path) in [
+        ("proxy-jwks-acl-external-allow", "/jwks-acl-external-allow"),
+        ("proxy-jwks-acl-external-deny", "/jwks-acl-external-deny"),
+    ] {
+        create_proxy(
+            &client,
+            admin_url,
+            &auth_header,
+            &json!({
+                "id": id,
+                "listen_path": path,
+                "backend_protocol": "http",
+                "backend_host": "localhost",
+                "backend_port": backend_port,
+                "strip_listen_path": true,
+                "auth_mode": "single",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    for plugin in [
+        json!({
+            "id": "plugin-jwks-acl-external-allow",
+            "plugin_name": "jwks_auth",
+            "scope": "proxy",
+            "proxy_id": "proxy-jwks-acl-external-allow",
+            "enabled": true,
+            "config": {
+                "providers": [{
+                    "jwks_uri": jwks_uri,
+                    "required_scopes": ["gateway:access"]
+                }]
+            }
+        }),
+        json!({
+            "id": "plugin-acl-external-allow",
+            "plugin_name": "access_control",
+            "scope": "proxy",
+            "proxy_id": "proxy-jwks-acl-external-allow",
+            "enabled": true,
+            "config": {
+                "allowed_consumers": ["alice"],
+                "allow_authenticated_identity": true
+            }
+        }),
+        json!({
+            "id": "plugin-jwks-acl-external-deny",
+            "plugin_name": "jwks_auth",
+            "scope": "proxy",
+            "proxy_id": "proxy-jwks-acl-external-deny",
+            "enabled": true,
+            "config": {
+                "providers": [{
+                    "jwks_uri": jwks_uri,
+                    "required_scopes": ["gateway:access"]
+                }]
+            }
+        }),
+        json!({
+            "id": "plugin-acl-external-deny",
+            "plugin_name": "access_control",
+            "scope": "proxy",
+            "proxy_id": "proxy-jwks-acl-external-deny",
+            "enabled": true,
+            "config": {
+                "allowed_consumers": ["alice"]
+            }
+        }),
+    ] {
+        create_plugin_config(&client, admin_url, &auth_header, &plugin)
+            .await
+            .unwrap();
+    }
+
+    update_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "proxy-jwks-acl-external-allow",
+            "listen_path": "/jwks-acl-external-allow",
+            "backend_protocol": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+            "plugins": [
+                {"plugin_config_id": "plugin-jwks-acl-external-allow"},
+                {"plugin_config_id": "plugin-acl-external-allow"}
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+
+    update_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        &json!({
+            "id": "proxy-jwks-acl-external-deny",
+            "listen_path": "/jwks-acl-external-deny",
+            "backend_protocol": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+            "plugins": [
+                {"plugin_config_id": "plugin-jwks-acl-external-deny"},
+                {"plugin_config_id": "plugin-acl-external-deny"}
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let now = Utc::now();
+    let token = create_rs256_token(
+        &json!({
+            "sub": "oidc-user-123",
+            "scope": "gateway:access",
+            "iat": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+        }),
+        private_key_pem,
+    );
+
+    let allowed = client
+        .get(format!("{}/jwks-acl-external-allow", proxy_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("Allowed external identity request failed");
+    assert_eq!(
+        allowed.status().as_u16(),
+        200,
+        "access_control should permit authenticated_identity when enabled"
+    );
+
+    let denied = client
+        .get(format!("{}/jwks-acl-external-deny", proxy_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("Denied external identity request failed");
+    assert_eq!(
+        denied.status().as_u16(),
+        401,
+        "without allow_authenticated_identity, external identity should still be rejected by ACL"
+    );
 }
 
 #[tokio::test]

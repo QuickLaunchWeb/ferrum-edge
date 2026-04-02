@@ -667,7 +667,7 @@ async fn test_grpc_multiple_proxies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_grpc_unmatched_path_returns_404() {
+async fn test_grpc_unmatched_path_returns_grpc_error() {
     let (backend_addr, _backend_handle) = start_mock_grpc_backend().await;
 
     let proxy = create_grpc_proxy("grpc-specific", "/grpc", backend_addr.port());
@@ -675,11 +675,17 @@ async fn test_grpc_unmatched_path_returns_404() {
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     // Send to a path that doesn't match any proxy
-    let (status, _headers, _body) =
+    let (status, headers, _body) =
         send_grpc_request(gateway_addr, "/unknown/my.Service/Echo", b"", &[])
             .await
             .expect("Request should complete");
 
-    // Should get 404 Not Found (not a gRPC error, since no proxy matched)
-    assert_eq!(status, 404, "Unmatched path should return 404");
+    // gRPC requests get trailers-only gRPC errors (HTTP 200 + grpc-status)
+    // instead of raw HTTP 404, so gRPC clients can parse the error properly
+    assert_eq!(
+        status, 200,
+        "gRPC route miss should return HTTP 200 with grpc-status"
+    );
+    let grpc_status = headers.get("grpc-status").expect("should have grpc-status");
+    assert_eq!(grpc_status, "5", "Route miss should map to NOT_FOUND (5)");
 }
