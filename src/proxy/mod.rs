@@ -1210,7 +1210,7 @@ impl ProxyState {
         new_config.loaded_at = result.poll_timestamp;
 
         // Validate the patched config before applying (same validations as load_full_config)
-        new_config.normalize_hosts();
+        new_config.normalize_fields();
         if let Err(errors) = new_config.validate_all_fields() {
             for msg in &errors {
                 warn!("Incremental config field validation: {}", msg);
@@ -1239,6 +1239,24 @@ impl ProxyState {
             }
             return false;
         }
+        if let Err(errors) = new_config.validate_upstream_references() {
+            for msg in &errors {
+                error!("Incremental config rejected: {}", msg);
+            }
+            return false;
+        }
+        if let Err(errors) = new_config.validate_plugin_references() {
+            for msg in &errors {
+                error!("Incremental config rejected: {}", msg);
+            }
+            return false;
+        }
+        if let Err(errors) = new_config.validate_unique_plugins_per_proxy() {
+            for msg in &errors {
+                error!("Incremental config rejected: {}", msg);
+            }
+            return false;
+        }
         let reserved_ports = self.env_config.reserved_gateway_ports();
         if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
             if matches!(
@@ -1258,12 +1276,6 @@ impl ProxyState {
                 return false;
             }
         }
-        if let Err(errors) = new_config.validate_upstream_references() {
-            for msg in &errors {
-                warn!("Incremental config: {}", msg);
-            }
-        }
-        new_config.normalize_stream_proxy_paths();
 
         // Build a ConfigDelta to feed into existing cache apply_delta() methods.
         // For incremental results, we treat all changed resources as "modified"
