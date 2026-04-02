@@ -746,14 +746,6 @@ impl ProxyState {
             tls_policy_arc.clone(),
         ));
 
-        // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
-        // stream proxies in the initial config begin accepting connections
-        // immediately, without waiting for a config reload event.
-        let slm_startup = stream_listener_manager.clone();
-        tokio::spawn(async move {
-            slm_startup.reconcile().await;
-        });
-
         Ok(Self {
             config: config_arc,
             dns_cache,
@@ -785,17 +777,12 @@ impl ProxyState {
         })
     }
 
-    /// Apply a new configuration, using incremental (surgical) updates when
-    /// possible to avoid disrupting the hot request path.
+    /// Reconcile stream proxy listeners at startup.
     ///
-    /// The delta between the old and new config is computed first. If nothing
-    /// changed, this is a no-op. For typical admin API edits (1-2 resources),
-    /// only the affected cache entries are updated while the rest of the
-    /// caches — including stateful plugin instances, warm path caches, and
-    /// load balancer counters — remain completely untouched.
-    ///
-    /// Falls back to a full rebuild only on the very first config load (when
-    /// there is no previous config to diff against).
+    /// This must be called after `ProxyState::new()` to start TCP/UDP listeners
+    /// for any stream proxies in the initial config. Returns an error if any
+    /// listener failed to bind its port (e.g., port already in use by another
+    /// process). The caller should fail startup on error.
     pub async fn initial_reconcile_stream_listeners(&self) -> Result<(), anyhow::Error> {
         let failures = self.stream_listener_manager.reconcile().await;
         if failures.is_empty() {
@@ -811,10 +798,22 @@ impl ProxyState {
         Err(anyhow::anyhow!("{}", msg.trim_end()))
     }
 
+    /// Apply a new configuration, using incremental (surgical) updates when
+    /// possible to avoid disrupting the hot request path.
+    ///
+    /// The delta between the old and new config is computed first. If nothing
+    /// changed, this is a no-op. For typical admin API edits (1-2 resources),
+    /// only the affected cache entries are updated while the rest of the
+    /// caches — including stateful plugin instances, warm path caches, and
+    /// load balancer counters — remain completely untouched.
+    ///
+    /// Falls back to a full rebuild only on the very first config load (when
+    /// there is no previous config to diff against).
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
+        // Validate stream proxy port conflicts before applying any config.
         // In DP mode, warn but don't reject — the DP doesn't control its config
         // and one bad stream proxy port shouldn't block all other config updates.
         let reserved_ports = self.env_config.reserved_gateway_ports();

@@ -151,6 +151,8 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 
 For the full list of 90+ environment variables, see [docs/configuration.md](docs/configuration.md).
 
+Operational note: keep application logs on `stdout`/`stderr` by default. In containers, let the container runtime or platform collect and rotate the stream. On VMs, prefer running Ferrum Edge under `systemd` or another supervisor and let `journald`, `rsyslog`, `logrotate`, or a host log agent handle retention and rotation. Only add application-level file logging if you have a specific requirement for local log files.
+
 ### File Mode Config Format
 
 ```yaml
