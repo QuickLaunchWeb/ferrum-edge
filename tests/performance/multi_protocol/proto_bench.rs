@@ -652,12 +652,12 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                 let mut next_timeout: Option<std::time::Instant> = None;
                 let mut connected = false;
 
-                // Kick off handshake
+                // Kick off handshake — drain until Timeout
                 loop {
                     match dtls.poll_output(&mut out_buf) {
                         Output::Packet(d) => { sock.send(d).await.map_err(|e| anyhow::anyhow!("hs send: {e}"))?; }
                         Output::Timeout(t) => { next_timeout = Some(t); break; }
-                        _ => break,
+                        _ => {} // PeerCert, KeyingMaterial, etc. — continue
                     }
                 }
 
@@ -681,12 +681,25 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // Drain all outputs until Timeout (dimpl docs: Timeout
+                    // is always the last variant in a poll cycle).
+                    let mut just_connected = false;
                     loop {
                         match dtls.poll_output(&mut out_buf) {
                             Output::Packet(d) => { let _ = sock.send(d).await; }
-                            Output::Timeout(t) => { next_timeout = Some(t); break; }
-                            Output::Connected => { connected = true; }
-                            _ => break,
+                            Output::Timeout(t) => {
+                                next_timeout = Some(t);
+                                if just_connected {
+                                    just_connected = false;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Output::Connected => {
+                                just_connected = true;
+                                connected = true;
+                            }
+                            _ => {} // PeerCert, KeyingMaterial, etc.
                         }
                     }
                 }
@@ -696,12 +709,12 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     let start = Instant::now();
                     dtls.send_application_data(&payload).map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
 
-                    // Drain encrypted packets
+                    // Drain encrypted packets until Timeout
                     loop {
                         match dtls.poll_output(&mut out_buf) {
                             Output::Packet(d) => { sock.send(d).await.map_err(|e| anyhow::anyhow!("send: {e}"))?; }
                             Output::Timeout(t) => { next_timeout = Some(t); break; }
-                            _ => break,
+                            _ => {} // continue draining
                         }
                     }
 
@@ -742,7 +755,7 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                                     got_reply = true;
                                     break;
                                 }
-                                _ => break,
+                                _ => {} // PeerCert, KeyingMaterial, etc.
                             }
                         }
                     }

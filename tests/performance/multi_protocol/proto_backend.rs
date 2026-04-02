@@ -333,7 +333,12 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
         private_key: key_der.secret_der().to_vec(),
     };
 
-    let config = Arc::new(Config::default());
+    let config = Arc::new(
+        Config::builder()
+            .require_client_certificate(false)
+            .build()
+            .map_err(|e| anyhow::anyhow!("DTLS config build: {e}"))?,
+    );
     let socket = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
     eprintln!("  DTLS echo server listening on {addr}");
 
@@ -365,6 +370,17 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                 let mut connected = false;
                 let mut next_timeout: Option<std::time::Instant> = None;
 
+                // Initialize server state (random, etc.) — required before
+                // handle_packet or dimpl panics in send_server_hello.
+                let _ = dtls.handle_timeout(std::time::Instant::now());
+                // Drain the resulting Timeout output
+                for _ in 0..64 {
+                    if let Output::Timeout(t) = dtls.poll_output(&mut out_buf) {
+                        next_timeout = Some(t);
+                        break;
+                    }
+                }
+
                 loop {
                     let sleep_dur = next_timeout
                         .map(|t| t.saturating_duration_since(std::time::Instant::now()))
@@ -372,7 +388,10 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
 
                     tokio::select! {
                         Some(pkt) = rx.recv() => {
-                            if dtls.handle_packet(&pkt).is_err() { break; }
+                            if let Err(e) = dtls.handle_packet(&pkt) {
+                                eprintln!("  DTLS server handle_packet error for {peer}: {e}");
+                                break;
+                            }
                         }
                         _ = tokio::time::sleep(sleep_dur) => {
                             if let Some(t) = next_timeout {
@@ -384,17 +403,30 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                         }
                     }
 
-                    // Drain outputs — echo application data
+                    // Drain all outputs until Timeout (dimpl docs: Timeout is
+                    // always the last variant). Handle all known variants to
+                    // avoid breaking before the Timeout sentinel.
+                    let mut just_connected = false;
                     for _ in 0..64 {
                         match dtls.poll_output(&mut out_buf) {
                             Output::Packet(d) => { let _ = socket.send_to(d, peer).await; }
-                            Output::Timeout(t) => { next_timeout = Some(t); break; }
-                            Output::Connected => { connected = true; }
+                            Output::Timeout(t) => {
+                                next_timeout = Some(t);
+                                if just_connected {
+                                    just_connected = false;
+                                    continue;
+                                }
+                                break;
+                            }
+                            Output::Connected => {
+                                just_connected = true;
+                                connected = true;
+                            }
                             Output::ApplicationData(d) if connected => {
-                                // Echo: send the data right back
                                 if dtls.send_application_data(d).is_err() { break; }
                             }
-                            _ => break,
+                            Output::PeerCert(_) | Output::KeyingMaterial(_, _) => {}
+                            _ => {} // future non_exhaustive variants
                         }
                     }
 
@@ -404,7 +436,11 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                             match dtls.poll_output(&mut out_buf) {
                                 Output::Packet(d) => { let _ = socket.send_to(d, peer).await; }
                                 Output::Timeout(t) => { next_timeout = Some(t); break; }
-                                _ => break,
+                                Output::ApplicationData(d) => {
+                                    // Late app data arrival — echo it
+                                    if dtls.send_application_data(d).is_err() { break; }
+                                }
+                                _ => {} // PeerCert, KeyingMaterial, future variants
                             }
                         }
                     }
