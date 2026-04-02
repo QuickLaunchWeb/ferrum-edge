@@ -1,7 +1,9 @@
 //! Access Control List (ACL) plugin — post-authentication authorization.
 //!
 //! Runs in the `authorize` phase after authentication plugins have identified
-//! the caller. By default this plugin is consumer-based only:
+//! the caller. On TCP stream proxies it applies the same checks in
+//! `on_stream_connect` after a stream auth plugin has identified the caller.
+//! By default this plugin is consumer-based only:
 //! 1. **Consumer-based**: Allow/deny lists checked by consumer username (O(1) HashSet).
 //! 2. **Optional external-auth bypass**: `allow_authenticated_identity` permits
 //!    requests that have `ctx.authenticated_identity` set but no mapped Consumer.
@@ -17,7 +19,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 
 pub struct AccessControl {
     /// O(1) consumer allow list (empty = no restriction).
@@ -64,6 +66,50 @@ impl AccessControl {
             allow_authenticated_identity,
         })
     }
+
+    fn authorize_identity(
+        &self,
+        client_ip: &str,
+        identified_consumer: Option<&crate::config::types::Consumer>,
+        authenticated_identity: Option<&str>,
+    ) -> PluginResult {
+        let consumer = match identified_consumer {
+            Some(consumer) => consumer,
+            None => {
+                if self.allow_authenticated_identity && authenticated_identity.is_some() {
+                    return PluginResult::Continue;
+                }
+                warn!(client_ip = %client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
+                return PluginResult::Reject {
+                    status_code: 401,
+                    body: r#"{"error":"No consumer identified"}"#.into(),
+                    headers: HashMap::new(),
+                };
+            }
+        };
+
+        let username = &consumer.username;
+
+        if self.disallowed_consumers.contains(username) {
+            warn!(consumer = %username, client_ip = %client_ip, plugin = "access_control", reason = "consumer_disallowed", "Consumer rejected by access control");
+            return PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Consumer is not allowed"}"#.into(),
+                headers: HashMap::new(),
+            };
+        }
+
+        if !self.allowed_consumers.is_empty() && !self.allowed_consumers.contains(username) {
+            warn!(consumer = %username, client_ip = %client_ip, plugin = "access_control", reason = "consumer_not_allowed", "Consumer not in allow list");
+            return PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Consumer is not allowed"}"#.into(),
+                headers: HashMap::new(),
+            };
+        }
+
+        PluginResult::Continue
+    }
 }
 
 #[async_trait]
@@ -77,47 +123,22 @@ impl Plugin for AccessControl {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_PROTOCOLS
+        super::HTTP_FAMILY_AND_TCP_PROTOCOLS
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        let consumer = match &ctx.identified_consumer {
-            Some(c) => c,
-            None => {
-                if self.allow_authenticated_identity && ctx.authenticated_identity.is_some() {
-                    return PluginResult::Continue;
-                }
-                warn!(client_ip = %ctx.client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"No consumer identified"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
+        self.authorize_identity(
+            &ctx.client_ip,
+            ctx.identified_consumer.as_ref(),
+            ctx.authenticated_identity.as_deref(),
+        )
+    }
 
-        let username = &consumer.username;
-
-        // O(1) check: consumer deny list
-        if self.disallowed_consumers.contains(username) {
-            warn!(consumer = %username, client_ip = %ctx.client_ip, plugin = "access_control", reason = "consumer_disallowed", "Consumer rejected by access control");
-            return PluginResult::Reject {
-                status_code: 403,
-                body: r#"{"error":"Consumer is not allowed"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-
-        // O(1) check: consumer allow list (if configured, consumer must be in it)
-        if !self.allowed_consumers.is_empty() && !self.allowed_consumers.contains(username) {
-            warn!(consumer = %username, client_ip = %ctx.client_ip, plugin = "access_control", reason = "consumer_not_allowed", "Consumer not in allow list");
-            return PluginResult::Reject {
-                status_code: 403,
-                body: r#"{"error":"Consumer is not allowed"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-
-        PluginResult::Continue
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        self.authorize_identity(
+            &ctx.client_ip,
+            ctx.identified_consumer.as_ref(),
+            ctx.authenticated_identity.as_deref(),
+        )
     }
 }

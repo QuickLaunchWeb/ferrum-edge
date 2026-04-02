@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
@@ -175,6 +176,7 @@ pub struct UdpListenerConfig {
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub load_balancer_cache: Arc<LoadBalancerCache>,
+    pub consumer_index: Arc<ConsumerIndex>,
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<UdpProxyMetrics>,
     /// DTLS server config for frontend termination. When `Some`, the listener
@@ -208,6 +210,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         config,
         dns_cache,
         load_balancer_cache,
+        consumer_index,
         shutdown,
         metrics,
         frontend_dtls_config,
@@ -227,6 +230,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             config,
             dns_cache,
             load_balancer_cache,
+            consumer_index,
             shutdown,
             metrics,
             dtls_config,
@@ -329,6 +333,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     backend_protocol,
                     port,
                     &circuit_breaker_cache,
+                    &consumer_index,
                 )
                 .await;
                 if let Err(e) = result {
@@ -362,6 +367,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 backend_protocol,
                                 port,
                                 &circuit_breaker_cache,
+                                &consumer_index,
                             )
                             .await;
                             if let Err(e) = result {
@@ -411,6 +417,7 @@ async fn process_datagram(
     backend_protocol: BackendProtocol,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
+    consumer_index: &Arc<ConsumerIndex>,
 ) -> Result<(), anyhow::Error> {
     // Fast path: check last-client cache before hitting DashMap.
     let session = if let Some((cached_addr, ref cached_session)) = *last_client {
@@ -433,6 +440,7 @@ async fn process_datagram(
                 backend_protocol,
                 listen_port,
                 circuit_breaker_cache,
+                consumer_index,
             )
             .await?
         }
@@ -453,6 +461,7 @@ async fn process_datagram(
             backend_protocol,
             listen_port,
             circuit_breaker_cache,
+            consumer_index,
         )
         .await?
     };
@@ -506,6 +515,7 @@ async fn lookup_or_create_session(
     backend_protocol: BackendProtocol,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
+    consumer_index: &Arc<ConsumerIndex>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
         return Ok(existing.value().clone());
@@ -538,6 +548,7 @@ async fn lookup_or_create_session(
         backend_protocol,
         listen_port,
         circuit_breaker_cache,
+        consumer_index,
     )
     .await
     {
@@ -638,6 +649,7 @@ async fn start_dtls_frontend_listener(
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
     load_balancer_cache: Arc<LoadBalancerCache>,
+    consumer_index: Arc<ConsumerIndex>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: crate::dtls::FrontendDtlsConfig,
@@ -708,7 +720,12 @@ async fn start_dtls_frontend_listener(
                     proxy_name: proxy_name.clone(),
                     listen_port: port,
                     backend_protocol,
+                    consumer_index: consumer_index.clone(),
+                    identified_consumer: None,
+                    authenticated_identity: None,
                     metadata: std::collections::HashMap::new(),
+                    tls_client_cert_der: None,
+                    tls_client_cert_chain_der: None,
                 };
                 let mut rejected = false;
                 for plugin in plugins.iter() {
@@ -1199,6 +1216,7 @@ async fn create_session(
     backend_protocol: BackendProtocol,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
+    consumer_index: &Arc<ConsumerIndex>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     // Run on_stream_connect plugins before creating backend connection
     let mut stream_ctx = StreamConnectionContext {
@@ -1207,7 +1225,12 @@ async fn create_session(
         proxy_name: proxy_name.map(|s| s.to_string()),
         listen_port,
         backend_protocol,
+        consumer_index: consumer_index.clone(),
+        identified_consumer: None,
+        authenticated_identity: None,
         metadata: std::collections::HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
     };
     for plugin in plugins {
         if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {

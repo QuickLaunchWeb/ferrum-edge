@@ -39,6 +39,7 @@ mod response_size_limiting_tests;
 mod response_transformer_tests;
 mod stdout_logging_tests;
 mod stream_plugin_tests;
+mod tcp_connection_throttle_tests;
 mod transaction_debugger_tests;
 mod transaction_summary_tests;
 mod ws_frame_logging_tests;

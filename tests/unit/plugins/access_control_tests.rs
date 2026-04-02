@@ -1,9 +1,30 @@
 //! Tests for access_control plugin
 
+use ferrum_edge::config::types::{BackendProtocol, Consumer};
 use ferrum_edge::plugins::{Plugin, access_control::AccessControl};
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
+
+fn create_stream_context(
+    consumer: Option<Consumer>,
+) -> ferrum_edge::plugins::StreamConnectionContext {
+    ferrum_edge::plugins::StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "tcp-proxy".to_string(),
+        proxy_name: Some("TCP Proxy".to_string()),
+        listen_port: 5432,
+        backend_protocol: BackendProtocol::Tcp,
+        consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+        identified_consumer: consumer,
+        authenticated_identity: None,
+        metadata: HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+    }
+}
 
 #[tokio::test]
 async fn test_access_control_plugin_creation() {
@@ -176,4 +197,36 @@ async fn test_access_control_disallowed_consumer_takes_precedence() {
     let mut ctx = create_test_context();
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_stream_connect_allowed_consumer() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_consumers": ["stream-user"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_stream_context(Some(Consumer {
+        id: "consumer-1".to_string(),
+        username: "stream-user".to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }));
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_access_control_stream_connect_rejects_without_consumer() {
+    let plugin = AccessControl::new(&json!({
+        "allowed_consumers": ["stream-user"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_stream_context(None);
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_reject(result, Some(401));
 }
