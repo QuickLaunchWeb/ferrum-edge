@@ -68,7 +68,7 @@ For gateway-generated rejection responses, a small set of header-only `after_pro
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 
-TCP and UDP stream proxies use a separate two-phase lifecycle. Since there is no HTTP request/response structure, only protocol-agnostic plugins (those declaring `ALL_PROTOCOLS`) participate.
+TCP and UDP stream proxies use a separate two-phase lifecycle. Since there is no HTTP request/response structure, only protocol-agnostic plugins (those declaring `ALL_PROTOCOLS`) and protocol-specific plugins (e.g., `tcp_connection_throttle` for TCP, `udp_rate_limiting` for UDP) participate.
 
 ```
 Connection/Session In
@@ -166,6 +166,41 @@ Plugins execute in priority order (lower number runs first):
 
 When no plugins on a proxy return `true` from `requires_ws_frame_hooks()`, the frame forwarding loop has zero overhead — frames are forwarded directly without entering the plugin pipeline. The `requires_ws_frame_hooks` flag is pre-computed per-proxy in `PluginCache` at config reload time.
 
+## UDP Datagram Lifecycle (`on_udp_datagram`)
+
+UDP proxies support per-datagram plugin hooks that fire before each client→backend datagram is forwarded. This is separate from the `on_stream_connect`/`on_stream_disconnect` lifecycle, which fires once per session.
+
+```
+Session Established (on_stream_connect already ran)
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  Datagram Forwarding Loop           │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │ on_udp_datagram               │──── For each client→backend datagram
+│  │ (returns Forward or Drop)     │
+│  └───────────────────────────────┘  │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+### Execution Order
+
+| # | Plugin | Priority | Behavior |
+|---|--------|----------|----------|
+| 1 | `udp_rate_limiting` | 2910 | Per-client-IP datagram and byte rate limiting |
+
+### Silent Drop Semantics
+
+Unlike HTTP plugins which return status codes and response bodies, UDP datagram plugins return `UdpDatagramVerdict::Drop` to silently discard the datagram. This is standard UDP behavior — there is no error response to send.
+
+### Zero-Overhead Opt-In
+
+When no plugins on a proxy return `true` from `requires_udp_datagram_hooks()`, the datagram forwarding loop has zero overhead — datagrams are forwarded directly without entering the plugin pipeline. The flag is checked once at listener startup.
+
+Both plain UDP and DTLS frontend paths support per-datagram hooks.
+
 ## Priority Bands
 
 Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Priority is intrinsic to each plugin — it is not user-configurable. Plugins at the same priority have no guaranteed relative order.
@@ -176,7 +211,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation and AI accounting | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -208,21 +243,22 @@ Given all built-in plugins enabled, the execution order is:
 | 18 | `graphql` | 2850 | before_proxy |
 | 19 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
 | 20 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 21 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 22 | `body_validator` | 2950 | before_proxy, on_final_response_body |
-| 23 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 24 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 25 | `grpc_deadline` | 3050 | before_proxy |
-| 26 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 27 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 28 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 29 | `ai_token_metrics` | 4100 | on_response_body |
-| 30 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 31 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 32 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 33 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 34 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 35 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 21 | `udp_rate_limiting` | 2910 | on_udp_datagram |
+| 22 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 23 | `body_validator` | 2950 | before_proxy, on_final_response_body |
+| 24 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 25 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 26 | `grpc_deadline` | 3050 | before_proxy |
+| 27 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 28 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 29 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 30 | `ai_token_metrics` | 4100 | on_response_body |
+| 31 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 32 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 33 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 34 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 35 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 36 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -399,6 +435,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ws_message_size_limiting` | | | ✓ | | | Enforces max frame size on WebSocket connections |
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
 | `ws_frame_logging` | | | ✓ | | | Logs WebSocket frame metadata |
+| `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
