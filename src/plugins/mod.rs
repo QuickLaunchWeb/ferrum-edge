@@ -1,4 +1,4 @@
-//! Plugin system — 33+ built-in plugins with a trait-based architecture.
+//! Plugin system — 36 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -49,6 +49,7 @@ pub mod response_transformer;
 pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod transaction_debugger;
+pub mod udp_rate_limiting;
 pub mod utils;
 pub mod ws_frame_logging;
 pub mod ws_message_size_limiting;
@@ -121,6 +122,34 @@ pub const GRPC_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Grpc];
 
 /// TCP-only (raw stream plugins that do not apply to UDP/DTLS).
 pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
+
+/// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
+pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
+
+/// Context for per-datagram UDP plugin hooks.
+///
+/// Passed to `on_udp_datagram` for every client→backend datagram when at least
+/// one plugin on the proxy opts in via `requires_udp_datagram_hooks()`.
+#[allow(dead_code)]
+pub struct UdpDatagramContext {
+    pub client_ip: String,
+    pub proxy_id: String,
+    pub proxy_name: Option<String>,
+    pub listen_port: u16,
+    pub datagram_size: usize,
+}
+
+/// Verdict from a per-datagram UDP plugin hook.
+///
+/// Unlike HTTP plugins which return status codes and bodies, UDP datagrams
+/// are silently dropped when rate limited — standard UDP behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpDatagramVerdict {
+    /// Forward the datagram to the backend.
+    Forward,
+    /// Silently drop the datagram (standard UDP flood mitigation).
+    Drop,
+}
 
 /// Direction of a WebSocket frame being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,6 +446,7 @@ pub mod priority {
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
     pub const WS_RATE_LIMITING: u16 = 2910;
     pub const WS_FRAME_LOGGING: u16 = 9050;
+    pub const UDP_RATE_LIMITING: u16 = 2910;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
     pub const DEFAULT: u16 = 5000;
 }
@@ -712,6 +742,21 @@ pub trait Plugin: Send + Sync {
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
     }
+
+    /// Returns `true` if this plugin needs per-datagram UDP inspection.
+    /// Zero overhead when `false` (default) — the datagram forwarding path skips plugins entirely.
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        false
+    }
+
+    /// Called for each UDP datagram before it is forwarded to the backend.
+    ///
+    /// Only invoked when at least one plugin on the proxy opts in via
+    /// `requires_udp_datagram_hooks()`. Return `UdpDatagramVerdict::Drop` to
+    /// silently discard the datagram (standard UDP flood mitigation).
+    async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
+        UdpDatagramVerdict::Forward
+    }
 }
 
 /// Create a plugin instance from its name and configuration.
@@ -825,6 +870,9 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )))),
+        "udp_rate_limiting" => Ok(Some(Arc::new(udp_rate_limiting::UdpRateLimiting::new(
+            config,
+        )?))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client);
@@ -893,6 +941,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_message_size_limiting",
         "ws_frame_logging",
         "ws_rate_limiting",
+        "udp_rate_limiting",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

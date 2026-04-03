@@ -30,6 +30,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
+    UdpDatagramContext, UdpDatagramVerdict,
 };
 
 /// Maximum datagram size for UDP forwarding.
@@ -253,6 +254,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
+    let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
     let (proxy_name, backend_protocol) = {
         let current = config.load();
         current
@@ -334,6 +336,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     port,
                     &circuit_breaker_cache,
                     &consumer_index,
+                    has_datagram_plugins,
                 )
                 .await;
                 if let Err(e) = result {
@@ -368,6 +371,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 port,
                                 &circuit_breaker_cache,
                                 &consumer_index,
+                                has_datagram_plugins,
                             )
                             .await;
                             if let Err(e) = result {
@@ -418,7 +422,28 @@ async fn process_datagram(
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
+    has_datagram_plugins: bool,
 ) -> Result<(), anyhow::Error> {
+    // Run per-datagram plugins (e.g., udp_rate_limiting) before session
+    // allocation so dropped datagrams don't consume session slots or trigger
+    // backend connection setup.
+    if has_datagram_plugins {
+        let ctx = UdpDatagramContext {
+            client_ip: client_addr.ip().to_string(),
+            proxy_id: proxy_id.to_string(),
+            proxy_name: proxy_name.map(str::to_string),
+            listen_port,
+            datagram_size: data.len(),
+        };
+        for plugin in plugins {
+            if plugin.requires_udp_datagram_hooks()
+                && matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop)
+            {
+                return Ok(()); // Silent drop — standard UDP behavior
+            }
+        }
+    }
+
     // Fast path: check last-client cache before hitting DashMap.
     let session = if let Some((cached_addr, ref cached_session)) = *last_client {
         if cached_addr == client_addr {
@@ -667,6 +692,7 @@ async fn start_dtls_frontend_listener(
 
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
+    let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
     let (proxy_name, backend_protocol) = {
         let current = config.load();
         current
@@ -765,6 +791,7 @@ async fn start_dtls_frontend_listener(
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
 
+                let handler_has_dgram_plugins = has_datagram_plugins;
                 tokio::spawn(async move {
                     let result = handle_dtls_client(
                         client_conn,
@@ -776,6 +803,10 @@ async fn start_dtls_frontend_listener(
                         &handler_metrics,
                         tls_no_verify,
                         &handler_cb_cache,
+                        &handler_plugins,
+                        handler_proxy_name.as_deref(),
+                        port,
+                        handler_has_dgram_plugins,
                     )
                     .await;
                     let (err_msg, error_class) = match &result.outcome {
@@ -869,6 +900,10 @@ async fn handle_dtls_client(
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
     circuit_breaker_cache: &CircuitBreakerCache,
+    plugins: &[Arc<dyn Plugin>],
+    proxy_name: Option<&str>,
+    listen_port: u16,
+    has_datagram_plugins: bool,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -889,6 +924,10 @@ async fn handle_dtls_client(
         &mut backend_info,
         Arc::clone(&bytes_sent),
         Arc::clone(&bytes_received),
+        plugins,
+        proxy_name,
+        listen_port,
+        has_datagram_plugins,
     )
     .await;
     DtlsHandlerResult {
@@ -913,6 +952,10 @@ async fn handle_dtls_client_inner(
     backend_info: &mut DtlsBackendInfo,
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
+    plugins: &[Arc<dyn Plugin>],
+    proxy_name: Option<&str>,
+    listen_port: u16,
+    has_datagram_plugins: bool,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let current_config = config.load();
@@ -1096,6 +1139,19 @@ async fn handle_dtls_client_inner(
     let metrics_fwd = metrics.clone();
     let proxy_id_fwd = proxy_id.to_string();
     let bytes_sent_fwd = Arc::clone(&bytes_sent);
+    let dgram_plugins: Vec<Arc<dyn Plugin>> = if has_datagram_plugins {
+        plugins
+            .iter()
+            .filter(|p| p.requires_udp_datagram_hooks())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let dgram_client_ip = client_addr.ip().to_string();
+    let dgram_proxy_id = proxy_id.to_string();
+    let dgram_proxy_name = proxy_name.map(str::to_string);
+    let dgram_listen_port = listen_port;
 
     // Client → Backend
     let client_to_backend = tokio::spawn(async move {
@@ -1111,6 +1167,27 @@ async fn handle_dtls_client_inner(
             metrics_fwd
                 .bytes_in
                 .fetch_add(len as u64, Ordering::Relaxed);
+
+            // Run per-datagram plugins before forwarding.
+            if !dgram_plugins.is_empty() {
+                let ctx = UdpDatagramContext {
+                    client_ip: dgram_client_ip.clone(),
+                    proxy_id: dgram_proxy_id.clone(),
+                    proxy_name: dgram_proxy_name.clone(),
+                    listen_port: dgram_listen_port,
+                    datagram_size: len,
+                };
+                let mut dropped = false;
+                for plugin in &dgram_plugins {
+                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
+                        dropped = true;
+                        break;
+                    }
+                }
+                if dropped {
+                    continue; // Silent drop — standard UDP behavior
+                }
+            }
 
             let send_ok = if let Some(ref dtls) = backend_dtls_write {
                 dtls.send(&data).await.map_err(|e| e.to_string())
