@@ -1,6 +1,6 @@
 # Ferrum Edge
 
-A high-performance edge proxy built in Rust, powered by `tokio` and `hyper`.
+A high-performance edge proxy built in Rust
 
 ## Overview
 
