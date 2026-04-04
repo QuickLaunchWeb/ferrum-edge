@@ -377,6 +377,18 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Protocol-level header validation (HTTP/3-applicable subset).
+    // HTTP/3 has no Transfer-Encoding or Host header concerns (uses :authority),
+    // but multiple Content-Length with mismatched values is still a protocol violation.
+    if let Some(error_body) =
+        crate::proxy::check_protocol_headers(req.headers(), http::Version::HTTP_3)
+    {
+        warn!("Rejected HTTP/3 request: {}", error_body);
+        record_request(&state, 400);
+        send_h3_response(&mut stream, StatusCode::BAD_REQUEST, error_body).await?;
+        return Ok(());
+    }
+
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.
     if !state.trusted_proxies.is_empty() {
