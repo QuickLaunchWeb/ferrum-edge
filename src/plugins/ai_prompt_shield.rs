@@ -434,6 +434,7 @@ impl Plugin for AiPromptShield {
         &self,
         body: &[u8],
         content_type: Option<&str>,
+        _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if self.action != ShieldAction::Redact {
             return None;

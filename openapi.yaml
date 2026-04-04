@@ -709,6 +709,7 @@ paths:
                 - correlation_id
                 - request_transformer
                 - response_transformer
+                - compression
                 - graphql
                 - grpc_method_router
                 - grpc_deadline
@@ -2969,6 +2970,57 @@ components:
                 type: string
               new_key:
                 type: string
+
+    CompressionConfig:
+      type: object
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression."
+      properties:
+        algorithms:
+          type: array
+          items:
+            type: string
+            enum: [gzip, br, brotli]
+          default: [gzip, br]
+          description: "Enabled compression algorithms in server preference order"
+        min_content_length:
+          type: integer
+          format: uint64
+          default: 256
+          description: "Skip compression for bodies smaller than this (bytes)"
+        content_types:
+          type: array
+          items:
+            type: string
+          description: "Content-type whitelist. Defaults to 10 common text/application types"
+        disable_on_etag:
+          type: boolean
+          default: false
+          description: "Skip compression when the response has an ETag header"
+        remove_accept_encoding:
+          type: boolean
+          default: true
+          description: "Strip Accept-Encoding from backend request so backend sends uncompressed"
+        gzip_level:
+          type: integer
+          minimum: 1
+          maximum: 9
+          default: 6
+          description: "Gzip compression level (1=fastest, 9=best)"
+        brotli_quality:
+          type: integer
+          minimum: 0
+          maximum: 11
+          default: 4
+          description: "Brotli quality (0=fastest, 11=best)"
+        decompress_request:
+          type: boolean
+          default: false
+          description: "Enable decompression of gzip/brotli request bodies"
+        max_decompressed_request_size:
+          type: integer
+          format: uint64
+          default: 10485760
+          description: "Zip bomb protection: max decompressed request body size in bytes (10 MB)"
 
     RateLimitingConfig:
       type: object

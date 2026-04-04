@@ -140,6 +140,7 @@ impl Plugin for ResponseTransformer {
         &self,
         body: &[u8],
         content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Only transform JSON bodies
         if let Some(ct) = content_type

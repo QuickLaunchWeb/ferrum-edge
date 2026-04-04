@@ -55,7 +55,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 37 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 38 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -109,6 +109,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Request Transformer** — add, remove, or update headers and query parameters
 - **Response Transformer** — modify response headers
+- **Compression** — on-the-fly response compression (gzip, brotli) with Accept-Encoding negotiation, content-type filtering, minimum body size threshold, and optional request decompression with zip bomb protection
 - **Response Caching** — cache backend responses with TTL, cache key rules, and conditional caching
 - **Request Termination** — return static responses without proxying
 

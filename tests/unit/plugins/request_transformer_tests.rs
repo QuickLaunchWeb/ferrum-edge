@@ -416,7 +416,7 @@ async fn test_request_transformer_body_add_field() {
 
     let body = br#"{"name":"Alice"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["name"], "Alice");
@@ -433,7 +433,7 @@ async fn test_request_transformer_body_add_nested_field() {
 
     let body = br#"{"user":{"name":"Alice"}}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["user"]["name"], "Alice");
@@ -450,7 +450,7 @@ async fn test_request_transformer_body_add_does_not_overwrite() {
 
     let body = br#"{"name":"Alice"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     // "add" should not overwrite existing field
     assert!(result.is_none());
@@ -466,7 +466,7 @@ async fn test_request_transformer_body_update_field() {
 
     let body = br#"{"status":"pending"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["status"], "active");
@@ -482,7 +482,7 @@ async fn test_request_transformer_body_update_nested_field() {
 
     let body = br#"{"user":{"address":{"city":"LA","zip":"90001"}}}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["user"]["address"]["city"], "NYC");
@@ -499,7 +499,7 @@ async fn test_request_transformer_body_remove_field() {
 
     let body = br#"{"name":"Alice","internal_id":"secret123"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["name"], "Alice");
@@ -516,7 +516,7 @@ async fn test_request_transformer_body_remove_nested_field() {
 
     let body = br#"{"user":{"name":"Alice","password":"secret"}}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["user"]["name"], "Alice");
@@ -533,7 +533,7 @@ async fn test_request_transformer_body_rename_field() {
 
     let body = br#"{"first_name":"Alice","age":30}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["given_name"], "Alice");
@@ -551,7 +551,7 @@ async fn test_request_transformer_body_rename_nested_field() {
 
     let body = br#"{"user":{"old_field":"data","other":"keep"}}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["user"]["new_field"], "data");
@@ -569,7 +569,7 @@ async fn test_request_transformer_body_rename_across_nesting_levels() {
 
     let body = br#"{"nested":{"deep":{"value":"found"}}}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["flat_value"], "found");
@@ -589,7 +589,7 @@ async fn test_request_transformer_body_multiple_rules() {
 
     let body = br#"{"old_name":"Alice","secret":"hidden","status":"pending"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["new_name"], "Alice");
@@ -627,7 +627,7 @@ async fn test_request_transformer_body_mixed_header_and_body_rules() {
     // Test body rules via transform_request_body
     let body = br#"{"old_field":"data"}"#;
     let body_result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&body_result.unwrap()).unwrap();
     assert_eq!(transformed["new_field"], "data");
@@ -643,7 +643,7 @@ async fn test_request_transformer_body_non_json_content_type_skipped() {
 
     let body = b"<xml>not json</xml>";
     let result = plugin
-        .transform_request_body(body, Some("application/xml"))
+        .transform_request_body(body, Some("application/xml"), &HashMap::new())
         .await;
     assert!(result.is_none());
 }
@@ -658,7 +658,7 @@ async fn test_request_transformer_body_invalid_json_skipped() {
 
     let body = b"this is not json";
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_none());
 }
@@ -672,7 +672,7 @@ async fn test_request_transformer_body_empty_body_skipped() {
     }));
 
     let result = plugin
-        .transform_request_body(b"", Some("application/json"))
+        .transform_request_body(b"", Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_none());
 }
@@ -698,7 +698,7 @@ async fn test_request_transformer_body_deeply_nested_three_levels() {
 
     let body = br#"{"a":{"b":{"c":{"d":"old"}}}}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["a"]["b"]["c"]["d"], "deep_value");
@@ -714,7 +714,7 @@ async fn test_request_transformer_body_add_creates_intermediate_objects() {
 
     let body = br#"{"existing":"keep"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["existing"], "keep");
@@ -731,7 +731,7 @@ async fn test_request_transformer_body_numeric_value() {
 
     let body = br#"{}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     // "42" string is parsed as number 42
@@ -748,7 +748,7 @@ async fn test_request_transformer_body_boolean_value() {
 
     let body = br#"{}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["active"], true);
@@ -764,7 +764,7 @@ async fn test_request_transformer_body_rename_nonexistent_is_noop() {
 
     let body = br#"{"name":"Alice"}"#;
     let result = plugin
-        .transform_request_body(body, Some("application/json"))
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await;
     // No field was renamed, so no modification — returns None
     assert!(result.is_none());

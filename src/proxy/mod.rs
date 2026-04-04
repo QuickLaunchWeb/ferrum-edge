@@ -315,6 +315,7 @@ mod tests {
             &self,
             body: &[u8],
             _content_type: Option<&str>,
+            _request_headers: &HashMap<String, String>,
         ) -> Option<Vec<u8>> {
             let mut transformed = body.to_vec();
             transformed.extend_from_slice(self.suffix.as_bytes());
@@ -593,7 +594,9 @@ async fn apply_request_body_plugins(
     let mut current = body_bytes;
     for plugin in plugins {
         if plugin.modifies_request_body()
-            && let Some(transformed) = plugin.transform_request_body(&current, content_type).await
+            && let Some(transformed) = plugin
+                .transform_request_body(&current, content_type, headers)
+                .await
         {
             current = transformed;
         }
@@ -4759,8 +4762,9 @@ pub async fn handle_proxy_request(
                     let content_type = response_headers.get("content-type").cloned();
                     let ct_ref = content_type.as_deref();
                     for plugin in plugins.iter() {
-                        if let Some(transformed) =
-                            plugin.transform_response_body(&response_body, ct_ref).await
+                        if let Some(transformed) = plugin
+                            .transform_response_body(&response_body, ct_ref, &response_headers)
+                            .await
                         {
                             response_headers.insert(
                                 "content-length".to_string(),
@@ -5330,7 +5334,10 @@ pub async fn handle_proxy_request(
         let content_type = response_headers.get("content-type").cloned();
         let ct_ref = content_type.as_deref();
         for plugin in plugins.iter() {
-            if let Some(transformed) = plugin.transform_response_body(data, ct_ref).await {
+            if let Some(transformed) = plugin
+                .transform_response_body(data, ct_ref, &response_headers)
+                .await
+            {
                 // Update Content-Length to reflect the new body size
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());

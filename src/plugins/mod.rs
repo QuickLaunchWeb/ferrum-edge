@@ -1,4 +1,4 @@
-//! Plugin system — 37 built-in plugins with a trait-based architecture.
+//! Plugin system — 38 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -22,6 +22,7 @@ pub mod ai_token_metrics;
 pub mod basic_auth;
 pub mod body_validator;
 pub mod bot_detection;
+pub mod compression;
 pub mod correlation_id;
 pub mod cors;
 pub mod graphql;
@@ -456,6 +457,7 @@ pub mod priority {
     pub const RESPONSE_SIZE_LIMITING: u16 = 3490;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
+    pub const COMPRESSION: u16 = 4050;
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
@@ -625,11 +627,14 @@ pub trait Plugin: Send + Sync {
     ///
     /// Return `Some(new_body)` to replace the body, or `None` to leave it
     /// unchanged. The `content_type` parameter is extracted from the request
-    /// headers so plugins can decide whether to parse the body.
+    /// headers so plugins can decide whether to parse the body. The full
+    /// `request_headers` map is also available for plugins that need other
+    /// headers (e.g., `content-encoding` for decompression).
     async fn transform_request_body(
         &self,
         _body: &[u8],
         _content_type: Option<&str>,
+        _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         None
     }
@@ -654,11 +659,14 @@ pub trait Plugin: Send + Sync {
     ///
     /// Return `Some(new_body)` to replace the body, or `None` to leave it
     /// unchanged. The `content_type` parameter is extracted from the response
-    /// headers so plugins can decide whether to parse the body.
+    /// headers so plugins can decide whether to parse the body. The full
+    /// `response_headers` map is also available for plugins that need other
+    /// headers (e.g., `content-encoding` for compression).
     async fn transform_response_body(
         &self,
         _body: &[u8],
         _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         None
     }
@@ -825,6 +833,7 @@ pub fn create_plugin_with_http_client(
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)))),
+        "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(

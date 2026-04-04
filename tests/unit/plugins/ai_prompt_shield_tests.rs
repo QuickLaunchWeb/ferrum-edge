@@ -198,7 +198,7 @@ async fn test_redact_mode_ssn() {
     // transform_request_body should redact
     let body = serde_json::to_vec(&ai_request("My SSN is 123-45-6789")).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -217,7 +217,7 @@ async fn test_redact_multiple_types() {
     let body =
         serde_json::to_vec(&ai_request("SSN: 123-45-6789, email: test@example.com")).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -380,7 +380,7 @@ async fn test_custom_redaction_placeholder() {
 
     let body = serde_json::to_vec(&ai_request("SSN: 123-45-6789")).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -465,7 +465,7 @@ async fn test_redaction_preserves_json_structure() {
     .unwrap();
 
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
