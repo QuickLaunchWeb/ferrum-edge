@@ -358,34 +358,27 @@ async fn run_discovery_loop(
 }
 
 /// Check if two target lists are equivalent (same host:port:weight and tags, ignoring order).
-/// Uses a HashSet of borrowed fields to avoid per-poll string allocations.
+/// Uses borrowed tuples sorted in place to avoid per-poll string allocations while
+/// preserving multiplicity (duplicate targets are compared correctly).
 pub fn targets_equal(a: &[UpstreamTarget], b: &[UpstreamTarget]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    // Build a set of (host, port, weight, sorted_tags) tuples from `a`,
-    // then verify every element in `b` is present.
-    let set: std::collections::HashSet<_> = a
-        .iter()
-        .map(|t| {
-            let mut tag_pairs: Vec<(&str, &str)> = t
-                .tags
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-            tag_pairs.sort();
-            (t.host.as_str(), t.port, t.weight, tag_pairs)
-        })
-        .collect();
-    b.iter().all(|t| {
+    // Build sortable borrowed tuples — no String allocations.
+    fn to_key(t: &UpstreamTarget) -> (&str, u16, u32, Vec<(&str, &str)>) {
         let mut tag_pairs: Vec<(&str, &str)> = t
             .tags
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         tag_pairs.sort();
-        set.contains(&(t.host.as_str(), t.port, t.weight, tag_pairs))
-    })
+        (t.host.as_str(), t.port, t.weight, tag_pairs)
+    }
+    let mut a_keys: Vec<_> = a.iter().map(to_key).collect();
+    let mut b_keys: Vec<_> = b.iter().map(to_key).collect();
+    a_keys.sort();
+    b_keys.sort();
+    a_keys == b_keys
 }
 
 /// Merge static targets with discovered targets. If a discovered target has the
