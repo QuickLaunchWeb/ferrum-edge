@@ -1544,6 +1544,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dimpl",
+ "flate2",
  "futures",
  "futures-util",
  "google-cloud-secretmanager-v1",
@@ -1561,6 +1562,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "prost",
+ "prost-reflect",
  "quinn",
  "rand 0.10.0",
  "rcgen 0.13.2",
@@ -3402,6 +3404,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "prost-reflect"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b89455ef41ed200cafc47c76c552ee7792370ac420497e551f16123a9135f76e"
+dependencies = [
+ "prost",
+ "prost-types",
 ]
 
 [[package]]

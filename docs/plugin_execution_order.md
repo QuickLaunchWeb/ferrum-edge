@@ -245,7 +245,7 @@ Given all built-in plugins enabled, the execution order is:
 | 20 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 21 | `udp_rate_limiting` | 2910 | on_udp_datagram |
 | 22 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 23 | `body_validator` | 2950 | before_proxy, on_final_response_body |
+| 23 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
 | 24 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
 | 25 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 26 | `serverless_function` | 3025 | before_proxy |
@@ -271,7 +271,7 @@ That ordering has a few practical effects:
 - Cache entries include the final client-visible body and headers, not the raw backend response.
 - Backend `Vary` headers are respected when building the cache key, so variants such as `Accept-Encoding: gzip` stay isolated from uncompressed responses.
 - Fresh cached validators (`ETag`, `Last-Modified`) can satisfy conditional requests at the edge with a `304 Not Modified` response.
-- Ferrum still does not generate gzip/brotli on its own; compression remains backend-driven pass-through. The cache can store and replay those compressed backend variants safely.
+- Ferrum does not generate gzip/brotli on its own; compression remains backend-driven pass-through. The cache can store and replay those compressed backend variants safely. The one exception is the `body_validator` plugin, which decompresses gzip-compressed gRPC frames in order to validate protobuf payloads — this is internal to the validation path and does not affect the forwarded body.
 
 ### OTel tracing runs first (priority 25)
 
