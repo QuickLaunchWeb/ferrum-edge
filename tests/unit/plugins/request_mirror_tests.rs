@@ -2,6 +2,7 @@ use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::plugin_utils;
 
@@ -14,6 +15,22 @@ fn make_ctx() -> RequestContext {
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     ctx.query_params.insert("page".to_string(), "1".to_string());
+    ctx
+}
+
+fn make_ctx_with_proxy() -> RequestContext {
+    let mut ctx = make_ctx();
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(json!({
+        "id": "proxy-123",
+        "name": "test-proxy",
+        "listen_path": "/api",
+        "backend_host": "backend.local",
+        "backend_port": 8080,
+        "backend_protocol": "http",
+        "backend_read_timeout_ms": 30000
+    }))
+    .unwrap();
+    ctx.matched_proxy = Some(Arc::new(proxy));
     ctx
 }
 
@@ -257,6 +274,42 @@ async fn test_before_proxy_with_body_metadata() {
     plugin_utils::assert_continue(result);
 }
 
+#[tokio::test]
+async fn test_before_proxy_with_matched_proxy_uses_proxy_timeout() {
+    // Verify that before_proxy doesn't panic when a matched_proxy is present.
+    // The actual timeout is applied inside the spawned task (fire-and-forget),
+    // so we can only verify the plugin reads proxy config without errors.
+    let plugin = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local" }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_before_proxy_without_matched_proxy_uses_default_timeout() {
+    // When no proxy is matched (shouldn't happen in practice), the plugin
+    // falls back to a 60s default timeout.
+    let plugin = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local" }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx(); // No matched_proxy
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+}
+
 // ---------------------------------------------------------------------------
 // Percentage sampling
 // ---------------------------------------------------------------------------
@@ -367,4 +420,35 @@ fn test_mirror_path_override() {
         PluginHttpClient::default(),
     );
     assert!(plugin.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Mirror transaction summary serialization
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_mirror_captures_proxy_context() {
+    // Verify that the plugin captures proxy context (proxy_id, proxy_name,
+    // consumer_username) from the request context for mirror logging.
+    let plugin = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "mirror_request_body": false }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.identified_consumer = Some(
+        serde_json::from_value(json!({
+            "id": "consumer-1",
+            "username": "test-user"
+        }))
+        .unwrap(),
+    );
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    // This fires the mirror task — we can't inspect the spawned task's output
+    // directly, but we verify the plugin reads all context fields without panicking.
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
 }

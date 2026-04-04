@@ -19,6 +19,17 @@
 //! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
 //! settings (CA bundle, skip-verify).
 //!
+//! ## Mirror response logging
+//!
+//! The spawned task captures mirror response metadata (status code, response
+//! size, latency) and emits a structured JSON log entry on the `access_log`
+//! tracing target — the same output stream used by `stdout_logging`. Each
+//! mirror log entry includes `"mirrored": true` so log collectors can
+//! distinguish mirror results from normal transaction summaries.
+//!
+//! Mirror timeout defaults to the proxy's `backend_read_timeout_ms`, ensuring
+//! shadow requests respect the same timeout budget as the real backend call.
+//!
 //! ## Configuration
 //!
 //! ```json
@@ -45,10 +56,46 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use std::time::Duration;
+use tracing::warn;
 use url::form_urlencoded;
 
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+/// Structured log entry for mirror response metadata.
+///
+/// Emitted on the `access_log` tracing target alongside normal transaction
+/// summaries. The `mirrored: true` field distinguishes these entries so log
+/// collectors can filter or dashboard them separately.
+#[derive(Debug, serde::Serialize)]
+struct MirrorTransactionSummary {
+    /// Always `true` — the distinguishing flag for mirror log entries.
+    mirrored: bool,
+    timestamp: String,
+    client_ip: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consumer_username: Option<String>,
+    http_method: String,
+    request_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_proxy_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_proxy_name: Option<String>,
+    mirror_target_url: String,
+    /// HTTP status code from the mirror target. `None` when the request failed
+    /// before a response was received (DNS, connect, timeout errors).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror_response_status_code: Option<u16>,
+    /// Response body size in bytes from the mirror target. Derived from
+    /// `content-length` header when present, otherwise from reading the body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror_response_size_bytes: Option<u64>,
+    /// Wall-clock latency of the mirror request in milliseconds.
+    mirror_latency_ms: f64,
+    /// Human-readable error message when the mirror request failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror_error: Option<String>,
+}
 
 pub struct RequestMirror {
     http_client: PluginHttpClient,
@@ -226,12 +273,30 @@ impl Plugin for RequestMirror {
             None
         };
 
+        // Capture context for the mirror transaction summary log entry.
+        let client_ip = ctx.client_ip.clone();
+        let consumer_username = ctx.effective_identity().map(str::to_owned);
+        let request_path = ctx.path.clone();
+        let matched_proxy_id = ctx.matched_proxy.as_ref().map(|p| p.id.clone());
+        let matched_proxy_name = ctx.matched_proxy.as_ref().and_then(|p| p.name.clone());
+
+        // Use the proxy's backend_read_timeout_ms for the mirror request timeout,
+        // so shadow requests respect the same timeout budget as the real backend call.
+        let mirror_timeout = ctx
+            .matched_proxy
+            .as_ref()
+            .map(|p| Duration::from_millis(p.backend_read_timeout_ms))
+            .unwrap_or(Duration::from_secs(60));
+
         let http_client = self.http_client.clone();
+        let mirror_url_for_log = mirror_url.clone();
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
         // impact on client response time.
         tokio::spawn(async move {
+            let start = std::time::Instant::now();
+
             let mut req_builder = match method.as_str() {
                 "GET" => http_client.get().get(&mirror_url),
                 "POST" => http_client.get().post(&mirror_url),
@@ -244,6 +309,9 @@ impl Plugin for RequestMirror {
                     &mirror_url,
                 ),
             };
+
+            // Override the client-level timeout with the proxy's backend timeout.
+            req_builder = req_builder.timeout(mirror_timeout);
 
             // Forward all headers from the original (transformed) request
             for (key, value) in &mirror_headers {
@@ -267,22 +335,47 @@ impl Plugin for RequestMirror {
                 req_builder = req_builder.body(body);
             }
 
-            match http_client.execute(req_builder, "request_mirror").await {
-                Ok(resp) => {
-                    debug!(
-                        "request_mirror: mirrored {} {} → {} (status {})",
-                        method,
-                        mirror_url,
-                        resp.status().as_u16(),
-                        resp.status()
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        "request_mirror: failed to mirror {} {} → {}",
-                        method, mirror_url, err
-                    );
-                }
+            let (status_code, response_size, error_msg) =
+                match http_client.execute(req_builder, "request_mirror").await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        // Derive response size from content-length when available (avoids
+                        // reading the body). Fall back to consuming the body bytes.
+                        let size = match resp.content_length() {
+                            Some(cl) => Some(cl),
+                            None => resp.bytes().await.ok().map(|b| b.len() as u64),
+                        };
+                        (Some(status), size, None)
+                    }
+                    Err(err) => {
+                        warn!(
+                            "request_mirror: failed to mirror {} {} → {}",
+                            method, mirror_url_for_log, err
+                        );
+                        (None, None, Some(err.to_string()))
+                    }
+                };
+
+            let elapsed = start.elapsed();
+
+            let summary = MirrorTransactionSummary {
+                mirrored: true,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                client_ip,
+                consumer_username,
+                http_method: method,
+                request_path,
+                matched_proxy_id,
+                matched_proxy_name,
+                mirror_target_url: mirror_url_for_log,
+                mirror_response_status_code: status_code,
+                mirror_response_size_bytes: response_size,
+                mirror_latency_ms: elapsed.as_secs_f64() * 1000.0,
+                mirror_error: error_msg,
+            };
+
+            if let Ok(json) = serde_json::to_string(&summary) {
+                tracing::info!(target: "access_log", "{}", json);
             }
         });
 
