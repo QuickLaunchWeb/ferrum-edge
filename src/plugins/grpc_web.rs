@@ -54,10 +54,23 @@ const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
 /// Metadata key storing the original content-type for response rewriting.
 const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 
+/// Internal proxy header injected by `before_proxy` so that `transform_request_body`
+/// (which lacks access to `ctx.metadata`) can deterministically identify the
+/// gRPC-Web encoding mode. Stripped before reaching the backend by the gateway's
+/// hop-by-hop header removal.
+const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
+
 /// gRPC frame flag: data frame.
 const GRPC_FRAME_DATA: u8 = 0x00;
 /// gRPC frame flag: trailer frame (used in gRPC-Web to embed trailers in body).
 const GRPC_FRAME_TRAILER: u8 = 0x80;
+
+/// Returns a header map with `content-type: application/grpc` for gRPC error responses.
+fn grpc_content_type_header() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "application/grpc".to_string());
+    h
+}
 
 pub struct GrpcWebPlugin {
     expose_headers: Vec<String>,
@@ -192,8 +205,11 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        // Always buffer responses: we need to embed trailers in the body
-        // and optionally base64-encode for text mode.
+        // Both binary and text modes require response buffering because HTTP/2
+        // trailers from the backend (grpc-status, grpc-message) must be embedded
+        // as a length-prefixed trailer frame (0x80) in the response body — this
+        // is the core gRPC-Web wire format difference from native gRPC. Text mode
+        // additionally needs base64 encoding of the complete body.
         true
     }
 
@@ -240,12 +256,17 @@ impl Plugin for GrpcWebPlugin {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only act if this was a gRPC-Web request
-        if !ctx.metadata.contains_key(META_GRPC_WEB_MODE) {
-            return PluginResult::Continue;
-        }
+        let mode = match ctx.metadata.get(META_GRPC_WEB_MODE) {
+            Some(m) => m.clone(),
+            None => return PluginResult::Continue,
+        };
 
         // Ensure outgoing content-type is native gRPC
         headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+        // Inject mode marker so transform_request_body (which lacks ctx access)
+        // can deterministically identify text vs binary mode.
+        headers.insert(HEADER_GRPC_WEB_MODE.to_string(), mode);
 
         // Remove headers that are gRPC-Web specific and shouldn't reach the backend
         headers.remove("x-grpc-web");
@@ -259,51 +280,79 @@ impl Plugin for GrpcWebPlugin {
         _content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // Only transform if this is a gRPC-Web text request (base64-encoded).
-        // Check via the metadata key we stored, which is passed through headers
-        // for the transform_request_body interface.
+        // Only transform text mode (base64-encoded). The mode marker was injected
+        // by before_proxy so we have a deterministic signal — no heuristics.
         let is_text = request_headers
-            .get("content-type")
-            .is_some_and(|ct| ct == "application/grpc");
+            .get(HEADER_GRPC_WEB_MODE)
+            .is_some_and(|m| m == "text");
 
-        // We rely on the metadata to know if this was text mode.
-        // However, transform_request_body doesn't have access to ctx.metadata.
-        // Instead, detect text mode from the body: if the body is valid base64
-        // and the decoded content has valid gRPC framing, decode it.
-        //
-        // Actually, we can check if this was marked by looking at request_headers
-        // for our internal marker. But request_headers at this point is the
-        // proxy headers (already rewritten to application/grpc). We stored the
-        // mode in ctx.metadata, but transform_request_body doesn't receive ctx.
-        //
-        // Safest approach: attempt base64 decode and validate gRPC framing.
-        // If the body is already binary gRPC, base64 decode would produce garbage
-        // that doesn't have valid framing, so we'd leave it unchanged.
-        if body.is_empty() || !is_text {
+        if !is_text || body.is_empty() {
             return None;
         }
 
-        // Try base64 decode — gRPC-Web text mode uses standard base64
+        // Base64 decode — gRPC-Web text mode uses standard base64.
+        // On failure, return the raw body unchanged; on_final_request_body will
+        // reject it with a 400 after validating gRPC framing.
         match BASE64.decode(body) {
             Ok(decoded) => {
-                // Validate that the decoded data looks like gRPC framing
-                if decoded.len() >= 5 {
-                    let flag = decoded[0];
-                    if flag == GRPC_FRAME_DATA || flag == GRPC_FRAME_TRAILER {
-                        debug!(
-                            plugin = "grpc_web",
-                            original_len = body.len(),
-                            decoded_len = decoded.len(),
-                            "Base64-decoded gRPC-Web text request body"
-                        );
-                        return Some(decoded);
-                    }
-                }
-                // Decoded but doesn't look like gRPC framing — leave unchanged
+                debug!(
+                    plugin = "grpc_web",
+                    original_len = body.len(),
+                    decoded_len = decoded.len(),
+                    "Base64-decoded gRPC-Web text request body"
+                );
+                Some(decoded)
+            }
+            Err(e) => {
+                debug!(
+                    plugin = "grpc_web",
+                    error = %e,
+                    "Failed to base64-decode gRPC-Web text request body"
+                );
+                // Return None to pass through; on_final_request_body will catch
+                // the invalid framing and reject with 400.
                 None
             }
-            Err(_) => None, // Not base64 — binary mode, pass through
         }
+    }
+
+    async fn on_final_request_body(
+        &self,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        // Only validate text mode requests — binary mode bodies are native gRPC.
+        let is_text = headers
+            .get(HEADER_GRPC_WEB_MODE)
+            .is_some_and(|m| m == "text");
+
+        if !is_text {
+            return PluginResult::Continue;
+        }
+
+        // Validate that the body (post-transform) has valid gRPC length-prefixed
+        // framing. If base64 decode failed or produced garbage, reject early with
+        // a clear error rather than sending corrupt data to the backend.
+        if body.len() < 5 {
+            return PluginResult::Reject {
+                status_code: 400,
+                body:
+                    r#"{"error":"Invalid gRPC-Web text request: body too short for gRPC framing"}"#
+                        .to_string(),
+                headers: grpc_content_type_header(),
+            };
+        }
+
+        let flag = body[0];
+        if flag != GRPC_FRAME_DATA && flag != GRPC_FRAME_TRAILER {
+            return PluginResult::Reject {
+                status_code: 400,
+                body: r#"{"error":"Invalid gRPC-Web text request: invalid base64 encoding or corrupted gRPC framing"}"#.to_string(),
+                headers: grpc_content_type_header(),
+            };
+        }
+
+        PluginResult::Continue
     }
 
     async fn after_proxy(
@@ -320,6 +369,9 @@ impl Plugin for GrpcWebPlugin {
         // Rewrite response content-type to the gRPC-Web variant
         let resp_ct = response_content_type(&original_ct);
         response_headers.insert("content-type".to_string(), resp_ct.to_string());
+
+        // Signal to clients that this is a gRPC-Web response
+        response_headers.insert("x-grpc-web".to_string(), "1".to_string());
 
         // Add CORS-friendly expose headers so browsers can read gRPC metadata
         let mut expose = vec![

@@ -141,7 +141,22 @@ async fn test_before_proxy_rewrites_headers() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
+    // x-grpc-web request header stripped
     assert!(!headers.contains_key("x-grpc-web"));
+    // Mode marker injected for transform_request_body
+    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "binary");
+}
+
+#[tokio::test]
+async fn test_before_proxy_injects_text_mode_marker() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "text");
 }
 
 #[tokio::test]
@@ -156,6 +171,8 @@ async fn test_before_proxy_noop_for_non_grpc_web() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
+    // No mode marker should be injected
+    assert!(!headers.contains_key("x-grpc-web-mode"));
 }
 
 // ── should_buffer_request_body ──
@@ -208,8 +225,9 @@ async fn test_transform_request_body_base64_decode() {
     // Base64-encode it (simulating gRPC-Web text mode)
     let encoded = BASE64.encode(&grpc_frame);
 
+    // Mode marker from before_proxy tells transform_request_body it's text mode
     let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
 
     let result = plugin
         .transform_request_body(encoded.as_bytes(), Some("application/grpc"), &headers)
@@ -223,32 +241,146 @@ async fn test_transform_request_body_base64_decode() {
 async fn test_transform_request_body_binary_passthrough() {
     let plugin = create_plugin_default();
 
-    // Binary gRPC frame — should not be transformed
+    // Binary gRPC frame — should not be transformed (mode is "binary")
     let mut grpc_frame = vec![0x00u8];
     grpc_frame.extend_from_slice(&5u32.to_be_bytes());
     grpc_frame.extend_from_slice(b"hello");
 
     let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("x-grpc-web-mode".to_string(), "binary".to_string());
 
     let result = plugin
         .transform_request_body(&grpc_frame, Some("application/grpc"), &headers)
         .await;
 
-    // Binary gRPC data won't base64-decode to valid gRPC framing, so None
+    // Binary mode: no transformation
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_transform_request_body_no_mode_header() {
+    let plugin = create_plugin_default();
+
+    let body = b"some data";
+    let headers = HashMap::new(); // No x-grpc-web-mode header
+
+    let result = plugin
+        .transform_request_body(body, Some("application/grpc"), &headers)
+        .await;
+
+    // Not a gRPC-Web request — no transformation
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_transform_request_body_invalid_base64_returns_none() {
+    let plugin = create_plugin_default();
+
+    // Invalid base64 data in text mode
+    let body = b"not!!!valid===base64";
+    let mut headers = HashMap::new();
+    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+
+    let result = plugin
+        .transform_request_body(body, Some("application/grpc"), &headers)
+        .await;
+
+    // Returns None — on_final_request_body will catch the invalid framing
     assert!(result.is_none());
 }
 
 #[tokio::test]
 async fn test_transform_request_body_empty() {
     let plugin = create_plugin_default();
-    let headers = HashMap::new();
+    let mut headers = HashMap::new();
+    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
 
     let result = plugin
         .transform_request_body(&[], Some("application/grpc"), &headers)
         .await;
 
     assert!(result.is_none());
+}
+
+// ── on_final_request_body — validation ──
+
+#[tokio::test]
+async fn test_final_request_body_valid_grpc_framing() {
+    let plugin = create_plugin_default();
+
+    let mut body = vec![0x00u8]; // data frame flag
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut headers = HashMap::new();
+    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+
+    let result = plugin.on_final_request_body(&headers, &body).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_final_request_body_rejects_too_short() {
+    let plugin = create_plugin_default();
+
+    let body = b"abc"; // Too short for gRPC framing (needs >= 5 bytes)
+
+    let mut headers = HashMap::new();
+    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+
+    let result = plugin.on_final_request_body(&headers, body).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 400,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn test_final_request_body_rejects_invalid_flag() {
+    let plugin = create_plugin_default();
+
+    let mut body = vec![0x42u8]; // Invalid flag byte (not 0x00 or 0x80)
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut headers = HashMap::new();
+    headers.insert("x-grpc-web-mode".to_string(), "text".to_string());
+
+    let result = plugin.on_final_request_body(&headers, &body).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 400,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn test_final_request_body_skips_binary_mode() {
+    let plugin = create_plugin_default();
+
+    let body = b"anything"; // Invalid gRPC framing, but binary mode skips validation
+
+    let mut headers = HashMap::new();
+    headers.insert("x-grpc-web-mode".to_string(), "binary".to_string());
+
+    let result = plugin.on_final_request_body(&headers, body).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_final_request_body_skips_non_grpc_web() {
+    let plugin = create_plugin_default();
+
+    let body = b"anything";
+    let headers = HashMap::new(); // No mode header
+
+    let result = plugin.on_final_request_body(&headers, body).await;
+    assert!(matches!(result, PluginResult::Continue));
 }
 
 // ── after_proxy — response header rewriting ──
@@ -271,6 +403,8 @@ async fn test_after_proxy_rewrites_content_type_binary() {
         response_headers.get("content-type").unwrap(),
         "application/grpc-web"
     );
+    // x-grpc-web response header signals gRPC-Web to clients
+    assert_eq!(response_headers.get("x-grpc-web").unwrap(), "1");
 }
 
 #[tokio::test]
@@ -457,7 +591,7 @@ async fn test_full_roundtrip_binary() {
     plugin.on_request_received(&mut ctx).await;
     assert_eq!(ctx.headers.get("content-type").unwrap(), "application/grpc");
 
-    // 2. before_proxy sets outgoing headers
+    // 2. before_proxy sets outgoing headers and injects mode marker
     let mut headers = HashMap::new();
     headers.insert(
         "content-type".to_string(),
@@ -465,6 +599,7 @@ async fn test_full_roundtrip_binary() {
     );
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
+    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "binary");
 
     // 3. Response comes back from backend
     let mut response_headers = HashMap::new();
@@ -515,9 +650,11 @@ async fn test_full_roundtrip_text() {
     plugin.on_request_received(&mut ctx).await;
     assert_eq!(ctx.metadata.get("grpc_web_mode").unwrap(), "text");
 
-    // 3. Request body gets base64-decoded
+    // 3. before_proxy injects mode marker, then request body gets base64-decoded
     let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "text");
+
     let decoded = plugin
         .transform_request_body(
             encoded_request.as_bytes(),
