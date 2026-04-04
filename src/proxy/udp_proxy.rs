@@ -1005,7 +1005,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502);
+                cb.record_failure(502, true);
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -1039,7 +1039,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1051,7 +1051,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502);
+                cb.record_failure(502, true);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect to backend {}: {}",
@@ -1070,7 +1070,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
                 return Err(anyhow::anyhow!("Backend DTLS handshake failed: {}", e));
             }
@@ -1092,7 +1092,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1104,7 +1104,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502);
+                cb.record_failure(502, true);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect to backend {}: {}",
@@ -1361,7 +1361,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502);
+                cb.record_failure(502, true);
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -1390,7 +1390,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1402,7 +1402,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502);
+                cb.record_failure(502, true);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect UDP socket to {}: {}",
@@ -1422,7 +1422,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
                 return Err(anyhow::anyhow!("DTLS handshake failed: {}", e));
             }
@@ -1445,7 +1445,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1457,7 +1457,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502);
+                cb.record_failure(502, true);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect UDP socket to {}: {}",

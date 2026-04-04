@@ -1665,6 +1665,15 @@ components:
           format: uint32
           default: 1
           description: Maximum concurrent probe requests allowed in half-open state
+        trip_on_connection_errors:
+          type: boolean
+          default: true
+          description: >
+            Whether connection-level errors (TCP refused, DNS failure, TLS handshake
+            error, connect timeout) count as circuit breaker failures independently
+            of failure_status_codes. When true (default), connection errors always
+            trip the breaker. When false, only real HTTP response status codes in
+            failure_status_codes are counted.
 
     # ── Retry ───────────────────────────────────────────────────────
     RetryConfig:

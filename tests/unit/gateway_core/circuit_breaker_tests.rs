@@ -11,6 +11,7 @@ fn default_config() -> CircuitBreakerConfig {
         timeout_seconds: 1,
         failure_status_codes: vec![500, 502, 503],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     }
 }
 
@@ -25,11 +26,11 @@ fn test_closed_allows_requests() {
 fn test_opens_after_threshold() {
     let cb = CircuitBreaker::new(default_config());
 
-    cb.record_failure(500);
-    cb.record_failure(500);
+    cb.record_failure(500, false);
+    cb.record_failure(500, false);
     assert!(cb.can_execute().is_ok()); // Still closed
 
-    cb.record_failure(500);
+    cb.record_failure(500, false);
     assert_eq!(cb.state_name(), "open");
     assert!(cb.can_execute().is_err());
 }
@@ -39,9 +40,9 @@ fn test_non_configured_status_treated_as_success() {
     let cb = CircuitBreaker::new(default_config());
 
     // 404 is not in failure_status_codes, should be treated as success
-    cb.record_failure(404);
-    cb.record_failure(404);
-    cb.record_failure(404);
+    cb.record_failure(404, false);
+    cb.record_failure(404, false);
+    cb.record_failure(404, false);
     assert_eq!(cb.state_name(), "closed");
 }
 
@@ -49,11 +50,11 @@ fn test_non_configured_status_treated_as_success() {
 fn test_success_resets_failure_count() {
     let cb = CircuitBreaker::new(default_config());
 
-    cb.record_failure(500);
-    cb.record_failure(500);
+    cb.record_failure(500, false);
+    cb.record_failure(500, false);
     cb.record_success(); // Should reset
-    cb.record_failure(500);
-    cb.record_failure(500);
+    cb.record_failure(500, false);
+    cb.record_failure(500, false);
     // Only 2 failures after reset, should still be closed
     assert_eq!(cb.state_name(), "closed");
 }
@@ -66,12 +67,13 @@ fn test_half_open_recovery() {
         timeout_seconds: 0, // Immediate timeout for testing
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
+        trip_on_connection_errors: true,
     };
     let cb = CircuitBreaker::new(config);
 
     // Trip open
-    cb.record_failure(500);
-    cb.record_failure(500);
+    cb.record_failure(500, false);
+    cb.record_failure(500, false);
     assert_eq!(cb.state_name(), "open");
 
     // Timeout elapsed (0 seconds), should transition to half-open
@@ -92,18 +94,19 @@ fn test_half_open_probe_failure_reopens() {
         timeout_seconds: 0,
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
     let cb = CircuitBreaker::new(config);
 
     // Trip open
-    cb.record_failure(500);
-    cb.record_failure(500);
+    cb.record_failure(500, false);
+    cb.record_failure(500, false);
 
     // Transition to half-open
     assert!(cb.can_execute().is_ok());
 
     // Probe fails
-    cb.record_failure(500);
+    cb.record_failure(500, false);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -127,11 +130,12 @@ fn test_half_open_max_requests_enforced() {
         timeout_seconds: 0,
         failure_status_codes: vec![500],
         half_open_max_requests: 2,
+        trip_on_connection_errors: true,
     };
     let cb = CircuitBreaker::new(config);
 
     // Trip open
-    cb.record_failure(500);
+    cb.record_failure(500, false);
     assert_eq!(cb.state_name(), "open");
 
     // First call transitions to half-open and admits (slot 1)
@@ -153,11 +157,12 @@ fn test_half_open_slot_freed_on_success() {
         timeout_seconds: 0,
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
     let cb = CircuitBreaker::new(config);
 
     // Trip open, transition to half-open
-    cb.record_failure(500);
+    cb.record_failure(500, false);
     assert!(cb.can_execute().is_ok()); // slot 1 taken
 
     // At max — should reject
@@ -178,11 +183,12 @@ fn test_half_open_concurrent_slots() {
         timeout_seconds: 0,
         failure_status_codes: vec![500],
         half_open_max_requests: 5,
+        trip_on_connection_errors: true,
     };
     let cb = Arc::new(CircuitBreaker::new(config));
 
     // Trip open
-    cb.record_failure(500);
+    cb.record_failure(500, false);
 
     // Spawn threads that all try to get a half-open slot
     let mut handles = Vec::new();
@@ -210,6 +216,7 @@ fn test_concurrent_failure_recording() {
         timeout_seconds: 60,
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
     let cb = Arc::new(CircuitBreaker::new(config));
 
@@ -218,7 +225,7 @@ fn test_concurrent_failure_recording() {
     for _ in 0..100 {
         let cb_clone = cb.clone();
         handles.push(std::thread::spawn(move || {
-            cb_clone.record_failure(500);
+            cb_clone.record_failure(500, false);
         }));
     }
     for h in handles {
@@ -275,6 +282,7 @@ fn test_per_target_independent_breakers() {
         timeout_seconds: 60,
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     let tk_a = target_key("10.0.0.1", 8080);
@@ -282,8 +290,8 @@ fn test_per_target_independent_breakers() {
 
     // Trip target A's breaker
     let cb_a = cache.get_or_create("proxy-1", Some(&tk_a), &config);
-    cb_a.record_failure(500);
-    cb_a.record_failure(500);
+    cb_a.record_failure(500, false);
+    cb_a.record_failure(500, false);
     assert_eq!(cb_a.state_name(), "open");
 
     // Target B should still be closed
@@ -304,12 +312,13 @@ fn test_per_target_does_not_share_with_direct_backend() {
         timeout_seconds: 60,
         failure_status_codes: vec![500],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     // Trip breaker for proxy-1 with no target (direct backend)
     let cb_direct = cache.get_or_create("proxy-1", None, &config);
-    cb_direct.record_failure(500);
-    cb_direct.record_failure(500);
+    cb_direct.record_failure(500, false);
+    cb_direct.record_failure(500, false);
     assert_eq!(cb_direct.state_name(), "open");
 
     // Same proxy with a target key should have its own breaker (closed)
@@ -378,14 +387,15 @@ fn test_tcp_direct_backend_circuit_breaker_opens() {
         timeout_seconds: 60,
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     // Simulate two backend connect failures (no upstream → None target key).
     let cb = cache.get_or_create("tcp-proxy-1", None, &config);
-    cb.record_failure(502);
+    cb.record_failure(502, true);
     assert!(cache.can_execute("tcp-proxy-1", None, &config).is_ok()); // Still closed after 1
 
-    cb.record_failure(502);
+    cb.record_failure(502, true);
     // After threshold, circuit should be open.
     assert_eq!(cb.state_name(), "open");
     assert!(
@@ -404,14 +414,15 @@ fn test_tcp_upstream_backend_circuit_breaker_per_target() {
         timeout_seconds: 60,
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     let tk = target_key("backend.internal", 4000);
 
     // Simulate connection failures on the upstream target.
     let cb = cache.get_or_create("tcp-proxy-2", Some(&tk), &config);
-    cb.record_failure(502);
-    cb.record_failure(502);
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
     assert_eq!(cb.state_name(), "open");
 
     // Proxy without this specific target should not be affected.
@@ -431,13 +442,14 @@ fn test_tcp_successful_connection_records_success() {
         timeout_seconds: 0, // immediate half-open
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     // Trip the breaker open.
     let cb = cache.get_or_create("tcp-proxy-3", None, &config);
-    cb.record_failure(502);
-    cb.record_failure(502);
-    cb.record_failure(502);
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
     assert_eq!(cb.state_name(), "open");
 
     // Transition to half-open (timeout = 0).
@@ -459,12 +471,13 @@ fn test_udp_session_failure_records_failure() {
         timeout_seconds: 60,
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     // Simulate two UDP socket connect failures.
     let cb = cache.get_or_create("udp-proxy-1", None, &config);
-    cb.record_failure(502);
-    cb.record_failure(502);
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
 
     assert_eq!(cb.state_name(), "open");
     assert!(
@@ -483,13 +496,14 @@ fn test_udp_successful_session_records_success() {
         timeout_seconds: 60,
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     let cb = cache.get_or_create("udp-proxy-2", None, &config);
     // One failure, then success — breaker should remain closed.
-    cb.record_failure(502);
+    cb.record_failure(502, true);
     cb.record_success();
-    cb.record_failure(502);
+    cb.record_failure(502, true);
 
     // Only 1 failure after the reset — should remain closed.
     assert_eq!(cb.state_name(), "closed");
@@ -506,11 +520,12 @@ fn test_stream_proxy_rejects_when_circuit_open() {
         timeout_seconds: 60,
         failure_status_codes: vec![502],
         half_open_max_requests: 1,
+        trip_on_connection_errors: true,
     };
 
     // Trip the breaker with a single failure.
     let cb = cache.get_or_create("stream-proxy-cb", None, &config);
-    cb.record_failure(502);
+    cb.record_failure(502, true);
     assert_eq!(cb.state_name(), "open");
 
     // Both TCP and UDP stream proxies call can_execute before opening sockets.
@@ -519,4 +534,132 @@ fn test_stream_proxy_rejects_when_circuit_open() {
         result.is_err(),
         "can_execute must return Err when circuit is open"
     );
+}
+
+// --- trip_on_connection_errors tests ---
+
+/// Connection errors trip the breaker when trip_on_connection_errors is true (default).
+#[test]
+fn test_connection_errors_trip_breaker_by_default() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500], // Note: 502 is NOT in the list
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Connection errors (connection_error=true) should count as failures
+    // even though 502 is not in failure_status_codes.
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
+    assert_eq!(cb.state_name(), "open");
+}
+
+/// Connection errors do NOT trip the breaker when trip_on_connection_errors is false.
+#[test]
+fn test_connection_errors_ignored_when_disabled() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500, 502],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: false,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Connection errors should be ignored even though 502 is in failure_status_codes.
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
+    cb.record_failure(502, true);
+    assert_eq!(cb.state_name(), "closed");
+
+    // But real HTTP 502 responses (connection_error=false) should still trip it.
+    cb.record_failure(502, false);
+    cb.record_failure(502, false);
+    assert_eq!(cb.state_name(), "open");
+}
+
+/// Real HTTP status code failures still work when trip_on_connection_errors is false.
+#[test]
+fn test_status_code_failures_work_independently_of_connection_flag() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500, 503],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: false,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false);
+    cb.record_failure(503, false);
+    assert_eq!(cb.state_name(), "open");
+}
+
+/// Connection errors in half-open state reopen the circuit when enabled.
+#[test]
+fn test_connection_error_reopens_half_open() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Trip open with a connection error
+    cb.record_failure(502, true);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to half-open
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Connection error during probe should reopen
+    cb.record_failure(502, true);
+    assert_eq!(cb.state_name(), "open");
+}
+
+/// Connection errors in half-open do NOT reopen when disabled.
+#[test]
+fn test_connection_error_ignored_in_half_open_when_disabled() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: false,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Trip open with a status code failure
+    cb.record_failure(500, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to half-open
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Connection error during probe should be ignored
+    cb.record_failure(502, true);
+    assert_eq!(cb.state_name(), "half_open");
+
+    // But a status code failure should still reopen
+    cb.record_failure(500, false);
+    assert_eq!(cb.state_name(), "open");
+}
+
+/// Default config has trip_on_connection_errors = true.
+#[test]
+fn test_default_config_has_trip_on_connection_errors_true() {
+    let config = CircuitBreakerConfig::default();
+    assert!(config.trip_on_connection_errors);
 }

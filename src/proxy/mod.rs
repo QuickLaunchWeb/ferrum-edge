@@ -1702,7 +1702,7 @@ async fn handle_websocket_request_authenticated(
                             cb_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502);
+                        cb.record_failure(502, true);
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
@@ -3743,7 +3743,7 @@ pub async fn handle_proxy_request(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502);
+                    cb.record_failure(502, true);
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
@@ -4296,7 +4296,7 @@ pub async fn handle_proxy_request(
                     current_cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(result.status_code);
+                cb.record_failure(result.status_code, result.connection_error);
             }
 
             let delay = retry::retry_delay(retry_config, attempt);
@@ -4444,8 +4444,13 @@ pub async fn handle_proxy_request(
             final_cb_target_key.as_deref(),
             cb_config,
         );
-        if cb.config().failure_status_codes.contains(&response_status) {
-            cb.record_failure(response_status);
+        let is_cb_failure = if backend_resp.connection_error {
+            cb.config().trip_on_connection_errors
+        } else {
+            cb.config().failure_status_codes.contains(&response_status)
+        };
+        if is_cb_failure {
+            cb.record_failure(response_status, backend_resp.connection_error);
         } else {
             cb.record_success();
         }
