@@ -2,8 +2,12 @@ use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use super::plugin_utils::create_test_context;
+
+/// Mutex to serialize tests that touch process-global env vars.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -129,6 +133,11 @@ fn test_gcp_missing_url_rejects() {
 
 #[test]
 fn test_aws_missing_region_rejects() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    // SAFETY: serialized by ENV_MUTEX — no concurrent env var access
+    unsafe {
+        remove_all_aws_env_vars();
+    }
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -143,6 +152,10 @@ fn test_aws_missing_region_rejects() {
 
 #[test]
 fn test_aws_missing_access_key_rejects() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    unsafe {
+        remove_all_aws_env_vars();
+    }
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -157,6 +170,10 @@ fn test_aws_missing_access_key_rejects() {
 
 #[test]
 fn test_aws_missing_secret_key_rejects() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    unsafe {
+        remove_all_aws_env_vars();
+    }
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -171,6 +188,10 @@ fn test_aws_missing_secret_key_rejects() {
 
 #[test]
 fn test_aws_missing_function_name_rejects() {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    unsafe {
+        remove_all_aws_env_vars();
+    }
     let err = expect_err(ServerlessFunction::new(
         &json!({
             "provider": "aws_lambda",
@@ -465,23 +486,18 @@ fn test_forward_headers_lowercase() {
 // ---------------------------------------------------------------------------
 // Environment variable fallback
 //
-// SAFETY: std::env::set_var / remove_var are unsafe in Rust 2024 edition because
-// concurrent threads may read env vars while we mutate them. These tests run
-// single-threaded and use unique env var names, so there is no data race.
+// All env-var-touching tests are serialized via ENV_MUTEX to prevent races.
+// SAFETY: std::env::set_var / remove_var are unsafe in Rust 2024 because
+// concurrent threads may read env vars while we mutate them. The mutex
+// ensures only one test mutates env vars at a time.
 // ---------------------------------------------------------------------------
 
-unsafe fn set_aws_env_vars(region: &str, key_id: &str, secret: &str, func: &str) {
-    unsafe {
-        std::env::set_var("AWS_DEFAULT_REGION", region);
-        std::env::set_var("AWS_ACCESS_KEY_ID", key_id);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", secret);
-        std::env::set_var("AWS_LAMBDA_FUNCTION_NAME", func);
-    }
-}
-
-unsafe fn remove_aws_env_vars() {
+/// Clear all AWS env vars that could affect plugin construction.
+/// Caller must hold ENV_MUTEX.
+unsafe fn remove_all_aws_env_vars() {
     unsafe {
         std::env::remove_var("AWS_DEFAULT_REGION");
+        std::env::remove_var("AWS_REGION");
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_LAMBDA_FUNCTION_NAME");
@@ -490,21 +506,19 @@ unsafe fn remove_aws_env_vars() {
 
 #[test]
 fn test_aws_falls_back_to_env_vars() {
-    // SAFETY: single-threaded test, unique env var names
+    let _lock = ENV_MUTEX.lock().unwrap();
     unsafe {
-        set_aws_env_vars(
-            "ap-southeast-1",
-            "AKIAENVTEST123456789",
-            "env-secret-key-value",
-            "env-function",
-        );
+        remove_all_aws_env_vars();
+        std::env::set_var("AWS_DEFAULT_REGION", "ap-southeast-1");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVTEST123456789");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret-key-value");
+        std::env::set_var("AWS_LAMBDA_FUNCTION_NAME", "env-function");
     }
 
     let result = ServerlessFunction::new(&json!({ "provider": "aws_lambda" }), default_client());
 
-    // SAFETY: cleanup before assertions
     unsafe {
-        remove_aws_env_vars();
+        remove_all_aws_env_vars();
     }
 
     let plugin = result.unwrap();
@@ -517,9 +531,13 @@ fn test_aws_falls_back_to_env_vars() {
 
 #[test]
 fn test_aws_config_overrides_env_vars() {
-    // SAFETY: single-threaded test
+    let _lock = ENV_MUTEX.lock().unwrap();
     unsafe {
-        set_aws_env_vars("eu-west-1", "AKIAENVOVERRIDE", "env-secret", "env-func");
+        remove_all_aws_env_vars();
+        std::env::set_var("AWS_DEFAULT_REGION", "eu-west-1");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVOVERRIDE");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret");
+        std::env::set_var("AWS_LAMBDA_FUNCTION_NAME", "env-func");
     }
 
     let result = ServerlessFunction::new(
@@ -533,9 +551,8 @@ fn test_aws_config_overrides_env_vars() {
         default_client(),
     );
 
-    // SAFETY: cleanup
     unsafe {
-        remove_aws_env_vars();
+        remove_all_aws_env_vars();
     }
 
     let plugin = result.unwrap();
@@ -548,8 +565,9 @@ fn test_aws_config_overrides_env_vars() {
 
 #[test]
 fn test_aws_region_falls_back_to_aws_region_env() {
-    // SAFETY: single-threaded test
+    let _lock = ENV_MUTEX.lock().unwrap();
     unsafe {
+        remove_all_aws_env_vars();
         std::env::set_var("AWS_REGION", "ca-central-1");
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVTEST123456789");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret-key-value");
@@ -558,12 +576,8 @@ fn test_aws_region_falls_back_to_aws_region_env() {
 
     let result = ServerlessFunction::new(&json!({ "provider": "aws_lambda" }), default_client());
 
-    // SAFETY: cleanup
     unsafe {
-        std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        std::env::remove_var("AWS_LAMBDA_FUNCTION_NAME");
+        remove_all_aws_env_vars();
     }
 
     let plugin = result.unwrap();
@@ -576,7 +590,7 @@ fn test_aws_region_falls_back_to_aws_region_env() {
 
 #[test]
 fn test_azure_function_key_falls_back_to_env() {
-    // SAFETY: single-threaded test
+    let _lock = ENV_MUTEX.lock().unwrap();
     unsafe {
         std::env::set_var("AZURE_FUNCTIONS_KEY", "env-azure-key");
     }
@@ -589,7 +603,6 @@ fn test_azure_function_key_falls_back_to_env() {
         default_client(),
     );
 
-    // SAFETY: cleanup
     unsafe {
         std::env::remove_var("AZURE_FUNCTIONS_KEY");
     }
@@ -599,7 +612,7 @@ fn test_azure_function_key_falls_back_to_env() {
 
 #[test]
 fn test_gcp_bearer_token_falls_back_to_env() {
-    // SAFETY: single-threaded test
+    let _lock = ENV_MUTEX.lock().unwrap();
     unsafe {
         std::env::set_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN", "ya29.env-token");
     }
@@ -612,7 +625,6 @@ fn test_gcp_bearer_token_falls_back_to_env() {
         default_client(),
     );
 
-    // SAFETY: cleanup
     unsafe {
         std::env::remove_var("GCP_CLOUD_FUNCTIONS_BEARER_TOKEN");
     }
