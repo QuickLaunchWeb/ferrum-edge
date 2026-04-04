@@ -5822,6 +5822,20 @@ fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMa
     }
 }
 
+/// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
+/// Used for parsing comma-separated header field values per RFC 9110 §5.6.1.
+fn trim_ows(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
 /// Validate protocol-level header constraints to block smuggling and desync attacks.
 ///
 /// Returns an error message string if the request violates protocol rules, `None` if valid.
@@ -5861,15 +5875,27 @@ pub fn check_protocol_headers(
     }
 
     // 2. Multiple Content-Length with mismatched values (all HTTP versions)
-    // A single CL header is common; only scan when multiple exist.
-    let mut cl_iter = headers.get_all("content-length").iter();
-    if let Some(first) = cl_iter.next() {
-        let first_bytes = first.as_bytes();
-        for val in cl_iter {
-            if val.as_bytes() != first_bytes {
-                return Some(
-                    r#"{"error":"Multiple Content-Length headers with conflicting values"}"#,
-                );
+    // An intermediary may coalesce duplicate CL headers into a single comma-separated
+    // field line (e.g. "Content-Length: 42, 0"). We must split on commas, trim OWS,
+    // and reject if any parsed value differs — otherwise a smuggling variant that
+    // relies on coalesced CL values can bypass the guard.
+    {
+        let mut canonical: Option<&[u8]> = None;
+        for val in headers.get_all("content-length") {
+            for token in val.as_bytes().split(|&b| b == b',') {
+                let trimmed = trim_ows(token);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match canonical {
+                    None => canonical = Some(trimmed),
+                    Some(prev) if prev != trimmed => {
+                        return Some(
+                            r#"{"error":"Multiple Content-Length headers with conflicting values"}"#,
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -5884,12 +5910,22 @@ pub fn check_protocol_headers(
     }
 
     // 4. TE header in HTTP/2 must be "trailers" only (RFC 9113 §8.2.2)
-    if version == hyper::Version::HTTP_2
-        && let Some(te) = headers.get("te")
-        && let Ok(te_str) = te.to_str()
-        && !te_str.eq_ignore_ascii_case("trailers")
-    {
-        return Some(r#"{"error":"HTTP/2 TE header must be 'trailers' or absent"}"#);
+    // Iterate all TE header entries and comma-separated tokens within each entry.
+    // A request with `te: trailers` plus a second `te: gzip` entry (or a single
+    // `te: trailers, gzip` field) must be rejected.
+    if version == hyper::Version::HTTP_2 {
+        for te_val in headers.get_all("te") {
+            if let Ok(te_str) = te_val.to_str() {
+                for token in te_str.split(',') {
+                    let trimmed = token.trim();
+                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
+                        return Some(
+                            r#"{"error":"HTTP/2 TE header must be 'trailers' or absent"}"#,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     None

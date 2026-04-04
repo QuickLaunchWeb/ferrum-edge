@@ -107,6 +107,45 @@ fn conflicting_content_length_checked_on_http3() {
     assert!(result.unwrap().contains("conflicting values"));
 }
 
+// --- Comma-separated Content-Length (coalesced by intermediary) ---
+
+#[test]
+fn rejects_comma_separated_conflicting_content_length() {
+    // An intermediary may coalesce "Content-Length: 42" + "Content-Length: 0"
+    // into a single "Content-Length: 42, 0" field line.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42, 0"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("conflicting values"));
+}
+
+#[test]
+fn allows_comma_separated_identical_content_length() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42, 42"));
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+}
+
+#[test]
+fn rejects_mixed_header_and_comma_content_length() {
+    // One header entry with "100", another with "100, 200"
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("content-length", HeaderValue::from_static("100"));
+    headers.append("content-length", HeaderValue::from_static("100, 200"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("conflicting values"));
+}
+
+#[test]
+fn allows_comma_separated_with_ows() {
+    // Whitespace around comma-separated values should be trimmed
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42 , 42"));
+    assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
+}
+
 // --- Multiple Host headers (HTTP/1.1) ---
 
 #[test]
@@ -173,6 +212,27 @@ fn http2_rejects_te_gzip() {
 fn http2_allows_no_te() {
     let headers = hyper::HeaderMap::new();
     assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
+fn http2_rejects_te_trailers_plus_invalid_in_same_field() {
+    // "te: trailers, gzip" has a valid token + invalid token — must reject
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("te", HeaderValue::from_static("trailers, gzip"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("TE header"));
+}
+
+#[test]
+fn http2_rejects_second_te_header_entry_with_invalid_value() {
+    // First entry is valid, second is not — must catch via get_all iteration
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("te", HeaderValue::from_static("trailers"));
+    headers.append("te", HeaderValue::from_static("gzip"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("TE header"));
 }
 
 #[test]
