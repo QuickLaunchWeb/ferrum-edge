@@ -120,6 +120,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Global defaults with per-proxy overrides (max idle, idle timeout, keep-alive, HTTP/2)
 - HTTP/2 multiplexing via ALPN negotiation
 - TCP and HTTP/2 keep-alive with configurable intervals
+- **Startup pool warmup** — pre-establishes backend connections (reqwest, gRPC, HTTP/2, HTTP/3) after DNS warmup to eliminate first-request cold-start latency (configurable via `FERRUM_POOL_WARMUP_ENABLED`)
 
 ## High-Concurrency & Runtime Tuning
 
@@ -139,6 +140,13 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - DTLS 1.2/1.3 frontend termination and backend origination (ECDSA P-256/P-384)
 - Configurable cipher suites, key exchange groups, and protocol versions
 - Database TLS/SSL with PostgreSQL and MySQL support
+- Protocol-level request validation (anti-smuggling, desync prevention):
+  - HTTP/1.x: Content-Length + Transfer-Encoding conflict rejection
+  - All versions: Multiple Content-Length with mismatched values rejection
+  - HTTP/1.x: Multiple Host header rejection
+  - HTTP/2: TE header restricted to "trailers" only
+  - gRPC: POST method enforcement
+  - WebSocket: Sec-WebSocket-Key format validation (base64 16-byte nonce)
 
 ## DNS Caching
 

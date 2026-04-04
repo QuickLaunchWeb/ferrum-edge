@@ -6,6 +6,7 @@ mod dns_tests;
 mod grpc_proxy_tests;
 mod health_check_tests;
 mod load_balancer_tests;
+mod protocol_validation_tests;
 mod proxy_tests;
 mod response_body_mode_tests;
 mod retry_tests;

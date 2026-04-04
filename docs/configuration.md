@@ -86,8 +86,13 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 |---|---|---|---|
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | No | `32768` | Maximum total request header size (all headers combined) |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | No | `16384` | Maximum size of any single request header (name + value) |
+| `FERRUM_MAX_HEADER_COUNT` | No | `100` | Max number of request headers allowed (0=unlimited) |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | No | `10485760` | Maximum response body size from backends (0=unlimited) |
+| `FERRUM_MAX_URL_LENGTH_BYTES` | No | `8192` | Maximum URL length in bytes (path + query string, 0=unlimited) |
+| `FERRUM_MAX_QUERY_PARAMS` | No | `100` | Maximum number of query parameters allowed (0=unlimited) |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | No | `4194304` | Maximum total received gRPC payload size in bytes (0=unlimited) |
+| `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
@@ -180,6 +185,20 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 
 See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning guidance.
+
+### Connection Pooling
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_POOL_WARMUP_ENABLED` | No | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP stream proxies |
+| `FERRUM_POOL_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent connection warmup attempts at startup |
+| `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | No | `30` | Cleanup sweep interval for all connection pools |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host (reqwest pool) |
+| `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | No | `90` | Seconds before idle connections are closed |
+| `FERRUM_POOL_ENABLE_HTTP2` | No | `true` | Enable HTTP/2 multiplexing when supported |
+| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | No | `60` | TCP keep-alive interval in seconds |
+
+See [connection_pooling.md](connection_pooling.md) for the full configuration reference and pool warmup details.
 
 The full list of 90+ environment variables is defined in `src/config/env_config.rs`.
 

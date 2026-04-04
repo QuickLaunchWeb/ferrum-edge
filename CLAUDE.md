@@ -103,6 +103,8 @@ Within each mode (database/file/dp), after config is loaded:
 14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
 15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Conflicts are fatal in database/file modes.
 16. **Stream listener bind** — `initial_reconcile_stream_listeners()` binds TCP/UDP stream proxy ports. In database/file modes, bind failure is fatal (gateway exits). In DP mode, bind failures are logged as errors but non-fatal — the DP continues serving HTTP traffic and retries when the CP pushes corrected config.
+17. **DNS warmup** — All backend hostnames (proxy backends, upstream targets, plugin endpoints) are resolved concurrently before accepting traffic.
+18. **Connection pool warmup** — When `FERRUM_POOL_WARMUP_ENABLED=true` (default), pre-establishes backend connections for HTTP-family pools (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS warmup. TCP/UDP stream proxies are skipped (no persistent pools). Upstream targets are expanded so each target gets a warmed connection. Failures are logged as warnings but never block startup.
 
 ### External Secret Resolution
 
@@ -159,8 +161,8 @@ src/
 │       ├── http_client.rs     # Shared HTTP client for plugin outbound calls
 │       └── redis_rate_limiter.rs  # Shared Redis client for centralized rate limiting
 ├── grpc/                      # CP/DP gRPC communication
-│   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service)
-│   └── dp_client.rs           # Data Plane gRPC client (subscribe + reconnect)
+│   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
+│   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache
 ├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
 ├── circuit_breaker.rs         # Three-state circuit breaker (connection errors vs status code failures tracked independently via trip_on_connection_errors)
@@ -207,6 +209,32 @@ Routes are matched in priority order within each host tier (exact host → wildc
 2. **Regex routes second** — first match in config order wins
 
 **Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
+
+### Protocol-Level Request Validation
+
+The gateway validates protocol-level constraints before routing to block smuggling, desync, and framing attacks. These checks run on every inbound request in `handle_proxy_request()` (HTTP/1.1, HTTP/2) and `handle_h3_request()` (HTTP/3) via the shared `check_protocol_headers()` helper in `src/proxy/mod.rs`.
+
+| Check | HTTP/1.x | HTTP/2 | HTTP/3 | Response |
+|-------|----------|--------|--------|----------|
+| **CL + TE conflict** (request smuggling) | Reject 400 | N/A (no TE) | N/A (no TE) | `{"error":"Request contains both Content-Length and Transfer-Encoding headers"}` |
+| **Multiple Content-Length** (mismatched values) | Reject 400 | Reject 400 | Reject 400 | `{"error":"Multiple Content-Length headers with conflicting values"}` |
+| **Multiple Host headers** | Reject 400 | N/A (:authority) | N/A (:authority) | `{"error":"Request contains multiple Host headers"}` |
+| **TE header value** | Any allowed | Only "trailers" | N/A | `{"error":"HTTP/2 TE header must be 'trailers' or absent"}` |
+| **gRPC non-POST method** | Reject (gRPC error) | Reject (gRPC error) | N/A | gRPC trailers-only error |
+| **WebSocket Sec-WebSocket-Key** | Format validated | N/A | N/A | Treated as non-WS request |
+
+**CL + TE conflict** is the most critical check — it prevents HTTP request smuggling attacks that exploit parsing disagreements between the proxy and backend about message boundaries (RFC 9112 §6.1).
+
+**WebSocket Sec-WebSocket-Key validation**: RFC 6455 §4.1 requires the key to be a base64-encoded 16-byte nonce. The `is_valid_websocket_key()` helper validates this; requests with malformed keys are not treated as WebSocket upgrades, falling through to regular HTTP handling.
+
+**What hyper/h2/quinn already validate** (no additional checks needed):
+- HTTP method token syntax (RFC 7230)
+- Header name/value syntax
+- HTTP/2 pseudo-header presence and ordering (`:method`, `:path`, `:scheme`, `:authority`)
+- HTTP/2 frame format, stream state machine, flow control
+- HTTP/2 stream abuse detection (`max_pending_accept_reset_streams`, `max_local_error_reset_streams`)
+- HTTP/3 QUIC packet format, TLS 1.3 handshake, stream state transitions
+- WebSocket frame format, masking, close frame validation (tokio-tungstenite)
 
 ### Stream Proxy Port Validation
 
@@ -514,7 +542,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
   5. **Fallback**: If the incremental poll fails for any reason, the loop automatically falls back to a full `load_full_config()` + `update_config()` cycle and re-seeds the known IDs.
   - The `updated_at` columns are indexed (`idx_proxies_updated_at`, `idx_consumers_updated_at`, `idx_plugin_configs_updated_at`, `idx_upstreams_updated_at`) so incremental queries use index scans, not full table scans.
   - Incremental results feed into `ProxyState::apply_incremental()` which patches the in-memory `GatewayConfig` and drives the same surgical cache updates (router, plugin, consumer, load balancer, circuit breaker, DNS warmup) as the full-reload path.
-  - **CP mode** uses the same incremental polling strategy. Deltas are serialized and broadcast to DPs as `DELTA` updates (update_type=1) via gRPC. DPs apply them via `apply_incremental()`. On incremental poll failure, the CP falls back to a full reload and broadcasts a `FULL_SNAPSHOT`.
+  - **CP mode** uses the same incremental polling strategy. Deltas are serialized and broadcast to DPs as `DELTA` updates (update_type=1) via a tokio `broadcast` channel (capacity configurable via `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`, default 128). DPs apply them via `apply_incremental()`. On incremental poll failure, the CP falls back to a full reload and broadcasts a `FULL_SNAPSHOT`. If a DP lags behind by more than the channel capacity, it automatically receives a fresh full snapshot instead of the missed deltas (self-healing). The broadcast is lock-free — `tx.send()` writes once to a ring buffer that all receivers share; it never blocks on slow DPs.
 - **Multi-URL Failover**: `FERRUM_DB_FAILOVER_URLS` accepts comma-separated fallback database URLs. On startup, if the primary `FERRUM_DB_URL` is unreachable, failover URLs are tried in order. During polling, if both incremental and full reload fail, the gateway attempts to reconnect via failover URLs before marking the DB as unavailable. All failover URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
 - **Read Replica**: `FERRUM_DB_READ_REPLICA_URL` offloads config polling reads to a read replica. The polling loop (both full and incremental) queries the replica, while Admin API writes always go to the primary. If the replica is unreachable at startup, polling transparently falls back to the primary. DNS re-resolution is performed independently for both primary and replica hostnames.
 
@@ -580,6 +608,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | (none) | PEM key for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | (none) | PEM CA for verifying DP client certs (mTLS) |
+| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | `128` | Broadcast channel capacity for CP-to-DP delta fan-out. DPs that lag behind by more than this many updates receive a full snapshot instead. Increase for high config churn |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode) | CP gRPC URL for DP to connect to (`http://` or `https://`) |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | (none) | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | (none) | PEM client cert for DP-to-CP mTLS |
@@ -600,6 +629,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | `100` | Max request body size (MiB) for `POST /restore` |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per HTTP/3 backend (distributes frame processing) |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | HTTP/3 connection pool idle eviction timeout |
+| `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP |
+| `FERRUM_POOL_WARMUP_CONCURRENCY` | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
@@ -612,6 +643,11 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Server-side HTTP/2 pending reset-stream threshold before GOAWAY |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Server-side HTTP/2 local reset-stream threshold before GOAWAY |
 | `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | `20000` | Max concurrently upgraded WebSocket connections (`0` = disabled) |
+| `FERRUM_MAX_HEADER_COUNT` | `100` | Max number of request headers allowed. `0` = unlimited |
+| `FERRUM_MAX_URL_LENGTH_BYTES` | `8192` | Max URL length in bytes (path + query string). `0` = unlimited |
+| `FERRUM_MAX_QUERY_PARAMS` | `100` | Max number of query parameters allowed. `0` = unlimited |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
+| `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
@@ -621,6 +657,8 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 - Build script: `build.rs` compiles protos via `tonic_build`
 - Service: `ConfigSync` with `Subscribe` (streaming) and `GetFullConfig` (unary)
 - Auth: HS256 JWT in gRPC metadata (`authorization` key)
+- **CP broadcast**: `CpGrpcServer::with_channel_capacity()` creates the tokio broadcast channel. `CpGrpcServer::new()` is a convenience wrapper that defaults to capacity 128 (used by tests). Production code in `control_plane.rs` calls `with_channel_capacity()` passing `env_config.cp_broadcast_channel_capacity`.
+- **DP reconnect**: `start_dp_client_with_shutdown_and_startup_ready()` uses exponential backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) to prevent thundering-herd reconnection storms when many DPs restart simultaneously. Backoff resets to 1s on clean stream disconnect (CP graceful shutdown). The single-shot `connect_and_subscribe()` has no retry loop (used by tests and one-off callers).
 
 ## Docker
 

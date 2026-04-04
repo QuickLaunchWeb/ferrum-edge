@@ -187,6 +187,12 @@ pub struct EnvConfig {
     /// Path to PEM CA bundle for verifying DP client certificates (mTLS).
     /// When set, the CP requires and verifies client certificates from DPs.
     pub cp_grpc_tls_client_ca_path: Option<String>,
+    /// Capacity of the tokio broadcast channel used to fan out config deltas
+    /// to subscribed Data Planes. When a DP lags behind by more than this many
+    /// updates, it receives a full config snapshot instead of the missed deltas.
+    /// Higher values trade memory for fewer full-snapshot recoveries under
+    /// high config churn. Default: 128.
+    pub cp_broadcast_channel_capacity: usize,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -202,8 +208,20 @@ pub struct EnvConfig {
     // Request/Response limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
+    /// Maximum number of request headers allowed. 0 = unlimited.
+    pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    /// Maximum URL length in bytes (path + query string). 0 = unlimited.
+    pub max_url_length_bytes: usize,
+    /// Maximum number of query parameters allowed. 0 = unlimited.
+    pub max_query_params: usize,
+    /// Maximum total received gRPC payload size in bytes. For unary RPCs this is
+    /// effectively a per-message limit (plus 5 bytes of gRPC framing). For streaming
+    /// RPCs this caps the cumulative body size across all messages. 0 = unlimited.
+    pub max_grpc_recv_size_bytes: usize,
+    /// Maximum WebSocket frame size in bytes. Applied to both client and backend connections.
+    pub max_websocket_frame_size_bytes: usize,
 
     // DNS
     pub dns_cache_ttl_seconds: u64,
@@ -278,6 +296,14 @@ pub struct EnvConfig {
     /// Lower values reduce queueing for unary gRPC under load. Set to 0 to
     /// skip the wait and open a new backend connection immediately.
     pub grpc_pool_ready_wait_ms: u64,
+
+    // Connection pool warmup
+    /// Pre-establish backend connections at startup (default: true).
+    /// Warms HTTP, gRPC, HTTP/2, and HTTP/3 pools after DNS warmup completes.
+    /// Skipped for TCP/UDP stream proxies (no persistent connection pools).
+    pub pool_warmup_enabled: bool,
+    /// Maximum concurrent connection warmup attempts at startup (default: 500).
+    pub pool_warmup_concurrency: usize,
 
     // Connection pool cleanup
     /// Interval in seconds between connection pool cleanup sweeps (default: 30).
@@ -450,14 +476,20 @@ impl Default for EnvConfig {
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
+            cp_broadcast_channel_capacity: 128,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
             dp_grpc_tls_no_verify: false,
             max_header_size_bytes: 32_768,
             max_single_header_size_bytes: 16_384,
+            max_header_count: 100,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
+            max_url_length_bytes: 8_192,
+            max_query_params: 100,
+            max_grpc_recv_size_bytes: 4_194_304,
+            max_websocket_frame_size_bytes: 16_777_216,
             dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
@@ -490,6 +522,8 @@ impl Default for EnvConfig {
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
             grpc_pool_ready_wait_ms: 1,
+            pool_warmup_enabled: true,
+            pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
@@ -625,6 +659,11 @@ impl EnvConfig {
             cp_grpc_tls_cert_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CERT_PATH"),
             cp_grpc_tls_key_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_KEY_PATH"),
             cp_grpc_tls_client_ca_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH"),
+            cp_broadcast_channel_capacity: resolve_usize(
+                conf,
+                "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY",
+                128,
+            ),
 
             // DP gRPC TLS
             dp_grpc_tls_ca_cert_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CA_CERT_PATH"),
@@ -638,6 +677,7 @@ impl EnvConfig {
                 "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
                 16_384,
             ),
+            max_header_count: resolve_usize(conf, "FERRUM_MAX_HEADER_COUNT", 100),
             max_request_body_size_bytes: resolve_usize(
                 conf,
                 "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
@@ -647,6 +687,18 @@ impl EnvConfig {
                 conf,
                 "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
                 10_485_760,
+            ),
+            max_url_length_bytes: resolve_usize(conf, "FERRUM_MAX_URL_LENGTH_BYTES", 8_192),
+            max_query_params: resolve_usize(conf, "FERRUM_MAX_QUERY_PARAMS", 100),
+            max_grpc_recv_size_bytes: resolve_usize(
+                conf,
+                "FERRUM_MAX_GRPC_RECV_SIZE_BYTES",
+                4_194_304,
+            ),
+            max_websocket_frame_size_bytes: resolve_usize(
+                conf,
+                "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
+                16_777_216,
             ),
 
             dns_cache_ttl_seconds: resolve_u64(conf, "FERRUM_DNS_CACHE_TTL_SECONDS", 300),
@@ -721,6 +773,13 @@ impl EnvConfig {
                 120,
             ),
             grpc_pool_ready_wait_ms: resolve_u64(conf, "FERRUM_GRPC_POOL_READY_WAIT_MS", 1),
+
+            // Connection pool warmup
+            pool_warmup_enabled: resolve_bool(conf, "FERRUM_POOL_WARMUP_ENABLED", true),
+            pool_warmup_concurrency: resolve_var(conf, "FERRUM_POOL_WARMUP_CONCURRENCY")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500)
+                .max(1),
 
             // Connection pool cleanup
             pool_cleanup_interval_seconds: resolve_u64(

@@ -142,6 +142,11 @@ See [Response Body Streaming](response_body_streaming.md) for full details on st
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | 10 MB | Maximum response body size |
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | 32 KB | Maximum total header size |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | 16 KB | Maximum single header value size |
+| `FERRUM_MAX_HEADER_COUNT` | 100 | Maximum number of request headers (0=unlimited) |
+| `FERRUM_MAX_URL_LENGTH_BYTES` | 8 KB | Maximum URL length (path + query string) |
+| `FERRUM_MAX_QUERY_PARAMS` | 100 | Maximum number of query parameters |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | 4 MB | Maximum total received gRPC payload size |
+| `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | 16 MB | Maximum WebSocket frame size (max message size = 4x frame size) |
 
 See [Size Limits](size_limits.md) for full details on enforcement layers.
 
@@ -167,6 +172,8 @@ pool_memory ≈ num_upstream_hosts × max_idle_per_host × 20 KB
 | 50 | 64 | ~64 MB |
 | 200 | 128 | ~512 MB |
 | 200 | 32 | ~128 MB |
+
+**Connection pool warmup:** When `FERRUM_POOL_WARMUP_ENABLED=true` (the default), the gateway pre-establishes connections to all HTTP-family backends at startup. This adds a small amount of time to startup (typically sub-second for most configs, depending on backend latency and `FERRUM_POOL_WARMUP_CONCURRENCY`) but eliminates first-request latency spikes. The warmed connections consume the same memory as connections created during normal traffic. For Kubernetes deployments, account for warmup time in your `startupProbe.initialDelaySeconds`. See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for configuration details.
 
 **Recommendations:**
 - With HTTP/2 enabled, a single connection can multiplex many requests — reduce `max_idle_per_host` to 4–16.

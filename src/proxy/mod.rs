@@ -85,10 +85,21 @@ pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::http2_pool::Http2ConnectionPool;
 
+/// Boxed future type for pool warmup tasks.
+/// Returns `Ok(description)` on success or `Err(message)` on failure.
+type WarmupTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
 /// String allocations on the hot path.
+///
+/// Validates the `Sec-WebSocket-Key` header format: RFC 6455 §4.1 requires it to
+/// be a base64-encoded 16-byte nonce (exactly 24 base64 characters). A malformed
+/// key causes the handshake to be treated as a non-WebSocket request, which the
+/// backend will handle as a regular HTTP request rather than proceeding with a
+/// broken upgrade.
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
     let connection = headers.get("connection").and_then(|v| v.to_str().ok());
@@ -106,8 +117,20 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
         conn.split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
     }) && upgrade.is_some_and(|up| up.eq_ignore_ascii_case("websocket"))
-        && sec_key.is_some()
+        && sec_key.is_some_and(is_valid_websocket_key)
         && (sec_version == Some("13"))
+}
+
+/// Validate that a `Sec-WebSocket-Key` value is a base64-encoded 16-byte nonce.
+///
+/// RFC 6455 §4.1 requires the key to be exactly 16 bytes of random data,
+/// base64-encoded to 24 characters (16 bytes → 22 base64 chars + 2 padding `=`).
+/// We accept any valid base64 that decodes to exactly 16 bytes.
+pub fn is_valid_websocket_key(key: &str) -> bool {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .is_ok_and(|bytes| bytes.len() == 16)
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`.
@@ -639,8 +662,13 @@ pub struct ProxyState {
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
+    pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    pub max_url_length_bytes: usize,
+    pub max_query_params: usize,
+    pub max_grpc_recv_size_bytes: usize,
+    pub max_websocket_frame_size_bytes: usize,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -674,8 +702,13 @@ impl ProxyState {
         };
         let max_header_size_bytes = env_config.max_header_size_bytes;
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
+        let max_header_count = env_config.max_header_count;
         let max_request_body_size_bytes = env_config.max_request_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
+        let max_url_length_bytes = env_config.max_url_length_bytes;
+        let max_query_params = env_config.max_query_params;
+        let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
+        let max_websocket_frame_size_bytes = env_config.max_websocket_frame_size_bytes;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -798,8 +831,13 @@ impl ProxyState {
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
+            max_header_count,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
+            max_url_length_bytes,
+            max_query_params,
+            max_grpc_recv_size_bytes,
+            max_websocket_frame_size_bytes,
             trusted_proxies,
             websocket_conn_limit,
             stream_listener_manager,
@@ -828,6 +866,397 @@ impl ProxyState {
             ));
         }
         Err(anyhow::anyhow!("{}", msg.trim_end()))
+    }
+
+    /// Pre-establish backend connections for all HTTP-family proxies.
+    ///
+    /// Warms four pool types (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS
+    /// warmup completes, so the first request to each backend does not pay
+    /// TCP/TLS/QUIC handshake latency. Stream proxies (TCP/UDP) are skipped
+    /// because they create per-session connections with no persistent pool.
+    ///
+    /// For upstream-backed proxies, every target in the upstream is warmed for
+    /// pools that key by (host, port) — gRPC, HTTP/2 direct, HTTP/3. The
+    /// reqwest pool keys by `upstream_id` so one `get_client()` call covers
+    /// all targets (reqwest handles per-host pooling internally).
+    pub async fn warmup_connection_pools(&self) {
+        use futures_util::stream;
+        use std::collections::HashSet;
+
+        let config = self.config.load_full();
+        let concurrency = self.env_config.pool_warmup_concurrency;
+
+        // Build a deduplication set for per-host pools (gRPC, H2, H3) keyed by
+        // the same pool key the pool itself uses, preventing redundant warmups.
+        let mut seen_reqwest = HashSet::new();
+        let mut seen_grpc = HashSet::new();
+        let mut seen_h2 = HashSet::new();
+        let mut seen_h3 = HashSet::new();
+
+        // Collect all warmup tasks as boxed futures.
+        let mut tasks: Vec<WarmupTask> = Vec::new();
+
+        // Helper: build upstream target map for O(1) lookup
+        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.id.as_str(), u))
+            .collect();
+
+        for proxy in &config.proxies {
+            // Skip stream proxies — no persistent connection pools
+            if proxy.backend_protocol.is_stream_proxy() {
+                continue;
+            }
+
+            match proxy.backend_protocol {
+                // ── reqwest pool (HTTP/1.1, HTTPS, WS, WSS) ──
+                // Also covers HTTPS when H2 direct pool is not eligible.
+                BackendProtocol::Http
+                | BackendProtocol::Https
+                | BackendProtocol::Ws
+                | BackendProtocol::Wss => {
+                    self.collect_reqwest_warmup_tasks(
+                        proxy,
+                        &upstream_map,
+                        &mut seen_reqwest,
+                        &mut tasks,
+                    );
+
+                    // If HTTPS with enable_http2, also warm the direct H2 pool
+                    if matches!(proxy.backend_protocol, BackendProtocol::Https) {
+                        let pool_config =
+                            self.connection_pool.global_pool_config().for_proxy(proxy);
+                        if pool_config.enable_http2 {
+                            self.collect_h2_warmup_tasks(
+                                proxy,
+                                &upstream_map,
+                                &mut seen_h2,
+                                &mut tasks,
+                            );
+                        }
+                    }
+                }
+
+                // ── gRPC pool (Grpc/Grpcs) ──
+                BackendProtocol::Grpc | BackendProtocol::Grpcs => {
+                    self.collect_grpc_warmup_tasks(
+                        proxy,
+                        &upstream_map,
+                        &mut seen_grpc,
+                        &mut tasks,
+                    );
+                }
+
+                // ── HTTP/3 pool ──
+                BackendProtocol::H3 => {
+                    self.collect_h3_warmup_tasks(proxy, &upstream_map, &mut seen_h3, &mut tasks);
+                }
+
+                // Stream protocols already filtered above
+                _ => {}
+            }
+        }
+
+        if tasks.is_empty() {
+            debug!("Pool warmup: no HTTP-family backends to warm");
+            return;
+        }
+
+        let total = tasks.len();
+        info!(
+            "Pool warmup: establishing {} backend connections (concurrency={})",
+            total, concurrency
+        );
+
+        let ok = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+
+        let ok_ref = ok.clone();
+        let failed_ref = failed.clone();
+
+        stream::iter(tasks)
+            .for_each_concurrent(concurrency, |task| {
+                let ok = ok_ref.clone();
+                let failed = failed_ref.clone();
+                async move {
+                    match task.await {
+                        Ok(desc) => {
+                            debug!("Pool warmup: {} ok", desc);
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(msg) => {
+                            warn!("Pool warmup failed: {}", msg);
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .await;
+
+        let ok_count = ok.load(Ordering::Relaxed);
+        let failed_count = failed.load(Ordering::Relaxed);
+        if failed_count > 0 {
+            info!(
+                "Pool warmup complete: {} ok, {} failed out of {} targets",
+                ok_count, failed_count, total
+            );
+        } else {
+            info!("Pool warmup complete: all {} targets ok", total);
+        }
+    }
+
+    /// Collect reqwest pool warmup tasks for a proxy.
+    ///
+    /// Creates the `reqwest::Client` (TLS config, cert parsing) and then sends
+    /// a lightweight HEAD request to each unique backend host:port to force
+    /// TCP/TLS connection establishment. reqwest caches connections internally
+    /// by host:port, so subsequent requests reuse the warmed connection.
+    ///
+    /// For upstream-backed proxies, every target is warmed individually because
+    /// reqwest pools connections per URL host:port.
+    fn collect_reqwest_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        let scheme = match proxy.backend_protocol {
+            BackendProtocol::Http | BackendProtocol::Ws => "http",
+            _ => "https",
+        };
+
+        // Collect (host, port) targets to warm
+        let mut targets: Vec<(String, u16)> = Vec::new();
+        if let Some(ref upstream_id) = proxy.upstream_id
+            && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+        {
+            for target in &upstream.targets {
+                targets.push((target.host.clone(), target.port));
+            }
+        }
+        if targets.is_empty() {
+            targets.push((proxy.backend_host.clone(), proxy.backend_port));
+        }
+
+        // First, ensure the reqwest::Client is created and cached (TLS config,
+        // cert parsing, root store). This is shared across all targets.
+        let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
+        let client_created = seen.contains(&pool_key);
+        if !client_created {
+            seen.insert(pool_key);
+        }
+
+        for (host, port) in targets {
+            let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+
+            let pool = self.connection_pool.clone();
+            let proxy = proxy.clone();
+            let scheme = scheme.to_string();
+            tasks.push(Box::pin(async move {
+                let desc = format!("reqwest {}:{}", host, port);
+                let client = pool
+                    .get_client(&proxy)
+                    .await
+                    .map_err(|e| format!("{}: {}", desc, e))?;
+
+                // Send a HEAD request to force TCP/TLS connection establishment.
+                // The backend will likely return an error (404, 503, etc.) but
+                // the underlying TCP/TLS connection is kept in reqwest's internal
+                // pool for reuse. We ignore the HTTP response status entirely.
+                let url = format!("{}://{}:{}/", scheme, host, port);
+                let result = client
+                    .head(&url)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_) => Ok(desc),
+                    Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
+                    // Non-connect errors (4xx, 5xx, etc.) are fine — the TCP/TLS
+                    // connection was established and is now pooled.
+                    Err(_) => Ok(desc),
+                }
+            }));
+        }
+    }
+
+    /// Collect gRPC pool warmup tasks for a proxy, expanding upstream targets.
+    fn collect_grpc_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
+                for target in &upstream.targets {
+                    let mut target_proxy = proxy.clone();
+                    target_proxy.backend_host = target.host.clone();
+                    target_proxy.backend_port = target.port;
+                    let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(&target_proxy);
+                    if seen.insert(key) {
+                        let pool = self.grpc_pool.clone();
+                        let dns = self.dns_cache.clone();
+                        tasks.push(Box::pin(async move {
+                            let desc = format!(
+                                "gRPC {}:{}",
+                                target_proxy.backend_host, target_proxy.backend_port
+                            );
+                            pool.get_sender(&target_proxy, &dns)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {:?}", desc, e))
+                        }));
+                    }
+                }
+            }
+        } else {
+            let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(proxy);
+            if seen.insert(key) {
+                let pool = self.grpc_pool.clone();
+                let dns = self.dns_cache.clone();
+                let proxy = proxy.clone();
+                tasks.push(Box::pin(async move {
+                    let desc = format!("gRPC {}:{}", proxy.backend_host, proxy.backend_port);
+                    pool.get_sender(&proxy, &dns)
+                        .await
+                        .map(|_| desc.clone())
+                        .map_err(|e| format!("{}: {:?}", desc, e))
+                }));
+            }
+        }
+    }
+
+    /// Collect HTTP/2 direct pool warmup tasks for a proxy, expanding upstream targets.
+    fn collect_h2_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
+                for target in &upstream.targets {
+                    let mut target_proxy = proxy.clone();
+                    target_proxy.backend_host = target.host.clone();
+                    target_proxy.backend_port = target.port;
+                    let key = Http2ConnectionPool::pool_key_for_warmup(&target_proxy);
+                    if seen.insert(key) {
+                        let pool = self.http2_pool.clone();
+                        let dns = self.dns_cache.clone();
+                        tasks.push(Box::pin(async move {
+                            let desc = format!(
+                                "H2 {}:{}",
+                                target_proxy.backend_host, target_proxy.backend_port
+                            );
+                            pool.get_sender(&target_proxy, &dns)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {:?}", desc, e))
+                        }));
+                    }
+                }
+            }
+        } else {
+            let key = Http2ConnectionPool::pool_key_for_warmup(proxy);
+            if seen.insert(key) {
+                let pool = self.http2_pool.clone();
+                let dns = self.dns_cache.clone();
+                let proxy = proxy.clone();
+                tasks.push(Box::pin(async move {
+                    let desc = format!("H2 {}:{}", proxy.backend_host, proxy.backend_port);
+                    pool.get_sender(&proxy, &dns)
+                        .await
+                        .map(|_| desc.clone())
+                        .map_err(|e| format!("{}: {:?}", desc, e))
+                }));
+            }
+        }
+    }
+
+    /// Collect HTTP/3 pool warmup tasks for a proxy, expanding upstream targets.
+    fn collect_h3_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
+                for target in &upstream.targets {
+                    let key = format!(
+                        "h3|{}|{}|{}|{}|{}",
+                        target.host,
+                        target.port,
+                        proxy
+                            .backend_tls_server_ca_cert_path
+                            .as_deref()
+                            .unwrap_or_default(),
+                        proxy
+                            .backend_tls_client_cert_path
+                            .as_deref()
+                            .unwrap_or_default(),
+                        proxy.backend_tls_verify_server_cert as u8,
+                    );
+                    if seen.insert(key) {
+                        let pool = self.h3_pool.clone();
+                        let conn_pool = self.connection_pool.clone();
+                        let proxy = proxy.clone();
+                        let host = target.host.clone();
+                        let port = target.port;
+                        tasks.push(Box::pin(async move {
+                            let desc = format!("H3 {}:{}", host, port);
+                            let tls_config = conn_pool
+                                .get_tls_config_for_backend(&proxy)
+                                .map_err(|e| format!("{}: TLS config: {}", desc, e))?;
+                            pool.warmup_connection_to_target(&host, port, &tls_config)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {}", desc, e))
+                        }));
+                    }
+                }
+            }
+        } else {
+            let key = format!(
+                "h3|{}|{}|{}|{}|{}",
+                proxy.backend_host,
+                proxy.backend_port,
+                proxy
+                    .backend_tls_server_ca_cert_path
+                    .as_deref()
+                    .unwrap_or_default(),
+                proxy
+                    .backend_tls_client_cert_path
+                    .as_deref()
+                    .unwrap_or_default(),
+                proxy.backend_tls_verify_server_cert as u8,
+            );
+            if seen.insert(key) {
+                let pool = self.h3_pool.clone();
+                let conn_pool = self.connection_pool.clone();
+                let proxy = proxy.clone();
+                tasks.push(Box::pin(async move {
+                    let desc = format!("H3 {}:{}", proxy.backend_host, proxy.backend_port);
+                    let tls_config = conn_pool
+                        .get_tls_config_for_backend(&proxy)
+                        .map_err(|e| format!("{}: TLS config: {}", desc, e))?;
+                    pool.warmup_connection(&proxy, &tls_config)
+                        .await
+                        .map(|_| desc.clone())
+                        .map_err(|e| format!("{}: {}", desc, e))
+                }));
+            }
+        }
     }
 
     /// Apply a new configuration, using incremental (surgical) updates when
@@ -1664,6 +2093,7 @@ async fn handle_websocket_request_authenticated(
             &env_config,
             &client_headers,
             state.tls_policy.as_deref(),
+            state.max_websocket_frame_size_bytes,
         )
         .await
         {
@@ -1930,6 +2360,7 @@ async fn handle_websocket_request_authenticated(
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
+    let max_ws_frame = state.max_websocket_frame_size_bytes;
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -1940,6 +2371,7 @@ async fn handle_websocket_request_authenticated(
                     ws_conn_id,
                     ws_frame_plugins,
                     ws_connection_permit,
+                    max_ws_frame,
                 )
                 .await
                 {
@@ -2170,13 +2602,14 @@ async fn connect_websocket_backend(
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
     tls_policy: Option<&TlsPolicy>,
+    max_websocket_frame_size_bytes: usize,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(16 << 20);
-    ws_config.max_message_size = Some(64 << 20);
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -2231,10 +2664,11 @@ async fn run_websocket_proxy(
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    max_websocket_frame_size_bytes: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(16 << 20);
-    ws_config.max_message_size = Some(64 << 20);
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
@@ -3103,6 +3537,61 @@ pub async fn handle_proxy_request(
             r#"{"error":"Total request headers exceed maximum size"}"#,
         ));
     }
+    if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
+        record_request(&state, 431);
+        return Ok(build_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            &format!(
+                r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
+                req.headers().len(),
+                state.max_header_count
+            ),
+        ));
+    }
+
+    // Validate URL length (path + query string)
+    if state.max_url_length_bytes > 0 {
+        let url_len = path.len()
+            + if query_string.is_empty() {
+                0
+            } else {
+                1 + query_string.len()
+            };
+        if url_len > state.max_url_length_bytes {
+            record_request(&state, 414);
+            return Ok(build_response(
+                StatusCode::URI_TOO_LONG,
+                &format!(
+                    r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
+                    url_len, state.max_url_length_bytes
+                ),
+            ));
+        }
+    }
+
+    // Validate query parameter count
+    if state.max_query_params > 0 && !query_string.is_empty() {
+        let param_count = query_string.split('&').count();
+        if param_count > state.max_query_params {
+            record_request(&state, 400);
+            return Ok(build_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
+                    param_count, state.max_query_params
+                ),
+            ));
+        }
+    }
+
+    // Protocol-level header validation to prevent request smuggling and desync attacks.
+    // Must run before routing because these are transport-level violations that apply
+    // regardless of which backend the request would be forwarded to.
+    if let Some(error_body) = check_protocol_headers(req.headers(), req.version()) {
+        warn!("Rejected request: {}", error_body);
+        record_request(&state, 400);
+        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
+    }
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse the socket IP once and reuse the parsed value to avoid redundant
@@ -3236,6 +3725,21 @@ pub async fn handle_proxy_request(
         ProxyProtocol::Http
     };
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+
+    // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
+    // gRPC trailers-only error rather than forwarding an invalid request to the backend.
+    if is_grpc_request && method != "POST" {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
+        let reject = normalize_reject_response(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"gRPC requires POST method"}"#,
+            &HashMap::new(),
+            true,
+        );
+        record_status(&state, reject.http_status.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
+    }
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = state
@@ -3693,7 +4197,9 @@ pub async fn handle_proxy_request(
                 }
             };
             let (grpc_method, grpc_headers, grpc_req_body) =
-                match grpc_proxy::collect_grpc_request_body(request).await {
+                match grpc_proxy::collect_grpc_request_body(request, state.max_grpc_recv_size_bytes)
+                    .await
+                {
                     Ok(parts) => parts,
                     Err(e) => {
                         record_request(&state, 500);
@@ -3781,6 +4287,7 @@ pub async fn handle_proxy_request(
                 &state.dns_cache,
                 proxy_headers,
                 grpc_should_stream,
+                state.max_grpc_recv_size_bytes,
             )
             .await
         };
@@ -4240,6 +4747,9 @@ pub async fn handle_proxy_request(
                     }
                     GrpcProxyError::BackendTimeout(m) => {
                         (grpc_proxy::grpc_status::DEADLINE_EXCEEDED, m.as_str())
+                    }
+                    GrpcProxyError::ResourceExhausted(m) => {
+                        (grpc_proxy::grpc_status::RESOURCE_EXHAUSTED, m.as_str())
                     }
                     GrpcProxyError::Internal(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
@@ -5867,6 +6377,115 @@ fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMa
             }
         }
     }
+}
+
+/// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
+/// Used for parsing comma-separated header field values per RFC 9110 §5.6.1.
+fn trim_ows(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// Validate protocol-level header constraints to block smuggling and desync attacks.
+///
+/// Returns an error message string if the request violates protocol rules, `None` if valid.
+///
+/// Checks performed (all run before routing — these are transport-level violations):
+///
+/// 1. **Content-Length + Transfer-Encoding conflict** (HTTP/1.x only): RFC 9112 §6.1
+///    mandates that a proxy MUST reject or fix messages with both headers. Attackers
+///    exploit CL/TE or TE/CL parsing disagreements between proxies and backends to
+///    smuggle requests across connection boundaries.
+///
+/// 2. **Multiple Content-Length with mismatched values** (all HTTP versions): RFC 9110 §8.6
+///    — different CL values in the same message indicate tampering or a broken intermediary.
+///
+/// 3. **Multiple Host headers** (HTTP/1.1 only): RFC 9112 §3.2 — a request with
+///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
+///    confusion between the proxy and backend.
+///
+/// 4. **TE header validation** (HTTP/2 only): RFC 9113 §8.2.2 — the only permitted
+///    value is "trailers"; any other value is a protocol violation that could be used
+///    to confuse HTTP/2-unaware intermediaries.
+pub fn check_protocol_headers(
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+) -> Option<&'static str> {
+    let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
+
+    // 1. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
+    // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
+    if is_http1
+        && headers.contains_key("transfer-encoding")
+        && headers.contains_key("content-length")
+    {
+        return Some(
+            r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#,
+        );
+    }
+
+    // 2. Multiple Content-Length with mismatched values (all HTTP versions)
+    // An intermediary may coalesce duplicate CL headers into a single comma-separated
+    // field line (e.g. "Content-Length: 42, 0"). We must split on commas, trim OWS,
+    // and reject if any parsed value differs — otherwise a smuggling variant that
+    // relies on coalesced CL values can bypass the guard.
+    {
+        let mut canonical: Option<&[u8]> = None;
+        for val in headers.get_all("content-length") {
+            for token in val.as_bytes().split(|&b| b == b',') {
+                let trimmed = trim_ows(token);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match canonical {
+                    None => canonical = Some(trimmed),
+                    Some(prev) if prev != trimmed => {
+                        return Some(
+                            r#"{"error":"Multiple Content-Length headers with conflicting values"}"#,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 3. Multiple Host headers (HTTP/1.1 only)
+    // HTTP/2 and HTTP/3 use the :authority pseudo-header (exposed via URI), not Host.
+    if is_http1 {
+        let mut host_iter = headers.get_all("host").iter();
+        if host_iter.next().is_some() && host_iter.next().is_some() {
+            return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+        }
+    }
+
+    // 4. TE header in HTTP/2 must be "trailers" only (RFC 9113 §8.2.2)
+    // Iterate all TE header entries and comma-separated tokens within each entry.
+    // A request with `te: trailers` plus a second `te: gzip` entry (or a single
+    // `te: trailers, gzip` field) must be rejected.
+    if version == hyper::Version::HTTP_2 {
+        for te_val in headers.get_all("te") {
+            if let Ok(te_str) = te_val.to_str() {
+                for token in te_str.split(',') {
+                    let trimmed = token.trim();
+                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
+                        return Some(
+                            r#"{"error":"HTTP/2 TE header must be 'trailers' or absent"}"#,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {

@@ -140,6 +140,11 @@ impl GrpcConnectionPool {
         )
     }
 
+    /// Expose the base pool key for warmup deduplication (without shard suffix).
+    pub(crate) fn pool_key_for_warmup(proxy: &Proxy) -> String {
+        Self::pool_key(proxy)
+    }
+
     /// Build a shard key by appending the shard index to a pre-allocated buffer.
     /// Reuses the same buffer across calls to minimize allocations.
     fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
@@ -604,6 +609,7 @@ impl GrpcConnectionPool {
 pub enum GrpcProxyError {
     BackendUnavailable(String),
     BackendTimeout(String),
+    ResourceExhausted(String),
     Internal(String),
 }
 
@@ -675,6 +681,7 @@ pub enum GrpcResponseKind {
 /// returned as a live `Incoming` stream so frames flow frame-by-frame to the
 /// downstream client. This is only safe when retries are NOT configured (the
 /// body has already been consumed by the time we know if a retry is needed).
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request(
     req: Request<Incoming>,
     proxy: &Proxy,
@@ -683,19 +690,47 @@ pub async fn proxy_grpc_request(
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
+    max_grpc_recv_size_bytes: usize,
 ) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
     // Collect the incoming body for potential retry replay
     let (parts, body) = req.into_parts();
-    let body_bytes = match BodyExt::collect(body).await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return (
-                Err(GrpcProxyError::Internal(format!(
-                    "Failed to read request body: {}",
-                    e
-                ))),
-                Bytes::new(),
-            );
+    let body_bytes = if max_grpc_recv_size_bytes > 0 {
+        // Use http_body_util::Limited to enforce max gRPC recv size during body collection
+        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
+        match BodyExt::collect(limited).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("length limit exceeded") {
+                    return (
+                        Err(GrpcProxyError::ResourceExhausted(format!(
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            max_grpc_recv_size_bytes
+                        ))),
+                        Bytes::new(),
+                    );
+                }
+                return (
+                    Err(GrpcProxyError::Internal(format!(
+                        "Failed to read request body: {}",
+                        e
+                    ))),
+                    Bytes::new(),
+                );
+            }
+        }
+    } else {
+        match BodyExt::collect(body).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                return (
+                    Err(GrpcProxyError::Internal(format!(
+                        "Failed to read request body: {}",
+                        e
+                    ))),
+                    Bytes::new(),
+                );
+            }
         }
     };
 
@@ -770,12 +805,33 @@ pub async fn proxy_grpc_request_from_bytes(
 /// so the caller can run plugin hooks before dispatching via `proxy_grpc_request_core`.
 pub async fn collect_grpc_request_body(
     req: Request<Incoming>,
+    max_grpc_recv_size_bytes: usize,
 ) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcProxyError> {
     let (parts, body) = req.into_parts();
-    let body_bytes = BodyExt::collect(body)
-        .await
-        .map_err(|e| GrpcProxyError::Internal(format!("Failed to read request body: {}", e)))?
-        .to_bytes();
+    let body_bytes = if max_grpc_recv_size_bytes > 0 {
+        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
+        match BodyExt::collect(limited).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("length limit exceeded") {
+                    return Err(GrpcProxyError::ResourceExhausted(format!(
+                        "gRPC request payload size exceeds maximum of {} bytes",
+                        max_grpc_recv_size_bytes
+                    )));
+                }
+                return Err(GrpcProxyError::Internal(format!(
+                    "Failed to read request body: {}",
+                    e
+                )));
+            }
+        }
+    } else {
+        BodyExt::collect(body)
+            .await
+            .map_err(|e| GrpcProxyError::Internal(format!("Failed to read request body: {}", e)))?
+            .to_bytes()
+    };
     Ok((parts.method, parts.headers, body_bytes))
 }
 
