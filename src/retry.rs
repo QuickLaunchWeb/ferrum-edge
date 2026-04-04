@@ -94,7 +94,9 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 ErrorClass::ConnectionRefused
             } else if msg.contains("h2c handshake failed") {
                 ErrorClass::ProtocolError
-            } else if msg.contains("Invalid server name") {
+            } else if msg.contains("Invalid server name")
+                || msg.contains("DNS resolution for backend failed")
+            {
                 ErrorClass::DnsLookupError
             } else {
                 ErrorClass::ConnectionRefused

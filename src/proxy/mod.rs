@@ -1670,6 +1670,7 @@ async fn handle_websocket_request_authenticated(
             Ok(stream) => break stream,
             Err(e) => {
                 let ws_error_class = retry::classify_boxed_error(e.as_ref());
+                let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
 
                 // Check if we should retry this connection failure
                 let should_retry_ws = if let Some(retry_config) = &proxy.retry {
@@ -1685,10 +1686,12 @@ async fn handle_websocket_request_authenticated(
                     let retry_config = match proxy.retry.as_ref() {
                         Some(rc) => rc,
                         None => {
-                            return Ok(build_response(
-                                StatusCode::BAD_GATEWAY,
-                                r#"{"error":"Backend WebSocket connection failed"}"#,
-                            ));
+                            let ws_body = if is_ws_dns_error {
+                                r#"{"error":"DNS resolution for backend failed"}"#
+                            } else {
+                                r#"{"error":"Backend WebSocket connection failed"}"#
+                            };
+                            return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
                         }
                     };
 
@@ -1805,10 +1808,12 @@ async fn handle_websocket_request_authenticated(
                     }
                 }
 
-                return Ok(build_response(
-                    StatusCode::BAD_GATEWAY,
-                    r#"{"error":"Backend WebSocket connection failed"}"#,
-                ));
+                let ws_body = if is_ws_dns_error {
+                    r#"{"error":"DNS resolution for backend failed"}"#
+                } else {
+                    r#"{"error":"Backend WebSocket connection failed"}"#
+                };
+                return Ok(build_response(StatusCode::BAD_GATEWAY, ws_body));
             }
         }
     };
@@ -4146,7 +4151,7 @@ pub async fn handle_proxy_request(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
-                let (grpc_code, msg) = match &e {
+                let (grpc_code, original_msg) = match &e {
                     GrpcProxyError::BackendUnavailable(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
@@ -4156,6 +4161,11 @@ pub async fn handle_proxy_request(
                     GrpcProxyError::Internal(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
+                };
+                let msg = if grpc_error_class == retry::ErrorClass::DnsLookupError {
+                    "DNS resolution for backend failed"
+                } else {
+                    original_msg
                 };
 
                 // Log with error_class for gRPC backend failures
@@ -5026,15 +5036,19 @@ async fn proxy_to_backend_retry(
                 error = %e,
                 "Backend retry request failed"
             );
+            let error_class = retry::classify_reqwest_error(&e);
+            let error_body = if error_class == retry::ErrorClass::DnsLookupError {
+                r#"{"error":"DNS resolution for backend failed"}"#
+            } else {
+                r#"{"error":"Backend unavailable"}"#
+            };
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                ),
+                body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
                 backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(retry::classify_reqwest_error(&e)),
+                error_class: Some(error_class),
             }
         }
     }
@@ -5553,15 +5567,19 @@ async fn proxy_to_backend(
                 error = %e,
                 "Backend request failed"
             );
+            let error_class = retry::classify_reqwest_error(&e);
+            let error_body = if error_class == retry::ErrorClass::DnsLookupError {
+                r#"{"error":"DNS resolution for backend failed"}"#
+            } else {
+                r#"{"error":"Backend unavailable"}"#
+            };
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                ),
+                body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
                 connection_error: is_connect || is_timeout,
                 backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(retry::classify_reqwest_error(&e)),
+                error_class: Some(error_class),
             }
         }
     };
