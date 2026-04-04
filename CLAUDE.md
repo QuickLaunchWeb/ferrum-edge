@@ -210,6 +210,32 @@ Routes are matched in priority order within each host tier (exact host → wildc
 
 **Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
 
+### Protocol-Level Request Validation
+
+The gateway validates protocol-level constraints before routing to block smuggling, desync, and framing attacks. These checks run on every inbound request in `handle_proxy_request()` (HTTP/1.1, HTTP/2) and `handle_h3_request()` (HTTP/3) via the shared `check_protocol_headers()` helper in `src/proxy/mod.rs`.
+
+| Check | HTTP/1.x | HTTP/2 | HTTP/3 | Response |
+|-------|----------|--------|--------|----------|
+| **CL + TE conflict** (request smuggling) | Reject 400 | N/A (no TE) | N/A (no TE) | `{"error":"Request contains both Content-Length and Transfer-Encoding headers"}` |
+| **Multiple Content-Length** (mismatched values) | Reject 400 | Reject 400 | Reject 400 | `{"error":"Multiple Content-Length headers with conflicting values"}` |
+| **Multiple Host headers** | Reject 400 | N/A (:authority) | N/A (:authority) | `{"error":"Request contains multiple Host headers"}` |
+| **TE header value** | Any allowed | Only "trailers" | N/A | `{"error":"HTTP/2 TE header must be 'trailers' or absent"}` |
+| **gRPC non-POST method** | Reject (gRPC error) | Reject (gRPC error) | N/A | gRPC trailers-only error |
+| **WebSocket Sec-WebSocket-Key** | Format validated | N/A | N/A | Treated as non-WS request |
+
+**CL + TE conflict** is the most critical check — it prevents HTTP request smuggling attacks that exploit parsing disagreements between the proxy and backend about message boundaries (RFC 9112 §6.1).
+
+**WebSocket Sec-WebSocket-Key validation**: RFC 6455 §4.1 requires the key to be a base64-encoded 16-byte nonce. The `is_valid_websocket_key()` helper validates this; requests with malformed keys are not treated as WebSocket upgrades, falling through to regular HTTP handling.
+
+**What hyper/h2/quinn already validate** (no additional checks needed):
+- HTTP method token syntax (RFC 7230)
+- Header name/value syntax
+- HTTP/2 pseudo-header presence and ordering (`:method`, `:path`, `:scheme`, `:authority`)
+- HTTP/2 frame format, stream state machine, flow control
+- HTTP/2 stream abuse detection (`max_pending_accept_reset_streams`, `max_local_error_reset_streams`)
+- HTTP/3 QUIC packet format, TLS 1.3 handshake, stream state transitions
+- WebSocket frame format, masking, close frame validation (tokio-tungstenite)
+
 ### Stream Proxy Port Validation
 
 TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts are detected at multiple levels:

@@ -94,6 +94,12 @@ type WarmupTask =
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
 /// String allocations on the hot path.
+///
+/// Validates the `Sec-WebSocket-Key` header format: RFC 6455 §4.1 requires it to
+/// be a base64-encoded 16-byte nonce (exactly 24 base64 characters). A malformed
+/// key causes the handshake to be treated as a non-WebSocket request, which the
+/// backend will handle as a regular HTTP request rather than proceeding with a
+/// broken upgrade.
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
     let connection = headers.get("connection").and_then(|v| v.to_str().ok());
@@ -111,8 +117,20 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
         conn.split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
     }) && upgrade.is_some_and(|up| up.eq_ignore_ascii_case("websocket"))
-        && sec_key.is_some()
+        && sec_key.is_some_and(is_valid_websocket_key)
         && (sec_version == Some("13"))
+}
+
+/// Validate that a `Sec-WebSocket-Key` value is a base64-encoded 16-byte nonce.
+///
+/// RFC 6455 §4.1 requires the key to be exactly 16 bytes of random data,
+/// base64-encoded to 24 characters (16 bytes → 22 base64 chars + 2 padding `=`).
+/// We accept any valid base64 that decodes to exactly 16 bytes.
+pub fn is_valid_websocket_key(key: &str) -> bool {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(key)
+        .is_ok_and(|bytes| bytes.len() == 16)
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`.
@@ -3500,6 +3518,15 @@ pub async fn handle_proxy_request(
         ));
     }
 
+    // Protocol-level header validation to prevent request smuggling and desync attacks.
+    // Must run before routing because these are transport-level violations that apply
+    // regardless of which backend the request would be forwarded to.
+    if let Some(error_body) = check_protocol_headers(req.headers(), req.version()) {
+        warn!("Rejected request: {}", error_body);
+        record_request(&state, 400);
+        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
+    }
+
     // Resolve real client IP using trusted proxy configuration.
     // Parse the socket IP once and reuse the parsed value to avoid redundant
     // parsing across the real-IP-header check and the XFF walk.
@@ -3632,6 +3659,21 @@ pub async fn handle_proxy_request(
         ProxyProtocol::Http
     };
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
+
+    // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
+    // gRPC trailers-only error rather than forwarding an invalid request to the backend.
+    if is_grpc_request && method != "POST" {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
+        let reject = normalize_reject_response(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":"gRPC requires POST method"}"#,
+            &HashMap::new(),
+            true,
+        );
+        record_status(&state, reject.http_status.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
+    }
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = state
@@ -6180,6 +6222,115 @@ fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMa
             }
         }
     }
+}
+
+/// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
+/// Used for parsing comma-separated header field values per RFC 9110 §5.6.1.
+fn trim_ows(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b' ' && b != b'\t')
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// Validate protocol-level header constraints to block smuggling and desync attacks.
+///
+/// Returns an error message string if the request violates protocol rules, `None` if valid.
+///
+/// Checks performed (all run before routing — these are transport-level violations):
+///
+/// 1. **Content-Length + Transfer-Encoding conflict** (HTTP/1.x only): RFC 9112 §6.1
+///    mandates that a proxy MUST reject or fix messages with both headers. Attackers
+///    exploit CL/TE or TE/CL parsing disagreements between proxies and backends to
+///    smuggle requests across connection boundaries.
+///
+/// 2. **Multiple Content-Length with mismatched values** (all HTTP versions): RFC 9110 §8.6
+///    — different CL values in the same message indicate tampering or a broken intermediary.
+///
+/// 3. **Multiple Host headers** (HTTP/1.1 only): RFC 9112 §3.2 — a request with
+///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
+///    confusion between the proxy and backend.
+///
+/// 4. **TE header validation** (HTTP/2 only): RFC 9113 §8.2.2 — the only permitted
+///    value is "trailers"; any other value is a protocol violation that could be used
+///    to confuse HTTP/2-unaware intermediaries.
+pub fn check_protocol_headers(
+    headers: &hyper::HeaderMap,
+    version: hyper::Version,
+) -> Option<&'static str> {
+    let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
+
+    // 1. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
+    // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
+    if is_http1
+        && headers.contains_key("transfer-encoding")
+        && headers.contains_key("content-length")
+    {
+        return Some(
+            r#"{"error":"Request contains both Content-Length and Transfer-Encoding headers"}"#,
+        );
+    }
+
+    // 2. Multiple Content-Length with mismatched values (all HTTP versions)
+    // An intermediary may coalesce duplicate CL headers into a single comma-separated
+    // field line (e.g. "Content-Length: 42, 0"). We must split on commas, trim OWS,
+    // and reject if any parsed value differs — otherwise a smuggling variant that
+    // relies on coalesced CL values can bypass the guard.
+    {
+        let mut canonical: Option<&[u8]> = None;
+        for val in headers.get_all("content-length") {
+            for token in val.as_bytes().split(|&b| b == b',') {
+                let trimmed = trim_ows(token);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match canonical {
+                    None => canonical = Some(trimmed),
+                    Some(prev) if prev != trimmed => {
+                        return Some(
+                            r#"{"error":"Multiple Content-Length headers with conflicting values"}"#,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 3. Multiple Host headers (HTTP/1.1 only)
+    // HTTP/2 and HTTP/3 use the :authority pseudo-header (exposed via URI), not Host.
+    if is_http1 {
+        let mut host_iter = headers.get_all("host").iter();
+        if host_iter.next().is_some() && host_iter.next().is_some() {
+            return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+        }
+    }
+
+    // 4. TE header in HTTP/2 must be "trailers" only (RFC 9113 §8.2.2)
+    // Iterate all TE header entries and comma-separated tokens within each entry.
+    // A request with `te: trailers` plus a second `te: gzip` entry (or a single
+    // `te: trailers, gzip` field) must be rejected.
+    if version == hyper::Version::HTTP_2 {
+        for te_val in headers.get_all("te") {
+            if let Ok(te_str) = te_val.to_str() {
+                for token in te_str.split(',') {
+                    let trimmed = token.trim();
+                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
+                        return Some(
+                            r#"{"error":"HTTP/2 TE header must be 'trailers' or absent"}"#,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
