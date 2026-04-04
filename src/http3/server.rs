@@ -1217,12 +1217,12 @@ async fn proxy_to_backend_h3_streaming(
         Err(e) => {
             error!("Backend request failed (HTTP/3 streaming): {}", e);
             let h3_error_class = crate::retry::classify_reqwest_error(&e);
-            send_h3_response(
-                h3_stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Backend unavailable"}"#,
-            )
-            .await?;
+            let h3_error_body = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
+                r#"{"error":"DNS resolution for backend failed"}"#
+            } else {
+                r#"{"error":"Backend unavailable"}"#
+            };
+            send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
             return Ok((502, HashMap::new(), Some(h3_error_class)));
         }
     };
@@ -1549,7 +1549,12 @@ async fn proxy_to_backend_h3(
                 e
             );
             let h3_error_class = crate::retry::classify_reqwest_error(&e);
-            let error_msg = serde_json::json!({"error": "Backend unavailable"});
+            let error_text = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
+                "DNS resolution for backend failed"
+            } else {
+                "Backend unavailable"
+            };
+            let error_msg = serde_json::json!({"error": error_text});
             (
                 502,
                 error_msg.to_string().into_bytes(),

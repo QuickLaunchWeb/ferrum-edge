@@ -318,7 +318,20 @@ impl GrpcConnectionPool {
             })?
             .map_err(|e| {
                 warn!("gRPC: failed to connect to backend {}: {}", addr, e);
-                GrpcProxyError::BackendUnavailable(format!("Connection refused: {}", e))
+                let err_str = e.to_string();
+                if err_str.contains("Name or service not known")
+                    || err_str.contains("No such host")
+                    || err_str.contains("resolve")
+                    || err_str.contains("no record found")
+                    || err_str.contains("failed to lookup address")
+                {
+                    GrpcProxyError::BackendUnavailable(format!(
+                        "DNS resolution for backend failed: {}",
+                        e
+                    ))
+                } else {
+                    GrpcProxyError::BackendUnavailable(format!("Connection refused: {}", e))
+                }
             })?;
 
         // Disable Nagle for lower latency
