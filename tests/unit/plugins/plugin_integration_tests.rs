@@ -96,7 +96,7 @@ async fn run_buffered_response_lifecycle(
     let content_type = content_type.as_deref();
     for plugin in plugins {
         if let Some(transformed) = plugin
-            .transform_response_body(&response_body, content_type)
+            .transform_response_body(&response_body, content_type, &response_headers)
             .await
         {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
@@ -147,7 +147,7 @@ async fn run_buffered_request_lifecycle(
     let content_type = content_type.as_deref();
     for plugin in plugins {
         if let Some(transformed) = plugin
-            .transform_request_body(&request_body, content_type)
+            .transform_request_body(&request_body, content_type, &request_headers)
             .await
         {
             request_headers.insert("content-length".to_string(), transformed.len().to_string());

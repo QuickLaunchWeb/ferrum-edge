@@ -289,7 +289,7 @@ async fn test_response_transformer_body_rename_field() {
 
     let body = br#"{"old_name":"Alice","age":30}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["new_name"], "Alice");
@@ -307,7 +307,7 @@ async fn test_response_transformer_body_rename_nested_field() {
 
     let body = br#"{"data":{"old_field":"value","other":"keep"}}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"]["new_field"], "value");
@@ -325,7 +325,7 @@ async fn test_response_transformer_body_remove_field() {
 
     let body = br#"{"data":"public","internal":{"debug_info":"secret","id":"keep"}}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"], "public");
@@ -343,7 +343,7 @@ async fn test_response_transformer_body_add_field() {
 
     let body = br#"{"data":"response"}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"], "response");
@@ -360,7 +360,7 @@ async fn test_response_transformer_body_update_field() {
 
     let body = br#"{"status":"pending","data":"result"}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["status"], "processed");
@@ -379,7 +379,7 @@ async fn test_response_transformer_body_multiple_rules() {
 
     let body = br#"{"resp_data":"payload","internal_trace_id":"abc123"}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"], "payload");
@@ -412,7 +412,7 @@ async fn test_response_transformer_body_mixed_header_and_body_rules() {
     // Test body rules via transform_response_body
     let body = br#"{"old_field":"data"}"#;
     let body_result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&body_result.unwrap()).unwrap();
     assert_eq!(transformed["new_field"], "data");
@@ -428,7 +428,7 @@ async fn test_response_transformer_body_non_json_skipped() {
 
     let body = b"<xml>not json</xml>";
     let result = plugin
-        .transform_response_body(body, Some("text/html"))
+        .transform_response_body(body, Some("text/html"), &HashMap::new())
         .await;
     assert!(result.is_none());
 }
@@ -455,7 +455,7 @@ async fn test_response_transformer_body_deeply_nested() {
 
     let body = br#"{"a":{"b":{"c":{"old":"deep_value","keep":"yes"}}}}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/json"))
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["a"]["b"]["c"]["new"], "deep_value");
@@ -473,7 +473,7 @@ async fn test_response_transformer_body_vnd_json_content_type() {
 
     let body = br#"{"data":"value"}"#;
     let result = plugin
-        .transform_response_body(body, Some("application/vnd.api+json"))
+        .transform_response_body(body, Some("application/vnd.api+json"), &HashMap::new())
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["processed"], true);

@@ -146,7 +146,7 @@ async fn test_max_tokens_clamp_mode() {
     // transform_request_body should clamp the value
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "max_tokens": 5000})).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -162,7 +162,7 @@ async fn test_max_output_tokens_clamped() {
     let body =
         serde_json::to_vec(&json!({"model": "claude-3", "max_output_tokens": 2000})).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -176,7 +176,7 @@ async fn test_default_max_tokens_injected() {
 
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "messages": []})).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     assert!(result.is_some());
     let modified: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
@@ -188,7 +188,7 @@ async fn test_default_max_tokens_not_injected_when_present() {
     let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096}));
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "max_tokens": 100})).unwrap();
     let result = plugin
-        .transform_request_body(&body, Some("application/json"))
+        .transform_request_body(&body, Some("application/json"), &HashMap::new())
         .await;
     // No modification needed
     assert!(result.is_none());

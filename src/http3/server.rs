@@ -904,8 +904,9 @@ async fn handle_h3_request(
         let mut current = body_data;
         for plugin in plugins.iter() {
             if plugin.modifies_request_body()
-                && let Some(transformed) =
-                    plugin.transform_request_body(&current, content_type).await
+                && let Some(transformed) = plugin
+                    .transform_request_body(&current, content_type, &proxy_headers)
+                    .await
             {
                 current = transformed;
             }
@@ -1101,8 +1102,9 @@ async fn handle_h3_request(
             let content_type = response_headers.get("content-type").cloned();
             let ct_ref = content_type.as_deref();
             for plugin in plugins.iter() {
-                if let Some(transformed) =
-                    plugin.transform_response_body(&response_body, ct_ref).await
+                if let Some(transformed) = plugin
+                    .transform_response_body(&response_body, ct_ref, &response_headers)
+                    .await
                 {
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());

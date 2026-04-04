@@ -377,6 +377,7 @@ impl Plugin for AiRequestGuard {
         &self,
         body: &[u8],
         content_type: Option<&str>,
+        _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Only transform JSON
         if let Some(ct) = content_type
