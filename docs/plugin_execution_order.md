@@ -213,7 +213,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
 | **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
-| **Response** | 4000–4999 | Response transformation and AI accounting | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
+| **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
@@ -253,13 +253,14 @@ Given all built-in plugins enabled, the execution order is:
 | 28 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 29 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 30 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 31 | `ai_token_metrics` | 4100 | on_response_body |
-| 32 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 33 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 34 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 35 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 36 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 37 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 31 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 32 | `ai_token_metrics` | 4100 | on_response_body |
+| 33 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 34 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 35 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 36 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 37 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 38 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -271,7 +272,7 @@ That ordering has a few practical effects:
 - Cache entries include the final client-visible body and headers, not the raw backend response.
 - Backend `Vary` headers are respected when building the cache key, so variants such as `Accept-Encoding: gzip` stay isolated from uncompressed responses.
 - Fresh cached validators (`ETag`, `Last-Modified`) can satisfy conditional requests at the edge with a `304 Not Modified` response.
-- Ferrum does not generate gzip/brotli on its own; compression remains backend-driven pass-through. The cache can store and replay those compressed backend variants safely. The one exception is the `body_validator` plugin, which decompresses gzip-compressed gRPC frames in order to validate protobuf payloads — this is internal to the validation path and does not affect the forwarded body.
+- The `compression` plugin (4050) can generate gzip/brotli responses at the gateway. When both `response_caching` and `compression` are enabled, the cache stores the uncompressed backend response (since `response_caching` at 3500 runs before `compression` at 4050). Compression is applied after cache retrieval. The `body_validator` plugin separately decompresses gzip-compressed gRPC frames for protobuf validation — this is internal to the validation path and does not affect the forwarded body.
 
 ### OTel tracing runs first (priority 25)
 
@@ -317,6 +318,10 @@ The four AI plugins are ordered to compose correctly:
 Request transformers run after authentication and authorization, so they only modify requests that are already permitted. This prevents wasted transformation work on requests that will be rejected.
 
 `request_size_limiting` participates again after request transforms on buffered requests, so transformed bodies are re-checked before backend dispatch.
+
+### Compression runs after response transformation (4050)
+
+The `compression` plugin runs at priority 4050 — after `response_transformer` (4000) so it compresses the final transformed response body, and before `ai_token_metrics` (4100) and `ai_rate_limiter` (4200) so AI plugins see the uncompressed body. In `before_proxy`, it optionally strips `Accept-Encoding` from the backend request so the backend sends uncompressed responses for the gateway to compress. Response body buffering is required when this plugin is enabled.
 
 ### Logging runs last (9000+)
 
@@ -430,6 +435,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
+| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
 | `ai_prompt_shield` | ✓ | ✓ | | | | Scans JSON request bodies for PII |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |

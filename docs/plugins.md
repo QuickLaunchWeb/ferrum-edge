@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 37 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 38 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -993,6 +993,60 @@ config:
 
 Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
 
+### `compression`
+
+On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Supports gzip and brotli.
+
+**Priority:** 4050
+
+**Response compression** (enabled by default):
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties) |
+| `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes) |
+| `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
+| `disable_on_etag` | bool | `false` | Skip compression when the response has an ETag header |
+| `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
+| `gzip_level` | u64 | `6` | Gzip compression level (1=fastest, 9=best) |
+| `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
+
+**Request decompression** (opt-in):
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `decompress_request` | bool | `false` | Enable decompression of gzip/brotli request bodies |
+| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB) |
+
+**Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
+
+**Skip conditions** (checked in order):
+1. Response status is 204 or 304
+2. Response already has `Content-Encoding` (no double-compression)
+3. `disable_on_etag` is true and response has an `ETag` header
+4. Response `Content-Type` is not in the whitelist
+5. Response `Content-Length` is below `min_content_length`
+6. Client did not send `Accept-Encoding` with a supported algorithm
+
+**Behavior:**
+- Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
+- Adds `Vary: Accept-Encoding` to compressed responses for cache correctness
+- Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
+- Forces response body buffering on proxies where this plugin is enabled
+- Request decompression removes `Content-Encoding` and `Content-Length` from the forwarded request headers
+
+```yaml
+config:
+  algorithms: ["gzip", "br"]
+  min_content_length: 256
+  gzip_level: 6
+  brotli_quality: 4
+  remove_accept_encoding: true
+  decompress_request: false
+```
+
+**Note:** This plugin handles HTTP-level `Content-Encoding` compression/decompression. gRPC message-level compression (the compressed flag in gRPC wire frames) is handled separately by `body_validator` for protobuf validation — these are different protocol layers and should not be confused.
+
 ---
 
 ## Validation Plugins
@@ -1098,8 +1152,8 @@ Behavior:
 - The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
 
 Compression note:
-- Ferrum does **not** generate gzip or brotli on its own — compression remains backend-driven pass-through.
-- It forwards backend `Content-Encoding` as-is and caches compressed variants correctly when the origin sends the matching `Vary` header.
+- The `compression` plugin (priority 4050) can generate gzip or brotli responses at the gateway. When both `response_caching` and `compression` are enabled on the same proxy, the cache stores the uncompressed backend response (since `response_caching` at 3500 runs before `compression` at 4050). Compression is applied after cache retrieval, so cached responses are compressed on each cache hit.
+- Without the `compression` plugin, the gateway forwards backend `Content-Encoding` as-is and caches compressed variants correctly when the origin sends the matching `Vary` header.
 - The `body_validator` plugin decompresses gzip-compressed gRPC frames for protobuf validation, but this is internal to the validation path and does not affect the cached or forwarded body.
 
 ### `graphql`
