@@ -11,9 +11,11 @@
 //! and requires response body buffering when configured.
 
 use async_trait::async_trait;
+use flate2::read::GzDecoder;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read as _;
 use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
@@ -662,7 +664,7 @@ impl BodyValidator {
         descriptor: &MessageDescriptor,
     ) -> Result<(), String> {
         let payload = parse_grpc_frame(body)?;
-        let msg = DynamicMessage::decode(descriptor.clone(), payload)
+        let msg = DynamicMessage::decode(descriptor.clone(), payload.as_slice())
             .map_err(|e| format!("Protobuf decode failed: {}", e))?;
         if self.protobuf_reject_unknown_fields {
             let unknown_count = msg.unknown_fields().count();
@@ -693,10 +695,18 @@ impl BodyValidator {
     }
 }
 
-/// Parse the gRPC length-prefixed frame and return the protobuf payload bytes.
+/// Parse the first gRPC length-prefixed frame and return the protobuf payload bytes.
 ///
 /// Frame format: [1 byte compressed flag] [4 bytes big-endian u32 length] [payload]
-fn parse_grpc_frame(body: &[u8]) -> Result<&[u8], String> {
+///
+/// Supports unary RPCs only (single frame per message). For streaming RPCs the body
+/// may contain multiple concatenated frames — this function validates only the first
+/// frame and rejects trailing data via the length mismatch check.
+///
+/// When the compressed flag is set (byte 0 == 1), the payload is decompressed using
+/// gzip (deflate), which is the standard gRPC compression algorithm. Other compression
+/// algorithms (e.g., zstd, snappy) are not supported and will return an error.
+fn parse_grpc_frame(body: &[u8]) -> Result<Vec<u8>, String> {
     if body.len() < 5 {
         return Err(format!(
             "gRPC frame too short: {} bytes (minimum 5)",
@@ -704,9 +714,6 @@ fn parse_grpc_frame(body: &[u8]) -> Result<&[u8], String> {
         ));
     }
     let compressed = body[0];
-    if compressed != 0 {
-        return Err("Compressed gRPC frames are not supported for protobuf validation".to_string());
-    }
     let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
     let payload = &body[5..];
     if payload.len() != msg_len {
@@ -716,7 +723,17 @@ fn parse_grpc_frame(body: &[u8]) -> Result<&[u8], String> {
             payload.len()
         ));
     }
-    Ok(payload)
+    if compressed != 0 {
+        // gRPC compression uses gzip (deflate) by default per the gRPC spec.
+        let mut decoder = GzDecoder::new(payload);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| format!("Failed to decompress gRPC frame (gzip): {}", e))?;
+        Ok(decompressed)
+    } else {
+        Ok(payload.to_vec())
+    }
 }
 
 /// Load protobuf validation config from the plugin config JSON.
@@ -1177,6 +1194,9 @@ impl Plugin for BodyValidator {
                 Some(d) => d,
                 None => return PluginResult::Continue,
             };
+            // 502 Bad Gateway: the backend returned a response whose protobuf
+            // payload does not match the expected schema — i.e., the upstream
+            // produced an invalid response, which is the definition of 502.
             return match self.validate_protobuf_body(body, descriptor) {
                 Ok(()) => PluginResult::Continue,
                 Err(msg) => protobuf_reject(502, "response", &msg),

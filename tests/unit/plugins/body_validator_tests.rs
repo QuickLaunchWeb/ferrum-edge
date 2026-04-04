@@ -1410,8 +1410,32 @@ async fn test_protobuf_frame_length_mismatch() {
 }
 
 #[tokio::test]
-async fn test_protobuf_compressed_frame_rejected() {
+async fn test_protobuf_compressed_gzip_frame_valid() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
     let plugin = protobuf_plugin();
+    let payload = encode_hello_request("Bob", 25);
+    // Compress with gzip
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    // Build frame with compressed flag = 1
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1); // compressed flag
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_invalid_gzip_data_rejected() {
+    let plugin = protobuf_plugin();
+    // Not valid gzip — just raw protobuf bytes with compressed flag set
     let payload = encode_hello_request("Bob", 25);
     let mut frame = Vec::with_capacity(5 + payload.len());
     frame.push(1); // compressed flag = 1
@@ -1423,6 +1447,59 @@ async fn test_protobuf_compressed_frame_rejected() {
     assert_reject(
         plugin.on_final_request_body(&headers, &frame).await,
         Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_gzip_invalid_protobuf_rejected() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = protobuf_plugin();
+    // Compress garbage bytes that aren't valid protobuf
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(b"\xff\xff\xff\xff").unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_gzip_response_valid() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = protobuf_plugin();
+    let payload = encode_hello_response("Hi Bob!", true);
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &frame)
+            .await,
     );
 }
 
