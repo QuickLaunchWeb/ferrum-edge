@@ -269,15 +269,37 @@ async fn handle_h3_connection(
         .filter(|certs| certs.len() > 1)
         .map(|certs| Arc::new(certs[1..].to_vec()));
 
+    // Keep a handle to the quinn connection so we can detect QUIC connection
+    // migration (RFC 9000 §9). When a client migrates to a new IP (e.g., mobile
+    // network handoff), quinn updates remote_address() internally. We compare
+    // the SocketAddr per-request (cheap integer comparison) and only re-format
+    // the IP string on the rare occasion it changes. This prevents stale IPs
+    // from poisoning rate-limit keys and access logs after migration.
+    let quinn_conn = connection.clone();
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
 
     // Pre-format socket IP string once per connection — shared across all streams
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
-    let socket_ip: Arc<str> = Arc::from(remote_addr.ip().to_string());
+    // Updated in-place when QUIC connection migration is detected.
+    let mut cached_addr = quinn_conn.remote_address();
+    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_string());
 
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
+                // Detect QUIC connection migration: compare SocketAddr (two integer
+                // fields) — zero allocation. Only re-format the IP string when the
+                // address actually changes, which is rare (mobile network handoff).
+                let current_addr = quinn_conn.remote_address();
+                if current_addr != cached_addr {
+                    info!(
+                        "HTTP/3 connection migration detected: {} -> {}",
+                        cached_addr, current_addr
+                    );
+                    cached_addr = current_addr;
+                    socket_ip = Arc::from(current_addr.ip().to_string());
+                }
+
                 let state = state.clone();
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
@@ -289,7 +311,7 @@ async fn handle_h3_connection(
                                 req,
                                 stream,
                                 state,
-                                remote_addr,
+                                current_addr,
                                 &socket_ip,
                                 cert,
                                 chain,
