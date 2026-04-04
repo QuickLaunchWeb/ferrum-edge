@@ -544,7 +544,7 @@ async fn handle_tcp_connection_inner(
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_failure(502);
+            cb.record_failure(502, true);
         }
     };
 
@@ -780,7 +780,7 @@ async fn handle_tcp_connection_inner(
         );
         match &copy_result {
             Ok(_) => cb.record_success(),
-            Err(_) => cb.record_failure(502),
+            Err(_) => cb.record_failure(502, true),
         }
     }
 

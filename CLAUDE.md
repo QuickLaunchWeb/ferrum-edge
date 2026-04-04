@@ -163,7 +163,7 @@ src/
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + reconnect)
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache
 ├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
-├── circuit_breaker.rs         # Three-state circuit breaker
+├── circuit_breaker.rs         # Three-state circuit breaker (connection errors vs status code failures tracked independently via trip_on_connection_errors)
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS
 ├── router_cache.rs            # Pre-sorted route table with host+path routing, LPM path cache, and full-path-anchored regex routes

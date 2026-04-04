@@ -175,8 +175,17 @@ impl CircuitBreaker {
     }
 
     /// Record a failed response.
-    pub fn record_failure(&self, status_code: u16) {
-        if !self.config.failure_status_codes.contains(&status_code) {
+    ///
+    /// `connection_error` indicates whether this was a connection-level failure
+    /// (TCP refused, DNS, TLS handshake, connect timeout) rather than an actual
+    /// HTTP response from the backend. When `true`, the failure is controlled by
+    /// `trip_on_connection_errors` independently of `failure_status_codes`.
+    pub fn record_failure(&self, status_code: u16, connection_error: bool) {
+        if connection_error {
+            if !self.config.trip_on_connection_errors {
+                return;
+            }
+        } else if !self.config.failure_status_codes.contains(&status_code) {
             // Non-failure status codes are neutral — don't treat as success or failure
             return;
         }

@@ -511,6 +511,8 @@ pub struct CircuitBreakerConfig {
     pub failure_status_codes: Vec<u16>,
     #[serde(default = "default_half_open_max")]
     pub half_open_max_requests: u32,
+    #[serde(default = "default_trip_on_connection_errors")]
+    pub trip_on_connection_errors: bool,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -521,6 +523,7 @@ impl Default for CircuitBreakerConfig {
             timeout_seconds: default_circuit_timeout(),
             failure_status_codes: default_failure_status_codes(),
             half_open_max_requests: default_half_open_max(),
+            trip_on_connection_errors: default_trip_on_connection_errors(),
         }
     }
 }
@@ -539,6 +542,9 @@ fn default_failure_status_codes() -> Vec<u16> {
 }
 fn default_half_open_max() -> u32 {
     1
+}
+fn default_trip_on_connection_errors() -> bool {
+    true
 }
 
 /// Retry backoff strategy.

@@ -621,6 +621,7 @@ proxies:
       timeout_seconds: 30
       failure_status_codes: [500, 502, 503, 504]
       half_open_max_requests: 1
+      trip_on_connection_errors: true
 ```
 
 | Field | Type | Default | Description |
@@ -628,23 +629,28 @@ proxies:
 | `failure_threshold` | integer | `5` | Failures before opening the circuit |
 | `success_threshold` | integer | `3` | Successes in half-open to close the circuit |
 | `timeout_seconds` | integer | `30` | How long the circuit stays open before half-open |
-| `failure_status_codes` | array | `[500, 502, 503, 504]` | Status codes that count as failures |
+| `failure_status_codes` | array | `[500, 502, 503, 504]` | HTTP status codes from real backend responses that count as failures |
 | `half_open_max_requests` | integer | `1` | Max concurrent requests in half-open state |
+| `trip_on_connection_errors` | boolean | `true` | Whether connection-level errors trip the breaker independently of `failure_status_codes` |
 
 **States:**
 
-- **Closed** (normal) — Requests pass through. Responses with status codes in `failure_status_codes` increment the failure counter; all other responses reset it to zero. When the failure counter reaches `failure_threshold`, the circuit opens.
+- **Closed** (normal) — Requests pass through. Responses with status codes in `failure_status_codes` increment the failure counter; connection-level errors also increment it when `trip_on_connection_errors` is enabled. All other responses reset the counter to zero. When the failure counter reaches `failure_threshold`, the circuit opens.
 - **Open** — All requests immediately return `503 Service Unavailable` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
 - **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
 
 **Failure detection:**
 
-The circuit breaker counts failures from two sources:
+The circuit breaker counts failures from two independent sources:
 
-1. **HTTP response status codes** — backend responses with a status code in `failure_status_codes` are counted as failures.
-2. **Connection-level errors** — TCP connection refused, connection timeout, DNS resolution failure, and TLS handshake errors are recorded as a synthetic `502` status code. These always count as failures as long as `502` is in `failure_status_codes` (which it is by default).
+1. **HTTP response status codes** — backend responses with a status code in `failure_status_codes` are counted as failures. These are real HTTP responses from the backend.
+2. **Connection-level errors** — TCP connection refused, connection timeout, DNS resolution failure, and TLS handshake errors. These are controlled by `trip_on_connection_errors` (default: `true`) independently of `failure_status_codes`.
 
-> **Note:** Connection-level errors and real HTTP 502 responses from backends share the same `502` code for circuit breaker tracking. They cannot be configured independently — removing `502` from `failure_status_codes` would suppress both. If you only want to trip the breaker on connection errors and not on backend 502 responses (or vice versa), that distinction is not currently supported.
+This separation means you can configure the breaker to trip on connection errors only, status code errors only, or both:
+
+- **Both (default)**: `trip_on_connection_errors: true` with `failure_status_codes: [500, 502, 503, 504]`
+- **Connection errors only**: `trip_on_connection_errors: true` with `failure_status_codes: []`
+- **Status codes only**: `trip_on_connection_errors: false` with `failure_status_codes: [500, 503]`
 
 ## Configuration Reference
 
@@ -671,6 +677,7 @@ proxies:
       success_threshold: 3
       timeout_seconds: 30
       failure_status_codes: [500, 502, 503, 504]
+      trip_on_connection_errors: true
 
   - id: "static-proxy"
     listen_path: "/static"
