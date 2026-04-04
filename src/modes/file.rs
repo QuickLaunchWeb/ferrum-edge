@@ -116,6 +116,10 @@ pub async fn run(
     // and backend TLS — cipher suites, protocol versions, key exchange groups).
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
 
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
@@ -314,9 +318,7 @@ pub async fn run(
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         reserved_ports,
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
-        admin_allowed_cidrs: Arc::new(crate::proxy::client_ip::TrustedProxies::parse(
-            &env_config.admin_allowed_cidrs,
-        )),
+        admin_allowed_cidrs: admin_allowed_cidrs.clone(),
     };
 
     let mut handles = Vec::new();

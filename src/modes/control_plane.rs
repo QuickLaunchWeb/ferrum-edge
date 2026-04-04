@@ -114,6 +114,10 @@ pub async fn run(
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
@@ -139,9 +143,7 @@ pub async fn run(
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
-        admin_allowed_cidrs: Arc::new(crate::proxy::client_ip::TrustedProxies::parse(
-            &env_config.admin_allowed_cidrs,
-        )),
+        admin_allowed_cidrs: admin_allowed_cidrs.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -175,9 +177,7 @@ pub async fn run(
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
             reserved_ports: reserved_ports.clone(),
             stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
-            admin_allowed_cidrs: Arc::new(crate::proxy::client_ip::TrustedProxies::parse(
-                &env_config.admin_allowed_cidrs,
-            )),
+            admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
