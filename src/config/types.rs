@@ -636,9 +636,11 @@ impl BackendProtocol {
     }
 
     /// Returns true if the backend connection uses TLS/DTLS.
-    #[allow(dead_code)] // Used in Phase 2 (TCP/UDP proxy TLS origination)
     pub fn is_tls_backend(&self) -> bool {
-        matches!(self, Self::TcpTls | Self::Dtls)
+        matches!(
+            self,
+            Self::Https | Self::Wss | Self::Grpcs | Self::H3 | Self::TcpTls | Self::Dtls
+        )
     }
 }
 
@@ -1027,6 +1029,9 @@ impl GatewayConfig {
         }
         for plugin_config in &mut self.plugin_configs {
             plugin_config.normalize_fields();
+        }
+        for upstream in &mut self.upstreams {
+            upstream.normalize_fields();
         }
     }
 
@@ -1720,6 +1725,10 @@ impl Proxy {
         for host in &mut self.hosts {
             *host = host.to_lowercase();
         }
+        // RFC 1035: DNS names are case-insensitive. Normalize backend_host so
+        // downstream consumers (DNS cache, connection pool keys) never create
+        // duplicate entries for mixed-case variants of the same hostname.
+        self.backend_host = self.backend_host.to_ascii_lowercase();
     }
 
     /// Validate all fields of a proxy for correctness and safe lengths.
@@ -1727,7 +1736,7 @@ impl Proxy {
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
-        self.validate_fields_inner(None)
+        self.validate_fields_inner(None, crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS)
     }
 
     /// Validate fields with a shared cache of already-validated TLS file paths.
@@ -1736,13 +1745,15 @@ impl Proxy {
     pub fn validate_fields_with_cache(
         &self,
         validated_tls_paths: &mut std::collections::HashSet<String>,
+        cert_expiry_warning_days: u64,
     ) -> Result<(), Vec<String>> {
-        self.validate_fields_inner(Some(validated_tls_paths))
+        self.validate_fields_inner(Some(validated_tls_paths), cert_expiry_warning_days)
     }
 
     fn validate_fields_inner(
         &self,
         mut validated_tls_paths: Option<&mut std::collections::HashSet<String>>,
+        cert_expiry_warning_days: u64,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         let is_stream_proxy = self.backend_protocol.is_stream_proxy();
@@ -1944,6 +1955,33 @@ impl Proxy {
             ));
         }
 
+        // Reject backend TLS fields on non-TLS protocols — cert configs are
+        // meaningless for plaintext backends and would waste disk I/O and
+        // fragment the connection pool.
+        if !self.backend_protocol.is_tls_backend() {
+            let protocol = &self.backend_protocol;
+            if self.backend_tls_client_cert_path.is_some() {
+                errors.push(format!(
+                    "backend_tls_client_cert_path cannot be set when backend_protocol is '{protocol}' — TLS client certs are only used with TLS-enabled protocols (https, wss, grpcs, h3, tcp_tls, dtls)"
+                ));
+            }
+            if self.backend_tls_client_key_path.is_some() {
+                errors.push(format!(
+                    "backend_tls_client_key_path cannot be set when backend_protocol is '{protocol}' — TLS client keys are only used with TLS-enabled protocols (https, wss, grpcs, h3, tcp_tls, dtls)"
+                ));
+            }
+            if self.backend_tls_server_ca_cert_path.is_some() {
+                errors.push(format!(
+                    "backend_tls_server_ca_cert_path cannot be set when backend_protocol is '{protocol}' — CA certs are only used with TLS-enabled protocols (https, wss, grpcs, h3, tcp_tls, dtls)"
+                ));
+            }
+            if !self.backend_tls_verify_server_cert {
+                errors.push(format!(
+                    "backend_tls_verify_server_cert cannot be set to false when backend_protocol is '{protocol}' — there is no TLS to verify on plaintext protocols"
+                ));
+            }
+        }
+
         // TLS file path lengths
         if let Some(ref path) = self.backend_tls_client_cert_path
             && let Err(e) =
@@ -1989,12 +2027,20 @@ impl Proxy {
         // When a validated_tls_paths cache is provided (batch validation), paths
         // that were already validated by a prior proxy are skipped to avoid
         // redundant file I/O when many proxies share the same cert files.
+        // Also checks certificate expiration: expired certs are rejected,
+        // near-expiry certs emit a warning log.
         if let Some(ref path) = self.backend_tls_client_cert_path {
             let already_validated = validated_tls_paths
                 .as_ref()
                 .is_some_and(|s| s.contains(path.as_str()));
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
+                    errors.push(e);
+                } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
+                    path,
+                    "backend_tls_client_cert_path",
+                    cert_expiry_warning_days,
+                ) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
                     cache.insert(path.clone());
@@ -2019,6 +2065,12 @@ impl Proxy {
                 .is_some_and(|s| s.contains(path.as_str()));
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                    errors.push(e);
+                } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
+                    path,
+                    "backend_tls_server_ca_cert_path",
+                    cert_expiry_warning_days,
+                ) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
                     cache.insert(path.clone());
@@ -2159,6 +2211,16 @@ impl Consumer {
 }
 
 impl Upstream {
+    /// Normalize upstream fields to their canonical in-memory form.
+    pub fn normalize_fields(&mut self) {
+        // RFC 1035: DNS names are case-insensitive. Normalize target hosts so
+        // downstream consumers (DNS cache, health check keys, LB keys) never
+        // create duplicate entries for mixed-case variants of the same hostname.
+        for target in &mut self.targets {
+            target.host = target.host.to_ascii_lowercase();
+        }
+    }
+
     /// Validate all fields of an upstream for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -2767,14 +2829,19 @@ impl GatewayConfig {
     /// This validates individual field values (lengths, ranges, formats) — not
     /// cross-resource constraints like uniqueness or FK references, which are
     /// handled by the existing `validate_*` methods.
-    pub fn validate_all_fields(&self) -> Result<(), Vec<String>> {
+    ///
+    /// `cert_expiry_warning_days` controls the near-expiry warning threshold
+    /// for TLS certificate files. Expired certificates are always rejected.
+    pub fn validate_all_fields(&self, cert_expiry_warning_days: u64) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Shared cache: when multiple proxies reference the same TLS file path,
         // each file is opened and parsed only once during batch validation.
         let mut validated_tls_paths = std::collections::HashSet::new();
         for proxy in &self.proxies {
-            if let Err(errs) = proxy.validate_fields_with_cache(&mut validated_tls_paths) {
+            if let Err(errs) =
+                proxy.validate_fields_with_cache(&mut validated_tls_paths, cert_expiry_warning_days)
+            {
                 for e in errs {
                     errors.push(format!("Proxy '{}': {}", proxy.id, e));
                 }

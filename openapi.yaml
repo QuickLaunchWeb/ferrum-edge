@@ -16,8 +16,8 @@ info:
     PUT, and DELETE operations return `403 Forbidden`.
   version: 0.1.0
   license:
-    name: MIT
-    url: https://opensource.org/licenses/MIT
+    name: PolyForm Noncommercial 1.0.0
+    url: https://polyformproject.org/licenses/noncommercial/1.0.0
 
 servers:
   - url: "{protocol}://{host}:{port}"
@@ -29,7 +29,7 @@ servers:
       host:
         default: 127.0.0.1
       port:
-        default: "8001"
+        default: "9000"
 
 security:
   - bearerAuth: []
@@ -695,12 +695,12 @@ paths:
                 - stdout_logging
                 - http_logging
                 - transaction_debugger
-                - mtls_auth
                 - jwks_auth
                 - jwt_auth
                 - key_auth
                 - basic_auth
                 - hmac_auth
+                - mtls_auth
                 - cors
                 - access_control
                 - tcp_connection_throttle
@@ -713,13 +713,21 @@ paths:
                 - grpc_method_router
                 - grpc_deadline
                 - rate_limiting
+                - request_size_limiting
+                - response_size_limiting
                 - body_validator
                 - request_termination
+                - response_caching
                 - prometheus_metrics
                 - otel_tracing
+                - ai_token_metrics
+                - ai_request_guard
+                - ai_rate_limiter
+                - ai_prompt_shield
                 - ws_message_size_limiting
                 - ws_frame_logging
                 - ws_rate_limiting
+                - udp_rate_limiting
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -1060,6 +1068,12 @@ components:
             error: Admin API is in read-only mode
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Resource already exists or conflicts with an existing resource
       content:
         application/json:
           schema:

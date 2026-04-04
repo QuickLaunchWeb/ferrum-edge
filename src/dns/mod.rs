@@ -96,7 +96,7 @@ impl Default for DnsConfig {
             dns_order: None,
             valid_ttl_override: None,
             stale_ttl_seconds: 3600,
-            error_ttl_seconds: 1,
+            error_ttl_seconds: 5,
             max_cache_size: 10_000,
             slow_threshold_ms: None,
             warmup_concurrency: 500,

@@ -21,8 +21,12 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use tracing::{info, warn};
+use x509_parser::prelude::*;
 
 use crate::config::EnvConfig;
+
+/// Default number of days before expiration to emit a warning.
+pub const DEFAULT_CERT_EXPIRY_WARNING_DAYS: u64 = 30;
 
 /// TLS hardening policy parsed from environment variables.
 #[derive(Debug, Clone)]
@@ -224,13 +228,23 @@ fn parse_kx_groups(
 
 /// Load TLS server configuration with optional client certificate verification
 /// and TLS hardening policy.
+///
+/// Checks certificate expiration: expired certs are rejected, certs expiring
+/// within `cert_expiry_warning_days` emit a warning log.
 pub fn load_tls_config_with_client_auth(
     cert_path: &str,
     key_path: &str,
     client_ca_bundle_path: Option<&str>,
     no_verify: bool,
     tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
+    // Check certificate expiration before loading
+    check_cert_expiry(cert_path, "server TLS cert", cert_expiry_warning_days)?;
+    if let Some(ca_path) = client_ca_bundle_path {
+        check_cert_expiry(ca_path, "client CA bundle", cert_expiry_warning_days)?;
+    }
+
     let cert_file = File::open(cert_path)?;
     let key_file = File::open(key_path)?;
 
@@ -419,4 +433,105 @@ pub fn build_client_cert_verifier(
     rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))
+}
+
+/// Check X.509 certificate expiration for a PEM certificate file.
+///
+/// - Returns `Err` if any certificate in the file is expired (notAfter < now)
+///   or not yet valid (notBefore > now).
+/// - Logs a warning if any certificate expires within `warning_days`.
+/// - `label` is used in log/error messages to identify the cert surface
+///   (e.g. "frontend TLS cert", "backend_tls_client_cert_path").
+pub fn check_cert_expiry(
+    pem_path: &str,
+    label: &str,
+    warning_days: u64,
+) -> Result<(), anyhow::Error> {
+    let pem_data = std::fs::read(pem_path)
+        .map_err(|e| anyhow::anyhow!("{}: failed to read '{}': {}", label, pem_path, e))?;
+
+    let der_certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if der_certs.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{}: no valid PEM certificates found in '{}'",
+            label,
+            pem_path
+        ));
+    }
+
+    for (i, der) in der_certs.iter().enumerate() {
+        let (_, cert) = X509Certificate::from_der(der.as_ref()).map_err(|e| {
+            anyhow::anyhow!(
+                "{}: failed to parse certificate #{} in '{}': {}",
+                label,
+                i + 1,
+                pem_path,
+                e
+            )
+        })?;
+
+        let subject = cert.subject().to_string();
+        let validity = cert.validity();
+
+        // is_valid() checks both notBefore and notAfter against the current time
+        if !validity.is_valid() {
+            // Determine which end of the validity window we're outside
+            let now_ts = ASN1Time::now().timestamp();
+            let not_before_ts = validity.not_before.timestamp();
+
+            if now_ts < not_before_ts {
+                return Err(anyhow::anyhow!(
+                    "{}: certificate #{} (subject: {}) in '{}' is not yet valid (notBefore: {})",
+                    label,
+                    i + 1,
+                    subject,
+                    pem_path,
+                    validity.not_before
+                ));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "{}: certificate #{} (subject: {}) in '{}' has expired (notAfter: {})",
+                    label,
+                    i + 1,
+                    subject,
+                    pem_path,
+                    validity.not_after
+                ));
+            }
+        }
+
+        // Check near-expiry warning using UNIX timestamps to avoid time crate dependency
+        if warning_days > 0 {
+            let now_ts = ASN1Time::now().timestamp();
+            let not_after_ts = validity.not_after.timestamp();
+            let remaining_secs = not_after_ts - now_ts;
+            let remaining_days = remaining_secs / 86400;
+            if remaining_days < warning_days as i64 {
+                warn!(
+                    "{}: certificate #{} (subject: {}) in '{}' expires in {} days (notAfter: {})",
+                    label,
+                    i + 1,
+                    subject,
+                    pem_path,
+                    remaining_days,
+                    validity.not_after
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check certificate expiration for a PEM file, returning a `String` error
+/// suitable for field validation (used by per-proxy backend TLS validation).
+pub fn check_cert_expiry_for_validation(
+    pem_path: &str,
+    field_name: &str,
+    warning_days: u64,
+) -> Result<(), String> {
+    check_cert_expiry(pem_path, field_name, warning_days).map_err(|e| e.to_string())
 }

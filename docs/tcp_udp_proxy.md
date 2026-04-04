@@ -303,7 +303,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 | Plugin | Hook | Description |
 |--------|------|-------------|
 | `ip_restriction` | `on_stream_connect` | Block connections from denied IPs |
-| `mtls_auth` | `on_stream_connect` | Map TCP+TLS client certificates to Consumers |
+| `mtls_auth` | `on_stream_connect` | Map TCP+TLS or UDP+DTLS client certificates to Consumers |
 | `access_control` | `on_stream_connect` | Consumer allow/deny after a stream auth plugin identifies the caller |
 | `tcp_connection_throttle` | `on_stream_connect`, `on_stream_disconnect` | Cap active TCP connections per Consumer, else per client IP |
 | `rate_limiting` | `on_stream_connect` | Connection/session rate limiting; consumer-aware when a stream identity exists |
@@ -317,8 +317,8 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per-plugin protocol matrix.
 
 Notes:
-- `mtls_auth` and `access_control` apply to TCP stream proxies, not plain UDP sessions.
-- `mtls_auth` only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented.
+- `access_control` applies to TCP stream proxies, not plain UDP sessions.
+- `mtls_auth` applies to both TCP+TLS and UDP+DTLS stream proxies. It only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented during the TLS/DTLS handshake.
 
 ## Environment Variables
 

@@ -627,7 +627,7 @@ fn test_validate_all_fields_catches_proxy_errors() {
         upstreams: vec![],
         ..Default::default()
     };
-    let errs = config.validate_all_fields().unwrap_err();
+    let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
             .any(|e| e.contains("Proxy 'test'") && e.contains("backend_connect_timeout_ms"))
@@ -643,7 +643,7 @@ fn test_validate_all_fields_catches_consumer_errors() {
         upstreams: vec![],
         ..Default::default()
     };
-    let errs = config.validate_all_fields().unwrap_err();
+    let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
             .any(|e| e.contains("Consumer 'test'") && e.contains("username"))
@@ -663,7 +663,7 @@ fn test_validate_all_fields_catches_upstream_errors() {
         }],
         ..Default::default()
     };
-    let errs = config.validate_all_fields().unwrap_err();
+    let errs = config.validate_all_fields(30).unwrap_err();
     assert!(
         errs.iter()
             .any(|e| e.contains("Upstream 'test'") && e.contains("targets[0].port"))
@@ -679,7 +679,7 @@ fn test_validate_all_fields_valid_config_passes() {
         upstreams: vec![make_upstream("u1")],
         ..Default::default()
     };
-    assert!(config.validate_all_fields().is_ok());
+    assert!(config.validate_all_fields(30).is_ok());
 }
 
 // ---- CircuitBreakerConfig validation tests ----
@@ -978,10 +978,99 @@ fn test_proxy_tls_valid_cert_files_pass() {
         .to_string();
 
     let mut proxy = make_proxy("test", "/api");
+    proxy.backend_protocol = BackendProtocol::Https;
     proxy.backend_tls_client_cert_path = Some(cert_path.clone());
     proxy.backend_tls_client_key_path = Some(key_path);
     proxy.backend_tls_server_ca_cert_path = Some(cert_path);
     assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_tls_fields_rejected_on_plaintext_backend() {
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // HTTP backend with TLS cert fields should be rejected
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+    proxy.backend_tls_client_key_path = Some(key_path.clone());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_cert_path") && e.contains("http"))
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_key_path") && e.contains("http"))
+    );
+
+    // HTTP backend with CA cert should be rejected
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_server_ca_cert_path = Some(cert_path.clone());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_server_ca_cert_path") && e.contains("http"))
+    );
+
+    // HTTP backend with verify=false should be rejected
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_verify_server_cert = false;
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_verify_server_cert") && e.contains("http"))
+    );
+
+    // Other plaintext protocols: ws, grpc, tcp, udp
+    for protocol in [
+        BackendProtocol::Ws,
+        BackendProtocol::Grpc,
+        BackendProtocol::Tcp,
+        BackendProtocol::Udp,
+    ] {
+        let mut proxy = make_proxy("test", "/api");
+        proxy.backend_protocol = protocol;
+        if proxy.backend_protocol.is_stream_proxy() {
+            proxy.listen_port = Some(19000);
+        }
+        proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+        proxy.backend_tls_client_key_path = Some(key_path.clone());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("backend_tls_client_cert_path")),
+            "Expected rejection for {:?}",
+            proxy.backend_protocol
+        );
+    }
+
+    // TLS protocols should allow cert fields
+    for protocol in [
+        BackendProtocol::Https,
+        BackendProtocol::Wss,
+        BackendProtocol::Grpcs,
+        BackendProtocol::H3,
+    ] {
+        let mut proxy = make_proxy("test", "/api");
+        proxy.backend_protocol = protocol;
+        proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+        proxy.backend_tls_client_key_path = Some(key_path.clone());
+        proxy.backend_tls_server_ca_cert_path = Some(cert_path.clone());
+        assert!(
+            proxy.validate_fields().is_ok(),
+            "Should pass for {:?}",
+            proxy.backend_protocol
+        );
+    }
 }
 
 // ---- Allowed methods validation tests ----

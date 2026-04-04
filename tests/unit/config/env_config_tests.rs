@@ -634,7 +634,7 @@ fn test_env_config_dns_error_ttl_default() {
         || {
             remove_var("FERRUM_DNS_ERROR_TTL");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.dns_error_ttl, 1, "dns_error_ttl should default to 1");
+            assert_eq!(config.dns_error_ttl, 5, "dns_error_ttl should default to 5");
         },
     );
 }

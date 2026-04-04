@@ -59,6 +59,7 @@ pub async fn run(
     .await?;
 
     db.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+    db.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
 
     // Connect read replica for config polling (reduces primary load)
     let effective_replica_url = env_config.effective_db_read_replica_url();
@@ -176,6 +177,7 @@ pub async fn run(
             admin_client_ca_bundle,
             env_config.admin_tls_no_verify,
             &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
         ) {
             Ok(config) => {
                 if admin_client_ca_bundle.is_some() {
@@ -228,6 +230,13 @@ pub async fn run(
         &env_config.cp_grpc_tls_cert_path,
         &env_config.cp_grpc_tls_key_path,
     ) {
+        // Check certificate expiration
+        tls::check_cert_expiry(
+            cert_path,
+            "CP gRPC TLS cert",
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+
         let cert_pem = std::fs::read(cert_path)
             .map_err(|e| anyhow::anyhow!("Failed to read CP gRPC TLS cert {}: {}", cert_path, e))?;
         let key_pem = std::fs::read(key_path)
@@ -236,6 +245,11 @@ pub async fn run(
         let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert_pem, &key_pem));
 
         if let Some(client_ca_path) = &env_config.cp_grpc_tls_client_ca_path {
+            tls::check_cert_expiry(
+                client_ca_path,
+                "CP gRPC client CA",
+                env_config.tls_cert_expiry_warning_days,
+            )?;
             let ca_pem = std::fs::read(client_ca_path).map_err(|e| {
                 anyhow::anyhow!("Failed to read CP gRPC client CA {}: {}", client_ca_path, e)
             })?;

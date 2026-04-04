@@ -5,9 +5,10 @@
 
 use ferrum_edge::config::types::BackendProtocol;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, HTTP_FAMILY_AND_TCP_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, StreamConnectionContext,
-    StreamTransactionSummary, TCP_ONLY_PROTOCOLS, create_plugin,
+    ALL_PROTOCOLS, HTTP_FAMILY_AND_STREAM_PROTOCOLS, HTTP_FAMILY_AND_TCP_PROTOCOLS,
+    HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin, PluginResult,
+    ProxyProtocol, StreamConnectionContext, StreamTransactionSummary, TCP_ONLY_PROTOCOLS,
+    create_plugin,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -102,10 +103,7 @@ fn test_http_family_plugins() {
 
 #[test]
 fn test_http_family_and_tcp_plugins() {
-    let plugins = vec![
-        ("access_control", json!({"allowed_consumers": ["admin"]})),
-        ("mtls_auth", json!({})),
-    ];
+    let plugins = vec![("access_control", json!({"allowed_consumers": ["admin"]}))];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);
@@ -125,6 +123,34 @@ fn test_http_family_and_tcp_plugins() {
         assert!(
             !protocols.contains(&ProxyProtocol::Udp),
             "Plugin {} should not support UDP",
+            name
+        );
+    }
+}
+
+#[test]
+fn test_http_family_and_stream_plugins() {
+    // mtls_auth supports all stream transports (TCP + UDP/DTLS) for client cert auth
+    let plugins = vec![("mtls_auth", json!({}))];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols, HTTP_FAMILY_AND_STREAM_PROTOCOLS,
+            "Plugin {} should support HTTP_FAMILY_AND_STREAM_PROTOCOLS, got {:?}",
+            name, protocols
+        );
+        assert!(
+            protocols.contains(&ProxyProtocol::Tcp),
+            "Plugin {} should support TCP",
+            name
+        );
+        assert!(
+            protocols.contains(&ProxyProtocol::Udp),
+            "Plugin {} should support UDP/DTLS",
             name
         );
     }
@@ -563,10 +589,7 @@ async fn test_http_family_plugins_complete_coverage() {
 
 #[test]
 fn test_http_family_and_tcp_plugins_complete_coverage() {
-    let plugins = vec![
-        ("access_control", json!({"allowed_consumers": ["admin"]})),
-        ("mtls_auth", json!({})),
-    ];
+    let plugins = vec![("access_control", json!({"allowed_consumers": ["admin"]}))];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);
@@ -586,6 +609,33 @@ fn test_http_family_and_tcp_plugins_complete_coverage() {
         assert!(
             !plugin.supported_protocols().contains(&ProxyProtocol::Udp),
             "Plugin {} must NOT support UDP",
+            name
+        );
+    }
+}
+
+#[test]
+fn test_http_family_and_stream_plugins_complete_coverage() {
+    let plugins = vec![("mtls_auth", json!({}))];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        assert_eq!(
+            plugin.supported_protocols(),
+            HTTP_FAMILY_AND_STREAM_PROTOCOLS,
+            "Plugin {} should support HTTP_FAMILY_AND_STREAM_PROTOCOLS",
+            name
+        );
+        assert!(
+            plugin.supported_protocols().contains(&ProxyProtocol::Tcp),
+            "Plugin {} must support TCP",
+            name
+        );
+        assert!(
+            plugin.supported_protocols().contains(&ProxyProtocol::Udp),
+            "Plugin {} must support UDP/DTLS",
             name
         );
     }

@@ -314,6 +314,10 @@ pub struct EnvConfig {
     /// TLS 1.3 uses stateless tickets (unlimited) so this only affects TLS 1.2 clients.
     /// (default: 4096)
     pub tls_session_cache_size: usize,
+    /// Number of days before certificate expiration to emit a warning log.
+    /// Expired certificates are rejected at startup/config-load time.
+    /// Set to 0 to disable near-expiry warnings. (default: 30)
+    pub tls_cert_expiry_warning_days: u64,
 
     // Stream proxy (TCP/UDP)
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
@@ -461,7 +465,7 @@ impl Default for EnvConfig {
             dns_order: None,
             dns_valid_ttl: None,
             dns_stale_ttl: 3600,
-            dns_error_ttl: 1,
+            dns_error_ttl: 5,
             dns_cache_max_size: 10_000,
             dns_warmup_concurrency: 500,
             dns_slow_threshold_ms: None,
@@ -496,6 +500,7 @@ impl Default for EnvConfig {
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
             tls_session_cache_size: 4096,
+            tls_cert_expiry_warning_days: 30,
             trusted_proxies: String::new(),
             real_ip_header: None,
             plugin_http_slow_threshold_ms: 1000,
@@ -651,7 +656,7 @@ impl EnvConfig {
             dns_order: resolve_var(conf, "FERRUM_DNS_ORDER"),
             dns_valid_ttl: resolve_var(conf, "FERRUM_DNS_VALID_TTL").and_then(|v| v.parse().ok()),
             dns_stale_ttl: resolve_u64(conf, "FERRUM_DNS_STALE_TTL", 3600),
-            dns_error_ttl: resolve_u64(conf, "FERRUM_DNS_ERROR_TTL", 1),
+            dns_error_ttl: resolve_u64(conf, "FERRUM_DNS_ERROR_TTL", 5),
             dns_cache_max_size: resolve_var(conf, "FERRUM_DNS_CACHE_MAX_SIZE")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
@@ -750,6 +755,11 @@ impl EnvConfig {
             .unwrap_or(true),
             tls_curves: resolve_var(conf, "FERRUM_TLS_CURVES"),
             tls_session_cache_size: resolve_usize(conf, "FERRUM_TLS_SESSION_CACHE_SIZE", 4096),
+            tls_cert_expiry_warning_days: resolve_u64(
+                conf,
+                "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS",
+                30,
+            ),
 
             // Client IP resolution
             trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),

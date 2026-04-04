@@ -2146,6 +2146,8 @@ async fn handle_create_upstream(
         }
     }
 
+    upstream.normalize_fields();
+
     if upstream.targets.is_empty() && upstream.service_discovery.is_none() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
@@ -2260,6 +2262,7 @@ async fn handle_update_upstream(
 
     upstream.id = id.to_string();
     upstream.updated_at = Utc::now();
+    upstream.normalize_fields();
 
     if upstream.targets.is_empty() && upstream.service_discovery.is_none() {
         return Ok(json_response(
@@ -2632,6 +2635,7 @@ async fn handle_batch_create(
         } else if let Err(msg) = validate_resource_id(&upstream.id) {
             validation_errors.push(format!("Upstream '{}': {}", upstream.id, msg));
         }
+        upstream.normalize_fields();
         if let Err(field_errs) = upstream.validate_fields() {
             for err in field_errs {
                 validation_errors.push(format!("Upstream '{}': {}", upstream.id, err));
@@ -3209,7 +3213,12 @@ async fn handle_restore(
         temp_config.normalize_fields();
         let mut validation_errors: Vec<String> = Vec::new();
 
-        if let Err(errs) = temp_config.validate_all_fields() {
+        let cert_expiry_days = state
+            .proxy_state
+            .as_ref()
+            .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
+            .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
+        if let Err(errs) = temp_config.validate_all_fields(cert_expiry_days) {
             validation_errors.extend(errs);
         }
         if let Err(errs) = temp_config.validate_unique_resource_ids() {

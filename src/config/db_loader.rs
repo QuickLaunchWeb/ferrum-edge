@@ -114,6 +114,7 @@ pub struct DatabaseStore {
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
     slow_query_threshold_ms: Option<u64>,
+    cert_expiry_warning_days: u64,
 }
 
 impl DatabaseStore {
@@ -150,6 +151,11 @@ impl DatabaseStore {
     /// operation name and elapsed time.
     pub fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
         self.slow_query_threshold_ms = threshold_ms;
+    }
+
+    /// Set the certificate expiry warning threshold (days before expiration).
+    pub fn set_cert_expiry_warning_days(&mut self, days: u64) {
+        self.cert_expiry_warning_days = days;
     }
 
     /// Log a warning if the elapsed time since `start` exceeds the configured
@@ -239,6 +245,7 @@ impl DatabaseStore {
             failover_urls: Vec::new(),
             pool_config,
             slow_query_threshold_ms: None,
+            cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
         };
 
         store.run_migrations().await?;
@@ -361,7 +368,7 @@ impl DatabaseStore {
 
         // Validate all field-level constraints (lengths, ranges, nested configs).
         // Warn-only since data already exists in the database.
-        if let Err(errors) = config.validate_all_fields() {
+        if let Err(errors) = config.validate_all_fields(self.cert_expiry_warning_days) {
             for msg in &errors {
                 warn!("{}", msg);
             }

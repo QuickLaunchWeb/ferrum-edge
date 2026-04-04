@@ -417,7 +417,7 @@ impl Plugin for MtlsAuth {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_AND_TCP_PROTOCOLS
+        super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
     }
 
     async fn authenticate(

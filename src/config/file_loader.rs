@@ -22,7 +22,10 @@ use tracing::{error, info, warn};
 /// the config is migrated **in memory** before deserialization. The file on
 /// disk is not modified — use `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=config`
 /// to persist config file migrations.
-pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error> {
+pub fn load_config_from_file(
+    path: &str,
+    cert_expiry_warning_days: u64,
+) -> Result<GatewayConfig, anyhow::Error> {
     let file_path = Path::new(path);
     if !file_path.exists() {
         anyhow::bail!("Configuration file not found: {}", file_path.display());
@@ -111,7 +114,7 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
     }
 
     // Validate all field-level constraints (lengths, ranges, nested configs)
-    if let Err(errors) = config.validate_all_fields() {
+    if let Err(errors) = config.validate_all_fields(cert_expiry_warning_days) {
         for msg in &errors {
             error!("{}", msg);
         }
@@ -268,7 +271,10 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
 }
 
 /// Reload config from file, returning the new config or an error.
-pub fn reload_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error> {
+pub fn reload_config_from_file(
+    path: &str,
+    cert_expiry_warning_days: u64,
+) -> Result<GatewayConfig, anyhow::Error> {
     info!("Reloading configuration from file: {}", path);
-    load_config_from_file(path)
+    load_config_from_file(path, cert_expiry_warning_days)
 }

@@ -475,7 +475,7 @@ async fn test_dns_config_default() {
     let config = DnsConfig::default();
     assert_eq!(config.default_ttl_seconds, 300);
     assert_eq!(config.stale_ttl_seconds, 3600);
-    assert_eq!(config.error_ttl_seconds, 1);
+    assert_eq!(config.error_ttl_seconds, 5);
     assert!(config.valid_ttl_override.is_none());
     assert!(config.resolver_addresses.is_none());
     assert!(config.hosts_file_path.is_none());

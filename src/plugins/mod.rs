@@ -111,6 +111,16 @@ pub const HTTP_FAMILY_AND_TCP_PROTOCOLS: &[ProxyProtocol] = &[
     ProxyProtocol::Tcp,
 ];
 
+/// HTTP family + all stream protocols (TCP + UDP/DTLS). Used by plugins that
+/// authenticate via TLS/DTLS client certificates across all transport types.
+pub const HTTP_FAMILY_AND_STREAM_PROTOCOLS: &[ProxyProtocol] = &[
+    ProxyProtocol::Http,
+    ProxyProtocol::Grpc,
+    ProxyProtocol::WebSocket,
+    ProxyProtocol::Tcp,
+    ProxyProtocol::Udp,
+];
+
 /// HTTP-only (single protocol).
 pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 

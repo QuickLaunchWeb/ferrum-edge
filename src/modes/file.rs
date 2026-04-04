@@ -52,7 +52,8 @@ pub async fn run(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("FERRUM_FILE_CONFIG_PATH not set"))?;
 
-    let config = file_loader::load_config_from_file(config_path)?;
+    let config =
+        file_loader::load_config_from_file(config_path, env_config.tls_cert_expiry_warning_days)?;
     info!(
         "File mode: loaded {} proxies, {} consumers",
         config.proxies.len(),
@@ -148,6 +149,7 @@ pub async fn run(
             client_ca_bundle_path,
             env_config.tls_no_verify,
             &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
         ) {
             Ok(config) => {
                 if client_ca_bundle_path.is_some() {
@@ -184,6 +186,18 @@ pub async fn run(
     if let (Some(cert_path), Some(key_path)) =
         (&env_config.dtls_cert_path, &env_config.dtls_key_path)
     {
+        tls::check_cert_expiry(
+            cert_path,
+            "DTLS frontend cert",
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
+            tls::check_cert_expiry(
+                ca_path,
+                "DTLS client CA cert",
+                env_config.tls_cert_expiry_warning_days,
+            )?;
+        }
         proxy_state
             .stream_listener_manager
             .set_frontend_dtls_cert_key(
@@ -210,6 +224,7 @@ pub async fn run(
     // Listen for SIGHUP to reload config (with shutdown)
     let proxy_state_reload = proxy_state.clone();
     let config_path_owned = config_path.to_string();
+    let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let mut sighup_shutdown = shutdown_tx.subscribe();
     let sighup_handle = tokio::spawn(async move {
         #[cfg(unix)]
@@ -226,7 +241,7 @@ pub async fn run(
                 tokio::select! {
                     _ = sighup.recv() => {
                         info!("SIGHUP received, reloading configuration...");
-                        match file_loader::reload_config_from_file(&config_path_owned) {
+                        match file_loader::reload_config_from_file(&config_path_owned, reload_cert_expiry_warning_days) {
                             Ok(new_config) => {
                                 proxy_state_reload.update_config(new_config);
                                 info!("Configuration reloaded successfully");
@@ -317,6 +332,7 @@ pub async fn run(
             admin_client_ca,
             env_config.admin_tls_no_verify,
             &admin_tls_policy,
+            env_config.tls_cert_expiry_warning_days,
         ) {
             Ok(admin_tls_config) => {
                 let admin_https_addr: SocketAddr =

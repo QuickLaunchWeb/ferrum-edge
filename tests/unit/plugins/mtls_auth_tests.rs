@@ -648,8 +648,8 @@ fn test_mtls_auth_supported_protocols() {
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Tcp));
-    // Should NOT support raw UDP
-    assert!(!protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp));
+    // UDP/DTLS is supported for mutual DTLS client cert authentication
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp));
 }
 
 #[test]
@@ -767,5 +767,123 @@ async fn test_mtls_auth_stream_connect_identifies_consumer() {
     assert_eq!(
         ctx.metadata.get("consumer_username").map(String::as_str),
         Some("alice")
+    );
+}
+
+// --- DTLS/UDP mTLS auth tests ---
+
+fn create_udp_stream_ctx_with_cert(
+    cert_der: Vec<u8>,
+    consumers: Vec<Consumer>,
+) -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "udp-proxy".to_string(),
+        proxy_name: Some("UDP Proxy".to_string()),
+        listen_port: 5353,
+        backend_protocol: ferrum_edge::config::types::BackendProtocol::Dtls,
+        consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
+        identified_consumer: None,
+        authenticated_identity: None,
+        metadata: HashMap::new(),
+        tls_client_cert_der: Some(Arc::new(cert_der)),
+        tls_client_cert_chain_der: None,
+    }
+}
+
+fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionContext {
+    StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "udp-proxy".to_string(),
+        proxy_name: Some("UDP Proxy".to_string()),
+        listen_port: 5353,
+        backend_protocol: ferrum_edge::config::types::BackendProtocol::Udp,
+        consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
+        identified_consumer: None,
+        authenticated_identity: None,
+        metadata: HashMap::new(),
+        tls_client_cert_der: None,
+        tls_client_cert_chain_der: None,
+    }
+}
+
+#[tokio::test]
+async fn test_mtls_auth_dtls_stream_connect_identifies_consumer() {
+    let cert_der = create_test_cert("dtls-client.example.com", None, None);
+    let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let mut ctx = create_udp_stream_ctx_with_cert(cert_der, vec![consumer]);
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+}
+
+#[tokio::test]
+async fn test_mtls_auth_dtls_stream_connect_rejects_no_cert() {
+    let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let mut ctx = create_udp_stream_ctx_no_cert(vec![consumer]);
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_mtls_auth_dtls_stream_connect_rejects_unknown_consumer() {
+    let cert_der = create_test_cert("unknown-dtls.example.com", None, None);
+    let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let mut ctx = create_udp_stream_ctx_with_cert(cert_der, vec![consumer]);
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_mtls_auth_dtls_with_issuer_verification() {
+    let (ca_der, client_der) =
+        create_ca_signed_cert("Test CA", Some("TestOrg"), None, "dtls-client.example.com");
+    let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
+    let plugin = MtlsAuth::new(&json!({
+        "cert_field": "subject_cn",
+        "issuer_verification": {
+            "issuer_cn": "Test CA"
+        }
+    }));
+    let mut ctx = StreamConnectionContext {
+        client_ip: "127.0.0.1".to_string(),
+        proxy_id: "udp-proxy".to_string(),
+        proxy_name: Some("UDP Proxy".to_string()),
+        listen_port: 5353,
+        backend_protocol: ferrum_edge::config::types::BackendProtocol::Dtls,
+        consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
+        identified_consumer: None,
+        authenticated_identity: None,
+        metadata: HashMap::new(),
+        tls_client_cert_der: Some(Arc::new(client_der)),
+        tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
+    };
+
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+}
+
+#[tokio::test]
+async fn test_mtls_auth_supports_udp_protocol() {
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let protocols = plugin.supported_protocols();
+    assert!(
+        protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp),
+        "mtls_auth should support UDP/DTLS protocol"
+    );
+    assert!(
+        protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Tcp),
+        "mtls_auth should still support TCP protocol"
+    );
+    assert!(
+        protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http),
+        "mtls_auth should still support HTTP protocol"
     );
 }
