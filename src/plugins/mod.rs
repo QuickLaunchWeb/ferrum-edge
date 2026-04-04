@@ -210,6 +210,10 @@ pub struct RequestContext {
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
     pub plugin_http_call_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver for mirror response metadata from the `request_mirror` plugin.
+    /// Set by the plugin in `before_proxy`; collected before building
+    /// `TransactionSummary` so all logging plugins receive mirror results.
+    pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
 }
 
 impl RequestContext {
@@ -229,6 +233,25 @@ impl RequestContext {
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            mirror_result_rx: None,
+        }
+    }
+
+    /// Collect mirror response metadata from the `request_mirror` plugin.
+    ///
+    /// Returns `Some(meta)` if a mirror request was dispatched and completed
+    /// before the timeout. The 5-second timeout is a safety net — the mirror
+    /// task always completes within the proxy's `backend_read_timeout_ms`
+    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
+    /// the response is sent to the client, the wait has zero impact on
+    /// client-facing latency.
+    pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
+        let rx = self.mirror_result_rx.as_ref()?;
+        let mut rx_clone = rx.clone();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
+            Ok(Ok(())) => rx_clone.borrow().clone(),
+            // Timeout or sender dropped — return whatever is currently available
+            _ => rx.borrow().clone(),
         }
     }
 
@@ -296,6 +319,30 @@ pub enum PluginResult {
     },
 }
 
+/// Mirror response metadata captured by the `request_mirror` plugin.
+///
+/// Included in `TransactionSummary.mirror` when a mirror request was dispatched,
+/// so all logging plugins (stdout, http_logging, prometheus, transaction_debugger)
+/// automatically receive mirror results without special-casing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MirrorResponseMeta {
+    /// URL the mirror request was sent to.
+    pub mirror_target_url: String,
+    /// HTTP status code from the mirror target. `None` when the request failed
+    /// before a response was received (DNS, connect, timeout errors).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_response_status_code: Option<u16>,
+    /// Response body size in bytes from the mirror target. Derived from
+    /// `content-length` header when present, otherwise from reading the body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_response_size_bytes: Option<u64>,
+    /// Wall-clock latency of the mirror request in milliseconds.
+    pub mirror_latency_ms: f64,
+    /// Human-readable error message when the mirror request failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror_error: Option<String>,
+}
+
 /// Transaction summary for logging plugins.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransactionSummary {
@@ -345,6 +392,10 @@ pub struct TransactionSummary {
     /// and normal HTTP error responses from the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
+    /// Mirror response metadata from the `request_mirror` plugin. Present when
+    /// a mirror request was dispatched and its result was collected before logging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorResponseMeta>,
     pub metadata: HashMap<String, String>,
 }
 

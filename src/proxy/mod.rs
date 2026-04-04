@@ -2300,6 +2300,7 @@ async fn handle_websocket_request_authenticated(
                             "rejection_phase".to_string(),
                             "websocket_backend_error".to_string(),
                         );
+                        let mirror = ctx.collect_mirror_result().await;
                         let summary = TransactionSummary {
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
@@ -2324,6 +2325,7 @@ async fn handle_websocket_request_authenticated(
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(ws_error_class),
+                            mirror,
                             metadata,
                         };
                         for plugin in &logging_plugins {
@@ -2368,6 +2370,7 @@ async fn handle_websocket_request_authenticated(
         ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     let ws_gateway_overhead_ms = (total_ms - ws_plugin_execution_ms).max(0.0);
 
+    let mirror = ctx.collect_mirror_result().await;
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
@@ -2390,6 +2393,7 @@ async fn handle_websocket_request_authenticated(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        mirror,
         metadata: ctx.metadata.clone(),
     };
 
@@ -3229,6 +3233,7 @@ pub async fn log_rejected_request(
     let mut metadata = ctx.metadata.clone();
     metadata.insert("rejection_phase".to_string(), rejection_phase.to_string());
 
+    let mirror = ctx.collect_mirror_result().await;
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
@@ -3254,6 +3259,7 @@ pub async fn log_rejected_request(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        mirror,
         metadata,
     };
 
@@ -4626,6 +4632,7 @@ pub async fn handle_proxy_request(
                         .ok()
                         .map(|ip| ip.to_string());
 
+                    let mirror = ctx.collect_mirror_result().await;
                     let summary = TransactionSummary {
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
@@ -4648,6 +4655,7 @@ pub async fn handle_proxy_request(
                         response_streamed: true,
                         client_disconnected: false,
                         error_class: None,
+                        mirror,
                         metadata: ctx.metadata.clone(),
                     };
                     for plugin in plugins.iter() {
@@ -4838,6 +4846,7 @@ pub async fn handle_proxy_request(
                         .ok()
                         .map(|ip| ip.to_string());
 
+                    let mirror = ctx.collect_mirror_result().await;
                     let summary = TransactionSummary {
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
@@ -4860,6 +4869,7 @@ pub async fn handle_proxy_request(
                         response_streamed: false,
                         client_disconnected: false,
                         error_class: None,
+                        mirror,
                         metadata: ctx.metadata.clone(),
                     };
                     for plugin in plugins.iter() {
@@ -4958,6 +4968,7 @@ pub async fn handle_proxy_request(
                             "grpc_backend_error".to_string(),
                         );
                         insert_grpc_error_metadata(&mut metadata, grpc_code, msg);
+                        let mirror = ctx.collect_mirror_result().await;
                         let summary = TransactionSummary {
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
@@ -4983,6 +4994,7 @@ pub async fn handle_proxy_request(
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(grpc_error_class),
+                            mirror,
                             metadata,
                         };
                         for plugin in &logging_plugins {
@@ -5398,6 +5410,7 @@ pub async fn handle_proxy_request(
 
     // Log phase — skip TransactionSummary construction when no plugins need it
     if !plugins.is_empty() {
+        let mirror = ctx.collect_mirror_result().await;
         let summary = TransactionSummary {
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -5420,6 +5433,7 @@ pub async fn handle_proxy_request(
             response_streamed: is_streaming_response,
             client_disconnected: false,
             error_class: backend_error_class,
+            mirror,
             metadata: ctx.metadata.clone(),
         };
 
