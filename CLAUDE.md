@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (38 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 compression plugin, 2 gRPC-specific plugins, 3 WebSocket frame-level plugins, and 1 UDP datagram-level plugin), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (39 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 compression plugin, 2 gRPC-specific plugins, 3 WebSocket frame-level plugins, and 1 UDP datagram-level plugin), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -154,7 +154,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (38 plugins, including 4 AI/LLM, 1 serverless, 1 compression, 2 gRPC, 3 WS frame, and 1 UDP datagram plugin)
+├── plugins/                   # Plugin system (39 plugins, including 4 AI/LLM, 1 serverless, 1 compression, 2 gRPC, 3 WS frame, and 1 UDP datagram plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure

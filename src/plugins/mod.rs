@@ -1,4 +1,4 @@
-//! Plugin system — 38 built-in plugins with a trait-based architecture.
+//! Plugin system — 39 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
