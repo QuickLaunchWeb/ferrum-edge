@@ -2324,11 +2324,10 @@ async fn handle_websocket_request_authenticated(
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(ws_error_class),
+                            mirror: false,
                             metadata,
                         };
-                        for plugin in &logging_plugins {
-                            plugin.log(&summary).await;
-                        }
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
                 }
 
@@ -2390,12 +2389,11 @@ async fn handle_websocket_request_authenticated(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        mirror: false,
         metadata: ctx.metadata.clone(),
     };
 
-    for plugin in plugins.iter() {
-        plugin.log(&summary).await;
-    }
+    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
     // Create the upgrade response with proper headers
     let mut ws_resp_builder = Response::builder()
@@ -3254,12 +3252,11 @@ pub async fn log_rejected_request(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        mirror: false,
         metadata,
     };
 
-    for plugin in &logging_plugins {
-        plugin.log(&summary).await;
-    }
+    crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
 
 pub(crate) async fn apply_after_proxy_hooks_to_rejection(
@@ -4648,11 +4645,10 @@ pub async fn handle_proxy_request(
                         response_streamed: true,
                         client_disconnected: false,
                         error_class: None,
+                        mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
-                    for plugin in plugins.iter() {
-                        plugin.log(&summary).await;
-                    }
+                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 record_request(&state, grpc_streaming.status);
@@ -4860,11 +4856,10 @@ pub async fn handle_proxy_request(
                         response_streamed: false,
                         client_disconnected: false,
                         error_class: None,
+                        mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
-                    for plugin in plugins.iter() {
-                        plugin.log(&summary).await;
-                    }
+                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
                 // Inject sticky session cookie for gRPC responses
@@ -4983,11 +4978,10 @@ pub async fn handle_proxy_request(
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(grpc_error_class),
+                            mirror: false,
                             metadata,
                         };
-                        for plugin in &logging_plugins {
-                            plugin.log(&summary).await;
-                        }
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
                 }
 
@@ -5420,12 +5414,11 @@ pub async fn handle_proxy_request(
             response_streamed: is_streaming_response,
             client_disconnected: false,
             error_class: backend_error_class,
+            mirror: false,
             metadata: ctx.metadata.clone(),
         };
 
-        for plugin in plugins.iter() {
-            plugin.log(&summary).await;
-        }
+        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
     }
 
     // Inject sticky session cookie when cookie-based consistent hashing selected a new session
