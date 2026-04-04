@@ -100,7 +100,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | Plugin | `on_stream_connect` | `on_stream_disconnect` | Behavior |
 |--------|:-------------------:|:----------------------:|----------|
 | `ip_restriction` | ✓ | | Rejects connections from denied IPs |
-| `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS |
+| `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer allow/deny rules once a stream Consumer exists |
 | `tcp_connection_throttle` | ✓ | ✓ | Caps active TCP connections per Consumer, else per client IP |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
@@ -410,7 +410,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
-| `mtls_auth` | ✓ | ✓ | ✓ | ✓ | | Requires TLS client certificate |
+| `mtls_auth` | ✓ | ✓ | ✓ | ✓ | ✓ | Requires TLS/DTLS client certificate |
 | `jwks_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |

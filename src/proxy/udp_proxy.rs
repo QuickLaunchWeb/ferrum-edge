@@ -739,7 +739,7 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
-                // Run on_stream_connect plugins
+                // Run on_stream_connect plugins (with DTLS client cert if available)
                 let mut stream_ctx = StreamConnectionContext {
                     client_ip: client_addr.ip().to_string(),
                     proxy_id: proxy_id.clone(),
@@ -750,8 +750,8 @@ async fn start_dtls_frontend_listener(
                     identified_consumer: None,
                     authenticated_identity: None,
                     metadata: std::collections::HashMap::new(),
-                    tls_client_cert_der: None,
-                    tls_client_cert_chain_der: None,
+                    tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
+                    tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
                 };
                 let mut rejected = false;
                 for plugin in plugins.iter() {

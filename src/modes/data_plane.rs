@@ -81,6 +81,22 @@ pub async fn run(
             || cp_url.starts_with("https://");
 
         if has_tls {
+            // Check certificate expiration for DP gRPC certs
+            if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
+                tls::check_cert_expiry(
+                    path,
+                    "DP gRPC TLS CA cert",
+                    env_config.tls_cert_expiry_warning_days,
+                )?;
+            }
+            if let Some(ref path) = env_config.dp_grpc_tls_client_cert_path {
+                tls::check_cert_expiry(
+                    path,
+                    "DP gRPC TLS client cert",
+                    env_config.tls_cert_expiry_warning_days,
+                )?;
+            }
+
             let ca_cert_pem = if let Some(ref path) = env_config.dp_grpc_tls_ca_cert_path {
                 Some(std::fs::read(path).map_err(|e| {
                     anyhow::anyhow!("Failed to read DP gRPC TLS CA cert {}: {}", path, e)
@@ -142,6 +158,7 @@ pub async fn run(
             client_ca_bundle_path,
             env_config.tls_no_verify,
             &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
         ) {
             Ok(config) => {
                 if client_ca_bundle_path.is_some() {
@@ -176,6 +193,18 @@ pub async fn run(
     if let (Some(cert_path), Some(key_path)) =
         (&env_config.dtls_cert_path, &env_config.dtls_key_path)
     {
+        tls::check_cert_expiry(
+            cert_path,
+            "DTLS frontend cert",
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
+            tls::check_cert_expiry(
+                ca_path,
+                "DTLS client CA cert",
+                env_config.tls_cert_expiry_warning_days,
+            )?;
+        }
         proxy_state
             .stream_listener_manager
             .set_frontend_dtls_cert_key(
@@ -336,6 +365,7 @@ pub async fn run(
             admin_client_ca_bundle,
             env_config.admin_tls_no_verify,
             &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
         ) {
             Ok(config) => {
                 if admin_client_ca_bundle.is_some() {

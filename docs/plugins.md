@@ -523,7 +523,7 @@ Exported spans include OTel semantic convention attributes, gateway-specific att
 
 ### `mtls_auth`
 
-Authenticates requests using the client's TLS certificate, matching a configurable certificate field against consumer credentials. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake so the client certificate can be mapped to a Consumer before later stream plugins run.
+Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
 
 **Priority:** 950
 
@@ -704,7 +704,7 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 - If a prior stream auth plugin identified a Consumer, the key is `consumer:<username>`
 - Otherwise the key is `ip:<client_ip>`
 
-This makes plaintext TCP listeners IP-scoped, while TCP+TLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
+This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
 ### `ip_restriction`
 

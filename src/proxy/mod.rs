@@ -66,7 +66,7 @@ use crate::config::types::{
 };
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
-use crate::dns::{DnsCache, DnsCacheResolver};
+use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
@@ -1242,7 +1242,9 @@ impl ProxyState {
 
         // Validate the patched config before applying (same validations as load_full_config)
         new_config.normalize_fields();
-        if let Err(errors) = new_config.validate_all_fields() {
+        if let Err(errors) =
+            new_config.validate_all_fields(self.env_config.tls_cert_expiry_warning_days)
+        {
             for msg in &errors {
                 warn!("Incremental config field validation: {}", msg);
             }
@@ -5177,22 +5179,23 @@ async fn proxy_to_backend(
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
-            error!("Failed to get client from pool: {}", e);
-            // Fallback to creating new client with shared DNS cache
-            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
-            reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_millis(
-                    proxy.backend_connect_timeout_ms,
-                ))
-                .timeout(std::time::Duration::from_millis(
-                    proxy.backend_read_timeout_ms,
-                ))
-                .danger_accept_invalid_certs(
-                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
-                )
-                .dns_resolver(Arc::new(resolver))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
+            error!(
+                proxy_id = %proxy.id,
+                listen_path = %proxy.listen_path,
+                "Connection pool client creation failed — refusing to proxy without proper TLS configuration: {}",
+                e
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+            );
         }
     };
 

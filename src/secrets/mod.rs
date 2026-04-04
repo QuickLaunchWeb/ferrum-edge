@@ -37,14 +37,31 @@ use tracing::info;
 /// Only scan environment variables with this prefix.
 const FERRUM_PREFIX: &str = "FERRUM_";
 
-/// Timeout for individual secret fetch operations from cloud backends.
+/// Default timeout (seconds) for individual secret fetch operations from cloud backends.
 #[cfg(any(
     feature = "secrets-vault",
     feature = "secrets-aws",
     feature = "secrets-gcp",
     feature = "secrets-azure"
 ))]
-const SECRET_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
+
+/// Read the secret fetch timeout from `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` env var,
+/// falling back to the default. Called before EnvConfig is parsed (secrets are
+/// resolved first), so this reads the env var directly.
+#[cfg(any(
+    feature = "secrets-vault",
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
+fn secret_fetch_timeout() -> std::time::Duration {
+    let secs = std::env::var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECRET_FETCH_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
 
 /// Secret backend identified during env var scanning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +193,15 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
         });
     }
 
+    // Read the configurable timeout once for all backend fetches.
+    #[cfg(any(
+        feature = "secrets-vault",
+        feature = "secrets-aws",
+        feature = "secrets-gcp",
+        feature = "secrets-azure"
+    ))]
+    let fetch_timeout = secret_fetch_timeout();
+
     // Resolve secrets, grouped by backend for client reuse
     let mut results = ResolvedEnvSecrets {
         vars: Vec::new(),
@@ -190,7 +216,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
         results.source_keys_to_remove.push(s.suffixed_key.clone());
     }
 
-    // Vault secrets (single client, shared across all Vault refs)
+    // Vault secrets (single client, all fetches concurrent via join_all)
     #[cfg(feature = "secrets-vault")]
     {
         let vault_secrets: Vec<&PendingSecret> = pending
@@ -199,27 +225,34 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             .collect();
         if !vault_secrets.is_empty() {
             let client = vault::VaultClientWrapper::new()?;
-            for s in vault_secrets {
-                let value = tokio::time::timeout(
-                    SECRET_FETCH_TIMEOUT,
-                    client.fetch_secret(&s.reference, &s.base_key),
-                )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "Timeout resolving {} from Vault after {}s",
-                        s.base_key,
-                        SECRET_FETCH_TIMEOUT.as_secs()
+            let futs: Vec<_> = vault_secrets
+                .iter()
+                .map(|s| async {
+                    let value = tokio::time::timeout(
+                        fetch_timeout,
+                        client.fetch_secret(&s.reference, &s.base_key),
                     )
-                })??;
-                info!("Loaded {} from Vault", s.base_key);
-                results.vars.push((s.base_key.clone(), value));
-                results.source_keys_to_remove.push(s.suffixed_key.clone());
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from Vault after {}s",
+                            s.base_key,
+                            fetch_timeout.as_secs()
+                        )
+                    })??;
+                    Ok::<_, String>((s.base_key.clone(), value, s.suffixed_key.clone()))
+                })
+                .collect();
+            for result in futures_util::future::join_all(futs).await {
+                let (base_key, value, suffixed_key) = result?;
+                info!("Loaded {} from Vault", base_key);
+                results.vars.push((base_key, value));
+                results.source_keys_to_remove.push(suffixed_key);
             }
         }
     }
 
-    // AWS secrets (single client, shared across all AWS refs)
+    // AWS secrets (single client, all fetches concurrent via join_all)
     #[cfg(feature = "secrets-aws")]
     {
         let aws_secrets: Vec<&PendingSecret> = pending
@@ -228,27 +261,34 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             .collect();
         if !aws_secrets.is_empty() {
             let client = aws::AwsClientWrapper::new().await;
-            for s in aws_secrets {
-                let value = tokio::time::timeout(
-                    SECRET_FETCH_TIMEOUT,
-                    client.fetch_secret(&s.reference, &s.base_key),
-                )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "Timeout resolving {} from AWS Secrets Manager after {}s",
-                        s.base_key,
-                        SECRET_FETCH_TIMEOUT.as_secs()
+            let futs: Vec<_> = aws_secrets
+                .iter()
+                .map(|s| async {
+                    let value = tokio::time::timeout(
+                        fetch_timeout,
+                        client.fetch_secret(&s.reference, &s.base_key),
                     )
-                })??;
-                info!("Loaded {} from AWS Secrets Manager", s.base_key);
-                results.vars.push((s.base_key.clone(), value));
-                results.source_keys_to_remove.push(s.suffixed_key.clone());
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from AWS Secrets Manager after {}s",
+                            s.base_key,
+                            fetch_timeout.as_secs()
+                        )
+                    })??;
+                    Ok::<_, String>((s.base_key.clone(), value, s.suffixed_key.clone()))
+                })
+                .collect();
+            for result in futures_util::future::join_all(futs).await {
+                let (base_key, value, suffixed_key) = result?;
+                info!("Loaded {} from AWS Secrets Manager", base_key);
+                results.vars.push((base_key, value));
+                results.source_keys_to_remove.push(suffixed_key);
             }
         }
     }
 
-    // GCP secrets (single client, shared across all GCP refs)
+    // GCP secrets (single client, all fetches concurrent via join_all)
     #[cfg(feature = "secrets-gcp")]
     {
         let gcp_secrets: Vec<&PendingSecret> = pending
@@ -257,27 +297,34 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             .collect();
         if !gcp_secrets.is_empty() {
             let client = gcp::GcpClientWrapper::new().await?;
-            for s in gcp_secrets {
-                let value = tokio::time::timeout(
-                    SECRET_FETCH_TIMEOUT,
-                    client.fetch_secret(&s.reference, &s.base_key),
-                )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "Timeout resolving {} from GCP Secret Manager after {}s",
-                        s.base_key,
-                        SECRET_FETCH_TIMEOUT.as_secs()
+            let futs: Vec<_> = gcp_secrets
+                .iter()
+                .map(|s| async {
+                    let value = tokio::time::timeout(
+                        fetch_timeout,
+                        client.fetch_secret(&s.reference, &s.base_key),
                     )
-                })??;
-                info!("Loaded {} from GCP Secret Manager", s.base_key);
-                results.vars.push((s.base_key.clone(), value));
-                results.source_keys_to_remove.push(s.suffixed_key.clone());
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from GCP Secret Manager after {}s",
+                            s.base_key,
+                            fetch_timeout.as_secs()
+                        )
+                    })??;
+                    Ok::<_, String>((s.base_key.clone(), value, s.suffixed_key.clone()))
+                })
+                .collect();
+            for result in futures_util::future::join_all(futs).await {
+                let (base_key, value, suffixed_key) = result?;
+                info!("Loaded {} from GCP Secret Manager", base_key);
+                results.vars.push((base_key, value));
+                results.source_keys_to_remove.push(suffixed_key);
             }
         }
     }
 
-    // Azure secrets (single credential, shared across all Azure refs)
+    // Azure secrets (single credential, all fetches concurrent via join_all)
     #[cfg(feature = "secrets-azure")]
     {
         let azure_secrets: Vec<&PendingSecret> = pending
@@ -286,22 +333,29 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
             .collect();
         if !azure_secrets.is_empty() {
             let creds = azure::AzureCredentials::new()?;
-            for s in azure_secrets {
-                let value = tokio::time::timeout(
-                    SECRET_FETCH_TIMEOUT,
-                    creds.fetch_secret(&s.reference, &s.base_key),
-                )
-                .await
-                .map_err(|_| {
-                    format!(
-                        "Timeout resolving {} from Azure Key Vault after {}s",
-                        s.base_key,
-                        SECRET_FETCH_TIMEOUT.as_secs()
+            let futs: Vec<_> = azure_secrets
+                .iter()
+                .map(|s| async {
+                    let value = tokio::time::timeout(
+                        fetch_timeout,
+                        creds.fetch_secret(&s.reference, &s.base_key),
                     )
-                })??;
-                info!("Loaded {} from Azure Key Vault", s.base_key);
-                results.vars.push((s.base_key.clone(), value));
-                results.source_keys_to_remove.push(s.suffixed_key.clone());
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from Azure Key Vault after {}s",
+                            s.base_key,
+                            fetch_timeout.as_secs()
+                        )
+                    })??;
+                    Ok::<_, String>((s.base_key.clone(), value, s.suffixed_key.clone()))
+                })
+                .collect();
+            for result in futures_util::future::join_all(futs).await {
+                let (base_key, value, suffixed_key) = result?;
+                info!("Loaded {} from Azure Key Vault", base_key);
+                results.vars.push((base_key, value));
+                results.source_keys_to_remove.push(suffixed_key);
             }
         }
     }
@@ -372,13 +426,13 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         #[cfg(feature = "secrets-vault")]
         "vault" => {
             let value =
-                tokio::time::timeout(SECRET_FETCH_TIMEOUT, vault::fetch_secret(&reference, key))
+                tokio::time::timeout(secret_fetch_timeout(), vault::fetch_secret(&reference, key))
                     .await
                     .map_err(|_| {
                         format!(
                             "Timeout resolving {} from Vault after {}s",
                             key,
-                            SECRET_FETCH_TIMEOUT.as_secs()
+                            secret_fetch_timeout().as_secs()
                         )
                     })??;
             info!("Loaded {} from Vault", key);
@@ -390,13 +444,13 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         #[cfg(feature = "secrets-aws")]
         "aws" => {
             let value =
-                tokio::time::timeout(SECRET_FETCH_TIMEOUT, aws::fetch_secret(&reference, key))
+                tokio::time::timeout(secret_fetch_timeout(), aws::fetch_secret(&reference, key))
                     .await
                     .map_err(|_| {
                         format!(
                             "Timeout resolving {} from AWS Secrets Manager after {}s",
                             key,
-                            SECRET_FETCH_TIMEOUT.as_secs()
+                            secret_fetch_timeout().as_secs()
                         )
                     })??;
             info!("Loaded {} from AWS Secrets Manager", key);
@@ -408,13 +462,13 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         #[cfg(feature = "secrets-gcp")]
         "gcp" => {
             let value =
-                tokio::time::timeout(SECRET_FETCH_TIMEOUT, gcp::fetch_secret(&reference, key))
+                tokio::time::timeout(secret_fetch_timeout(), gcp::fetch_secret(&reference, key))
                     .await
                     .map_err(|_| {
                         format!(
                             "Timeout resolving {} from GCP Secret Manager after {}s",
                             key,
-                            SECRET_FETCH_TIMEOUT.as_secs()
+                            secret_fetch_timeout().as_secs()
                         )
                     })??;
             info!("Loaded {} from GCP Secret Manager", key);
@@ -426,13 +480,13 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         #[cfg(feature = "secrets-azure")]
         "azure" => {
             let value =
-                tokio::time::timeout(SECRET_FETCH_TIMEOUT, azure::fetch_secret(&reference, key))
+                tokio::time::timeout(secret_fetch_timeout(), azure::fetch_secret(&reference, key))
                     .await
                     .map_err(|_| {
                         format!(
                             "Timeout resolving {} from Azure Key Vault after {}s",
                             key,
-                            SECRET_FETCH_TIMEOUT.as_secs()
+                            secret_fetch_timeout().as_secs()
                         )
                     })??;
             info!("Loaded {} from Azure Key Vault", key);

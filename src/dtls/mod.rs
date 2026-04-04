@@ -391,6 +391,12 @@ pub struct DtlsServerConn {
     app_rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Signal this connection's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
+    /// DER-encoded client certificate from the DTLS handshake (first cert in chain).
+    /// Populated when the client presents a certificate during mutual DTLS authentication.
+    pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    /// DER-encoded intermediate/CA certificates from the client's certificate chain
+    /// (all certs after the peer cert). `None` when no chain certs were sent.
+    pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 }
 
 /// A cloneable sender half of a `DtlsServerConn`, used to send data back to
@@ -574,6 +580,10 @@ impl DtlsServer {
             let mut out_buf = vec![0u8; OUTPUT_BUF_SIZE];
             let mut next_timeout: Option<Instant> = None;
             let mut connected = false;
+            // Collect client certificate DER bytes emitted via Output::PeerCert
+            // during the DTLS handshake. The first cert is the peer cert, the
+            // rest are intermediates/CA chain certs.
+            let mut peer_cert_ders: Vec<Vec<u8>> = Vec::new();
 
             // Drain init outputs (just Timeout from handle_timeout)
             for _ in 0..MAX_OUTPUTS_PER_DRAIN {
@@ -669,10 +679,24 @@ impl DtlsServer {
                             let Some(rx) = app_out_rx.take() else {
                                 continue; // Already connected — should not happen
                             };
+                            // Extract collected client certificates: first = peer cert, rest = chain
+                            let (peer_cert, chain_certs) = if peer_cert_ders.is_empty() {
+                                (None, None)
+                            } else {
+                                let peer = Arc::new(peer_cert_ders[0].clone());
+                                let chain = if peer_cert_ders.len() > 1 {
+                                    Some(Arc::new(peer_cert_ders[1..].to_vec()))
+                                } else {
+                                    None
+                                };
+                                (Some(peer), chain)
+                            };
                             let conn = DtlsServerConn {
                                 app_tx: app_in_tx.clone(),
                                 app_rx: tokio::sync::Mutex::new(rx),
                                 shutdown_tx: shutdown_tx.clone(),
+                                tls_client_cert_der: peer_cert,
+                                tls_client_cert_chain_der: chain_certs,
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
                                 // Server shut down
@@ -688,6 +712,8 @@ impl DtlsServer {
                                 sessions.remove(&peer_addr);
                                 return;
                             }
+                            // Store the certificate DER for plugin access after Connected
+                            peer_cert_ders.push(der.to_vec());
                         }
                         Output::ApplicationData(data) => {
                             if app_out_tx.send(data.to_vec()).await.is_err() {

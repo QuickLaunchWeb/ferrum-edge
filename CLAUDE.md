@@ -73,6 +73,8 @@ All four jobs must pass for a PR to merge.
 | `dp` | Data Plane | Read-only | Yes | gRPC stream from CP |
 | `migrate` | Schema migration utility | No | No | Runs DB migrations then exits |
 
+**Admin JWT secret handling is intentionally per-mode**: Database and CP modes **require** `FERRUM_ADMIN_JWT_SECRET` (hard failure if unset) because their read-write admin API issues tokens via `POST /auth` that must survive restarts and be valid across instances sharing the same secret. File mode has a **read-only** admin API that never issues tokens, so it generates a random secret as a convenience — all externally-crafted tokens are rejected since no one can predict the secret. This asymmetry is by design, not an inconsistency.
+
 ### Core Design Principles
 
 1. **Lock-free hot path**: All request-path reads use `ArcSwap::load()` or `DashMap` sharded locks. No `Mutex`/`RwLock` on the proxy path.
@@ -195,6 +197,8 @@ src/
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
 
+**Hostname normalization**: All hostnames are normalized to ASCII-lowercase at the admission layer via `normalize_fields()` — this includes `Proxy.hosts`, `Proxy.backend_host`, and `UpstreamTarget.host`. Normalization runs at every entry point: admin API (create/update/batch/restore), file loader, DB loader (full and incremental), DP gRPC client, and config backup restore. Downstream consumers (DNS cache, connection pool keys, health check keys, LB keys) rely on this invariant and do NOT re-lowercase. Do not add per-lookup lowercasing in those paths — it is unnecessary and adds hot-path overhead.
+
 ### Route Matching
 
 Routes are matched in priority order within each host tier (exact host → wildcard host → catch-all):
@@ -227,6 +231,8 @@ TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts ar
 - Bind failures are logged as errors but never crash the gateway
 - Failed listeners are skipped; existing working listeners continue unaffected
 
+**DP port conflict validation — intentionally deferred to bind time**: The DP does NOT run `validate_stream_proxy_port_conflicts()` when receiving full config snapshots or incremental deltas from the CP. This is by design — the CP manages proxies for many heterogeneous DPs, each with different reserved ports, so the CP cannot know which ports conflict on each DP. Rejecting the entire config would prevent all valid proxies from running. Instead, port conflicts are detected at bind time during listener reconciliation, where only the conflicting proxy is skipped and all others proceed normally.
+
 ### Plugin System
 
 Plugins execute in priority order (lower number = runs first). The lifecycle phases are:
@@ -241,7 +247,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
 9. `log` — Stdout logging (9000), HTTP logging (9100), transaction debugger (9200), Prometheus (9300), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
-11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available
+11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available. For UDP+DTLS proxies, `on_stream_connect` runs after the DTLS handshake completes, with client certificate DER bytes available in `StreamConnectionContext` for mTLS authentication
 12. `on_udp_datagram` — Per-datagram UDP hooks fired before each client→backend datagram is forwarded. udp_rate_limiting (2910) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`
 
 **Multi-auth**: `AuthMode::Multi` recognizes both `ctx.identified_consumer` (consumer-backed auth) and `ctx.authenticated_identity` (external JWKS/OIDC identity) as successful authentication. First-success-wins semantics apply.
@@ -353,6 +359,8 @@ tests/
 
 **No silent fallbacks**: All protocol paths hard-error on cert load failure. No degradation to unauthenticated connections.
 
+**Certificate expiration checking**: All TLS surfaces (frontend, admin, DTLS, CP/DP gRPC, per-proxy backend certs, CA bundles) check X.509 `notBefore`/`notAfter` at load time. Expired certificates are rejected (hard failure). Certificates expiring within `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` (default 30) emit a warning log. Set to 0 to disable near-expiry warnings. The `check_cert_expiry()` helper in `src/tls/mod.rs` is shared across all surfaces.
+
 **No hot reload for any TLS surface**: Updating a cert file on disk has no effect until restart (or config reload for per-proxy paths, which creates new pool entries but does not re-read files for existing ones). This applies to frontend, backend, admin, DTLS, and gRPC TLS surfaces. See `docs/frontend_tls.md` for the complete list.
 
 **Pool-per-cert-path**: For reqwest-based paths (HTTP/1.1, H2 via reqwest, H3 frontend-to-backend), different cert paths create different `reqwest::Client` pool entries. For rustls-based paths (gRPC pool, H2 direct pool), TLS config is built per-connection.
@@ -404,7 +412,7 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 - H2 pool dispatch: `matches!(proxy.backend_protocol, BackendProtocol::H2)` (line ~3828)
 - Streaming vs buffered: controlled by `plugin_cache.requires_response_body_buffering()` and `proxy.retry.is_some()`
 
-**HTTP/3 frontend architecture**: The H3 listener in `http3/server.rs` is a standalone QUIC server that handles its own request lifecycle (plugin phases, auth, route matching). For backend communication, it uses **reqwest** (not the `Http3ConnectionPool`). This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms QUIC for small payloads due to lower per-request crypto overhead and more mature connection pooling. The `Http3ConnectionPool` in `http3/client.rs` is used only by the main hyper-based proxy path (`mod.rs`) for H3 backend targets.
+**HTTP/3 frontend architecture**: The H3 listener in `http3/server.rs` is a standalone QUIC server that handles its own request lifecycle (plugin phases, auth, route matching). For backend communication, it uses **reqwest** (not the `Http3ConnectionPool`). This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms QUIC for small payloads due to lower per-request crypto overhead and more mature connection pooling. The `Http3ConnectionPool` in `http3/client.rs` is used only by the main hyper-based proxy path (`mod.rs`) for H3 backend targets. The H3 listener enforces its own per-header and total-header size limits (`FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` / `FERRUM_MAX_HEADER_SIZE_BYTES`) since it does not use hyper's built-in header validation — the host header extracted for routing is a substring of an already-validated header, so separate host-length validation is unnecessary.
 
 **gRPC proxy architecture**: Uses hyper's HTTP/2 client directly (not reqwest) to preserve HTTP/2 trailers (`grpc-status`, `grpc-message`). The `GrpcConnectionPool` maintains sharded H2 connections with round-robin distribution. When `stream_response=true` (no retries, no body-buffering plugins), the response `Incoming` body is passed through as `ProxyBody::streaming_h2` — hyper forwards DATA and TRAILERS frames directly to the client without buffering.
 
@@ -476,7 +484,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
 2. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
+3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_TCP_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
 4. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
 5. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs`
 6. Add the module to `tests/unit/plugins/mod.rs`
@@ -554,6 +562,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_JWT_SECRET` | (required for db/cp) | JWT secret for admin API auth |
+| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | JWT issuer claim (iss) for admin API tokens |
+| `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Maximum TTL in seconds for admin API JWT tokens |
 | `FERRUM_FILE_CONFIG_PATH` | (required for file mode) | Path to YAML/JSON config file |
 | `FERRUM_DB_TYPE` | (required for db mode) | `postgres`, `mysql`, `sqlite` |
 | `FERRUM_DB_URL` | (required for db mode) | Database connection URL |
@@ -577,6 +587,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY` | `false` | Skip gRPC TLS cert verification (testing only) |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CA_BUNDLE_PATH` | (none) | Path to PEM CA bundle for outbound TLS verification (internal CAs) |
+| `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | `30` | Days before cert expiration to warn. Expired certs are always rejected. 0 = disable warnings |
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | `ferrum-edge-change-me-in-production` | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt). **Must be changed in production.** |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
