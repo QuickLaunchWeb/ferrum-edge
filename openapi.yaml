@@ -3038,6 +3038,12 @@ components:
               role_claim:
                 type: string
                 description: Per-provider override for role claim path
+              consumer_identity_claim:
+                type: string
+                description: Per-provider override for consumer identity claim (falls back to global)
+              consumer_header_claim:
+                type: string
+                description: Per-provider override for consumer header claim (falls back to global)
           description: Array of identity provider configurations
         scope_claim:
           type: string
@@ -3057,7 +3063,7 @@ components:
         jwks_refresh_interval_secs:
           type: integer
           format: uint64
-          default: 300
+          default: 900
           description: JWKS key refresh interval in seconds
 
     JwtAuthConfig:

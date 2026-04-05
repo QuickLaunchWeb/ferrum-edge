@@ -938,3 +938,224 @@ async fn test_jwks_auth_per_provider_scope_claim_override() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
 }
+
+// ─── Per-Provider Consumer Claim Overrides ─────────────────────────────
+
+#[tokio::test]
+async fn test_jwks_auth_per_provider_consumer_identity_claim_override() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+
+    // Global consumer_identity_claim is "sub", but provider overrides to "preferred_username"
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "consumer_identity_claim": "preferred_username"
+            }],
+            "consumer_identity_claim": "sub"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer = create_consumer("keycloak-user");
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    // Token has both "sub" and "preferred_username" — provider override picks "preferred_username"
+    let token = create_rs256_token(
+        &json!({
+            "sub": "some-uuid-12345",
+            "preferred_username": "keycloak-user"
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    // Consumer found via "preferred_username", not "sub"
+    assert!(ctx.identified_consumer.is_some());
+    assert_eq!(ctx.identified_consumer.unwrap().username, "keycloak-user");
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("keycloak-user"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_per_provider_consumer_header_claim_override() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+
+    // Global header claim is "email", provider overrides to "upn"
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "consumer_identity_claim": "sub",
+                "consumer_header_claim": "upn"
+            }],
+            "consumer_identity_claim": "sub",
+            "consumer_header_claim": "email"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let token = create_rs256_token(
+        &json!({
+            "sub": "user-123",
+            "email": "user@google.com",
+            "upn": "user@corp.example.com"
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("user-123"));
+    // Header uses per-provider "upn", not global "email"
+    assert_eq!(
+        ctx.authenticated_identity_header.as_deref(),
+        Some("user@corp.example.com")
+    );
+}
+
+#[tokio::test]
+async fn test_jwks_auth_multi_provider_different_identity_claims() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    // Two providers with different JWKS endpoints and different identity claims
+    let server1 = wiremock::MockServer::start().await;
+    let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks1"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
+        .mount(&server1)
+        .await;
+
+    let server2 = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks2"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
+        .mount(&server2)
+        .await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "issuer": "https://google.com",
+                    "jwks_uri": format!("{}/jwks1", server1.uri()),
+                    "consumer_identity_claim": "email",
+                    "consumer_header_claim": "email"
+                },
+                {
+                    "issuer": "https://keycloak.internal",
+                    "jwks_uri": format!("{}/jwks2", server2.uri()),
+                    "consumer_identity_claim": "preferred_username",
+                    "consumer_header_claim": "preferred_username"
+                }
+            ],
+            "consumer_identity_claim": "sub"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    // Token from Google — identity should come from "email" claim
+    let token_google = create_rs256_token(
+        &json!({
+            "sub": "google-uid-123",
+            "iss": "https://google.com",
+            "email": "alice@gmail.com"
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!("Bearer {}", token_google),
+    );
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("alice@gmail.com")
+    );
+
+    // Token from Keycloak — identity should come from "preferred_username" claim
+    let token_kc = create_rs256_token(
+        &json!({
+            "sub": "kc-uid-456",
+            "iss": "https://keycloak.internal",
+            "preferred_username": "bob"
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx2 = make_ctx();
+    ctx2.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token_kc));
+    let result = plugin.authenticate(&mut ctx2, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx2.authenticated_identity.as_deref(), Some("bob"));
+}
+
+#[tokio::test]
+async fn test_jwks_auth_provider_without_override_uses_global() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+
+    // Provider has no consumer_identity_claim — should fall back to global "email"
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri
+            }],
+            "consumer_identity_claim": "email"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let token = create_rs256_token(
+        &json!({
+            "sub": "user-123",
+            "email": "user@example.com"
+        }),
+        private_key_pem,
+    );
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    // Falls back to global consumer_identity_claim="email"
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("user@example.com")
+    );
+}
