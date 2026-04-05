@@ -589,9 +589,12 @@ Custom plugins that need their own database tables can declare migrations via a 
 1. Add the field to the appropriate struct in `src/config/types.rs` with `#[serde(default)]`
 2. If env-var driven: add parsing in `src/config/env_config.rs`
 3. **Update `ferrum.conf`** — every new `FERRUM_*` env var must also be added to `ferrum.conf` with a commented-out default and descriptive comment. The conf file and env vars must stay in sync.
-4. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
-5. Add unit tests for deserialization in `tests/unit/config/`
-6. Update `openapi.yaml` if the Admin API exposes it
+4. If database-stored (SQL backends): add a migration in `src/config/migrations/` (ALTER TABLE / new column) and update row parsing in `db_loader.rs`
+5. **MongoDB gets the field automatically** — `MongoStore` serializes domain types via `bson::to_document`/`from_document` using serde, so new fields on `Proxy`, `Consumer`, `Upstream`, or `PluginConfig` are persisted without any MongoDB-specific migration. New indexes (if the field needs to be queried) should be added to `MongoStore::run_migrations()`.
+6. Add unit tests for deserialization in `tests/unit/config/`
+7. Update `openapi.yaml` if the Admin API exposes it
+
+**Schema centralization**: The domain types in `src/config/types.rs` (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) are the single source of truth for schema. MongoDB uses serde-based BSON serialization so new fields propagate automatically. SQL backends require explicit migrations (ALTER TABLE) and manual row parsing in `db_loader.rs`. This asymmetry is by design — centralizing SQL DDL generation from the Rust types would add significant complexity for marginal benefit, and the SQL backends need fine-grained control over column types, indexes, and cross-database dialect differences.
 
 ### Database Considerations
 
@@ -599,8 +602,12 @@ Custom plugins that need their own database tables can declare migrations via a 
 - **Database backend abstraction**: The `DatabaseBackend` trait in `src/config/db_backend.rs` abstracts all database operations. `DatabaseStore` (sqlx) and `MongoStore` (mongodb) both implement this trait. The admin API and operating modes use `Arc<dyn DatabaseBackend>` for polymorphic dispatch.
 - **MongoDB support**: Enabled via `--features mongodb` or `mongodb` feature flag. Uses BSON document storage with domain types serialized directly via serde. No junction tables — plugin associations are embedded in proxy documents. Indexes replace SQL migrations (idempotent `createIndex`). Incremental polling uses `updated_at` timestamp queries (same strategy as SQL). MongoDB-specific env vars: `FERRUM_MONGO_DATABASE`, `FERRUM_MONGO_APP_NAME`, `FERRUM_MONGO_REPLICA_SET`, `FERRUM_MONGO_AUTH_MECHANISM`, `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS`, `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS`.
 - **Migrations**: Core gateway migrations in `src/config/migrations/` (SQL). For MongoDB, `run_migrations()` creates indexes instead. Custom plugin migrations declared via `plugin_migrations()` in plugin files and tracked in `_ferrum_plugin_migrations`. Both run via `FERRUM_MODE=migrate`.
-- **Schema relationships**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type and an `acl_groups` JSON array for group-based access control.
-- **Transactions**: All multi-step CRUD operations (create/update/delete proxy, delete plugin_config, delete upstream, cleanup orphaned upstream) are wrapped in `sqlx::Transaction` to prevent partial updates on crash or concurrent access.
+- **Schema relationships (SQL)**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type and an `acl_groups` JSON array for group-based access control.
+- **Schema relationships (MongoDB)**: Same domain model, different storage. Proxy documents embed plugin associations directly (no junction collection). Upstream references use `upstream_id` field with an index. Credentials and acl_groups are nested BSON objects/arrays. The `_id` field maps to the resource's `id`.
+- **Transactions (SQL)**: All multi-step CRUD operations (create/update/delete proxy, delete plugin_config, delete upstream, cleanup orphaned upstream) are wrapped in `sqlx::Transaction` to prevent partial updates on crash or concurrent access.
+- **Transactions (MongoDB)**: Single-document operations are atomic by default. Multi-document operations (e.g., delete proxy + associated plugin_configs) are not transactional unless a replica set is configured (`FERRUM_MONGO_REPLICA_SET`). Without a replica set, operations are designed to be idempotent — partial failures are detected and cleaned up on the next poll cycle.
+- **Custom plugin migrations (SQL)**: `CustomPluginMigration` structs with `sql`, `sql_postgres`, `sql_mysql` fields. Tracked in `_ferrum_plugin_migrations`.
+- **Custom plugin migrations (MongoDB)**: The SQL-based `CustomPluginMigration` system is **SQL-only**. Custom plugins needing MongoDB collections/indexes should create them in their `create_plugin()` initialization or provide a separate setup function. The `sql` field in `CustomPluginMigration` is skipped when `FERRUM_DB_TYPE=mongodb`.
 - **Full proxy persistence**: All Proxy struct fields are persisted in the database, including `circuit_breaker` (JSON), `retry` (JSON), `response_body_mode`, and all `pool_*` override fields.
 - **Incremental Polling**: Database mode polls for changes at `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30s) using a two-phase incremental strategy:
   1. **Startup**: Full `SELECT *` on all 4 tables to build the initial config and seed the poller's known ID sets. The `loaded_at` timestamp is captured **before** queries execute so the safety margin covers the full load duration.

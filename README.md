@@ -20,7 +20,7 @@ For the full feature list, see [FEATURES.md](FEATURES.md).
 
 | Mode | Env Var | Description | Admin API | Proxy |
 |------|---------|-------------|-----------|-------|
-| **Database** | `FERRUM_MODE=database` | Single-instance, DB-backed (PostgreSQL/MySQL/SQLite) | Read/Write | Yes |
+| **Database** | `FERRUM_MODE=database` | Single-instance, DB-backed (PostgreSQL/MySQL/SQLite/MongoDB) | Read/Write | Yes |
 | **File** | `FERRUM_MODE=file` | Single-instance, YAML/JSON config, SIGHUP reload | Read-only | Yes |
 | **Control Plane** | `FERRUM_MODE=cp` | Centralized config authority, gRPC distribution to DPs | Read/Write | No |
 | **Data Plane** | `FERRUM_MODE=dp` | Horizontally scalable traffic processing nodes | Read-only | Yes |
@@ -32,7 +32,7 @@ See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
 
 - **Rust** toolchain (stable 1.85+)
 - **protoc** (Protocol Buffers compiler) for gRPC code generation
-- **Database** (optional): PostgreSQL, MySQL, or SQLite (for database and CP modes)
+- **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes). MongoDB requires `--features mongodb` at build time.
 
 ## Installation
 
@@ -98,6 +98,20 @@ FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
 cargo run --release
 ```
 
+### Database Mode (MongoDB)
+
+```bash
+# Build with MongoDB support first:
+cargo build --release --features mongodb
+
+FERRUM_MODE=database \
+FERRUM_DB_TYPE=mongodb \
+FERRUM_DB_URL="mongodb://user:pass@localhost:27017/ferrum?authSource=admin" \
+FERRUM_MONGO_DATABASE=ferrum \
+FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
+./target/release/ferrum-edge
+```
+
 ### Control Plane + Data Plane
 
 ```bash
@@ -146,7 +160,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API |
-| `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite` |
+| `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP | — | Database connection string |
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 
