@@ -62,6 +62,11 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
             env_config.mongo_auth_mechanism.as_deref(),
             env_config.mongo_server_selection_timeout_seconds,
             env_config.mongo_connect_timeout_seconds,
+            env_config.db_tls_enabled,
+            env_config.db_tls_ca_cert_path.as_deref(),
+            env_config.db_tls_client_cert_path.as_deref(),
+            env_config.db_tls_client_key_path.as_deref(),
+            env_config.db_tls_insecure,
         )
         .await?;
         use crate::config::db_backend::DatabaseBackend;

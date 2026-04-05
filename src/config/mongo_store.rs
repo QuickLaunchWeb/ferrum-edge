@@ -33,9 +33,10 @@ mod inner {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use mongodb::bson::{Document, doc};
-    use mongodb::options::{ClientOptions, FindOptions, IndexOptions};
+    use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
     use mongodb::{Client, Collection, Database, IndexModel};
     use std::collections::HashSet;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tracing::{debug, info, warn};
 
@@ -60,9 +61,18 @@ mod inner {
         /// The connection string follows the standard MongoDB URI format:
         /// `mongodb://[username:password@]host[:port]/[database][?options]`
         ///
-        /// TLS is configured via the connection string (`tls=true`, `tlsCAFile=...`).
-        /// When `FERRUM_DB_TLS_ENABLED=true`, the TLS parameters are appended to
-        /// the connection string automatically by the mode dispatch code.
+        /// **TLS/mTLS configuration**: When `tls_enabled` is true, TLS is configured
+        /// programmatically via `TlsOptions` using the existing `FERRUM_DB_TLS_*`
+        /// env vars:
+        /// - `FERRUM_DB_TLS_CA_CERT_PATH` → `TlsOptions::ca_file_path`
+        /// - `FERRUM_DB_TLS_CLIENT_CERT_PATH` → Combined with key into a temp PEM
+        ///   for `TlsOptions::cert_key_file_path` (MongoDB requires a single file)
+        /// - `FERRUM_DB_TLS_INSECURE` → `TlsOptions::allow_invalid_certificates`
+        ///
+        /// TLS can also be configured directly via connection string options
+        /// (`tls=true&tlsCAFile=...`), which takes precedence over the programmatic
+        /// config when both are set.
+        #[allow(clippy::too_many_arguments)]
         pub async fn connect(
             mongo_url: &str,
             database_name: &str,
@@ -71,6 +81,11 @@ mod inner {
             auth_mechanism: Option<&str>,
             server_selection_timeout_secs: u64,
             connect_timeout_secs: u64,
+            tls_enabled: bool,
+            tls_ca_cert_path: Option<&str>,
+            tls_client_cert_path: Option<&str>,
+            tls_client_key_path: Option<&str>,
+            tls_insecure: bool,
         ) -> Result<Self, anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
 
@@ -91,6 +106,37 @@ mod inner {
             client_options.server_selection_timeout =
                 Some(Duration::from_secs(server_selection_timeout_secs));
             client_options.connect_timeout = Some(Duration::from_secs(connect_timeout_secs));
+
+            // Configure TLS via the existing FERRUM_DB_TLS_* env vars.
+            // Only set programmatic TLS if the connection string doesn't already
+            // include TLS options (connection string takes precedence).
+            if tls_enabled && client_options.tls.is_none() {
+                let ca = tls_ca_cert_path.map(PathBuf::from);
+
+                // MongoDB requires client cert + key in a single combined PEM file.
+                // If the user provides separate cert and key files, combine them
+                // into a temp file. If only cert is provided, assume it already
+                // contains the key (combined PEM).
+                let cert_key = match (tls_client_cert_path, tls_client_key_path) {
+                    (Some(cert_path), Some(key_path)) => {
+                        Some(Self::combine_cert_key_pem(cert_path, key_path)?)
+                    }
+                    (Some(cert_path), None) => Some(PathBuf::from(cert_path)),
+                    _ => None,
+                };
+
+                // Build TlsOptions using the typed-state builder. Each method
+                // consumes the builder, so we chain conditionally.
+                let tls_opts = Self::build_tls_options(ca, cert_key, tls_insecure);
+
+                client_options.tls = Some(Tls::Enabled(tls_opts));
+                info!(
+                    "MongoDB TLS enabled (ca={}, client_cert={}, insecure={})",
+                    tls_ca_cert_path.unwrap_or("system-roots"),
+                    tls_client_cert_path.unwrap_or("none"),
+                    tls_insecure
+                );
+            }
 
             let client = Client::with_options(client_options)?;
             let db = client.database(database_name);
@@ -121,6 +167,83 @@ mod inner {
             })
         }
 
+        /// Combine separate PEM cert and key files into a single temporary file.
+        ///
+        /// The MongoDB Rust driver requires client cert + key in a single PEM file
+        /// (`TlsOptions::cert_key_file_path`). The gateway's `FERRUM_DB_TLS_*` env
+        /// vars use separate files (matching the PostgreSQL/MySQL convention).
+        /// This helper reads both files and writes a combined PEM to a temp file
+        /// that persists for the lifetime of the process.
+        fn combine_cert_key_pem(cert_path: &str, key_path: &str) -> Result<PathBuf, anyhow::Error> {
+            let cert_data = std::fs::read_to_string(cert_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read MongoDB client cert '{}': {}", cert_path, e)
+            })?;
+            let key_data = std::fs::read_to_string(key_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read MongoDB client key '{}': {}", key_path, e)
+            })?;
+
+            // Write combined PEM to a temp file. Use a deterministic path so
+            // reconnect calls reuse the same file instead of leaking temp files.
+            let combined_path = std::env::temp_dir().join("ferrum-mongo-client.pem");
+            let combined = format!("{}\n{}", cert_data.trim(), key_data.trim());
+            std::fs::write(&combined_path, combined).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to write combined MongoDB client PEM to '{}': {}",
+                    combined_path.display(),
+                    e
+                )
+            })?;
+
+            info!(
+                "Combined MongoDB client cert ({}) + key ({}) into {}",
+                cert_path,
+                key_path,
+                combined_path.display()
+            );
+            Ok(combined_path)
+        }
+
+        /// Build `TlsOptions` from the individual components.
+        ///
+        /// The MongoDB `TlsOptions` builder uses a typed-state pattern where each
+        /// method consumes the builder and returns a new type. This makes conditional
+        /// chaining impossible, so we handle the 8 possible combinations explicitly.
+        fn build_tls_options(
+            ca: Option<PathBuf>,
+            cert_key: Option<PathBuf>,
+            insecure: bool,
+        ) -> TlsOptions {
+            // Use the typed-state builder for each combination of options.
+            // Each arm builds the complete option set matching what's provided.
+            match (ca, cert_key, insecure) {
+                (Some(ca_path), Some(ck_path), true) => TlsOptions::builder()
+                    .ca_file_path(ca_path)
+                    .cert_key_file_path(ck_path)
+                    .allow_invalid_certificates(true)
+                    .build(),
+                (Some(ca_path), Some(ck_path), false) => TlsOptions::builder()
+                    .ca_file_path(ca_path)
+                    .cert_key_file_path(ck_path)
+                    .build(),
+                (Some(ca_path), None, true) => TlsOptions::builder()
+                    .ca_file_path(ca_path)
+                    .allow_invalid_certificates(true)
+                    .build(),
+                (Some(ca_path), None, false) => TlsOptions::builder().ca_file_path(ca_path).build(),
+                (None, Some(ck_path), true) => TlsOptions::builder()
+                    .cert_key_file_path(ck_path)
+                    .allow_invalid_certificates(true)
+                    .build(),
+                (None, Some(ck_path), false) => {
+                    TlsOptions::builder().cert_key_file_path(ck_path).build()
+                }
+                (None, None, true) => TlsOptions::builder()
+                    .allow_invalid_certificates(true)
+                    .build(),
+                (None, None, false) => TlsOptions::builder().build(),
+            }
+        }
+
         /// Connect with failover URLs (same pattern as SQL backend).
         #[allow(clippy::too_many_arguments)]
         pub async fn connect_with_failover(
@@ -131,6 +254,11 @@ mod inner {
             auth_mechanism: Option<&str>,
             server_selection_timeout_secs: u64,
             connect_timeout_secs: u64,
+            tls_enabled: bool,
+            tls_ca_cert_path: Option<&str>,
+            tls_client_cert_path: Option<&str>,
+            tls_client_key_path: Option<&str>,
+            tls_insecure: bool,
             failover_urls: &[String],
         ) -> Result<Self, anyhow::Error> {
             match Self::connect(
@@ -141,6 +269,11 @@ mod inner {
                 auth_mechanism,
                 server_selection_timeout_secs,
                 connect_timeout_secs,
+                tls_enabled,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
             )
             .await
             {
@@ -166,6 +299,11 @@ mod inner {
                             auth_mechanism,
                             server_selection_timeout_secs,
                             connect_timeout_secs,
+                            tls_enabled,
+                            tls_ca_cert_path,
+                            tls_client_cert_path,
+                            tls_client_key_path,
+                            tls_insecure,
                         )
                         .await
                         {
