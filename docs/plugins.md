@@ -67,7 +67,6 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 |---|---|---|---|
 | `endpoint_url` | String | `""` | URL to POST transaction logs to |
 | `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
-| `authorization_header` | String | *(none)* | **Deprecated** — use `custom_headers` instead. Sets the Authorization header |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
@@ -78,7 +77,7 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
-`custom_headers` accepts a JSON object of header name → value pairs. All headers are sent with every batch POST request. This supports services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). If both `authorization_header` and `custom_headers` contain an `Authorization` key, `custom_headers` takes precedence.
+`custom_headers` accepts a JSON object of header name → value pairs. All headers are sent with every batch POST request. This supports services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). Use `Authorization` as a key for services that authenticate via the standard Authorization header (e.g., Splunk HEC, Logtail).
 
 ```yaml
 plugin_name: http_logging

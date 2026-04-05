@@ -14,7 +14,9 @@ async fn test_http_logging_plugin_creation() {
     let plugin = HttpLogging::new(
         &json!({
             "endpoint_url": "http://localhost:9200/logs",
-            "authorization_header": "Bearer log-token"
+            "custom_headers": {
+                "Authorization": "Bearer log-token"
+            }
         }),
         default_client(),
     )
@@ -103,29 +105,6 @@ async fn test_http_logging_rejects_non_http_scheme() {
 }
 
 #[tokio::test]
-async fn test_http_logging_with_authorization_header() {
-    // Legacy authorization_header is still accepted for backward compatibility
-    let plugin = HttpLogging::new(
-        &json!({
-            "endpoint_url": "http://127.0.0.1:1/unreachable",
-            "authorization_header": "Bearer my-secret-token",
-            "batch_size": 1,
-            "flush_interval_ms": 100,
-            "max_retries": 0
-        }),
-        default_client(),
-    )
-    .unwrap();
-    assert_eq!(plugin.name(), "http_logging");
-
-    // Should not panic even with auth header set and unreachable endpoint
-    let summary = create_test_transaction_summary();
-    plugin.log(&summary).await;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-}
-
-#[tokio::test]
 async fn test_http_logging_with_custom_headers() {
     // custom_headers supports arbitrary key-value pairs for services like Datadog, New Relic
     let plugin = HttpLogging::new(
@@ -134,33 +113,6 @@ async fn test_http_logging_with_custom_headers() {
             "custom_headers": {
                 "DD-API-KEY": "my-datadog-key",
                 "X-Custom-Tag": "ferrum-edge"
-            },
-            "batch_size": 1,
-            "flush_interval_ms": 100,
-            "max_retries": 0
-        }),
-        default_client(),
-    )
-    .unwrap();
-    assert_eq!(plugin.name(), "http_logging");
-
-    let summary = create_test_transaction_summary();
-    plugin.log(&summary).await;
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-}
-
-#[tokio::test]
-async fn test_http_logging_custom_headers_overrides_legacy_authorization() {
-    // When both authorization_header and custom_headers with Authorization are set,
-    // custom_headers takes precedence
-    let plugin = HttpLogging::new(
-        &json!({
-            "endpoint_url": "http://127.0.0.1:1/unreachable",
-            "authorization_header": "Bearer old-token",
-            "custom_headers": {
-                "Authorization": "Bearer new-token",
-                "X-Extra": "value"
             },
             "batch_size": 1,
             "flush_interval_ms": 100,

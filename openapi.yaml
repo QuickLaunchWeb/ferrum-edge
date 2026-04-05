@@ -2582,9 +2582,6 @@ components:
         endpoint_url:
           type: string
           description: URL to POST transaction logs to
-        authorization_header:
-          type: string
-          description: "DEPRECATED: Use custom_headers instead. Sets the Authorization header. If custom_headers also includes Authorization, custom_headers takes precedence."
         custom_headers:
           type: object
           additionalProperties:

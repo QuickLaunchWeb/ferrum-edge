@@ -77,19 +77,10 @@ impl HttpLogging {
         let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
         // Build custom headers list from the `custom_headers` object.
-        // For backward compatibility, `authorization_header` is also accepted
-        // and mapped to an `Authorization` entry (custom_headers takes precedence).
         let mut custom_headers: Vec<(String, String)> = Vec::new();
-        if let Some(legacy_auth) = config["authorization_header"].as_str() {
-            custom_headers.push(("Authorization".to_string(), legacy_auth.to_string()));
-        }
         if let Some(map) = config["custom_headers"].as_object() {
             for (key, value) in map {
                 if let Some(v) = value.as_str() {
-                    // custom_headers entries override any legacy authorization_header
-                    if key.eq_ignore_ascii_case("authorization") {
-                        custom_headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
-                    }
                     custom_headers.push((key.clone(), v.to_string()));
                 }
             }
