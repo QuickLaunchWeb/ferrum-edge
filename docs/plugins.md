@@ -1069,11 +1069,13 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present in the token |
 | `providers[].scope_claim` | String (optional) | Per-provider override for scope claim path |
 | `providers[].role_claim` | String (optional) | Per-provider override for role claim path |
+| `providers[].consumer_identity_claim` | String (optional) | Per-provider override for consumer identity claim |
+| `providers[].consumer_header_claim` | String (optional) | Per-provider override for consumer header claim |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
-| `consumer_identity_claim` | String | JWT claim for consumer lookup (default: `"sub"`) |
-| `consumer_header_claim` | String | JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
-| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `300`) |
+| `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
+| `consumer_header_claim` | String | Global JWT claim for `X-Consumer-Username` header (default: same as `consumer_identity_claim`) |
+| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 

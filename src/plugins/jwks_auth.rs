@@ -15,8 +15,8 @@ use super::utils::jwks_cache::get_or_create_jwks_store;
 use super::utils::jwks_store::JwksKeyStore;
 use super::{Plugin, PluginResult, RequestContext};
 
-/// Default JWKS refresh interval: 5 minutes.
-const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 300;
+/// Default JWKS refresh interval: 15 minutes.
+const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 
 /// JWKS authentication plugin.
 ///
@@ -49,14 +49,16 @@ const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 300;
 ///       "required_scopes": ["read:data"],
 ///       "required_roles": ["admin"],
 ///       "scope_claim": "scp",
-///       "role_claim": "realm_access.roles"
+///       "role_claim": "realm_access.roles",
+///       "consumer_identity_claim": "preferred_username",
+///       "consumer_header_claim": "email"
 ///     }
 ///   ],
 ///   "scope_claim": "scope",
 ///   "role_claim": "roles",
 ///   "consumer_identity_claim": "sub",
 ///   "consumer_header_claim": "email",
-///   "jwks_refresh_interval_secs": 300
+///   "jwks_refresh_interval_secs": 900
 /// }
 /// ```
 pub struct JwksAuth {
@@ -86,6 +88,10 @@ struct JwksProvider {
     scope_claim: Option<String>,
     /// Per-provider override for the role claim path.
     role_claim: Option<String>,
+    /// Per-provider override for the consumer identity claim.
+    consumer_identity_claim: Option<String>,
+    /// Per-provider override for the consumer header claim.
+    consumer_header_claim: Option<String>,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
 }
@@ -140,6 +146,12 @@ impl JwksAuth {
 
             let scope_claim = prov_cfg["scope_claim"].as_str().map(|s| s.to_string());
             let role_claim = prov_cfg["role_claim"].as_str().map(|s| s.to_string());
+            let prov_consumer_identity_claim = prov_cfg["consumer_identity_claim"]
+                .as_str()
+                .map(|s| s.to_string());
+            let prov_consumer_header_claim = prov_cfg["consumer_header_claim"]
+                .as_str()
+                .map(|s| s.to_string());
 
             let jwks_store_slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>> =
                 Arc::new(ArcSwap::from_pointee(None));
@@ -182,6 +194,8 @@ impl JwksAuth {
                 required_roles,
                 scope_claim,
                 role_claim,
+                consumer_identity_claim: prov_consumer_identity_claim,
+                consumer_header_claim: prov_consumer_header_claim,
                 jwks_store: jwks_store_slot,
             });
         }
@@ -357,12 +371,21 @@ impl Plugin for JwksAuth {
             };
         }
 
-        // 3. Extract consumer identity claim
-        let identity = extract_claim_string(&claims, &self.consumer_identity_claim);
-        let header_value = if self.consumer_header_claim == self.consumer_identity_claim {
+        // 3. Extract consumer identity claim (per-provider override → global default)
+        let effective_identity_claim = provider
+            .consumer_identity_claim
+            .as_deref()
+            .unwrap_or(&self.consumer_identity_claim);
+        let effective_header_claim = provider
+            .consumer_header_claim
+            .as_deref()
+            .unwrap_or(&self.consumer_header_claim);
+
+        let identity = extract_claim_string(&claims, effective_identity_claim);
+        let header_value = if effective_header_claim == effective_identity_claim {
             identity.clone()
         } else {
-            extract_claim_string(&claims, &self.consumer_header_claim).or_else(|| identity.clone())
+            extract_claim_string(&claims, effective_header_claim).or_else(|| identity.clone())
         };
 
         // 4. Set authenticated identity on context (always, even without Consumer)
@@ -379,20 +402,20 @@ impl Plugin for JwksAuth {
                 if ctx.identified_consumer.is_none() {
                     debug!(
                         "jwks_auth: identified consumer '{}' via claim '{}'='{}'",
-                        consumer.username, self.consumer_identity_claim, id
+                        consumer.username, effective_identity_claim, id
                     );
                     ctx.identified_consumer = Some((*consumer).clone());
                 }
             } else {
                 debug!(
                     "jwks_auth: no consumer found for '{}'='{}' — using external identity",
-                    self.consumer_identity_claim, id
+                    effective_identity_claim, id
                 );
             }
         } else {
             warn!(
                 "jwks_auth: token valid but claim '{}' not present",
-                self.consumer_identity_claim
+                effective_identity_claim
             );
         }
 
