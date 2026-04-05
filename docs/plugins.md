@@ -25,6 +25,7 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 
 - **Global** plugins apply to all proxies
 - **Proxy-scoped** plugins apply only to a specific proxy and override globals of the same plugin type
+- A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order
 
 ## Multi-Authentication Mode
 
