@@ -723,6 +723,7 @@ paths:
                 - response_size_limiting
                 - body_validator
                 - request_termination
+                - response_mock
                 - response_caching
                 - prometheus_metrics
                 - otel_tracing
@@ -3535,6 +3536,47 @@ components:
         message:
           type: string
           description: Error message
+
+    ResponseMockConfig:
+      type: object
+      description: "Plugin: response_mock — Returns mock responses for API testing before backends are ready. Rule paths are relative to the proxy's listen_path."
+      required:
+        - rules
+      properties:
+        rules:
+          type: array
+          description: Mock rules evaluated in order (first match wins)
+          minItems: 1
+          items:
+            type: object
+            required:
+              - path
+            properties:
+              method:
+                type: string
+                description: HTTP method to match (omit to match all methods)
+              path:
+                type: string
+                description: "Path relative to the proxy's listen_path (e.g., /users for a proxy with listen_path /api/v1). Regex supported with ~ prefix (auto-anchored). For root or regex listen_paths, uses full request path."
+              status_code:
+                type: integer
+                format: uint16
+                description: HTTP status code to return (default 200)
+              headers:
+                type: object
+                additionalProperties:
+                  type: string
+                description: Response headers (default content-type application/json)
+              body:
+                type: string
+                description: Response body string
+              delay_ms:
+                type: integer
+                format: uint64
+                description: Simulated latency in milliseconds (default 0)
+        passthrough_on_no_match:
+          type: boolean
+          description: "If true, unmatched requests continue to the backend. If false (default), returns 404."
 
     ResponseCachingConfig:
       type: object

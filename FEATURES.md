@@ -55,7 +55,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 47 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 48 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
@@ -107,6 +107,10 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 ### Serverless Function Plugin
 
 - **Serverless Function** — invoke AWS Lambda, Azure Functions, or Google Cloud Functions as middleware. Pre-proxy mode enriches requests with function-computed headers; terminate mode returns function responses directly. Supports SigV4 signing for AWS, function key auth for Azure, and bearer token auth for GCP. Cloud credentials fall back to standard environment variables (`AWS_ACCESS_KEY_ID`, `AZURE_FUNCTIONS_KEY`, etc.) when not set in plugin config.
+
+### Response Mock Plugin
+
+- **Response Mock** — returns configurable mock responses without proxying to the backend. Mock rule paths are relative to the proxy's `listen_path`, so rules are scoped to the proxy they're configured on. Supports matching by HTTP method and path pattern (exact or regex with `~` prefix), configurable status codes, headers, body, and optional latency simulation via `delay_ms`. When `passthrough_on_no_match` is true, unmatched requests continue to the real backend. Useful for early API testing, contract testing, and local development
 
 ### SSE Plugin
 

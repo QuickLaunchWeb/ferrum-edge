@@ -224,6 +224,7 @@ async fn test_all_plugins_available() {
         "udp_rate_limiting",
         "udp_logging",
         "serverless_function",
+        "response_mock",
         "request_mirror",
         "kafka_logging",
     ]
@@ -261,6 +262,7 @@ async fn test_plugin_creation_all_plugins() {
                 json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
             }
             "request_mirror" => json!({"mirror_host": "mirror.local"}),
+            "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),
             "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
             "kafka_logging" => {
                 json!({"broker_list": "localhost:9092", "topic": "test-logs"})
