@@ -18,8 +18,6 @@ Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1
 ```bash
 cargo build                              # Debug build
 cargo build --release                    # Release build (O3, thin LTO, strip)
-cargo build --features mongodb           # Build with MongoDB support
-cargo build --features mongodb --release # Release build with MongoDB
 ```
 
 **Prerequisite**: `protoc` (protobuf compiler) must be installed. `build.rs` runs `tonic_build` to compile `proto/ferrum.proto`.
@@ -28,24 +26,22 @@ cargo build --features mongodb --release # Release build with MongoDB
 
 ```bash
 # Unit tests (fast, no I/O)
-cargo test --test unit_tests --all-features
-
+cargo test --test unit_tests
 # Integration tests (component interaction — mTLS, connection pool, gRPC, HTTP/3, admin API)
-cargo test --test integration_tests --all-features
-
+cargo test --test integration_tests
 # Functional / end-to-end tests (start real gateway binary, test all modes)
 # Requires: cargo build --bin ferrum-edge (builds the binary first)
-cargo test --test functional_tests --all-features -- --ignored
+cargo test --test functional_tests -- --ignored
 
 # All tests together
-cargo test --all-features
-cargo test --all-features -- --ignored   # includes E2E tests
+cargo test
+cargo test -- --ignored   # includes E2E tests
 ```
 
 ### Lint
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings   # Zero warnings policy
+cargo clippy --all-targets -- -D warnings   # Zero warnings policy
 cargo fmt --all -- --check                                  # Formatting check
 cargo fmt                                                   # Auto-format
 ```
@@ -137,7 +133,7 @@ src/
 │   ├── env_config.rs          # Environment variable parsing (90+ vars)
 │   ├── db_backend.rs          # DatabaseBackend trait (shared interface for sqlx + MongoDB)
 │   ├── db_loader.rs           # SQL config loader + polling (sqlx: PostgreSQL, MySQL, SQLite)
-│   ├── mongo_store.rs         # MongoDB config store (behind `mongodb` feature flag)
+│   ├── mongo_store.rs         # MongoDB config store
 │   ├── file_loader.rs         # YAML/JSON file loader
 │   ├── pool_config.rs         # Connection pool configuration
 │   ├── config_migration.rs    # Config version migrations
@@ -371,7 +367,6 @@ tests/
 - Integration tests: test component interactions with real network I/O
 - Functional tests: marked `#[ignore]` — start real gateway binary, test full request flow
 - **Functional test subprocess rule**: When spawning the gateway binary in functional tests, use `Stdio::null()` for stdout/stderr unless the test explicitly reads the output (e.g., `functional_logging_test.rs`). Using `Stdio::piped()` without reading causes a pipe buffer deadlock — the OS buffer fills up from debug logs and the gateway blocks on writes, hanging the test.
-- All test crates use `--all-features`
 
 ## Development Guidelines
 
@@ -379,10 +374,10 @@ tests/
 
 1. `cargo fmt --all` — format all code
 2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI enforces this)
-3. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
-4. `cargo test --test unit_tests --all-features` — all unit tests pass
-5. `cargo test --test integration_tests --all-features` — integration tests pass
-6. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+3. `cargo clippy --all-targets -- -D warnings` — zero warnings
+4. `cargo test --test unit_tests` — all unit tests pass
+5. `cargo test --test integration_tests` — integration tests pass
+6. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored` — E2E tests pass
 
 **All steps (1-5) must pass locally before pushing. Do not skip step 2 — `cargo fmt` can miss files that `cargo fmt --all -- --check` catches.**
 
@@ -598,9 +593,9 @@ Custom plugins that need their own database tables can declare migrations via a 
 
 ### Database Considerations
 
-- **Supported databases**: PostgreSQL, MySQL, SQLite (via sqlx), MongoDB (via `mongodb` crate, behind `mongodb` feature flag)
+- **Supported databases**: PostgreSQL, MySQL, SQLite (via sqlx), MongoDB (via `mongodb` crate)
 - **Database backend abstraction**: The `DatabaseBackend` trait in `src/config/db_backend.rs` abstracts all database operations. `DatabaseStore` (sqlx) and `MongoStore` (mongodb) both implement this trait. The admin API and operating modes use `Arc<dyn DatabaseBackend>` for polymorphic dispatch.
-- **MongoDB support**: Enabled via `--features mongodb` or `mongodb` feature flag. Uses BSON document storage with domain types serialized directly via serde. No junction tables — plugin associations are embedded in proxy documents. Indexes replace SQL migrations (idempotent `createIndex`). Incremental polling uses `updated_at` timestamp queries (same strategy as SQL). MongoDB-specific env vars: `FERRUM_MONGO_DATABASE`, `FERRUM_MONGO_APP_NAME`, `FERRUM_MONGO_REPLICA_SET`, `FERRUM_MONGO_AUTH_MECHANISM`, `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS`, `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS`.
+- **MongoDB support**: Uses BSON document storage with domain types serialized directly via serde. No junction tables — plugin associations are embedded in proxy documents. Indexes replace SQL migrations (idempotent `createIndex`). Incremental polling uses `updated_at` timestamp queries (same strategy as SQL). MongoDB-specific env vars: `FERRUM_MONGO_DATABASE`, `FERRUM_MONGO_APP_NAME`, `FERRUM_MONGO_REPLICA_SET`, `FERRUM_MONGO_AUTH_MECHANISM`, `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS`, `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS`.
 - **Migrations**: Core gateway migrations in `src/config/migrations/` (SQL). For MongoDB, `run_migrations()` creates indexes instead. Custom plugin migrations declared via `plugin_migrations()` in plugin files and tracked in `_ferrum_plugin_migrations`. Both run via `FERRUM_MODE=migrate`.
 - **Schema relationships (SQL)**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type and an `acl_groups` JSON array for group-based access control.
 - **Schema relationships (MongoDB)**: Same domain model, different storage. Proxy documents embed plugin associations directly (no junction collection). Upstream references use `upstream_id` field with an index. Credentials and acl_groups are nested BSON objects/arrays. The `_id` field maps to the resource's `id`.
@@ -624,9 +619,9 @@ Custom plugins that need their own database tables can declare migrations via a 
 ### PR Checklist
 
 - [ ] `cargo fmt` — no formatting diffs
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
-- [ ] `cargo test --test unit_tests --all-features` — unit tests pass
-- [ ] `cargo test --test integration_tests --all-features` — integration tests pass
+- [ ] `cargo clippy --all-targets -- -D warnings` — zero warnings
+- [ ] `cargo test --test unit_tests` — unit tests pass
+- [ ] `cargo test --test integration_tests` — integration tests pass
 - [ ] New features have unit tests covering normal, edge, and error cases
 - [ ] No `.unwrap()` or `.expect()` in production code paths
 - [ ] No dead code (clippy enforces `-D dead-code`)
@@ -669,7 +664,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | JWT issuer claim (iss) for admin API tokens |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Maximum TTL in seconds for admin API JWT tokens |
 | `FERRUM_FILE_CONFIG_PATH` | (required for file mode) | Path to YAML/JSON config file |
-| `FERRUM_DB_TYPE` | (required for db mode) | `postgres`, `mysql`, `sqlite`, `mongodb` (requires `mongodb` feature) |
+| `FERRUM_DB_TYPE` | (required for db mode) | `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | (required for db mode) | Database connection URL |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | (none) | Path to externally provided JSON config backup for startup failover when DB is unreachable |
 | `FERRUM_DB_FAILOVER_URLS` | (empty) | Comma-separated failover database URLs (tried in order when primary is unreachable) |

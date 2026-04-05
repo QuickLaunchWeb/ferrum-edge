@@ -47,7 +47,6 @@ pub async fn run(
 
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
-        #[cfg(feature = "mongodb")]
         "mongodb" => {
             let mut store = crate::config::mongo_store::MongoStore::connect_with_failover(
                 &effective_url,
@@ -70,13 +69,6 @@ pub async fn run(
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.run_migrations().await?;
             Box::new(store)
-        }
-        #[cfg(not(feature = "mongodb"))]
-        "mongodb" => {
-            return Err(anyhow::anyhow!(
-                "FERRUM_DB_TYPE=mongodb requires the 'mongodb' feature. \
-                 Rebuild with: cargo build --features mongodb"
-            ));
         }
         _ => {
             // SQL backends (postgres, mysql, sqlite)

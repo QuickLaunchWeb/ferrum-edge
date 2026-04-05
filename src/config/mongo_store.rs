@@ -23,7 +23,6 @@
 //! running SQL migrations. Indexes are idempotent (`createIndex` is a no-op if
 //! the index already exists).
 
-#[cfg(feature = "mongodb")]
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
     use crate::config::db_backend::{DatabaseBackend, IncrementalResult, PaginatedResult};
@@ -1312,6 +1311,4 @@ mod inner {
     }
 }
 
-// Re-export the MongoStore type when the feature is enabled.
-#[cfg(feature = "mongodb")]
 pub use inner::MongoStore;

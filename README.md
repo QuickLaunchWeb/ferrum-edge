@@ -32,7 +32,7 @@ See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
 
 - **Rust** toolchain (stable 1.85+)
 - **protoc** (Protocol Buffers compiler) for gRPC code generation
-- **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes). MongoDB requires `--features mongodb` at build time.
+- **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
 ## Installation
 
@@ -101,15 +101,12 @@ cargo run --release
 ### Database Mode (MongoDB)
 
 ```bash
-# Build with MongoDB support first:
-cargo build --release --features mongodb
-
 FERRUM_MODE=database \
 FERRUM_DB_TYPE=mongodb \
 FERRUM_DB_URL="mongodb://user:pass@localhost:27017/ferrum?authSource=admin" \
 FERRUM_MONGO_DATABASE=ferrum \
 FERRUM_ADMIN_JWT_SECRET="my-super-secret-jwt-key" \
-./target/release/ferrum-edge
+cargo run --release
 ```
 
 ### Control Plane + Data Plane

@@ -44,7 +44,6 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     info!("Connecting to database (type={})...", db_type);
 
     // MongoDB: index creation via MongoStore::run_migrations()
-    #[cfg(feature = "mongodb")]
     if db_type == "mongodb" {
         if dry_run {
             println!("MongoDB dry run: indexes would be created/verified on collections");
@@ -73,13 +72,6 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
         store.run_migrations().await?;
         println!("MongoDB indexes ensured successfully.");
         return Ok(());
-    }
-    #[cfg(not(feature = "mongodb"))]
-    if db_type == "mongodb" {
-        return Err(anyhow::anyhow!(
-            "FERRUM_DB_TYPE=mongodb requires the 'mongodb' feature. \
-             Rebuild with: cargo build --features mongodb"
-        ));
     }
 
     // SQL databases: run schema migrations

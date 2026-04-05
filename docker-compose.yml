@@ -118,8 +118,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        CARGO_BUILD_FEATURES: mongodb
     container_name: ferrum-mongodb
     depends_on:
       mongodb:
