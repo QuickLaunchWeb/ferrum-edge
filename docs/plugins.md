@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 47 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 48 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1439,6 +1439,41 @@ config:
   forward_body: true
   timeout_ms: 10000
 ```
+
+---
+
+## Response Mock Plugin
+
+### `response_mock`
+
+Returns configurable mock responses without proxying to the backend. Supports matching by HTTP method and path pattern (exact or regex), with configurable status codes, headers, body, and optional latency simulation. Useful for early API testing before backends are ready, contract testing, and local development.
+
+**Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family
+
+**Path matching is relative to the proxy's `listen_path`.** The plugin strips the proxy's prefix listen_path before matching rules. For example, if the proxy has `listen_path: /api/v1` and a request arrives at `/api/v1/users`, the mock rule path should be `/users`. For proxies with regex listen_paths (`~` prefix) or root listen_path (`/`), the full request path is used.
+
+```yaml
+# Proxy with listen_path: /api/v1
+config:
+  rules:
+    - method: GET                        # optional — omit to match all methods
+      path: /users                       # matches /api/v1/users
+      status_code: 200
+      headers:
+        content-type: application/json
+      body: '{"users": []}'
+      delay_ms: 50                       # optional simulated latency (ms)
+    - path: "~/users/[0-9]+"             # regex path (~ prefix, auto-anchored)
+      status_code: 200                   # matches /api/v1/users/42
+      body: '{"id": 1, "name": "Mock User"}'
+    - method: POST
+      path: /users                       # matches POST /api/v1/users
+      status_code: 201
+      body: '{"id": 2, "name": "Created"}'
+  passthrough_on_no_match: true          # false (default) returns 404 for unmatched requests
+```
+
+Rules are evaluated in order — first match wins. Regex paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. A request to exactly the listen_path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
 
 ---
 

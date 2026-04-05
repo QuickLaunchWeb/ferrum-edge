@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (47 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, and 1 Kafka logging plugin), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (48 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, and 1 Kafka logging plugin), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -154,7 +154,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (47 plugins, including 4 AI/LLM, 1 serverless, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, and 1 Kafka logging plugin)
+├── plugins/                   # Plugin system (48 plugins, including 4 AI/LLM, 1 serverless, 1 response mock, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, and 1 Kafka logging plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure
@@ -287,7 +287,7 @@ The lifecycle phases are:
 1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), SSE validation (250), gRPC-Web translation (260), gRPC method router (275)
 2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
 3. `authorize` — Access control / ACL (2000), TCP connection throttle (2050). Supports consumer username and ACL group allow/deny lists, plus `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
-4. `before_proxy` — SSE request shaping (250), Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), serverless function (3025), gRPC deadline (3050), compression (4050)
+4. `before_proxy` — SSE request shaping (250), Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), serverless function (3025), response mock (3030), gRPC deadline (3050), compression (4050)
 5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites. Body validator validates gRPC protobuf requests against descriptors (unary RPCs only, with gzip decompression for compressed frames) and re-checks JSON/XML after request_transformer rewrites
 6. `after_proxy` — SSE response headers (250), Response size limiting (3490), response caching (3500), response transformer (4000), compression (4050), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
 7. `on_final_response_body` — Post-transform response body hooks. Response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
@@ -306,6 +306,8 @@ The lifecycle phases are:
 **External identity support**: `ctx.authenticated_identity` (set by JWKS/OIDC) is treated as a first-class principal across rate-limit keys, cache keys, log summaries, and backend identity-header injection on all protocol paths (HTTP, HTTP/3, gRPC, WebSocket).
 
 **HTTP logging custom headers**: The `http_logging` plugin supports a `custom_headers` config field (JSON object of header name → value pairs) that are sent with every batch POST request. This enables integration with services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). See `docs/plugins.md` for the full service integration quick reference table covering Splunk, Datadog, New Relic, Sumo Logic, Elastic, Loki, Azure Monitor, AWS CloudWatch, Google Cloud Logging, Logtail, Axiom, and Mezmo.
+
+**Response mock path scoping**: The `response_mock` plugin matches rule paths **relative to the proxy's `listen_path`**, not the full incoming request path. The plugin strips the proxy's prefix listen_path from `ctx.path` before matching rules. For example, proxy with `listen_path: /api/v1` + request to `/api/v1/users` → mock rule path should be `/users`. A request to exactly the listen_path matches as `/`. For root listen_path (`/`) or regex listen_paths (`~` prefix), no stripping occurs and rules match the full path. This ensures mock rules are scoped to the proxy they are configured on.
 
 Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`, `priority::COMPRESSION = 4050`). Per-instance `priority_override` (on `PluginConfig`) can override these built-in constants via the `PriorityOverridePlugin` wrapper in `plugin_cache.rs`.
 
