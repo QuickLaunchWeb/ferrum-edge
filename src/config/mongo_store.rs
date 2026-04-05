@@ -381,8 +381,6 @@ mod inner {
         let mut doc = mongodb::bson::to_document(proxy)?;
         // Use the proxy's id as the MongoDB _id
         doc.insert("_id", proxy.id.as_str());
-        // Store updated_at as a BSON DateTime for indexed queries
-        doc.insert("updated_at", mongodb::bson::DateTime::now());
         Ok(doc)
     }
 
@@ -396,7 +394,6 @@ mod inner {
     fn consumer_to_doc(consumer: &Consumer) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(consumer)?;
         doc.insert("_id", consumer.id.as_str());
-        doc.insert("updated_at", mongodb::bson::DateTime::now());
         Ok(doc)
     }
 
@@ -408,7 +405,6 @@ mod inner {
     fn plugin_config_to_doc(pc: &PluginConfig) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(pc)?;
         doc.insert("_id", pc.id.as_str());
-        doc.insert("updated_at", mongodb::bson::DateTime::now());
         Ok(doc)
     }
 
@@ -420,7 +416,6 @@ mod inner {
     fn upstream_to_doc(upstream: &Upstream) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(upstream)?;
         doc.insert("_id", upstream.id.as_str());
-        doc.insert("updated_at", mongodb::bson::DateTime::now());
         Ok(doc)
     }
 
@@ -536,9 +531,12 @@ mod inner {
             let start = std::time::Instant::now();
             let poll_timestamp = Utc::now();
 
-            // Safety margin: 1 second before `since` to avoid missing boundary writes
-            let since_bson = mongodb::bson::DateTime::from_millis(since.timestamp_millis() - 1000);
-            let filter = doc! { "updated_at": { "$gt": since_bson } };
+            // Safety margin: 1 second before `since` to avoid missing boundary writes.
+            // The `updated_at` field is stored as an RFC 3339 string (chrono serde),
+            // which is lexicographically sortable, so $gt on strings works correctly.
+            let since_with_margin = since - chrono::Duration::seconds(1);
+            let since_str = since_with_margin.to_rfc3339();
+            let filter = doc! { "updated_at": { "$gt": &since_str } };
 
             // Load changed resources
             let mut added_or_modified_proxies = Vec::new();

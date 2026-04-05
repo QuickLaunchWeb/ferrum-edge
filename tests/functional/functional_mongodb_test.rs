@@ -327,8 +327,15 @@ async fn run_crud_and_proxy_tests(
         .send()
         .await
         .expect("Get proxy failed");
-    assert!(resp.status().is_success());
-    let proxy: serde_json::Value = resp.json().await.expect("Parse proxy");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "Get proxy failed with {}: {}",
+        status,
+        body
+    );
+    let proxy: serde_json::Value = serde_json::from_str(&body).expect("Parse proxy");
     assert_eq!(proxy["id"], proxy_id);
     println!("  OK: Proxy retrieved from MongoDB");
 
