@@ -466,14 +466,51 @@ async fn test_render_cache_returns_same_output() {
 #[tokio::test]
 async fn test_render_cache_invalidated_on_new_record() {
     let registry = MetricsRegistry::new();
+    // Set min age to 0 so invalidation is immediate (test needs instant invalidation)
+    registry.configure(5, 3600, 0);
     registry.record(&make_summary("inv-test-1", "GET", 200, 10.0, 5.0));
 
     let first = registry.render();
     assert!(first.contains("inv-test-1"));
 
-    // Record new data — cache should be invalidated
+    // Record new data — cache should be invalidated (min age = 0)
     registry.record(&make_summary("inv-test-2", "POST", 201, 20.0, 15.0));
 
     let second = registry.render();
     assert!(second.contains("inv-test-2"));
+}
+
+#[tokio::test]
+async fn test_render_cache_not_invalidated_when_young() {
+    let registry = MetricsRegistry::new();
+    // Set min age high so cache is never invalidated by record()
+    registry.configure(5, 3600, 60_000);
+    registry.record(&make_summary("young-1", "GET", 200, 10.0, 5.0));
+
+    let first = registry.render();
+    assert!(first.contains("young-1"));
+
+    // Record new data — cache is too young, should NOT be invalidated
+    registry.record(&make_summary("young-2", "POST", 201, 20.0, 15.0));
+
+    let second = registry.render();
+    // second should still be cached (young-2 not yet visible)
+    assert!(!second.contains("young-2"));
+    // But render_uncached should see it
+    assert!(registry.render_uncached().contains("young-2"));
+}
+
+#[tokio::test]
+async fn test_plugin_config_sets_registry_tunables() {
+    let config = serde_json::json!({
+        "render_cache_ttl_seconds": 10,
+        "stale_entry_ttl_seconds": 7200,
+        "cache_invalidation_min_age_ms": 1000
+    });
+    let _plugin = PrometheusMetrics::new(&config).unwrap();
+
+    let _registry = global_registry();
+    // Can't read atomics directly from outside, but we can verify the plugin
+    // didn't error on valid config
+    assert_eq!(_plugin.name(), "prometheus_metrics");
 }

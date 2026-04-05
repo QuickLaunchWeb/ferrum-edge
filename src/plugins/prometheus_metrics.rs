@@ -147,7 +147,11 @@ impl HistogramBuckets {
 const DEFAULT_STALE_TTL_NANOS: u64 = 3_600_000_000_000;
 
 /// Default render cache TTL: 5 seconds.
-const RENDER_CACHE_TTL_SECS: u64 = 5;
+const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
+
+/// Default minimum cache age (in nanoseconds) before record() will invalidate.
+/// At high RPS this prevents an Arc allocation on every single request.
+const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
 
 /// Metrics registry holding all Prometheus-compatible counters and histograms.
 pub struct MetricsRegistry {
@@ -169,6 +173,13 @@ pub struct MetricsRegistry {
     pub stream_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
+    /// Configurable render cache TTL in seconds
+    render_cache_ttl_secs: AtomicU64,
+    /// Configurable stale entry TTL in nanoseconds
+    stale_entry_ttl_nanos: AtomicU64,
+    /// Minimum cache age (nanos) before record() bothers to invalidate.
+    /// Prevents an Arc allocation on every request under high load.
+    cache_invalidation_min_age_nanos: AtomicU64,
 }
 
 impl Default for MetricsRegistry {
@@ -189,7 +200,29 @@ impl MetricsRegistry {
             stream_connection_counter: DashMap::new(),
             stream_duration_buckets: DashMap::new(),
             render_cache: ArcSwap::from_pointee(None),
+            render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
+            stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
+            cache_invalidation_min_age_nanos: AtomicU64::new(
+                DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
+            ),
         }
+    }
+
+    /// Update tunable parameters. Called by plugin constructor so the first
+    /// plugin instance's config wins (global singleton, subsequent calls
+    /// overwrite — but all instances on the same gateway share one config).
+    pub fn configure(
+        &self,
+        render_cache_ttl_secs: u64,
+        stale_entry_ttl_secs: u64,
+        cache_invalidation_min_age_ms: u64,
+    ) {
+        self.render_cache_ttl_secs
+            .store(render_cache_ttl_secs, Ordering::Relaxed);
+        self.stale_entry_ttl_nanos
+            .store(stale_entry_ttl_secs * 1_000_000_000, Ordering::Relaxed);
+        self.cache_invalidation_min_age_nanos
+            .store(cache_invalidation_min_age_ms * 1_000_000, Ordering::Relaxed);
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
@@ -209,8 +242,7 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.duration_ms, self.epoch);
 
-        // Invalidate render cache on new data
-        self.render_cache.store(Arc::new(None));
+        self.maybe_invalidate_cache();
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
@@ -247,7 +279,24 @@ impl MetricsRegistry {
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
 
-        // Invalidate render cache on new data
+        self.maybe_invalidate_cache();
+    }
+
+    /// Invalidate the render cache only if it's older than the configured
+    /// minimum age. Under extreme load this avoids an Arc allocation on
+    /// every single request — the TTL in render() is the real freshness
+    /// guarantee, this just ensures it gets rebuilt promptly at low RPS.
+    fn maybe_invalidate_cache(&self) {
+        let min_age_nanos = self
+            .cache_invalidation_min_age_nanos
+            .load(Ordering::Relaxed);
+        let cached = self.render_cache.load();
+        if let Some((generated_at, _)) = **cached {
+            let age_nanos = generated_at.elapsed().as_nanos() as u64;
+            if age_nanos < min_age_nanos {
+                return; // Cache is young enough, skip invalidation
+            }
+        }
         self.render_cache.store(Arc::new(None));
     }
 
@@ -313,19 +362,21 @@ impl MetricsRegistry {
     }
 
     /// Render metrics in Prometheus exposition format.
-    /// Returns a cached result if the cache is still fresh (within RENDER_CACHE_TTL_SECS).
+    /// Returns a cached result if the cache is still fresh (within render_cache_ttl_secs).
     /// Also runs lazy stale-entry eviction on each cache miss to bound memory growth.
     pub fn render(&self) -> String {
         // Check cache
+        let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let cached = self.render_cache.load();
         if let Some((generated_at, ref output)) = **cached
-            && generated_at.elapsed().as_secs() < RENDER_CACHE_TTL_SECS
+            && generated_at.elapsed().as_secs() < ttl_secs
         {
             return output.clone();
         }
 
-        // Lazy eviction: piggyback on cache-miss (at most once per RENDER_CACHE_TTL_SECS)
-        self.evict_stale(DEFAULT_STALE_TTL_NANOS);
+        // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
+        let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+        self.evict_stale(stale_ttl);
 
         let output = self.render_uncached();
 
@@ -485,10 +536,31 @@ pub struct PrometheusMetrics {
 }
 
 impl PrometheusMetrics {
-    pub fn new(_config: &Value) -> Result<Self, String> {
-        Ok(Self {
-            registry: global_registry(),
-        })
+    pub fn new(config: &Value) -> Result<Self, String> {
+        let registry = global_registry();
+
+        let render_cache_ttl_secs = config
+            .get("render_cache_ttl_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_RENDER_CACHE_TTL_SECS);
+
+        let stale_entry_ttl_secs = config
+            .get("stale_entry_ttl_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_STALE_TTL_NANOS / 1_000_000_000);
+
+        let cache_invalidation_min_age_ms = config
+            .get("cache_invalidation_min_age_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000);
+
+        registry.configure(
+            render_cache_ttl_secs,
+            stale_entry_ttl_secs,
+            cache_invalidation_min_age_ms,
+        );
+
+        Ok(Self { registry })
     }
 }
 
