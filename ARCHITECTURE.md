@@ -72,7 +72,7 @@ src/
 │   ├── database.rs            # Database mode
 │   ├── file.rs                # File mode
 │   └── migrate.rs             # Database migration mode
-├── plugins/                   # Plugin system (40 built-in plugins)
+├── plugins/                   # Plugin system (42 built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
 │   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
@@ -90,6 +90,7 @@ src/
 │   ├── jwks_store.rs          # JWKS key store with background refresh
 │   ├── jwt_auth.rs            # HS256 JWT authentication
 │   ├── key_auth.rs            # API key authentication
+│   ├── loki_logging.rs        # Loki push API logging with batched label-based streams
 │   ├── mtls_auth.rs           # Mutual TLS client certificate authentication
 │   ├── otel_tracing.rs        # OpenTelemetry distributed tracing
 │   ├── prometheus_metrics.rs  # Prometheus metrics export
@@ -141,7 +142,7 @@ tests/
 │
 ├── unit_tests.rs                       # Entry point: unit test crate
 ├── unit/                               # Unit tests by component
-│   ├── plugins/                        # All 40 plugin tests
+│   ├── plugins/                        # All 42 plugin tests
 │   ├── config/                         # Configuration parsing tests
 │   ├── admin/                          # Admin API tests
 │   ├── gateway_core/                   # Core data structure tests
@@ -339,14 +340,14 @@ High-performance HTTP client connection pooling with backend mTLS support:
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**22 Plugins Registered**:
+**23 Plugins Registered**:
 - **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`
 - **Rate Limiting**: `rate_limiting`
 - **Transformation**: `request_transformer`, `response_transformer`, `request_termination`, `body_validator`, `graphql`
 - **Caching**: `response_caching`
-- **Observability**: `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
+- **Observability**: `stdout_logging`, `http_logging`, `loki_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
 
 **Plugin Lifecycle**:
 1. **Request Phase**: Authentication → Authorization → Rate Limiting

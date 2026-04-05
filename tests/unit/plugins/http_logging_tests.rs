@@ -14,7 +14,9 @@ async fn test_http_logging_plugin_creation() {
     let plugin = HttpLogging::new(
         &json!({
             "endpoint_url": "http://localhost:9200/logs",
-            "authorization_header": "Bearer log-token"
+            "custom_headers": {
+                "Authorization": "Bearer log-token"
+            }
         }),
         default_client(),
     )
@@ -103,11 +105,15 @@ async fn test_http_logging_rejects_non_http_scheme() {
 }
 
 #[tokio::test]
-async fn test_http_logging_with_authorization_header() {
+async fn test_http_logging_with_custom_headers() {
+    // custom_headers supports arbitrary key-value pairs for services like Datadog, New Relic
     let plugin = HttpLogging::new(
         &json!({
             "endpoint_url": "http://127.0.0.1:1/unreachable",
-            "authorization_header": "Bearer my-secret-token",
+            "custom_headers": {
+                "DD-API-KEY": "my-datadog-key",
+                "X-Custom-Tag": "ferrum-edge"
+            },
             "batch_size": 1,
             "flush_interval_ms": 100,
             "max_retries": 0
@@ -117,11 +123,93 @@ async fn test_http_logging_with_authorization_header() {
     .unwrap();
     assert_eq!(plugin.name(), "http_logging");
 
-    // Should not panic even with auth header set and unreachable endpoint
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn test_http_logging_custom_headers_skips_non_string_values() {
+    // Non-string values in custom_headers are skipped with a warning log
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "DD-API-KEY": "valid-key",
+                "bad_number": 123,
+                "bad_bool": true
+            },
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "http_logging");
+}
+
+#[tokio::test]
+async fn test_http_logging_rejects_invalid_header_name() {
+    // Header names with spaces or non-ASCII characters are rejected at config load time
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "Invalid Header": "value"
+            }
+        }),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("invalid custom_headers name"),
+            "Expected header name validation error, got: {e}"
+        ),
+        Ok(_) => panic!("Expected invalid header name to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_logging_rejects_invalid_header_value() {
+    // Header values with non-visible ASCII are rejected at config load time
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "X-Token": "bad\x01value"
+            }
+        }),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("invalid custom_headers value"),
+            "Expected header value validation error, got: {e}"
+        ),
+        Ok(_) => panic!("Expected invalid header value to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_logging_custom_headers_deduplicates_case_insensitive() {
+    // Duplicate header names with different casing should be deduplicated (last wins)
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "X-Custom": "first",
+                "x-custom": "second"
+            },
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "http_logging");
 }
 
 #[tokio::test]
