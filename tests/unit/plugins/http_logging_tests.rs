@@ -130,8 +130,8 @@ async fn test_http_logging_with_custom_headers() {
 }
 
 #[tokio::test]
-async fn test_http_logging_custom_headers_ignores_non_string_values() {
-    // Non-string values in custom_headers should be silently skipped
+async fn test_http_logging_custom_headers_skips_non_string_values() {
+    // Non-string values in custom_headers are skipped with a warning log
     let plugin = HttpLogging::new(
         &json!({
             "endpoint_url": "http://127.0.0.1:1/unreachable",
@@ -139,6 +139,68 @@ async fn test_http_logging_custom_headers_ignores_non_string_values() {
                 "DD-API-KEY": "valid-key",
                 "bad_number": 123,
                 "bad_bool": true
+            },
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "http_logging");
+}
+
+#[tokio::test]
+async fn test_http_logging_rejects_invalid_header_name() {
+    // Header names with spaces or non-ASCII characters are rejected at config load time
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "Invalid Header": "value"
+            }
+        }),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("invalid custom_headers name"),
+            "Expected header name validation error, got: {e}"
+        ),
+        Ok(_) => panic!("Expected invalid header name to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_logging_rejects_invalid_header_value() {
+    // Header values with non-visible ASCII are rejected at config load time
+    let result = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "X-Token": "bad\x01value"
+            }
+        }),
+        default_client(),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("invalid custom_headers value"),
+            "Expected header value validation error, got: {e}"
+        ),
+        Ok(_) => panic!("Expected invalid header value to be rejected"),
+    }
+}
+
+#[tokio::test]
+async fn test_http_logging_custom_headers_deduplicates_case_insensitive() {
+    // Duplicate header names with different casing should be deduplicated (last wins)
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "custom_headers": {
+                "X-Custom": "first",
+                "x-custom": "second"
             },
             "batch_size": 1,
             "flush_interval_ms": 100,

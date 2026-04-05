@@ -11,6 +11,7 @@
 //! connection pooling and DNS cache integration.
 
 use async_trait::async_trait;
+use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -30,7 +31,7 @@ enum LogEntry {
 
 struct BatchConfig {
     endpoint_url: String,
-    custom_headers: Vec<(String, String)>,
+    custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
     batch_size: usize,
     flush_interval: Duration,
@@ -77,12 +78,24 @@ impl HttpLogging {
         let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
         // Build custom headers list from the `custom_headers` object.
-        let mut custom_headers: Vec<(String, String)> = Vec::new();
+        // Header names are validated and normalized to lowercase per RFC 7230.
+        // Duplicate header names (case-insensitive) are deduplicated — last value wins.
+        let mut custom_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         if let Some(map) = config["custom_headers"].as_object() {
             for (key, value) in map {
-                if let Some(v) = value.as_str() {
-                    custom_headers.push((key.clone(), v.to_string()));
-                }
+                let Some(v) = value.as_str() else {
+                    warn!("http_logging: custom_headers['{key}'] has non-string value, skipping");
+                    continue;
+                };
+                let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+                    format!("http_logging: invalid custom_headers name '{key}': {e}")
+                })?;
+                let header_value = HeaderValue::from_str(v).map_err(|e| {
+                    format!("http_logging: invalid custom_headers value for '{key}': {e}")
+                })?;
+                // Deduplicate case-insensitively — last value wins.
+                custom_headers.retain(|(k, _)| *k != header_name);
+                custom_headers.push((header_name, header_value));
             }
         }
 
@@ -204,7 +217,7 @@ async fn send_batch(cfg: &BatchConfig, batch: Vec<LogEntry>) {
     for attempt in 1..=total_attempts {
         let mut req = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
         for (name, value) in &cfg.custom_headers {
-            req = req.header(name.as_str(), value.as_str());
+            req = req.header(name.clone(), value.clone());
         }
         match cfg.http_client.execute(req, "http_logging").await {
             Ok(response) if response.status().is_success() => return,
