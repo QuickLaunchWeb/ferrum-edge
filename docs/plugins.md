@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 41 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 42 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -126,9 +126,72 @@ sourcetype="ferrum_edge_logs" response_status_code>=500
 
 > **TLS verification:** If your Splunk instance uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the HEC endpoint's certificate.
 
+### `statsd_logging`
+
+Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStatsD, Telegraf, etc.) over UDP. Extracts counters, timers, and gauges from each transaction summary and ships them in batched, newline-delimited StatsD line protocol.
+
+**Priority:** 9075
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `host` | String | *(required)* | StatsD server hostname or IP address |
+| `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
+| `prefix` | String | `"ferrum"` | Metric name prefix (e.g., `ferrum.request.count`) |
+| `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric |
+| `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing |
+
+Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Large payloads are automatically split across multiple UDP packets at 1472-byte MTU boundaries.
+
+**Metrics emitted per HTTP/gRPC/WebSocket request:**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `{prefix}.request.count` | Counter | Request count |
+| `{prefix}.request.latency_total_ms` | Timer | Total request latency |
+| `{prefix}.request.latency_backend_ttfb_ms` | Timer | Backend time-to-first-byte |
+| `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
+| `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
+| `{prefix}.request.status.{N}xx` | Counter | Status code bucket (2xx, 4xx, 5xx, etc.) |
+
+Tags: `method`, `status`, `status_class`, `proxy` (plus any `global_tags`).
+
+**Metrics emitted per stream (TCP/UDP) disconnect:**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `{prefix}.stream.count` | Counter | Stream connection count |
+| `{prefix}.stream.duration_ms` | Timer | Connection duration |
+| `{prefix}.stream.bytes_sent` | Gauge | Bytes sent to client |
+| `{prefix}.stream.bytes_received` | Gauge | Bytes received from client |
+
+Tags: `protocol`, `proxy`, `error` (plus any `global_tags`).
+
+```yaml
+plugin_name: statsd_logging
+config:
+  host: "statsd.internal.example.com"
+  port: 8125
+  prefix: "ferrum"
+  global_tags:
+    env: "production"
+    region: "us-east-1"
+  flush_interval_ms: 500
+  max_batch_lines: 50
+```
+
+#### DogStatsD / Datadog Integration
+
+The `global_tags` config maps directly to DogStatsD tag format (`|#key:value,key:value`). Per-request tags (method, status, proxy) are always included. To route metrics to Datadog:
+
+1. Point `host` at your Datadog Agent or DogStatsD server
+2. Set `global_tags` with environment and service metadata
+3. Metrics appear in Datadog with full tag filtering
+
 ### Transaction Summary Reference
 
-Both `stdout_logging` and `http_logging` emit the same JSON structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
+Both `stdout_logging`, `http_logging`, and `statsd_logging` emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
 
 #### TransactionSummary Fields (HTTP / gRPC / WebSocket)
 

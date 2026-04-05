@@ -693,6 +693,7 @@ paths:
                   type: [string, "null"]
               example:
                 - stdout_logging
+                - statsd_logging
                 - http_logging
                 - transaction_debugger
                 - jwks_auth
@@ -2606,6 +2607,44 @@ components:
           type: integer
           default: 10000
           description: Channel capacity — new entries are dropped when full
+
+    StatsdLoggingConfig:
+      type: object
+      description: "Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible server over UDP."
+      required:
+        - host
+      properties:
+        host:
+          type: string
+          description: StatsD server hostname or IP address
+        port:
+          type: integer
+          default: 8125
+          minimum: 1
+          maximum: 65535
+          description: StatsD server UDP port
+        prefix:
+          type: string
+          default: "ferrum"
+          description: Metric name prefix (e.g., ferrum.request.count)
+        global_tags:
+          type: object
+          additionalProperties:
+            type: string
+          description: Key-value pairs appended as DogStatsD tags to every metric
+        flush_interval_ms:
+          type: integer
+          default: 500
+          minimum: 50
+          description: Max milliseconds before flushing buffered metrics
+        buffer_capacity:
+          type: integer
+          default: 10000
+          description: Channel capacity — new entries are dropped when full
+        max_batch_lines:
+          type: integer
+          default: 50
+          description: Max metric entries to batch before flushing
 
     TransactionDebuggerConfig:
       type: object

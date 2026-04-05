@@ -1,4 +1,4 @@
-//! Plugin system — 41 built-in plugins with a trait-based architecture.
+//! Plugin system — 42 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -48,6 +48,7 @@ pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod serverless_function;
 pub mod sse;
+pub mod statsd_logging;
 pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod transaction_debugger;
@@ -537,7 +538,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -574,6 +575,7 @@ pub mod priority {
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
+    pub const STATSD_LOGGING: u16 = 9075;
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
@@ -930,6 +932,7 @@ pub fn create_plugin_with_http_client(
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)))),
+        "statsd_logging" => Ok(Some(Arc::new(statsd_logging::StatsdLogging::new(config)?))),
         "http_logging" => Ok(Some(Arc::new(http_logging::HttpLogging::new(
             config,
             http_client,
