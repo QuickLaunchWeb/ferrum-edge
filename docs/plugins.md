@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 41 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 42 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -629,6 +629,29 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
   "timestamp_disconnected": "2026-03-31T14:22:00.500+00:00"
 }
 ```
+
+### `loki_logging`
+
+**Priority**: 9150
+**Phases**: `log`, `on_stream_disconnect`
+**Protocols**: All (HTTP, gRPC, WebSocket, TCP, UDP)
+
+Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint_url` | string | (required) | Loki push API URL |
+| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
+| `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
+| `include_listen_path_label` | bool | `true` | Add `proxy_id` as a label |
+| `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
+| `gzip` | bool | `true` | Gzip-compress request bodies |
+| `batch_size` | integer | `100` | Max entries per batch |
+| `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
+| `buffer_capacity` | integer | `10000` | Channel buffer capacity |
+| `max_retries` | integer | `3` | Retry attempts on failure |
+| `retry_delay_ms` | integer | `1000` | Delay between retries |
 
 ### `transaction_debugger`
 
