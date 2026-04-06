@@ -12,7 +12,7 @@
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,12 +37,61 @@ struct RouteEntry {
     proxy: Arc<Proxy>,
 }
 
+/// A collection of prefix routes with both sorted Vec (for fallback) and
+/// HashMap index (for O(path_depth) lookup instead of O(n_routes) linear scan).
+///
+/// The HashMap maps each listen_path to its proxy, enabling rapid longest-prefix
+/// matching by walking the request path backwards through segment boundaries.
+/// This is the key optimization for scaling to thousands of proxies — without it,
+/// every cache miss triggers a linear scan of ALL routes in the tier.
+struct IndexedPrefixRoutes {
+    /// Sorted by listen_path length descending (longest first).
+    /// Used as fallback and for the apply_delta retain scan.
+    sorted: Vec<RouteEntry>,
+    /// Maps listen_path → Arc<Proxy> for O(1) exact-match and O(depth) prefix lookups.
+    path_index: HashMap<String, Arc<Proxy>>,
+}
+
 /// A pre-compiled regex route entry.
 struct RegexRouteEntry {
     pattern: Regex,
     /// Named capture group names, pre-extracted for O(1) iteration.
     capture_names: Vec<String>,
     proxy: Arc<Proxy>,
+}
+
+/// A collection of regex routes with a `RegexSet` for O(1) multi-pattern matching.
+///
+/// Instead of testing each regex pattern sequentially (O(n_patterns) per cache miss),
+/// `RegexSet` compiles all patterns into a single DFA and evaluates them in one pass.
+/// When a match is found, only the winning pattern's `Regex` runs `captures()` to
+/// extract named groups. This turns the regex hot path from O(n) to O(1) matching
+/// + O(1) capture extraction.
+struct IndexedRegexRoutes {
+    /// Individual route entries (in config order) for capture extraction after RegexSet match.
+    entries: Vec<RegexRouteEntry>,
+    /// All patterns compiled into a single DFA for O(1) multi-pattern matching.
+    /// Index correspondence: `regex_set` pattern at index i matches `entries[i]`.
+    regex_set: RegexSet,
+}
+
+impl IndexedRegexRoutes {
+    /// Build from a list of regex route entries.
+    /// The RegexSet is compiled from the same anchored patterns used by individual entries.
+    fn new(entries: Vec<RegexRouteEntry>) -> Self {
+        let patterns: Vec<&str> = entries.iter().map(|e| e.pattern.as_str()).collect();
+        // RegexSet::new cannot fail here because all patterns were already individually
+        // compiled as Regex (invalid patterns were skipped with a warning during build_route_table).
+        let regex_set = RegexSet::new(&patterns).unwrap_or_else(|e| {
+            warn!(error = %e, "RegexSet compilation failed — falling back to empty set");
+            RegexSet::empty()
+        });
+        Self { entries, regex_set }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 /// Pre-computed host-based route index.
@@ -55,19 +104,19 @@ struct RegexRouteEntry {
 /// Within each tier, prefix routes are checked first (longest-prefix matching),
 /// then regex routes (first match in config order).
 struct HostRouteTable {
-    /// Exact host → sorted prefix route entries (longest listen_path first).
-    exact_hosts: HashMap<String, Vec<RouteEntry>>,
+    /// Exact host → indexed prefix route entries (longest listen_path first + HashMap index).
+    exact_hosts: HashMap<String, IndexedPrefixRoutes>,
     /// Wildcard suffix entries, e.g., ("*.example.com", routes).
     /// Sorted by pattern length descending so more-specific wildcards match first.
-    wildcard_hosts: Vec<(String, Vec<RouteEntry>)>,
-    /// Catch-all prefix routes (proxies with empty `hosts`).
-    catch_all: Vec<RouteEntry>,
-    /// Exact host → regex route entries (in config order).
-    exact_hosts_regex: HashMap<String, Vec<RegexRouteEntry>>,
-    /// Wildcard host → regex route entries.
-    wildcard_hosts_regex: Vec<(String, Vec<RegexRouteEntry>)>,
-    /// Catch-all regex routes.
-    catch_all_regex: Vec<RegexRouteEntry>,
+    wildcard_hosts: Vec<(String, IndexedPrefixRoutes)>,
+    /// Catch-all prefix routes (proxies with empty `hosts`) with HashMap index.
+    catch_all: IndexedPrefixRoutes,
+    /// Exact host → indexed regex route entries (RegexSet + individual patterns).
+    exact_hosts_regex: HashMap<String, IndexedRegexRoutes>,
+    /// Wildcard host → indexed regex route entries.
+    wildcard_hosts_regex: Vec<(String, IndexedRegexRoutes)>,
+    /// Catch-all regex routes with RegexSet index.
+    catch_all_regex: IndexedRegexRoutes,
     /// Pre-computed flag: true if any regex routes exist (skip regex path entirely when false).
     has_regex_routes: bool,
 }
@@ -227,13 +276,13 @@ impl RouterCache {
         if let Some(host) = host {
             // 1. Exact host match — prefix then regex
             if let Some(routes) = table.exact_hosts.get(host)
-                && let Some(route_match) = find_prefix_match(routes, path)
+                && let Some(route_match) = find_prefix_match_indexed(routes, path)
             {
                 return Some(route_match);
             }
             if table.has_regex_routes
                 && let Some(routes) = table.exact_hosts_regex.get(host)
-                && let Some(route_match) = find_regex_match(routes, path)
+                && let Some(route_match) = find_regex_match_indexed(routes, path)
             {
                 return Some(route_match);
             }
@@ -241,7 +290,7 @@ impl RouterCache {
             // 2. Wildcard host match — prefix then regex
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
-                    && let Some(route_match) = find_prefix_match(routes, path)
+                    && let Some(route_match) = find_prefix_match_indexed(routes, path)
                 {
                     return Some(route_match);
                 }
@@ -249,7 +298,7 @@ impl RouterCache {
             if table.has_regex_routes {
                 for (pattern, routes) in &table.wildcard_hosts_regex {
                     if wildcard_matches(pattern, host)
-                        && let Some(route_match) = find_regex_match(routes, path)
+                        && let Some(route_match) = find_regex_match_indexed(routes, path)
                     {
                         return Some(route_match);
                     }
@@ -258,11 +307,11 @@ impl RouterCache {
         }
 
         // 3. Catch-all — prefix then regex
-        if let Some(route_match) = find_prefix_match(&table.catch_all, path) {
+        if let Some(route_match) = find_prefix_match_indexed(&table.catch_all, path) {
             return Some(route_match);
         }
         if table.has_regex_routes
-            && let Some(route_match) = find_regex_match(&table.catch_all_regex, path)
+            && let Some(route_match) = find_regex_match_indexed(&table.catch_all_regex, path)
         {
             return Some(route_match);
         }
@@ -297,20 +346,28 @@ impl RouterCache {
     #[allow(dead_code)]
     pub fn route_count(&self) -> usize {
         let table = self.route_table.load();
-        let exact_count: usize = table.exact_hosts.values().map(|v| v.len()).sum();
-        let wildcard_count: usize = table.wildcard_hosts.iter().map(|(_, v)| v.len()).sum();
-        let exact_regex: usize = table.exact_hosts_regex.values().map(|v| v.len()).sum();
+        let exact_count: usize = table.exact_hosts.values().map(|v| v.sorted.len()).sum();
+        let wildcard_count: usize = table
+            .wildcard_hosts
+            .iter()
+            .map(|(_, v)| v.sorted.len())
+            .sum();
+        let exact_regex: usize = table
+            .exact_hosts_regex
+            .values()
+            .map(|v| v.entries.len())
+            .sum();
         let wildcard_regex: usize = table
             .wildcard_hosts_regex
             .iter()
-            .map(|(_, v)| v.len())
+            .map(|(_, v)| v.entries.len())
             .sum();
         exact_count
             + wildcard_count
-            + table.catch_all.len()
+            + table.catch_all.sorted.len()
             + exact_regex
             + wildcard_regex
-            + table.catch_all_regex.len()
+            + table.catch_all_regex.entries.len()
     }
 
     /// Evict ~25% of prefix cache entries using counter-based pseudo-random sampling.
@@ -397,7 +454,8 @@ impl RouterCache {
     /// Build a pre-computed host route table from config.
     ///
     /// Partitions proxies into prefix/regex and by host tier.
-    /// Prefix routes are sorted by listen_path length descending within each tier.
+    /// Prefix routes are sorted by listen_path length descending within each tier
+    /// and indexed in a HashMap for O(path_depth) lookup instead of O(n) linear scan.
     /// Regex patterns are pre-compiled at build time.
     fn build_route_table(config: &GatewayConfig) -> HostRouteTable {
         let mut exact_hosts: HashMap<String, Vec<RouteEntry>> = HashMap::new();
@@ -492,39 +550,171 @@ impl RouterCache {
         }
 
         // Sort prefix route lists by listen_path length descending (longest first)
+        // and build HashMap indexes for O(path_depth) lookups
         for routes in exact_hosts.values_mut() {
             routes.sort_by(|a, b| b.listen_path.len().cmp(&a.listen_path.len()));
         }
+        let exact_hosts_indexed: HashMap<String, IndexedPrefixRoutes> = exact_hosts
+            .into_iter()
+            .map(|(host, routes)| (host, IndexedPrefixRoutes::from_sorted(routes)))
+            .collect();
+
         let mut wildcard_vec: Vec<(String, Vec<RouteEntry>)> = wildcard_hosts.into_iter().collect();
         for (_, routes) in &mut wildcard_vec {
             routes.sort_by(|a, b| b.listen_path.len().cmp(&a.listen_path.len()));
         }
         // Sort wildcard patterns by length descending (more-specific wildcards first)
         wildcard_vec.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let wildcard_indexed: Vec<(String, IndexedPrefixRoutes)> = wildcard_vec
+            .into_iter()
+            .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_sorted(routes)))
+            .collect();
+
         catch_all.sort_by(|a, b| b.listen_path.len().cmp(&a.listen_path.len()));
+        let catch_all_indexed = IndexedPrefixRoutes::from_sorted(catch_all);
+
+        // Build RegexSet indexes for O(1) multi-pattern matching
+        let exact_hosts_regex_indexed: HashMap<String, IndexedRegexRoutes> = exact_hosts_regex
+            .into_iter()
+            .map(|(host, entries)| (host, IndexedRegexRoutes::new(entries)))
+            .collect();
 
         // Sort wildcard regex hosts by pattern length descending (same ordering as prefix)
         let mut wildcard_regex_vec: Vec<(String, Vec<RegexRouteEntry>)> =
             wildcard_hosts_regex.into_iter().collect();
         wildcard_regex_vec.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let wildcard_regex_indexed: Vec<(String, IndexedRegexRoutes)> = wildcard_regex_vec
+            .into_iter()
+            .map(|(pattern, entries)| (pattern, IndexedRegexRoutes::new(entries)))
+            .collect();
 
-        let has_regex_routes = !exact_hosts_regex.is_empty()
-            || !wildcard_regex_vec.is_empty()
-            || !catch_all_regex.is_empty();
+        let catch_all_regex_indexed = IndexedRegexRoutes::new(catch_all_regex);
+
+        let has_regex_routes = !exact_hosts_regex_indexed.is_empty()
+            || !wildcard_regex_indexed.is_empty()
+            || !catch_all_regex_indexed.is_empty();
 
         HostRouteTable {
-            exact_hosts,
-            wildcard_hosts: wildcard_vec,
-            catch_all,
-            exact_hosts_regex,
-            wildcard_hosts_regex: wildcard_regex_vec,
-            catch_all_regex,
+            exact_hosts: exact_hosts_indexed,
+            wildcard_hosts: wildcard_indexed,
+            catch_all: catch_all_indexed,
+            exact_hosts_regex: exact_hosts_regex_indexed,
+            wildcard_hosts_regex: wildcard_regex_indexed,
+            catch_all_regex: catch_all_regex_indexed,
             has_regex_routes,
         }
     }
 }
 
-/// Find the first prefix-matching route in a pre-sorted route list.
+impl IndexedPrefixRoutes {
+    /// Build from a pre-sorted Vec<RouteEntry> (must already be sorted by length descending).
+    fn from_sorted(sorted: Vec<RouteEntry>) -> Self {
+        let path_index: HashMap<String, Arc<Proxy>> = sorted
+            .iter()
+            .map(|entry| (entry.listen_path.clone(), Arc::clone(&entry.proxy)))
+            .collect();
+        Self { sorted, path_index }
+    }
+}
+
+/// Find the longest-prefix-matching route using the HashMap index.
+///
+/// Instead of scanning all N routes linearly (O(n)), this walks the request path
+/// backwards through "/" segment boundaries, doing O(1) HashMap lookups at each step.
+/// Total cost: O(path_depth) which is typically 2-5, independent of proxy count.
+///
+/// This is the key optimization that prevents throughput degradation as proxy count
+/// scales from tens to tens of thousands.
+fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option<RouteMatch> {
+    if routes.path_index.is_empty() {
+        return None;
+    }
+
+    // Strip query string — listen_paths never contain query parameters
+    let match_path = match path.find('?') {
+        Some(pos) => &path[..pos],
+        None => path,
+    };
+
+    // 1. Exact match (most common case for the scale test pattern)
+    if let Some(proxy) = routes.path_index.get(match_path) {
+        return Some(RouteMatch {
+            proxy: Arc::clone(proxy),
+            path_params: Vec::new(),
+            matched_prefix_len: match_path.len(),
+        });
+    }
+
+    // 2. Walk backwards through "/" boundaries for longest-prefix match.
+    //    At each "/" position, try both "with slash" (for listen_paths ending in "/")
+    //    and "without slash" (for listen_paths like "/api" matching "/api/users").
+    let bytes = match_path.as_bytes();
+    let mut search_end = match_path.len();
+    loop {
+        match match_path[..search_end].rfind('/') {
+            Some(0) => {
+                // Try "/" as a listen_path
+                if let Some(proxy) = routes.path_index.get("/") {
+                    return Some(RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: Vec::new(),
+                        matched_prefix_len: 1,
+                    });
+                }
+                break;
+            }
+            Some(slash_pos) => {
+                // Try with trailing slash: "/api/" matching "/api/users"
+                // (listen_paths ending in "/" pass the boundary check because
+                // the slash IS the boundary)
+                let with_slash = &match_path[..=slash_pos];
+                if let Some(proxy) = routes.path_index.get(with_slash) {
+                    return Some(RouteMatch {
+                        proxy: Arc::clone(proxy),
+                        path_params: Vec::new(),
+                        matched_prefix_len: with_slash.len(),
+                    });
+                }
+
+                // Try without trailing slash: "/api" matching "/api/users"
+                // The char at listen_path.len() must be '/' or '?' (boundary check)
+                let without_slash = &match_path[..slash_pos];
+                if let Some(proxy) = routes.path_index.get(without_slash) {
+                    // Verify boundary: char after the prefix must be '/'
+                    // (we know it is because we found the slash at slash_pos)
+                    if bytes[slash_pos] == b'/' {
+                        return Some(RouteMatch {
+                            proxy: Arc::clone(proxy),
+                            path_params: Vec::new(),
+                            matched_prefix_len: without_slash.len(),
+                        });
+                    }
+                }
+
+                search_end = slash_pos;
+            }
+            None => break,
+        }
+    }
+
+    // 3. Check if original path (with query string) has a "?" boundary match.
+    //    E.g., listen_path "/api" matching "/api?foo=bar"
+    if match_path.len() < path.len() {
+        // There was a query string; match_path is the path before "?"
+        if let Some(proxy) = routes.path_index.get(match_path) {
+            return Some(RouteMatch {
+                proxy: Arc::clone(proxy),
+                path_params: Vec::new(),
+                matched_prefix_len: match_path.len(),
+            });
+        }
+    }
+
+    None
+}
+
+/// Find the first prefix-matching route in a pre-sorted route list (linear scan fallback).
+#[allow(dead_code)]
 fn find_prefix_match(routes: &[RouteEntry], path: &str) -> Option<RouteMatch> {
     routes
         .iter()
@@ -546,7 +736,47 @@ fn find_prefix_match(routes: &[RouteEntry], path: &str) -> Option<RouteMatch> {
         })
 }
 
-/// Find the first regex-matching route in a list of regex route entries.
+/// Find the first regex-matching route using the RegexSet index.
+///
+/// Instead of testing each regex pattern sequentially (O(n_patterns) per cache miss),
+/// `RegexSet::matches()` evaluates all patterns in a single DFA pass (O(path_length),
+/// independent of pattern count). When multiple patterns match, the lowest index wins
+/// (preserving config-order / first-match-wins semantics). Only the winning pattern's
+/// individual `Regex` runs `captures()` to extract named groups.
+fn find_regex_match_indexed(routes: &IndexedRegexRoutes, path: &str) -> Option<RouteMatch> {
+    if routes.is_empty() {
+        return None;
+    }
+
+    // O(1) amortized: single DFA pass tests all patterns simultaneously
+    let matches = routes.regex_set.matches(path);
+    // First matching index preserves config-order semantics (first-match-wins)
+    let winner_idx = matches.iter().next()?;
+
+    let entry = &routes.entries[winner_idx];
+    // Only run captures() on the single winning pattern
+    let captures = entry.pattern.captures(path)?;
+    let matched_len = captures.get(0).map(|m| m.end()).unwrap_or(0);
+
+    let path_params: Vec<(String, String)> = entry
+        .capture_names
+        .iter()
+        .filter_map(|name| {
+            captures
+                .name(name)
+                .map(|m| (name.clone(), m.as_str().to_string()))
+        })
+        .collect();
+
+    Some(RouteMatch {
+        proxy: Arc::clone(&entry.proxy),
+        path_params,
+        matched_prefix_len: matched_len,
+    })
+}
+
+/// Find the first regex-matching route in a list of regex route entries (linear scan fallback).
+#[allow(dead_code)]
 fn find_regex_match(routes: &[RegexRouteEntry], path: &str) -> Option<RouteMatch> {
     for entry in routes {
         if let Some(captures) = entry.pattern.captures(path) {

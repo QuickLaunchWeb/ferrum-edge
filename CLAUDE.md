@@ -207,8 +207,14 @@ src/
 
 Routes are matched in priority order within each host tier (exact host → wildcard host → catch-all):
 
-1. **Prefix routes first** — longest-prefix match (pre-sorted by `listen_path.len()` descending)
-2. **Regex routes second** — first match in config order wins
+1. **Prefix routes first** — longest-prefix match via HashMap index (O(path_depth), typically 2-5 lookups)
+2. **Regex routes second** — first match via RegexSet (O(path_length) single DFA pass, independent of pattern count)
+
+**Prefix route matching uses `IndexedPrefixRoutes`** — a HashMap that maps each `listen_path` to its proxy, built at config-load time. On a cache miss, the router walks the request path backwards through `/` segment boundaries doing O(1) HashMap lookups at each step. This is **O(path_depth)** regardless of how many proxies are configured, replacing the previous O(n) linear scan that degraded throughput by 30-46% as proxy count grew from 50 to 500+. **Do not replace this with a linear scan or any algorithm whose per-request cost scales with total proxy count.** The HashMap index is applied to all three host tiers (exact, wildcard, catch-all). The `IndexedPrefixRoutes` struct in `src/router_cache.rs` bundles the sorted `Vec<RouteEntry>` (for `apply_delta` retain scans) with the `HashMap<String, Arc<Proxy>>` index.
+
+**Regex route matching uses `IndexedRegexRoutes`** — a `RegexSet` that compiles all patterns for a host tier into a single DFA, built at config-load time. On a cache miss, `RegexSet::matches()` evaluates all patterns in one pass (O(path_length), independent of how many regex patterns exist), then only the winning pattern's individual `Regex` runs `captures()` to extract named groups. When multiple patterns match, the lowest index wins (preserving first-match-wins / config-order semantics). **Do not replace this with sequential per-pattern matching — that is O(n_patterns) per cache miss and degrades at scale.** The `IndexedRegexRoutes` struct in `src/router_cache.rs` bundles `Vec<RegexRouteEntry>` with the `RegexSet`.
+
+**Router lookup cache** (`DashMap` in `RouterCache`) caches `(host, path) → proxy` results for O(1) repeated lookups. Cache size is controlled by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default: auto-scales as `max(10_000, proxies × 3)`). Both prefix and regex matches have separate cache partitions to prevent high-cardinality regex paths from evicting prefix entries. Negative lookups (no route matched) are also cached to prevent repeated scans from scanner traffic.
 
 **Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
 
@@ -528,6 +534,11 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **Response header `get_mut()` pattern** — `collect_response_headers()` and `collect_hyper_response_headers()` use `get_mut(k.as_str())` to check for existing headers before allocating the key `String`. For multi-valued headers (common with `set-cookie`), this avoids allocating a key that already exists in the map. The `set-cookie` vs comma separator is determined via zero-cost `HeaderName` comparison before any allocation.
 - **Pre-populated status code DashMap** — Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are inserted into `ProxyState.status_counts` at construction. The hot path uses `DashMap::get()` (shared read lock) for virtually all requests instead of `entry()` (write lock).
 
+**Route matching (critical for scale):**
+- **NEVER use O(n) linear scan for prefix route matching** where n = total proxy count. The router previously scanned ALL routes in a host tier on every cache miss, causing 30-46% throughput degradation at 50→500 proxies. The `IndexedPrefixRoutes` HashMap index in `router_cache.rs` replaced this with O(path_depth) lookups (typically 2-5, independent of proxy count). Any future changes to route matching MUST preserve this O(path_depth) guarantee — do not introduce loops over all routes on the request path.
+- **NEVER use sequential per-pattern regex matching** — the `IndexedRegexRoutes` `RegexSet` in `router_cache.rs` evaluates all regex patterns for a host tier in a single DFA pass (O(path_length), independent of pattern count). The previous approach tested each `Regex` sequentially which was O(n_patterns). Do not replace `find_regex_match_indexed()` with a loop over individual patterns.
+- **Router cache size must scale with proxy count** — a fixed-size cache with thousands of proxies causes eviction thrashing (constant cache misses → expensive lookups + DashMap `retain()` lock contention). The auto-scaling default (`proxies × 3`, min 10K) prevents this. `FERRUM_ROUTER_CACHE_MAX_ENTRIES` overrides for memory-constrained deployments.
+
 **Protocol-specific gotchas:**
 - **Don't replace reqwest with H3 pool for HTTP/3 frontend→backend**: Tested and reverted. QUIC has higher per-request overhead than TCP/H2 for small payloads (~10x regression). reqwest's HTTP/2 pooling is highly optimized and auto-negotiates the best protocol via ALPN.
 - **gRPC `Proxy.clone()` is expensive**: The full `Proxy` struct has many fields. Avoid cloning it per-request. Extract needed fields into lightweight param structs (see `TcpConnParams` pattern in `tcp_proxy.rs`).
@@ -743,6 +754,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |
+| `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router prefix/negative lookup cache size. 0 = auto-scale as `max(10_000, proxies × 3)`. Set explicit value to cap memory. Min: 1,000, Max: 10,000,000 |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
