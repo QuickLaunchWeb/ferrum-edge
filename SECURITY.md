@@ -20,7 +20,7 @@ We take security vulnerabilities seriously. If you discover a security issue in 
 
 **Please do not open public GitHub issues for security vulnerabilities.**
 
-Instead, send an email to: **security@ferrum-edge.io**
+Instead, send an email to: **contact@ferrumedge.com**
 
 Include the following information:
 - Description of the vulnerability
@@ -96,4 +96,4 @@ We thank the following security researchers who have responsibly disclosed vulne
 
 ---
 
-For questions about security practices or to report security concerns, contact: security@ferrum-edge.io
+For questions about security practices or to report security concerns, contact: contact@ferrumedge.com
