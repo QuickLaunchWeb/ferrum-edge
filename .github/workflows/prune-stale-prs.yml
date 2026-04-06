@@ -57,17 +57,20 @@ jobs:
           SKIPPED_COUNT=0
           
           for branch in $ALL_PR_BRANCHES; do
+            # Skip empty lines
+            [[ -z "$branch" ]] && continue
+            
             # Extra safety: skip if somehow a tag reference made it here
             if [[ "$branch" == refs/tags/* ]] || [[ "$branch" == v*.* ]] || [[ "$branch" == release-* ]]; then
               echo "⏭️ Skipping potential tag: $branch"
-              ((SKIPPED_COUNT++))
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
             # Skip protected branches
             if [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]] || [[ "$branch" == release/* ]] || [[ "$branch" == "develop" ]]; then
               echo "⏭️ Skipping protected branch: $branch"
-              ((SKIPPED_COUNT++))
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
             
@@ -79,7 +82,7 @@ jobs:
                 echo "🗑️ Deleting: $branch"
                 git push origin --delete "$branch" || echo "⚠️ Failed to delete $branch"
               fi
-              ((DELETED_COUNT++))
+              DELETED_COUNT=$((DELETED_COUNT + 1))
             else
               echo "✅ Already deleted: $branch"
             fi
@@ -117,13 +120,14 @@ jobs:
           echo "Cutoff date: $CUTOFF_DATE"
           
           # Get closed PRs older than threshold that weren't merged
-          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt --jq "
-            map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\")) | .[].headRefName
-          ")
+          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt --jq 'map(select(.mergedAt == null and .closedAt < '"$CUTOFF_DATE"')) | .[].headRefName')
           
           DELETED_COUNT=0
           
           for branch in $STALE_PRS; do
+            # Skip empty lines
+            [[ -z "$branch" ]] && continue
+            
             # Skip protected branches
             if [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]] || [[ "$branch" == release/* ]] || [[ "$branch" == "develop" ]]; then
               echo "⏭️ Skipping protected branch: $branch"
@@ -137,7 +141,7 @@ jobs:
                 echo "🗑️ Deleting stale PR branch: $branch"
                 git push origin --delete "$branch" || echo "⚠️ Failed to delete $branch"
               fi
-              ((DELETED_COUNT++))
+              DELETED_COUNT=$((DELETED_COUNT + 1))
             fi
           done
           
