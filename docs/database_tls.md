@@ -370,6 +370,29 @@ export FERRUM_DB_SSL_MODE=verify-full
 export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/DigiCertGlobalRootCA.crt.pem
 ```
 
+### MongoDB Atlas
+
+TLS is enabled by default when using `mongodb+srv://` URLs:
+
+```bash
+export FERRUM_DB_TYPE=mongodb
+export FERRUM_DB_URL="mongodb+srv://ferrum:password@cluster0.abc123.mongodb.net/ferrum?retryWrites=true&w=majority&readPreference=secondaryPreferred"
+export FERRUM_MONGO_DATABASE=ferrum
+# No FERRUM_DB_TLS_* needed — Atlas enables TLS by default via mongodb+srv://
+```
+
+### AWS DocumentDB
+
+```bash
+export FERRUM_DB_TYPE=mongodb
+export FERRUM_DB_URL="mongodb://ferrum:password@docdb-cluster.xxxx.us-east-1.docdb.amazonaws.com:27017/ferrum?retryWrites=false"
+export FERRUM_MONGO_DATABASE=ferrum
+export FERRUM_DB_TLS_ENABLED=true
+export FERRUM_DB_TLS_CA_CERT_PATH=/etc/ferrum/rds-combined-ca-bundle.pem
+```
+
+**Note:** DocumentDB requires `retryWrites=false` (retryable writes not supported).
+
 ## Functional Testing
 
 The project includes functional tests that verify TLS database connectivity end-to-end.
@@ -447,6 +470,8 @@ If the database URL already contains SSL parameters (e.g., `?sslmode=require`), 
 
 ## Failover and Read Replica URLs
 
+### SQL Databases (PostgreSQL, MySQL)
+
 When using `FERRUM_DB_FAILOVER_URLS` or `FERRUM_DB_READ_REPLICA_URL`, the same TLS
 settings (`FERRUM_DB_TLS_*` and `FERRUM_DB_SSL_*`) apply to all database connections.
 If your failover or replica databases require different TLS parameters, embed them
@@ -455,3 +480,17 @@ directly in the URL query string:
 ```
 FERRUM_DB_FAILOVER_URLS=postgres://standby1:5432/ferrum?sslmode=verify-full&sslrootcert=/certs/ca.pem,postgres://standby2:5432/ferrum?sslmode=require
 ```
+
+### MongoDB
+
+MongoDB handles failover and read routing differently from SQL backends:
+
+- **`FERRUM_DB_READ_REPLICA_URL` does not apply to MongoDB.** Use `readPreference` in the connection string instead (e.g., `?readPreference=secondaryPreferred`). The MongoDB driver routes reads to secondaries and writes to the primary automatically.
+
+- **`FERRUM_DB_FAILOVER_URLS` is typically unnecessary for MongoDB replica sets.** List all members directly in `FERRUM_DB_URL` and the driver handles failover natively:
+
+```
+FERRUM_DB_URL=mongodb://mongo1:27017,mongo2:27017,mongo3:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred&tls=true&tlsCAFile=/certs/ca.pem
+```
+
+See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including Atlas, DocumentDB, and Kubernetes examples.

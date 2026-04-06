@@ -40,13 +40,13 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
-| `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
+| `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite`, `mongodb` |
+| `FERRUM_DB_URL` | DB/CP modes | — | Database connection string. For MongoDB: `mongodb://` or `mongodb+srv://` |
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
 | `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
-| `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs |
-| `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling |
+| `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
+| `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling (SQL only). For MongoDB, use `readPreference` in the connection string |
 
 ### Database TLS
 
@@ -63,6 +63,21 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
 
 See [database_tls.md](database_tls.md) for detailed configuration examples and SSL mode descriptions.
+
+### MongoDB
+
+These settings only apply when `FERRUM_DB_TYPE=mongodb`. The `FERRUM_DB_SSL_*` and `FERRUM_DB_POOL_*` settings are SQL-only and ignored for MongoDB.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_MONGO_DATABASE` | No | `ferrum` | MongoDB database name |
+| `FERRUM_MONGO_APP_NAME` | No | — | App name for server-side connection tracking |
+| `FERRUM_MONGO_REPLICA_SET` | No | — | Replica set name. Required for transactions and change streams |
+| `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | `30` | Server selection timeout |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | `10` | TCP connection timeout |
+
+See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 
 ### File Mode
 
