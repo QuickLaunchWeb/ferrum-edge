@@ -996,9 +996,9 @@ async fn test_plugin_soap_ws_security_username_token() {
                 "username_token": {
                     "enabled": true,
                     "password_type": "PasswordText",
-                    "credentials": {
-                        "testuser": "testpass"
-                    }
+                    "credentials": [
+                        {"username": "testuser", "password": "testpass"}
+                    ]
                 },
                 "timestamp": {
                     "require": false
@@ -1076,9 +1076,9 @@ async fn test_plugin_soap_ws_security_missing_header() {
                 "username_token": {
                     "enabled": true,
                     "password_type": "PasswordText",
-                    "credentials": {
-                        "testuser": "testpass"
-                    }
+                    "credentials": [
+                        {"username": "testuser", "password": "testpass"}
+                    ]
                 },
                 "timestamp": {
                     "require": false
