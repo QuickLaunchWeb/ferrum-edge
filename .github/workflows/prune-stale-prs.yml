@@ -1,0 +1,167 @@
+name: Prune Stale PRs and Branches
+
+# SAFETY NOTES:
+# - This workflow ONLY deletes branches, never tags
+# - Protected branches (main, master, develop, release/*) are always skipped
+# - Tags like v1.0.0, release-2024, etc. are NEVER affected by this workflow
+# - Only remote branches associated with merged/closed PRs are removed
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'  # Run every Sunday at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (no actual deletion)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      days_stale:
+        description: 'Days after which a closed PR is considered stale'
+        required: false
+        default: '30'
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  prune-merged-branches:
+    name: Delete merged PR branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete merged PR branches
+        id: delete_merged
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          echo "Dry run mode: $DRY_RUN"
+          
+          # Get all merged PRs (both merged and closed)
+          MERGED_PRS=$(gh pr list --state merged --json headRefName,number --jq '.[].headRefName')
+          CLOSED_PRS=$(gh pr list --state closed --json headRefName,number --jq '.[].headRefName')
+          
+          # Combine and remove duplicates
+          ALL_PR_BRANCHES=$(echo -e "$MERGED_PRS\n$CLOSED_PRS" | sort -u)
+          
+          DELETED_COUNT=0
+          SKIPPED_COUNT=0
+          
+          for branch in $ALL_PR_BRANCHES; do
+            # Extra safety: skip if somehow a tag reference made it here
+            if [[ "$branch" == refs/tags/* ]] || [[ "$branch" == v*.* ]] || [[ "$branch" == release-* ]]; then
+              echo "⏭️ Skipping potential tag: $branch"
+              ((SKIPPED_COUNT++))
+              continue
+            fi
+            
+            # Skip protected branches
+            if [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]] || [[ "$branch" == release/* ]] || [[ "$branch" == "develop" ]]; then
+              echo "⏭️ Skipping protected branch: $branch"
+              ((SKIPPED_COUNT++))
+              continue
+            fi
+            
+            # Check if branch exists remotely
+            if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+              if [[ "$DRY_RUN" == "true" ]]; then
+                echo "🧪 [DRY RUN] Would delete: $branch"
+              else
+                echo "🗑️ Deleting: $branch"
+                git push origin --delete "$branch" || echo "⚠️ Failed to delete $branch"
+              fi
+              ((DELETED_COUNT++))
+            else
+              echo "✅ Already deleted: $branch"
+            fi
+          done
+          
+          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+          echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+          echo ""
+          echo "📊 Summary: $DELETED_COUNT branches processed, $SKIPPED_COUNT protected branches skipped"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  prune-stale-closed-prs:
+    name: Delete branches from stale closed PRs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete stale closed PR branches
+        id: delete_stale
+        run: |
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          DAYS_STALE="${{ github.event.inputs.days_stale || '30' }}"
+          
+          echo "Dry run mode: $DRY_RUN"
+          echo "Stale threshold: $DAYS_STALE days"
+          
+          # Calculate cutoff date
+          CUTOFF_DATE=$(date -d "$DAYS_STALE days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Cutoff date: $CUTOFF_DATE"
+          
+          # Get closed PRs older than threshold that weren't merged
+          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt --jq "
+            map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\")) | .[].headRefName
+          ")
+          
+          DELETED_COUNT=0
+          
+          for branch in $STALE_PRS; do
+            # Skip protected branches
+            if [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]] || [[ "$branch" == release/* ]] || [[ "$branch" == "develop" ]]; then
+              echo "⏭️ Skipping protected branch: $branch"
+              continue
+            fi
+            
+            if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+              if [[ "$DRY_RUN" == "true" ]]; then
+                echo "🧪 [DRY RUN] Would delete stale PR branch: $branch"
+              else
+                echo "🗑️ Deleting stale PR branch: $branch"
+                git push origin --delete "$branch" || echo "⚠️ Failed to delete $branch"
+              fi
+              ((DELETED_COUNT++))
+            fi
+          done
+          
+          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+          echo ""
+          echo "📊 Summary: $DELETED_COUNT stale closed PR branches processed"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cleanup-local-refs:
+    name: Prune remote-tracking branches
+    runs-on: ubuntu-latest
+    needs: [prune-merged-branches, prune-stale-closed-prs]
+    if: github.event.inputs.dry_run != 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prune remote-tracking branches
+        run: |
+          echo "🧹 Pruning remote-tracking branches..."
+          git remote prune origin
+          echo "✅ Remote-tracking branches pruned"
