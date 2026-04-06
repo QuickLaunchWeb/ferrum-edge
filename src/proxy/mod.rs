@@ -841,8 +841,16 @@ impl ProxyState {
             tls_policy_arc.clone(),
             crls.clone(),
         ));
-        // Build router cache with pre-sorted route table for fast prefix matching
-        let router_cache = Arc::new(RouterCache::new(&config, 10_000));
+        // Build router cache with pre-sorted route table and HashMap prefix index.
+        // Cache size: explicit env var if set (>0), otherwise auto-scales with proxy count.
+        let max_cache_entries = if env_config_arc.router_cache_max_entries > 0 {
+            env_config_arc
+                .router_cache_max_entries
+                .clamp(1_000, 10_000_000)
+        } else {
+            (config.proxies.len() * 3).clamp(10_000, 1_000_000)
+        };
+        let router_cache = Arc::new(RouterCache::new(&config, max_cache_entries));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).

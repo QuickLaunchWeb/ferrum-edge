@@ -420,6 +420,14 @@ pub struct EnvConfig {
     /// Applies to HTTP, gRPC, HTTP/2, and HTTP/3 connection pools.
     pub pool_cleanup_interval_seconds: u64,
 
+    // Router cache
+    /// Maximum entries in the router prefix/negative lookup cache (default: 0 = auto).
+    /// When set to 0 (auto), the cache size is computed as `max(10_000, proxies × 3)`,
+    /// scaling with proxy count to prevent eviction thrashing at high scale.
+    /// Set an explicit value to cap memory usage on memory-constrained deployments.
+    /// Minimum effective value: 1_000. Maximum: 10_000_000.
+    pub router_cache_max_entries: usize,
+
     // TCP proxy
     /// Default TCP idle timeout in seconds (default: 300 / 5 min).
     /// Per-proxy `tcp_idle_timeout_seconds` overrides this. Set to 0 to disable.
@@ -691,6 +699,7 @@ impl Default for EnvConfig {
             pool_warmup_enabled: true,
             pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
+            router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
@@ -996,6 +1005,13 @@ impl EnvConfig {
                 conf,
                 "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS",
                 30,
+            ),
+
+            // Router cache
+            router_cache_max_entries: resolve_usize(
+                conf,
+                "FERRUM_ROUTER_CACHE_MAX_ENTRIES",
+                0, // 0 = auto-scale: max(10_000, proxies × 3)
             ),
 
             // TCP proxy
