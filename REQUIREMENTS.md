@@ -30,7 +30,7 @@ Ferrum Edge MUST operate in one of three distinct modes, determined by the `FERR
 
 *   **3.1. Database Mode (`FERRUM_MODE=database`)**
     *   **Functionality:** In this mode, a single gateway instance reads its configuration (Proxies, Consumers, Plugins) directly from a specified database, handles end-user proxy traffic, and provides an Admin API for configuration management.
-    *   **Database Integration:** Connects to PostgreSQL, MySQL, or SQLite using connection parameters provided via environment variables (`FERRUM_DB_TYPE`, `FERRUM_DB_URL`).
+    *   **Database Integration:** Connects to PostgreSQL, MySQL, SQLite, or MongoDB using connection parameters provided via environment variables (`FERRUM_DB_TYPE`, `FERRUM_DB_URL`).
     *   **Listeners:** Activates and listens on *both* the Proxy Traffic network interfaces (HTTP/HTTPS) *and* the Admin API network interfaces (HTTP/HTTPS).
     *   **Configuration Loading:**
         *   Loads the entire active configuration from the database upon startup.
@@ -102,7 +102,7 @@ All operational parameters MUST be configurable via environment variables.
     *   `FERRUM_CP_GRPC_JWT_SECRET`: (HS256 secret string) - **Required** in CP mode.
     *   `FERRUM_DP_GRPC_AUTH_TOKEN`: (HS256 JWT string) - **Required** in DP mode.
 *   **Database (Database & CP Modes):**
-    *   `FERRUM_DB_TYPE`: (`postgres`, `mysql`, `sqlite`) - **Required**.
+    *   `FERRUM_DB_TYPE`: (`postgres`, `mysql`, `sqlite`, `mongodb`) - **Required**.
     *   `FERRUM_DB_URL`: (Connection string) - **Required**.
     *   `FERRUM_DB_POLL_INTERVAL`: (Integer seconds) - Default: `30`.
     *   `FERRUM_DB_POLL_CHECK_INTERVAL`: (Integer seconds) - Default: `5`.

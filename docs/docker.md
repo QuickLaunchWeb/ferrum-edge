@@ -147,7 +147,24 @@ docker-compose --profile postgres up ferrum-postgres
 - Tables auto-created on first startup
 - Automatic schema migrations
 
-### 3. CP/DP Distributed Mode (Horizontal Scaling)
+### 3. MongoDB Single-Node (NoSQL Alternative)
+
+```bash
+# Start services
+docker compose --profile mongodb up -d
+
+# Verify
+curl http://localhost:9002/health
+```
+
+Uses the `mongodb` and `ferrum-mongodb` services defined in `docker-compose.yml`. See [docs/mongodb.md](mongodb.md) for the full MongoDB deployment guide including replica sets, read preference, and managed service configuration.
+
+**Key differences from SQL**:
+- Indexes created automatically instead of SQL migrations
+- Read/write splitting via `readPreference` in connection string (not `FERRUM_DB_READ_REPLICA_URL`)
+- `FERRUM_DB_POOL_*` settings are ignored — MongoDB driver manages its own pool
+
+### 4. CP/DP Distributed Mode (Horizontal Scaling)
 
 Multi-node architecture with separate Control Plane and Data Planes:
 
@@ -231,8 +248,9 @@ FERRUM_ADMIN_HTTPS_PORT=9443
 FERRUM_ADMIN_JWT_SECRET=your-secret-key
 
 # Database (for database/cp modes)
-FERRUM_DB_TYPE=postgres           # postgres, mysql, sqlite
+FERRUM_DB_TYPE=postgres           # postgres, mysql, sqlite, mongodb
 FERRUM_DB_URL=postgres://user:pass@host/db
+# For MongoDB: FERRUM_DB_URL=mongodb://user:pass@host:27017/ferrum
 FERRUM_DB_POLL_INTERVAL=30
 
 # Control Plane (for cp mode)

@@ -376,9 +376,58 @@ println!("✓ Test description");
 - [ ] Add rate limiting verification
 - [ ] Add performance benchmarking
 
+## Testing with MongoDB
+
+The MongoDB functional test (`tests/functional/functional_mongodb_test.rs`) provides the same end-to-end coverage as the SQLite test but with a MongoDB backend.
+
+### Prerequisites
+
+```bash
+# Start MongoDB
+docker run -d --name mongo-test -p 27017:27017 mongo:7
+
+# Build the gateway
+cargo build
+```
+
+### Running Tests
+
+```bash
+# Run the plaintext MongoDB test
+cargo test --test functional_tests test_mongodb_plaintext_full_lifecycle -- --ignored --nocapture
+
+# Run TLS tests (requires TLS-enabled MongoDB — see tests/scripts/setup_mongo_tls.sh)
+cargo test --test functional_tests test_mongodb_tls_connection -- --ignored --nocapture
+cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --nocapture
+```
+
+### Test Coverage
+
+| Test | Connection | What It Verifies |
+|---|---|---|
+| `test_mongodb_plaintext_full_lifecycle` | Plaintext | Health (reports `"type":"mongodb"`), CRUD (proxy, consumer, plugin), live proxy routing, update, delete |
+| `test_mongodb_tls_connection` | TLS | Same CRUD lifecycle over TLS-encrypted connection |
+| `test_mongodb_mtls_connection` | mTLS | Same CRUD lifecycle with client certificate auth |
+
+### Environment Variable Overrides
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERRUM_TEST_MONGO_URL` | `mongodb://localhost:27017/ferrum_test` | Plaintext test URL |
+| `FERRUM_TEST_MONGO_TLS_URL` | `mongodb://localhost:27018/ferrum_test` | TLS test URL |
+| `FERRUM_TEST_MONGO_MTLS_URL` | `mongodb://localhost:27019/ferrum_test` | mTLS test URL |
+| `FERRUM_TEST_MONGO_CERT_DIR` | `/tmp/ferrum-mongo-tls-certs` | Directory with `ca.crt`, `client.crt`, `client.key` |
+
+### Cleanup
+
+```bash
+docker stop mongo-test && docker rm mongo-test
+```
+
 ## References
 
 - [Database Mode Documentation](../README.md#database-mode)
+- [MongoDB Deployment Guide](mongodb.md)
 - [Admin API Reference](../README.md#admin-api)
 - [JWT Authentication](../README.md#jwt-authentication)
 - [Proxy Configuration](../README.md#proxy-configuration)
