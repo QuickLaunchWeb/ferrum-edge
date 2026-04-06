@@ -121,6 +121,8 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: true
+    plugins:
+      - plugin_config_id: "sse-1"
 
 consumers: []
 
