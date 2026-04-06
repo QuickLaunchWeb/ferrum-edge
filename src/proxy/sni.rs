@@ -528,6 +528,128 @@ mod tests {
         assert_eq!(extract_sni_from_dtls_client_hello(&data), None);
     }
 
+    // --- Malformed ClientHello tests ---
+
+    #[test]
+    fn test_extract_sni_oversized_session_id() {
+        // session_id_len claims 255 bytes but data is much shorter
+        let mut data = build_tls_client_hello("example.com");
+        // Offset into the ClientHello body: record(5) + handshake_hdr(4) + version(2) + random(32) = 43
+        // session_id_len is at byte 43
+        data[43] = 0xFF; // claim 255-byte session ID
+        assert_eq!(extract_sni_from_client_hello(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_oversized_cipher_suites() {
+        let mut data = build_tls_client_hello("example.com");
+        // session_id_len=0 at byte 43, cipher_suites_len at bytes 44-45
+        // Set cipher_suites_len to a huge value
+        data[44] = 0xFF;
+        data[45] = 0xFF; // 65535 bytes
+        assert_eq!(extract_sni_from_client_hello(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_oversized_extensions_len() {
+        let mut data = build_tls_client_hello("example.com");
+        // Find the extensions_len field and corrupt it.
+        // With session_id=0, cipher_suites=2, compression=1:
+        // extensions_len is at offset 43 + 1 + 2 + 2 + 1 + 1 = 50 within the body,
+        // plus record(5) + handshake_hdr(4) = offset 59 in the full record.
+        // The parser caps extensions_end with min(), so this should not panic.
+        data[59] = 0xFF;
+        data[60] = 0xFF; // claim 65535 bytes of extensions
+        // Should still extract SNI from available data, or return None gracefully
+        let result = extract_sni_from_client_hello(&data);
+        // Either extracts the SNI (data is still there) or returns None — must not panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_extract_sni_zero_length_record() {
+        // Valid TLS record header but zero-length payload
+        let data = [0x16, 0x03, 0x01, 0x00, 0x00];
+        assert_eq!(extract_sni_from_client_hello(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_non_sni_extension_only() {
+        // Build a ClientHello with a non-SNI extension (e.g., extension type 0x0010 = ALPN)
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session_id length: 0
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2f]);
+        body.push(1);
+        body.push(0);
+        // One extension: ALPN (type 0x0010) with dummy data
+        let alpn_ext = [0x00, 0x10, 0x00, 0x03, 0x02, 0x68, 0x32]; // ALPN: h2
+        body.extend_from_slice(&(alpn_ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&alpn_ext);
+
+        let mut handshake = Vec::new();
+        handshake.push(0x01);
+        let body_len = body.len();
+        handshake.push((body_len >> 16) as u8);
+        handshake.push((body_len >> 8) as u8);
+        handshake.push(body_len as u8);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        let hs_len = handshake.len();
+        record.extend_from_slice(&(hs_len as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        assert_eq!(extract_sni_from_client_hello(&record), None);
+    }
+
+    #[test]
+    fn test_extract_sni_truncated_sni_extension_data() {
+        let mut data = build_tls_client_hello("example.com");
+        // Truncate after the SNI extension type+length but before the hostname
+        // The SNI ext starts near the end. Chop off the last 5 bytes.
+        data.truncate(data.len().saturating_sub(5));
+        // Update the record length to match
+        let new_len = (data.len() - 5) as u16;
+        data[3] = (new_len >> 8) as u8;
+        data[4] = new_len as u8;
+        // Should return None, not panic
+        assert_eq!(extract_sni_from_client_hello(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_random_garbage_bytes() {
+        // Pure random data that happens to start with 0x16 (handshake content type)
+        let garbage = [
+            0x16, 0x03, 0x01, 0x00, 0x20, // valid-looking record header, 32 bytes
+            0x01, 0xFF, 0xFF, 0xFF, // handshake type=ClientHello, absurd length
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(extract_sni_from_client_hello(&garbage), None);
+    }
+
+    #[test]
+    fn test_extract_sni_dtls_oversized_cookie() {
+        let mut data = build_dtls_client_hello("example.com");
+        // DTLS record(13) + handshake_hdr(12) + version(2) + random(32) + session_id_len(1=0)
+        // cookie_len is at offset 13 + 12 + 2 + 32 + 1 = 60
+        data[60] = 0xFF; // claim 255-byte cookie
+        assert_eq!(extract_sni_from_dtls_client_hello(&data), None);
+    }
+
+    #[test]
+    fn test_extract_sni_dtls_wrong_handshake_type() {
+        let mut data = build_dtls_client_hello("example.com");
+        // Handshake type is at offset 13 (after DTLS record header)
+        data[13] = 0x02; // ServerHello, not ClientHello
+        assert_eq!(extract_sni_from_dtls_client_hello(&data), None);
+    }
+
     // --- resolve_proxy_by_sni tests ---
 
     fn make_test_config(
