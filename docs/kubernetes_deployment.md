@@ -243,6 +243,45 @@ spec:
 
 If your cluster publishes services directly instead of using ingress, change `ferrum-edge-proxy` to `type: LoadBalancer`.
 
+### MongoDB Variant
+
+For MongoDB, replace the Secret and Deployment `env` section:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ferrum-edge-secrets
+type: Opaque
+stringData:
+  # For Atlas: mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum?readPreference=secondaryPreferred
+  db-url: mongodb://ferrum:change-me@mongodb.default.svc.cluster.local:27017/ferrum?replicaSet=rs0&readPreference=secondaryPreferred
+  admin-jwt-secret: change-me
+```
+
+Key `env` changes in the Deployment:
+
+```yaml
+env:
+  - name: FERRUM_DB_TYPE
+    value: mongodb
+  - name: FERRUM_DB_URL
+    valueFrom:
+      secretKeyRef:
+        name: ferrum-edge-secrets
+        key: db-url
+  - name: FERRUM_MONGO_DATABASE
+    value: ferrum
+  - name: FERRUM_MONGO_REPLICA_SET
+    value: rs0
+```
+
+**Notes:**
+- `FERRUM_DB_READ_REPLICA_URL` is not needed — use `readPreference=secondaryPreferred` in the connection string
+- `FERRUM_DB_POOL_*` settings are ignored for MongoDB
+- For MongoDB on Kubernetes, consider the [MongoDB Community Kubernetes Operator](https://github.com/mongodb/mongodb-kubernetes-operator)
+- See [docs/mongodb.md](mongodb.md) for the full deployment guide
+
 ## Control Plane / Data Plane Layout
 
 For CP/DP mode, keep the Control Plane private and expose only the Data Plane proxy service.
