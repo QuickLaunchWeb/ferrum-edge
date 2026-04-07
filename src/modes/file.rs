@@ -239,9 +239,13 @@ pub async fn run(
     }
 
     // Listen for SIGHUP to reload config (with shutdown)
+    #[cfg(unix)]
     let proxy_state_reload = proxy_state.clone();
+    #[cfg(unix)]
     let config_path_owned = config_path.to_string();
+    #[cfg(unix)]
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
+    #[cfg(unix)]
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
     let mut sighup_shutdown = shutdown_tx.subscribe();
     let sighup_handle = tokio::spawn(async move {

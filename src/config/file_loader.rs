@@ -290,6 +290,7 @@ pub fn load_config_from_file(
 }
 
 /// Reload config from file, returning the new config or an error.
+#[cfg(unix)]
 pub fn reload_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
