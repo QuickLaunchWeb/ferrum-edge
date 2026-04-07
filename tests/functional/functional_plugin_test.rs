@@ -210,7 +210,29 @@ impl PluginTestHarness {
         Ok(())
     }
 
-    /// Wait for DB poll to pick up config changes
+    /// Wait for DB poll to pick up config changes.
+    /// Polls a known proxy path until the gateway returns a non-404 response,
+    /// which proves the route has been registered by the DB poller.
+    async fn wait_for_route(&self, path: &str) {
+        let url = format!("{}{}/wait-for-route-probe", self.proxy_base_url, path);
+        let client = reqwest::Client::new();
+        let deadline = SystemTime::now() + Duration::from_secs(15);
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!(
+                    "Gateway did not register route '{}' within 15 seconds",
+                    path
+                );
+            }
+            match client.get(&url).send().await {
+                Ok(r) if r.status().as_u16() != 404 => return,
+                _ => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+    }
+
+    /// Wait for DB poll to pick up config changes (fallback for tests that
+    /// don't have a specific route to probe).
     async fn wait_for_poll(&self) {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -817,7 +839,9 @@ async fn test_plugin_request_termination() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    // Wait for the DB poller to register both routes before asserting
+    harness.wait_for_route("/maintenance").await;
+    harness.wait_for_route("/blocked").await;
 
     // Test maintenance mode returns 503
     let resp = client
@@ -896,7 +920,7 @@ async fn test_plugin_request_termination_preserves_cors_preflight() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    harness.wait_for_route("/cors-maintenance").await;
 
     let preflight = client
         .request(
