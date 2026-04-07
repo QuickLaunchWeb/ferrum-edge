@@ -112,7 +112,7 @@ The script pulls the specified Docker image tags automatically. Results are over
 
 | Gateway | Image Source | Build |
 |---------|-------------|-------|
-| **Ferrum Edge** | `comparison/Dockerfile.ferrum-bench` | Built locally from source (release mode, multi-stage) |
+| **Ferrum Edge** | `Dockerfile` (project root) | Built locally from source (release mode, multi-stage) |
 | **Pingora** | `comparison/Dockerfile.pingora-bench` | Built locally from crates.io deps (release mode, multi-stage) |
 | **Kong** | `kong/kong-gateway:${KONG_VERSION}` | Official Docker Hub image |
 | **Tyk** | `tykio/tyk-gateway:${TYK_VERSION}` | Official Docker Hub image |

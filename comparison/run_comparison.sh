@@ -300,7 +300,7 @@ build_images() {
 
     if ! should_skip "ferrum"; then
         log_info "Building Ferrum Edge Docker image..."
-        docker build -t "$FERRUM_IMAGE" -f "$COMP_DIR/Dockerfile.ferrum-bench" "$PROJECT_ROOT" 2>&1 | tail -5
+        docker build -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" 2>&1 | tail -5
         log_ok "Ferrum image built: $FERRUM_IMAGE"
     fi
 
