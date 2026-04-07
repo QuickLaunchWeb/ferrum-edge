@@ -42,12 +42,23 @@ See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
 git clone https://github.com/QuickLaunchWeb/ferrum-edge.git
 cd ferrum-edge
 cargo build --release
-# Binary: target/release/ferrum-edge
+
+# Install to PATH
+sudo cp target/release/ferrum-edge /usr/local/bin/
+ferrum-edge version
 ```
 
 ### Pre-built Binaries
 
 Download from [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64.
+
+```bash
+# Example: Linux x86_64
+curl -LO https://github.com/QuickLaunchWeb/ferrum-edge/releases/latest/download/ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
+tar xzf ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
+sudo mv ferrum-edge /usr/local/bin/
+ferrum-edge version
+```
 
 ### Docker
 
