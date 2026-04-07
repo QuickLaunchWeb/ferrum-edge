@@ -47,7 +47,8 @@ WORKDIR /app
 COPY --from=builder --chown=ferrum:ferrum /build/target/release/ferrum-edge /app/ferrum-edge
 
 # Set environment variables
-ENV FERRUM_MODE=database \
+ENV PATH="/app:${PATH}" \
+    FERRUM_MODE=database \
     FERRUM_LOG_LEVEL=error \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \

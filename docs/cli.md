@@ -2,6 +2,26 @@
 
 Ferrum Edge provides a command-line interface for running, validating, and managing the gateway. The CLI is fully backwards compatible — invoking `ferrum-edge` with no arguments uses the existing environment-variable-only startup path.
 
+## Making the Binary Available
+
+The `ferrum-edge` binary must be on your shell's `PATH` to be invoked by name. After building or downloading:
+
+```bash
+# From source
+sudo cp target/release/ferrum-edge /usr/local/bin/
+
+# From a pre-built release download
+sudo mv ferrum-edge /usr/local/bin/
+
+# Verify
+ferrum-edge version
+```
+
+Alternative approaches:
+- **Symlink**: `sudo ln -s /path/to/ferrum-edge /usr/local/bin/ferrum-edge`
+- **Add to PATH**: `export PATH="/path/to/dir:$PATH"` (in `~/.bashrc` or `~/.zshrc`)
+- **Docker**: The official images include `ferrum-edge` on PATH — use `docker exec <container> ferrum-edge version`
+
 ## Subcommands
 
 | Command | Description |
