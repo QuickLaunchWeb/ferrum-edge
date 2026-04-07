@@ -8,7 +8,7 @@
 //   pingora-bench-proxy --backend-port 3443 --backend-tls   (for E2E TLS)
 
 use async_trait::async_trait;
-use pingora_core::server::configuration::Opt;
+use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
@@ -51,14 +51,23 @@ fn main() {
     let tls_cert = env::var("PINGORA_TLS_CERT").ok();
     let tls_key = env::var("PINGORA_TLS_KEY").ok();
 
+    // Use available CPU cores for worker threads (Pingora defaults to 1)
+    let num_threads: usize = env::var("PINGORA_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1));
+
     let backend_addr = format!("{}:{}", backend_host, backend_port);
     eprintln!(
-        "Pingora bench proxy: HTTP={}, HTTPS={}, backend={} (tls={})",
-        http_port, https_port, backend_addr, backend_tls
+        "Pingora bench proxy: HTTP={}, HTTPS={}, backend={} (tls={}), threads={}",
+        http_port, https_port, backend_addr, backend_tls, num_threads
     );
 
-    let opt = Opt::default();
-    let mut server = Server::new(Some(opt)).expect("Failed to create Pingora server");
+    let mut conf = ServerConf::new().expect("Failed to create server conf");
+    conf.threads = num_threads;
+    conf.work_stealing = true;
+
+    let mut server = Server::new_with_opt_and_conf(Opt::default(), conf);
     server.bootstrap();
 
     let proxy = BenchProxy {
