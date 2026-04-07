@@ -345,17 +345,20 @@ In-memory async DNS cache with startup warmup, stale-while-revalidate, per-proxy
 
 ## Performance
 
-Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s):
+Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s, 64-byte payload):
 
-| Protocol | Gateway RPS | Direct RPS | Overhead |
-|----------|------------|------------|----------|
-| HTTP/1.1 | 88,773 | 100,112 | ~11% |
-| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% |
-| HTTP/2 | 49,223 | 109,162 | ~55% |
-| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% |
-| gRPC | 34,470 | 118,650 | ~71% |
-| WebSocket | 104,465 | 219,620 | ~52% |
-| TCP | 108,332 | 215,646 | ~50% |
+| Protocol | Gateway RPS | Gw P50 | Gw P99 | Direct RPS | Direct P50 | Direct P99 | Overhead |
+|----------|------------|--------|--------|------------|------------|------------|----------|
+| HTTP/1.1 | 102,183 | 1.89ms | 3.85ms | 209,910 | 939μs | 1.81ms | ~51% |
+| HTTP/1.1+TLS | 101,317 | 1.90ms | 3.84ms | 209,361 | 941μs | 1.81ms | ~52% |
+| HTTP/2 | 108,138 | 1.67ms | 6.38ms | 355,544 | 486μs | 1.53ms | ~70% |
+| HTTP/3 (QUIC) | 53,085 | 3.51ms | 5.87ms | 83,592 | 2.38ms | 2.80ms | ~37% |
+| gRPC | 68,352 | 2.53ms | 12.02ms | 205,927 | 821μs | 3.15ms | ~67% |
+| WebSocket | 103,830 | 1.88ms | 3.15ms | 207,507 | 952μs | 1.72ms | ~50% |
+| TCP | 108,841 | 1.83ms | 2.59ms | 214,113 | 928μs | 1.65ms | ~49% |
+| TCP+TLS | 107,340 | 1.84ms | 2.68ms | 207,103 | 949μs | 1.78ms | ~48% |
+| UDP | 82,042 | 2.46ms | 2.93ms | 276,526 | 682μs | 1.27ms | ~70% |
+| UDP+DTLS | 76,107 | 2.61ms | 3.69ms | 101,839 | 1.96ms | 2.47ms | ~25% |
 
 See `tests/performance/` for the full benchmark suite.
 

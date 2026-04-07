@@ -111,9 +111,9 @@ pub fn make_h3_server_config(
     ));
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
-    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
-    transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-    transport.send_window(16 * 1024 * 1024);
+    transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024)); // 8 MiB
+    transport.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024)); // 32 MiB
+    transport.send_window(8 * 1024 * 1024); // 8 MiB
     server_cfg.transport_config(Arc::new(transport));
     Ok(server_cfg)
 }
@@ -136,9 +136,9 @@ pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
     let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1024));
-    transport.stream_receive_window(quinn::VarInt::from_u32(2 * 1024 * 1024));
-    transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
-    transport.send_window(16 * 1024 * 1024);
+    transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024)); // 8 MiB
+    transport.receive_window(quinn::VarInt::from_u32(32 * 1024 * 1024)); // 32 MiB
+    transport.send_window(8 * 1024 * 1024); // 8 MiB
     client_cfg.transport_config(Arc::new(transport));
     client_cfg
 }
