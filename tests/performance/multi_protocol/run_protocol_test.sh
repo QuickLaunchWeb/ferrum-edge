@@ -157,9 +157,15 @@ start_gateway() {
         "FERRUM_FILE_CONFIG_PATH=$config_file"
         "FERRUM_PROXY_HTTP_PORT=$GATEWAY_HTTP_PORT"
         "FERRUM_PROXY_HTTPS_PORT=$GATEWAY_HTTPS_PORT"
+        # Minimize non-proxy overhead
+        FERRUM_LOG_LEVEL=error
+        FERRUM_ADD_VIA_HEADER=false
+        # Connection pool tuning
         FERRUM_POOL_MAX_IDLE_PER_HOST=200
         FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
         FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
+        FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30
+        FERRUM_POOL_WARMUP_ENABLED=true
         FERRUM_TLS_NO_VERIFY=true
         # HTTP/2 flow control tuning (8 MiB stream, 32 MiB connection, adaptive BDP)
         FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608
@@ -167,11 +173,20 @@ start_gateway() {
         FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true
         FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576
         FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
+        # Server-side HTTP/2 tuning
+        FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000
+        # gRPC pool tuning (documented 3.8% throughput improvement)
+        FERRUM_GRPC_POOL_READY_WAIT_MS=1
         # HTTP/3 QUIC transport tuning (8 MiB stream, 32 MiB connection, 8 MiB send)
         FERRUM_HTTP3_MAX_STREAMS=1000
         FERRUM_HTTP3_STREAM_RECEIVE_WINDOW=8388608
         FERRUM_HTTP3_RECEIVE_WINDOW=33554432
         FERRUM_HTTP3_SEND_WINDOW=8388608
+        FERRUM_HTTP3_CONNECTIONS_PER_BACKEND=4
+        FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS=120
+        # UDP tuning
+        FERRUM_UDP_MAX_SESSIONS=10000
+        FERRUM_UDP_CLEANUP_INTERVAL_SECONDS=10
     )
     if [ -f "$cert_dir/cert.pem" ]; then
         env_cmd+=(

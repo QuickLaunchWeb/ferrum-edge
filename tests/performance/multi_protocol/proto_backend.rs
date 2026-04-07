@@ -127,6 +127,7 @@ async fn run_http1_server(addr: SocketAddr) -> anyhow::Result<()> {
         .context("binding http1 listener")?;
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = hyper::server::conn::http1::Builder::new()
@@ -159,9 +160,15 @@ async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
         .context("binding h2c listener")?;
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .initial_stream_window_size(8_388_608) // 8 MiB
+                .initial_connection_window_size(33_554_432) // 32 MiB
+                .adaptive_window(true)
+                .max_frame_size(1_048_576) // 1 MiB
+                .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
                 .await;
         });
@@ -178,6 +185,7 @@ async fn run_h2_tls_server(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let Ok(tls_stream) = acceptor.accept(stream).await else {
@@ -185,6 +193,11 @@ async fn run_h2_tls_server(
             };
             let io = TokioIo::new(tls_stream);
             let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .initial_stream_window_size(8_388_608) // 8 MiB
+                .initial_connection_window_size(33_554_432) // 32 MiB
+                .adaptive_window(true)
+                .max_frame_size(1_048_576) // 1 MiB
+                .max_concurrent_streams(1000)
                 .serve_connection(io, hyper::service::service_fn(handle_http))
                 .await;
         });
@@ -198,6 +211,7 @@ async fn run_ws_server(addr: SocketAddr) -> anyhow::Result<()> {
         .context("binding ws listener")?;
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
                 return;
@@ -214,6 +228,9 @@ async fn run_ws_server(addr: SocketAddr) -> anyhow::Result<()> {
 
 async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
     tonic::transport::Server::builder()
+        .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
+        .initial_connection_window_size(33_554_432) // 32 MiB
+        .tcp_nodelay(true)
         .add_service(BenchServiceServer::new(BenchServiceImpl))
         .serve(addr)
         .await
@@ -244,6 +261,7 @@ async fn run_tcp_tls_echo(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
     loop {
         let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let Ok(tls_stream) = acceptor.accept(stream).await else {
@@ -394,11 +412,13 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                             }
                         }
                         _ = tokio::time::sleep(sleep_dur) => {
-                            if let Some(t) = next_timeout {
-                                if std::time::Instant::now() >= t {
-                                    if dtls.handle_timeout(std::time::Instant::now()).is_err() { break; }
-                                    next_timeout = None;
+                            if let Some(t) = next_timeout
+                                && std::time::Instant::now() >= t
+                            {
+                                if dtls.handle_timeout(std::time::Instant::now()).is_err() {
+                                    break;
                                 }
+                                next_timeout = None;
                             }
                         }
                     }
@@ -409,7 +429,9 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                     let mut just_connected = false;
                     for _ in 0..64 {
                         match dtls.poll_output(&mut out_buf) {
-                            Output::Packet(d) => { let _ = socket.send_to(d, peer).await; }
+                            Output::Packet(d) => {
+                                let _ = socket.send_to(d, peer).await;
+                            }
                             Output::Timeout(t) => {
                                 next_timeout = Some(t);
                                 if just_connected {
@@ -423,7 +445,9 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                                 connected = true;
                             }
                             Output::ApplicationData(d) if connected => {
-                                if dtls.send_application_data(d).is_err() { break; }
+                                if dtls.send_application_data(d).is_err() {
+                                    break;
+                                }
                             }
                             Output::PeerCert(_) | Output::KeyingMaterial(_, _) => {}
                             _ => {} // future non_exhaustive variants
@@ -434,11 +458,18 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                     if connected {
                         for _ in 0..64 {
                             match dtls.poll_output(&mut out_buf) {
-                                Output::Packet(d) => { let _ = socket.send_to(d, peer).await; }
-                                Output::Timeout(t) => { next_timeout = Some(t); break; }
+                                Output::Packet(d) => {
+                                    let _ = socket.send_to(d, peer).await;
+                                }
+                                Output::Timeout(t) => {
+                                    next_timeout = Some(t);
+                                    break;
+                                }
                                 Output::ApplicationData(d) => {
                                     // Late app data arrival — echo it
-                                    if dtls.send_application_data(d).is_err() { break; }
+                                    if dtls.send_application_data(d).is_err() {
+                                        break;
+                                    }
                                 }
                                 _ => {} // PeerCert, KeyingMaterial, future variants
                             }

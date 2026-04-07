@@ -466,7 +466,7 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 
             while Instant::now() < deadline {
                 let start = Instant::now();
-                if write.send(Message::Binary(payload.clone().into())).await.is_err() {
+                if write.send(Message::Binary(payload.clone())).await.is_err() {
                     metrics.record_error();
                     break;
                 }
@@ -516,6 +516,9 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
             .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
             .initial_connection_window_size(33_554_432) // 32 MiB
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_while_idle(true)
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("gRPC connect to {}: {e}", args.target))?;
@@ -617,6 +620,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
 
 // ── UDP ──────────────────────────────────────────────────────────────────────
 
+#[allow(unused_assignments)] // next_timeout assignments are defensive — drain loop may not always produce Timeout
 async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid UDP target address")?;
     let deadline = Instant::now() + Duration::from_secs(args.duration);
@@ -649,7 +653,7 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                 let mut out_buf = vec![0u8; 2048];
                 let mut recv_buf = vec![0u8; 65536];
                 let hs_deadline = std::time::Instant::now() + Duration::from_secs(10);
-                let mut next_timeout: Option<std::time::Instant> = None;
+                let mut next_timeout: Option<std::time::Instant>;
                 let mut connected = false;
 
                 // Kick off handshake — drain until Timeout
@@ -673,11 +677,11 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                             dtls.handle_packet(&recv_buf[..len]).map_err(|e| anyhow::anyhow!("hs pkt: {e}"))?;
                         }
                         _ = tokio::time::sleep(sleep_dur) => {
-                            if let Some(t) = next_timeout {
-                                if std::time::Instant::now() >= t {
-                                    dtls.handle_timeout(std::time::Instant::now()).map_err(|e| anyhow::anyhow!("hs timeout: {e}"))?;
-                                    next_timeout = None;
-                                }
+                            if let Some(t) = next_timeout
+                                && std::time::Instant::now() >= t
+                            {
+                                dtls.handle_timeout(std::time::Instant::now()).map_err(|e| anyhow::anyhow!("hs timeout: {e}"))?;
+                                next_timeout = None;
                             }
                         }
                     }
@@ -737,11 +741,11 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                                 }
                             }
                             _ = tokio::time::sleep(sleep_dur) => {
-                                if let Some(t) = next_timeout {
-                                    if std::time::Instant::now() >= t {
-                                        let _ = dtls.handle_timeout(std::time::Instant::now());
-                                        next_timeout = None;
-                                    }
+                                if let Some(t) = next_timeout
+                                    && std::time::Instant::now() >= t
+                                {
+                                    let _ = dtls.handle_timeout(std::time::Instant::now());
+                                    next_timeout = None;
                                 }
                             }
                         }
