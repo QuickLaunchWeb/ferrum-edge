@@ -92,12 +92,16 @@ Key environment variables set by the test runner:
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `FERRUM_MODE` | `file` | File-based config |
+| `FERRUM_LOG_LEVEL` | `error` | Minimize logging overhead during benchmarks |
+| `FERRUM_ADD_VIA_HEADER` | `false` | Skip Via header to reduce per-request overhead |
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | `200` | Prevent connection churn |
+| `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup |
 | `FERRUM_TLS_NO_VERIFY` | `true` | Accept self-signed certs |
 | `FERRUM_ENABLE_HTTP3` | `true` | Enable QUIC listener (HTTP/3 test) |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | `certs/cert.pem` | Gateway TLS cert |
 | `FERRUM_DTLS_CERT_PATH` | `certs/cert.pem` | Gateway DTLS cert |
 | `FERRUM_POOL_HTTP2_*` | (tuned) | H2 flow control: 8 MiB stream, 32 MiB conn windows |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side H2 stream limit |
 | `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 1000 max streams |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per backend |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 pool idle eviction timeout |
@@ -162,31 +166,31 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
 |----------|-------------|-------------|------|------|------|--------|
-| HTTP/1.1 | 90,063 | 2.22ms | 2.12ms | 4.70ms | 30.51ms | 0 |
-| HTTP/1.1+TLS | 89,046 | 2.24ms | 2.14ms | 4.84ms | 42.17ms | 0 |
-| HTTP/2 (TLS) | 100,530 | 1.99ms | 1.82ms | 6.13ms | 127.04ms | 0 |
-| HTTP/3 (QUIC) | 49,188 | 4.06ms | 3.77ms | 7.54ms | 123.07ms | 0 |
-| WebSocket | 111,852 | 1.78ms | 1.74ms | 3.15ms | 23.66ms | 0 |
-| gRPC | 60,689 | 3.29ms | 2.96ms | 11.11ms | 47.65ms | 0 |
-| TCP | 112,037 | 1.78ms | 1.74ms | 3.08ms | 24.72ms | 0 |
-| TCP+TLS | 112,017 | 1.78ms | 1.74ms | 3.19ms | 19.65ms | 0 |
-| UDP | 81,924 | 2.44ms | 2.45ms | 3.00ms | 10.96ms | 0 |
-| UDP+DTLS | 75,150 | 2.53ms | 2.54ms | 4.41ms | 33.18ms | 0 |
+| HTTP/1.1 | 102,183 | 1.96ms | 1.89ms | 3.85ms | 28.41ms | 0 |
+| HTTP/1.1+TLS | 101,317 | 1.97ms | 1.90ms | 3.84ms | 26.25ms | 0 |
+| HTTP/2 (TLS) | 108,138 | 1.85ms | 1.67ms | 6.38ms | 120.19ms | 0 |
+| HTTP/3 (QUIC) | 53,085 | 3.76ms | 3.51ms | 5.87ms | 150.91ms | 0 |
+| WebSocket | 103,830 | 1.92ms | 1.88ms | 3.15ms | 15.27ms | 0 |
+| gRPC | 68,352 | 2.92ms | 2.53ms | 12.02ms | 128.06ms | 0 |
+| TCP | 108,841 | 1.83ms | 1.83ms | 2.59ms | 10.63ms | 0 |
+| TCP+TLS | 107,340 | 1.86ms | 1.84ms | 2.68ms | 13.35ms | 0 |
+| UDP | 82,042 | 2.44ms | 2.46ms | 2.93ms | 10.24ms | 0 |
+| UDP+DTLS | 76,107 | 2.61ms | 2.61ms | 3.69ms | 11.81ms | 0 |
 
 ### Direct Backend (client → backend, no gateway)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
 |----------|-------------|-------------|------|------|------|
-| HTTP/1.1 | 221,572 | 901μs | 866μs | 1.82ms | 9.38ms |
-| HTTP/1.1+TLS | 219,383* | 909μs | 865μs | 1.89ms | 76.48ms |
-| HTTP/2 (TLS) | 354,711 | 562μs | 489μs | 1.74ms | 73.86ms |
-| HTTP/3 (QUIC) | 90,448 | 2.21ms | 2.19ms | 3.26ms | 25.66ms |
-| WebSocket | 222,932 | 895μs | 870μs | 1.74ms | 7.20ms |
-| gRPC | 162,602 | 1.23ms | 974μs | 4.42ms | 366.08ms |
-| TCP | 223,859 | 892μs | 865μs | 1.75ms | 16.43ms |
-| TCP+TLS | 222,303 | 898μs | 869μs | 1.78ms | 6.67ms |
-| UDP | 247,271 | 808μs | 738μs | 1.71ms | 6.81ms |
-| UDP+DTLS | 101,452 | 1.87ms | 1.87ms | 2.95ms | 23.20ms |
+| HTTP/1.1 | 209,910 | 951μs | 939μs | 1.81ms | 4.54ms |
+| HTTP/1.1+TLS | 209,361* | 953μs | 941μs | 1.81ms | 5.24ms |
+| HTTP/2 (TLS) | 355,544 | 561μs | 486μs | 1.53ms | 126.40ms |
+| HTTP/3 (QUIC) | 83,592 | 2.39ms | 2.38ms | 2.80ms | 4.93ms |
+| WebSocket | 207,507 | 962μs | 952μs | 1.72ms | 3.16ms |
+| gRPC | 205,927 | 970μs | 821μs | 3.15ms | 90.81ms |
+| TCP | 214,113 | 933μs | 928μs | 1.65ms | 8.48ms |
+| TCP+TLS | 207,103 | 964μs | 949μs | 1.78ms | 9.51ms |
+| UDP | 276,526 | 722μs | 682μs | 1.27ms | 3.48ms |
+| UDP+DTLS | 101,839 | 1.95ms | 1.96ms | 2.47ms | 4.75ms |
 
 *\*HTTP/1.1+TLS direct baseline uses plain HTTP since the backend has no TLS; the TLS overhead is entirely at the gateway.*
 
@@ -194,16 +198,20 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/1.1 | 90,063 | 221,572 | ~59% | reqwest connection pool with keep-alive |
-| HTTP/1.1+TLS | 89,046 | 219,383 | ~59% | TLS termination at gateway, plain HTTP to backend |
-| HTTP/2 (TLS) | 100,530 | 354,711 | ~72% | hyper-native H2 pool with two-phase ready() multiplexing |
-| HTTP/3 (QUIC) | 49,188 | 90,448 | ~46% | QUIC connection pool via quinn |
-| WebSocket | 111,852 | 222,932 | ~50% | Upgrade overhead amortized over many messages |
-| gRPC | 60,689 | 162,602 | ~63% | H2 multiplexing + protobuf passthrough |
-| TCP | 112,037 | 223,859 | ~50% | Bidirectional copy, minimal per-byte overhead |
-| TCP+TLS | 112,017 | 222,303 | ~50% | TLS termination + bidirectional copy (cached TLS config) |
-| UDP | 81,924 | 247,271 | ~67% | Per-datagram session lookup + forwarding |
-| UDP+DTLS | 75,150 | 101,452 | ~26% | DTLS termination + plain UDP forwarding |
+| HTTP/1.1 | 102,183 | 209,910 | ~51% | reqwest connection pool with keep-alive |
+| HTTP/1.1+TLS | 101,317 | 209,361 | ~52% | TLS termination at gateway, plain HTTP to backend |
+| HTTP/2 (TLS) | 108,138 | 355,544 | ~70% | hyper-native H2 pool with two-phase ready() multiplexing |
+| HTTP/3 (QUIC) | 53,085 | 83,592 | ~37% | QUIC connection pool via quinn |
+| WebSocket | 103,830 | 207,507 | ~50% | Upgrade overhead amortized over many messages |
+| gRPC | 68,352 | 205,927 | ~67% | H2 multiplexing + protobuf passthrough |
+| TCP | 108,841 | 214,113 | ~49% | Bidirectional copy, minimal per-byte overhead |
+| TCP+TLS | 107,340 | 207,103 | ~48% | TLS termination + bidirectional copy (cached TLS config) |
+| UDP | 82,042 | 276,526 | ~70% | Per-datagram session lookup + forwarding |
+| UDP+DTLS | 76,107 | 101,839 | ~25% | DTLS termination + plain UDP forwarding |
+
+> **Note:** Benchmark numbers vary between runs due to system load, thermal
+> throttling, and background processes. Focus on the overhead ratios and relative
+> comparisons rather than absolute RPS numbers.
 
 > Tuning note: in one back-to-back local comparison, lowering the gRPC pool
 > sender-ready wait from `5ms` to `1ms` improved gateway throughput by about

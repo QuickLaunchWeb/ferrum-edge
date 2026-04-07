@@ -345,17 +345,20 @@ In-memory async DNS cache with startup warmup, stale-while-revalidate, per-proxy
 
 ## Performance
 
-Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s):
+Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s, 64-byte payload):
 
 | Protocol | Gateway RPS | Direct RPS | Overhead |
 |----------|------------|------------|----------|
-| HTTP/1.1 | 88,773 | 100,112 | ~11% |
-| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% |
-| HTTP/2 | 49,223 | 109,162 | ~55% |
-| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% |
-| gRPC | 34,470 | 118,650 | ~71% |
-| WebSocket | 104,465 | 219,620 | ~52% |
-| TCP | 108,332 | 215,646 | ~50% |
+| HTTP/1.1 | 102,183 | 209,910 | ~51% |
+| HTTP/1.1+TLS | 101,317 | 209,361 | ~52% |
+| HTTP/2 | 108,138 | 355,544 | ~70% |
+| HTTP/3 (QUIC) | 53,085 | 83,592 | ~37% |
+| gRPC | 68,352 | 205,927 | ~67% |
+| WebSocket | 103,830 | 207,507 | ~50% |
+| TCP | 108,841 | 214,113 | ~49% |
+| TCP+TLS | 107,340 | 207,103 | ~48% |
+| UDP | 82,042 | 276,526 | ~70% |
+| UDP+DTLS | 76,107 | 101,839 | ~25% |
 
 See `tests/performance/` for the full benchmark suite.
 
