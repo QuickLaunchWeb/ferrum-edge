@@ -47,8 +47,18 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use hyper::StatusCode;
+
+    use crate::config::types::{AuthMode, BackendProtocol};
+    use crate::plugins::Plugin;
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
-    pub use crate::proxy::tcp_proxy::classify_stream_error;
+    pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
+        crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
@@ -71,25 +81,110 @@ pub mod _test_support {
 
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
-    pub use crate::config::db_loader::{
-        diff_removed as db_diff_removed, parse_auth_mode, parse_protocol,
-    };
 
     pub fn db_append_connect_timeout(url: &str, db_type: &str, timeout: u64) -> String {
         crate::config::db_loader::DatabaseStore::append_connect_timeout(url, db_type, timeout)
     }
 
+    pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
+        crate::config::db_loader::diff_removed(known, current)
+    }
+
+    pub fn parse_protocol(s: &str) -> BackendProtocol {
+        crate::config::db_loader::parse_protocol(s)
+    }
+
+    pub fn parse_auth_mode(s: &str) -> AuthMode {
+        crate::config::db_loader::parse_auth_mode(s)
+    }
+
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
-    pub use crate::plugins::grpc_web::parse_grpc_frames;
-    pub use crate::plugins::grpc_web::{
-        GRPC_FRAME_DATA, GRPC_FRAME_TRAILER, build_trailer_frame, is_grpc_web_content_type,
-        is_grpc_web_text, response_content_type,
-    };
+    pub const GRPC_FRAME_DATA: u8 = crate::plugins::grpc_web::GRPC_FRAME_DATA;
+    pub const GRPC_FRAME_TRAILER: u8 = crate::plugins::grpc_web::GRPC_FRAME_TRAILER;
+
+    pub fn is_grpc_web_content_type(ct: &str) -> bool {
+        crate::plugins::grpc_web::is_grpc_web_content_type(ct)
+    }
+
+    pub fn is_grpc_web_text(ct: &str) -> bool {
+        crate::plugins::grpc_web::is_grpc_web_text(ct)
+    }
+
+    pub fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
+        crate::plugins::grpc_web::build_trailer_frame(response_headers)
+    }
+
+    pub fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        crate::plugins::grpc_web::parse_grpc_frames(data)
+    }
+
+    pub fn response_content_type(original_ct: &str) -> &'static str {
+        crate::plugins::grpc_web::response_content_type(original_ct)
+    }
 
     // ── proxy/mod ────────────────────────────────────────────────────────────
-    pub use crate::proxy::{
-        NormalizedRejectResponse, apply_request_body_plugins, can_use_direct_http2_pool,
-        extract_grpc_reject_message, insert_grpc_error_metadata,
-        map_http_reject_status_to_grpc_status, normalize_reject_response, request_may_have_body,
-    };
+    pub struct NormalizedRejectResponse {
+        pub http_status: StatusCode,
+        pub headers: HashMap<String, String>,
+        pub body: Vec<u8>,
+        pub grpc_status: Option<u32>,
+        pub grpc_message: Option<String>,
+    }
+
+    pub fn can_use_direct_http2_pool(
+        enable_http2: bool,
+        retain_request_body: bool,
+        requires_request_body_buffering: bool,
+    ) -> bool {
+        crate::proxy::can_use_direct_http2_pool(
+            enable_http2,
+            retain_request_body,
+            requires_request_body_buffering,
+        )
+    }
+
+    pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
+        crate::proxy::request_may_have_body(method, headers)
+    }
+
+    pub async fn apply_request_body_plugins(
+        plugins: &[Arc<dyn Plugin>],
+        headers: &HashMap<String, String>,
+        body_bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        crate::proxy::apply_request_body_plugins(plugins, headers, body_bytes).await
+    }
+
+    pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
+        crate::proxy::extract_grpc_reject_message(body)
+    }
+
+    pub fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
+        crate::proxy::map_http_reject_status_to_grpc_status(status)
+    }
+
+    pub fn normalize_reject_response(
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+        is_grpc_request: bool,
+    ) -> NormalizedRejectResponse {
+        let normalized =
+            crate::proxy::normalize_reject_response(status, body, headers, is_grpc_request);
+        NormalizedRejectResponse {
+            http_status: normalized.http_status,
+            headers: normalized.headers,
+            body: normalized.body,
+            grpc_status: normalized.grpc_status,
+            grpc_message: normalized.grpc_message,
+        }
+    }
+
+    pub fn insert_grpc_error_metadata(
+        metadata: &mut HashMap<String, String>,
+        grpc_status: u32,
+        grpc_message: &str,
+    ) {
+        crate::proxy::insert_grpc_error_metadata(metadata, grpc_status, grpc_message)
+    }
 }

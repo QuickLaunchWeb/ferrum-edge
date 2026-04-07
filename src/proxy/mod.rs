@@ -182,7 +182,7 @@ fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
 /// Request-body plugins require buffering and transformation before forwarding,
 /// which the direct H2 path does not implement. Those requests must stay on the
 /// reqwest path so the final backend body matches the plugin output.
-pub fn can_use_direct_http2_pool(
+pub(crate) fn can_use_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
     requires_request_body_buffering: bool,
@@ -200,7 +200,7 @@ enum RequestBodyBufferError {
     ClientDisconnected(String),
 }
 
-pub fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
+pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
     !matches!(method, "GET" | "HEAD" | "OPTIONS")
         || headers.contains_key("content-length")
         || headers.contains_key("transfer-encoding")
@@ -326,7 +326,7 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val
 }
 
-pub async fn apply_request_body_plugins(
+pub(crate) async fn apply_request_body_plugins(
     plugins: &[Arc<dyn Plugin>],
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
@@ -3189,12 +3189,12 @@ pub(crate) async fn run_after_proxy_hooks(
     None
 }
 
-pub struct NormalizedRejectResponse {
-    pub http_status: StatusCode,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-    pub grpc_status: Option<u32>,
-    pub grpc_message: Option<String>,
+pub(crate) struct NormalizedRejectResponse {
+    pub(crate) http_status: StatusCode,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) grpc_status: Option<u32>,
+    pub(crate) grpc_message: Option<String>,
 }
 
 fn grpc_status_reason(status: u32) -> &'static str {
@@ -3223,7 +3223,7 @@ fn sanitize_grpc_message(message: &str) -> String {
         .to_string()
 }
 
-pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
+pub(crate) fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
     let body = std::str::from_utf8(body).ok()?;
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -3245,7 +3245,7 @@ pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-pub fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
+pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     match status {
         StatusCode::BAD_REQUEST => grpc_proxy::grpc_status::INVALID_ARGUMENT,
         StatusCode::METHOD_NOT_ALLOWED => grpc_proxy::grpc_status::UNIMPLEMENTED,
@@ -3268,7 +3268,7 @@ pub fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     }
 }
 
-pub fn normalize_reject_response(
+pub(crate) fn normalize_reject_response(
     status: StatusCode,
     body: &[u8],
     headers: &HashMap<String, String>,
@@ -3324,7 +3324,7 @@ pub fn normalize_reject_response(
     }
 }
 
-pub fn insert_grpc_error_metadata(
+pub(crate) fn insert_grpc_error_metadata(
     metadata: &mut HashMap<String, String>,
     grpc_status: u32,
     grpc_message: &str,

@@ -61,9 +61,9 @@ const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
 
 /// gRPC frame flag: data frame.
-pub const GRPC_FRAME_DATA: u8 = 0x00;
+pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;
 /// gRPC frame flag: trailer frame (used in gRPC-Web to embed trailers in body).
-pub const GRPC_FRAME_TRAILER: u8 = 0x80;
+pub(crate) const GRPC_FRAME_TRAILER: u8 = 0x80;
 
 /// Returns a header map with `content-type: application/grpc` for gRPC error responses.
 fn grpc_content_type_header() -> HashMap<String, String> {
@@ -92,13 +92,13 @@ impl GrpcWebPlugin {
 }
 
 /// Check if a content-type indicates a gRPC-Web request.
-pub fn is_grpc_web_content_type(ct: &str) -> bool {
+pub(crate) fn is_grpc_web_content_type(ct: &str) -> bool {
     let ct_lower = ct.trim().to_lowercase();
     ct_lower.starts_with("application/grpc-web")
 }
 
 /// Check if a gRPC-Web content-type uses text (base64) encoding.
-pub fn is_grpc_web_text(ct: &str) -> bool {
+pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
     let ct_lower = ct.trim().to_lowercase();
     ct_lower.starts_with("application/grpc-web-text")
 }
@@ -109,7 +109,7 @@ pub fn is_grpc_web_text(ct: &str) -> bool {
 /// - 1 byte: 0x80 (trailer flag)
 /// - 4 bytes: big-endian u32 length of trailer payload
 /// - N bytes: trailer payload (HTTP header encoding: `key: value\r\n`)
-pub fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
+pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
     let mut trailer_payload = Vec::new();
     for (key, value) in response_headers {
         // Include grpc-* trailers and any custom trailing metadata
@@ -139,7 +139,7 @@ pub fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8
 /// Returns a list of (flag, payload) tuples. Used to separate data frames
 /// from trailer frames in gRPC-Web responses.
 #[allow(dead_code)]
-pub fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+pub(crate) fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut frames = Vec::new();
     let mut pos = 0;
     while pos + 5 <= data.len() {
@@ -159,7 +159,7 @@ pub fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 /// Map an original gRPC-Web content-type to the response content-type.
 ///
 /// Preserves the +proto suffix if present.
-pub fn response_content_type(original_ct: &str) -> &'static str {
+pub(crate) fn response_content_type(original_ct: &str) -> &'static str {
     let ct_lower = original_ct.trim().to_lowercase();
     if ct_lower.starts_with("application/grpc-web-text") {
         if ct_lower.contains("+proto") {

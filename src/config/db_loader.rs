@@ -3165,11 +3165,11 @@ impl DatabaseBackend for DatabaseStore {
 }
 
 /// IDs in `known` that are not in `current` (i.e., deleted resources).
-pub fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
+pub(crate) fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
     known.difference(current).cloned().collect()
 }
 
-pub fn parse_protocol(s: &str) -> BackendProtocol {
+pub(crate) fn parse_protocol(s: &str) -> BackendProtocol {
     match s.to_lowercase().as_str() {
         "https" => BackendProtocol::Https,
         "ws" => BackendProtocol::Ws,
@@ -3185,7 +3185,7 @@ pub fn parse_protocol(s: &str) -> BackendProtocol {
     }
 }
 
-pub fn parse_auth_mode(s: &str) -> AuthMode {
+pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
     match s.to_lowercase().as_str() {
         "multi" => AuthMode::Multi,
         _ => AuthMode::Single,

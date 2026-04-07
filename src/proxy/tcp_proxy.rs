@@ -27,7 +27,7 @@ use crate::plugins::{
     PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
 };
 
-pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
+pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
