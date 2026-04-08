@@ -340,7 +340,7 @@ async fn run_discovery_loop(
                     );
 
                     // Clean up stale health state for targets that were removed
-                    health_checker.remove_stale_targets(&merged);
+                    health_checker.remove_stale_targets(upstream_id, &merged);
 
                     last_discovered = discovered;
                 }

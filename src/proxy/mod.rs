@@ -2017,7 +2017,14 @@ async fn handle_websocket_request_authenticated(
                             upstream_id,
                             &lb_hash_key,
                             prev_target,
-                            Some(&state.health_checker.unhealthy_targets),
+                            Some(&crate::load_balancer::HealthContext {
+                                active_unhealthy: &state.health_checker.active_unhealthy_targets,
+                                proxy_passive: state
+                                    .health_checker
+                                    .passive_health
+                                    .get(&proxy.id)
+                                    .map(|r| r.value().clone()),
+                            }),
                         )
                     {
                         current_backend_url = build_websocket_backend_url_with_target(
@@ -4077,10 +4084,19 @@ pub async fn handle_proxy_request(
     let (upstream_target, upstream_is_fallback, sticky_cookie_needed) = if let Some(upstream_id) =
         &proxy.upstream_id
     {
+        let proxy_passive = state
+            .health_checker
+            .passive_health
+            .get(&proxy.id)
+            .map(|r| r.value().clone());
+        let health_ctx = crate::load_balancer::HealthContext {
+            active_unhealthy: &state.health_checker.active_unhealthy_targets,
+            proxy_passive: proxy_passive.clone(),
+        };
         match state.load_balancer_cache.select_target(
             upstream_id,
             &lb_hash_key.0,
-            Some(&state.health_checker.unhealthy_targets),
+            Some(&health_ctx),
         ) {
             Some(selection) => {
                 if selection.is_fallback {
@@ -4413,7 +4429,14 @@ pub async fn handle_proxy_request(
                         upstream_id,
                         &lb_hash_key.0,
                         prev_target,
-                        Some(&state.health_checker.unhealthy_targets),
+                        Some(&crate::load_balancer::HealthContext {
+                            active_unhealthy: &state.health_checker.active_unhealthy_targets,
+                            proxy_passive: state
+                                .health_checker
+                                .passive_health
+                                .get(&proxy.id)
+                                .map(|r| r.value().clone()),
+                        }),
                     )
                 {
                     grpc_backend_url = build_backend_url_with_target(
@@ -4971,7 +4994,14 @@ pub async fn handle_proxy_request(
                     upstream_id,
                     &lb_hash_key.0,
                     prev_target,
-                    Some(&state.health_checker.unhealthy_targets),
+                    Some(&crate::load_balancer::HealthContext {
+                        active_unhealthy: &state.health_checker.active_unhealthy_targets,
+                        proxy_passive: state
+                            .health_checker
+                            .passive_health
+                            .get(&proxy.id)
+                            .map(|r| r.value().clone()),
+                    }),
                 )
             {
                 current_url = build_backend_url_with_target(
@@ -5125,6 +5155,7 @@ pub async fn handle_proxy_request(
         && let Some(hc) = &upstream.health_checks
     {
         state.health_checker.report_response(
+            &proxy.id,
             target,
             response_status,
             backend_resp.connection_error,
@@ -6360,8 +6391,8 @@ fn build_sticky_cookie_header(
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,
 ) -> String {
-    use crate::load_balancer::target_key;
-    let value = target_key(target);
+    use crate::load_balancer::target_host_port_key;
+    let value = target_host_port_key(target);
     let mut cookie = format!(
         "{}={}; Path={}; Max-Age={}",
         cookie_name, value, config.path, config.ttl_seconds
