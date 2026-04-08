@@ -37,16 +37,17 @@ RUN touch src/main.rs && cargo build --release
 # Stage 2: Runtime — must match builder's glibc version (rust:latest = trixie)
 FROM debian:trixie-slim
 
-# Install runtime dependencies
+# Install runtime dependencies and create non-root user
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     curl \
     && apt-get purge -y --auto-remove tar libgd3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN useradd -m -u 1000 ferrum
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/log/dpkg.log /var/log/apt \
+              /usr/share/doc /usr/share/man /usr/share/info \
+              /usr/share/lintian /usr/share/linda \
+    && useradd -m -u 1000 ferrum
 
 WORKDIR /app
 

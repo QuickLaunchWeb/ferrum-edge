@@ -9,9 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     curl \
     && apt-get purge -y --auto-remove tar libgd3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -m -u 1000 ferrum
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/log/dpkg.log /var/log/apt \
+              /usr/share/doc /usr/share/man /usr/share/info \
+              /usr/share/lintian /usr/share/linda \
+    && useradd -m -u 1000 ferrum
 
 WORKDIR /app
 
