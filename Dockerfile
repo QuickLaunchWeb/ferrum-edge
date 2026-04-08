@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     curl \
+    && apt-get purge -y --auto-remove tar libgd3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
