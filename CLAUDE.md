@@ -220,8 +220,8 @@ src/
 ├── grpc/                      # CP/DP gRPC communication
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
-├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection)
-├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
+├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection) + HealthContext for dual-map health filtering
+├── health_check.rs            # Active (shared per-upstream probes) + passive (isolated per-proxy) health checking with two-level index
 ├── circuit_breaker.rs         # Three-state circuit breaker (connection errors vs status code failures tracked independently via trip_on_connection_errors)
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS (thread-local pool keys for zero-alloc cache hits)
@@ -585,6 +585,40 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 - **Never add fields that only affect policy** (timeouts, pool sizes, keepalive intervals). These don't change connection identity and adding them causes fragmentation.
 - **Empty/default values are free** — most proxies won't set per-proxy mTLS or dns_override, so these fields are empty strings and all proxies sharing a backend still share one pool entry.
 - **Keep the `|` delimiter** — do not switch to `:` or any character that can appear in hostnames, IPv6 addresses, or file paths.
+
+### Health Check Architecture
+
+Health checking uses a **two-layer design** to prevent cross-proxy contamination while keeping shared state where appropriate:
+
+**Active health checks** (periodic probes) are shared per-upstream in `HealthChecker.active_unhealthy_targets: DashMap<"upstream_id::host:port", u64>`. When a TCP/HTTP/UDP/gRPC probe fails, the target is marked unhealthy for ALL proxies using that upstream — correct because the target is genuinely unreachable regardless of which proxy routes through it. Active probe state uses a separate `active_target_states` DashMap with the same key format.
+
+**Passive health checks** (traffic-based failure counting) are isolated per-proxy via a two-level index: `HealthChecker.passive_health: DashMap<proxy_id, Arc<ProxyHealthState>>`. Each `ProxyHealthState` contains:
+- `unhealthy: DashMap<"host:port", u64>` — targets this proxy considers unhealthy
+- `states: DashMap<"host:port", Arc<TargetHealth>>` — failure/success counters for this proxy
+
+This means proxy A sending large payloads that trigger 500s will only mark targets unhealthy in proxy A's own `ProxyHealthState`. Proxy B (sending small payloads that succeed) maintains an independent healthy view of the same targets, even when both proxies share the same upstream.
+
+**Target selection** checks both layers via `HealthContext`:
+```rust
+pub struct HealthContext<'a> {
+    pub active_unhealthy: &'a DashMap<String, u64>,
+    pub proxy_passive: Option<Arc<ProxyHealthState>>,
+}
+```
+
+The `proxy_passive` is resolved once per request via `passive_health.get(proxy_id)` (one outer DashMap lookup, `Arc::clone` ~5ns), then reused for all targets in `healthy_targets()`. Each target check is two O(1) DashMap lookups using pre-computed keys:
+1. `active_unhealthy.contains_key(&target_keys[i])` — pre-computed `upstream_id::host:port`
+2. `proxy_passive.unhealthy.contains_key(&host_port_keys[i])` — pre-computed `host:port`
+
+No composite key construction, no thread-local buffers, no string formatting on the hot path.
+
+**Key design rules:**
+- **Never merge active and passive state into a single map.** Active probes are proxy-agnostic (same ping for everyone). Passive failures are proxy-specific (different payloads → different outcomes). Merging them causes cross-proxy contamination.
+- **Never key passive state by `upstream_id`.** Two proxies sharing the same upstream must have independent passive health state. The isolation boundary is the proxy, not the upstream.
+- **The `ProxyHealthState` inner maps use plain `host:port` keys** (not `upstream_id::host:port`). Since a proxy has at most one `upstream_id`, the proxy_id partition already provides uniqueness.
+- **`report_response()` takes `proxy_id`** (not `upstream_id`). The proxy is the isolation boundary for passive health.
+- **`remove_stale_targets()` cleans both layers**: active entries by exact `upstream_id::host:port` match, passive entries by iterating each proxy's inner map and retaining only current `host:port` targets.
+- **Passive recovery timer** iterates all proxies' inner maps, checking `host:port` suffix matches against the upstream's targets. Runs in a background task (not hot path).
 
 ### Performance Optimization Lessons
 

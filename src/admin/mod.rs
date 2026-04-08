@@ -2542,18 +2542,30 @@ fn build_metrics(state: &AdminState) -> Value {
             })
             .collect();
 
-        // Health check
-        let unhealthy_targets: Vec<Value> = ps
+        // Health check — merge active (upstream-scoped) and passive (proxy-scoped) maps
+        let mut unhealthy_targets: Vec<Value> = ps
             .health_checker
-            .unhealthy_targets
+            .active_unhealthy_targets
             .iter()
             .map(|entry| {
                 json!({
                     "target": entry.key().clone(),
+                    "type": "active",
                     "since_epoch_ms": *entry.value(),
                 })
             })
             .collect();
+        for proxy_entry in ps.health_checker.passive_health.iter() {
+            let proxy_id = proxy_entry.key();
+            for target_entry in proxy_entry.value().unhealthy.iter() {
+                unhealthy_targets.push(json!({
+                    "proxy_id": proxy_id.clone(),
+                    "target": target_entry.key().clone(),
+                    "type": "passive",
+                    "since_epoch_ms": *target_entry.value(),
+                }));
+            }
+        }
 
         // Load balancers
         let lb_snapshot = ps.load_balancer_cache.active_connections_snapshot();

@@ -4,12 +4,30 @@
 //! least connections, least latency, consistent hashing, and random.
 
 use crate::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+/// Health context passed to target selection, bundling both active (shared
+/// per-upstream) and passive (per-proxy) unhealthy target state.
+///
+/// A target is filtered out if it appears in EITHER:
+/// - `active_unhealthy`: keyed by `upstream_id::host:port` (matches `LoadBalancer.target_keys`)
+/// - `proxy_passive`: the calling proxy's `ProxyHealthState.unhealthy` map,
+///   keyed by plain `host:port` (matches `LoadBalancer.host_port_keys`) —
+///   resolved once via the outer `passive_health` DashMap before calling `select_target`
+pub struct HealthContext<'a> {
+    pub active_unhealthy: &'a DashMap<String, u64>,
+    /// Pre-resolved per-proxy passive health state. `None` means no passive
+    /// failures have been recorded for this proxy (all targets healthy).
+    /// Resolved from `HealthChecker.passive_health.get(proxy_id)` at the call
+    /// site — one outer DashMap lookup amortized across all targets.
+    pub proxy_passive: Option<Arc<ProxyHealthState>>,
+}
 
 /// Parsed strategy for resolving the hash key used by consistent hashing.
 /// Pre-computed at config-reload time so the request path does no string parsing.
@@ -123,6 +141,7 @@ impl LoadBalancerCache {
             map.insert(
                 upstream.id.clone(),
                 Arc::new(LoadBalancer::new(
+                    &upstream.id,
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
@@ -173,6 +192,7 @@ impl LoadBalancerCache {
             new_balancers.insert(
                 upstream.id.clone(),
                 Arc::new(LoadBalancer::new(
+                    &upstream.id,
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
@@ -209,7 +229,12 @@ impl LoadBalancerCache {
         let mut new_balancers = self.balancers.load().as_ref().clone();
         new_balancers.insert(
             upstream_id.to_string(),
-            Arc::new(LoadBalancer::new(algorithm, &new_targets, hash_on)),
+            Arc::new(LoadBalancer::new(
+                upstream_id,
+                algorithm,
+                &new_targets,
+                hash_on,
+            )),
         );
         self.balancers.store(Arc::new(new_balancers));
 
@@ -237,15 +262,19 @@ impl LoadBalancerCache {
     ///
     /// Returns a [`TargetSelection`] indicating whether the target came from
     /// the healthy pool or is a degraded-mode fallback (all targets unhealthy).
+    ///
+    /// When `health` is provided, targets appearing in either the active
+    /// unhealthy map (upstream-wide probe failures) or the passive unhealthy
+    /// map (per-proxy traffic failures) are filtered out.
     pub fn select_target(
         &self,
         upstream_id: &str,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, u64>>,
+        health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
-        balancer.select(ctx_key, unhealthy)
+        balancer.select(ctx_key, health)
     }
 
     /// Select next target, excluding a previously tried target (for retries).
@@ -254,11 +283,11 @@ impl LoadBalancerCache {
         upstream_id: &str,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, u64>>,
+        health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
-        balancer.select_excluding(ctx_key, exclude, unhealthy)
+        balancer.select_excluding(ctx_key, exclude, health)
     }
 
     /// Snapshot of active connection counts per upstream for metrics.
@@ -346,15 +375,31 @@ impl LoadBalancerCache {
     }
 }
 
-pub fn target_key(target: &UpstreamTarget) -> String {
+/// Build a health-check-scoped key ("upstream_id::host:port") for a target.
+/// Used by `LoadBalancer::target_keys` and `HealthChecker` to scope health
+/// state per-upstream, preventing cross-upstream contamination when different
+/// upstreams contain overlapping host:port targets.
+pub fn target_key(upstream_id: &str, target: &UpstreamTarget) -> String {
+    format!("{}::{}:{}", upstream_id, target.host, target.port)
+}
+
+/// Build a plain "host:port" key for a target (no upstream scoping).
+/// Used for sticky session cookies, active connection tracking, latency EWMA,
+/// and other contexts where the key is already scoped to a single LoadBalancer.
+pub fn target_host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
 /// Per-upstream load balancer with algorithm-specific state.
 pub struct LoadBalancer {
     targets: Vec<Arc<UpstreamTarget>>,
-    /// Pre-computed "host:port" keys for each target, avoiding format!() per request.
+    /// Pre-computed "upstream_id::host:port" keys for each target, matching the
+    /// format used by `HealthChecker.unhealthy_targets` for O(1) health filtering.
     target_keys: Vec<String>,
+    /// Pre-computed "host:port" keys (no upstream scope) for internal use by
+    /// active_connections, latency_ewma, and find_target_key lookups that are
+    /// already scoped to this LoadBalancer instance.
+    host_port_keys: Vec<String>,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin counter.
     rr_counter: AtomicU64,
@@ -381,18 +426,21 @@ pub struct LoadBalancer {
 
 impl LoadBalancer {
     pub fn new(
+        upstream_id: &str,
         algorithm: LoadBalancerAlgorithm,
         targets: &[UpstreamTarget],
         hash_on: Option<String>,
     ) -> Self {
         let wrr_weights: Vec<i64> = vec![0; targets.len()];
-        // Pre-compute target keys once at build time, not per-request
-        let target_keys: Vec<String> = targets.iter().map(target_key).collect();
+        // Pre-compute host:port keys for internal use (active connections, latency, hash ring)
+        let host_port_keys: Vec<String> = targets.iter().map(target_host_port_key).collect();
+        // Pre-compute upstream-scoped keys for health check filtering (matches HealthChecker key format)
+        let target_keys: Vec<String> = targets.iter().map(|t| target_key(upstream_id, t)).collect();
 
         // Build consistent hash ring with virtual nodes
         let mut hash_ring = Vec::new();
         if algorithm == LoadBalancerAlgorithm::ConsistentHashing {
-            for (idx, key) in target_keys.iter().enumerate() {
+            for (idx, key) in host_port_keys.iter().enumerate() {
                 // 150 virtual nodes per target for better distribution
                 for vnode in 0..150 {
                     let vnode_key = format!("{}:{}", key, vnode);
@@ -408,7 +456,7 @@ impl LoadBalancer {
         let latency_ewma = DashMap::new();
         let latency_sample_count = DashMap::new();
         if algorithm == LoadBalancerAlgorithm::LeastLatency {
-            for key in &target_keys {
+            for key in &host_port_keys {
                 latency_ewma.insert(key.clone(), AtomicU64::new(LATENCY_UNSET));
                 latency_sample_count.insert(key.clone(), AtomicU64::new(0));
             }
@@ -419,6 +467,7 @@ impl LoadBalancer {
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
+            host_port_keys,
             algorithm,
             rr_counter: AtomicU64::new(0),
             wrr_state: std::sync::Mutex::new(wrr_weights),
@@ -529,33 +578,49 @@ impl LoadBalancer {
         }
     }
 
-    /// Find the pre-computed target key for a target without allocating.
-    /// Uses a linear scan of the (typically 2-5 element) targets vec, which is
-    /// faster than a HashMap lookup that requires cloning the host String.
+    /// Find the pre-computed host:port key for a target without allocating.
+    /// Returns the internal (non-upstream-scoped) key used for active connections,
+    /// latency EWMA, and hash ring lookups within this LoadBalancer instance.
     fn find_target_key(&self, target: &UpstreamTarget) -> Option<&str> {
         for (i, t) in self.targets.iter().enumerate() {
             if t.host == target.host && t.port == target.port {
-                return Some(self.target_keys[i].as_str());
+                return Some(self.host_port_keys[i].as_str());
             }
         }
         None
     }
 
-    /// Build a bitmask of healthy target indices. Avoids per-request Vec allocation.
     /// Collect healthy targets into a Vec for selection by any algorithm.
+    ///
+    /// A target is unhealthy if it appears in EITHER:
+    /// - The active unhealthy map (upstream-wide probe failure) — checked via
+    ///   pre-computed `target_keys` ("upstream_id::host:port"), O(1) DashMap lookup.
+    /// - The proxy's passive unhealthy map (per-proxy traffic failure) — checked
+    ///   via pre-computed `host_port_keys` ("host:port"), O(1) inner DashMap lookup.
+    ///   The outer DashMap lookup (by proxy_id) is done once at the call site and
+    ///   the resolved `ProxyHealthState` is passed in via `HealthContext`.
     fn healthy_targets(
         &self,
-        unhealthy: Option<&DashMap<String, u64>>,
+        health: Option<&HealthContext<'_>>,
     ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
         self.targets
             .iter()
             .enumerate()
             .filter(|(i, _)| {
-                if let Some(unhealthy_set) = unhealthy {
-                    !unhealthy_set.contains_key(&self.target_keys[*i])
-                } else {
-                    true
+                if let Some(h) = health {
+                    // Active: pre-computed "upstream_id::host:port" key
+                    if h.active_unhealthy.contains_key(&self.target_keys[*i]) {
+                        return false;
+                    }
+                    // Passive: direct "host:port" lookup in proxy's own map
+                    if h.proxy_passive
+                        .as_ref()
+                        .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[*i]))
+                    {
+                        return false;
+                    }
                 }
+                true
             })
             .collect()
     }
@@ -563,9 +628,9 @@ impl LoadBalancer {
     pub fn select(
         &self,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, u64>>,
+        health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let healthy = self.healthy_targets(unhealthy);
+        let healthy = self.healthy_targets(health);
         if healthy.is_empty() {
             // Fallback: try all targets if everything is unhealthy
             if self.targets.is_empty() {
@@ -639,7 +704,7 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, u64>>,
+        health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
         // Find the exclude target's index via linear scan (avoids host.clone() allocation)
         let exclude_idx = self
@@ -657,11 +722,18 @@ impl LoadBalancer {
                 if exclude_idx.is_some_and(|ei| ei == *i) {
                     return false;
                 }
-                if let Some(unhealthy_set) = unhealthy {
-                    !unhealthy_set.contains_key(&self.target_keys[*i])
-                } else {
-                    true
+                if let Some(h) = health {
+                    if h.active_unhealthy.contains_key(&self.target_keys[*i]) {
+                        return false;
+                    }
+                    if h.proxy_passive
+                        .as_ref()
+                        .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[*i]))
+                    {
+                        return false;
+                    }
                 }
+                true
             })
             .collect();
 
@@ -748,7 +820,7 @@ impl LoadBalancer {
         let mut best = &candidates[0];
 
         for candidate in candidates {
-            let key = &self.target_keys[candidate.0];
+            let key = &self.host_port_keys[candidate.0];
             let conns = self
                 .active_connections
                 .get(key)
@@ -795,7 +867,7 @@ impl LoadBalancer {
         let mut warmed_count = 0usize;
         let mut any_has_data = false;
         for (idx, _) in candidates {
-            let key = &self.target_keys[*idx];
+            let key = &self.host_port_keys[*idx];
             let samples = self
                 .latency_sample_count
                 .get(key)
@@ -827,7 +899,7 @@ impl LoadBalancer {
             candidates
                 .iter()
                 .filter_map(|(idx, _)| {
-                    let key = &self.target_keys[*idx];
+                    let key = &self.host_port_keys[*idx];
                     self.latency_ewma
                         .get(key)
                         .map(|v| v.load(Ordering::Relaxed))
@@ -846,7 +918,7 @@ impl LoadBalancer {
         let mut best = &candidates[0];
 
         for candidate in candidates {
-            let key = &self.target_keys[candidate.0];
+            let key = &self.host_port_keys[candidate.0];
             let samples = self
                 .latency_sample_count
                 .get(key)

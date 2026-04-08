@@ -3,8 +3,20 @@
 use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
-use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache, target_key};
+use ferrum_edge::load_balancer::{
+    HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key,
+};
 use std::collections::HashMap;
+
+const TEST_UPSTREAM: &str = "test-upstream";
+
+/// Helper to build a HealthContext for tests that only need active unhealthy filtering.
+fn active_health_ctx(active: &DashMap<String, u64>) -> HealthContext<'_> {
+    HealthContext {
+        active_unhealthy: active,
+        proxy_passive: None,
+    }
+}
 use std::sync::atomic::{AtomicI64, Ordering};
 
 fn make_targets(n: usize) -> Vec<UpstreamTarget> {
@@ -41,7 +53,12 @@ fn make_weighted_targets() -> Vec<UpstreamTarget> {
 #[test]
 fn test_round_robin_distributes_evenly() {
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
 
     let mut counts = HashMap::new();
     for _ in 0..300 {
@@ -59,7 +76,12 @@ fn test_round_robin_distributes_evenly() {
 #[test]
 fn test_weighted_round_robin_respects_weights() {
     let targets = make_weighted_targets();
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::WeightedRoundRobin, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
 
     let mut counts = HashMap::new();
     for _ in 0..600 {
@@ -76,7 +98,12 @@ fn test_weighted_round_robin_respects_weights() {
 #[test]
 fn test_consistent_hash_same_key_same_target() {
     let targets = make_targets(5);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::ConsistentHashing, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::ConsistentHashing,
+        &targets,
+        None,
+    );
 
     let first = lb.select("user-123", None).unwrap();
     for _ in 0..100 {
@@ -88,12 +115,17 @@ fn test_consistent_hash_same_key_same_target() {
 #[test]
 fn test_least_connections_prefers_least_loaded() {
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastConnections, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastConnections,
+        &targets,
+        None,
+    );
 
     // Simulate 5 connections to host0
     for _ in 0..5 {
         lb.active_connections
-            .entry(target_key(&targets[0]))
+            .entry(target_host_port_key(&targets[0]))
             .or_insert_with(|| AtomicI64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -106,14 +138,19 @@ fn test_least_connections_prefers_least_loaded() {
 #[test]
 fn test_unhealthy_targets_filtered() {
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
 
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert("host0:8080".to_string(), 0);
+    unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
 
     let mut seen = std::collections::HashSet::new();
     for _ in 0..100 {
-        let sel = lb.select("", Some(&unhealthy)).unwrap();
+        let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
         assert!(
             !sel.is_fallback,
             "Should not be fallback when healthy targets exist"
@@ -129,14 +166,19 @@ fn test_unhealthy_targets_filtered() {
 #[test]
 fn test_all_unhealthy_falls_back_to_all() {
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
 
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert("host0:8080".to_string(), 0);
-    unhealthy.insert("host1:8080".to_string(), 0);
+    unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
+    unhealthy.insert(format!("{}::host1:8080", TEST_UPSTREAM), 0);
 
     // Should still return a target (fallback) and mark it as degraded
-    let sel = lb.select("", Some(&unhealthy));
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy)));
     assert!(sel.is_some());
     assert!(
         sel.unwrap().is_fallback,
@@ -147,7 +189,12 @@ fn test_all_unhealthy_falls_back_to_all() {
 #[test]
 fn test_select_excluding_skips_target() {
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
 
     let exclude = targets[0].clone();
     for _ in 0..100 {
@@ -158,7 +205,7 @@ fn test_select_excluding_skips_target() {
 
 #[test]
 fn test_empty_targets() {
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &[], None);
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::RoundRobin, &[], None);
     assert!(lb.select("", None).is_none());
 }
 
@@ -196,7 +243,12 @@ fn test_least_latency_warmup_uses_round_robin() {
     // During the warm-up phase (< 5 samples per target), least-latency
     // should distribute traffic via round-robin to collect baselines.
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Record only 2 samples for host0 — not enough for warm-up to complete
     for _ in 0..2 {
@@ -228,7 +280,12 @@ fn test_least_latency_warmup_uses_round_robin() {
 fn test_least_latency_prefers_lowest_latency_after_warmup() {
     // After warm-up completes, traffic should go to the lowest-latency target.
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Complete warm-up for all targets with distinct latencies:
     // host0: 10ms (10000μs), host1: 1ms (1000μs), host2: 5ms (5000μs)
@@ -259,7 +316,12 @@ fn test_least_latency_ewma_adapts_to_changes() {
     // EWMA should adapt when a target's latency changes, eventually
     // shifting traffic to the new lowest-latency target.
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Phase 1: host0 is fast (1ms), host1 is slow (10ms)
     for _ in 0..10 {
@@ -294,7 +356,12 @@ fn test_least_latency_with_unhealthy_targets() {
     // Least-latency should respect unhealthy target filtering and select
     // the lowest-latency among healthy targets only.
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // host0: 1ms (fastest), host1: 5ms, host2: 10ms
     for _ in 0..10 {
@@ -305,10 +372,10 @@ fn test_least_latency_with_unhealthy_targets() {
 
     // Mark host0 (fastest) as unhealthy
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert("host0:8080".to_string(), 0);
+    unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
 
     // Should select host1 (next lowest latency) among healthy targets
-    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
     assert!(!sel.is_fallback);
     assert_eq!(
         sel.target.host, "host1",
@@ -322,7 +389,12 @@ fn test_least_latency_fallback_when_all_unhealthy() {
     // When all targets are unhealthy, least-latency should still select
     // a target (fallback mode) and mark it as degraded.
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Record some latency data
     for _ in 0..10 {
@@ -331,10 +403,10 @@ fn test_least_latency_fallback_when_all_unhealthy() {
     }
 
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert("host0:8080".to_string(), 0);
-    unhealthy.insert("host1:8080".to_string(), 0);
+    unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
+    unhealthy.insert(format!("{}::host1:8080", TEST_UPSTREAM), 0);
 
-    let sel = lb.select("", Some(&unhealthy));
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy)));
     assert!(
         sel.is_some(),
         "Should return a target even when all unhealthy"
@@ -350,7 +422,12 @@ fn test_least_latency_select_excluding() {
     // select_excluding should work correctly with least-latency, skipping
     // the excluded target and selecting the next-lowest-latency target.
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // host0: 1ms (fastest), host1: 5ms, host2: 10ms
     for _ in 0..10 {
@@ -372,7 +449,12 @@ fn test_least_latency_select_excluding() {
 fn test_least_latency_record_latency_first_sample_seeds_ewma() {
     // The first latency sample should set the EWMA directly, not smooth it.
     let targets = make_targets(1);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     lb.record_latency(&targets[0], 5_000); // 5ms
 
@@ -396,7 +478,12 @@ fn test_least_latency_ewma_smoothing() {
     // Verify that the EWMA smoothing formula works correctly.
     // EWMA = 0.3 * new + 0.7 * old (using fixed-point: 300/1000 and 700/1000)
     let targets = make_targets(1);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Seed: 10000μs
     lb.record_latency(&targets[0], 10_000);
@@ -429,7 +516,12 @@ fn test_least_latency_reset_recovered_target() {
     // When a target recovers from unhealthy, its EWMA should be reset to the
     // current minimum, giving it a fair chance at traffic.
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // host0: 50ms (slow), host1: 5ms (fast)
     for _ in 0..10 {
@@ -524,7 +616,12 @@ fn test_least_latency_no_data_falls_back_to_round_robin() {
     // When latency_ewma has been initialized but no samples recorded (all UNSET),
     // warm-up round-robin should be used.
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // No latency data recorded — should use round-robin
     let mut counts = HashMap::new();
@@ -547,7 +644,12 @@ fn test_least_latency_no_data_falls_back_to_round_robin() {
 
 #[test]
 fn test_least_latency_empty_targets() {
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &[], None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &[],
+        None,
+    );
     assert!(lb.select("", None).is_none());
 }
 
@@ -555,7 +657,12 @@ fn test_least_latency_empty_targets() {
 fn test_least_latency_single_target() {
     // With a single target, least-latency should always return it.
     let targets = make_targets(1);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     for _ in 0..5 {
         lb.record_latency(&targets[0], 5_000);
@@ -574,11 +681,16 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
     // When the unhealthy target later recovers and joins the healthy pool,
     // it should NOT force the entire upstream back into round-robin warm-up.
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Mark host2 as unhealthy from the start
     let unhealthy: DashMap<String, u64> = DashMap::new();
-    unhealthy.insert("host2:8080".to_string(), 0);
+    unhealthy.insert(format!("{}::host2:8080", TEST_UPSTREAM), 0);
 
     // Complete warm-up for host0 and host1 only (host2 is unhealthy, gets no traffic)
     // host0: 10ms, host1: 2ms
@@ -588,20 +700,20 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
     }
 
     // With host2 unhealthy, latency-based selection should work for host0/host1
-    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
     assert_eq!(
         sel.target.host, "host1",
         "Should prefer host1 (lowest latency among healthy targets)"
     );
 
     // Now host2 recovers — remove from unhealthy set
-    unhealthy.remove("host2:8080");
+    unhealthy.remove(&format!("{}::host2:8080", TEST_UPSTREAM));
 
     // host2 has 0 samples, but host0/host1 are warmed up.
     // The algorithm should NOT regress to round-robin for all traffic.
     // Instead, host2 should be slightly favored (min EWMA - 1) to get
     // traffic and establish a real baseline.
-    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
     assert_eq!(
         sel.target.host, "host2",
         "Recovered host2 should be slightly favored as a late joiner to establish baseline, got {}",
@@ -615,7 +727,7 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
         lb.record_latency(&targets[2], 8_000); // 8ms > host1's 2ms
     }
 
-    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
     assert_eq!(
         sel.target.host, "host1",
         "After host2 warms up with higher latency, host1 should be preferred again"
@@ -628,7 +740,12 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
     // unhealthy), the existing latency-based routing should continue uninterrupted.
     // The new target should get a fair share via optimistic EWMA estimation.
     let targets = make_targets(2);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     // Complete warm-up: host0: 20ms, host1: 5ms
     for _ in 0..10 {
@@ -672,7 +789,12 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
 fn test_least_latency_record_for_nonexistent_target() {
     // Recording latency for a target not in the balancer should be a no-op.
     let targets = make_targets(1);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
 
     let phantom = UpstreamTarget {
         host: "nonexistent".into(),
@@ -740,6 +862,7 @@ fn test_hash_on_strategy_parse_cookie() {
 fn test_hash_on_strategy_stored_in_load_balancer() {
     let targets = make_targets(2);
     let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
         LoadBalancerAlgorithm::ConsistentHashing,
         &targets,
         Some("header:x-tenant".to_string()),
@@ -756,6 +879,7 @@ fn test_consistent_hash_different_keys_different_targets() {
     // (with high probability) map to different targets.
     let targets = make_targets(10);
     let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
         LoadBalancerAlgorithm::ConsistentHashing,
         &targets,
         Some("header:x-user".to_string()),
@@ -778,7 +902,12 @@ fn test_consistent_hash_different_keys_different_targets() {
 #[test]
 fn test_consistent_hash_sticky_same_key_same_target() {
     let targets = make_targets(5);
-    let lb = LoadBalancer::new(LoadBalancerAlgorithm::ConsistentHashing, &targets, None);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::ConsistentHashing,
+        &targets,
+        None,
+    );
 
     // Same key should always map to the same target
     let first = lb.select("sticky-user-123", None).unwrap();
