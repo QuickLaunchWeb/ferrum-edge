@@ -161,25 +161,36 @@ impl JwksAuth {
                 let store = get_or_create_jwks_store(uri, &http_client, refresh_interval);
                 jwks_store_slot.store(Arc::new(Some(store)));
             } else if let Some(ref disc_url) = discovery_url {
-                // OIDC discovery — resolve jwks_uri asynchronously with retries.
-                // Transient failures (network blip, IdP restart) should not
-                // permanently disable the provider.
+                // OIDC discovery — resolve jwks_uri asynchronously with
+                // indefinite retries. The background task keeps trying with
+                // exponential backoff (2s → 4s → … → 60s cap) until discovery
+                // succeeds. Once resolved, the JwksKeyStore's own background
+                // refresh task takes over for periodic key rotation.
+                //
+                // This ensures a prolonged IdP outage during gateway startup
+                // does not permanently disable the provider — it self-heals
+                // as soon as the IdP comes back.
+                //
+                // Auth behavior while discovery is pending: tokens destined
+                // for this provider are rejected with 401 (fail closed).
                 let slot = jwks_store_slot.clone();
                 let client = http_client.clone();
                 let url = disc_url.clone();
                 let interval = refresh_interval;
                 tokio::spawn(async move {
-                    const MAX_RETRIES: u32 = 5;
                     const INITIAL_BACKOFF_SECS: u64 = 2;
+                    const MAX_BACKOFF_SECS: u64 = 60;
 
-                    let mut last_err = String::new();
-                    for attempt in 0..=MAX_RETRIES {
+                    let mut attempt: u32 = 0;
+                    loop {
                         if attempt > 0 {
-                            let backoff =
-                                Duration::from_secs(INITIAL_BACKOFF_SECS << (attempt - 1).min(4));
+                            let backoff_secs = INITIAL_BACKOFF_SECS
+                                .saturating_mul(1u64 << (attempt - 1).min(5))
+                                .min(MAX_BACKOFF_SECS);
+                            let backoff = Duration::from_secs(backoff_secs);
                             warn!(
-                                "jwks_auth OIDC discovery attempt {}/{} failed: {} — retrying in {:?}",
-                                attempt, MAX_RETRIES, last_err, backoff
+                                "jwks_auth OIDC discovery attempt {} failed — retrying in {:?}",
+                                attempt, backoff
                             );
                             tokio::time::sleep(backoff).await;
                         }
@@ -194,14 +205,16 @@ impl JwksAuth {
                                 return;
                             }
                             Err(e) => {
-                                last_err = e;
+                                if attempt == 0 {
+                                    warn!(
+                                        "jwks_auth OIDC discovery failed: {} — will keep retrying in background",
+                                        e
+                                    );
+                                }
                             }
                         }
+                        attempt = attempt.saturating_add(1);
                     }
-                    warn!(
-                        "jwks_auth OIDC discovery failed after {} retries: {} — provider will be unavailable until gateway restart",
-                        MAX_RETRIES, last_err
-                    );
                 });
             }
 
