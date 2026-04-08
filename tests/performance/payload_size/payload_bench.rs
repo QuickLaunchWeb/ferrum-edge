@@ -683,6 +683,7 @@ async fn run_udp(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMetri
             }
 
             let mut buf = vec![0u8; 65535];
+            let recv_timeout = Duration::from_secs(2);
 
             while Instant::now() < deadline {
                 let start = Instant::now();
@@ -690,12 +691,13 @@ async fn run_udp(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMetri
                     metrics.record_error();
                     continue;
                 }
-                match sock.recv(&mut buf).await {
-                    Ok(n) => {
+                // Timeout on recv to avoid hanging on lost datagrams
+                match tokio::time::timeout(recv_timeout, sock.recv(&mut buf)).await {
+                    Ok(Ok(n)) => {
                         let latency = start.elapsed().as_micros() as u64;
                         metrics.record(latency, n);
                     }
-                    Err(_) => metrics.record_error(),
+                    _ => metrics.record_error(),
                 }
             }
             metrics

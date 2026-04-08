@@ -25,6 +25,10 @@ bash run_payload_test.sh all-protocols --duration 10
 
 # Skip rebuild for iteration
 bash run_payload_test.sh grpc --skip-build --duration 15
+
+# Compare Ferrum Edge vs Envoy (requires: brew install envoy)
+bash run_payload_test.sh json --envoy --duration 15
+bash run_payload_test.sh tier1 --envoy
 ```
 
 ## Content Type Tiers
@@ -55,6 +59,8 @@ bash run_payload_test.sh grpc --skip-build --duration 15
 
 ## Payload Sizes
 
+**HTTP / gRPC / WebSocket** — full range:
+
 | Label | Bytes | Use Case |
 |---|---|---|
 | 10KB | 10,240 | Typical JSON API response |
@@ -64,6 +70,16 @@ bash run_payload_test.sh grpc --skip-build --duration 15
 | 5MB | 5,242,880 | Image upload, data export |
 | 9MB | 9,437,184 | Large file upload, video thumbnail |
 
+**TCP** — capped at 1MB (synchronous write/read_exact at 100 concurrency stalls at larger sizes):
+
+| Sizes | 10KB, 50KB, 100KB, 1MB |
+|---|---|
+
+**UDP** — realistic datagram sizes (must fit in a single datagram, fragmentation degrades at >MTU):
+
+| Sizes | 64B, 512B, 1KB, 4KB |
+|---|---|
+
 ## Options
 
 | Flag | Default | Description |
@@ -71,6 +87,7 @@ bash run_payload_test.sh grpc --skip-build --duration 15
 | `--duration <SECS>` | 15 | Test duration per size point |
 | `--concurrency <N>` | 100 | Concurrent connections |
 | `--sizes <S1,S2,...>` | 10kb,50kb,100kb,1mb,5mb,9mb | Comma-separated size list |
+| `--envoy` | false | Compare Ferrum Edge against Envoy side-by-side |
 | `--skip-build` | false | Skip cargo build step |
 | `--skip-direct` | false | Skip direct-to-backend baseline |
 | `--json` | false | Machine-readable JSON output |
