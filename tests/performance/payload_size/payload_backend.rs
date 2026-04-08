@@ -392,6 +392,9 @@ async fn run_grpc_server(port: u16) -> anyhow::Result<()> {
     eprintln!("[backend] gRPC server listening on {addr}");
 
     tonic::transport::Server::builder()
+        .initial_stream_window_size(8 * 1024 * 1024) // 8 MiB
+        .initial_connection_window_size(32 * 1024 * 1024) // 32 MiB
+        .tcp_nodelay(true)
         .add_service(
             BenchServiceServer::new(BenchServiceImpl)
                 .max_decoding_message_size(64 * 1024 * 1024)

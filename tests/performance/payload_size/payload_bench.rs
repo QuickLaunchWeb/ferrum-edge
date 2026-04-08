@@ -334,12 +334,15 @@ async fn run_http2(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMet
             };
 
             let io = TokioIo::new(tls_stream);
-            let (sender, conn) = match hyper::client::conn::http2::handshake(
+            let mut h2_builder = hyper::client::conn::http2::Builder::new(
                 hyper_util::rt::TokioExecutor::new(),
-                io,
-            )
-            .await
-            {
+            );
+            h2_builder
+                .initial_stream_window_size(8 * 1024 * 1024) // 8 MiB
+                .initial_connection_window_size(32 * 1024 * 1024) // 32 MiB
+                .adaptive_window(true)
+                .max_frame_size(1_048_576); // 1 MiB
+            let (sender, conn) = match h2_builder.handshake(io).await {
                 Ok(pair) => pair,
                 Err(_) => return combined,
             };
@@ -506,6 +509,8 @@ async fn run_grpc(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMetr
 
     let channel = tonic::transport::Channel::from_shared(cli.target.clone())?
         .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_while_idle(true)
+        .tcp_nodelay(true)
         .initial_stream_window_size(8 * 1024 * 1024)
         .initial_connection_window_size(32 * 1024 * 1024)
         .connect()

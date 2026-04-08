@@ -320,17 +320,31 @@ start_gateway() {
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \
     FERRUM_ADMIN_HTTPS_PORT=9443 \
-    FERRUM_POOL_WARMUP_ENABLED=true \
-    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
     FERRUM_ADD_VIA_HEADER=false \
     FERRUM_TLS_NO_VERIFY=true \
-    FERRUM_MAX_GRPC_RECV_SIZE_BYTES=67108864 \
+    FERRUM_POOL_WARMUP_ENABLED=true \
+    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+    FERRUM_POOL_CLEANUP_INTERVAL_SECONDS=30 \
+    FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608 \
+    FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432 \
+    FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true \
+    FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576 \
+    FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
     FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000 \
-    FERRUM_FRONTEND_TLS_CERT_PATH="$SCRIPT_DIR/certs/cert.pem" \
-    FERRUM_FRONTEND_TLS_KEY_PATH="$SCRIPT_DIR/certs/key.pem" \
+    FERRUM_MAX_GRPC_RECV_SIZE_BYTES=67108864 \
     FERRUM_GRPC_POOL_READY_WAIT_MS=1 \
+    FERRUM_HTTP3_MAX_STREAMS=1000 \
+    FERRUM_HTTP3_STREAM_RECEIVE_WINDOW=8388608 \
+    FERRUM_HTTP3_RECEIVE_WINDOW=33554432 \
+    FERRUM_HTTP3_SEND_WINDOW=8388608 \
+    FERRUM_HTTP3_CONNECTIONS_PER_BACKEND=4 \
+    FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS=120 \
     FERRUM_UDP_MAX_SESSIONS=10000 \
     FERRUM_UDP_CLEANUP_INTERVAL_SECONDS=10 \
+    FERRUM_FRONTEND_TLS_CERT_PATH="$SCRIPT_DIR/certs/cert.pem" \
+    FERRUM_FRONTEND_TLS_KEY_PATH="$SCRIPT_DIR/certs/key.pem" \
         "$GATEWAY_BIN" > /dev/null 2>&1 &
     GATEWAY_PID=$!
     wait_for_health "http://127.0.0.1:9000/health" "Gateway"
@@ -609,7 +623,7 @@ run_envoy_comparison() {
             elif [ "$(echo "$ev_rps > $fe_rps" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
                 winner="ENVOY"
                 if [ "$(echo "$fe_rps > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-                    overhead=$(printf "-%.1f%%" "$(echo "(($ev_rps - $fe_rps) / $fe_rps) * 100" | bc -l 2>/dev/null || echo 0)")
+                    overhead=$(printf -- "-%.1f%%" "$(echo "(($ev_rps - $fe_rps) / $fe_rps) * 100" | bc -l 2>/dev/null || echo 0)")
                 fi
             fi
 
