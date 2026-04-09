@@ -38,7 +38,7 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 /// Maximum datagrams to drain per recv wakeup via `try_recv_from` before yielding
 /// back to the async runtime. Configurable via `FERRUM_UDP_RECV_BATCH_LIMIT`.
-/// Default: 6000 (matches Envoy's MAX_NUM_PACKETS_PER_EVENT_LOOP).
+/// Default: 6000
 static RECV_BATCH_LIMIT: AtomicU64 = AtomicU64::new(6000);
 
 /// Metrics for a single UDP proxy listener.
