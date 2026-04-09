@@ -2570,6 +2570,22 @@ async fn run_websocket_proxy(
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     max_websocket_frame_size_bytes: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // When no plugins need frame-level hooks, bypass WebSocket frame parsing
+    // entirely and do raw TCP bidirectional copy (same approach as Envoy after
+    // HTTP upgrade negotiation). This avoids per-frame header parsing, masking
+    // validation, and opcode dispatch — critical for large frames (9 MB+).
+    if ws_frame_plugins.is_empty() {
+        debug!(
+            proxy_id = %proxy_id,
+            connection_id,
+            "WebSocket tunnel mode: no frame plugins, using raw bidirectional copy"
+        );
+        let mut client = TokioIo::new(upgraded);
+        let mut backend = backend_ws_stream.into_inner();
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+        return Ok(());
+    }
+
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
