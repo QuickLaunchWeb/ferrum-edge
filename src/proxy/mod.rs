@@ -3044,26 +3044,22 @@ async fn run_accept_loop(
     _thread_id: usize,
 ) {
     loop {
-        // Overload check: reject new connections under critical pressure.
-        // Single atomic load (~1ns), branch predictor learns "always false" quickly.
-        if state
-            .overload
-            .reject_new_connections
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // Accept and immediately drop to send TCP RST, then yield briefly
-            // to avoid busy-looping when the overload condition persists.
-            if let Ok((stream, _)) = listener.accept().await {
-                drop(stream);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            continue;
-        }
-
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        // Overload check: reject new connections under critical
+                        // pressure. Checked after accept (inside the select!) so
+                        // shutdown_rx is always observed even during sustained
+                        // overload. Single atomic load (~1ns).
+                        if state
+                            .overload
+                            .reject_new_connections
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            drop(stream); // TCP RST
+                            continue;
+                        }
                         let state = state.clone();
                         let tls_config = tls_config.clone();
                         let semaphore = conn_semaphore.clone();
