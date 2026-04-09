@@ -49,6 +49,13 @@ pub struct RecvMmsgBatch {
 #[cfg(target_os = "linux")]
 const MAX_DGRAM_SIZE: usize = 65535;
 
+// SAFETY: The raw pointers in `iovecs` (`*mut c_void`) and `msgs` (`*mut iovec`)
+// point into `Vec` buffers owned by the same struct. They are only dereferenced
+// inside `recv()` which rebuilds them from scratch before each `recvmmsg` call.
+// The struct is exclusively owned by a single tokio task (the UDP listener loop).
+#[cfg(target_os = "linux")]
+unsafe impl Send for RecvMmsgBatch {}
+
 #[cfg(target_os = "linux")]
 impl RecvMmsgBatch {
     /// Create a new batch with pre-allocated buffers for `capacity` datagrams.
