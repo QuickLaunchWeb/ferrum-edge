@@ -471,6 +471,8 @@ pub struct ProxyState {
     pub max_query_params: usize,
     pub max_grpc_recv_size_bytes: usize,
     pub max_websocket_frame_size_bytes: usize,
+    pub websocket_write_buffer_size: usize,
+    pub websocket_tunnel_mode: bool,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -530,6 +532,8 @@ impl ProxyState {
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
         let max_websocket_frame_size_bytes = env_config.max_websocket_frame_size_bytes;
+        let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
+        let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
@@ -642,6 +646,7 @@ impl ProxyState {
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
+            env_config_arc.udp_recv_batch_limit,
             tls_policy_arc.clone(),
             crls.clone(),
         ));
@@ -689,6 +694,8 @@ impl ProxyState {
             max_query_params,
             max_grpc_recv_size_bytes,
             max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
+            websocket_tunnel_mode,
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
@@ -1973,6 +1980,7 @@ async fn handle_websocket_request_authenticated(
             state.tls_policy.as_deref(),
             &state.crls,
             state.max_websocket_frame_size_bytes,
+            state.websocket_write_buffer_size,
         )
         .await
         {
@@ -2258,6 +2266,8 @@ async fn handle_websocket_request_authenticated(
     let proxy_id = proxy.id.clone();
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let max_ws_frame = state.max_websocket_frame_size_bytes;
+    let ws_write_buf = state.websocket_write_buffer_size;
+    let ws_tunnel = state.websocket_tunnel_mode;
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -2269,6 +2279,8 @@ async fn handle_websocket_request_authenticated(
                     ws_frame_plugins,
                     ws_connection_permit,
                     max_ws_frame,
+                    ws_write_buf,
+                    ws_tunnel,
                 )
                 .await
                 {
@@ -2499,6 +2511,7 @@ fn build_websocket_tls_connector(
 
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream, or an error if the backend is unreachable.
+#[allow(clippy::too_many_arguments)]
 async fn connect_websocket_backend(
     backend_url: &str,
     proxy: &Proxy,
@@ -2507,6 +2520,7 @@ async fn connect_websocket_backend(
     tls_policy: Option<&TlsPolicy>,
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
@@ -2514,6 +2528,7 @@ async fn connect_websocket_backend(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.write_buffer_size = websocket_write_buffer_size;
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -2561,6 +2576,9 @@ async fn connect_websocket_backend(
 /// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
 /// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
 /// when no plugin on this proxy needs frame inspection.
+/// `websocket_tunnel_mode` — when true and no frame plugins are configured, bypass
+/// WebSocket frame parsing and use raw TCP bidirectional copy for maximum throughput.
+#[allow(clippy::too_many_arguments)]
 async fn run_websocket_proxy(
     upgraded: Upgraded,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -2569,10 +2587,56 @@ async fn run_websocket_proxy(
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    websocket_tunnel_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
+    // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
+    // avoids per-frame header parsing, masking validation, and opcode dispatch —
+    // critical for large frames (9 MB+). Trade-off: FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES
+    // is not enforced, but data streams through a fixed-size copy buffer so there
+    // is no large-allocation DoS risk.
+    if websocket_tunnel_mode && ws_frame_plugins.is_empty() {
+        debug!(
+            proxy_id = %proxy_id,
+            connection_id,
+            "WebSocket tunnel mode: no frame plugins, using raw bidirectional copy"
+        );
+        // Drain any frames the backend sent piggybacked with the 101 response
+        // before switching to raw mode. This prevents data loss for server-push
+        // protocols that send immediately after the upgrade handshake.
+        use futures_util::StreamExt;
+        let (mut backend_write, mut backend_read) = backend_ws_stream.split();
+        let mut client_io = TokioIo::new(upgraded);
+
+        // Non-blocking drain: read any already-buffered frames and forward them
+        // as raw WebSocket wire bytes via the tungstenite sink → client path.
+        // In practice this is 0 frames for request-response protocols, 1-2 for
+        // server-push protocols (e.g., stock tickers).
+        while let std::task::Poll::Ready(Some(Ok(msg))) = futures_util::poll!(backend_read.next()) {
+            // Re-serialize the frame and write to client via tungstenite's
+            // framing layer so masking/headers are correct.
+            if let Err(e) = backend_write.send(msg).await {
+                warn!(
+                    proxy_id = %proxy_id,
+                    "WebSocket tunnel: failed to flush buffered frame: {e}"
+                );
+                return Ok(());
+            }
+        }
+        // Reunite the backend stream and extract the raw transport
+        let backend_ws = backend_read
+            .reunite(backend_write)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        let mut backend = backend_ws.into_inner();
+        let _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend).await;
+        return Ok(());
+    }
+
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    ws_config.write_buffer_size = websocket_write_buffer_size;
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
@@ -6085,11 +6149,10 @@ async fn proxy_to_backend(
                     );
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
-                    // No size limit — stream body directly via wrap_stream
-                    use futures_util::TryStreamExt;
-                    let stream = http_body_util::BodyStream::new(incoming)
-                        .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
-                    req_builder = req_builder.body(reqwest::Body::wrap_stream(stream));
+                    // No size limit — stream body directly, preserving size_hint
+                    // for Content-Length forwarding (avoids chunked encoding overhead)
+                    req_builder =
+                        req_builder.body(reqwest::Body::wrap(body::SyncBody::new(incoming)));
                 }
             }
             ClientRequestBody::Streaming(original_req) => {

@@ -330,6 +330,26 @@ pub struct EnvConfig {
     pub max_grpc_recv_size_bytes: usize,
     /// Maximum WebSocket frame size in bytes. Applied to both client and backend connections.
     pub max_websocket_frame_size_bytes: usize,
+    /// WebSocket write buffer size in bytes. Controls how much data is buffered
+    /// before flushing to the underlying transport. Larger values reduce syscalls
+    /// for large WS frames but increase per-connection memory. The default (128 KB)
+    /// is optimal for 10KB-100KB payloads. Increase to 4 MB+ for workloads with
+    /// large WS frames (1 MB+). Only applies when frame-level plugins are active;
+    /// tunnel mode uses raw copy_bidirectional which bypasses tungstenite entirely.
+    pub websocket_write_buffer_size: usize,
+    /// When true AND no frame-level plugins are configured on a proxy, bypass
+    /// WebSocket frame parsing entirely and use raw TCP bidirectional copy after
+    /// the upgrade handshake. This avoids per-frame header parsing, masking
+    /// validation, and opcode dispatch — critical for large frames (9 MB+).
+    ///
+    /// Trade-offs when enabled:
+    /// - `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is NOT enforced (data streams
+    ///   through a fixed-size copy buffer, so no large allocation risk)
+    /// - Server-push protocols that send frames piggybacked with the HTTP 101
+    ///   response may lose the first frame (rare in practice)
+    ///
+    /// Default: false (safe, frame-parsed path for all connections)
+    pub websocket_tunnel_mode: bool,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
@@ -442,6 +462,10 @@ pub struct EnvConfig {
     pub udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds (default: 10).
     pub udp_cleanup_interval_seconds: u64,
+    /// Maximum datagrams to drain per recv wakeup before yielding to the async
+    /// runtime. Higher values improve throughput under burst traffic at the cost
+    /// of event loop fairness. Default: 6000 (matches Envoy's per-loop limit).
+    pub udp_recv_batch_limit: usize,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -667,6 +691,8 @@ impl Default for EnvConfig {
             max_query_params: 100,
             max_grpc_recv_size_bytes: 4_194_304,
             max_websocket_frame_size_bytes: 16_777_216,
+            websocket_write_buffer_size: 131_072, // 128 KB
+            websocket_tunnel_mode: false,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             dns_cache_ttl_seconds: 300,
@@ -708,6 +734,7 @@ impl Default for EnvConfig {
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
+            udp_recv_batch_limit: 6_000,
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -921,6 +948,12 @@ impl EnvConfig {
                 "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
                 16_777_216,
             ),
+            websocket_write_buffer_size: resolve_usize(
+                conf,
+                "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE",
+                131_072, // 128 KB — optimal for 10KB-100KB payloads
+            ),
+            websocket_tunnel_mode: resolve_bool(conf, "FERRUM_WEBSOCKET_TUNNEL_MODE", false),
             max_credentials_per_type: resolve_usize(conf, "FERRUM_MAX_CREDENTIALS_PER_TYPE", 2),
             http_header_read_timeout_seconds: resolve_u64(
                 conf,
@@ -1035,6 +1068,7 @@ impl EnvConfig {
                 "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
                 10,
             ),
+            udp_recv_batch_limit: resolve_usize(conf, "FERRUM_UDP_RECV_BATCH_LIMIT", 6_000),
 
             // TLS Hardening
             tls_min_version: resolve_var_or(conf, "FERRUM_TLS_MIN_VERSION", "1.2"),
