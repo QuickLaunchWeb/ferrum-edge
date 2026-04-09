@@ -212,6 +212,8 @@ pub struct UdpListenerConfig {
     /// Maximum datagrams to drain per recv wakeup before yielding to the async
     /// runtime. Higher values improve throughput under burst traffic. Default: 6000.
     pub recv_batch_limit: usize,
+    /// Adaptive buffer tracker for dynamic batch limit sizing.
+    pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -243,6 +245,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         started,
         sni_proxy_ids,
         recv_batch_limit,
+        adaptive_buffer,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -371,6 +374,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     has_datagram_plugins,
                     &crls,
                     sni_proxy_ids.as_deref(),
+                    &adaptive_buffer,
                 )
                 .await;
                 if let Err(e) = result {
@@ -378,7 +382,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 }
 
                 // Drain additional pending datagrams without yielding to the runtime.
-                for _ in 0..recv_batch_limit {
+                let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
+                for _ in 0..batch_limit {
                     match frontend_socket.try_recv_from(&mut buf) {
                         Ok((len2, addr2)) => {
                             batch_dgrams_in += 1;
@@ -409,6 +414,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 has_datagram_plugins,
                                 &crls,
                                 sni_proxy_ids.as_deref(),
+                                &adaptive_buffer,
                             )
                             .await;
                             if let Err(e) = result {
@@ -418,6 +424,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                         Err(_) => break, // WouldBlock — socket drained
                     }
                 }
+
+                // Record batch cycle for adaptive batch limit tuning.
+                adaptive_buffer.record_batch_cycle(&proxy_id, batch_dgrams_in);
 
                 // Flush batched metrics to atomics once.
                 metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
@@ -463,6 +472,7 @@ async fn process_datagram(
     has_datagram_plugins: bool,
     crls: &crate::tls::CrlList,
     sni_proxy_ids: Option<&[String]>,
+    adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 ) -> Result<(), anyhow::Error> {
     // Run per-datagram plugins (e.g., udp_rate_limiting) before session
     // allocation so dropped datagrams don't consume session slots or trigger
@@ -511,6 +521,7 @@ async fn process_datagram(
                 crls,
                 data,
                 sni_proxy_ids,
+                adaptive_buffer,
             )
             .await?
         }
@@ -536,6 +547,7 @@ async fn process_datagram(
             crls,
             data,
             sni_proxy_ids,
+            adaptive_buffer,
         )
         .await?
     };
@@ -597,6 +609,7 @@ async fn lookup_or_create_session(
     crls: &crate::tls::CrlList,
     initial_data: &[u8],
     sni_proxy_ids: Option<&[String]>,
+    adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
         return Ok(existing.value().clone());
@@ -634,6 +647,7 @@ async fn lookup_or_create_session(
         crls,
         initial_data,
         sni_proxy_ids,
+        adaptive_buffer,
     )
     .await
     {
@@ -1426,6 +1440,7 @@ async fn create_session(
     crls: &crate::tls::CrlList,
     initial_data: &[u8],
     sni_proxy_ids: Option<&[String]>,
+    adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     // Check if this proxy uses passthrough mode (extract from config once).
     let is_passthrough = {
@@ -1687,6 +1702,7 @@ async fn create_session(
     let reply_proxy_namespace = proxy_namespace.to_string();
     let reply_backend_protocol = backend_protocol;
     let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
+    let reply_adaptive_buffer = adaptive_buffer.clone();
     let reply_has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
     let reply_datagram_plugins: Vec<Arc<dyn Plugin>> = if reply_has_datagram_plugins {
         plugins
@@ -1840,7 +1856,7 @@ async fn create_session(
                 let Some(ref sock) = backend_socket else {
                     break;
                 };
-                let batch_limit = RECV_BATCH_LIMIT.load(Ordering::Relaxed) as usize;
+                let batch_limit = reply_adaptive_buffer.get_batch_limit(&reply_proxy_id);
                 for _ in 0..batch_limit {
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {

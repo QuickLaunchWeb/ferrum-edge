@@ -75,6 +75,8 @@ pub struct StreamListenerManager {
     tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
     crls: crate::tls::CrlList,
+    /// Adaptive buffer tracker for dynamic copy buffer and batch limit sizing.
+    adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 }
 
 impl StreamListenerManager {
@@ -96,6 +98,7 @@ impl StreamListenerManager {
         udp_recv_batch_limit: usize,
         tls_policy: Option<Arc<TlsPolicy>>,
         crls: crate::tls::CrlList,
+        adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -117,6 +120,7 @@ impl StreamListenerManager {
             udp_recv_batch_limit,
             tls_policy,
             crls,
+            adaptive_buffer,
         }
     }
 
@@ -373,6 +377,7 @@ impl StreamListenerManager {
                 let plugin_cache = self.plugin_cache.clone();
                 let crls = self.crls.clone();
                 let sni_ids = sni_ids.clone();
+                let adaptive_buf = self.adaptive_buffer.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -394,6 +399,7 @@ impl StreamListenerManager {
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
                         recv_batch_limit: udp_recv_batch_limit,
+                        adaptive_buffer: adaptive_buf,
                     })
                     .await
                     {
@@ -422,6 +428,7 @@ impl StreamListenerManager {
                 let crls = self.crls.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 let sni_ids = sni_ids.clone();
+                let adaptive_buf = self.adaptive_buffer.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -443,6 +450,7 @@ impl StreamListenerManager {
                         crls,
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
+                        adaptive_buffer: adaptive_buf,
                     })
                     .await
                     {

@@ -105,6 +105,9 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     )
 }
 
@@ -167,6 +170,9 @@ async fn test_reconcile_starts_tcp_listener() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
@@ -221,6 +227,9 @@ async fn test_reconcile_starts_udp_listener() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
@@ -287,6 +296,9 @@ async fn test_reconcile_detects_port_conflict() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
@@ -348,6 +360,9 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
@@ -403,6 +418,9 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
@@ -461,6 +479,9 @@ async fn test_shutdown_all_releases_ports() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
@@ -530,6 +551,9 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         6_000,
         None,
         Arc::new(Vec::new()),
+        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+            true, true, 300, 8192, 262_144, 65_536, 6000,
+        )),
     );
 
     let failures = manager.reconcile().await;
