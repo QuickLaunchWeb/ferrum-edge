@@ -31,8 +31,8 @@ mod bench_proto {
     tonic::include_proto!("bench");
 }
 
-use bench_proto::bench_service_client::BenchServiceClient;
 use bench_proto::EchoRequest;
+use bench_proto::bench_service_client::BenchServiceClient;
 
 // -- CLI ----------------------------------------------------------------------
 
@@ -205,8 +205,7 @@ async fn run_http1(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMet
             let mut metrics = BenchMetrics::new();
             let addr = format!("{host}:{port}");
 
-            let mut sender_opt: Option<hyper::client::conn::http1::SendRequest<Full<Bytes>>> =
-                None;
+            let mut sender_opt: Option<hyper::client::conn::http1::SendRequest<Full<Bytes>>> = None;
 
             while Instant::now() < deadline {
                 if sender_opt.is_none() || sender_opt.as_ref().is_some_and(|s| !s.is_ready()) {
@@ -322,11 +321,10 @@ async fn run_http2(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMet
             };
             stream.set_nodelay(true).ok();
 
-            let server_name =
-                rustls::pki_types::ServerName::try_from(host_clone.clone())
-                    .unwrap_or(rustls::pki_types::ServerName::IpAddress(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
-                    ));
+            let server_name = rustls::pki_types::ServerName::try_from(host_clone.clone())
+                .unwrap_or(rustls::pki_types::ServerName::IpAddress(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
+                ));
 
             let tls_stream = match tls_connector.connect(server_name, stream).await {
                 Ok(s) => s,
@@ -334,9 +332,8 @@ async fn run_http2(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMet
             };
 
             let io = TokioIo::new(tls_stream);
-            let mut h2_builder = hyper::client::conn::http2::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            );
+            let mut h2_builder =
+                hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
             h2_builder
                 .initial_stream_window_size(8 * 1024 * 1024) // 8 MiB
                 .initial_connection_window_size(32 * 1024 * 1024) // 32 MiB
@@ -470,9 +467,7 @@ async fn run_http3(cli: &Cli, payload: &Arc<Vec<u8>>) -> anyhow::Result<BenchMet
                 match send_req.send_request(req).await {
                     Ok(mut stream) => {
                         // Send request body
-                        let _ = stream
-                            .send_data(Bytes::copy_from_slice(&payload))
-                            .await;
+                        let _ = stream.send_data(Bytes::copy_from_slice(&payload)).await;
                         let _ = stream.finish().await;
 
                         match stream.recv_response().await {

@@ -50,7 +50,9 @@ impl ContentType {
             Self::Json => "application/json",
             Self::Xml => "application/xml",
             Self::FormUrlEncoded => "application/x-www-form-urlencoded",
-            Self::MultipartFormData => "multipart/form-data; boundary=----PayloadBenchBoundary7MA4YWxkTrZu0gW",
+            Self::MultipartFormData => {
+                "multipart/form-data; boundary=----PayloadBenchBoundary7MA4YWxkTrZu0gW"
+            }
             Self::OctetStream => "application/octet-stream",
             Self::Grpc => "application/grpc",
             Self::Sse => "text/event-stream",
@@ -167,10 +169,10 @@ pub fn format_size(bytes: usize) -> String {
 
 /// All benchmark sizes in bytes.
 pub const SIZES: &[usize] = &[
-    10 * 1024,      // 10 KB
-    50 * 1024,      // 50 KB
-    100 * 1024,     // 100 KB
-    1024 * 1024,    // 1 MB
+    10 * 1024,       // 10 KB
+    50 * 1024,       // 50 KB
+    100 * 1024,      // 100 KB
+    1024 * 1024,     // 1 MB
     5 * 1024 * 1024, // 5 MB
     9 * 1024 * 1024, // 9 MB
 ];
@@ -182,7 +184,9 @@ pub fn generate_payload(content_type: ContentType, target_size: usize) -> Vec<u8
         ContentType::Xml => generate_xml(target_size),
         ContentType::FormUrlEncoded => generate_form_urlencoded(target_size),
         ContentType::MultipartFormData => generate_multipart(target_size),
-        ContentType::OctetStream | ContentType::WsBinary | ContentType::TcpBinary
+        ContentType::OctetStream
+        | ContentType::WsBinary
+        | ContentType::TcpBinary
         | ContentType::UdpBinary => generate_binary(target_size),
         ContentType::Grpc => generate_binary(target_size), // raw bytes, protobuf wrapping done by tonic
         ContentType::Sse => generate_sse(target_size),
@@ -425,9 +429,7 @@ fn generate_graphql(target_size: usize) -> Vec<u8> {
     let query = r#"mutation ProcessBatchData($input: BatchDataInput!) { processBatchData(input: $input) { success processedCount errors { code message } } }"#;
     let escaped_query = query.replace('"', r#"\""#);
     // Build the wrapper to measure exact overhead
-    let prefix = format!(
-        r#"{{"query":"{escaped_query}","variables":{{"input":{{"items":["#
-    );
+    let prefix = format!(r#"{{"query":"{escaped_query}","variables":{{"input":{{"items":["#);
     let suffix = "]}}}}";
     let overhead = prefix.len() + suffix.len();
     let available = target_size.saturating_sub(overhead);

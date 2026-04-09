@@ -111,9 +111,7 @@ async fn run_http1_server(port: u16) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_http_echo(
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_http_echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path().to_string();
 
     match path.as_str() {
@@ -154,7 +152,10 @@ async fn handle_http_echo(
             let mut id = 0u64;
             while offset < total_size {
                 let end = (offset + chunk_data_size).min(total_size);
-                let data: String = body[offset..end].iter().map(|b| format!("{b:02x}")).collect();
+                let data: String = body[offset..end]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 sse_buf.push_str(&format!("id: {id}\nevent: data\ndata: {data}\n\n"));
                 offset = end;
                 id += 1;
@@ -231,9 +232,8 @@ async fn run_https_h2_server(
             let io = TokioIo::new(tls_stream);
 
             if is_h2 {
-                let mut builder = hyper::server::conn::http2::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                );
+                let mut builder =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
                 let _ = builder
                     .initial_stream_window_size(8 * 1024 * 1024)
                     .initial_connection_window_size(32 * 1024 * 1024)
@@ -346,8 +346,7 @@ impl BenchService for BenchServiceImpl {
         }))
     }
 
-    type ServerStreamStream =
-        tokio_stream::wrappers::ReceiverStream<Result<EchoResponse, Status>>;
+    type ServerStreamStream = tokio_stream::wrappers::ReceiverStream<Result<EchoResponse, Status>>;
 
     async fn server_stream(
         &self,
