@@ -77,6 +77,16 @@ fn main() {
             }
             return;
         }
+        Some(cli::Command::Health(args)) => {
+            match cli::execute_health(args) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         _ => {}
     }
 

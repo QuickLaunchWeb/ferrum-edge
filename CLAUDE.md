@@ -20,6 +20,7 @@ ferrum-edge run [OPTIONS]                # Start gateway in foreground
 ferrum-edge validate [OPTIONS]           # Validate config without starting
 ferrum-edge reload [--pid PID]           # Send SIGHUP to running instance (Unix)
 ferrum-edge version [--json]             # Print version info
+ferrum-edge health [-p PORT] [--host H]  # Health check (for distroless Docker HEALTHCHECK)
 ferrum-edge                              # No args = legacy env-var-only mode
 ```
 
@@ -903,10 +904,11 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
 ## Docker
 
-- **Dockerfile**: Multi-stage build (rust:latest builder + debian:trixie-slim runtime) — for local `docker build .`
-- **Dockerfile.release**: Minimal runtime image (debian:trixie-slim) using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
+- **Dockerfile**: Multi-stage build (rust:latest builder + distroless runtime) — for local `docker build .`
+- **Dockerfile.release**: Distroless runtime image (`gcr.io/distroless/cc-debian13:nonroot`) using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
+- **Distroless**: No shell, no package manager, no OS CVEs. OpenSSL is vendored (statically linked) so `libssl` is not needed. CA certificates are included in `distroless/cc`. Runs as UID 65532 (`nonroot`)
 - **Exposed ports**: 8000, 8443 (proxy), 9000, 9443 (admin), 50051 (gRPC)
-- **Health check**: `curl -f http://localhost:9000/health`
+- **Health check**: `ferrum-edge health` CLI subcommand (no curl needed in distroless)
 - **docker-compose.yml**: Profiles for `sqlite`, `postgres`, and `cp-dp` deployments
 - **Docker Hub**: `ferrumedge/ferrum-edge` — `:latest` (main), `:v0.9.0` / `:0.9.0` / `:0.9` (tagged releases)
 - **GHCR**: `ghcr.io/ferrum-edge/ferrum-edge` — same tag scheme as Docker Hub

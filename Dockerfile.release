@@ -1,25 +1,15 @@
-# Minimal runtime image for pre-built binaries (used by CI/CD)
+# Minimal distroless runtime image for pre-built binaries (used by CI/CD)
 # For local builds from source, use: docker build -f Dockerfile .
-FROM debian:trixie-slim
+#
+# Debian 13 (trixie) distroless has glibc 2.40, compatible with binaries
+# built on ubuntu-latest (glibc 2.39) and cross containers (glibc 2.31).
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    curl \
-    && apt-get purge -y --auto-remove libgd3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -f /usr/bin/tar \
-    && rm -rf /var/log/dpkg.log /var/log/apt \
-              /usr/share/doc /usr/share/man /usr/share/info \
-              /usr/share/lintian /usr/share/linda \
-    && useradd -m -u 1000 ferrum
-
 WORKDIR /app
 
-COPY bin/${TARGETARCH}/ferrum-edge /app/ferrum-edge
-RUN chmod +x /app/ferrum-edge && chown ferrum:ferrum /app/ferrum-edge
+COPY --chmod=755 bin/${TARGETARCH}/ferrum-edge /app/ferrum-edge
 
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \
@@ -31,10 +21,9 @@ ENV PATH="/app:${PATH}" \
 
 EXPOSE 8000 8443 9000 9443 50051
 
-USER ferrum
-
+# Health check using built-in CLI subcommand (no curl needed in distroless)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:9000/health || exit 1
+    CMD ["/app/ferrum-edge", "health"]
 
 LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.description="High-performance edge proxy built in Rust" \

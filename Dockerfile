@@ -1,5 +1,5 @@
 # Multi-stage build for Ferrum Edge
-# Stage 1: Builder
+# Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
 
 # Install build dependencies
@@ -34,26 +34,16 @@ COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN touch src/main.rs && cargo build --release
 
-# Stage 2: Runtime — must match builder's glibc version (rust:latest = trixie)
-FROM debian:trixie-slim
-
-# Install runtime dependencies and create non-root user
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
-    curl \
-    && apt-get purge -y --auto-remove libgd3 \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -f /usr/bin/tar \
-    && rm -rf /var/log/dpkg.log /var/log/apt \
-              /usr/share/doc /usr/share/man /usr/share/info \
-              /usr/share/lintian /usr/share/linda \
-    && useradd -m -u 1000 ferrum
+# Stage 2: Distroless runtime — no OS packages, no shell, no CVEs
+# Uses nonroot tag (UID 65532) for least-privilege execution.
+# OpenSSL is vendored (statically linked) so libssl is not needed.
+# ca-certificates are included in distroless/cc.
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder --chown=ferrum:ferrum /build/target/release/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-edge /app/ferrum-edge
 
 # Set environment variables
 ENV PATH="/app:${PATH}" \
@@ -67,17 +57,14 @@ ENV PATH="/app:${PATH}" \
 # Expose ports
 EXPOSE 8000 8443 9000 9443 50051
 
-# Switch to non-root user
-USER ferrum
-
-# Add health check
+# Health check using built-in CLI subcommand (no curl needed in distroless)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:9000/health || exit 1
+    CMD ["/app/ferrum-edge", "health"]
 
 # Add labels
 LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.description="High-performance edge proxy built in Rust" \
       org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
-# Run the gateway
+# Run the gateway (already running as nonroot via distroless tag)
 ENTRYPOINT ["/app/ferrum-edge"]

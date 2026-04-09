@@ -35,6 +35,8 @@ pub enum Command {
     Reload(ReloadArgs),
     /// Print version information.
     Version(VersionArgs),
+    /// Check if the gateway is healthy (for Docker HEALTHCHECK in distroless images).
+    Health(HealthArgs),
 }
 
 #[derive(clap::Args)]
@@ -79,6 +81,17 @@ pub struct VersionArgs {
     /// Output version info as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args)]
+pub struct HealthArgs {
+    /// Admin API port to check (defaults to FERRUM_ADMIN_HTTP_PORT or 9000).
+    #[arg(short = 'p', long = "port")]
+    pub port: Option<u16>,
+
+    /// Admin API host to connect to.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
 }
 
 // ── Smart path resolution ───────────────────────────────────────────────────
@@ -277,6 +290,55 @@ pub fn execute_validate() -> Result<(), String> {
 
     println!("\nValidation passed.");
     Ok(())
+}
+
+/// Check gateway health by connecting to the admin API /health endpoint.
+/// Uses a raw TCP connection + minimal HTTP/1.1 request to avoid pulling in
+/// async runtime or reqwest for this one-shot diagnostic.
+pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let port = args.port.unwrap_or_else(|| {
+        std::env::var("FERRUM_ADMIN_HTTP_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9000)
+    });
+
+    let addr_str = format!("{}:{}", args.host, port);
+    let sock_addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("Cannot resolve {}: {}", addr_str, e))?
+        .next()
+        .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
+    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+        .map_err(|e| format!("Cannot connect to {}: {}", addr_str, e))?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("Failed to set read timeout: {}", e))?;
+
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
+        args.host, port
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    if response.contains("200 OK") {
+        Ok(())
+    } else {
+        let status_line = response.lines().next().unwrap_or("(empty response)");
+        Err(format!("Unhealthy: {}", status_line))
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
