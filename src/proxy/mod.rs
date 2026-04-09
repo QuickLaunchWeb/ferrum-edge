@@ -501,6 +501,9 @@ pub struct ProxyState {
     /// Overload state for progressive load shedding and graceful drain tracking.
     /// Shared across all accept loops and the background monitor.
     pub overload: Arc<crate::overload::OverloadState>,
+    /// Adaptive buffer size and batch limit tracker for TCP/WS tunnel/UDP.
+    /// Tracks EWMA of bytes per connection and datagrams per batch cycle per proxy.
+    pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 }
 
 impl ProxyState {
@@ -635,6 +638,16 @@ impl ProxyState {
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             });
 
+        let adaptive_buffer = Arc::new(crate::adaptive_buffer::AdaptiveBufferTracker::new(
+            env_config_arc.adaptive_buffer_enabled,
+            env_config_arc.adaptive_batch_limit_enabled,
+            env_config_arc.adaptive_buffer_ewma_alpha,
+            env_config_arc.adaptive_buffer_min_size,
+            env_config_arc.adaptive_buffer_max_size,
+            env_config_arc.adaptive_buffer_default_size,
+            env_config_arc.adaptive_batch_limit_default,
+        ));
+
         let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
             stream_bind_addr,
             config_arc.clone(),
@@ -649,9 +662,9 @@ impl ProxyState {
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
-            env_config_arc.udp_recv_batch_limit,
             tls_policy_arc.clone(),
             crls.clone(),
+            adaptive_buffer.clone(),
         ));
 
         Ok(Self {
@@ -713,6 +726,7 @@ impl ProxyState {
             tls_policy: tls_policy_arc,
             crls,
             overload: Arc::new(crate::overload::OverloadState::new()),
+            adaptive_buffer,
         })
     }
 
@@ -1212,6 +1226,13 @@ impl ProxyState {
                 });
             }
 
+            // Prune adaptive buffer state for removed proxies.
+            {
+                let active_ids: Vec<&str> =
+                    new_config.proxies.iter().map(|p| p.id.as_str()).collect();
+                self.adaptive_buffer.prune_missing(&active_ids);
+            }
+
             self.config.store(Arc::new(new_config));
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -1331,6 +1352,12 @@ impl ProxyState {
         // Clear cached pool keys when proxy settings change
         // Swap the canonical config last (readers may still be using old caches
         // via ArcSwap snapshots until they finish their current request)
+        // Prune adaptive buffer state for removed proxies.
+        {
+            let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
+            self.adaptive_buffer.prune_missing(&active_ids);
+        }
+
         self.config.store(Arc::new(new_config));
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -1687,6 +1714,12 @@ impl ProxyState {
             tokio::spawn(async move {
                 dns.warmup(new_hostnames).await;
             });
+        }
+
+        // Prune adaptive buffer state for removed proxies.
+        {
+            let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
+            self.adaptive_buffer.prune_missing(&active_ids);
         }
 
         // Store updated config
@@ -2272,6 +2305,7 @@ async fn handle_websocket_request_authenticated(
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
+    let adaptive_buf = state.adaptive_buffer.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -2285,6 +2319,7 @@ async fn handle_websocket_request_authenticated(
                     max_ws_frame,
                     ws_write_buf,
                     ws_tunnel,
+                    &adaptive_buf,
                 )
                 .await
                 {
@@ -2593,6 +2628,7 @@ async fn run_websocket_proxy(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     websocket_tunnel_mode: bool,
+    adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // When tunnel mode is enabled and no plugins need frame-level hooks, bypass
     // WebSocket frame parsing entirely and do raw TCP bidirectional copy. This
@@ -2633,7 +2669,17 @@ async fn run_websocket_proxy(
             .reunite(backend_write)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
         let mut backend = backend_ws.into_inner();
-        let _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend).await;
+        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let result = tokio::io::copy_bidirectional_with_sizes(
+            &mut client_io,
+            &mut backend,
+            buf_size,
+            buf_size,
+        )
+        .await;
+        if let Ok((c2b, b2c)) = &result {
+            adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
+        }
         return Ok(());
     }
 

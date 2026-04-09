@@ -406,9 +406,11 @@ async fn test_http3_proxy_state_creation() {
             300,
             10_000,
             10,
-            6_000,
             None,
             std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+                true, true, 300, 8192, 262_144, 65_536, 6000,
+            )),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -467,6 +469,11 @@ async fn test_http3_proxy_state_creation() {
         tls_policy: None,
         crls: std::sync::Arc::new(Vec::new()),
         overload: std::sync::Arc::new(ferrum_edge::overload::OverloadState::new()),
+        adaptive_buffer: std::sync::Arc::new(
+            ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+                true, true, 300, 8192, 262_144, 65_536, 6000,
+            ),
+        ),
     };
 
     // Verify proxy state is created successfully
@@ -601,9 +608,11 @@ async fn test_http3_full_integration() {
             300,
             10_000,
             10,
-            6_000,
             None,
             std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+                true, true, 300, 8192, 262_144, 65_536, 6000,
+            )),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -662,6 +671,11 @@ async fn test_http3_full_integration() {
         tls_policy: None,
         crls: std::sync::Arc::new(Vec::new()),
         overload: std::sync::Arc::new(ferrum_edge::overload::OverloadState::new()),
+        adaptive_buffer: std::sync::Arc::new(
+            ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
+                true, true, 300, 8192, 262_144, 65_536, 6000,
+            ),
+        ),
     };
 
     // Verify proxy state is created successfully
