@@ -87,15 +87,10 @@ impl RecvMmsgBatch {
         self.capacity
     }
 
-    /// Number of datagrams received in the last `recv()` call.
-    pub fn count(&self) -> usize {
-        self.count
-    }
-
     /// Returns the datagram data and source address for slot `i`.
     ///
     /// # Panics
-    /// Panics if `i >= self.count()`.
+    /// Panics (debug) if `i` is out of bounds.
     pub fn datagram(&self, i: usize) -> (&[u8], SocketAddr) {
         debug_assert!(i < self.count);
         (
