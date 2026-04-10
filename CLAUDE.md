@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (53 built-in plugins including 5 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 spec expose plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, 1 SOAP WS-Security plugin, and 1 load testing plugin), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (54 built-in plugins including 5 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 spec expose plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, 1 SOAP WS-Security plugin, 1 load testing plugin, and 1 API chargeback plugin), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -20,7 +20,7 @@ ferrum-edge run [OPTIONS]                # Start gateway in foreground
 ferrum-edge validate [OPTIONS]           # Validate config without starting
 ferrum-edge reload [--pid PID]           # Send SIGHUP to running instance (Unix)
 ferrum-edge version [--json]             # Print version info
-ferrum-edge health [-p PORT] [--host H]  # Health check (for distroless Docker HEALTHCHECK)
+ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify]  # Health check (for distroless Docker HEALTHCHECK)
 ferrum-edge                              # No args = legacy env-var-only mode
 ```
 
@@ -122,6 +122,8 @@ GHCR uses the built-in `GITHUB_TOKEN` — no additional secret needed. Ensure re
 | `dp` | Data Plane | Read-only | Yes | gRPC stream from CP |
 | `migrate` | Schema migration utility | No | No | Runs DB migrations then exits |
 
+**Disabling plaintext listeners (TLS-only operation)**: Setting `FERRUM_PROXY_HTTP_PORT=0` disables the plaintext HTTP proxy listener, `FERRUM_ADMIN_HTTP_PORT=0` disables the plaintext admin HTTP listener, and setting the port to `0` in `FERRUM_CP_GRPC_LISTEN_ADDR` (e.g., `0.0.0.0:0`) disables the gRPC listener. Disabled ports are excluded from `reserved_gateway_ports()` so stream proxy port conflict checks are unaffected. The gateway warns at startup if a plaintext port is disabled but no TLS is configured for that surface (which would leave no listeners active). The `ferrum-edge health` CLI subcommand auto-detects `FERRUM_ADMIN_HTTP_PORT=0` and switches to TLS mode (port 9443), or accepts `--tls` / `--tls-no-verify` flags explicitly.
+
 **Admin JWT secret handling is intentionally per-mode**: Database and CP modes **require** `FERRUM_ADMIN_JWT_SECRET` (hard failure if unset) because their read-write admin API issues tokens via `POST /auth` that must survive restarts and be valid across instances sharing the same secret. File mode has a **read-only** admin API that never issues tokens, so it generates a random secret as a convenience — all externally-crafted tokens are rejected since no one can predict the secret. This asymmetry is by design, not an inconsistency.
 
 **`/health` DB check is intentionally cached (15s TTL)**: The `/health` and `/status` endpoints are unauthenticated (by design — load balancer probes need them). Without caching, each call runs `SELECT 1` (SQL) or `ping` (MongoDB), which an attacker with admin port access could flood to exhaust the DB connection pool (`FERRUM_DB_POOL_MAX_CONNECTIONS`, default 10), starving config polling and admin writes. The `CachedDbHealthResult` in `AdminState` caches the boolean result for 15 seconds via lock-free `ArcSwap`. Do not remove this cache or make `/health` call `db.health_check()` directly on every request.
@@ -155,7 +157,7 @@ Within each mode (database/file/dp), after config is loaded:
 12. **DTLS certs** — Loads `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` for UDP proxy frontend DTLS termination (ECDSA P-256 / Ed25519)
 13. **Backend TLS** — Per-proxy `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` are validated at config load time (startup and each reload). Invalid paths reject the config — no silent degradation.
 14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
-15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Conflicts are fatal in database/file modes.
+15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Ports set to `0` (disabled) are excluded from conflict checks. Conflicts are fatal in database/file modes.
 16. **Stream listener bind** — `initial_reconcile_stream_listeners()` binds TCP/UDP stream proxy ports. In database/file modes, bind failure is fatal (gateway exits). In DP mode, bind failures are logged as errors but non-fatal — the DP continues serving HTTP traffic and retries when the CP pushes corrected config.
 17. **DNS warmup** — All backend hostnames (proxy backends, upstream targets, plugin endpoints) are resolved concurrently before accepting traffic.
 18. **Connection pool warmup** — When `FERRUM_POOL_WARMUP_ENABLED=true` (default), pre-establishes backend connections for HTTP-family pools (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS warmup. TCP/UDP stream proxies are skipped (no persistent pools). Upstream targets are expanded so each target gets a warmed connection. Failures are logged as warnings but never block startup.
@@ -247,7 +249,7 @@ src/
 │   ├── udp_batch.rs           # Batched UDP recv via recvmmsg(2) on Linux (reduces syscall overhead)
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (53 plugins, including 5 AI/LLM, 1 AI federation, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, 1 SOAP WS-Security plugin, and 1 load testing plugin)
+├── plugins/                   # Plugin system (54 plugins, including 5 AI/LLM, 1 AI federation, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, 1 SOAP WS-Security plugin, 1 load testing plugin, and 1 API chargeback plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure
@@ -411,7 +413,7 @@ The lifecycle phases are:
 6. `after_proxy` — SSE response headers (250), Response size limiting (3490), response caching (3500), response transformer (4000), compression (4050), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
 7. `on_final_response_body` — Post-transform response body hooks. Response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
 8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
-9. `log` — Stdout logging (9000), StatsD logging (9075), HTTP logging (9100), TCP logging (9125), Kafka logging (9150), Loki logging (9155), UDP logging (9160), WebSocket logging (9175), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), OTel tracing (25)
+9. `log` — Stdout logging (9000), StatsD logging (9075), HTTP logging (9100), TCP logging (9125), Kafka logging (9150), Loki logging (9155), UDP logging (9160), WebSocket logging (9175), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), API chargeback (9350), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available. For UDP+DTLS proxies, `on_stream_connect` runs after the DTLS handshake completes, with client certificate DER bytes available in `StreamConnectionContext` for mTLS authentication
 12. `on_udp_datagram` — Per-datagram UDP hooks fired in both directions (client→backend and backend→client). `UdpDatagramContext.direction` distinguishes the two. udp_rate_limiting (2915) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`. Backend→client hooks run before each response datagram is relayed to the client, enabling response-side rate limiting and filtering
@@ -837,12 +839,12 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_NAMESPACE` | `ferrum` | Namespace this gateway instance loads and manages. Resources from other namespaces are ignored. Enables multi-tenant resource isolation |
 | `FERRUM_LOG_LEVEL` | `error` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped (lossy) to avoid backpressure |
-| `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
+| `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port. `0` = disabled (TLS-only) |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
 | `FERRUM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for proxy listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | (none) | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_KEY_PATH` | (none) | PEM private key for the gateway's frontend TLS certificate |
-| `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port |
+| `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port. `0` = disabled (TLS-only) |
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_JWT_SECRET` | (required for db/cp) | JWT secret for admin API auth |
