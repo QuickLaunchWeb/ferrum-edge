@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 54 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 58 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -2345,7 +2345,7 @@ config:
 
 ## AI / LLM Plugins
 
-Five plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+Seven plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
 
 ### `ai_federation`
 
@@ -2426,6 +2426,63 @@ plugins:
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
 **Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility.
+
+### `ai_semantic_cache`
+
+Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. v1 uses exact-match with normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Supports local in-memory (DashMap) and centralized Redis storage backends.
+
+**Priority:** 2700
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `ttl_seconds` | u64 | `300` | Time-to-live for cached entries in seconds |
+| `max_entries` | u64 | `10000` | Maximum number of cached entries (local mode) |
+| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body in bytes (1 MiB) |
+| `max_total_size_bytes` | u64 | `104857600` | Maximum total cache size in bytes (100 MiB, local mode) |
+| `include_model_in_key` | bool | `true` | Include the model name in the cache key (different models get separate cache entries) |
+| `include_params_in_key` | bool | `false` | Include request parameters (temperature, max_tokens, etc.) in the cache key |
+| `scope_by_consumer` | bool | `false` | Scope cache entries per consumer (authenticated consumer ID is included in the cache key) |
+| `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
+| `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `"ferrum:ai_semantic_cache"` | Redis key namespace prefix |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | -- | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | -- | Redis password |
+
+**Behavior:**
+
+- **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
+- **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
+- **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
+- **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet).
+
+```yaml
+plugin_name: ai_semantic_cache
+config:
+  ttl_seconds: 600
+  max_entries: 5000
+  max_entry_size_bytes: 2097152
+  include_model_in_key: true
+  scope_by_consumer: true
+```
+
+**Redis mode example:**
+
+```yaml
+plugin_name: ai_semantic_cache
+config:
+  ttl_seconds: 3600
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/3"
+  redis_key_prefix: "myapp:ai_cache"
+```
+
+#### v2 Roadmap
+
+A future v2 will add semantic similarity matching using embedding vectors. Instead of requiring exact normalized prompt matches, v2 will compute embeddings for prompts and use cosine similarity to find cached responses for semantically similar (but not identical) prompts. This will support configurable similarity thresholds and pluggable embedding providers.
 
 ### `ai_token_metrics`
 
@@ -2605,7 +2662,7 @@ config:
 
 ### AI Plugin Composition Example
 
-A typical AI gateway proxy combining all six AI plugins with `ai_federation` for multi-provider routing:
+A typical AI gateway proxy combining all seven AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
 # Proxy config — ai_federation handles provider routing, so backend_host is unused
@@ -2618,6 +2675,11 @@ backend_port: 443
 plugins:
   - plugin_name: key_auth
     config: {}
+  - plugin_name: ai_semantic_cache
+    config:
+      ttl_seconds: 600
+      include_model_in_key: true
+      scope_by_consumer: true
   - plugin_name: ai_prompt_shield
     config:
       action: redact
@@ -2662,7 +2724,7 @@ plugins:
     config: {}
 ```
 
-> **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics` and `ai_response_guard` do not fire on the response path. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
+> **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics`, `ai_response_guard`, and `ai_semantic_cache` do not fire on the response path. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
 
 ---
 

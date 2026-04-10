@@ -220,6 +220,7 @@ async fn test_all_plugins_available() {
         "ai_rate_limiter",
         "ai_prompt_shield",
         "ai_response_guard",
+        "ai_semantic_cache",
         "geo_restriction",
         "request_deduplication",
         "ws_message_size_limiting",

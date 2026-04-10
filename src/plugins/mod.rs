@@ -1,4 +1,4 @@
-//! Plugin system — 57 built-in plugins with a trait-based architecture.
+//! Plugin system — 58 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -20,6 +20,7 @@ pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
 pub mod ai_request_guard;
 pub mod ai_response_guard;
+pub mod ai_semantic_cache;
 pub mod ai_token_metrics;
 pub mod api_chargeback;
 pub mod basic_auth;
@@ -602,6 +603,7 @@ pub mod priority {
     pub const SOAP_WS_SECURITY: u16 = 1500;
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
+    pub const AI_SEMANTIC_CACHE: u16 = 2700;
     pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
@@ -1119,6 +1121,10 @@ pub fn create_plugin_with_http_client(
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
+        "ai_semantic_cache" => Ok(Some(Arc::new(ai_semantic_cache::AiSemanticCache::new(
+            config,
+            http_client.clone(),
+        )?))),
         "ai_response_guard" => Ok(Some(Arc::new(ai_response_guard::AiResponseGuard::new(
             config,
         )?))),
@@ -1232,6 +1238,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ai_rate_limiter",
         "ai_prompt_shield",
         "ai_response_guard",
+        "ai_semantic_cache",
         "ai_federation",
         "ws_message_size_limiting",
         "ws_frame_logging",
