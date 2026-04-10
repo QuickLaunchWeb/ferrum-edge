@@ -9,7 +9,8 @@
 //! "scheduling overhead of multithread tokio runtime can be 50% of the on CPU time."
 
 use std::sync::{Arc, OnceLock};
-use tokio::runtime::{Handle, Runtime};
+use std::thread::JoinHandle as ThreadJoinHandle;
+use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
 /// Configuration for the TLS offload runtime.
@@ -42,8 +43,10 @@ impl Default for TlsOffloadConfig {
 pub struct TlsOffloadRuntime {
     /// Handles to the offload runtimes. Length = shards * threads_per_shard.
     handles: Vec<Handle>,
-    /// Keep runtimes alive. Dropped when the offload pool is dropped.
-    _runtimes: Vec<Runtime>,
+    /// Driver threads that keep each current_thread runtime running.
+    /// Each thread calls `Runtime::block_on(pending())` so the reactor
+    /// processes spawned tasks. Dropped (joined) when the pool is dropped.
+    _driver_threads: Vec<ThreadJoinHandle<()>>,
     /// Number of shards for peer-hash distribution.
     shards: usize,
     /// Threads per shard for intra-shard load balancing.
@@ -61,7 +64,7 @@ impl TlsOffloadRuntime {
 
         let total = config.shards * config.threads_per_shard;
         let mut handles = Vec::with_capacity(total);
-        let mut runtimes = Vec::with_capacity(total);
+        let mut driver_threads = Vec::with_capacity(total);
 
         for i in 0..total {
             match tokio::runtime::Builder::new_current_thread()
@@ -69,9 +72,24 @@ impl TlsOffloadRuntime {
                 .build()
             {
                 Ok(rt) => {
-                    handles.push(rt.handle().clone());
-                    runtimes.push(rt);
-                    debug!("TLS offload thread {}/{} started", i + 1, total);
+                    let handle = rt.handle().clone();
+                    handles.push(handle);
+                    // Spawn a dedicated OS thread that drives this current_thread runtime.
+                    // Without this, the runtime's reactor never runs and spawned tasks stall.
+                    let thread = std::thread::Builder::new()
+                        .name(format!("tls-offload-{i}"))
+                        .spawn(move || {
+                            rt.block_on(std::future::pending::<()>());
+                        });
+                    match thread {
+                        Ok(t) => {
+                            driver_threads.push(t);
+                            debug!("TLS offload thread {}/{} started", i + 1, total);
+                        }
+                        Err(e) => {
+                            warn!("Failed to spawn TLS offload driver thread {}: {}", i, e);
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to create TLS offload runtime {}: {}", i, e);
@@ -94,7 +112,7 @@ impl TlsOffloadRuntime {
 
         Some(Self {
             handles,
-            _runtimes: runtimes,
+            _driver_threads: driver_threads,
             shards: config.shards,
             threads_per_shard: config.threads_per_shard,
         })

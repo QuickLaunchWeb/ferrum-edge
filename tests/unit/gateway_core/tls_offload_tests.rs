@@ -55,3 +55,21 @@ fn test_offload_runtime_shard_affinity() {
     // Just verify it doesn't panic
     let _ = h3;
 }
+
+#[tokio::test]
+async fn test_offload_runtime_spawned_tasks_complete() {
+    let config = TlsOffloadConfig {
+        shards: 1,
+        threads_per_shard: 1,
+    };
+    let rt = TlsOffloadRuntime::new(config).unwrap();
+    // Spawn a task on the offload runtime and verify it completes.
+    // Before the driver-thread fix, this would hang indefinitely because
+    // the current_thread runtime was never driven.
+    let handle = rt.spawn(0, async { 42u64 });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+        .await
+        .expect("task should complete within 5s")
+        .expect("task should not panic");
+    assert_eq!(result, 42);
+}

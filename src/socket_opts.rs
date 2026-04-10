@@ -41,6 +41,7 @@ pub fn set_ip_bind_address_no_port(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn set_ip_bind_address_no_port(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(()) // No-op on non-Linux
 }
@@ -79,6 +80,7 @@ pub fn set_tcp_fastopen_server(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn set_tcp_fastopen_server(_fd: i32, _queue_len: i32) -> std::io::Result<()> {
     Ok(())
 }
@@ -111,6 +113,7 @@ pub fn set_tcp_fastopen_client(fd: std::os::unix::io::RawFd) -> std::io::Result<
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn set_tcp_fastopen_client(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }

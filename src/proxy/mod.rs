@@ -673,6 +673,7 @@ impl ProxyState {
             crls.clone(),
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
+            env_config_arc.tcp_fastopen_enabled,
         ));
 
         Ok(Self {
@@ -2953,12 +2954,12 @@ fn create_proxy_socket(
 
     // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.
     // This allows repeat clients to send data in the SYN packet, saving 1 RTT.
-    if let Some(queue_len) = tcp_fastopen_queue_len {
+    if let Some(_queue_len) = tcp_fastopen_queue_len {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
             if let Err(e) =
-                crate::socket_opts::set_tcp_fastopen_server(socket.as_raw_fd(), queue_len as i32)
+                crate::socket_opts::set_tcp_fastopen_server(socket.as_raw_fd(), _queue_len as i32)
             {
                 tracing::warn!("Failed to enable TCP_FASTOPEN on {}: {}", addr, e);
             }
