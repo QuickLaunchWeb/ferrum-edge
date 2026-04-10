@@ -1103,8 +1103,12 @@ pub fn create_plugin_with_http_client(
         ))),
         "prometheus_metrics" => Ok(Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(
             config,
+            http_client.namespace(),
         )?))),
-        "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(config)?))),
+        "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
+            config,
+            http_client.namespace(),
+        )?))),
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),

@@ -110,18 +110,21 @@ impl AiSemanticCache {
         let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(false);
 
         // Build optional Redis client
-        let redis_client =
-            RedisConfig::from_plugin_config(config, "ferrum:ai_cache").map(|redis_config| {
-                let dns_cache = http_client.dns_cache();
-                let tls_no_verify = http_client.tls_no_verify();
-                let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                Arc::new(RedisRateLimitClient::new(
-                    redis_config,
-                    dns_cache.cloned(),
-                    tls_no_verify,
-                    tls_ca_bundle_path,
-                ))
-            });
+        let redis_client = RedisConfig::from_plugin_config(
+            config,
+            &format!("{}:ai_cache", http_client.namespace()),
+        )
+        .map(|redis_config| {
+            let dns_cache = http_client.dns_cache();
+            let tls_no_verify = http_client.tls_no_verify();
+            let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
+            Arc::new(RedisRateLimitClient::new(
+                redis_config,
+                dns_cache.cloned(),
+                tls_no_verify,
+                tls_ca_bundle_path,
+            ))
+        });
 
         Ok(Self {
             ttl,

@@ -80,6 +80,11 @@ pub struct PluginHttpClient {
     /// Path to a PEM CA bundle for verifying outbound TLS connections.
     /// Mirrors `FERRUM_TLS_CA_BUNDLE_PATH` - shared with Redis rate limiting clients.
     tls_ca_bundle_path: Option<String>,
+    /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
+    /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
+    /// collisions when multiple gateway instances with different namespaces share
+    /// the same external backend.
+    namespace: String,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -91,6 +96,7 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("has_dns_cache", &self.dns_cache.is_some())
             .field("tls_no_verify", &self.tls_no_verify)
             .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
+            .field("namespace", &self.namespace)
             .finish()
     }
 }
@@ -108,6 +114,7 @@ impl PluginHttpClient {
     /// - Custom CA bundle from `FERRUM_TLS_CA_BUNDLE_PATH` (internal CAs)
     /// - `FERRUM_TLS_NO_VERIFY` support (skip TLS verification)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_config: &PoolConfig,
         dns_cache: DnsCache,
@@ -116,6 +123,7 @@ impl PluginHttpClient {
         retry_delay_ms: u64,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
+        namespace: &str,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -176,6 +184,7 @@ impl PluginHttpClient {
             dns_cache: Some(dns_cache_clone),
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
+            namespace: namespace.to_string(),
         }
     }
 
@@ -217,6 +226,7 @@ impl PluginHttpClient {
             dns_cache: None,
             tls_no_verify: false,
             tls_ca_bundle_path: None,
+            namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
         }
     }
 
@@ -274,6 +284,16 @@ impl PluginHttpClient {
     /// centralized rate limiting) to share the gateway's `FERRUM_TLS_CA_BUNDLE_PATH`.
     pub fn tls_ca_bundle_path(&self) -> Option<&str> {
         self.tls_ca_bundle_path.as_deref()
+    }
+
+    /// The gateway's namespace (`FERRUM_NAMESPACE`).
+    ///
+    /// Used by plugins to namespace Redis keys and metric labels when multiple
+    /// gateway instances share a single external backend. When this returns the
+    /// default namespace (`"ferrum"`), plugins use their standard key prefixes
+    /// for backward compatibility.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
     /// Get the underlying `reqwest::Client` for building requests.

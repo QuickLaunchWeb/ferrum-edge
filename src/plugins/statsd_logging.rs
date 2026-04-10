@@ -62,25 +62,36 @@ impl StatsdLogging {
             ));
         }
 
-        let prefix = config["prefix"].as_str().unwrap_or("ferrum").to_string();
+        let ns = http_client.namespace();
+        let prefix = config["prefix"].as_str().unwrap_or(ns).to_string();
 
         // Build a global tags suffix string (DogStatsD/Datadog extension).
         // Config: {"global_tags": {"env": "prod", "region": "us-east-1"}}
-        let global_tags = if let Some(tags_obj) = config["global_tags"].as_object() {
-            let pairs: Vec<String> = tags_obj
-                .iter()
-                .map(|(k, v)| {
-                    let val = v.as_str().unwrap_or("");
-                    format!("{k}:{val}")
-                })
-                .collect();
+        // When namespace is non-default and not already present in global_tags,
+        // inject a namespace tag automatically for metric isolation.
+        let global_tags = {
+            let mut pairs: Vec<String> = if let Some(tags_obj) = config["global_tags"].as_object() {
+                tags_obj
+                    .iter()
+                    .map(|(k, v)| {
+                        let val = v.as_str().unwrap_or("");
+                        format!("{k}:{val}")
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Auto-inject namespace tag when non-default.
+            if ns != crate::config::types::DEFAULT_NAMESPACE
+                && !pairs.iter().any(|p| p.starts_with("namespace:"))
+            {
+                pairs.push(format!("namespace:{ns}"));
+            }
             if pairs.is_empty() {
                 String::new()
             } else {
                 format!("|#{}", pairs.join(","))
             }
-        } else {
-            String::new()
         };
 
         let flush_interval_ms = config["flush_interval_ms"].as_u64().unwrap_or(500).max(50);

@@ -58,7 +58,7 @@ fn test_valid_config() {
             }
         ]
     });
-    let plugin = ApiChargeback::new(&config).unwrap();
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "api_chargeback");
     assert_eq!(plugin.priority(), 9350);
 }
@@ -66,14 +66,14 @@ fn test_valid_config() {
 #[test]
 fn test_missing_pricing_tiers() {
     let config = json!({ "currency": "USD" });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("pricing_tiers"));
 }
 
 #[test]
 fn test_empty_pricing_tiers() {
     let config = json!({ "pricing_tiers": [] });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("at least one"));
 }
 
@@ -82,7 +82,7 @@ fn test_missing_status_codes_in_tier() {
     let config = json!({
         "pricing_tiers": [{ "price_per_call": 0.001 }]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("status_codes"));
 }
 
@@ -91,7 +91,7 @@ fn test_missing_price_in_tier() {
     let config = json!({
         "pricing_tiers": [{ "status_codes": [200] }]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("price_per_call"));
 }
 
@@ -103,7 +103,7 @@ fn test_negative_price_rejected() {
             "price_per_call": -0.001
         }]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("non-negative"));
 }
 
@@ -115,7 +115,7 @@ fn test_duplicate_status_code_across_tiers() {
             { "status_codes": [200, 201], "price_per_call": 0.002 }
         ]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("200"));
     assert!(err.contains("multiple pricing tiers"));
 }
@@ -128,7 +128,7 @@ fn test_empty_status_codes_in_tier() {
             "price_per_call": 0.001
         }]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("must not be empty"));
 }
 
@@ -140,7 +140,7 @@ fn test_status_code_out_of_range() {
             "price_per_call": 0.001
         }]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("invalid HTTP status code"));
 }
 
@@ -152,7 +152,7 @@ fn test_status_code_below_100_rejected() {
             "price_per_call": 0.001
         }]
     });
-    let err = ApiChargeback::new(&config).err().unwrap();
+    let err = ApiChargeback::new(&config, "ferrum").err().unwrap();
     assert!(err.contains("invalid HTTP status code"));
 }
 
@@ -165,7 +165,7 @@ fn test_default_currency_is_usd() {
         }]
     });
     // Plugin creation succeeds with default currency
-    ApiChargeback::new(&config).unwrap();
+    ApiChargeback::new(&config, "ferrum").unwrap();
 }
 
 // --- Registry tests ---
@@ -258,7 +258,7 @@ fn test_prometheus_render_empty() {
 #[test]
 fn test_prometheus_render_with_data() {
     let registry = ChargebackRegistry::new();
-    registry.configure("USD", 5, 3600, 500);
+    registry.configure("USD", 5, 3600, 500, "ferrum");
     registry.record("alice", "proxy-1", "Payments API", 200, 0.00001);
     registry.record("alice", "proxy-1", "Payments API", 200, 0.00001);
 
@@ -287,7 +287,7 @@ fn test_json_render_empty() {
 #[test]
 fn test_json_render_with_data() {
     let registry = ChargebackRegistry::new();
-    registry.configure("EUR", 5, 3600, 500);
+    registry.configure("EUR", 5, 3600, 500, "ferrum");
 
     for _ in 0..100 {
         registry.record("bob", "proxy-2", "Orders API", 200, 0.00001);
@@ -320,7 +320,7 @@ async fn test_log_charges_identified_consumer() {
             "price_per_call": 0.001
         }]
     });
-    let plugin = ApiChargeback::new(&config).unwrap();
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
     let summary = make_summary("proxy-1", "Test API", Some("alice"), 200);
 
     plugin.log(&summary).await;
@@ -339,7 +339,7 @@ async fn test_log_skips_anonymous_traffic() {
             "price_per_call": 0.001
         }]
     });
-    let plugin = ApiChargeback::new(&config).unwrap();
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
 
     // No consumer
     let summary = make_summary("proxy-1", "Test API", None, 200);
@@ -360,7 +360,7 @@ async fn test_log_skips_uncharged_status_codes() {
             "price_per_call": 0.001
         }]
     });
-    let plugin = ApiChargeback::new(&config).unwrap();
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
 
     // 404 is not in the pricing tiers
     let summary = make_summary("proxy-uncharged", "Test API", Some("charlie"), 404);
@@ -379,6 +379,28 @@ fn test_multiple_pricing_tiers() {
             { "status_codes": [301, 302], "price_per_call": 0.000005 }
         ]
     });
-    let plugin = ApiChargeback::new(&config).unwrap();
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "api_chargeback");
+}
+
+#[test]
+fn test_prometheus_render_namespace_absent_for_default() {
+    let registry = ChargebackRegistry::new();
+    registry.configure("USD", 5, 3600, 500, "ferrum");
+    registry.record("alice", "proxy-1", "API", 200, 0.001);
+
+    let output = registry.render_prometheus_uncached();
+    assert!(!output.contains("namespace="));
+    assert!(output.contains("consumer=\"alice\""));
+}
+
+#[test]
+fn test_prometheus_render_namespace_present_for_non_default() {
+    let registry = ChargebackRegistry::new();
+    registry.configure("USD", 5, 3600, 500, "staging");
+    registry.record("bob", "proxy-2", "API", 200, 0.001);
+
+    let output = registry.render_prometheus_uncached();
+    assert!(output.contains(r#"namespace="staging""#));
+    assert!(output.contains("consumer=\"bob\""));
 }
