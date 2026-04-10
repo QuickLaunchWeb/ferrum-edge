@@ -10,6 +10,13 @@
 //! response formats. Auto-detection inspects the JSON structure to determine
 //! the provider when `provider` is set to `"auto"` (the default).
 //!
+//! Also supports SSE (Server-Sent Events) streaming responses (`text/event-stream`).
+//! For streaming responses, the plugin parses each `data:` line as JSON, extracts
+//! the model name from the first chunk, and looks for a final `usage` object in
+//! the last chunk (OpenAI sends usage in the final SSE event when
+//! `stream_options.include_usage` is set). For Anthropic streaming, the plugin
+//! looks for `message_delta` events containing `usage`.
+//!
 //! This plugin is observability-only: it never rejects a request.
 
 use async_trait::async_trait;
@@ -285,6 +292,151 @@ impl AiTokenMetrics {
         }
     }
 
+    /// Parse an SSE (text/event-stream) response body to extract token usage.
+    ///
+    /// SSE responses consist of `data: {...}\n\n` lines. The plugin scans for:
+    /// - **Model name**: extracted from the first parseable chunk
+    /// - **Usage data**: extracted from the final chunk that contains a `usage` object
+    ///   (OpenAI sends this when `stream_options.include_usage: true`)
+    /// - **Anthropic streaming**: looks for `message_delta` events with `usage`
+    fn extract_from_sse(&self, body: &[u8]) -> Option<TokenUsage> {
+        let body_str = std::str::from_utf8(body).ok()?;
+
+        let mut model: Option<String> = None;
+        let mut final_usage: Option<TokenUsage> = None;
+        let mut detected_provider: Option<Provider> = None;
+
+        for line in body_str.lines() {
+            let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                stripped.trim()
+            } else if let Some(stripped) = line.strip_prefix("data:") {
+                stripped.trim()
+            } else {
+                continue;
+            };
+
+            // Skip the [DONE] sentinel
+            if data == "[DONE]" {
+                continue;
+            }
+
+            let json: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Extract model from first chunk that has it
+            if model.is_none() {
+                model = json.get("model").and_then(|v| v.as_str()).map(String::from);
+            }
+
+            // Auto-detect provider from first parseable chunk
+            if detected_provider.is_none() {
+                if self.provider == "auto" {
+                    detected_provider = Self::detect_sse_provider(&json);
+                } else {
+                    detected_provider = Self::parse_configured_provider(&self.provider);
+                }
+            }
+
+            // Check for usage data in this chunk
+            // OpenAI: final chunk has "usage" object with prompt_tokens/completion_tokens
+            if let Some(usage) = json.get("usage")
+                && usage.is_object()
+                && !usage.as_object().is_some_and(|o| o.is_empty())
+            {
+                let provider = detected_provider.unwrap_or(Provider::OpenAi);
+                let mut extracted = Self::extract_tokens(&json, provider);
+                if extracted.model.is_none() {
+                    extracted.model = model.clone();
+                }
+                final_usage = Some(extracted);
+            }
+
+            // Anthropic streaming: message_delta event with usage
+            if json.get("type").and_then(|t| t.as_str()) == Some("message_delta")
+                && json.get("usage").is_some()
+            {
+                let usage = json.get("usage");
+                let output_tokens = usage
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(|v| v.as_u64());
+                // message_delta only has output_tokens; input_tokens come from message_start
+                if output_tokens.is_some() {
+                    let mut u = TokenUsage {
+                        prompt_tokens: None,
+                        completion_tokens: output_tokens,
+                        total_tokens: None,
+                        model: model.clone(),
+                        provider: Some(Provider::Anthropic),
+                    };
+                    // Try to merge with any previously seen input_tokens
+                    if let Some(ref prev) = final_usage {
+                        u.prompt_tokens = prev.prompt_tokens;
+                    }
+                    u.total_tokens = match (u.prompt_tokens, u.completion_tokens) {
+                        (Some(p), Some(c)) => Some(p + c),
+                        _ => None,
+                    };
+                    final_usage = Some(u);
+                }
+            }
+
+            // Anthropic streaming: message_start event with input_tokens
+            if json.get("type").and_then(|t| t.as_str()) == Some("message_start")
+                && let Some(message) = json.get("message")
+            {
+                let input_tokens = message
+                    .get("usage")
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(|v| v.as_u64());
+                if input_tokens.is_some() {
+                    let u = TokenUsage {
+                        prompt_tokens: input_tokens,
+                        completion_tokens: None,
+                        total_tokens: None,
+                        model: message
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                            .or_else(|| model.clone()),
+                        provider: Some(Provider::Anthropic),
+                    };
+                    final_usage = Some(u);
+                }
+            }
+        }
+
+        final_usage
+    }
+
+    /// Detect provider from an SSE chunk's JSON structure.
+    fn detect_sse_provider(json: &Value) -> Option<Provider> {
+        // Anthropic SSE: has "type" field like "message_start", "content_block_delta", etc.
+        if json.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+            t.starts_with("message") || t.starts_with("content_block") || t == "ping"
+        }) {
+            return Some(Provider::Anthropic);
+        }
+
+        // OpenAI SSE: has "object" field like "chat.completion.chunk"
+        if json
+            .get("object")
+            .and_then(|o| o.as_str())
+            .is_some_and(|o| o.contains("chat.completion"))
+        {
+            return Some(Provider::OpenAi);
+        }
+
+        // Google Gemini SSE: has "candidates" array
+        if json.get("candidates").is_some() {
+            return Some(Provider::Google);
+        }
+
+        // Fall back to full detection
+        Self::detect_provider(json)
+    }
+
     /// Write extracted token usage into the request context metadata.
     fn write_metadata(&self, metadata: &mut HashMap<String, String>, usage: &TokenUsage) {
         let prefix = &self.metadata_prefix;
@@ -357,21 +509,37 @@ impl Plugin for AiTokenMetrics {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Only parse JSON responses
         let content_type = response_headers
             .get("content-type")
             .map(|s| s.as_str())
             .unwrap_or("");
+
+        if body.is_empty() {
+            debug!("ai_token_metrics: empty response body, skipping");
+            return PluginResult::Continue;
+        }
+
+        // Handle SSE streaming responses
+        if content_type.contains("text/event-stream") || content_type.contains("event-stream") {
+            debug!("ai_token_metrics: parsing SSE streaming response");
+            if let Some(usage) = self.extract_from_sse(body) {
+                self.write_metadata(&mut ctx.metadata, &usage);
+                ctx.metadata.insert(
+                    format!("{}_streaming", self.metadata_prefix),
+                    "true".to_string(),
+                );
+            } else {
+                debug!("ai_token_metrics: no usage data found in SSE stream");
+            }
+            return PluginResult::Continue;
+        }
+
+        // Handle regular JSON responses
         if !content_type.contains("json") {
             debug!(
                 "ai_token_metrics: skipping non-JSON response (content-type: {})",
                 content_type
             );
-            return PluginResult::Continue;
-        }
-
-        if body.is_empty() {
-            debug!("ai_token_metrics: empty response body, skipping");
             return PluginResult::Continue;
         }
 

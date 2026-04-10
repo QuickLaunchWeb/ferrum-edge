@@ -9,7 +9,9 @@
 //!    and accumulate it against the consumer/IP's token budget.
 //!
 //! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock
-//! response formats with auto-detection.
+//! response formats with auto-detection. Also supports SSE (Server-Sent Events)
+//! streaming responses — when `ai_token_metrics` is active it reads tokens from
+//! metadata; when used standalone it parses SSE `data:` lines directly.
 //!
 //! # Centralized mode (`sync_mode: "redis"`)
 //!
@@ -375,6 +377,84 @@ impl AiRateLimiter {
             .and_then(|v| v.as_u64());
         (prompt, completion, total)
     }
+
+    /// Extract token count from an SSE (text/event-stream) response body.
+    ///
+    /// Parses `data:` lines looking for usage information in the final chunk
+    /// (OpenAI with `stream_options.include_usage`) or in Anthropic's
+    /// `message_start`/`message_delta` events.
+    fn extract_token_count_from_sse(&self, body: &[u8]) -> Option<u64> {
+        let body_str = std::str::from_utf8(body).ok()?;
+
+        let mut prompt_tokens: Option<u64> = None;
+        let mut completion_tokens: Option<u64> = None;
+        let mut total_tokens: Option<u64> = None;
+
+        for line in body_str.lines() {
+            let data = if let Some(stripped) = line.strip_prefix("data: ") {
+                stripped.trim()
+            } else if let Some(stripped) = line.strip_prefix("data:") {
+                stripped.trim()
+            } else {
+                continue;
+            };
+
+            if data == "[DONE]" {
+                continue;
+            }
+
+            let json: Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // OpenAI final chunk: usage object with prompt_tokens/completion_tokens
+            if let Some(usage) = json.get("usage")
+                && usage.is_object()
+                && !usage.as_object().is_some_and(|o| o.is_empty())
+            {
+                let (p, c, t) = if self.provider != "auto" {
+                    self.extract_by_provider(&json)
+                        .unwrap_or_else(|| Self::extract_openai(&json))
+                } else {
+                    self.auto_extract(&json)
+                        .unwrap_or_else(|| Self::extract_openai(&json))
+                };
+                prompt_tokens = p;
+                completion_tokens = c;
+                total_tokens = t;
+            }
+
+            // Anthropic: message_start has input_tokens
+            if json.get("type").and_then(|t| t.as_str()) == Some("message_start")
+                && let Some(message) = json.get("message")
+                && let Some(usage) = message.get("usage")
+            {
+                prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64());
+            }
+
+            // Anthropic: message_delta has output_tokens
+            if json.get("type").and_then(|t| t.as_str()) == Some("message_delta")
+                && let Some(usage) = json.get("usage")
+            {
+                completion_tokens = usage.get("output_tokens").and_then(|v| v.as_u64());
+            }
+        }
+
+        // Compute total if not provided
+        if total_tokens.is_none()
+            && let (Some(p), Some(c)) = (prompt_tokens, completion_tokens)
+        {
+            total_tokens = Some(p + c);
+        }
+
+        // Return the appropriate count based on count_mode
+        match self.count_mode.as_str() {
+            "prompt_tokens" => prompt_tokens.or(Some(0)),
+            "completion_tokens" => completion_tokens.or(Some(0)),
+            _ => total_tokens,
+        }
+    }
 }
 
 #[async_trait]
@@ -601,12 +681,22 @@ impl Plugin for AiRateLimiter {
         // re-parsing the response JSON when both plugins are active). Falls back
         // to parsing the body directly if metadata isn't available.
         let tokens = self.read_tokens_from_metadata(&ctx.metadata).or_else(|| {
-            // Only parse JSON responses
             let content_type = response_headers
                 .get("content-type")
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            if !content_type.contains("json") || body.is_empty() {
+
+            if body.is_empty() {
+                return None;
+            }
+
+            // SSE streaming responses
+            if content_type.contains("text/event-stream") || content_type.contains("event-stream") {
+                return self.extract_token_count_from_sse(body);
+            }
+
+            // Regular JSON responses
+            if !content_type.contains("json") {
                 return None;
             }
             self.extract_token_count(body)

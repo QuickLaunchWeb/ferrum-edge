@@ -1,4 +1,4 @@
-//! Plugin system — 53 built-in plugins with a trait-based architecture.
+//! Plugin system — 57 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -19,6 +19,7 @@ pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
 pub mod ai_request_guard;
+pub mod ai_response_guard;
 pub mod ai_token_metrics;
 pub mod api_chargeback;
 pub mod basic_auth;
@@ -27,6 +28,7 @@ pub mod bot_detection;
 pub mod compression;
 pub mod correlation_id;
 pub mod cors;
+pub mod geo_restriction;
 pub mod graphql;
 pub mod grpc_deadline;
 pub mod grpc_method_router;
@@ -45,6 +47,7 @@ pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
 pub mod rate_limiting;
+pub mod request_deduplication;
 pub mod request_mirror;
 pub mod request_size_limiting;
 pub mod request_termination;
@@ -583,6 +586,7 @@ pub mod priority {
     pub const REQUEST_TERMINATION: u16 = 125;
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
+    pub const GEO_RESTRICTION: u16 = 175;
     pub const BOT_DETECTION: u16 = 200;
     pub const SPEC_EXPOSE: u16 = 210;
     pub const SSE: u16 = 250;
@@ -598,6 +602,7 @@ pub mod priority {
     pub const SOAP_WS_SECURITY: u16 = 1500;
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
+    pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
@@ -615,6 +620,7 @@ pub mod priority {
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const COMPRESSION: u16 = 4050;
+    pub const AI_RESPONSE_GUARD: u16 = 4075;
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
@@ -1040,6 +1046,9 @@ pub fn create_plugin_with_http_client(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
+        "geo_restriction" => Ok(Some(Arc::new(geo_restriction::GeoRestriction::new(
+            config,
+        )?))),
         "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
         "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)?))),
         "request_transformer" => Ok(Some(Arc::new(
@@ -1067,6 +1076,9 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "request_deduplication" => Ok(Some(Arc::new(
+            request_deduplication::RequestDeduplication::new(config, http_client.clone())?,
+        ))),
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
@@ -1105,6 +1117,9 @@ pub fn create_plugin_with_http_client(
             http_client.clone(),
         )?))),
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
+            config,
+        )?))),
+        "ai_response_guard" => Ok(Some(Arc::new(ai_response_guard::AiResponseGuard::new(
             config,
         )?))),
         "ai_federation" => Ok(Some(Arc::new(ai_federation::AiFederation::new(
@@ -1216,6 +1231,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ai_request_guard",
         "ai_rate_limiter",
         "ai_prompt_shield",
+        "ai_response_guard",
         "ai_federation",
         "ws_message_size_limiting",
         "ws_frame_logging",
@@ -1227,6 +1243,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "sse",
         "request_mirror",
         "load_testing",
+        "geo_restriction",
+        "request_deduplication",
         "soap_ws_security",
         "spec_expose",
         "api_chargeback",

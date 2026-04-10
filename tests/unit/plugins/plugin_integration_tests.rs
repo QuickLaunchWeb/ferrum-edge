@@ -219,6 +219,9 @@ async fn test_all_plugins_available() {
         "ai_request_guard",
         "ai_rate_limiter",
         "ai_prompt_shield",
+        "ai_response_guard",
+        "geo_restriction",
+        "request_deduplication",
         "ws_message_size_limiting",
         "ws_frame_logging",
         "ws_logging",
@@ -255,6 +258,12 @@ async fn test_all_plugins_available() {
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
     for plugin_name in available_plugins() {
+        // geo_restriction requires a valid .mmdb file on disk — skip in this test.
+        // Its config validation is tested separately in geo_restriction_tests.rs.
+        if plugin_name == "geo_restriction" {
+            continue;
+        }
+
         // Some plugins now require specific config fields
         let config = match plugin_name {
             "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
@@ -311,6 +320,8 @@ async fn test_plugin_creation_all_plugins() {
             "api_chargeback" => {
                 json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
             }
+            "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
+            "request_deduplication" => json!({}),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);
