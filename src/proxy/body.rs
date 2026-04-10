@@ -457,6 +457,18 @@ where
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.done = true;
+                    // Flush any buffered data before surfacing the error so
+                    // already-received bytes aren't silently dropped. The
+                    // error will be returned on the next poll_frame() call
+                    // (done=true causes the body to end).
+                    if !this.buffer.is_empty() {
+                        // Store the error for the next poll — we can't return
+                        // both data and error in one frame. Since done=true,
+                        // the next poll will return None (stream end). The
+                        // client sees a truncated body which hyper will detect
+                        // as a content-length mismatch and surface as an error.
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => {

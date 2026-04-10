@@ -5899,20 +5899,30 @@ async fn proxy_to_backend_retry(
                 if threshold > 0
                     && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
                 {
-                    let body = match response.bytes().await {
-                        Ok(b) => b.to_vec(),
+                    match response.bytes().await {
+                        Ok(b) => retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Buffered(b.to_vec()),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
                         Err(e) => {
                             warn!("Failed to read backend response body: {}", e);
-                            Vec::new()
+                            retry::BackendResponse {
+                                status_code: 502,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Backend response body read failed"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: true,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::ConnectionReset),
+                            }
                         }
-                    };
-                    retry::BackendResponse {
-                        status_code: status,
-                        body: ResponseBody::Buffered(body),
-                        headers: resp_headers,
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: None,
                     }
                 } else {
                     retry::BackendResponse {
@@ -6481,20 +6491,30 @@ async fn proxy_to_backend(
                 if threshold > 0
                     && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
                 {
-                    let body = match response.bytes().await {
-                        Ok(b) => b.to_vec(),
+                    match response.bytes().await {
+                        Ok(b) => retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Buffered(b.to_vec()),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
                         Err(e) => {
                             warn!("Failed to read backend response body: {}", e);
-                            Vec::new()
+                            retry::BackendResponse {
+                                status_code: 502,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Backend response body read failed"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: true,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::ConnectionReset),
+                            }
                         }
-                    };
-                    retry::BackendResponse {
-                        status_code: status,
-                        body: ResponseBody::Buffered(body),
-                        headers: resp_headers,
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: None,
                     }
                 } else {
                     retry::BackendResponse {
