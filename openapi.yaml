@@ -3995,6 +3995,80 @@ components:
             Reject requests missing grpc-timeout with HTTP 400. Takes
             precedence over default_deadline_ms.
 
+    AiSemanticCacheConfig:
+      type: object
+      description: "Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized prompts (v1 exact-match with whitespace/case normalization, SHA-256 hash). Supports local DashMap and Redis storage."
+      properties:
+        ttl_seconds:
+          type: integer
+          format: uint64
+          default: 300
+          description: Time-to-live for cached entries in seconds
+        max_entries:
+          type: integer
+          format: uint64
+          default: 10000
+          description: Maximum number of cached entries (local mode)
+        max_entry_size_bytes:
+          type: integer
+          format: uint64
+          default: 1048576
+          description: Maximum size of a single cached response body in bytes (1 MiB)
+        max_total_size_bytes:
+          type: integer
+          format: uint64
+          default: 104857600
+          description: Maximum total cache size in bytes (100 MiB, local mode)
+        include_model_in_key:
+          type: boolean
+          default: true
+          description: Include the model name in the cache key (different models get separate cache entries)
+        include_params_in_key:
+          type: boolean
+          default: false
+          description: Include request parameters (temperature, max_tokens, etc.) in the cache key
+        scope_by_consumer:
+          type: boolean
+          default: false
+          description: Scope cache entries per consumer (authenticated consumer ID is included in the cache key)
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
+        redis_url:
+          type: string
+          description: Redis connection URL (required when sync_mode is redis)
+        redis_tls:
+          type: boolean
+          default: false
+          description: Enable TLS for Redis connection
+        redis_key_prefix:
+          type: string
+          default: "ferrum:ai_semantic_cache"
+          description: Redis key namespace prefix
+        redis_pool_size:
+          type: integer
+          format: uint64
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_connect_timeout_seconds:
+          type: integer
+          format: uint64
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          format: uint64
+          default: 5
+          description: Interval for background health check pings when Redis is unavailable
+        redis_username:
+          type: string
+          description: Redis ACL username (Redis 6+)
+        redis_password:
+          type: string
+          description: Redis password
+
     AiTokenMetricsConfig:
       type: object
       description: "Plugin: ai_token_metrics — Extracts token usage from LLM response bodies."
@@ -4192,6 +4266,83 @@ components:
           default: 1048576
           description: Skip scanning if body exceeds this size
 
+    AiResponseGuardConfig:
+      type: object
+      description: "Plugin: ai_response_guard — Validates and filters AI/LLM API responses for PII, blocked content, and structural requirements."
+      properties:
+        action:
+          type: string
+          enum: [reject, redact, warn]
+          default: reject
+          description: Action when a violation is detected in the response body
+        pii_patterns:
+          type: array
+          items:
+            type: string
+          default: []
+          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban)"
+        custom_pii_patterns:
+          type: array
+          items:
+            type: object
+            required: [name, regex]
+            properties:
+              name:
+                type: string
+                description: Pattern identifier used in redaction placeholders and violation reports
+              regex:
+                type: string
+                description: Regular expression pattern to match
+          default: []
+          description: "Custom PII {name, regex} patterns for domain-specific detection"
+        blocked_phrases:
+          type: array
+          items:
+            type: string
+          default: []
+          description: Exact phrases to block in response content (case-insensitive)
+        blocked_patterns:
+          type: array
+          items:
+            type: object
+            required: [name, regex]
+            properties:
+              name:
+                type: string
+                description: Pattern identifier for violation reports
+              regex:
+                type: string
+                description: Regular expression pattern to match
+          default: []
+          description: "Custom {name, regex} patterns for blocking arbitrary content in responses"
+        scan_fields:
+          type: string
+          enum: [content, all]
+          default: content
+          description: "Which response fields to scan: 'content' scans message content only, 'all' scans the entire response body"
+        redaction_placeholder:
+          type: string
+          default: "[REDACTED:{type}]"
+          description: "Template for redacted text. {type} is replaced with the pattern name"
+        max_scan_bytes:
+          type: integer
+          default: 1048576
+          description: Skip scanning if response body exceeds this size in bytes
+        require_json:
+          type: boolean
+          default: false
+          description: Reject responses that are not valid JSON
+        required_fields:
+          type: array
+          items:
+            type: string
+          default: []
+          description: JSON field names that must be present in the response body
+        max_completion_length:
+          type: integer
+          default: 0
+          description: Maximum allowed character length of completion content. 0 = no limit
+
     ApiChargebackConfig:
       type: object
       description: "Plugin: api_chargeback — Per-consumer API usage charge tracking with configurable pricing tiers by HTTP status code."
@@ -4271,6 +4422,101 @@ components:
                             type: integer
                           charges:
                             type: number
+
+    RequestDeduplicationConfig:
+      type: object
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Returns cached responses for duplicate requests within a TTL window. Supports centralized Redis-backed mode for cross-instance deduplication."
+      properties:
+        header_name:
+          type: string
+          default: "Idempotency-Key"
+          description: Request header name containing the deduplication key
+        ttl_seconds:
+          type: integer
+          default: 300
+          description: Time-to-live in seconds for cached responses
+        max_entries:
+          type: integer
+          default: 10000
+          description: Maximum number of cached deduplication entries (local mode only)
+        applicable_methods:
+          type: array
+          items:
+            type: string
+          default: ["POST", "PUT", "PATCH"]
+          description: HTTP methods that require deduplication
+        scope_by_consumer:
+          type: boolean
+          default: true
+          description: Scope deduplication keys per consumer identity
+        enforce_required:
+          type: boolean
+          default: false
+          description: Reject requests missing the deduplication header with 400
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Dedup cache storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:dedup"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+
+    GeoRestrictionConfig:
+      type: object
+      description: "Plugin: geo_restriction — IP geolocation-based access control using MaxMind GeoIP2/GeoLite2 databases."
+      required: [db_path]
+      properties:
+        db_path:
+          type: string
+          description: Path to MaxMind GeoIP2 or GeoLite2 .mmdb database file (required)
+        allow_countries:
+          type: array
+          items:
+            type: string
+          default: []
+          description: "ISO 3166-1 alpha-2 country codes to allow (e.g., [\"US\", \"CA\", \"GB\"]). If non-empty, only these countries are allowed"
+        deny_countries:
+          type: array
+          items:
+            type: string
+          default: []
+          description: "ISO 3166-1 alpha-2 country codes to deny. Evaluated after allow_countries"
+        inject_headers:
+          type: boolean
+          default: false
+          description: "Inject X-Geo-Country and X-Geo-Country-Name headers into proxied requests"
+        on_lookup_failure:
+          type: string
+          enum: [allow, deny]
+          default: allow
+          description: Action when the IP cannot be resolved to a country
 
     RateSpec:
       type: object

@@ -56,7 +56,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 54 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 58 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
@@ -79,6 +79,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Access Control** — consumer-based and group-based allow/deny lists (consumers declare `acl_groups` membership; plugins match via `allowed_groups` / `disallowed_groups`)
 - **IP Restriction** — standalone IP/CIDR filtering
+- **Geo Restriction** — GeoIP-based country allow/deny lists using MaxMind .mmdb database files
 - **TCP Connection Throttle** — caps active TCP connections per Consumer or client IP
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
@@ -86,6 +87,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
+- **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
 - **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
@@ -94,10 +96,12 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 ### AI / LLM Plugins
 
 - **AI Federation** — universal AI gateway that routes requests to any of 11 supported providers (OpenAI, Anthropic, Google Gemini/Vertex, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face). Clients send OpenAI Chat Completions format; the plugin translates to native provider format, handles authentication (API key, OAuth2, AWS SigV4), and normalizes responses back to OpenAI format. Supports model-based routing with glob patterns, provider-level model mapping, priority-ordered fallback on configurable status codes and network errors, per-provider connect/read timeouts, and custom base URLs for self-hosted endpoints. Writes token metadata for downstream rate limiting and logging
-- **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability
+- **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability, with SSE streaming support for real-time token counting
 - **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
 - **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses; supports centralized Redis-backed mode for cross-instance token budget coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
+- **AI Semantic Cache** — LLM response caching with normalized prompt matching (v1 exact-match with whitespace/case normalization, v2 roadmap for embedding-based similarity)
+- **AI Response Guard** — output-side content guardrails: PII detection in responses, blocked phrase filtering, and response format validation
 
 ### WebSocket Plugins
 

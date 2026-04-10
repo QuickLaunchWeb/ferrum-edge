@@ -631,6 +631,75 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Get a raw byte value from Redis.
+    ///
+    /// Used by plugins that need arbitrary key-value storage (e.g., request
+    /// deduplication, AI semantic cache) rather than rate limiting counters.
+    pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<Option<Vec<u8>>, redis::RedisError> =
+            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+
+        match result {
+            Ok(val) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(val)
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis GET failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Set a raw byte value in Redis with a TTL.
+    ///
+    /// Uses a pipelined `SET` + `EXPIRE` in a single round-trip.
+    /// Used by plugins that need arbitrary key-value storage.
+    pub async fn set_bytes_with_expire(
+        &self,
+        key: &str,
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<(), ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<(), redis::RedisError> = redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(key)
+            .arg(value)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(key)
+            .arg(ttl_seconds as i64)
+            .ignore()
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(()) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis SET+EXPIRE failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Build a full Redis key with the configured prefix.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();

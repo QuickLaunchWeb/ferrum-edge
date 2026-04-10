@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 54 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 58 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1488,6 +1488,36 @@ Restricts access based on client IP address or CIDR range.
 
 Rules are validated at config load time. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
+### `geo_restriction`
+
+Restricts access based on the geographic location of the client IP address using MaxMind GeoIP2/GeoLite2 `.mmdb` database files.
+
+**Priority:** 175
+
+**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `db_path` | String | (required) | Path to MaxMind `.mmdb` file |
+| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode) |
+| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode) |
+| `inject_headers` | bool | `false` | Inject `X-Geo-Country` header into upstream requests |
+| `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails: `allow` or `deny` |
+
+`allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
+
+The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart is required to pick up a new database file.
+
+> **Note:** Ferrum Edge does not ship or bundle any GeoIP database. Operators are responsible for obtaining a MaxMind GeoIP2 or GeoLite2 `.mmdb` file, accepting MaxMind's license terms, and managing updates. GeoLite2 (free) requires a [MaxMind account](https://www.maxmind.com/en/geolite2/signup) and is subject to the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula). MaxMind publishes weekly database updates.
+
+```yaml
+plugin_name: geo_restriction
+config:
+  db_path: /etc/ferrum/GeoLite2-Country.mmdb
+  allow_countries: [US, CA, GB, DE, FR]
+  inject_headers: true
+```
+
 ### `rate_limiting`
 
 Enforces request rate limits per time window. Supports limiting by client IP or authenticated consumer identity.
@@ -1534,6 +1564,48 @@ config:
   redis_url: "redis://redis-host:6379/0"
   redis_tls: true
   redis_key_prefix: "myapp:rate_limiting"
+```
+
+### `request_deduplication`
+
+Prevents duplicate API calls by tracking idempotency keys. When a request arrives with an idempotency key header and the same key was seen within the configured TTL, the plugin returns the cached response instead of forwarding to the backend.
+
+**Priority:** 2750
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive) |
+| `ttl_seconds` | u64 | `300` | Time-to-live for cached responses (must be > 0) |
+| `max_entries` | u64 | `10000` | Maximum number of cached entries (local mode) |
+| `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to |
+| `scope_by_consumer` | bool | `true` | Scope keys by authenticated consumer identity |
+| `enforce_required` | bool | `false` | Reject requests missing the idempotency header with 400 |
+| `sync_mode` | String | `"local"` | `local` (in-memory) or `redis` (centralized) |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `"ferrum:dedup"` | Redis key namespace prefix |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout |
+| `redis_health_check_interval_seconds` | u64 | `5` | Health check interval when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username |
+| `redis_password` | String (optional) | — | Redis password |
+
+**Behavior:**
+- On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
+- Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
+- GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
+- `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
+
+**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Automatic local fallback when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+
+```yaml
+plugin_name: request_deduplication
+config:
+  header_name: Idempotency-Key
+  ttl_seconds: 300
+  enforce_required: true
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/0"
 ```
 
 ---
@@ -2273,7 +2345,7 @@ config:
 
 ## AI / LLM Plugins
 
-Five plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+Seven plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
 
 ### `ai_federation`
 
@@ -2355,9 +2427,66 @@ plugins:
 
 **Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility.
 
+### `ai_semantic_cache`
+
+Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. v1 uses exact-match with normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Supports local in-memory (DashMap) and centralized Redis storage backends.
+
+**Priority:** 2700
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `ttl_seconds` | u64 | `300` | Time-to-live for cached entries in seconds |
+| `max_entries` | u64 | `10000` | Maximum number of cached entries (local mode) |
+| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body in bytes (1 MiB) |
+| `max_total_size_bytes` | u64 | `104857600` | Maximum total cache size in bytes (100 MiB, local mode) |
+| `include_model_in_key` | bool | `true` | Include the model name in the cache key (different models get separate cache entries) |
+| `include_params_in_key` | bool | `false` | Include request parameters (temperature, max_tokens, etc.) in the cache key |
+| `scope_by_consumer` | bool | `false` | Scope cache entries per consumer (authenticated consumer ID is included in the cache key) |
+| `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
+| `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `"ferrum:ai_semantic_cache"` | Redis key namespace prefix |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | -- | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | -- | Redis password |
+
+**Behavior:**
+
+- **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
+- **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
+- **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
+- **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet).
+
+```yaml
+plugin_name: ai_semantic_cache
+config:
+  ttl_seconds: 600
+  max_entries: 5000
+  max_entry_size_bytes: 2097152
+  include_model_in_key: true
+  scope_by_consumer: true
+```
+
+**Redis mode example:**
+
+```yaml
+plugin_name: ai_semantic_cache
+config:
+  ttl_seconds: 3600
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/3"
+  redis_key_prefix: "myapp:ai_cache"
+```
+
+#### v2 Roadmap
+
+A future v2 will add semantic similarity matching using embedding vectors. Instead of requiring exact normalized prompt matches, v2 will compute embeddings for prompts and use cosine similarity to find cached responses for semantically similar (but not identical) prompts. This will support configurable similarity thresholds and pluggable embedding providers.
+
 ### `ai_token_metrics`
 
-Extracts token usage from LLM response bodies and writes it to request metadata for downstream logging and observability plugins.
+Extracts token usage from LLM response bodies and writes it to request metadata for downstream logging and observability plugins. Supports both regular JSON responses and SSE (Server-Sent Events) streaming responses.
 
 **Priority:** 4100
 
@@ -2373,6 +2502,8 @@ Extracts token usage from LLM response bodies and writes it to request metadata 
 **Note**: Requires response body buffering. Set `response_body_mode: buffer` on the proxy.
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
+
+**SSE streaming support:** When the response content-type is `text/event-stream`, the plugin parses `data:` lines from the SSE stream to extract token usage. For OpenAI-compatible providers, usage data is found in the final SSE event (when `stream_options.include_usage: true` is set on the request). For Anthropic streaming, usage is extracted from `message_start` (input tokens) and `message_delta` (output tokens) events. Model name is extracted from the first parseable chunk. Sets `{prefix}_streaming: true` metadata when processing a streaming response.
 
 ```yaml
 plugin_name: ai_token_metrics
@@ -2416,7 +2547,7 @@ config:
 
 ### `ai_rate_limiter`
 
-Rate-limits consumers by LLM token consumption instead of request count.
+Rate-limits consumers by LLM token consumption instead of request count. Supports both regular JSON and SSE streaming responses — when `ai_token_metrics` is active, reads tokens from metadata; when used standalone, parses response bodies directly including SSE `data:` lines.
 
 **Priority:** 4200
 
@@ -2486,9 +2617,52 @@ config:
   exclude_roles: [system]
 ```
 
+### `ai_response_guard`
+
+Validates and filters LLM response content before it reaches the client. Complements `ai_prompt_shield` (which guards inputs) by providing output-side guardrails including PII detection in responses, keyword/phrase blocklists, and response format validation.
+
+**Priority:** 4075
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `action` | String | `"reject"` | `reject` (502), `redact`, or `warn` |
+| `pii_patterns` | String[] | `[]` | Built-in PII patterns to scan for in responses |
+| `custom_pii_patterns` | Object[] | `[]` | Custom `{name, regex}` PII patterns |
+| `blocked_phrases` | String[] | `[]` | Case-insensitive literal phrases to block |
+| `blocked_patterns` | Object[] | `[]` | Custom `{name, regex}` content patterns to block |
+| `scan_fields` | String | `"content"` | `content` (LLM completion fields only) or `all` (entire body) |
+| `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text |
+| `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
+| `require_json` | bool | `false` | Reject responses that are not valid JSON |
+| `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
+| `max_completion_length` | Integer | `0` | Maximum completion text length in characters (0 = unlimited) |
+
+At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_json`, `required_fields`, or `max_completion_length` must be configured.
+
+**Built-in PII patterns** (same as `ai_prompt_shield`): `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
+
+**Multi-provider support:** Extracts completion text from OpenAI (`choices[].message.content`), Anthropic (`content[].text`), and Google Gemini (`candidates[].content.parts[].text`) response formats.
+
+**Metadata keys** (for observability):
+- `ai_response_guard_detected` — comma-separated list of detected pattern types (warn mode)
+- `ai_response_guard_redacted` — comma-separated list of redacted pattern types (redact mode)
+- `ai_response_guard_warning` — completion length violation message
+
+```yaml
+plugin_name: ai_response_guard
+config:
+  action: redact
+  pii_patterns: [ssn, credit_card, email, api_key]
+  blocked_phrases: ["ignore all previous instructions"]
+  blocked_patterns:
+    - name: profanity
+      regex: "\\b(?:badword1|badword2)\\b"
+  max_completion_length: 10000
+```
+
 ### AI Plugin Composition Example
 
-A typical AI gateway proxy combining all five AI plugins with `ai_federation` for multi-provider routing:
+A typical AI gateway proxy combining all seven AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
 # Proxy config — ai_federation handles provider routing, so backend_host is unused
@@ -2501,6 +2675,11 @@ backend_port: 443
 plugins:
   - plugin_name: key_auth
     config: {}
+  - plugin_name: ai_semantic_cache
+    config:
+      ttl_seconds: 600
+      include_model_in_key: true
+      scope_by_consumer: true
   - plugin_name: ai_prompt_shield
     config:
       action: redact
@@ -2530,6 +2709,11 @@ plugins:
           priority: 3
           model_patterns: ["gemini-*"]
       fallback_enabled: true
+  - plugin_name: ai_response_guard
+    config:
+      action: redact
+      pii_patterns: [ssn, credit_card, email]
+      blocked_phrases: ["ignore all previous instructions"]
   - plugin_name: ai_rate_limiter
     config:
       token_limit: 1000000
@@ -2540,7 +2724,7 @@ plugins:
     config: {}
 ```
 
-> **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics` does not fire. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
+> **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics`, `ai_response_guard`, and `ai_semantic_cache` do not fire on the response path. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
 
 ---
 
