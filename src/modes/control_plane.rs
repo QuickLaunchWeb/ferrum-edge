@@ -665,7 +665,9 @@ pub async fn run(
         }
     });
 
-    // Wait for all listener handles (these exit when the shutdown signal fires)
+    // Wait for any listener handle to exit, or the shutdown signal if all
+    // listeners are disabled (e.g., admin_http=0, no admin TLS, gRPC port=0).
+    let mut wait_shutdown = shutdown_tx.subscribe();
     tokio::select! {
         _ = async {
             if let Some(handle) = admin_http_handle {
@@ -688,6 +690,15 @@ pub async fn run(
                 std::future::pending::<()>().await;
             }
         } => {}
+        _ = async {
+            while !*wait_shutdown.borrow() {
+                if wait_shutdown.changed().await.is_err() {
+                    return;
+                }
+            }
+        } => {
+            info!("Shutdown signal received with no active listeners");
+        }
     }
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent

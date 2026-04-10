@@ -515,9 +515,20 @@ pub async fn run(
     startup_ready.store(true, Ordering::Relaxed);
     info!("Gateway startup complete; /health now reports ready");
 
-    // Wait for all listeners to complete (these exit when the shutdown signal fires)
-    for handle in handles {
-        handle.await?;
+    // Wait for all listeners to complete (these exit when the shutdown signal fires).
+    // If no listener handles were spawned (e.g., all plaintext ports disabled and no
+    // TLS configured), block on the shutdown signal so stream proxies keep running.
+    if handles.is_empty() {
+        let mut wait_shutdown = shutdown_tx.subscribe();
+        while !*wait_shutdown.borrow() {
+            if wait_shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+    } else {
+        for handle in handles {
+            handle.await?;
+        }
     }
 
     // Graceful connection drain: wait for in-flight requests to complete.
