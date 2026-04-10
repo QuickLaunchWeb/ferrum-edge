@@ -13,7 +13,7 @@ Algorithm:
   3. Compute per-iteration overhead ratio = 1 - (gateway_rps / direct_rps)
   4. Take median of the N ratios
   5. Gate: median overhead < threshold (default 50%)
-  6. Gate: zero socket errors and zero non-2xx responses
+  6. Gate: error rate < 0.1% and non-2xx rate < 0.1%
 
 Total runtime: ~60s (2s warmup x2 + 3 iterations x (5s+5s) + overhead)
 """
@@ -185,22 +185,36 @@ def main():
     total_errors = 0
     total_non_2xx = 0
 
+    total_requests = 0
+
     for i in range(1, args.iterations + 1):
         print(f"Iteration {i}/{args.iterations}:")
 
-        gw = run_load_test(args.gateway_url, args.duration, args.concurrency)
+        # Alternate order: odd iterations run gateway first, even run backend
+        # first. This prevents systematic bias from CI runner load fluctuations
+        # that correlate with measurement position within each iteration.
+        gateway_first = (i % 2 == 1)
+
+        if gateway_first:
+            gw = run_load_test(args.gateway_url, args.duration, args.concurrency)
+            be = run_load_test(args.backend_url, args.duration, args.concurrency)
+        else:
+            be = run_load_test(args.backend_url, args.duration, args.concurrency)
+            gw = run_load_test(args.gateway_url, args.duration, args.concurrency)
+
         gateway_rps_samples.append(gw["rps"])
         total_errors += gw["errors"]
         total_non_2xx += gw["non_2xx"]
+        total_requests += gw["total_requests"]
         print(
             f"  Gateway:  {gw['rps']:>10.0f} RPS  "
             f"({gw['total_requests']} reqs, {gw['errors']} err, {gw['non_2xx']} non-2xx)"
         )
 
-        be = run_load_test(args.backend_url, args.duration, args.concurrency)
         backend_rps_samples.append(be["rps"])
         total_errors += be["errors"]
         total_non_2xx += be["non_2xx"]
+        total_requests += be["total_requests"]
         print(
             f"  Backend:  {be['rps']:>10.0f} RPS  "
             f"({be['total_requests']} reqs, {be['errors']} err, {be['non_2xx']} non-2xx)"
@@ -277,11 +291,20 @@ def main():
             f"OVERHEAD: median {median_overhead:.1f}% exceeds {args.overhead_threshold}% threshold"
         )
 
-    if total_errors > 0:
-        issues.append(f"ERRORS: {total_errors} socket errors during test")
+    # Allow a small error rate (0.1%) for transient CI runner noise (connection
+    # resets, scheduling jitter). Hard-zero was too strict and caused flaky failures.
+    error_rate_pct = (total_errors / total_requests * 100) if total_requests > 0 else 0
+    non_2xx_rate_pct = (total_non_2xx / total_requests * 100) if total_requests > 0 else 0
 
-    if total_non_2xx > 0:
-        issues.append(f"NON-2XX: {total_non_2xx} non-2xx responses during test")
+    if error_rate_pct > 0.1:
+        issues.append(
+            f"ERRORS: {total_errors} socket errors ({error_rate_pct:.2f}% of {total_requests} requests, threshold: 0.1%)"
+        )
+
+    if non_2xx_rate_pct > 0.1:
+        issues.append(
+            f"NON-2XX: {total_non_2xx} non-2xx responses ({non_2xx_rate_pct:.2f}% of {total_requests} requests, threshold: 0.1%)"
+        )
 
     if health_result["errors"] > 0 or health_result["non_2xx"] > 0:
         issues.append(

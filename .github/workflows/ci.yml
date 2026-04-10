@@ -238,6 +238,7 @@ jobs:
           done
 
       - name: Run self-relative performance test
+        timeout-minutes: 5
         run: |
           mkdir -p tests/performance/ci_results
           python3 tests/performance/ci_overhead_bench.py \
