@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 51 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 53 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -2135,6 +2135,50 @@ config:
   mirror_protocol: https
   percentage: 50.0
   mirror_request_body: true
+```
+
+---
+
+### `load_testing`
+
+Enables on-demand load testing of a proxy's backend by sending concurrent requests through the gateway's own proxy listener. Triggered when a request includes an `X-Loadtesting-Key` header matching the configured secret key. The triggering request proceeds normally; the load test runs in the background.
+
+**Priority:** 3080
+**Protocols:** HTTP
+
+Synthetic requests are sent to `127.0.0.1:{gateway_port}` without the `X-Loadtesting-Key` header, so they flow through the full proxy pipeline (routing, auth, rate limiting, backend dispatch, logging) without re-triggering the load test. The gateway's native transaction logging captures every synthetic request automatically. An `AtomicBool` guard prevents concurrent load tests on the same proxy.
+
+For multi-node deployments, `gateway_addresses` fans out the trigger (WITH the key) to remote gateway nodes, so each starts its own independent local load test.
+
+For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match to trigger |
+| `concurrent_clients` | Integer | **(required)** | Number of concurrent virtual clients (1–10,000) |
+| `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
+| `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once |
+| `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
+| `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
+| `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |
+| `gateway_addresses` | Array | _(none)_ | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header |
+
+**Caveats:**
+- **Auth forwarding**: Synthetic requests forward the triggering request's headers. For auth schemes with short-lived tokens (HMAC timestamps), tokens may expire during long tests.
+- **Rate limiting**: Synthetic requests pass through rate limiting plugins, which is realistic but may throttle throughput if limits are tight.
+
+```yaml
+plugin_name: load_testing
+config:
+  key: my-secret-load-test-key
+  concurrent_clients: 50
+  duration_seconds: 30
+  ramp: true
+  gateway_tls: true
+  gateway_port: 8443
+  gateway_addresses:
+    - https://node2:8443
+    - https://node3:8443
 ```
 
 ---
