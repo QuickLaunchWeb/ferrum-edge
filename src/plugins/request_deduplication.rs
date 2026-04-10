@@ -100,17 +100,18 @@ impl RequestDeduplication {
 
         // Build optional Redis client
         let redis_client =
-            RedisConfig::from_plugin_config(config, "ferrum:dedup").map(|redis_config| {
-                let dns_cache = http_client.dns_cache();
-                let tls_no_verify = http_client.tls_no_verify();
-                let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
-                Arc::new(RedisRateLimitClient::new(
-                    redis_config,
-                    dns_cache.cloned(),
-                    tls_no_verify,
-                    tls_ca_bundle_path,
-                ))
-            });
+            RedisConfig::from_plugin_config(config, &format!("{}:dedup", http_client.namespace()))
+                .map(|redis_config| {
+                    let dns_cache = http_client.dns_cache();
+                    let tls_no_verify = http_client.tls_no_verify();
+                    let tls_ca_bundle_path = http_client.tls_ca_bundle_path();
+                    Arc::new(RedisRateLimitClient::new(
+                        redis_config,
+                        dns_cache.cloned(),
+                        tls_no_verify,
+                        tls_ca_bundle_path,
+                    ))
+                });
 
         Ok(Self {
             header_name,

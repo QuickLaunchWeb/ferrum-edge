@@ -312,7 +312,7 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 |---|---|---|---|
 | `host` | String | *(required)* | StatsD server hostname or IP address |
 | `port` | Integer | `8125` | StatsD server UDP port (1–65535) |
-| `prefix` | String | `"ferrum"` | Metric name prefix (e.g., `ferrum.request.count`) |
+| `prefix` | String | `FERRUM_NAMESPACE` | Metric name prefix (e.g., `ferrum.request.count`). Defaults to the gateway's `FERRUM_NAMESPACE` value (default: `"ferrum"`) |
 | `global_tags` | Object | *(none)* | Key-value pairs appended as DogStatsD tags to every metric |
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (min: 50) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
@@ -331,7 +331,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | Status code bucket (2xx, 4xx, 5xx, etc.) |
 
-Tags: `method`, `status`, `status_class`, `proxy` (plus any `global_tags`).
+Tags: `method`, `status`, `status_class`, `proxy` (plus any `global_tags`). When `FERRUM_NAMESPACE` is non-default, a `namespace` tag is automatically injected into all metrics.
 
 **Metrics emitted per stream (TCP/UDP) disconnect:**
 
@@ -966,6 +966,8 @@ the `/metrics` endpoint; this plugin only records request and stream metrics.
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
+> **Namespace isolation:** When `FERRUM_NAMESPACE` is set to a non-default value (anything other than `"ferrum"`), all Prometheus metrics include an additional `namespace` label (e.g., `namespace="staging"`). This prevents metric collisions when multiple gateway instances with different namespaces are scraped by the same Prometheus server. When namespace is the default, no label is added and output is identical to pre-namespace behavior.
+
 ### `api_chargeback`
 
 Tracks per-consumer API usage charges based on configurable pricing tiers keyed
@@ -993,7 +995,7 @@ codes not listed in any pricing tier are free (not tracked).
 
 | Query Parameter | Description |
 |---|---|
-| _(none)_ | Prometheus text exposition format — two counter families: `ferrum_api_chargeable_calls_total` (call counts) and `ferrum_api_charges_total` (monetary charges) with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency` |
+| _(none)_ | Prometheus text exposition format — two counter families: `ferrum_api_chargeable_calls_total` (call counts) and `ferrum_api_charges_total` (monetary charges) with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency`. When `FERRUM_NAMESPACE` is non-default, all metrics include an additional `namespace` label |
 | `?format=json` | JSON format with nested consumer → proxy → status breakdowns and pre-computed totals |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
@@ -1534,7 +1536,7 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `ferrum:rate_limiting` | Redis key namespace prefix |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:rate_limiting` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -1553,6 +1555,8 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 Returns HTTP `429 Too Many Requests` when exceeded.
 
 **Centralized mode** (`sync_mode: "redis"`): Rate limit counters are stored in Redis so multiple gateway instances (e.g., multiple data planes) share a single global rate limit. Uses a two-window weighted approximation algorithm with native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined) for smooth sliding window semantics. If Redis becomes unreachable, the plugin automatically falls back to local in-memory rate limiting and switches back when connectivity is restored. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+
+> **Namespace isolation:** When `FERRUM_NAMESPACE` is set to a non-default value, the default `redis_key_prefix` automatically includes the namespace (e.g., `staging:rate_limiting` instead of `ferrum:rate_limiting`). This prevents key collisions when multiple gateway instances with different namespaces share the same Redis cluster. An explicit `redis_key_prefix` in the plugin config overrides this behavior entirely.
 
 ```yaml
 plugin_name: rate_limiting
@@ -1583,7 +1587,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `sync_mode` | String | `"local"` | `local` (in-memory) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `"ferrum:dedup"` | Redis key namespace prefix |
+| `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout |
 | `redis_health_check_interval_seconds` | u64 | `5` | Health check interval when Redis is unavailable |
@@ -1596,7 +1600,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 
-**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Automatic local fallback when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Centralized mode** (`sync_mode: "redis"`): Uses the shared `RedisRateLimitClient` infrastructure for centralized deduplication across multiple gateway instances. Automatic local fallback when Redis is unreachable. Compatible with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: request_deduplication
@@ -2445,7 +2449,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 | `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `"ferrum:ai_semantic_cache"` | Redis key namespace prefix |
+| `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:ai_cache"` | Redis key namespace prefix. Defaults to `ferrum:ai_cache` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -2457,7 +2461,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 - **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
 - **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
-- **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet).
+- **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: ai_semantic_cache
@@ -2562,7 +2566,7 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `ferrum:ai_rate_limiter` | Redis key namespace prefix |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ai_rate_limiter` | Redis key namespace prefix. Defaults to `ferrum:ai_rate_limiter` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -2573,7 +2577,7 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
-**Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 
 ```yaml
 plugin_name: ai_rate_limiter
@@ -2765,7 +2769,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `ferrum:ws_rate_limiting` | Redis key namespace prefix |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:ws_rate_limiting` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |

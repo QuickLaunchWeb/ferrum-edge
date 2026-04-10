@@ -288,20 +288,23 @@ impl RateLimiting {
         let dns_cache = http_client.dns_cache().cloned();
         let tls_no_verify = http_client.tls_no_verify();
         let tls_ca_bundle_path = http_client.tls_ca_bundle_path().map(|s| s.to_string());
-        let redis_client =
-            RedisConfig::from_plugin_config(config, "ferrum:rate_limiting").map(|cfg| {
-                tracing::info!(
-                    redis_url = %cfg.url,
-                    key_prefix = %cfg.key_prefix,
-                    "rate_limiting: centralized Redis mode enabled"
-                );
-                Arc::new(RedisRateLimitClient::new(
-                    cfg,
-                    dns_cache,
-                    tls_no_verify,
-                    tls_ca_bundle_path.as_deref(),
-                ))
-            });
+        let redis_client = RedisConfig::from_plugin_config(
+            config,
+            &format!("{}:rate_limiting", http_client.namespace()),
+        )
+        .map(|cfg| {
+            tracing::info!(
+                redis_url = %cfg.url,
+                key_prefix = %cfg.key_prefix,
+                "rate_limiting: centralized Redis mode enabled"
+            );
+            Arc::new(RedisRateLimitClient::new(
+                cfg,
+                dns_cache,
+                tls_no_verify,
+                tls_ca_bundle_path.as_deref(),
+            ))
+        });
 
         Ok(Self {
             limit_by,

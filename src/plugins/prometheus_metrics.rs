@@ -180,6 +180,11 @@ pub struct MetricsRegistry {
     /// Minimum cache age (nanos) before record() bothers to invalidate.
     /// Prevents an Arc allocation on every request under high load.
     cache_invalidation_min_age_nanos: AtomicU64,
+    /// Extra label fragment for namespace isolation. Empty when namespace is
+    /// the default ("ferrum"), otherwise `",namespace=\"<ns>\""`. Injected
+    /// into every metric's label set during render so that multiple gateway
+    /// instances with different namespaces produce distinct time series.
+    namespace_label: std::sync::RwLock<String>,
 }
 
 impl Default for MetricsRegistry {
@@ -205,6 +210,7 @@ impl MetricsRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
+            namespace_label: std::sync::RwLock::new(String::new()),
         }
     }
 
@@ -216,6 +222,7 @@ impl MetricsRegistry {
         render_cache_ttl_secs: u64,
         stale_entry_ttl_secs: u64,
         cache_invalidation_min_age_ms: u64,
+        namespace: &str,
     ) {
         self.render_cache_ttl_secs
             .store(render_cache_ttl_secs, Ordering::Relaxed);
@@ -223,6 +230,15 @@ impl MetricsRegistry {
             .store(stale_entry_ttl_secs * 1_000_000_000, Ordering::Relaxed);
         self.cache_invalidation_min_age_nanos
             .store(cache_invalidation_min_age_ms * 1_000_000, Ordering::Relaxed);
+        // Set namespace label fragment for non-default namespaces.
+        // Empty string for the default "ferrum" namespace (backward compatible).
+        if let Ok(mut ns_label) = self.namespace_label.write() {
+            if namespace != crate::config::types::DEFAULT_NAMESPACE {
+                *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
+            } else {
+                ns_label.clear();
+            }
+        }
     }
 
     pub fn record_stream(&self, summary: &StreamTransactionSummary) {
@@ -398,6 +414,13 @@ impl MetricsRegistry {
             + self.stream_duration_buckets.len() * 800;
         let mut output = String::with_capacity(estimated_cap);
 
+        // Read namespace label fragment once (empty for default namespace).
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+
         // Request counter
         output.push_str("# HELP ferrum_requests_total Total number of requests processed.\n");
         output.push_str("# TYPE ferrum_requests_total counter\n");
@@ -407,8 +430,8 @@ impl MetricsRegistry {
             let proxy_id = escape_label_value(&key.proxy_id);
             let method = escape_label_value(&key.method);
             output.push_str(&format!(
-                "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
-                proxy_id, method, key.status_code, count
+                "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"{}}} {}\n",
+                proxy_id, method, key.status_code, ns_label, count
             ));
         }
 
@@ -422,6 +445,7 @@ impl MetricsRegistry {
                 "ferrum_request_duration_ms",
                 &proxy_id,
                 entry.value(),
+                &ns_label,
             );
         }
 
@@ -436,6 +460,7 @@ impl MetricsRegistry {
                 "ferrum_backend_duration_ms",
                 &proxy_id,
                 entry.value(),
+                &ns_label,
             );
         }
 
@@ -451,16 +476,25 @@ impl MetricsRegistry {
                 "ferrum_edge_overhead_ms",
                 &proxy_id,
                 entry.value(),
+                &ns_label,
             );
         }
 
         // Rate limit exceeded
         output.push_str("# HELP ferrum_rate_limit_exceeded_total Total rate limit rejections.\n");
         output.push_str("# TYPE ferrum_rate_limit_exceeded_total counter\n");
-        output.push_str(&format!(
-            "ferrum_rate_limit_exceeded_total {}\n",
-            self.rate_limit_exceeded.load(Ordering::Relaxed)
-        ));
+        if ns_label.is_empty() {
+            output.push_str(&format!(
+                "ferrum_rate_limit_exceeded_total {}\n",
+                self.rate_limit_exceeded.load(Ordering::Relaxed)
+            ));
+        } else {
+            output.push_str(&format!(
+                "ferrum_rate_limit_exceeded_total{{{}}} {}\n",
+                &ns_label[1..], // strip leading comma
+                self.rate_limit_exceeded.load(Ordering::Relaxed)
+            ));
+        }
 
         // Stream connection counter
         if !self.stream_connection_counter.is_empty() {
@@ -474,8 +508,8 @@ impl MetricsRegistry {
                 let proxy_id = escape_label_value(&key.proxy_id);
                 let protocol = escape_label_value(&key.protocol);
                 output.push_str(&format!(
-                    "ferrum_stream_connections_total{{proxy_id=\"{}\",protocol=\"{}\"}} {}\n",
-                    proxy_id, protocol, count
+                    "ferrum_stream_connections_total{{proxy_id=\"{}\",protocol=\"{}\"{}}} {}\n",
+                    proxy_id, protocol, ns_label, count
                 ));
             }
         }
@@ -493,6 +527,7 @@ impl MetricsRegistry {
                     "ferrum_stream_duration_ms",
                     &proxy_id,
                     entry.value(),
+                    &ns_label,
                 );
             }
         }
@@ -507,27 +542,28 @@ fn render_histogram(
     metric_name: &str,
     proxy_id: &str,
     histogram: &HistogramBuckets,
+    ns_label: &str,
 ) {
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
         let count = histogram.counts[i].load(Ordering::Relaxed);
         output.push_str(&format!(
-            "{}_bucket{{proxy_id=\"{}\",le=\"{}\"}} {}\n",
-            metric_name, proxy_id, boundary, count
+            "{}_bucket{{proxy_id=\"{}\",le=\"{}\"{}}} {}\n",
+            metric_name, proxy_id, boundary, ns_label, count
         ));
     }
     let total_count = histogram.count.load(Ordering::Relaxed);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     output.push_str(&format!(
-        "{}_bucket{{proxy_id=\"{}\",le=\"+Inf\"}} {}\n",
-        metric_name, proxy_id, total_count
+        "{}_bucket{{proxy_id=\"{}\",le=\"+Inf\"{}}} {}\n",
+        metric_name, proxy_id, ns_label, total_count
     ));
     output.push_str(&format!(
-        "{}_sum{{proxy_id=\"{}\"}} {:.2}\n",
-        metric_name, proxy_id, sum
+        "{}_sum{{proxy_id=\"{}\"{}}} {:.2}\n",
+        metric_name, proxy_id, ns_label, sum
     ));
     output.push_str(&format!(
-        "{}_count{{proxy_id=\"{}\"}} {}\n",
-        metric_name, proxy_id, total_count
+        "{}_count{{proxy_id=\"{}\"{}}} {}\n",
+        metric_name, proxy_id, ns_label, total_count
     ));
 }
 
@@ -536,7 +572,7 @@ pub struct PrometheusMetrics {
 }
 
 impl PrometheusMetrics {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
         let registry = global_registry();
 
         let render_cache_ttl_secs = config
@@ -558,6 +594,7 @@ impl PrometheusMetrics {
             render_cache_ttl_secs,
             stale_entry_ttl_secs,
             cache_invalidation_min_age_ms,
+            namespace,
         );
 
         Ok(Self { registry })

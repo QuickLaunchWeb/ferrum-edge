@@ -453,18 +453,19 @@ All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_li
 **Architecture:**
 - **Shared client**: `src/plugins/utils/redis_rate_limiter.rs` provides `RedisRateLimitClient` — a shared Redis client with lazy connection, auto-reconnect via `ConnectionManager`, and background health checking.
 - **Algorithm**: Two-window weighted approximation using native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined in a single round-trip). No Lua scripts. `effective_count = prev_window * (1 - elapsed_fraction) + current_count`.
-- **Key design**: Keys are prefixed with `{redis_key_prefix}:{rate_key}:{window_index}` where `window_index = epoch_seconds / window_seconds`. All instances share the same window boundaries via system epoch clock.
+- **Key design**: Keys are prefixed with `{redis_key_prefix}:{rate_key}:{window_index}` where `window_index = epoch_seconds / window_seconds`. All instances share the same window boundaries via system epoch clock. The default `redis_key_prefix` is `{FERRUM_NAMESPACE}:{plugin_name}` (e.g., `ferrum:rate_limiting` for the default namespace). When `FERRUM_NAMESPACE` is non-default, the namespace is automatically included in the default prefix to prevent key collisions across gateway instances sharing the same Redis cluster. A user-configured `redis_key_prefix` overrides this entirely.
 - **Resilience**: If Redis goes down, plugins automatically fall back to local in-memory DashMap state and log a warning. A background tokio task pings Redis every N seconds (configurable via `redis_health_check_interval_seconds`) and switches back when connectivity is restored.
 - **TLS**: Supports `rediss://` URLs. CA verification and skip-verify use gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`.
 - **Protocol compatibility**: Uses the standard RESP protocol, so works with **Redis, Valkey, DragonflyDB, KeyDB, or Garnet** — any RESP-compatible server.
 - **Per-plugin isolation**: Each plugin instance has its own Redis connection and key prefix. Different proxies can use different Redis instances.
+- **Namespace isolation**: The `PluginHttpClient` carries the gateway's `FERRUM_NAMESPACE` to all plugins. Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `ai_semantic_cache`, `request_deduplication`) use it as the default key prefix so that gateways with different namespaces sharing the same Redis cluster do not collide. Observability plugins (`prometheus_metrics`, `statsd_logging`, `api_chargeback`) inject a `namespace` label/tag when `FERRUM_NAMESPACE` is non-default. When namespace is the default (`"ferrum"`), output is identical to pre-namespace behavior — no label is added, and keys use the same `ferrum:` prefix as before.
 - **No DB schema changes**: Plugin config is stored as opaque JSON (`serde_json::Value`) in the `plugin_configs` table, so new config fields are backward-compatible.
 
 **Config fields** (same for all three plugins):
 - `sync_mode`: `"local"` (default) or `"redis"`
 - `redis_url`: Connection URL (required when `sync_mode: "redis"`)
 - `redis_tls`: Enable TLS (CA verification and skip-verify use gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`)
-- `redis_key_prefix`: Key namespace (defaults to `ferrum:{plugin_name}`)
+- `redis_key_prefix`: Key namespace (defaults to `{FERRUM_NAMESPACE}:{plugin_name}`, e.g., `ferrum:rate_limiting` for the default namespace)
 - `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`: Connection tuning
 - `redis_username`, `redis_password`: Authentication
 

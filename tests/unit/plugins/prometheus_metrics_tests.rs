@@ -69,7 +69,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
 #[tokio::test]
 async fn test_prometheus_plugin_creation() {
     let config = json!({});
-    let plugin = PrometheusMetrics::new(&config).unwrap();
+    let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
     assert_eq!(plugin.priority(), 9300);
 }
@@ -329,7 +329,7 @@ async fn test_histogram_multiple_observations() {
 async fn test_plugin_log_hook_records_metrics() {
     // Use a fresh registry via the plugin's log hook
     let config = json!({});
-    let plugin = PrometheusMetrics::new(&config).unwrap();
+    let plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
 
     let summary = make_summary("log-hook-test", "DELETE", 204, 15.0, 10.0);
     plugin.log(&summary).await;
@@ -470,7 +470,7 @@ async fn test_render_cache_returns_same_output() {
 async fn test_render_cache_invalidated_on_new_record() {
     let registry = MetricsRegistry::new();
     // Set min age to 0 so invalidation is immediate (test needs instant invalidation)
-    registry.configure(5, 3600, 0);
+    registry.configure(5, 3600, 0, "ferrum");
     registry.record(&make_summary("inv-test-1", "GET", 200, 10.0, 5.0));
 
     let first = registry.render();
@@ -487,7 +487,7 @@ async fn test_render_cache_invalidated_on_new_record() {
 async fn test_render_cache_not_invalidated_when_young() {
     let registry = MetricsRegistry::new();
     // Set min age high so cache is never invalidated by record()
-    registry.configure(5, 3600, 60_000);
+    registry.configure(5, 3600, 60_000, "ferrum");
     registry.record(&make_summary("young-1", "GET", 200, 10.0, 5.0));
 
     let first = registry.render();
@@ -510,10 +510,81 @@ async fn test_plugin_config_sets_registry_tunables() {
         "stale_entry_ttl_seconds": 7200,
         "cache_invalidation_min_age_ms": 1000
     });
-    let _plugin = PrometheusMetrics::new(&config).unwrap();
+    let _plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
 
     let _registry = global_registry();
     // Can't read atomics directly from outside, but we can verify the plugin
     // didn't error on valid config
     assert_eq!(_plugin.name(), "prometheus_metrics");
+}
+
+#[tokio::test]
+async fn test_namespace_label_absent_for_default_namespace() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, "ferrum");
+    registry.record(&make_summary("ns-default", "GET", 200, 10.0, 5.0));
+
+    let output = registry.render_uncached();
+    // Default namespace should NOT produce a namespace label
+    assert!(!output.contains("namespace="));
+    assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="ns-default",method="GET",status_code="200"} 1"#
+    ));
+    assert!(
+        output.contains(r#"ferrum_request_duration_ms_bucket{proxy_id="ns-default",le="+Inf"} 1"#)
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_label_present_for_non_default_namespace() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, "staging");
+    registry.record(&make_summary("ns-custom", "POST", 201, 20.0, 15.0));
+
+    let output = registry.render_uncached();
+    // Non-default namespace should produce a namespace label on all metrics
+    assert!(output.contains(r#"namespace="staging""#));
+    assert!(output.contains(
+        r#"ferrum_requests_total{proxy_id="ns-custom",method="POST",status_code="201",namespace="staging"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_request_duration_ms_bucket{proxy_id="ns-custom",le="+Inf",namespace="staging"} 1"#
+    ));
+    // Rate limit counter should also have namespace label
+    assert!(output.contains(r#"ferrum_rate_limit_exceeded_total{namespace="staging"}"#));
+}
+
+#[tokio::test]
+async fn test_namespace_label_with_stream_metrics() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 0, "prod");
+
+    let summary = StreamTransactionSummary {
+        proxy_id: "stream-ns".to_string(),
+        proxy_name: Some("tcp-proxy".to_string()),
+        namespace: "prod".to_string(),
+        protocol: "tcp".to_string(),
+        listen_port: 9090,
+        client_ip: "10.0.0.1".to_string(),
+        backend_target: "backend.local:8080".to_string(),
+        backend_resolved_ip: None,
+        bytes_sent: 1024,
+        bytes_received: 2048,
+        duration_ms: 500.0,
+        connection_error: None,
+        error_class: None,
+        timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+    };
+    registry.record_stream(&summary);
+
+    let output = registry.render_uncached();
+    assert!(output.contains(
+        r#"ferrum_stream_connections_total{proxy_id="stream-ns",protocol="tcp",namespace="prod"} 1"#
+    ));
+    assert!(output.contains(
+        r#"ferrum_stream_duration_ms_bucket{proxy_id="stream-ns",le="+Inf",namespace="prod"} 1"#
+    ));
 }

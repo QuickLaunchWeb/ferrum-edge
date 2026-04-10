@@ -145,6 +145,9 @@ pub struct ChargebackRegistry {
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
+    /// Extra label fragment for namespace isolation. Empty for default namespace,
+    /// otherwise `",namespace=\"<ns>\""`. Matches the prometheus_metrics pattern.
+    namespace_label: std::sync::RwLock<String>,
 }
 
 impl Default for ChargebackRegistry {
@@ -166,6 +169,7 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
+            namespace_label: std::sync::RwLock::new(String::new()),
         }
     }
 
@@ -175,6 +179,7 @@ impl ChargebackRegistry {
         render_cache_ttl_secs: u64,
         stale_entry_ttl_secs: u64,
         cache_invalidation_min_age_ms: u64,
+        namespace: &str,
     ) {
         self.currency.store(Arc::new(currency.to_string()));
         self.render_cache_ttl_secs
@@ -183,6 +188,13 @@ impl ChargebackRegistry {
             .store(stale_entry_ttl_secs * 1_000_000_000, Ordering::Relaxed);
         self.cache_invalidation_min_age_nanos
             .store(cache_invalidation_min_age_ms * 1_000_000, Ordering::Relaxed);
+        if let Ok(mut ns_label) = self.namespace_label.write() {
+            if namespace != crate::config::types::DEFAULT_NAMESPACE {
+                *ns_label = format!(",namespace=\"{}\"", escape_label_value(namespace));
+            } else {
+                ns_label.clear();
+            }
+        }
     }
 
     /// Record a chargeable API call.
@@ -294,6 +306,11 @@ impl ChargebackRegistry {
 
     pub fn render_prometheus_uncached(&self) -> String {
         let currency = self.currency.load();
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_default();
         // Two counter families × ~150 bytes per entry
         let estimated_cap = 512 + self.entries.len() * 300;
         let mut output = String::with_capacity(estimated_cap);
@@ -307,11 +324,12 @@ impl ChargebackRegistry {
             let v = entry.value();
             let count = v.call_count.load(Ordering::Relaxed);
             output.push_str(&format!(
-                "ferrum_api_chargeable_calls_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\"}} {}\n",
+                "ferrum_api_chargeable_calls_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\"{}}} {}\n",
                 escape_label_value(&v.consumer),
                 escape_label_value(&v.proxy_id),
                 escape_label_value(&v.proxy_name),
                 v.status_code,
+                ns_label,
                 count
             ));
         }
@@ -324,12 +342,13 @@ impl ChargebackRegistry {
             let v = entry.value();
             let charge = f64::from_bits(v.charge_total_bits.load(Ordering::Relaxed));
             output.push_str(&format!(
-                "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"}} {:.10}\n",
+                "ferrum_api_charges_total{{consumer=\"{}\",proxy_id=\"{}\",proxy_name=\"{}\",status_code=\"{}\",currency=\"{}\"{}}} {:.10}\n",
                 escape_label_value(&v.consumer),
                 escape_label_value(&v.proxy_id),
                 escape_label_value(&v.proxy_name),
                 v.status_code,
                 escape_label_value(&currency),
+                ns_label,
                 charge
             ));
         }
@@ -444,7 +463,7 @@ pub struct ApiChargeback {
 }
 
 impl ApiChargeback {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
         let registry = global_registry();
 
         let currency = config
@@ -555,6 +574,7 @@ impl ApiChargeback {
             render_cache_ttl_secs,
             stale_entry_ttl_secs,
             cache_invalidation_min_age_ms,
+            namespace,
         );
 
         Ok(Self {
