@@ -133,6 +133,30 @@ fn test_empty_status_codes_in_tier() {
 }
 
 #[test]
+fn test_status_code_out_of_range() {
+    let config = json!({
+        "pricing_tiers": [{
+            "status_codes": [70000],
+            "price_per_call": 0.001
+        }]
+    });
+    let err = ApiChargeback::new(&config).err().unwrap();
+    assert!(err.contains("invalid HTTP status code"));
+}
+
+#[test]
+fn test_status_code_below_100_rejected() {
+    let config = json!({
+        "pricing_tiers": [{
+            "status_codes": [99],
+            "price_per_call": 0.001
+        }]
+    });
+    let err = ApiChargeback::new(&config).err().unwrap();
+    assert!(err.contains("invalid HTTP status code"));
+}
+
+#[test]
 fn test_default_currency_is_usd() {
     let config = json!({
         "pricing_tiers": [{

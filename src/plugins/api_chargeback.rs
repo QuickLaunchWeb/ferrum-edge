@@ -467,14 +467,9 @@ impl ApiChargeback {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000);
 
-        registry.configure(
-            currency,
-            render_cache_ttl_secs,
-            stale_entry_ttl_secs,
-            cache_invalidation_min_age_ms,
-        );
-
-        // Parse pricing tiers
+        // Validate pricing tiers BEFORE mutating the global registry.
+        // If validation fails, the singleton must remain unchanged so other
+        // plugin instances (or the /charges endpoint) are not affected.
         let tiers = config
             .get("pricing_tiers")
             .and_then(|v| v.as_array())
@@ -528,12 +523,20 @@ impl ApiChargeback {
             }
 
             for code_val in status_codes {
-                let code = code_val.as_u64().ok_or_else(|| {
+                let code_u64 = code_val.as_u64().ok_or_else(|| {
                     format!(
                         "api_chargeback: pricing_tiers[{}].status_codes contains non-integer value",
                         i
                     )
-                })? as u16;
+                })?;
+
+                if !(100..=599).contains(&code_u64) {
+                    return Err(format!(
+                        "api_chargeback: pricing_tiers[{}].status_codes contains invalid HTTP status code {}",
+                        i, code_u64
+                    ));
+                }
+                let code = code_u64 as u16;
 
                 if price_by_status.contains_key(&code) {
                     return Err(format!(
@@ -545,6 +548,14 @@ impl ApiChargeback {
                 price_by_status.insert(code, price);
             }
         }
+
+        // Validation passed — now safe to mutate the global registry.
+        registry.configure(
+            currency,
+            render_cache_ttl_secs,
+            stale_entry_ttl_secs,
+            cache_invalidation_min_age_ms,
+        );
 
         Ok(Self {
             registry,
