@@ -18,13 +18,14 @@ pub mod connection_pool;
 pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
+pub mod date_cache;
 pub mod dns;
 pub mod dtls;
 pub mod grpc;
 pub mod health_check;
 pub mod http3;
+pub mod lazy_timeout;
 pub mod load_balancer;
-pub mod metrics;
 pub mod modes;
 pub mod overload;
 pub mod plugin_cache;
@@ -34,8 +35,10 @@ pub mod retry;
 pub mod router_cache;
 pub mod secrets;
 pub mod service_discovery;
+pub mod socket_opts;
 pub mod startup;
 pub mod tls;
+pub mod tls_offload;
 
 pub use config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 pub use consumer_index::ConsumerIndex;

@@ -413,6 +413,7 @@ async fn test_http3_proxy_state_creation() {
                 true, true, 300, 8192, 262_144, 65_536, 6000,
             )),
             64,
+            true,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -449,7 +450,6 @@ async fn test_http3_proxy_state_creation() {
         via_header_http2: None,
         via_header_http3: None,
         add_forwarded_header: false,
-        windowed_metrics: std::sync::Arc::new(ferrum_edge::metrics::WindowedMetrics::new(30)),
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
         max_header_count: 100,
@@ -618,6 +618,7 @@ async fn test_http3_full_integration() {
                 true, true, 300, 8192, 262_144, 65_536, 6000,
             )),
             64,
+            true,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -654,7 +655,6 @@ async fn test_http3_full_integration() {
         via_header_http2: None,
         via_header_http3: None,
         add_forwarded_header: false,
-        windowed_metrics: std::sync::Arc::new(ferrum_edge::metrics::WindowedMetrics::new(30)),
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
         max_header_count: 100,
