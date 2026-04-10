@@ -38,6 +38,7 @@ pub mod jwt_auth;
 pub mod kafka_logging;
 pub mod key_auth;
 pub mod ldap_auth;
+pub mod load_testing;
 pub mod loki_logging;
 pub mod mtls_auth;
 pub mod otel_tracing;
@@ -608,6 +609,7 @@ pub mod priority {
     pub const RESPONSE_MOCK: u16 = 3030;
     pub const GRPC_DEADLINE: u16 = 3050;
     pub const REQUEST_MIRROR: u16 = 3075;
+    pub const LOAD_TESTING: u16 = 3080;
     pub const RESPONSE_SIZE_LIMITING: u16 = 3490;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
@@ -1059,6 +1061,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "load_testing" => Ok(Some(Arc::new(load_testing::LoadTesting::new(
+            config,
+            http_client.clone(),
+        )?))),
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
@@ -1217,6 +1223,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "loki_logging",
         "sse",
         "request_mirror",
+        "load_testing",
         "soap_ws_security",
         "spec_expose",
     ];
