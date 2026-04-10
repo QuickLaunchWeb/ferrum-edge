@@ -375,6 +375,30 @@ impl Plugin for AiSemanticCache {
         // Periodic cleanup
         self.cleanup_expired();
 
+        // Check Redis first (centralized cache across instances)
+        if let Some(ref redis) = self.redis_client
+            && redis.is_available()
+        {
+            let redis_key = redis.make_key(&[&cache_key]);
+            if let Ok(Some(data)) = redis.get_bytes(&redis_key).await
+                && let Ok(entry) = serde_json::from_slice::<SerializableCacheEntry>(&data)
+            {
+                debug!(
+                    cache_key = %cache_key,
+                    "ai_semantic_cache: Redis cache HIT, returning cached response"
+                );
+                let mut response_headers = entry.headers.clone();
+                response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
+                ctx.metadata
+                    .insert("ai_cache_status".to_string(), "HIT".to_string());
+                return PluginResult::RejectBinary {
+                    status_code: entry.status_code,
+                    body: Bytes::from(entry.body),
+                    headers: response_headers,
+                };
+            }
+        }
+
         // Check local cache
         if let Some(entry) = self.cache.get(&cache_key) {
             if Instant::now().duration_since(entry.inserted_at) < self.ttl {
@@ -487,7 +511,25 @@ impl Plugin for AiSemanticCache {
         }
         self.total_size
             .fetch_add(entry.approx_size, Ordering::Relaxed);
-        self.cache.insert(cache_key, entry);
+        self.cache.insert(cache_key.clone(), entry);
+
+        // Also store in Redis if configured
+        if let Some(ref redis) = self.redis_client
+            && redis.is_available()
+        {
+            let serializable = SerializableCacheEntry {
+                status_code: response_status,
+                headers: response_headers.clone(),
+                body: body.to_vec(),
+            };
+            if let Ok(data) = serde_json::to_vec(&serializable) {
+                let redis_key = redis.make_key(&[&cache_key]);
+                let ttl_seconds = self.ttl.as_secs().max(1);
+                let _ = redis
+                    .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+                    .await;
+            }
+        }
 
         PluginResult::Continue
     }

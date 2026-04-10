@@ -143,36 +143,27 @@ impl RequestDeduplication {
     }
 
     /// Try to retrieve a cached response from Redis.
-    #[allow(dead_code)]
     async fn redis_get(&self, key: &str) -> Option<CachedResponse> {
         let redis = self.redis_client.as_ref()?;
         if !redis.is_available() {
             return None;
         }
 
-        let mut conn = match self.get_redis_connection(redis).await {
-            Some(c) => c,
-            None => return None,
+        let redis_key = redis.make_key(&[key]);
+        let data = match redis.get_bytes(&redis_key).await {
+            Ok(Some(d)) => d,
+            Ok(None) => return None,
+            Err(()) => return None,
         };
 
-        let result: Result<Option<Vec<u8>>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
-
-        match result {
-            Ok(Some(data)) => serde_json::from_slice::<SerializableCachedResponse>(&data)
-                .ok()
-                .map(|s| CachedResponse {
-                    status_code: s.status_code,
-                    headers: s.headers,
-                    body: Bytes::from(s.body),
-                    inserted_at: Instant::now(), // Not meaningful for Redis
-                }),
-            Ok(None) => None,
-            Err(e) => {
-                debug!("request_deduplication: Redis GET failed: {}", e);
-                None
-            }
-        }
+        serde_json::from_slice::<SerializableCachedResponse>(&data)
+            .ok()
+            .map(|s| CachedResponse {
+                status_code: s.status_code,
+                headers: s.headers,
+                body: Bytes::from(s.body),
+                inserted_at: Instant::now(), // Not meaningful for Redis entries
+            })
     }
 
     /// Store a cached response in Redis with TTL.
@@ -195,46 +186,14 @@ impl RequestDeduplication {
             Err(_) => return,
         };
 
-        let mut conn = match self.get_redis_connection(redis).await {
-            Some(c) => c,
-            None => return,
-        };
-
-        let ttl_seconds = self.ttl.as_secs().max(1) as i64;
-        let result: Result<(), redis::RedisError> = redis::pipe()
-            .atomic()
-            .cmd("SET")
-            .arg(key)
-            .arg(data)
-            .cmd("EXPIRE")
-            .arg(key)
-            .arg(ttl_seconds)
-            .ignore()
-            .query_async(&mut conn)
-            .await;
-
-        if let Err(e) = result {
-            debug!("request_deduplication: Redis SET failed: {}", e);
+        let redis_key = redis.make_key(&[key]);
+        let ttl_seconds = self.ttl.as_secs().max(1);
+        if let Err(()) = redis
+            .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+            .await
+        {
+            debug!("request_deduplication: Redis SET failed for key '{}'", key);
         }
-    }
-
-    /// Helper to get a Redis connection through the client's lazy connection mechanism.
-    async fn get_redis_connection(
-        &self,
-        _redis: &RedisRateLimitClient,
-    ) -> Option<redis::aio::ConnectionManager> {
-        // We can't directly access get_connection since it's not pub.
-        // Instead, we use a lightweight PING-like probe via the available methods.
-        // For the dedup plugin, we use incr_with_expire as a connection test
-        // and handle the actual GET/SET via direct redis commands.
-        // Since RedisRateLimitClient manages connection internally,
-        // we need to work within its API.
-
-        // Actually, we need raw connection access for GET/SET.
-        // The RedisRateLimitClient exposes specific operations but not raw connections.
-        // For now, use local cache as the primary and Redis as a supplement
-        // through the existing incr_with_expire API for key reservation.
-        None
     }
 
     /// Evict expired entries from local cache.
@@ -352,6 +311,23 @@ impl Plugin for RequestDeduplication {
 
         // Periodic cleanup
         self.cleanup_local_cache();
+
+        // Check Redis first (centralized dedup across instances)
+        if self.redis_client.is_some()
+            && let Some(cached) = self.redis_get(&key).await
+        {
+            debug!(
+                "request_deduplication: Redis cache hit for key '{}', replaying response",
+                idempotency_value
+            );
+            let mut response_headers = cached.headers.clone();
+            response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
+            return PluginResult::RejectBinary {
+                status_code: cached.status_code,
+                body: cached.body.clone(),
+                headers: response_headers,
+            };
+        }
 
         // Check local cache
         if let Some(entry) = self.local_cache.get(&key) {
