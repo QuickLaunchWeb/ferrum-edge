@@ -4741,14 +4741,19 @@ pub async fn handle_proxy_request(
                     }
                 }
 
-                return Ok(resp_builder
-                    .body(ProxyBody::streaming_incoming(grpc_streaming.body))
-                    .unwrap_or_else(|_| {
-                        grpc_proxy::build_grpc_error_response(
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            "Internal gateway error",
-                        )
-                    }));
+                // Coalesce small H2 DATA frames into larger chunks to reduce
+                // per-frame overhead on the gRPC streaming path.
+                let cl = response_headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<u64>().ok());
+                let body = crate::proxy::body::coalescing_h2_body(grpc_streaming.body, cl);
+
+                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
+                    grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Internal gateway error",
+                    )
+                }));
             }
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
@@ -5642,7 +5647,12 @@ pub async fn handle_proxy_request(
                 .and_then(|v| v.parse::<u64>().ok());
             crate::proxy::body::coalescing_body(resp, cl)
         }
-        ResponseBody::StreamingH2(resp) => ProxyBody::streaming_h2(resp),
+        ResponseBody::StreamingH2(resp) => {
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            crate::proxy::body::coalescing_h2_body(resp.into_body(), cl)
+        }
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 
