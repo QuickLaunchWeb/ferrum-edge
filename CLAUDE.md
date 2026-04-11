@@ -446,7 +446,7 @@ All gateway components share a single `DnsCache` instance:
 - **Pre-warmed at startup**: Backend hostnames, plugin target hostnames, and upstream targets are resolved before traffic starts flowing
 - **TTL-based expiration**: Cache entries expire based on configurable TTL (default from `FERRUM_DNS_CACHE_TTL_SECONDS`)
 - **Stale-while-revalidate**: Serves the old IP while refreshing in the background, avoiding DNS latency on the hot path
-- **Background refresh**: A dedicated task refreshes entries before they expire, keeping the cache warm
+- **Background refresh**: A dedicated task refreshes entries before they expire (at configurable `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` of TTL, default 90%), keeping the cache warm
 - **`DnsCacheResolver`**: Implements `reqwest::dns::Resolve` — plugged into every `reqwest::Client` for automatic cache integration
 - **Custom nameservers**: Supports `FERRUM_DNS_NAMESERVERS` for internal DNS (e.g., Consul DNS, CoreDNS) and DNS-over-TLS via `FERRUM_DNS_TLS_NAMESERVERS`
 - **Record type optimization**: Remembers whether A or AAAA succeeded last for each hostname, querying that type first on refresh

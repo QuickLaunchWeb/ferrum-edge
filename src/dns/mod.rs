@@ -79,6 +79,9 @@ pub struct DnsConfig {
     pub error_ttl_seconds: u64,
     /// Maximum number of entries in the DNS cache. Entries are evicted when this limit is reached.
     pub max_cache_size: usize,
+    /// Percentage of TTL elapsed before background refresh triggers (1-99). Default: 90.
+    /// At 90%, a 300s TTL entry refreshes after 270s (30s remaining).
+    pub refresh_threshold_percent: u8,
     /// Threshold in milliseconds above which DNS resolutions are logged as slow.
     /// None = disabled (no slow resolution warnings). Default: None.
     pub slow_threshold_ms: Option<u64>,
@@ -100,6 +103,7 @@ impl Default for DnsConfig {
             stale_ttl_seconds: 3600,
             error_ttl_seconds: 5,
             max_cache_size: 10_000,
+            refresh_threshold_percent: 90,
             slow_threshold_ms: None,
             warmup_concurrency: 500,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
@@ -144,6 +148,8 @@ pub struct DnsCache {
     warmup_concurrency: usize,
     /// Backend IP allowlist policy for SSRF protection.
     backend_allow_ips: crate::config::BackendAllowIps,
+    /// Percentage of TTL elapsed before background refresh triggers (1-99).
+    refresh_threshold_percent: u8,
 }
 
 impl DnsCache {
@@ -172,6 +178,7 @@ impl DnsCache {
             resolver_label,
             warmup_concurrency: config.warmup_concurrency.max(1),
             backend_allow_ips: config.backend_allow_ips,
+            refresh_threshold_percent: config.refresh_threshold_percent.clamp(1, 99),
         }
     }
 
@@ -702,8 +709,8 @@ impl DnsCache {
     }
 
     /// Start a background task that proactively refreshes cache entries before
-    /// they expire. Entries are refreshed when they reach 75% of their TTL,
-    /// keeping DNS resolution out of the hot request path.
+    /// they expire. Entries are refreshed when the configured percentage of their
+    /// TTL has elapsed (default 90%), keeping DNS resolution off the hot request path.
     #[allow(dead_code)]
     pub fn start_background_refresh(&self) -> tokio::task::JoinHandle<()> {
         self.start_background_refresh_with_shutdown(None)
@@ -720,7 +727,9 @@ impl DnsCache {
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let cache = self.clone();
-        let check_interval = std::cmp::max(cache.default_ttl.as_secs() / 4, 5);
+        let remaining_fraction = (100 - cache.refresh_threshold_percent as u64).max(1);
+        let check_interval =
+            std::cmp::max(cache.default_ttl.as_secs() * remaining_fraction / 100, 5);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
@@ -741,9 +750,10 @@ impl DnsCache {
                 // Evict expired entries and enforce max cache size
                 cache.evict_expired();
 
-                // Collect entries that are nearing expiration (past 75% of TTL)
+                // Collect entries nearing expiration (past the configured refresh threshold)
                 let now = Instant::now();
                 let mut to_refresh: Vec<(String, Option<u64>)> = Vec::new();
+                let refresh_remaining_pct = (100 - cache.refresh_threshold_percent as u32).max(1);
 
                 for entry in cache.cache.iter() {
                     // Skip error entries
@@ -753,8 +763,9 @@ impl DnsCache {
 
                     let remaining = entry.expires_at.saturating_duration_since(now);
                     let total_ttl = cache.valid_ttl_override.unwrap_or(cache.default_ttl);
-                    // Refresh if less than 25% of TTL remaining
-                    if remaining < total_ttl / 4 && remaining > Duration::ZERO {
+                    // Refresh when remaining time drops below the configured threshold
+                    let threshold = total_ttl * refresh_remaining_pct / 100;
+                    if remaining < threshold && remaining > Duration::ZERO {
                         to_refresh.push((entry.key().clone(), None));
                     }
                 }

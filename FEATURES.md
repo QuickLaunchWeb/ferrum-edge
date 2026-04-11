@@ -227,7 +227,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 ## DNS Caching
 
 - In-memory async cache with startup warmup (backends, upstreams, plugin endpoints)
-- Background refresh at 75% TTL with stale-while-revalidate
+- Background refresh at configurable TTL threshold (default 90%) with stale-while-revalidate
 - Per-proxy TTL overrides and static hostname overrides
 - Shared resolver for all outbound HTTP clients including plugins
 

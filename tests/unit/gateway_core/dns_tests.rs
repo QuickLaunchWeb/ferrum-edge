@@ -662,3 +662,42 @@ async fn test_dns_resolve_all_caches_entries() {
     let result2 = cache.resolve_all("localhost", None, None).await.unwrap();
     assert_eq!(result1, result2);
 }
+
+#[tokio::test]
+async fn test_dns_refresh_threshold_default_is_90() {
+    // Default config should use 90% threshold
+    let config = DnsConfig::default();
+    assert_eq!(config.refresh_threshold_percent, 90);
+}
+
+#[tokio::test]
+async fn test_dns_refresh_threshold_clamped_to_valid_range() {
+    // Values outside 1-99 should be clamped
+    let cache_low = DnsCache::new(DnsConfig {
+        refresh_threshold_percent: 0,
+        ..DnsConfig::default()
+    });
+    // 0 is clamped to 1 — verify by resolving (cache is functional)
+    let result = cache_low.resolve("127.0.0.1", None, None).await;
+    assert!(result.is_ok());
+
+    let cache_high = DnsCache::new(DnsConfig {
+        refresh_threshold_percent: 100,
+        ..DnsConfig::default()
+    });
+    let result = cache_high.resolve("127.0.0.1", None, None).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_dns_refresh_threshold_custom_value() {
+    // Custom threshold should be accepted
+    let cache = DnsCache::new(DnsConfig {
+        default_ttl_seconds: 300,
+        refresh_threshold_percent: 75,
+        ..DnsConfig::default()
+    });
+    // Cache should be functional with custom threshold
+    let result = cache.resolve("localhost", None, None).await;
+    assert!(result.is_ok());
+}

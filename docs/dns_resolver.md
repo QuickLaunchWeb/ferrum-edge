@@ -29,6 +29,7 @@ Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](ht
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, oldest entries are removed. |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
+| `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 300s TTL entry refreshes after 270s. Lower values add safety margin at the cost of more DNS queries. |
 
 ### System-Level DNS Settings
 
@@ -83,7 +84,7 @@ When DNS resolution fails (NXDOMAIN, timeout, empty response), the error is cach
 
 ## Background Refresh
 
-A background task proactively refreshes cache entries when they reach 75% of their TTL. This keeps the cache warm and prevents any request from hitting DNS directly. The background task runs every `max(TTL/4, 5 seconds)`.
+A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly. The background task runs every `max(TTL * (100 - threshold%) / 100, 5 seconds)` — for example, with a 300s TTL and 90% threshold, the sweep runs every 30 seconds.
 
 ## DNS Warmup
 
@@ -167,6 +168,17 @@ FERRUM_DNS_RESOLVER_HOSTS_FILE="/etc/ferrum/hosts"
 ```bash
 # Log a warning when any DNS resolution takes longer than 50ms
 FERRUM_DNS_SLOW_THRESHOLD_MS=50
+```
+
+### Custom Refresh Threshold
+
+```bash
+# Refresh entries when 80% of TTL has elapsed (more conservative, more DNS queries)
+FERRUM_DNS_REFRESH_THRESHOLD_PERCENT=80
+
+# Refresh entries when 95% of TTL has elapsed (aggressive, fewer DNS queries)
+# Only recommended with stale-while-revalidate as a safety net
+FERRUM_DNS_REFRESH_THRESHOLD_PERCENT=95
 ```
 
 ### System Resolver Options
