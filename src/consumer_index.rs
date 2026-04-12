@@ -120,6 +120,11 @@ impl ConsumerIndex {
             .chain(modified.iter().map(|c| c.id.as_str()))
             .collect();
 
+        // Track jwt/hmac credential count delta incrementally instead of
+        // recomputing from the full consumer list (which would be O(n_total)).
+        let mut jwt_delta: isize = 0;
+        let mut hmac_delta: isize = 0;
+
         if !ids_to_remove.is_empty() {
             // Build a reverse index: consumer_id → old credential keys, so we can
             // do O(1) HashMap::remove instead of O(n) retain loops.
@@ -133,6 +138,9 @@ impl ConsumerIndex {
                 if !ids_to_remove.contains(consumer.id.as_str()) {
                     continue;
                 }
+                // Subtract old jwt/hmac counts for removed/modified consumers
+                jwt_delta -= consumer.credential_entries("jwt").len() as isize;
+                hmac_delta -= consumer.credential_entries("hmac_auth").len() as isize;
                 // Collect old keyauth credential keys (supports array)
                 for key_creds in consumer.credential_entries("keyauth") {
                     if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
@@ -198,6 +206,10 @@ impl ConsumerIndex {
 
             all.push(Arc::clone(&arc_consumer));
 
+            // Add new jwt/hmac counts for added/modified consumers
+            jwt_delta += consumer.credential_entries("jwt").len() as isize;
+            hmac_delta += consumer.credential_entries("hmac_auth").len() as isize;
+
             // Index all keyauth keys (supports array)
             for key_creds in consumer.credential_entries("keyauth") {
                 if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
@@ -222,13 +234,11 @@ impl ConsumerIndex {
             }
         }
 
-        // Recompute jwt/hmac credential counts from the updated consumer list
-        let mut jwt_count: usize = 0;
-        let mut hmac_count: usize = 0;
-        for consumer in &all {
-            jwt_count += consumer.credential_entries("jwt").len();
-            hmac_count += consumer.credential_entries("hmac_auth").len();
-        }
+        // Apply jwt/hmac credential count deltas
+        let jwt_count = (self.jwt_credential_count.load(Ordering::Relaxed) as isize + jwt_delta)
+            .max(0) as usize;
+        let hmac_count = (self.hmac_credential_count.load(Ordering::Relaxed) as isize + hmac_delta)
+            .max(0) as usize;
 
         // Swap all indexes. Store all_consumers last so that a concurrent reader
         // that finds a consumer via a credential index can also find it in the
