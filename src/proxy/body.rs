@@ -473,7 +473,7 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done && self.buffer.is_empty()
+        self.done && self.buffer.is_empty() && self.stashed_error.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
@@ -634,7 +634,10 @@ impl http_body::Body for CoalescingH2Body {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done && self.buffer.is_empty() && self.stashed_trailer.is_none()
+        self.done
+            && self.buffer.is_empty()
+            && self.stashed_trailer.is_none()
+            && self.stashed_error.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
