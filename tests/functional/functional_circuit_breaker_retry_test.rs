@@ -60,7 +60,7 @@ impl CbRetryTestHarness {
 
     async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-cb-jwt-secret-12345".to_string();
+        let jwt_secret = "test-cb-jwt-secret-1234567890abcdef".to_string();
         let jwt_issuer = "ferrum-edge-cb-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

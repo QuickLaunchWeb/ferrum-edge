@@ -49,6 +49,8 @@ pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
 pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 /// Maximum length for individual credential string values (API keys, secrets, identities).
 pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
+/// Minimum length for JWT secrets (admin API and consumer credentials).
+pub const MIN_JWT_SECRET_LENGTH: usize = 32;
 /// Default maximum number of credential entries per type (for zero-downtime rotation).
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
@@ -2511,6 +2513,15 @@ impl Consumer {
                             errors.push(format!(
                                 "{}.{} must not contain control characters",
                                 prefix, key
+                            ));
+                        }
+                        if cred_type == "jwt" && key == "secret" && s.len() < MIN_JWT_SECRET_LENGTH
+                        {
+                            errors.push(format!(
+                                "{}.secret must be at least {} characters (got {})",
+                                prefix,
+                                MIN_JWT_SECRET_LENGTH,
+                                s.len()
                             ));
                         }
                     }

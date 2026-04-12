@@ -170,6 +170,14 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
             )
         })?;
 
+    if secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
+        return Err(JwtError::VerificationFailed(format!(
+            "FERRUM_ADMIN_JWT_SECRET must be at least {} characters (got {})",
+            crate::config::types::MIN_JWT_SECRET_LENGTH,
+            secret.len()
+        )));
+    }
+
     let issuer =
         resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
 

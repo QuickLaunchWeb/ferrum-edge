@@ -1265,7 +1265,7 @@ components:
 
         | Variable | Default | Description |
         |----------|---------|-------------|
-        | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key |
+        | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key (minimum 32 characters) |
         | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
 
@@ -1753,7 +1753,7 @@ components:
             | `keyauth` | `key` | Each `key` must be globally unique |
             | `basicauth` | `password` or `password_hash` (bcrypt/HMAC) | Indexed by consumer `username` (unique) |
             | `mtls_auth` | `identity` | Each `identity` must be globally unique |
-            | `jwt` | `secret` | Looked up by `username`, `id`, or `custom_id`; all secrets tried |
+            | `jwt` | `secret` (min 32 chars) | Looked up by `username`, `id`, or `custom_id`; all secrets tried |
             | `jwks_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` (optional — consumer-less flow supported) |
             | `hmac_auth` | `secret` | Looked up by username in Authorization header; all secrets tried |
         acl_groups:

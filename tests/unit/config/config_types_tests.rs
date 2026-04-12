@@ -627,6 +627,44 @@ fn test_validate_fields_rejects_non_object_credential_value() {
     );
 }
 
+#[test]
+fn test_validate_fields_rejects_short_jwt_secret() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials
+        .insert("jwt".into(), serde_json::json!({"secret": "short-secret"}));
+    let err = c.validate_fields().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.contains("must be at least 32 characters"))
+    );
+}
+
+#[test]
+fn test_validate_fields_accepts_valid_jwt_secret() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "jwt".into(),
+        serde_json::json!({"secret": "this-is-a-valid-jwt-secret-key-32chars"}),
+    );
+    assert!(c.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_rejects_short_jwt_secret_in_array() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "jwt".into(),
+        serde_json::json!([{"secret": "short"}, {"secret": "also-too-short-key"}]),
+    );
+    let err = c.validate_fields().unwrap_err();
+    assert_eq!(
+        err.iter()
+            .filter(|e| e.contains("must be at least 32 characters"))
+            .count(),
+        2
+    );
+}
+
 // ---- Consumer identity uniqueness tests ----
 
 #[test]

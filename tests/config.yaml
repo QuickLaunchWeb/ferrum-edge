@@ -119,7 +119,7 @@ consumers:
       keyauth:
         key: "alice-secret-api-key-12345"
       jwt:
-        secret: "alice-jwt-secret-key"
+        secret: "alice-jwt-secret-key-1234567890ab"
       basicauth:
         password_hash: "$2b$12$LJ3m4ys3Lk0TSwHjOHRHOeUK/6Nh1GUz8QLXfYcR8x0e3kYzLhWS"
     acl_groups:
@@ -132,7 +132,7 @@ consumers:
       keyauth:
         key: "bob-secret-api-key-67890"
       jwt:
-        secret: "bob-jwt-secret-key"
+        secret: "bob-jwt-secret-key-12345678901234"
     acl_groups:
       - "engineering"
       - "platform"
