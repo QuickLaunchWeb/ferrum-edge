@@ -254,8 +254,8 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                         current_cp_index + 1,
                         cp_count,
                     );
-                    // Mark disconnected before switching
-                    update_state_disconnected(&connection_state);
+                    // Mark disconnected before switching — record fallback CP as last attempted
+                    update_state_disconnected(&connection_state, cp_url, is_primary);
                     current_cp_index = 0;
                     backoff_secs = BACKOFF_INITIAL_SECS;
                     continue;
@@ -284,7 +284,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state);
+                update_state_disconnected(&connection_state, cp_url, is_primary);
                 // On clean disconnect, try primary first if we were on a fallback
                 if is_fallback {
                     info!("Stream ended on fallback CP; will retry primary CP first");
@@ -300,7 +300,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                     cp_url,
                     e
                 );
-                update_state_disconnected(&connection_state);
+                update_state_disconnected(&connection_state, cp_url, is_primary);
 
                 if cp_count > 1 {
                     let next_index = (current_cp_index + 1) % cp_count;
@@ -357,14 +357,18 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     }
 }
 
-/// Helper: mark connection state as disconnected, preserving last_config_received_at.
-fn update_state_disconnected(connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>) {
+/// Helper: mark connection state as disconnected with the last attempted CP target.
+fn update_state_disconnected(
+    connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    cp_url: &str,
+    is_primary: bool,
+) {
     if let Some(cs) = connection_state {
         let prev = cs.load();
         cs.store(Arc::new(DpCpConnectionState {
             connected: false,
-            cp_url: prev.cp_url.clone(),
-            is_primary: prev.is_primary,
+            cp_url: cp_url.to_string(),
+            is_primary,
             last_config_received_at: prev.last_config_received_at,
             connected_since: None,
         }));

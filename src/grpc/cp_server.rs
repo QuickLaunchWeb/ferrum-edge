@@ -60,8 +60,12 @@ impl DpNodeRegistry {
         self.nodes.insert(info.node_id.clone(), info);
     }
 
-    pub fn remove(&self, node_id: &str) {
-        self.nodes.remove(node_id);
+    /// Remove a node only if its `connected_at` matches the expected timestamp.
+    /// This prevents a stale stream drop from removing a newer reconnection's entry.
+    pub fn remove_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
+        self.nodes.remove_if(node_id, |_, info| {
+            info.connected_at == expected_connected_at
+        });
     }
 
     /// Update `last_update_at` for all connected nodes (called after broadcast).
@@ -91,16 +95,20 @@ impl DpNodeRegistry {
 }
 
 /// A stream wrapper that removes the DP node from the registry when the
-/// gRPC stream is dropped (i.e. the DP disconnects).
+/// gRPC stream is dropped (i.e. the DP disconnects). Uses `connected_at`
+/// to guard against stale drops: if the DP reconnects before the old stream
+/// is dropped, the old drop will not remove the newer entry.
 struct TrackedStream<S> {
     inner: Pin<Box<S>>,
     registry: Arc<DpNodeRegistry>,
     node_id: String,
+    connected_at: DateTime<Utc>,
 }
 
 impl<S> Drop for TrackedStream<S> {
     fn drop(&mut self) {
-        self.registry.remove(&self.node_id);
+        self.registry
+            .remove_if_stale(&self.node_id, self.connected_at);
         info!("DP node '{}' disconnected (stream dropped)", self.node_id);
     }
 }
@@ -395,6 +403,7 @@ impl ConfigSync for CpGrpcServer {
             inner: Box::pin(combined),
             registry: self.registry.clone(),
             node_id,
+            connected_at: now,
         };
 
         Ok(Response::new(Box::pin(tracked)))
