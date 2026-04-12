@@ -370,7 +370,7 @@ impl LoadTestHarness {
         db_label: &str,
         enable_http2: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let jwt_secret = "load-test-secret-key-98765".to_string();
+        let jwt_secret = "load-test-secret-key-9876567890ab".to_string();
         let jwt_issuer = "ferrum-edge-load-test".to_string();
         let basic_auth_hmac_secret = "load-test-hmac-secret-54321".to_string();
 
@@ -819,7 +819,11 @@ async fn provision_resources(
                     password,
                 }
             } else {
-                let jwt_secret = format!("jwt-secret-{}-{}", i, &Uuid::new_v4().to_string()[..8]);
+                let jwt_secret = format!(
+                    "jwt-secret-padding-1234567890-{}-{}",
+                    i,
+                    &Uuid::new_v4().to_string()[..8]
+                );
                 let resp = client
                     .put(format!(
                         "{}/consumers/{}/credentials/jwt",

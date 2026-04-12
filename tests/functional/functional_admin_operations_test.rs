@@ -66,7 +66,7 @@ impl AdminTestHarness {
 
     async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-admin-ops-jwt-secret-12345".to_string();
+        let jwt_secret = "test-admin-ops-jwt-secret-1234567890".to_string();
         let jwt_issuer = "ferrum-edge-admin-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -517,7 +517,7 @@ async fn test_admin_consumer_credential_crud() {
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
-        .json(&json!({"secret": "my-jwt-secret"}))
+        .json(&json!({"secret": "my-jwt-secret-padding-1234567890ab"}))
         .send()
         .await
         .unwrap();

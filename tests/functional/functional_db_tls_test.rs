@@ -41,7 +41,7 @@ struct DbTlsTestHarness {
 impl DbTlsTestHarness {
     async fn new(db_type: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let jwt_secret = "db-tls-test-secret-key-12345".to_string();
+        let jwt_secret = "db-tls-test-secret-key-1234567890".to_string();
         let jwt_issuer = "ferrum-edge-db-tls-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

@@ -66,7 +66,7 @@ impl DbOutageTestHarness {
 
     async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-db-outage-jwt-secret-12345".to_string();
+        let jwt_secret = "test-db-outage-jwt-secret-1234567890".to_string();
         let jwt_issuer = "ferrum-edge-db-outage-test".to_string();
         let db_path = temp_dir.path().join("test.db");
 

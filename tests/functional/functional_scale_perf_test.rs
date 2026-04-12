@@ -121,7 +121,7 @@ impl ScalePerfHarness {
         db_url: &str,
         db_label: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let jwt_secret = "scale-test-secret-key-12345".to_string();
+        let jwt_secret = "scale-test-secret-key-1234567890ab".to_string();
         let jwt_issuer = "ferrum-edge-scale-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

@@ -1214,15 +1214,15 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
 
-**Consumer credential** (`jwt`) — single or array for rotation:
+**Consumer credential** (`jwt`) — single or array for rotation. Secrets must be at least 32 characters:
 ```yaml
 credentials:
   jwt:
-    secret: "consumer-specific-hs256-secret"
+    secret: "consumer-specific-hs256-secret-key-here"
   # Array format for zero-downtime rotation:
   # jwt:
-  #   - secret: "old-secret"
-  #   - secret: "new-secret"
+  #   - secret: "old-secret-at-least-32-chars-long"
+  #   - secret: "new-secret-at-least-32-chars-long"
 ```
 
 ### `key_auth`

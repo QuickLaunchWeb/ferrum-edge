@@ -41,7 +41,7 @@ impl DatabaseModeTestHarness {
     /// Create a new test harness with random ports
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-gateway-secret-key-12345".to_string();
+        let jwt_secret = "test-gateway-secret-key-1234567890".to_string();
         let jwt_issuer = "ferrum-edge-test".to_string();
 
         // Get available ports by binding to 0

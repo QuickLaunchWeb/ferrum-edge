@@ -1747,8 +1747,20 @@ impl EnvConfig {
     fn validate(&self) -> Result<(), String> {
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
-                if self.admin_jwt_secret.is_none() {
-                    return Err("FERRUM_ADMIN_JWT_SECRET is required in database/cp mode".into());
+                match self.admin_jwt_secret {
+                    None => {
+                        return Err(
+                            "FERRUM_ADMIN_JWT_SECRET is required in database/cp mode".into()
+                        );
+                    }
+                    Some(ref s) if s.len() < crate::config::types::MIN_JWT_SECRET_LENGTH => {
+                        return Err(format!(
+                            "FERRUM_ADMIN_JWT_SECRET must be at least {} characters (got {})",
+                            crate::config::types::MIN_JWT_SECRET_LENGTH,
+                            s.len()
+                        ));
+                    }
+                    _ => {}
                 }
                 if self.db_type.is_none() {
                     return Err("FERRUM_DB_TYPE is required in database/cp mode".into());
@@ -1769,8 +1781,18 @@ impl EnvConfig {
                             .into(),
                     );
                 }
-                if self.cp_dp_grpc_jwt_secret.is_none() {
-                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
+                match self.cp_dp_grpc_jwt_secret {
+                    None => {
+                        return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
+                    }
+                    Some(ref s) if s.len() < crate::config::types::MIN_JWT_SECRET_LENGTH => {
+                        return Err(format!(
+                            "FERRUM_CP_DP_GRPC_JWT_SECRET must be at least {} characters (got {})",
+                            crate::config::types::MIN_JWT_SECRET_LENGTH,
+                            s.len()
+                        ));
+                    }
+                    _ => {}
                 }
             }
             OperatingMode::Migrate => {
@@ -1842,8 +1864,18 @@ impl EnvConfig {
             if self.cp_grpc_listen_addr.is_none() {
                 return Err("FERRUM_CP_GRPC_LISTEN_ADDR is required in cp mode".into());
             }
-            if self.cp_dp_grpc_jwt_secret.is_none() {
-                return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode".into());
+            match self.cp_dp_grpc_jwt_secret {
+                None => {
+                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode".into());
+                }
+                Some(ref s) if s.len() < crate::config::types::MIN_JWT_SECRET_LENGTH => {
+                    return Err(format!(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET must be at least {} characters (got {})",
+                        crate::config::types::MIN_JWT_SECRET_LENGTH,
+                        s.len()
+                    ));
+                }
+                _ => {}
             }
         }
 

@@ -184,7 +184,7 @@ struct AuthTestHarness {
 impl AuthTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-admin-jwt-secret-key-12345".to_string();
+        let jwt_secret = "test-admin-jwt-secret-key-1234567890".to_string();
         let jwt_issuer = "ferrum-edge-auth-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -781,7 +781,7 @@ async fn test_auth_acl_comprehensive() {
         &auth_header,
         "consumer-alice",
         "jwt",
-        &json!({"secret": "alice-jwt-secret-key-999"}),
+        &json!({"secret": "alice-jwt-secret-key-9991234567890"}),
     )
     .await
     .unwrap();
@@ -1321,7 +1321,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 11: JWT Auth — valid token
     println!("\n--- Test 11: JWT Auth — Valid Token ---");
-    let jwt_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-999", 3600);
+    let jwt_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-9991234567890", 3600);
     let resp = client
         .get(format!("{}/jwtauth", proxy_url))
         .header("Authorization", format!("Bearer {}", jwt_token))
@@ -1339,7 +1339,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 12: JWT Auth — expired token
     println!("\n--- Test 12: JWT Auth — Expired Token ---");
-    let expired_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-999", -300);
+    let expired_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-9991234567890", -300);
     let resp = client
         .get(format!("{}/jwtauth", proxy_url))
         .header("Authorization", format!("Bearer {}", expired_token))
@@ -1621,7 +1621,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 28: Multi-Auth — authenticate via JWT (first-success wins)
     println!("\n--- Test 28: Multi-Auth — JWT Authentication ---");
-    let jwt_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-999", 3600);
+    let jwt_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-9991234567890", 3600);
     let resp = client
         .get(format!("{}/multiauth", proxy_url))
         .header("Authorization", format!("Bearer {}", jwt_token))
@@ -1708,7 +1708,7 @@ async fn test_auth_acl_comprehensive() {
 
     // Test 33: Multi-Auth + ACL — alice via JWT (allowed)
     println!("\n--- Test 33: Multi-Auth + ACL — Alice via JWT (allowed) ---");
-    let jwt_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-999", 3600);
+    let jwt_token = generate_consumer_jwt("alice", "alice-jwt-secret-key-9991234567890", 3600);
     let resp = client
         .get(format!("{}/multiauth-acl", proxy_url))
         .header("Authorization", format!("Bearer {}", jwt_token))

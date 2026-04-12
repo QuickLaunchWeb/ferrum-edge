@@ -11,7 +11,7 @@ See also:
 
 ## Authentication
 
-All endpoints (except `/health`, `/status`, `/overload`, `/metrics`, and `/charges`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET`.
+All endpoints (except `/health`, `/status`, `/overload`, `/metrics`, and `/charges`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET` (must be at least 32 characters).
 
 Generate a token:
 ```bash

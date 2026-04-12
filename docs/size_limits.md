@@ -160,6 +160,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `custom_id` | 255 chars | Optional custom identifier |
 | `credentials` (total JSON) | 64 KiB | Total serialized size of credentials object |
 | `credentials` (per value) | 4096 chars | Individual credential string values |
+| `credentials.jwt.secret` | min 32 chars | JWT secrets must be at least 32 characters |
 | Credential type key | 64 chars | Credential type name (e.g., `keyauth`, `basicauth`) |
 
 ### Upstream Fields

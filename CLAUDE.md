@@ -124,7 +124,7 @@ GHCR uses the built-in `GITHUB_TOKEN` — no additional secret needed. Ensure re
 
 **Disabling plaintext listeners (TLS-only operation)**: Setting `FERRUM_PROXY_HTTP_PORT=0` disables the plaintext HTTP proxy listener, `FERRUM_ADMIN_HTTP_PORT=0` disables the plaintext admin HTTP listener, and setting the port to `0` in `FERRUM_CP_GRPC_LISTEN_ADDR` (e.g., `0.0.0.0:0`) disables the gRPC listener. Disabled ports are excluded from `reserved_gateway_ports()` so stream proxy port conflict checks are unaffected. The gateway warns at startup if a plaintext port is disabled but no TLS is configured for that surface (which would leave no listeners active). The `ferrum-edge health` CLI subcommand auto-detects `FERRUM_ADMIN_HTTP_PORT=0` and switches to TLS mode (port 9443), or accepts `--tls` / `--tls-no-verify` flags explicitly.
 
-**Admin JWT secret handling is intentionally per-mode**: Database and CP modes **require** `FERRUM_ADMIN_JWT_SECRET` (hard failure if unset) because their read-write admin API issues tokens via `POST /auth` that must survive restarts and be valid across instances sharing the same secret. File mode has a **read-only** admin API that never issues tokens, so it generates a random secret as a convenience — all externally-crafted tokens are rejected since no one can predict the secret. This asymmetry is by design, not an inconsistency.
+**Admin JWT secret handling is intentionally per-mode**: Database and CP modes **require** `FERRUM_ADMIN_JWT_SECRET` (hard failure if unset, must be at least 32 characters) because their read-write admin API issues tokens via `POST /auth` that must survive restarts and be valid across instances sharing the same secret. File mode has a **read-only** admin API that never issues tokens, so it generates a random secret as a convenience — all externally-crafted tokens are rejected since no one can predict the secret. This asymmetry is by design, not an inconsistency.
 
 **`/health` DB check is intentionally cached (15s TTL)**: The `/health` and `/status` endpoints are unauthenticated (by design — load balancer probes need them). Without caching, each call runs `SELECT 1` (SQL) or `ping` (MongoDB), which an attacker with admin port access could flood to exhaust the DB connection pool (`FERRUM_DB_POOL_MAX_CONNECTIONS`, default 10), starving config polling and admin writes. The `CachedDbHealthResult` in `AdminState` caches the boolean result for 15 seconds via lock-free `ArcSwap`. Do not remove this cache or make `/health` call `db.health_check()` directly on every request.
 
@@ -302,7 +302,7 @@ src/
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
 | `Proxy` | A route + backend target | namespace, listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
-| `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation), acl_groups (Vec), tags |
+| `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation; JWT secrets must be at least 32 characters), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | namespace, targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), scope (Global/Proxy/ProxyGroup), proxy_id (Option), priority_override (Option<u16>) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
@@ -980,7 +980,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port. `0` = disabled (TLS-only) |
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |
-| `FERRUM_ADMIN_JWT_SECRET` | (required for db/cp) | JWT secret for admin API auth |
+| `FERRUM_ADMIN_JWT_SECRET` | (required for db/cp) | JWT secret for admin API auth. Must be at least 32 characters |
 | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | JWT issuer claim (iss) for admin API tokens |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Maximum TTL in seconds for admin API JWT tokens |
 | `FERRUM_FILE_CONFIG_PATH` | (required for file mode) | Path to YAML/JSON config file |
@@ -1007,7 +1007,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | (none) | PEM key for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | (none) | PEM CA for verifying DP client certs (mTLS) |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | (required in cp and dp modes) | Shared JWT secret for CP/DP gRPC auth (required in cp and dp modes) |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | (required in cp and dp modes) | Shared JWT secret for CP/DP gRPC auth (required in cp and dp modes). Must be at least 32 characters |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | `128` | Broadcast channel capacity for CP-to-DP delta fan-out. DPs that lag behind by more than this many updates receive a full snapshot instead. Increase for high config churn |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode unless `_URLS` set) | CP gRPC URL for DP to connect to (`http://` or `https://`) |
 | `FERRUM_DP_CP_GRPC_URLS` | (none) | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over `FERRUM_DP_CP_GRPC_URL` |

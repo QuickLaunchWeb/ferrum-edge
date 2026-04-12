@@ -130,7 +130,7 @@ consumers:
       keyauth:
         key: "alice-secret-api-key-12345"
       jwt:
-        secret: "alice-jwt-secret-key"
+        secret: "alice-jwt-secret-key-1234567890ab"
       basicauth:
         password_hash: "$2b$12$LJ3m4ys3Lk0TSwHjOHRHOeUK/6Nh1GUz8QLXfYcR8x0e3kYzLhWS"
 
@@ -400,7 +400,7 @@ consumers:
     username: "user1"
     credentials:
       jwt:
-        secret: "jwt-secret-key"
+        secret: "jwt-secret-key-padding-1234567890"
         algorithm: "HS256"
 plugin_configs: []
 "#;
@@ -417,7 +417,10 @@ plugin_configs: []
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("jwt"));
     let jwt = &config.consumers[0].credentials["jwt"];
-    assert_eq!(jwt["secret"].as_str(), Some("jwt-secret-key"));
+    assert_eq!(
+        jwt["secret"].as_str(),
+        Some("jwt-secret-key-padding-1234567890")
+    );
 }
 
 #[test]
@@ -462,7 +465,7 @@ consumers:
       keyauth:
         key: "api-key-123"
       jwt:
-        secret: "jwt-secret"
+        secret: "jwt-secret-padding-12345678901234"
       basicauth:
         password_hash: "$2b$12$hash"
 plugin_configs: []
