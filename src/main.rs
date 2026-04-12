@@ -153,7 +153,11 @@ fn main() {
         }
     }
 
-    info!("Ferrum Edge v{} starting...", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Ferrum Edge v{} ({}) starting...",
+        env!("CARGO_PKG_VERSION"),
+        env!("TARGET")
+    );
 
     // Resolve secrets using a single-threaded runtime so that subsequent
     // env var mutations are safe — no concurrent threads exist yet.
