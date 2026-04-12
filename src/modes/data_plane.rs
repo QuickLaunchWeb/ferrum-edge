@@ -41,6 +41,7 @@ pub async fn run(
         max_cache_size: env_config.dns_cache_max_size,
         warmup_concurrency: env_config.dns_warmup_concurrency,
         slow_threshold_ms: env_config.dns_slow_threshold_ms,
+        refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     });
 

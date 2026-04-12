@@ -225,6 +225,7 @@ fn create_test_proxy_state() -> ProxyState {
         warmup_concurrency: 500,
         backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
         slow_threshold_ms: None,
+        refresh_threshold_percent: 90,
     });
     let env_config = create_test_env_config();
     ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None).unwrap()

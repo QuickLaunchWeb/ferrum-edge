@@ -391,6 +391,8 @@ pub struct EnvConfig {
     pub dns_warmup_concurrency: usize,
     /// Threshold in milliseconds above which DNS resolutions are logged as slow. Default: disabled
     pub dns_slow_threshold_ms: Option<u64>,
+    /// Percentage of TTL elapsed before background refresh triggers (1-99). Default: 90
+    pub dns_refresh_threshold_percent: u8,
 
     /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
     /// Used by backend proxy connections, service discovery, and plugin HTTP calls.
@@ -799,6 +801,7 @@ impl Default for EnvConfig {
             dns_cache_max_size: 10_000,
             dns_warmup_concurrency: 500,
             dns_slow_threshold_ms: None,
+            dns_refresh_threshold_percent: 90,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1104,6 +1107,13 @@ impl EnvConfig {
                 .max(1),
             dns_slow_threshold_ms: resolve_var(conf, "FERRUM_DNS_SLOW_THRESHOLD_MS")
                 .and_then(|v| v.parse().ok()),
+            dns_refresh_threshold_percent: resolve_var(
+                conf,
+                "FERRUM_DNS_REFRESH_THRESHOLD_PERCENT",
+            )
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(90)
+            .clamp(1, 99),
 
             // Global TLS trust store and mTLS
             tls_ca_bundle_path: resolve_var(conf, "FERRUM_TLS_CA_BUNDLE_PATH"),
