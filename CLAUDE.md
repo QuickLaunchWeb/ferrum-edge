@@ -1007,7 +1007,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | (none) | PEM key for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | (none) | PEM CA for verifying DP client certs (mTLS) |
-| `FERRUM_CP_DP_GRPC_JWT_SECRET` | (required in cp and dp modes) | Shared JWT secret for CP/DP gRPC auth (required in cp and dp modes) |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | (required in cp and dp modes) | Shared JWT secret for CP/DP gRPC auth (required in cp and dp modes). Must be at least 32 characters |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | `128` | Broadcast channel capacity for CP-to-DP delta fan-out. DPs that lag behind by more than this many updates receive a full snapshot instead. Increase for high config churn |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode unless `_URLS` set) | CP gRPC URL for DP to connect to (`http://` or `https://`) |
 | `FERRUM_DP_CP_GRPC_URLS` | (none) | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over `FERRUM_DP_CP_GRPC_URL` |

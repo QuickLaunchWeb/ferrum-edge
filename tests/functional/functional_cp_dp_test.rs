@@ -30,7 +30,7 @@ use tokio::time::sleep;
 use tonic::transport::Server;
 
 const ADMIN_JWT_SECRET: &str = "test-admin-secret-key-functional";
-const GRPC_JWT_SECRET: &str = "test-grpc-secret-functional";
+const GRPC_JWT_SECRET: &str = "test-grpc-secret-functional-32ch";
 
 /// Create a minimal EnvConfig for testing
 fn create_test_env_config() -> EnvConfig {
