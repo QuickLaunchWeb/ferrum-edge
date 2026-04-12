@@ -512,6 +512,83 @@ tests/
 
 **Functional test subprocess rule**: Use `Stdio::null()` for the gateway's stdout/stderr unless the test explicitly reads the output. `Stdio::piped()` without reading causes a pipe-buffer deadlock (OS buffer fills from debug logs → gateway blocks on writes → test hangs).
 
+**Functional test port allocation — MUST use retry pattern**: Functional tests spawn the gateway binary as a subprocess and pass it ephemeral ports. The bind-drop-rebind pattern (bind port 0, get port N, drop listener, spawn gateway with port N) is vulnerable to port races — another parallel test can steal port N between the drop and the gateway bind. The gateway fails silently (stderr is null) and the health check times out.
+
+**All functional tests MUST use one of these two retry patterns:**
+
+*Struct harness pattern* — split `new()` into a retry wrapper + single-attempt method:
+```rust
+impl TestHarness {
+    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new().await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!("Harness startup attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, last_err);
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!("Failed to create harness after {} attempts: {}", MAX_ATTEMPTS, last_err).into())
+    }
+
+    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Allocate fresh ports, temp dir, spawn gateway...
+        // On wait_for_health failure, kill the gateway before returning Err:
+        match harness.wait_for_health().await {
+            Ok(()) => Ok(harness),
+            Err(e) => {
+                if let Some(mut child) = harness.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
+    }
+}
+```
+
+*Inline test pattern* — use a `start_gateway_with_retry()` helper:
+```rust
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Allocate fresh ports each attempt
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let mut child = start_gateway(config_path, proxy_port, admin_port);
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+        eprintln!("Gateway startup attempt {}/{} failed", attempt, MAX_ATTEMPTS);
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+}
+```
+
+**Key rules for functional test port allocation:**
+- **Never assume an ephemeral port will still be free** after dropping the listener — always retry.
+- **Kill the gateway process before retrying** — otherwise the zombie holds the old port and leaks FDs.
+- **Each retry must allocate fresh ports AND fresh temp dirs/DBs** — reusing the same SQLite path with a killed gateway can leave a corrupted WAL.
+- **Backend/echo server ports should be held, not dropped** — pass the pre-bound `TcpListener` directly to the echo server task (e.g., `start_echo_server_on(listener)`) instead of dropping it and re-binding by port number. This eliminates the race for same-process listeners.
+- **`wait_for_health`/`wait_for_gateway` should return `bool` or `Result`** — never panic directly. The retry wrapper handles the failure.
+
 ## Development Guidelines
 
 ### Before Every Commit
