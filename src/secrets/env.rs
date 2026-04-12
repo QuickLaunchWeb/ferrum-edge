@@ -9,3 +9,29 @@ use std::env;
 pub fn resolve(key: &str) -> Option<String> {
     env::var(key).ok().filter(|s| !s.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_returns_value_when_set() {
+        let key = "FERRUM_TEST_SECRET_ENV_RESOLVE_SET_12345";
+        unsafe { std::env::set_var(key, "my-secret-value") };
+        assert_eq!(resolve(key), Some("my-secret-value".to_string()));
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    fn resolve_returns_none_when_unset() {
+        assert_eq!(resolve("FERRUM_TEST_SECRET_DEFINITELY_NOT_SET_XYZ"), None);
+    }
+
+    #[test]
+    fn resolve_returns_none_when_empty() {
+        let key = "FERRUM_TEST_SECRET_ENV_RESOLVE_EMPTY_12345";
+        unsafe { std::env::set_var(key, "") };
+        assert_eq!(resolve(key), None);
+        unsafe { std::env::remove_var(key) };
+    }
+}

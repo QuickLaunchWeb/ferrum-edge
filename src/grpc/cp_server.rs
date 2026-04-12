@@ -437,3 +437,159 @@ impl ConfigSync for CpGrpcServer {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    fn make_node(id: &str) -> DpNodeInfo {
+        let now = Utc::now();
+        DpNodeInfo {
+            node_id: id.to_string(),
+            version: "0.9.0".to_string(),
+            namespace: "ferrum".to_string(),
+            connected_at: now,
+            last_update_at: now,
+        }
+    }
+
+    #[test]
+    fn registry_new_is_empty() {
+        let registry = DpNodeRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn registry_insert_and_snapshot() {
+        let registry = DpNodeRegistry::new();
+        registry.insert(make_node("node-1"));
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.is_empty());
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].node_id, "node-1");
+    }
+
+    #[test]
+    fn registry_insert_overwrites_same_node_id() {
+        let registry = DpNodeRegistry::new();
+        let mut node1 = make_node("node-1");
+        node1.version = "0.9.0".to_string();
+        registry.insert(node1);
+
+        let mut node1_v2 = make_node("node-1");
+        node1_v2.version = "0.9.1".to_string();
+        registry.insert(node1_v2);
+
+        assert_eq!(registry.len(), 1);
+        let snap = registry.snapshot();
+        assert_eq!(snap[0].version, "0.9.1");
+    }
+
+    #[test]
+    fn registry_remove_if_stale_removes_when_timestamps_match() {
+        let registry = DpNodeRegistry::new();
+        let node = make_node("node-1");
+        let connected_at = node.connected_at;
+        registry.insert(node);
+
+        registry.remove_if_stale("node-1", connected_at);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_remove_if_stale_does_not_remove_when_timestamps_differ() {
+        let registry = DpNodeRegistry::new();
+        let node = make_node("node-1");
+        registry.insert(node);
+
+        // Try to remove with a different timestamp (stale stream drop scenario)
+        let stale_timestamp = Utc::now() - Duration::hours(1);
+        registry.remove_if_stale("node-1", stale_timestamp);
+
+        // Node should still be there
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_remove_if_stale_nonexistent_node_is_noop() {
+        let registry = DpNodeRegistry::new();
+        registry.remove_if_stale("nonexistent", Utc::now());
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_touch_all_updates_last_update_at() {
+        let registry = DpNodeRegistry::new();
+        let mut node = make_node("node-1");
+        let old_time = Utc::now() - Duration::hours(1);
+        node.last_update_at = old_time;
+        registry.insert(node);
+
+        registry.touch_all();
+
+        let snap = registry.snapshot();
+        assert!(snap[0].last_update_at > old_time);
+    }
+
+    #[test]
+    fn registry_multiple_nodes() {
+        let registry = DpNodeRegistry::new();
+        registry.insert(make_node("node-1"));
+        registry.insert(make_node("node-2"));
+        registry.insert(make_node("node-3"));
+
+        assert_eq!(registry.len(), 3);
+        let snap = registry.snapshot();
+        assert_eq!(snap.len(), 3);
+        let ids: Vec<&str> = snap.iter().map(|n| n.node_id.as_str()).collect();
+        assert!(ids.contains(&"node-1"));
+        assert!(ids.contains(&"node-2"));
+        assert!(ids.contains(&"node-3"));
+    }
+
+    // ── Version compatibility ────────────────────────────────────────────
+
+    #[test]
+    fn version_check_same_version_ok() {
+        assert!(CpGrpcServer::check_version_compatibility(FERRUM_VERSION).is_ok());
+    }
+
+    #[test]
+    fn version_check_empty_version_rejected() {
+        let result = CpGrpcServer::check_version_compatibility("");
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn version_check_same_major_minor_different_patch_ok() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 3 {
+            let patch: u32 = parts[2].parse().unwrap_or(0);
+            let modified = format!("{}.{}.{}", parts[0], parts[1], patch + 1);
+            assert!(CpGrpcServer::check_version_compatibility(&modified).is_ok());
+        }
+    }
+
+    #[test]
+    fn version_check_different_minor_rejected() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 2 {
+            let minor: u32 = parts[1].parse().unwrap_or(0);
+            let modified = format!("{}.{}.0", parts[0], minor + 1);
+            let result = CpGrpcServer::check_version_compatibility(&modified);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn version_check_unparseable_version_allowed() {
+        // Single-component version is unparseable (< 2 parts), so it's allowed
+        assert!(CpGrpcServer::check_version_compatibility("1").is_ok());
+    }
+}
