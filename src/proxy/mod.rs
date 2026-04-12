@@ -6677,7 +6677,7 @@ async fn collect_response_with_limit(
 }
 
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
-fn build_sticky_cookie_header(
+pub(crate) fn build_sticky_cookie_header(
     cookie_name: &str,
     target: &UpstreamTarget,
     config: &crate::config::types::HashOnCookieConfig,

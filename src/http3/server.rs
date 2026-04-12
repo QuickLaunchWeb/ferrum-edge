@@ -942,13 +942,7 @@ async fn handle_h3_request(
         crate::proxy::build_backend_url(&proxy, &path, &query_string, strip_len)
     };
     let backend_start = std::time::Instant::now();
-
-    // Track connection for least-connections load balancing
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
-    }
+    let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Determine if we can stream the request body directly to the backend
     // without buffering into Vec<u8>. Conditions:
@@ -963,6 +957,13 @@ async fn handle_h3_request(
         // ===== STREAMING REQUEST + RESPONSE PATH =====
         // Stream both the request body (frontend → backend) and response body
         // (backend → frontend) without buffering either into memory.
+
+        // Track connection for least-connections LB (after all pre-dispatch rejects)
+        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+            state
+                .load_balancer_cache
+                .record_connection_start(upstream_id, target);
+        }
 
         let client_ip_owned = ctx.client_ip.clone();
         let h3_headers = build_h3_backend_headers(&proxy, &proxy_headers, &client_ip_owned, &state);
@@ -1116,6 +1117,15 @@ async fn handle_h3_request(
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
+
+        // Sticky session cookie injection
+        inject_sticky_cookie(
+            &state,
+            &proxy,
+            upstream_target.as_deref(),
+            sticky_cookie_needed,
+            &mut response_headers,
+        );
 
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1341,6 +1351,15 @@ async fn handle_h3_request(
         }
     }
 
+    // Track connection for least-connections LB (after all pre-dispatch rejects).
+    // Placed here so the streaming-request path above handles its own tracking,
+    // and early returns from body collection/plugin rejects don't leak counts.
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
+        state
+            .load_balancer_cache
+            .record_connection_start(upstream_id, target);
+    }
+
     if !needs_response_buffering {
         // ===== STREAMING RESPONSE PATH (buffered request body) =====
         // Response body is streamed, but request body was collected because
@@ -1355,6 +1374,7 @@ async fn handle_h3_request(
             body_data,
             &client_ip_owned,
             upstream_target.as_deref(),
+            sticky_cookie_needed,
             &mut stream,
             &plugins,
             &mut ctx,
@@ -1445,6 +1465,7 @@ async fn handle_h3_request(
             mut response_headers,
             h3_error_class,
             final_cb_target_key,
+            final_target,
         ) = if let Some(retry_config) = &proxy.retry {
             let mut attempt = 0u32;
             let mut current_target = upstream_target.clone();
@@ -1555,6 +1576,7 @@ async fn handle_h3_request(
                 resp_headers,
                 err_class,
                 current_cb_target_key,
+                current_target,
             )
         } else {
             // No retry configured — single attempt
@@ -1569,14 +1591,21 @@ async fn handle_h3_request(
                 upstream_target.as_deref(),
             )
             .await;
-            (status, resp_body, resp_headers, err_class, cb_target_key)
+            (
+                status,
+                resp_body,
+                resp_headers,
+                err_class,
+                cb_target_key,
+                upstream_target.clone(),
+            )
         };
 
-        // Record outcome across CB, passive health, latency, and connection tracking
+        // Record outcome against the final target (may differ from initial after retries)
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
-            upstream_target.as_deref(),
+            final_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
             h3_error_class.is_some(),
@@ -1604,6 +1633,17 @@ async fn handle_h3_request(
                 after_proxy_rejected = true;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
+        // Sticky session cookie injection
+        if !after_proxy_rejected {
+            inject_sticky_cookie(
+                &state,
+                &proxy,
+                upstream_target.as_deref(),
+                sticky_cookie_needed,
+                &mut response_headers,
+            );
         }
 
         // on_response_body hooks — only for buffered responses when plugins exist.
@@ -1887,6 +1927,39 @@ fn build_h3_backend_headers(
 }
 
 /// Classify an h3/quinn error into an `ErrorClass` for retry and CB recording.
+/// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
+/// and the cookie was not present in the original request.
+fn inject_sticky_cookie(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    sticky_cookie_needed: bool,
+    response_headers: &mut HashMap<String, String>,
+) {
+    if sticky_cookie_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
+    {
+        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
+            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let default_cc = crate::config::types::HashOnCookieConfig::default();
+            let cookie_config = upstream
+                .as_ref()
+                .and_then(|u| u.hash_on_cookie_config.as_ref())
+                .unwrap_or(&default_cc);
+            let cookie_val =
+                crate::proxy::build_sticky_cookie_header(cookie_name, target, cookie_config);
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|v| {
+                    v.push('\n');
+                    v.push_str(&cookie_val);
+                })
+                .or_insert(cookie_val);
+        }
+    }
+}
+
 fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
     let msg = e.to_string().to_lowercase();
     if msg.contains("dns") || msg.contains("resolution") {
@@ -1921,6 +1994,7 @@ async fn proxy_to_backend_h3_streaming(
     body_bytes: Vec<u8>,
     client_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    sticky_cookie_needed: bool,
     h3_stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -2025,6 +2099,15 @@ async fn proxy_to_backend_h3_streaming(
         }
         *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
+
+    // Sticky session cookie injection
+    inject_sticky_cookie(
+        state,
+        proxy,
+        upstream_target,
+        sticky_cookie_needed,
+        &mut response_headers,
+    );
 
     // Send response headers on the H3 stream
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);

@@ -817,8 +817,10 @@ impl Http3ConnectionPool {
             let mut sr = entry.send_request.clone();
             drop(entry);
 
-            // Single attempt — body is consumed, no retry possible
-            return Self::do_request_streaming_body(
+            // Single attempt — body is consumed, no retry possible.
+            // On error, evict the stale connection so subsequent requests
+            // don't repeatedly fail on the same dead QUIC handle.
+            match Self::do_request_streaming_body(
                 &mut sr,
                 proxy,
                 method,
@@ -827,7 +829,18 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
             )
-            .await;
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 streaming body: cached connection failed, evicting: {}",
+                        e
+                    );
+                    self.entries.remove(&key);
+                    return Err(e);
+                }
+            }
         }
 
         // Create new connection
@@ -890,7 +903,7 @@ impl Http3ConnectionPool {
             let mut sr = entry.send_request.clone();
             drop(entry);
 
-            return Self::do_request_streaming_body(
+            match Self::do_request_streaming_body(
                 &mut sr,
                 proxy,
                 method,
@@ -899,7 +912,18 @@ impl Http3ConnectionPool {
                 frontend_stream,
                 max_request_body_size,
             )
-            .await;
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 streaming body: cached connection to {}:{} failed, evicting: {}",
+                        target_host, target_port, e
+                    );
+                    self.entries.remove(&key);
+                    return Err(e);
+                }
+            }
         }
 
         let tls_config = tls_config_fn()?;
