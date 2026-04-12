@@ -765,9 +765,16 @@ impl LoadBalancer {
             return None;
         }
         match self.algorithm {
-            LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Random => {
+            LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 Some(Arc::clone(&self.targets[idx % self.targets.len()]))
+            }
+            LoadBalancerAlgorithm::Random => {
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                let mut hasher = DefaultHasher::new();
+                idx.hash(&mut hasher);
+                let hash = hasher.finish() as usize;
+                Some(Arc::clone(&self.targets[hash % self.targets.len()]))
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => {
                 let all: Vec<(usize, &Arc<UpstreamTarget>)> =
