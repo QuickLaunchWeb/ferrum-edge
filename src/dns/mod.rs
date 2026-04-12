@@ -736,11 +736,22 @@ impl DnsCache {
     /// Evict expired entries and enforce max cache size.
     /// Removes entries past their stale deadline first, then evicts oldest
     /// entries (by expiration time) if still over capacity.
+    ///
+    /// Error entries are preserved even past their stale deadline so that the
+    /// failed retry task can find and re-attempt them. The retry task manages
+    /// error entry lifecycle (re-caching on failure, promoting on success).
+    /// Error entries are only evicted in Phase 2 if the cache exceeds max size.
     pub fn evict_expired(&self) {
         let now = Instant::now();
 
-        // Phase 1: Remove all entries past their stale deadline (fully expired)
-        self.cache.retain(|_, entry| entry.stale_deadline > now);
+        // Phase 1: Remove non-error entries past their stale deadline.
+        // Error entries are kept alive for the failed retry task — it manages
+        // their lifecycle (re-caching on failure, promoting on success).
+        // When the retry task is disabled (failed_retry_interval == ZERO),
+        // error entries are evicted normally to prevent unbounded accumulation.
+        let retry_enabled = self.failed_retry_interval > Duration::ZERO;
+        self.cache
+            .retain(|_, entry| (entry.is_error && retry_enabled) || entry.stale_deadline > now);
 
         // Phase 2: If still over capacity, evict oldest entries by expires_at
         if self.cache.len() > self.max_cache_size {
