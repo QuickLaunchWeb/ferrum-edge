@@ -1265,26 +1265,16 @@ async fn bidirectional_splice(
         tokio::select! {
             c2b_result = &mut c2b_fut => {
                 let c2b_bytes = c2b_result?;
-                // Client→Backend done; give Backend→Client a brief drain.
-                let b2c_bytes = match tokio::time::timeout(
-                    Duration::from_millis(100), b2c_fut
-                ).await {
-                    Ok(Ok(b)) => b,
-                    Ok(Err(_)) => 0,
-                    Err(_) => 0, // timeout — drain period expired
-                };
+                // Client→Backend done (EOF); wait for Backend→Client to finish
+                // fully — the backend may still be sending response data after
+                // the client closed its write half (half-closed TCP flows).
+                let b2c_bytes = b2c_fut.await.unwrap_or(0);
                 return Ok((c2b_bytes, b2c_bytes));
             }
             b2c_result = &mut b2c_fut => {
                 let b2c_bytes = b2c_result?;
-                // Backend→Client done; give Client→Backend a brief drain.
-                let c2b_bytes = match tokio::time::timeout(
-                    Duration::from_millis(100), c2b_fut
-                ).await {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(_)) => 0,
-                    Err(_) => 0,
-                };
+                // Backend→Client done (EOF); wait for Client→Backend to finish.
+                let c2b_bytes = c2b_fut.await.unwrap_or(0);
                 return Ok((c2b_bytes, b2c_bytes));
             }
             // Idle timeout check — wake every second.

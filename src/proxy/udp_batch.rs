@@ -307,15 +307,24 @@ impl SendMmsgBatch {
             )
         };
 
-        let sent = if ret < 0 {
+        if ret < 0 {
             let err = std::io::Error::last_os_error();
             self.count = 0;
             return Err(err);
-        } else {
-            ret as usize
-        };
+        }
 
-        self.count = 0;
+        let sent = ret as usize;
+        let remaining = self.count - sent;
+        if remaining > 0 {
+            // Shift unsent datagrams to the front so a retry sends them.
+            for i in 0..remaining {
+                self.bufs.swap(i, sent + i);
+                self.lens[i] = self.lens[sent + i];
+                self.dest_addrs[i] = self.dest_addrs[sent + i];
+                self.dest_addr_lens[i] = self.dest_addr_lens[sent + i];
+            }
+        }
+        self.count = remaining;
         Ok(sent)
     }
 }

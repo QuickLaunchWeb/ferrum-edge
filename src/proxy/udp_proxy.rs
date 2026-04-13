@@ -2066,21 +2066,35 @@ async fn create_session(
             }
 
             // Flush the sendmmsg batch after draining all pending replies.
+            // Retry if sendmmsg returns a partial send (unsent datagrams remain).
             #[cfg(target_os = "linux")]
             if send_batched && !send_batch.is_empty() {
                 use std::os::unix::io::AsRawFd;
-                if let Err(e) = send_batch.flush(frontend.as_raw_fd()) {
-                    debug!(
-                        proxy_id = %reply_proxy_id,
-                        client = %client_addr,
-                        "UDP sendmmsg to client failed: {}",
-                        e
-                    );
-                    let error_message = e.to_string();
-                    disconnect_error = Some((
-                        error_message.clone(),
-                        crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
-                    ));
+                let fd = frontend.as_raw_fd();
+                loop {
+                    match send_batch.flush(fd) {
+                        Ok(_) if send_batch.is_empty() => break,
+                        Ok(_) => continue, // partial send — retry remaining
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
+                        Err(e) => {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %client_addr,
+                                "UDP sendmmsg to client failed: {}",
+                                e
+                            );
+                            let error_message = e.to_string();
+                            disconnect_error = Some((
+                                error_message.clone(),
+                                crate::retry::classify_boxed_error(
+                                    anyhow::anyhow!(error_message).as_ref(),
+                                ),
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if disconnect_error.is_some() {
                     break;
                 }
             }
