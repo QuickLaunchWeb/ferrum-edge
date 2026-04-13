@@ -2005,7 +2005,7 @@ async fn handle_websocket_request_authenticated(
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     upstream_target: Option<Arc<UpstreamTarget>>,
-    lb_hash_key: String,
+    lb_hash_key: Option<String>,
     sticky_cookie_needed: bool,
     start_time: Instant,
     is_h2_websocket: bool,
@@ -2157,9 +2157,10 @@ async fn handle_websocket_request_authenticated(
                     // Try a different target on retry if load balancing is configured
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
+                        && let Some(ref hash_key) = lb_hash_key
                         && let Some(next) = state.load_balancer_cache.select_next_target(
                             upstream_id,
-                            &lb_hash_key,
+                            hash_key,
                             prev_target,
                             Some(&crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -4512,7 +4513,7 @@ async fn handle_proxy_request_inner(
             plugins,
             plugin_execution_ns,
             upstream_target,
-            lb_hash_key.0,
+            lb_hash_key,
             sticky_cookie_needed,
             start_time,
             is_h2_ws,
@@ -4724,9 +4725,10 @@ async fn handle_proxy_request_inner(
                 // Try a different target on retry if load balancing is configured
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
+                    && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = state.load_balancer_cache.select_next_target(
                         upstream_id,
-                        &lb_hash_key.0,
+                        hash_key,
                         prev_target,
                         Some(&crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -4901,9 +4903,10 @@ async fn handle_proxy_request_inner(
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_body = grpc_resp.body;
 
-                // Forward trailers as response headers (gRPC Trailers-Only encoding)
-                for (k, v) in &grpc_resp.trailers {
-                    response_headers.insert(k.clone(), v.clone());
+                // Forward trailers as response headers (gRPC Trailers-Only encoding).
+                // Drain instead of clone to avoid per-trailer String allocations.
+                for (k, v) in grpc_resp.trailers {
+                    response_headers.insert(k, v);
                 }
 
                 // after_proxy hooks
@@ -5303,9 +5306,10 @@ async fn handle_proxy_request_inner(
 
             // Try a different target on retry if load balancing is configured
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
+                && let Some(ref hash_key) = lb_hash_key
                 && let Some(next) = state.load_balancer_cache.select_next_target(
                     upstream_id,
-                    &lb_hash_key.0,
+                    hash_key,
                     prev_target,
                     Some(&crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -5989,7 +5993,7 @@ async fn proxy_to_backend_retry(
     match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let mut resp_headers = HashMap::new();
+            let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
             if stream_response {
                 // Buffer moderate-sized bodies to avoid streaming overhead
@@ -6478,7 +6482,7 @@ async fn proxy_to_backend(
     let response = match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let mut resp_headers = HashMap::new();
+            let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
 
             // Enforce response body size limit
@@ -7194,7 +7198,7 @@ async fn proxy_to_backend_http2(
 
     // Extract response status and headers
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::new();
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if stream_response {

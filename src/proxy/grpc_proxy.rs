@@ -125,38 +125,58 @@ impl GrpcConnectionPool {
     /// TLS mode, DNS override, CA cert, mTLS client cert, and server cert verification.
     /// Uses `|` as field delimiter to avoid ambiguity with `:` in IPv6 addresses.
     ///
-    /// Returns the base key (without shard suffix). For shard keys, the caller
-    /// appends `#N` using `write!` to avoid extra allocations.
-    fn pool_key(proxy: &Proxy) -> String {
-        let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
-        let dns = proxy.dns_override.as_deref().unwrap_or_default();
-        let ca = proxy
-            .backend_tls_server_ca_cert_path
-            .as_deref()
-            .unwrap_or_default();
-        let mtls_cert = proxy
-            .backend_tls_client_cert_path
-            .as_deref()
-            .unwrap_or_default();
-        let verify = proxy.backend_tls_verify_server_cert;
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            proxy.backend_host, proxy.backend_port, tls, dns, ca, mtls_cert, verify as u8,
-        )
+    /// Writes the base key (without shard suffix) into `buf`. For shard keys,
+    /// `write_shard_key_inplace()` appends `#N` by truncating to the base length.
+    fn write_pool_key(buf: &mut String, proxy: &Proxy) {
+        use std::fmt::Write;
+        buf.clear();
+        let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs) as u8;
+        let _ = write!(
+            buf,
+            "{}|{}|{}|",
+            proxy.backend_host, proxy.backend_port, tls
+        );
+        buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+        buf.push('|');
+        buf.push_str(
+            proxy
+                .backend_tls_server_ca_cert_path
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        buf.push('|');
+        buf.push_str(
+            proxy
+                .backend_tls_client_cert_path
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        buf.push('|');
+        buf.push(if proxy.backend_tls_verify_server_cert {
+            '1'
+        } else {
+            '0'
+        });
+    }
+
+    /// Allocating version of the pool key — only used for warmup deduplication
+    /// where the key must outlive the thread-local buffer.
+    fn pool_key_owned(proxy: &Proxy) -> String {
+        let mut buf = String::with_capacity(128);
+        Self::write_pool_key(&mut buf, proxy);
+        buf
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
     pub(crate) fn pool_key_for_warmup(proxy: &Proxy) -> String {
-        Self::pool_key(proxy)
+        Self::pool_key_owned(proxy)
     }
 
-    /// Build a shard key by appending the shard index to a pre-allocated buffer.
-    /// Reuses the same buffer across calls to minimize allocations.
-    fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
-        buf.clear();
-        buf.push_str(base_key);
+    /// Append a shard suffix in-place by truncating to `base_len` first.
+    /// Avoids clearing and rewriting the base key on every shard iteration.
+    fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+        buf.truncate(base_len);
         buf.push('#');
-        // Inline integer formatting for small numbers (0-9 are single digit)
         if shard < 10 {
             buf.push((b'0' + shard as u8) as char);
         } else {
@@ -175,18 +195,25 @@ impl GrpcConnectionPool {
         proxy: &Proxy,
         dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
-        let base_key = Self::pool_key(proxy);
         let pool_config = self.global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
-        let rr = self
-            .rr_counters
-            .entry(base_key.clone())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
-        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
-        // Reusable buffer for shard key construction (avoids per-request String allocation)
-        let mut key_buf = String::with_capacity(base_key.len() + 4);
+        // Build the base pool key and resolve the round-robin start shard.
+        // The rr_counters lookup uses get() first (read-only, no allocation).
+        // Only on the first request for a given base key does entry() allocate.
+        let mut key_buf = String::with_capacity(128);
+        Self::write_pool_key(&mut key_buf, proxy);
+        let base_len = key_buf.len();
+
+        let rr = match self.rr_counters.get(&key_buf) {
+            Some(existing) => existing.value().clone(),
+            None => self
+                .rr_counters
+                .entry(key_buf[..base_len].to_owned())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone(),
+        };
+        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
         // Two-phase readiness check (see Http2ConnectionPool::get_sender for rationale):
         // Phase 1: instant poll each shard without blocking.
@@ -194,7 +221,7 @@ impl GrpcConnectionPool {
         let mut first_live_key: Option<String> = None;
         for offset in 0..shard_count {
             let shard = (start + offset) % shard_count;
-            Self::write_shard_key(&mut key_buf, &base_key, shard);
+            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
 
             if let Some(entry) = self.entries.get(&key_buf) {
                 if entry.sender.is_closed() {
@@ -244,13 +271,13 @@ impl GrpcConnectionPool {
         }
 
         // No existing shard was ready — create a new connection.
-        Self::write_shard_key(&mut key_buf, &base_key, start);
+        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
         let sender = match self.create_connection(proxy, dns_cache).await {
             Ok(sender) => sender,
             Err(err) => {
                 for offset in 1..shard_count {
                     let shard = (start + offset) % shard_count;
-                    Self::write_shard_key(&mut key_buf, &base_key, shard);
+                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
                     if let Some(entry) = self.entries.get(&key_buf) {
                         if !entry.sender.is_closed() {
                             entry
@@ -265,7 +292,7 @@ impl GrpcConnectionPool {
                 return Err(err);
             }
         };
-        Self::write_shard_key(&mut key_buf, &base_key, start);
+        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
         let sender = match self.entries.entry(key_buf) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if occupied.get().sender.is_closed() {
@@ -328,20 +355,7 @@ impl GrpcConnectionPool {
             })?
             .map_err(|e| {
                 warn!("gRPC: failed to connect to backend {}: {}", addr, e);
-                let err_str = e.to_string();
-                if err_str.contains("Name or service not known")
-                    || err_str.contains("No such host")
-                    || err_str.contains("resolve")
-                    || err_str.contains("no record found")
-                    || err_str.contains("failed to lookup address")
-                {
-                    GrpcProxyError::BackendUnavailable(format!(
-                        "DNS resolution for backend failed: {}",
-                        e
-                    ))
-                } else {
-                    GrpcProxyError::BackendUnavailable(format!("Connection refused: {}", e))
-                }
+                GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
             })?;
 
         // Disable Nagle for lower latency
@@ -889,24 +903,28 @@ pub(crate) async fn proxy_grpc_request_core(
         }
     }
 
+    // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins
+    // that add/replace/remove grpc-timeout are reflected in the effective timeout.
+    // Cap by the proxy's backend_read_timeout_ms so client deadlines propagate
+    // without exceeding the operator-configured maximum.
+    let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
+        Some(grpc_ms) => grpc_ms.min(proxy.backend_read_timeout_ms),
+        None => proxy.backend_read_timeout_ms,
+    };
+
     let mut backend_req = Request::new(Full::new(body_bytes));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
-
-    // Send to backend with read timeout
-    let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+    let read_timeout = Duration::from_millis(effective_timeout_ms);
     let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
         .await
         .map_err(|_| {
             warn!(
                 "gRPC: read timeout ({}ms) waiting for backend response",
-                proxy.backend_read_timeout_ms
+                effective_timeout_ms
             );
-            GrpcProxyError::BackendTimeout(format!(
-                "Read timeout after {}ms",
-                proxy.backend_read_timeout_ms
-            ))
+            GrpcProxyError::BackendTimeout(format!("Read timeout after {}ms", effective_timeout_ms))
         })?
         .map_err(|e| {
             error!("gRPC: backend request failed: {}", e);
@@ -1007,4 +1025,39 @@ pub fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("application/grpc"))
+}
+
+/// Parse the `grpc-timeout` header value into milliseconds.
+///
+/// Format: `{value}{unit}` where unit is one of:
+///   H (hours), M (minutes), S (seconds), m (milliseconds),
+///   u (microseconds), n (nanoseconds)
+///
+/// Returns `None` if the header is absent, malformed, or the value is 0.
+/// Per the gRPC spec, the timeout is a positive integer followed by a unit suffix.
+pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
+    let val = headers.get("grpc-timeout")?.to_str().ok()?;
+    let bytes = val.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    // The unit suffix is always a single ASCII byte per the gRPC spec.
+    // Split on the last byte to avoid panicking on multi-byte UTF-8 input.
+    let unit = *bytes.last()?;
+    let num_str = std::str::from_utf8(&bytes[..bytes.len() - 1]).ok()?;
+    let num: u64 = num_str.parse().ok()?;
+    if num == 0 {
+        return None;
+    }
+    let ms = match unit {
+        b'H' => num.checked_mul(3_600_000),
+        b'M' => num.checked_mul(60_000),
+        b'S' => num.checked_mul(1_000),
+        b'm' => Some(num),
+        b'u' => Some(num / 1_000), // microseconds → ms, floor to 0 is handled by max(1) below
+        b'n' => Some(num / 1_000_000),
+        _ => None,
+    }?;
+    // Ensure at least 1ms for sub-millisecond timeouts
+    Some(ms.max(1))
 }

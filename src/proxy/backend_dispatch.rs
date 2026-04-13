@@ -18,7 +18,9 @@ use crate::proxy::ProxyState;
 /// Result of upstream target selection.
 pub(crate) struct UpstreamSelection {
     /// Hash key used for consistent-hashing and sticky cookie decisions.
-    pub lb_hash_key: (String, bool),
+    /// `None` when no upstream is configured — the key is never read in that case
+    /// and skipping it avoids a per-request `client_ip.to_owned()` allocation.
+    pub lb_hash_key: Option<String>,
     /// Selected upstream target, or `None` if no upstream is configured or all
     /// targets are unavailable.
     pub target: Option<Arc<UpstreamTarget>>,
@@ -32,8 +34,8 @@ pub(crate) struct UpstreamSelection {
 /// Select an upstream target for the given proxy using load balancing with
 /// health-aware filtering.
 ///
-/// When the proxy has no `upstream_id`, returns a no-op selection with the
-/// client IP as the hash key (matching the main proxy path behavior).
+/// When the proxy has no `upstream_id`, returns a no-op selection with
+/// `lb_hash_key: None` — the key is never read without an upstream.
 pub(crate) fn select_upstream_target(
     proxy: &Proxy,
     state: &ProxyState,
@@ -42,7 +44,7 @@ pub(crate) fn select_upstream_target(
 ) -> UpstreamSelection {
     let Some(upstream_id) = &proxy.upstream_id else {
         return UpstreamSelection {
-            lb_hash_key: (client_ip.to_string(), false),
+            lb_hash_key: None,
             target: None,
             is_fallback: false,
             sticky_cookie_needed: false,
@@ -89,7 +91,7 @@ pub(crate) fn select_upstream_target(
                 );
             }
             UpstreamSelection {
-                lb_hash_key: (hash_key, needs_set),
+                lb_hash_key: Some(hash_key),
                 target: Some(selection.target),
                 is_fallback: selection.is_fallback,
                 sticky_cookie_needed: needs_set,
@@ -98,7 +100,7 @@ pub(crate) fn select_upstream_target(
         None => {
             warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
             UpstreamSelection {
-                lb_hash_key: (hash_key, needs_set),
+                lb_hash_key: Some(hash_key),
                 target: None,
                 is_fallback: false,
                 sticky_cookie_needed: false,
@@ -222,12 +224,12 @@ pub(crate) fn resolve_hash_key(
     headers: &HashMap<String, String>,
 ) -> (String, bool) {
     match strategy {
-        HashOnStrategy::Ip => (client_ip.to_string(), false),
+        HashOnStrategy::Ip => (client_ip.to_owned(), false),
         HashOnStrategy::Header(name) => {
             // Header names in ctx.headers are stored as-is from hyper (lowercased)
             let value = headers.get(name.as_str()).cloned().unwrap_or_default();
             if value.is_empty() {
-                (client_ip.to_string(), false)
+                (client_ip.to_owned(), false)
             } else {
                 (value, false)
             }
@@ -248,7 +250,7 @@ pub(crate) fn resolve_hash_key(
                 }
             }
             // Cookie not found — use IP and signal that we need to set the cookie
-            (client_ip.to_string(), true)
+            (client_ip.to_owned(), true)
         }
     }
 }
