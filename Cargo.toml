@@ -157,6 +157,16 @@ codegen-units = 256     # maximise codegen parallelism
 strip = true
 opt-level = 2           # still optimised, but less aggressive
 
+# Maximum-performance: for production shipping builds and benchmarks.
+# Fat LTO + single codegen unit enables whole-program optimisation across
+# all crates. Compile time is 3-5× slower than `release` but yields 5-10%
+# better runtime throughput.
+[profile.max-perf]
+inherits = "release"
+lto = "fat"             # full inter-module LTO (cross-crate inlining, DCE)
+codegen-units = 1       # single codegen unit for maximum optimiser visibility
+panic = "abort"         # skip unwind tables — smaller binary, faster panics
+
 [build-dependencies]
 tonic-prost-build = "0.14.5"
 

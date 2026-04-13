@@ -1,0 +1,238 @@
+# On-demand multi-protocol performance benchmark.
+#
+# Runs the full tests/performance/multi_protocol suite on Linux and posts
+# results to the GitHub Actions step summary.  Triggered manually via
+# workflow_dispatch so it can target any branch or PR.
+#
+# Usage:
+#   - Go to Actions → "Performance Benchmark" → "Run workflow"
+#   - Pick the branch (or PR branch) to benchmark
+#   - Optionally adjust duration, concurrency, payload size, and protocols
+
+name: Performance Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Test duration per protocol (seconds)"
+        required: false
+        default: "20"
+        type: string
+      concurrency:
+        description: "Concurrent connections"
+        required: false
+        default: "100"
+        type: string
+      payload_size:
+        description: "Payload size in bytes (UDP uses 2048 regardless)"
+        required: false
+        default: "10240"
+        type: string
+      protocols:
+        description: "Protocols to test (http1, http2, grpc, ws, tcp, etc. or 'all')"
+        required: false
+        default: "all"
+        type: string
+      build_profile:
+        description: "Cargo build profile for gateway binary"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - max-perf
+          - ci-release
+
+jobs:
+  benchmark:
+    name: Multi-Protocol Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-perf-bench"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof
+
+      - name: Build gateway binary
+        run: cargo build --profile ${{ inputs.build_profile }} --bin ferrum-edge
+
+      - name: Build benchmark tools
+        run: cd tests/performance/multi_protocol && cargo build --release
+
+      # The run_protocol_test.sh expects the gateway binary at target/release/ferrum-edge.
+      # When using a non-release profile, copy the binary so the script finds it.
+      - name: Stage gateway binary
+        if: inputs.build_profile != 'release'
+        run: |
+          mkdir -p target/release
+          cp "target/${{ inputs.build_profile }}/ferrum-edge" target/release/ferrum-edge
+
+      - name: Run benchmark suite
+        timeout-minutes: 45
+        run: |
+          cd tests/performance/multi_protocol
+          bash run_protocol_test.sh \
+            "${{ inputs.protocols }}" \
+            --skip-build \
+            --duration "${{ inputs.duration }}" \
+            --concurrency "${{ inputs.concurrency }}" \
+            --payload-size "${{ inputs.payload_size }}" \
+            --json 2>&1 | tee /tmp/bench_output.txt
+
+      - name: Collect JSON results
+        if: always()
+        run: |
+          mkdir -p benchmark-results
+
+          # The --json flag makes each proto_bench invocation print a JSON
+          # object.  Collect them from the interleaved output.
+          python3 - /tmp/bench_output.txt benchmark-results/results.json <<'PYEOF'
+          import json, re, sys
+
+          output_file = sys.argv[2]
+          raw = open(sys.argv[1]).read()
+
+          # Each JSON blob is a single line starting with {
+          blobs = []
+          for line in raw.splitlines():
+              line = line.strip()
+              if line.startswith("{"):
+                  try:
+                      blobs.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass
+
+          results = {"benchmarks": blobs}
+          with open(output_file, "w") as f:
+              json.dump(results, f, indent=2)
+          print(f"Collected {len(blobs)} benchmark results")
+          PYEOF
+
+      - name: Post benchmark summary
+        if: always()
+        run: |
+          python3 - benchmark-results/results.json <<'PYEOF'
+          import json, sys, os
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          results_path = sys.argv[1]
+
+          if not os.path.exists(results_path):
+              with open(summary_file, "a") as f:
+                  f.write("## Performance Benchmark\n\nNo results collected.\n")
+              sys.exit(0)
+
+          with open(results_path) as f:
+              data = json.load(f)
+
+          benchmarks = data.get("benchmarks", [])
+          if not benchmarks:
+              with open(summary_file, "a") as f:
+                  f.write("## Performance Benchmark\n\nNo benchmark results found.\n")
+              sys.exit(0)
+
+          def fmt_rps(v):
+              return f"{v:,.0f}"
+
+          def fmt_us(us):
+              if us is None:
+                  return "N/A"
+              if us >= 1_000_000:
+                  return f"{us/1_000_000:.2f}s"
+              if us >= 1000:
+                  return f"{us/1000:.2f}ms"
+              return f"{us}µs"
+
+          # Group by protocol: (via gateway) vs (direct backend)
+          pairs = {}
+          for b in benchmarks:
+              target = b.get("target", "")
+              proto = b.get("protocol", "unknown")
+              # Heuristic: gateway runs on 8000/8443, direct on 3xxx/50052
+              is_gateway = ":8000" in target or ":8443" in target or ":5010" in target or ":5001" in target or ":5003" in target or ":5004" in target
+              key = proto
+              if key not in pairs:
+                  pairs[key] = {}
+              if is_gateway:
+                  pairs[key]["gateway"] = b
+              else:
+                  pairs[key]["direct"] = b
+
+          lines = []
+          lines.append("## Performance Benchmark Results\n")
+          lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
+                       f"**Duration:** ${{ inputs.duration }}s | "
+                       f"**Concurrency:** ${{ inputs.concurrency }} | "
+                       f"**Protocols:** ${{ inputs.protocols }}\n")
+          lines.append("")
+          lines.append("| Protocol | Gateway RPS | Direct RPS | Overhead | Avg Latency | P50 | P99 | Errors |")
+          lines.append("|----------|------------|------------|----------|-------------|-----|-----|--------|")
+
+          for proto, p in sorted(pairs.items()):
+              gw = p.get("gateway", {})
+              dr = p.get("direct", {})
+              gw_rps = gw.get("rps", 0)
+              dr_rps = dr.get("rps", 0)
+              overhead = f"~{int((dr_rps - gw_rps) / dr_rps * 100)}%" if dr_rps > 0 else "N/A"
+              lines.append(
+                  f"| {proto} "
+                  f"| {fmt_rps(gw_rps)} "
+                  f"| {fmt_rps(dr_rps)} "
+                  f"| {overhead} "
+                  f"| {fmt_us(gw.get('latency_avg_us'))} "
+                  f"| {fmt_us(gw.get('p50_us'))} "
+                  f"| {fmt_us(gw.get('p99_us'))} "
+                  f"| {gw.get('total_errors', 0)} |"
+              )
+
+          lines.append("")
+          lines.append("<details><summary>Raw JSON</summary>\n")
+          lines.append("```json")
+          lines.append(json.dumps(data, indent=2))
+          lines.append("```\n")
+          lines.append("</details>")
+
+          with open(summary_file, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          # Also print to stdout for the log
+          for line in lines:
+              print(line)
+          PYEOF
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmark-results/
+          retention-days: 90
