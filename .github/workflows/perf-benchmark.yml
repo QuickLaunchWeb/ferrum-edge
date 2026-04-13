@@ -42,12 +42,13 @@ on:
       build_profile:
         description: "Cargo build profile for gateway binary"
         required: false
-        default: "release"
+        default: "dev"
         type: choice
         options:
           - release
           - max-perf
           - ci-release
+          - dev
 
 jobs:
   benchmark:
