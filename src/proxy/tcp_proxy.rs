@@ -154,6 +154,8 @@ pub struct TcpListenerConfig {
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Whether TCP Fast Open is enabled (from `FERRUM_TCP_FASTOPEN_ENABLED`).
     pub tcp_fastopen_enabled: bool,
+    /// Shared overload state for connection accounting and load shedding.
+    pub overload: Arc<crate::overload::OverloadState>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -186,6 +188,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         sni_proxy_ids,
         adaptive_buffer,
         tcp_fastopen_enabled,
+        overload,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -257,6 +260,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     }
                 };
 
+                // Reject new connections under critical overload (same as HTTP proxy).
+                if overload.reject_new_connections.load(Ordering::Relaxed) {
+                    drop(stream); // TCP RST
+                    continue;
+                }
+
                 metrics.total_connections.fetch_add(1, Ordering::Relaxed);
                 metrics.active_connections.fetch_add(1, Ordering::Relaxed);
 
@@ -274,8 +283,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let cb_cache = circuit_breaker_cache.clone();
                 let sni_proxy_ids = sni_proxy_ids.clone();
                 let adaptive_buf = adaptive_buffer.clone();
+                let overload_for_conn = overload.clone();
 
                 tokio::spawn(async move {
+                    // Track this connection for global overload accounting and graceful drain.
+                    // The guard decrements the counter on drop (all exit paths).
+                    let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
+
                     let connected_at = chrono::Utc::now();
 
                     // Build stream context — plugins run inside handle_tcp_connection
