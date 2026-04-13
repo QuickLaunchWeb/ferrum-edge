@@ -94,8 +94,7 @@ impl OverloadState {
 
     /// Returns true if this request should have keepalive disabled based on RED probability.
     /// Uses a fast deterministic hash of the request counter to avoid RNG overhead.
-    /// Cost: one AtomicU32::load + one AtomicU64::fetch_add + one comparison.
-    #[allow(dead_code)] // Wired into proxy hot path incrementally.
+    /// Cost: one AtomicU32::load + one AtomicU64::load + one comparison.
     pub fn should_disable_keepalive_red(&self) -> bool {
         let prob = self.red_drop_probability.load(Ordering::Relaxed);
         if prob == 0 {
