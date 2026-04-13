@@ -4,12 +4,17 @@
 # results to the GitHub Actions step summary.  Triggered manually via
 # workflow_dispatch so it can target any branch or PR.
 #
+# Each run executes the benchmark suite 3 times to identify outliers caused
+# by noisy-neighbor effects on shared GitHub runners.  A pre-benchmark
+# health check logs CPU steal, scheduler jitter, and memory to quantify
+# runner impairment.
+#
 # Usage:
-#   - Go to Actions → "Performance Benchmark" → "Run workflow"
+#   - Go to Actions → "Multi Protocol Performance Benchmark" → "Run workflow"
 #   - Pick the branch (or PR branch) to benchmark
 #   - Optionally adjust duration, concurrency, payload size, and protocols
 
-name: Performance Benchmark
+name: Multi Protocol Performance Benchmark
 
 on:
   workflow_dispatch:
@@ -80,7 +85,70 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof sysstat
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          echo "=========================================="
+          echo "  RUNNER HEALTH CHECK — PRE-BENCHMARK"
+          echo "=========================================="
+          echo ""
+
+          echo "--- CPU Info ---"
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|Socket|MHz|Hypervisor|Virtualization'
+          echo ""
+
+          echo "--- CPU Steal / Usage (5-second sample) ---"
+          # vmstat: columns us=user, sy=system, id=idle, wa=iowait, st=steal
+          vmstat 1 6 | tail -n 5
+          echo ""
+
+          # Parse average steal from the 5 samples
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $16; n++} END {printf "%.1f", sum/n}')
+          echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+            echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbor detected. Benchmark results may be unreliable."
+          else
+            echo "CPU steal is low (${AVG_STEAL}%). Runner appears unimpaired."
+          fi
+          echo ""
+
+          echo "--- Memory ---"
+          free -h
+          echo ""
+
+          echo "--- Disk I/O (5-second sample) ---"
+          iostat -x 1 2 2>/dev/null | tail -n 20 || echo "(iostat not available)"
+          echo ""
+
+          echo "--- System Load ---"
+          uptime
+          echo ""
+
+          echo "--- Kernel Scheduler Latency (check for contention) ---"
+          # Run a quick busy-loop timing test to detect scheduler jitter
+          python3 -c "
+          import time
+          samples = []
+          for _ in range(100):
+              t0 = time.monotonic_ns()
+              time.sleep(0.001)  # 1ms sleep
+              elapsed_us = (time.monotonic_ns() - t0) / 1000
+              samples.append(elapsed_us)
+          avg = sum(samples) / len(samples)
+          p99 = sorted(samples)[98]
+          maxv = max(samples)
+          print(f'1ms sleep accuracy: avg={avg:.0f}µs  p99={p99:.0f}µs  max={maxv:.0f}µs')
+          if p99 > 5000:
+              print('WARNING: High scheduler jitter detected — runner may be overloaded')
+          else:
+              print('Scheduler jitter is within normal range')
+          "
+          echo ""
+          echo "=========================================="
+          echo "  HEALTH CHECK COMPLETE"
+          echo "=========================================="
 
       - name: Build gateway binary
         run: cargo build --profile ${{ inputs.build_profile }} --bin ferrum-edge
@@ -96,74 +164,108 @@ jobs:
           mkdir -p target/release
           cp "target/${{ inputs.build_profile }}/ferrum-edge" target/release/ferrum-edge
 
-      - name: Run benchmark suite
+      - name: Run benchmark suite (3 iterations)
         timeout-minutes: 45
         run: |
-          cd tests/performance/multi_protocol
-          bash run_protocol_test.sh \
-            "${{ inputs.protocols }}" \
-            --skip-build \
-            --duration "${{ inputs.duration }}" \
-            --concurrency "${{ inputs.concurrency }}" \
-            --payload-size "${{ inputs.payload_size }}" \
-            --json 2>&1 | tee /tmp/bench_output.txt
+          for run in 1 2 3; do
+            echo ""
+            echo "============================================"
+            echo "  BENCHMARK RUN ${run}/3"
+            echo "============================================"
+            echo ""
+
+            # Quick steal check before each run
+            AVG_STEAL=$(vmstat 1 3 | tail -n 2 | awk '{sum += $16; n++} END {printf "%.1f", sum/n}')
+            echo "Pre-run CPU steal: ${AVG_STEAL}%"
+            if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+              echo "::warning::Run ${run}: CPU steal is ${AVG_STEAL}% before starting — noisy neighbor detected"
+            fi
+
+            cd ${{ github.workspace }}/tests/performance/multi_protocol
+            bash run_protocol_test.sh \
+              "${{ inputs.protocols }}" \
+              --skip-build \
+              --duration "${{ inputs.duration }}" \
+              --concurrency "${{ inputs.concurrency }}" \
+              --payload-size "${{ inputs.payload_size }}" \
+              --json 2>&1 | tee /tmp/bench_output_run${run}.txt
+
+            echo ""
+            echo "Run ${run}/3 complete."
+          done
+
+          echo ""
+          echo "============================================"
+          echo "  ALL 3 BENCHMARK RUNS COMPLETE"
+          echo "============================================"
 
       - name: Collect JSON results
         if: always()
         run: |
           mkdir -p benchmark-results
 
+          # Collect results from all 3 runs into separate files and a combined file.
           # The --json flag makes each proto_bench invocation print pretty-printed
           # multi-line JSON objects interleaved with shell log lines.  Use
           # json.JSONDecoder.raw_decode to extract complete objects from the stream.
-          python3 - /tmp/bench_output.txt benchmark-results/results.json <<'PYEOF'
-          import json, sys
+          python3 - <<'PYEOF'
+          import json, sys, os
 
-          output_file = sys.argv[2]
-          raw = open(sys.argv[1]).read()
+          def extract_json_blobs(filepath):
+              if not os.path.exists(filepath):
+                  return []
+              raw = open(filepath).read()
+              decoder = json.JSONDecoder()
+              blobs = []
+              i = 0
+              while i < len(raw):
+                  idx = raw.find("{", i)
+                  if idx == -1:
+                      break
+                  try:
+                      obj, end = decoder.raw_decode(raw, idx)
+                      blobs.append(obj)
+                      i = end
+                  except json.JSONDecodeError:
+                      i = idx + 1
+              return blobs
 
-          decoder = json.JSONDecoder()
-          blobs = []
-          i = 0
-          while i < len(raw):
-              # Skip to the next '{' which may start a JSON object
-              idx = raw.find("{", i)
-              if idx == -1:
-                  break
-              try:
-                  obj, end = decoder.raw_decode(raw, idx)
-                  blobs.append(obj)
-                  i = end
-              except json.JSONDecodeError:
-                  i = idx + 1
+          all_runs = {}
+          for run in range(1, 4):
+              blobs = extract_json_blobs(f"/tmp/bench_output_run{run}.txt")
+              all_runs[f"run_{run}"] = blobs
+              # Save per-run results
+              with open(f"benchmark-results/results_run{run}.json", "w") as f:
+                  json.dump({"benchmarks": blobs}, f, indent=2)
+              print(f"Run {run}: collected {len(blobs)} benchmark results")
 
-          results = {"benchmarks": blobs}
-          with open(output_file, "w") as f:
-              json.dump(results, f, indent=2)
-          print(f"Collected {len(blobs)} benchmark results")
+          # Combined results file with all runs
+          combined = {"runs": all_runs}
+          with open("benchmark-results/results.json", "w") as f:
+              json.dump(combined, f, indent=2)
           PYEOF
 
       - name: Post benchmark summary
         if: always()
         run: |
           python3 - benchmark-results/results.json <<'PYEOF'
-          import json, sys, os
+          import json, sys, os, math
 
           summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
           results_path = sys.argv[1]
 
           if not os.path.exists(results_path):
               with open(summary_file, "a") as f:
-                  f.write("## Performance Benchmark\n\nNo results collected.\n")
+                  f.write("## Multi Protocol Performance Benchmark\n\nNo results collected.\n")
               sys.exit(0)
 
           with open(results_path) as f:
               data = json.load(f)
 
-          benchmarks = data.get("benchmarks", [])
-          if not benchmarks:
+          runs = data.get("runs", {})
+          if not runs:
               with open(summary_file, "a") as f:
-                  f.write("## Performance Benchmark\n\nNo benchmark results found.\n")
+                  f.write("## Multi Protocol Performance Benchmark\n\nNo benchmark results found.\n")
               sys.exit(0)
 
           def fmt_rps(v):
@@ -178,50 +280,112 @@ jobs:
                   return f"{us/1000:.2f}ms"
               return f"{us}µs"
 
-          # Group by protocol: (via gateway) vs (direct backend)
-          pairs = {}
-          for b in benchmarks:
-              target = b.get("target", "")
-              proto = b.get("protocol", "unknown")
-              # Heuristic: gateway runs on 8000/8443, direct on 3xxx/50052
-              is_gateway = ":8000" in target or ":8443" in target or ":5010" in target or ":5001" in target or ":5003" in target or ":5004" in target
-              key = proto
-              if key not in pairs:
-                  pairs[key] = {}
-              if is_gateway:
-                  pairs[key]["gateway"] = b
-              else:
-                  pairs[key]["direct"] = b
+          def classify_gateway(target):
+              return ":8000" in target or ":8443" in target or ":5010" in target or ":5001" in target or ":5003" in target or ":5004" in target
+
+          def group_benchmarks(benchmarks):
+              pairs = {}
+              for b in benchmarks:
+                  target = b.get("target", "")
+                  proto = b.get("protocol", "unknown")
+                  if proto not in pairs:
+                      pairs[proto] = {}
+                  if classify_gateway(target):
+                      pairs[proto]["gateway"] = b
+                  else:
+                      pairs[proto]["direct"] = b
+              return pairs
 
           lines = []
-          lines.append("## Performance Benchmark Results\n")
+          lines.append("## Multi Protocol Performance Benchmark Results\n")
           lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
                        f"**Duration:** ${{ inputs.duration }}s | "
                        f"**Concurrency:** ${{ inputs.concurrency }} | "
-                       f"**Protocols:** ${{ inputs.protocols }}\n")
-          lines.append("")
-          lines.append("| Protocol | Gateway RPS | Direct RPS | Overhead | Avg Latency | P50 | P99 | Errors |")
-          lines.append("|----------|------------|------------|----------|-------------|-----|-----|--------|")
+                       f"**Protocols:** ${{ inputs.protocols }} | "
+                       f"**Iterations:** 3\n")
 
-          for proto, p in sorted(pairs.items()):
-              gw = p.get("gateway", {})
-              dr = p.get("direct", {})
-              gw_rps = gw.get("rps", 0)
-              dr_rps = dr.get("rps", 0)
-              overhead = f"~{int((dr_rps - gw_rps) / dr_rps * 100)}%" if dr_rps > 0 else "N/A"
-              lines.append(
-                  f"| {proto} "
-                  f"| {fmt_rps(gw_rps)} "
-                  f"| {fmt_rps(dr_rps)} "
-                  f"| {overhead} "
-                  f"| {fmt_us(gw.get('latency_avg_us'))} "
-                  f"| {fmt_us(gw.get('p50_us'))} "
-                  f"| {fmt_us(gw.get('p99_us'))} "
-                  f"| {gw.get('total_errors', 0)} |"
-              )
+          # Per-run tables
+          for run_key in sorted(runs.keys()):
+              run_num = run_key.replace("run_", "")
+              benchmarks = runs[run_key]
+              if not benchmarks:
+                  continue
+              pairs = group_benchmarks(benchmarks)
+
+              lines.append(f"\n### Run {run_num}\n")
+              lines.append("| Protocol | Gateway RPS | Direct RPS | Overhead | Avg Latency | P50 | P99 | Errors |")
+              lines.append("|----------|------------|------------|----------|-------------|-----|-----|--------|")
+
+              for proto, p in sorted(pairs.items()):
+                  gw = p.get("gateway", {})
+                  dr = p.get("direct", {})
+                  gw_rps = gw.get("rps", 0)
+                  dr_rps = dr.get("rps", 0)
+                  overhead = f"~{int((dr_rps - gw_rps) / dr_rps * 100)}%" if dr_rps > 0 else "N/A"
+                  lines.append(
+                      f"| {proto} "
+                      f"| {fmt_rps(gw_rps)} "
+                      f"| {fmt_rps(dr_rps)} "
+                      f"| {overhead} "
+                      f"| {fmt_us(gw.get('latency_avg_us'))} "
+                      f"| {fmt_us(gw.get('p50_us'))} "
+                      f"| {fmt_us(gw.get('p99_us'))} "
+                      f"| {gw.get('total_errors', 0)} |"
+                  )
+
+          # Cross-run comparison & outlier detection
+          # Collect gateway RPS per protocol across runs
+          proto_rps = {}  # proto -> [rps_run1, rps_run2, rps_run3]
+          for run_key in sorted(runs.keys()):
+              pairs = group_benchmarks(runs[run_key])
+              for proto, p in pairs.items():
+                  gw_rps = p.get("gateway", {}).get("rps", 0)
+                  if proto not in proto_rps:
+                      proto_rps[proto] = []
+                  proto_rps[proto].append(gw_rps)
+
+          if proto_rps:
+              lines.append("\n### Cross-Run Comparison (Gateway RPS)\n")
+              run_headers = " | ".join(f"Run {i+1}" for i in range(3))
+              lines.append(f"| Protocol | {run_headers} | Mean | Stdev | CV% | Outlier? |")
+              lines.append(f"|----------|{'--------|' * 3}------|-------|-----|----------|")
+
+              for proto in sorted(proto_rps.keys()):
+                  vals = proto_rps[proto]
+                  mean_v = sum(vals) / len(vals) if vals else 0
+                  if len(vals) > 1 and mean_v > 0:
+                      variance = sum((v - mean_v) ** 2 for v in vals) / (len(vals) - 1)
+                      stdev = math.sqrt(variance)
+                      cv = (stdev / mean_v) * 100
+                  else:
+                      stdev = 0
+                      cv = 0
+
+                  # Flag as outlier if CV > 15% (high variance across runs)
+                  outlier = "⚠️ YES" if cv > 15 else "No"
+
+                  rps_cells = " | ".join(fmt_rps(v) for v in vals)
+                  # Pad if fewer than 3 runs
+                  while len(vals) < 3:
+                      rps_cells += " | N/A"
+                      vals.append(0)
+
+                  lines.append(
+                      f"| {proto} "
+                      f"| {rps_cells} "
+                      f"| {fmt_rps(mean_v)} "
+                      f"| {fmt_rps(stdev)} "
+                      f"| {cv:.1f}% "
+                      f"| {outlier} |"
+                  )
+
+              lines.append("")
+              lines.append("> **CV% (Coefficient of Variation)**: Measures run-to-run consistency. "
+                           "CV > 15% suggests noisy-neighbor interference or other instability. "
+                           "Results marked as outliers should be interpreted with caution.")
 
           lines.append("")
-          lines.append("<details><summary>Raw JSON</summary>\n")
+          lines.append("<details><summary>Raw JSON (all runs)</summary>\n")
           lines.append("```json")
           lines.append(json.dumps(data, indent=2))
           lines.append("```\n")
