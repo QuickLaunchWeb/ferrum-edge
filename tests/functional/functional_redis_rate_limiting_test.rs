@@ -181,8 +181,27 @@ impl RedisRateLimitHarness {
         }
     }
 
+    /// Wait for the DB poll to pick up config changes by actively probing a route.
+    /// Falls back to a 5-second sleep if no path is provided.
     async fn wait_for_poll(&self) {
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    /// Actively wait for a specific route to become available (non-404).
+    /// More reliable than a fixed sleep, especially under CI load.
+    async fn wait_for_route(&self, path: &str) {
+        let url = format!("{}{}", self.proxy_base_url, path);
+        let client = reqwest::Client::new();
+        let deadline = SystemTime::now() + Duration::from_secs(15);
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!("Route {} did not become available within 15 seconds", path);
+            }
+            match client.get(&url).send().await {
+                Ok(r) if r.status().as_u16() != 404 => return,
+                _ => sleep(Duration::from_millis(500)).await,
+            }
+        }
     }
 
     fn generate_admin_token(&self) -> String {
@@ -543,7 +562,11 @@ async fn test_rate_limiting_redis_centralized() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    // Actively wait for the route to be loaded (more reliable than fixed sleep)
+    harness.wait_for_route("/redis-rl/test").await;
+
+    // Flush Redis after the route probe to clear any requests made during polling
+    flush_redis_db().await;
 
     // Send 3 requests — should all succeed
     for i in 1..=3 {
