@@ -4924,16 +4924,22 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
-                // Coalesce small H2 DATA frames into larger chunks to reduce
-                // per-frame overhead on the gRPC streaming path.
+                // Stream H2 DATA frames on the gRPC streaming path.
+                // Fast path: skip coalescing when no size limits or threshold configured.
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
-                let body = crate::proxy::body::coalescing_h2_body(
-                    grpc_streaming.body,
-                    cl,
-                    state.h2_coalesce_target_bytes,
-                );
+                let body = if state.response_buffer_threshold_bytes == 0
+                    && state.max_response_body_size_bytes == 0
+                {
+                    crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl)
+                } else {
+                    crate::proxy::body::coalescing_h2_body(
+                        grpc_streaming.body,
+                        cl,
+                        state.h2_coalesce_target_bytes,
+                    )
+                };
 
                 return Ok(resp_builder.body(body).unwrap_or_else(|_| {
                     grpc_proxy::build_grpc_error_response(
@@ -5779,17 +5785,30 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            crate::proxy::body::coalescing_body(resp, cl)
+            // Fast path: skip coalescing when no plugins need body buffering,
+            // no size limits apply, and response buffer threshold is disabled.
+            // This eliminates per-frame BytesMut buffering and branch overhead.
+            if state.response_buffer_threshold_bytes == 0 && state.max_response_body_size_bytes == 0
+            {
+                crate::proxy::body::direct_streaming_body(resp, cl)
+            } else {
+                crate::proxy::body::coalescing_body(resp, cl)
+            }
         }
         ResponseBody::StreamingH2(resp) => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            crate::proxy::body::coalescing_h2_body(
-                resp.into_body(),
-                cl,
-                state.h2_coalesce_target_bytes,
-            )
+            if state.response_buffer_threshold_bytes == 0 && state.max_response_body_size_bytes == 0
+            {
+                crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+            } else {
+                crate::proxy::body::coalescing_h2_body(
+                    resp.into_body(),
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                )
+            }
         }
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };

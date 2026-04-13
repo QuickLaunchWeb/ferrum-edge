@@ -438,6 +438,62 @@ pub(crate) fn coalescing_body(
     ProxyBody::streaming(Box::pin(body))
 }
 
+/// Wraps a reqwest response into a direct streaming body without coalescing.
+///
+/// Skips the `CoalescingBody` buffering adapter for zero-overhead passthrough.
+/// Use when no plugins require response body buffering and no size limits apply.
+/// `content_length` propagates an exact size hint for Content-Length forwarding.
+pub(crate) fn direct_streaming_body(
+    response: reqwest::Response,
+    content_length: Option<u64>,
+) -> ProxyBody {
+    use futures_util::StreamExt;
+
+    let stream = response.bytes_stream().map(|r| {
+        r.map(Frame::data)
+            .map_err(|e| Box::new(e) as ProxyBodyError)
+    });
+    let body = DirectStreamBody {
+        inner: stream,
+        content_length,
+    };
+    ProxyBody::streaming(Box::pin(body))
+}
+
+/// A zero-overhead streaming body that passes frames directly from the backend
+/// without coalescing. Used on the fast path when no plugins need body buffering.
+struct DirectStreamBody<S> {
+    inner: S,
+    content_length: Option<u64>,
+}
+
+impl<S> http_body::Body for DirectStreamBody<S>
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Unpin,
+{
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if let Some(len) = self.content_length {
+            http_body::SizeHint::with_exact(len)
+        } else {
+            http_body::SizeHint::default()
+        }
+    }
+}
+
 impl<S> http_body::Body for CoalescingBody<S>
 where
     S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Unpin,
@@ -583,6 +639,53 @@ pub(crate) fn coalescing_h2_body(
     };
     let mapped = coalescing.map_err(|e| Box::new(e) as ProxyBodyError);
     ProxyBody::streaming(Box::pin(mapped))
+}
+
+/// Wraps a hyper `Incoming` body into a direct streaming body without coalescing.
+///
+/// Skips the `CoalescingH2Body` buffering adapter for zero-overhead passthrough.
+/// Use when no plugins require response body buffering and no size limits apply.
+pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u64>) -> ProxyBody {
+    use http_body_util::BodyExt;
+
+    let direct = DirectH2Body {
+        inner: body,
+        content_length,
+    };
+    let mapped = direct.map_err(|e| Box::new(e) as ProxyBodyError);
+    ProxyBody::streaming(Box::pin(mapped))
+}
+
+/// A zero-overhead streaming body that passes H2 frames directly from the
+/// backend without coalescing. Used on the fast path for gRPC and HTTP/2 direct
+/// pool responses when no plugins need body buffering.
+struct DirectH2Body {
+    inner: Incoming,
+    content_length: Option<u64>,
+}
+
+impl http_body::Body for DirectH2Body {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if let Some(len) = self.content_length {
+            http_body::SizeHint::with_exact(len)
+        } else {
+            self.inner.size_hint()
+        }
+    }
 }
 
 impl http_body::Body for CoalescingH2Body {
