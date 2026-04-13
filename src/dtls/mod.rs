@@ -40,7 +40,7 @@ const DEFAULT_DTLS_RECORD_OVERHEAD: usize = 64;
 /// Override: `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default: 16384).
 const DEFAULT_DTLS_MAX_PLAINTEXT: usize = 16_384;
 
-/// Cached DTLS buffer configuration, resolved once from env vars.
+/// Cached DTLS buffer configuration, initialized from `EnvConfig` at startup.
 struct DtlsBufConfig {
     /// Max plaintext payload that can be encrypted.
     max_plaintext: usize,
@@ -50,19 +50,23 @@ struct DtlsBufConfig {
 
 static DTLS_BUF_CONFIG: std::sync::OnceLock<DtlsBufConfig> = std::sync::OnceLock::new();
 
+/// Initialize DTLS buffer configuration from resolved `EnvConfig` values.
+/// Must be called after `EnvConfig` is parsed (before any DTLS connections).
+/// Uses saturating arithmetic to prevent overflow with extreme values.
+pub fn init_dtls_buf_config(max_plaintext: usize, record_overhead: usize) {
+    let _ = DTLS_BUF_CONFIG.set(DtlsBufConfig {
+        max_plaintext,
+        output_buf_size: max_plaintext.saturating_add(record_overhead),
+    });
+}
+
 fn dtls_buf_config() -> &'static DtlsBufConfig {
     DTLS_BUF_CONFIG.get_or_init(|| {
-        let max_plaintext = std::env::var("FERRUM_DTLS_MAX_PLAINTEXT_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_DTLS_MAX_PLAINTEXT);
-        let record_overhead = std::env::var("FERRUM_DTLS_RECORD_OVERHEAD_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_DTLS_RECORD_OVERHEAD);
+        // Fallback if init_dtls_buf_config() was never called (e.g. tests).
         DtlsBufConfig {
-            max_plaintext,
-            output_buf_size: max_plaintext + record_overhead,
+            max_plaintext: DEFAULT_DTLS_MAX_PLAINTEXT,
+            output_buf_size: DEFAULT_DTLS_MAX_PLAINTEXT
+                .saturating_add(DEFAULT_DTLS_RECORD_OVERHEAD),
         }
     })
 }
