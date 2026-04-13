@@ -209,6 +209,8 @@ pub struct UdpListenerConfig {
     /// Number of datagrams per `recvmmsg` syscall on Linux (default: 64).
     /// Ignored on non-Linux platforms.
     pub recvmmsg_batch_size: usize,
+    /// Shared overload state for session accounting and load shedding.
+    pub overload: Arc<crate::overload::OverloadState>,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -241,6 +243,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         sni_proxy_ids,
         adaptive_buffer,
         recvmmsg_batch_size,
+        overload,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -261,6 +264,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             circuit_breaker_cache,
             crls,
             started,
+            overload,
         )
         .await;
     }
@@ -339,6 +343,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                         continue;
                     }
                 };
+
+                // Reject datagrams from new clients under critical overload.
+                // Existing sessions continue to be served (UDP is sessionless at the
+                // wire level, so we only block session creation, not in-flight traffic).
+                if overload.reject_new_connections.load(Ordering::Relaxed)
+                    && !sessions.contains_key(&client_addr)
+                {
+                    continue;
+                }
 
                 // Batch-local metric accumulators — flushed to atomics once per batch.
                 let mut batch_dgrams_in: u64 = 1;
@@ -820,6 +833,7 @@ async fn start_dtls_frontend_listener(
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     crls: crate::tls::CrlList,
     started: Arc<AtomicBool>,
+    overload: Arc<crate::overload::OverloadState>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let server = Arc::new(crate::dtls::DtlsServer::bind(addr, dtls_config).await?);
@@ -865,6 +879,12 @@ async fn start_dtls_frontend_listener(
                         continue;
                     }
                 };
+
+                // Reject new DTLS connections under critical overload.
+                if overload.reject_new_connections.load(Ordering::Relaxed) {
+                    client_conn.close().await;
+                    continue;
+                }
 
                 // Atomically reserve a session slot
                 let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);

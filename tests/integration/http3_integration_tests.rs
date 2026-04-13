@@ -233,8 +233,10 @@ fn create_http3_test_env_config() -> EnvConfig {
     }
 }
 
-/// Test HTTP/3 backend connection directly
+/// Test HTTP/3 backend connection directly.
+/// Requires real network access to an HTTP/3-enabled endpoint.
 #[tokio::test]
+#[ignore]
 async fn test_http3_backend_connection() {
     // Initialize crypto provider for this test
     init_crypto_provider();
@@ -322,7 +324,19 @@ async fn test_http3_backend_connection() {
                         body.len(),
                         response_headers.len()
                     );
-                    assert!(status > 0, "Status should be valid");
+                    assert!(
+                        (200..600).contains(&status),
+                        "Status should be a valid HTTP status code, got {}",
+                        status
+                    );
+                    assert!(
+                        !body.is_empty(),
+                        "Response body should not be empty for an HTTP/3 request"
+                    );
+                    assert!(
+                        !response_headers.is_empty(),
+                        "Response headers should not be empty"
+                    );
 
                     // Should be reasonably fast with HTTP/3
                     assert!(
@@ -331,15 +345,15 @@ async fn test_http3_backend_connection() {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("HTTP/3 request failed: {:?}", e);
-                    // This is still possible due to network issues, but should be less common
+                    // Fail the test — a network error means the round trip did not complete.
+                    // If the test environment has no HTTP/3 connectivity, it should be #[ignore]d.
+                    panic!("HTTP/3 request failed (round trip incomplete): {:?}", e);
                 }
             }
         }
         Err(e) => {
-            tracing::warn!("Failed to create HTTP/3 client: {:?}", e);
-            // This is expected in test environments without proper HTTP/3 support
-            // We'll still verify the configuration is correct
+            // Fail the test — if we can't create an HTTP/3 client, the test is meaningless.
+            panic!("Failed to create HTTP/3 client: {:?}", e);
         }
     }
 
@@ -418,6 +432,7 @@ async fn test_http3_proxy_state_creation() {
             )),
             64,
             true,
+            Arc::new(ferrum_edge::overload::OverloadState::new()),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -626,6 +641,7 @@ async fn test_http3_full_integration() {
             )),
             64,
             true,
+            Arc::new(ferrum_edge::overload::OverloadState::new()),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();

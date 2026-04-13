@@ -79,6 +79,8 @@ pub struct StreamListenerManager {
     udp_recvmmsg_batch_size: usize,
     /// Whether TCP Fast Open is enabled for outbound stream proxy connections.
     tcp_fastopen_enabled: bool,
+    /// Shared overload state for connection accounting and load shedding.
+    overload: Arc<crate::overload::OverloadState>,
 }
 
 impl StreamListenerManager {
@@ -102,6 +104,7 @@ impl StreamListenerManager {
         adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
         udp_recvmmsg_batch_size: usize,
         tcp_fastopen_enabled: bool,
+        overload: Arc<crate::overload::OverloadState>,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -125,6 +128,7 @@ impl StreamListenerManager {
             adaptive_buffer,
             udp_recvmmsg_batch_size,
             tcp_fastopen_enabled,
+            overload,
         }
     }
 
@@ -382,6 +386,7 @@ impl StreamListenerManager {
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let recvmmsg_batch = self.udp_recvmmsg_batch_size;
+                let overload = self.overload.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -404,6 +409,7 @@ impl StreamListenerManager {
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
                         recvmmsg_batch_size: recvmmsg_batch,
+                        overload,
                     })
                     .await
                     {
@@ -434,6 +440,7 @@ impl StreamListenerManager {
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let tcp_fastopen = self.tcp_fastopen_enabled;
+                let overload = self.overload.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -457,6 +464,7 @@ impl StreamListenerManager {
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
                         tcp_fastopen_enabled: tcp_fastopen,
+                        overload,
                     })
                     .await
                     {

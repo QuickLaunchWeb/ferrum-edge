@@ -662,6 +662,8 @@ impl ProxyState {
             env_config_arc.adaptive_batch_limit_default,
         ));
 
+        let overload = Arc::new(crate::overload::OverloadState::new());
+
         let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
             stream_bind_addr,
             config_arc.clone(),
@@ -681,6 +683,7 @@ impl ProxyState {
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
             env_config_arc.tcp_fastopen_enabled,
+            overload.clone(),
         ));
 
         Ok(Self {
@@ -746,7 +749,7 @@ impl ProxyState {
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
             crls,
-            overload: Arc::new(crate::overload::OverloadState::new()),
+            overload,
             adaptive_buffer,
         })
     }
