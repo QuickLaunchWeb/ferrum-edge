@@ -3732,6 +3732,32 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
+    // Global request admission control. Single atomic load (~1ns) on the fast
+    // path. Rejects with 503 when request pressure exceeds the critical
+    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD).
+    if state
+        .overload
+        .reject_new_requests
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        record_request(&state, 503);
+        if is_grpc {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                "Service overloaded",
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service overloaded"}"#,
+        ));
+    }
+
+    // Track this request for overload monitoring and graceful drain.
+    // The guard decrements the counter on drop (all exit paths).
+    let _request_guard = crate::overload::RequestGuard::new(&state.overload);
+
     let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
