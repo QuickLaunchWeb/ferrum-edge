@@ -5611,15 +5611,18 @@ pub async fn handle_proxy_request(
     // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
     // close after this response instead of reusing the connection. This
     // naturally frees connection slots for new clients (overload) or allows
-    // the process to exit cleanly (drain). Single atomic load, ~1ns.
+    // the process to exit cleanly (drain).
+    // RED adaptive shedding: between pressure and critical thresholds,
+    // Connection: close is applied probabilistically (linear ramp from 0%
+    // to 100%) rather than all-or-nothing. This smooths tail latency by
+    // gradually shedding keepalive connections as load increases.
+    // Cost: draining check is one AtomicBool::load(Relaxed) ~1ns;
+    // RED check is one AtomicU32::load + one AtomicU64::load + one multiply ~3ns.
     if state
         .overload
         .draining
         .load(std::sync::atomic::Ordering::Relaxed)
-        || state
-            .overload
-            .disable_keepalive
-            .load(std::sync::atomic::Ordering::Relaxed)
+        || state.overload.should_disable_keepalive_red()
     {
         resp_builder = resp_builder.header("connection", "close");
     }
