@@ -152,15 +152,22 @@ jobs:
         run: cargo build --profile ${{ inputs.build_profile }} --bin ferrum-edge
 
       - name: Build payload benchmark tools
-        run: cd tests/performance/payload_size && cargo build --release
+        run: cd tests/performance/payload_size && cargo build --profile ${{ inputs.build_profile }}
 
-      # The run_payload_test.sh expects the gateway binary at target/release/ferrum-edge.
-      # When using a non-release profile, copy the binary so the script finds it.
+      # The run_payload_test.sh expects binaries at target/release/.
+      # When using a non-release profile, copy binaries so the scripts find them.
       - name: Stage gateway binary
         if: inputs.build_profile != 'release'
         run: |
           mkdir -p target/release
           cp "target/${{ inputs.build_profile }}/ferrum-edge" target/release/ferrum-edge
+
+      - name: Stage benchmark binaries
+        if: inputs.build_profile != 'release'
+        run: |
+          mkdir -p tests/performance/payload_size/target/release
+          cp "tests/performance/payload_size/target/${{ inputs.build_profile }}/payload_backend" tests/performance/payload_size/target/release/payload_backend
+          cp "tests/performance/payload_size/target/${{ inputs.build_profile }}/payload_bench" tests/performance/payload_size/target/release/payload_bench
 
       - name: Run payload benchmark suite (3 iterations)
         timeout-minutes: 75
