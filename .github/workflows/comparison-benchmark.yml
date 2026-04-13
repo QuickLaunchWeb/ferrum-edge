@@ -242,7 +242,9 @@ jobs:
 
           GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend", "envoy"]
           PROTOCOLS = ["http", "https", "e2e_tls"]
-          ENDPOINTS = ["health", "users"]
+          # Must match safe_endpoint names in result filenames (/ replaced with _)
+          ENDPOINTS = ["health", "api_users"]
+          ENDPOINT_LABELS = {"health": "/health", "api_users": "/api/users"}
 
           def discover_results(results_dir):
               data = {}
@@ -383,7 +385,7 @@ jobs:
                           marker = " :trophy:" if gw == best_rps_gw else ""
                           lines.append(
                               f"| **{GATEWAY_LABELS.get(gw, gw)}**{marker} "
-                              f"| /{ep} "
+                              f"| {ENDPOINT_LABELS.get(ep, ep)} "
                               f"| {fmt_rps(rps)} "
                               f"| {fmt_ms(m.get('latency_avg_ms'))} "
                               f"| {fmt_ms(m.get('latency_p50_ms'))} "
@@ -407,7 +409,7 @@ jobs:
                           continue
                       m = key_auth[gw]
                       rps = m.get("rps")
-                      no_auth_rps = data.get(gw, {}).get("http", {}).get("users", {}).get("rps")
+                      no_auth_rps = data.get(gw, {}).get("http", {}).get("api_users", {}).get("rps")
                       auth_overhead = ""
                       if no_auth_rps and rps:
                           pct = ((no_auth_rps - rps) / no_auth_rps) * 100
@@ -463,7 +465,7 @@ jobs:
                       lines.append(
                           f"| {GATEWAY_LABELS.get(gw, gw)} "
                           f"| {proto.upper()} "
-                          f"| /{ep} "
+                          f"| {ENDPOINT_LABELS.get(ep, ep)} "
                           f"| {rps_cells} "
                           f"| {fmt_rps(mean_v)} "
                           f"| {cv:.1f}% "
@@ -549,11 +551,11 @@ jobs:
                                   if f_rps > r_rps:
                                       ferrum_wins += 1
                                       pct = ((f_rps - r_rps) / r_rps) * 100 if r_rps > 0 else 0
-                                      comparisons.append(f"  - {proto.upper()} /{ep}: Ferrum +{pct:.1f}% ({fmt_rps(f_rps)} vs {fmt_rps(r_rps)})")
+                                      comparisons.append(f"  - {proto.upper()} {ENDPOINT_LABELS.get(ep, ep)}: Ferrum +{pct:.1f}% ({fmt_rps(f_rps)} vs {fmt_rps(r_rps)})")
                                   else:
                                       rival_wins += 1
                                       pct = ((r_rps - f_rps) / f_rps) * 100 if f_rps > 0 else 0
-                                      comparisons.append(f"  - {proto.upper()} /{ep}: {GATEWAY_LABELS[rival]} +{pct:.1f}% ({fmt_rps(r_rps)} vs {fmt_rps(f_rps)})")
+                                      comparisons.append(f"  - {proto.upper()} {ENDPOINT_LABELS.get(ep, ep)}: {GATEWAY_LABELS[rival]} +{pct:.1f}% ({fmt_rps(r_rps)} vs {fmt_rps(f_rps)})")
 
                       # Key-auth comparison
                       f_ka = key_auth.get("ferrum", {}).get("rps")
