@@ -9,7 +9,6 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_otel_ldap
 
-use std::io::Write;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,12 +19,8 @@ use tokio::time::sleep;
 // Echo Server Helper
 // ============================================================================
 
-/// Start a simple HTTP echo server that returns 200 with a JSON body.
-async fn start_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind echo server");
-
+/// Start a simple HTTP echo server on a pre-bound listener that returns 200 with a JSON body.
+async fn start_echo_server_on(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -95,14 +90,86 @@ async fn wait_for_health(admin_port: u16) -> Result<(), Box<dyn std::error::Erro
     }
 }
 
-/// Allocate an ephemeral port and return it (binds then drops to free the port).
-async fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
+/// Start the gateway with retry logic to handle ephemeral port races.
+/// Returns (gateway_process, echo_handle, proxy_port, admin_port, _temp_dir, _backend_listener).
+async fn start_otel_gateway_with_retry(
+    config_template: &str,
+) -> (
+    std::process::Child,
+    tokio::task::JoinHandle<()>,
+    u16,
+    u16,
+    TempDir,
+    // Keep the backend listener alive indirectly via the spawned task
+) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Allocate fresh ports each attempt
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backend");
+        let backend_port = backend_listener.local_addr().unwrap().port();
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let config_path = temp_dir.path().join("config.yaml");
+        let config_content = config_template.replace("{backend_port}", &backend_port.to_string());
+        std::fs::write(&config_path, config_content.as_bytes())
+            .expect("Failed to write config file");
+
+        // Start echo backend on the pre-bound listener (no port race)
+        let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
+        sleep(Duration::from_millis(200)).await;
+
+        // Start gateway
+        let mut gateway_process =
+            match start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Gateway spawn attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, e
+                    );
+                    echo_handle.abort();
+                    if attempt < MAX_ATTEMPTS {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            };
+
+        match wait_for_health(admin_port).await {
+            Ok(()) => {
+                return (
+                    gateway_process,
+                    echo_handle,
+                    proxy_port,
+                    admin_port,
+                    temp_dir,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Gateway startup attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                let _ = gateway_process.kill();
+                let _ = gateway_process.wait();
+                echo_handle.abort();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 // ============================================================================
@@ -112,15 +179,7 @@ async fn ephemeral_port() -> u16 {
 #[ignore]
 #[tokio::test]
 async fn test_otel_tracing_injects_traceparent() {
-    let backend_port = ephemeral_port().await;
-    let proxy_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
-
-    let config_content = format!(
-        r#"
+    let config_template = r#"
 proxies:
   - id: "traced-proxy"
     listen_path: "/traced"
@@ -141,26 +200,10 @@ plugin_configs:
     enabled: true
     config:
       service_name: "test-gateway"
-"#
-    );
+"#;
 
-    let mut config_file =
-        std::fs::File::create(&config_path).expect("Failed to create config file");
-    config_file
-        .write_all(config_content.as_bytes())
-        .expect("Failed to write config");
-    drop(config_file);
-
-    // Start echo backend
-    let echo_handle = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway
-    let mut gateway_process = start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
+        start_otel_gateway_with_retry(config_template).await;
 
     // Send a request without a traceparent header — the plugin should generate one
     let client = reqwest::Client::new();
@@ -220,15 +263,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_otel_tracing_preserves_existing_traceparent() {
-    let backend_port = ephemeral_port().await;
-    let proxy_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
-
-    let config_content = format!(
-        r#"
+    let config_template = r#"
 proxies:
   - id: "traced-proxy"
     listen_path: "/traced"
@@ -249,26 +284,10 @@ plugin_configs:
     enabled: true
     config:
       service_name: "test-gateway"
-"#
-    );
+"#;
 
-    let mut config_file =
-        std::fs::File::create(&config_path).expect("Failed to create config file");
-    config_file
-        .write_all(config_content.as_bytes())
-        .expect("Failed to write config");
-    drop(config_file);
-
-    // Start echo backend
-    let echo_handle = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway
-    let mut gateway_process = start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
+        start_otel_gateway_with_retry(config_template).await;
 
     // Send a request WITH an existing traceparent — the plugin should preserve the trace_id
     let existing_traceparent = "00-abcdef1234567890abcdef1234567890-1234567890abcdef-01";
@@ -312,21 +331,94 @@ plugin_configs:
 // LDAP Auth Tests
 // ============================================================================
 
+/// Start the gateway with retry logic for LDAP tests (echo backend + unreachable LDAP port).
+async fn start_ldap_gateway_with_retry(
+    config_template: &str,
+) -> (
+    std::process::Child,
+    tokio::task::JoinHandle<()>,
+    u16,
+    u16,
+    TempDir,
+) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backend");
+        let backend_port = backend_listener.local_addr().unwrap().port();
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        // Use a port that we do NOT listen on — guaranteeing LDAP connection failure
+        let ldap_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ldap");
+        let ldap_port = ldap_listener.local_addr().unwrap().port();
+        drop(ldap_listener);
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let config_path = temp_dir.path().join("config.yaml");
+        let config_content = config_template
+            .replace("{backend_port}", &backend_port.to_string())
+            .replace("{ldap_port}", &ldap_port.to_string());
+        std::fs::write(&config_path, config_content.as_bytes())
+            .expect("Failed to write config file");
+
+        let echo_handle = tokio::spawn(start_echo_server_on(backend_listener));
+        sleep(Duration::from_millis(200)).await;
+
+        let mut gateway_process =
+            match start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "Gateway spawn attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, e
+                    );
+                    echo_handle.abort();
+                    if attempt < MAX_ATTEMPTS {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            };
+
+        match wait_for_health(admin_port).await {
+            Ok(()) => {
+                return (
+                    gateway_process,
+                    echo_handle,
+                    proxy_port,
+                    admin_port,
+                    temp_dir,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Gateway startup attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                let _ = gateway_process.kill();
+                let _ = gateway_process.wait();
+                echo_handle.abort();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+}
+
 #[ignore]
 #[tokio::test]
 async fn test_ldap_auth_rejects_when_server_unreachable() {
-    let backend_port = ephemeral_port().await;
-    let proxy_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
-
-    // Use an ephemeral port that we do NOT listen on — guaranteeing LDAP connection failure
-    let ldap_port = ephemeral_port().await;
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
-
-    let config_content = format!(
-        r#"
+    let config_template = r#"
 proxies:
   - id: "auth-proxy"
     listen_path: "/secure"
@@ -348,26 +440,10 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
-"#
-    );
+"#;
 
-    let mut config_file =
-        std::fs::File::create(&config_path).expect("Failed to create config file");
-    config_file
-        .write_all(config_content.as_bytes())
-        .expect("Failed to write config");
-    drop(config_file);
-
-    // Start echo backend (should never be reached)
-    let echo_handle = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway
-    let mut gateway_process = start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
+        start_ldap_gateway_with_retry(config_template).await;
 
     // Send a request with Basic auth credentials — LDAP server is unreachable so auth must fail
     let client = reqwest::Client::new();
@@ -402,16 +478,7 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_ldap_auth_rejects_missing_credentials() {
-    let backend_port = ephemeral_port().await;
-    let proxy_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
-    let ldap_port = ephemeral_port().await;
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
-
-    let config_content = format!(
-        r#"
+    let config_template = r#"
 proxies:
   - id: "auth-proxy"
     listen_path: "/secure"
@@ -433,26 +500,10 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
-"#
-    );
+"#;
 
-    let mut config_file =
-        std::fs::File::create(&config_path).expect("Failed to create config file");
-    config_file
-        .write_all(config_content.as_bytes())
-        .expect("Failed to write config");
-    drop(config_file);
-
-    // Start echo backend (should never be reached)
-    let echo_handle = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway
-    let mut gateway_process = start_gateway(&config_path.to_string_lossy(), proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
+        start_ldap_gateway_with_retry(config_template).await;
 
     // Send a request WITHOUT any auth credentials
     let client = reqwest::Client::new();

@@ -71,6 +71,42 @@ async fn flush_redis_db() {
     let _ = reader.read(&mut buf).await;
 }
 
+/// Delete only Redis keys matching a specific prefix (DB 15).
+/// Uses SCAN + DEL to avoid cross-test interference from FLUSHDB.
+async fn delete_redis_keys_by_prefix(prefix: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:6379").await else {
+        return;
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = reader;
+    let mut buf = vec![0u8; 8192];
+
+    // SELECT 15
+    writer
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n")
+        .await
+        .unwrap();
+    let _ = reader.read(&mut buf).await;
+
+    // Use EVAL with Lua to atomically SCAN+DEL keys matching the pattern.
+    // This avoids the race of KEYS returning stale results and is safe for
+    // concurrent test execution since it only touches keys with our prefix.
+    let pattern = format!("{}*", prefix);
+    let lua_script = format!(
+        "local keys = redis.call('KEYS','{}') for i=1,#keys do redis.call('DEL',keys[i]) end return #keys",
+        pattern
+    );
+    let lua_len = lua_script.len();
+    let cmd = format!(
+        "*3\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n0\r\n",
+        lua_len, lua_script
+    );
+    writer.write_all(cmd.as_bytes()).await.unwrap();
+    let _ = reader.read(&mut buf).await;
+}
+
 // ============================================================================
 // Test Harness (Database mode with Redis rate limiting)
 // ============================================================================
@@ -181,8 +217,27 @@ impl RedisRateLimitHarness {
         }
     }
 
+    /// Wait for the DB poll to pick up config changes by actively probing a route.
+    /// Falls back to a 5-second sleep if no path is provided.
     async fn wait_for_poll(&self) {
-        sleep(Duration::from_secs(3)).await;
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    /// Actively wait for a specific route to become available (non-404).
+    /// More reliable than a fixed sleep, especially under CI load.
+    async fn wait_for_route(&self, path: &str) {
+        let url = format!("{}{}", self.proxy_base_url, path);
+        let client = reqwest::Client::new();
+        let deadline = SystemTime::now() + Duration::from_secs(15);
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!("Route {} did not become available within 15 seconds", path);
+            }
+            match client.get(&url).send().await {
+                Ok(r) if r.status().as_u16() != 404 => return,
+                _ => sleep(Duration::from_millis(500)).await,
+            }
+        }
     }
 
     fn generate_admin_token(&self) -> String {
@@ -543,7 +598,13 @@ async fn test_rate_limiting_redis_centralized() {
     .await
     .unwrap();
 
-    harness.wait_for_poll().await;
+    // Actively wait for the route to be loaded (more reliable than fixed sleep)
+    harness.wait_for_route("/redis-rl/test").await;
+
+    // Clear only this test's rate limit keys (probe requests consumed quota).
+    // Uses targeted key deletion instead of FLUSHDB to avoid interfering with
+    // other Redis rate-limit tests that may be running concurrently.
+    delete_redis_keys_by_prefix(&unique_prefix).await;
 
     // Send 3 requests — should all succeed
     for i in 1..=3 {
