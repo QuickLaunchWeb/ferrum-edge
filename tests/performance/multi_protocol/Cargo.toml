@@ -64,3 +64,15 @@ dashmap = "6"
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
