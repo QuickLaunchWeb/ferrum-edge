@@ -22,7 +22,7 @@ on:
       duration:
         description: "Test duration per size (seconds)"
         required: false
-        default: "15"
+        default: "10"
         type: string
       concurrency:
         description: "Concurrent connections"
@@ -32,7 +32,7 @@ on:
       content_types:
         description: "Content types/tiers to test (json, grpc, tcp, tier1, all, etc.)"
         required: false
-        default: "tier1"
+        default: "all"
         type: string
       sizes:
         description: "Comma-separated payload sizes (default: 10kb,50kb,100kb,1mb,5mb,9mb)"
