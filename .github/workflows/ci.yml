@@ -291,7 +291,7 @@ jobs:
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     needs: [lint]
-    if: always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped')
+    if: always() && (needs.lint.result == 'success' || (github.event_name == 'push' && needs.lint.result == 'skipped'))
     environment: ${{ github.event_name == 'pull_request' && 'ci-build' || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
