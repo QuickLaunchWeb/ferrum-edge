@@ -7630,18 +7630,37 @@ async fn proxy_to_backend_http3(
     let body_bytes: bytes::Bytes = request_body.into();
 
     if stream_response {
-        // Streaming path: return StreamingH3 with the recv_stream still open
-        let h3_result = state
-            .h3_pool
-            .request_streaming(
-                proxy,
-                method,
-                backend_url,
-                &http3_headers,
-                body_bytes,
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
-            )
-            .await;
+        // Streaming path: return StreamingH3 with the recv_stream still open.
+        // When an upstream target is specified, use target-aware pool keying.
+        let h3_result = if let Some(target) = upstream_target {
+            let target_host = target.host.clone();
+            let target_port = target.port;
+            state
+                .h3_pool
+                .request_with_target_streaming(
+                    proxy,
+                    &target_host,
+                    target_port,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        } else {
+            state
+                .h3_pool
+                .request_streaming(
+                    proxy,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        };
 
         match h3_result {
             Ok(response) => {
