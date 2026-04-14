@@ -243,8 +243,8 @@ jobs:
           GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend", "envoy"]
           PROTOCOLS = ["http", "https", "e2e_tls"]
           # Must match safe_endpoint names in result filenames (/ replaced with _)
-          ENDPOINTS = ["health", "api_users"]
-          ENDPOINT_LABELS = {"health": "/health", "api_users": "/api/users"}
+          ENDPOINTS = ["api_echo"]
+          ENDPOINT_LABELS = {"api_echo": "/api/echo (POST ~10KB)"}
 
           def discover_results(results_dir):
               data = {}

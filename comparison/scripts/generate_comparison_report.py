@@ -6,7 +6,7 @@ Usage:
     python3 generate_comparison_report.py results/
 
 Expects result files named: {gateway}_{protocol}_{endpoint}_results.txt
-Example: ferrum_http_health_results.txt, kong_https_users_results.txt
+Example: ferrum_http_health_results.txt, kong_https_api_users_results.txt
 """
 
 import os
@@ -105,7 +105,7 @@ def _latency_to_ms(s):
 
 GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend", "envoy"]
 PROTOCOLS = ["http", "https", "e2e_tls"]
-ENDPOINTS = ["health", "users"]
+ENDPOINTS = ["api_echo"]
 
 
 def _gateway_labels(meta):
@@ -197,7 +197,7 @@ def _build_key_auth_table(key_auth_data, no_auth_data):
         rps = m.get("rps")
 
         # Compare against no-auth HTTP /api/users
-        no_auth_rps = no_auth_data.get(gw, {}).get("http", {}).get("users", {}).get("rps")
+        no_auth_rps = no_auth_data.get(gw, {}).get("http", {}).get("api_users", {}).get("rps")
         overhead = ""
         if no_auth_rps and rps:
             pct = ((no_auth_rps - rps) / no_auth_rps) * 100
@@ -356,8 +356,9 @@ def _build_tls_overhead_table(data):
                 diff = https_lat - http_lat
                 lat_inc = f"+{diff:.2f} ms"
 
+            ep_label = {"api_echo": "/api/echo (POST ~10KB)"}.get(ep, ep)
             html += f"<tr><td><strong>{GATEWAY_LABELS.get(gw, gw)}</strong></td>"
-            html += f"<td>{ep}</td>"
+            html += f"<td>{ep_label}</td>"
             html += f"<td>{_fmt(http_rps, '', 0)}</td>"
             html += f"<td>{_fmt(https_rps, '', 0)}</td>"
             html += f"<td>{rps_drop}</td>"
@@ -399,11 +400,9 @@ def generate_report(results_dir, output_path, meta=None):
         print(f"No result files found in {results_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Baseline metrics for /health and /users
-    bl_health = data.get("baseline", {}).get("http", {}).get("health", {})
-    bl_users = data.get("baseline", {}).get("http", {}).get("users", {})
-    bl_https_health = data.get("baseline", {}).get("https", {}).get("health", {})
-    bl_https_users = data.get("baseline", {}).get("https", {}).get("users", {})
+    # Baseline metrics for /api/echo
+    bl_echo = data.get("baseline", {}).get("http", {}).get("api_echo", {})
+    bl_https_echo = data.get("baseline", {}).get("https", {}).get("api_echo", {})
 
     meta = meta or {}
     GATEWAY_LABELS = _gateway_labels(meta)
@@ -482,44 +481,29 @@ def generate_report(results_dir, output_path, meta=None):
 <div class="section">
   <h2>Direct Backend Baseline</h2>
   <div class="baseline-box">
-    <strong>HTTP /health:</strong> {_fmt(bl_health.get('rps'), ' req/s', 0)} &mdash;
-    {_fmt(bl_health.get('latency_avg_ms'), ' ms avg')} &mdash;
-    {_fmt(bl_health.get('error_count', 0), ' errors', 0)}<br>
-    <strong>HTTP /api/users:</strong> {_fmt(bl_users.get('rps'), ' req/s', 0)} &mdash;
-    {_fmt(bl_users.get('latency_avg_ms'), ' ms avg')} &mdash;
-    {_fmt(bl_users.get('error_count', 0), ' errors', 0)}<br>
-    <strong>HTTPS /health:</strong> {_fmt(bl_https_health.get('rps'), ' req/s', 0)} &mdash;
-    {_fmt(bl_https_health.get('latency_avg_ms'), ' ms avg')} &mdash;
-    {_fmt(bl_https_health.get('error_count', 0), ' errors', 0)}<br>
-    <strong>HTTPS /api/users:</strong> {_fmt(bl_https_users.get('rps'), ' req/s', 0)} &mdash;
-    {_fmt(bl_https_users.get('latency_avg_ms'), ' ms avg')} &mdash;
-    {_fmt(bl_https_users.get('error_count', 0), ' errors', 0)}
+    <strong>HTTP /api/echo (POST ~10KB):</strong> {_fmt(bl_echo.get('rps'), ' req/s', 0)} &mdash;
+    {_fmt(bl_echo.get('latency_avg_ms'), ' ms avg')} &mdash;
+    {_fmt(bl_echo.get('error_count', 0), ' errors', 0)}<br>
+    <strong>HTTPS /api/echo (POST ~10KB):</strong> {_fmt(bl_https_echo.get('rps'), ' req/s', 0)} &mdash;
+    {_fmt(bl_https_echo.get('latency_avg_ms'), ' ms avg')} &mdash;
+    {_fmt(bl_https_echo.get('error_count', 0), ' errors', 0)}
   </div>
 </div>
 
 <div class="section">
-  <h2>HTTP Performance (Plaintext)</h2>
-  <h3>/health endpoint</h3>
-  {_build_table(data, 'http', 'health', bl_health)}
-  <h3>/api/users endpoint</h3>
-  {_build_table(data, 'http', 'users', bl_users)}
+  <h2>HTTP Performance (Plaintext) &mdash; POST ~10KB Echo</h2>
+  {_build_table(data, 'http', 'api_echo', bl_echo)}
 </div>
 
 <div class="section">
-  <h2>HTTPS Performance (TLS Termination)</h2>
-  <h3>/health endpoint</h3>
-  {_build_table(data, 'https', 'health', bl_health)}
-  <h3>/api/users endpoint</h3>
-  {_build_table(data, 'https', 'users', bl_users)}
+  <h2>HTTPS Performance (TLS Termination) &mdash; POST ~10KB Echo</h2>
+  {_build_table(data, 'https', 'api_echo', bl_echo)}
 </div>
 
 <div class="section">
-  <h2>End-to-End TLS Performance (Full Encryption)</h2>
+  <h2>End-to-End TLS Performance (Full Encryption) &mdash; POST ~10KB Echo</h2>
   <p>Client &rarr; HTTPS &rarr; Gateway &rarr; HTTPS &rarr; Backend. Both hops are encrypted. This is the most secure deployment pattern.</p>
-  <h3>/health endpoint</h3>
-  {_build_table(data, 'e2e_tls', 'health', bl_https_health)}
-  <h3>/api/users endpoint</h3>
-  {_build_table(data, 'e2e_tls', 'users', bl_https_users)}
+  {_build_table(data, 'e2e_tls', 'api_echo', bl_https_echo)}
 </div>
 
 {"" if not key_auth_data else f'''<div class="section">
@@ -543,6 +527,7 @@ def generate_report(results_dir, output_path, meta=None):
     <li><strong>Envoy Proxy</strong> runs inside a Docker container (C++-based, high-performance proxy). The same Docker overhead caveats apply. Envoy is configured as a minimal HTTP reverse proxy with static route configuration, no access logging, and connection pooling defaults. Key-auth benchmarks are excluded as Envoy&rsquo;s ext_authz filter requires an external authorization service.</li>
     <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend), the most secure pattern.</li>
     <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
+    <li>The <strong>/api/echo</strong> endpoint receives a POST with a ~10 KB JSON payload that the backend echoes back, measuring realistic request+response body proxying overhead.</li>
     <li>Each test includes a {meta.get("duration", "30s")} measured run preceded by a warm-up phase (results discarded).</li>
     <li>To get the fairest comparison on macOS, install Kong natively and run the benchmark again. Tyk results on macOS should be interpreted with Docker overhead in mind (~0.1–0.5 ms added latency, ~5-15% throughput reduction).</li>
   </ul>
