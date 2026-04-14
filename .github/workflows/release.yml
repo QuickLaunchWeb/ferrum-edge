@@ -94,13 +94,13 @@ jobs:
 
       - name: Build release binary (cross)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --features cloud-secrets --release --target ${{ matrix.target }}
         env:
           RUSTC_WRAPPER: ""
 
       - name: Build release binary (cargo)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --features cloud-secrets --release --target ${{ matrix.target }}
 
       - name: Create release assets directory
         shell: bash

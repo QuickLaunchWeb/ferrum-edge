@@ -100,14 +100,14 @@ hmac = "0.13.0"
 hex = "0.4"
 x509-parser = "0.18"
 
-# Secrets management
-vaultrs = "0.8"
-aws-config = { version = "1.1", features = ["behavior-version-latest"] }
-aws-sdk-secretsmanager = "1"
-google-cloud-secretmanager-v1 = "1.7"
-azure_security_keyvault_secrets = "0.13"
-azure_identity = "0.34"
-azure_core = "0.34"
+# Secrets management (optional cloud backends — gate via cargo features)
+vaultrs = { version = "0.8", optional = true }
+aws-config = { version = "1.1", features = ["behavior-version-latest"], optional = true }
+aws-sdk-secretsmanager = { version = "1", optional = true }
+google-cloud-secretmanager-v1 = { version = "1.7", optional = true }
+azure_security_keyvault_secrets = { version = "0.13", optional = true }
+azure_identity = { version = "0.34", optional = true }
+azure_core = { version = "0.34", optional = true }
 
 # GeoIP (geo_restriction plugin)
 maxminddb = { version = "0.27", features = ["mmap"] }
@@ -132,6 +132,18 @@ tikv-jemallocator = "0.6"
 # recvmmsg/sendmmsg for batched UDP datagram I/O (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# ── Feature flags ──────────────────────────────────────────────────────────
+# Cloud secret backends are optional.  Disabling them saves ~1,900 transitive
+# crate compilations, which is useful for benchmark and perf-regression CI
+# builds that never use external secret providers.
+[features]
+default = []
+cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
+secrets-vault = ["dep:vaultrs"]
+secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
+secrets-gcp = ["dep:google-cloud-secretmanager-v1"]
+secrets-azure = ["dep:azure_identity", "dep:azure_security_keyvault_secrets", "dep:azure_core"]
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles

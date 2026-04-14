@@ -26,13 +26,13 @@ COPY custom_plugins ./custom_plugins
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \
     echo 'fn main() { println!("dummy"); }' > src/main.rs && \
-    cargo build --release 2>/dev/null || true && \
+    cargo build --features cloud-secrets --release 2>/dev/null || true && \
     rm -rf src
 
 # ── Build the real binary ───────────────────────────────────────────────
 COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --features cloud-secrets --release
 
 # Stage 2: Distroless runtime — no OS packages, no shell, no CVEs
 # Uses nonroot tag (UID 65532) for least-privilege execution.
