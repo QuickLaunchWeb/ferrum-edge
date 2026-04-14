@@ -141,6 +141,7 @@ pub fn load_config_from_file(
 
     // Normalize canonical in-memory fields before cross-resource validation.
     config.normalize_fields();
+    config.resolve_upstream_tls();
     if let Err(errors) = config.validate_hosts() {
         for msg in &errors {
             error!("{}", msg);

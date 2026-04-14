@@ -7,7 +7,9 @@
 
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy, ResponseBodyMode};
+use ferrum_edge::config::types::{
+    AuthMode, BackendProtocol, BackendTlsConfig, Proxy, ResponseBodyMode,
+};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::client::Http3ConnectionPool;
@@ -36,6 +38,7 @@ fn minimal_proxy() -> Proxy {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        resolved_tls: BackendTlsConfig::default_verify(),
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -164,6 +167,7 @@ async fn connection_pool_key_with_backend_ca_cert() {
     let pool = pool_with_defaults();
     let mut proxy = minimal_proxy();
     proxy.backend_tls_server_ca_cert_path = Some("/path/to/ca.pem".to_string());
+    proxy.resolved_tls.server_ca_cert_path = Some("/path/to/ca.pem".to_string());
     let key = pool.pool_key_for_warmup(&proxy);
     assert!(
         key.contains("|/path/to/ca.pem|"),
@@ -176,6 +180,7 @@ async fn connection_pool_key_with_mtls_client_cert() {
     let pool = pool_with_defaults();
     let mut proxy = minimal_proxy();
     proxy.backend_tls_client_cert_path = Some("/path/to/client.pem".to_string());
+    proxy.resolved_tls.client_cert_path = Some("/path/to/client.pem".to_string());
     let key = pool.pool_key_for_warmup(&proxy);
     assert!(
         key.contains("|/path/to/client.pem|"),
@@ -188,6 +193,7 @@ async fn connection_pool_key_verify_disabled() {
     let pool = pool_with_defaults();
     let mut proxy = minimal_proxy();
     proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.verify_server_cert = false;
     let key = pool.pool_key_for_warmup(&proxy);
     assert!(
         key.ends_with("|0"),
@@ -271,6 +277,7 @@ async fn connection_pool_key_per_proxy_mtls_overrides_global() {
     );
     let mut proxy = minimal_proxy();
     proxy.backend_tls_client_cert_path = Some("/proxy/client.pem".to_string());
+    proxy.resolved_tls.client_cert_path = Some("/proxy/client.pem".to_string());
     let key = pool.pool_key_for_warmup(&proxy);
     assert!(
         key.contains("|/proxy/client.pem|"),
@@ -329,8 +336,10 @@ async fn connection_pool_key_different_ca_paths_differ() {
     let pool = pool_with_defaults();
     let mut p1 = minimal_proxy();
     p1.backend_tls_server_ca_cert_path = Some("/ca/one.pem".to_string());
+    p1.resolved_tls.server_ca_cert_path = Some("/ca/one.pem".to_string());
     let mut p2 = minimal_proxy();
     p2.backend_tls_server_ca_cert_path = Some("/ca/two.pem".to_string());
+    p2.resolved_tls.server_ca_cert_path = Some("/ca/two.pem".to_string());
     assert_ne!(
         pool.pool_key_for_warmup(&p1),
         pool.pool_key_for_warmup(&p2),
@@ -384,6 +393,7 @@ fn h2_pool_key_with_dns_override() {
 fn h2_pool_key_with_ca_cert() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_server_ca_cert_path = Some("/certs/ca.pem".to_string());
+    proxy.resolved_tls.server_ca_cert_path = Some("/certs/ca.pem".to_string());
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     assert!(
         key.contains("|/certs/ca.pem|"),
@@ -395,6 +405,7 @@ fn h2_pool_key_with_ca_cert() {
 fn h2_pool_key_with_mtls_cert() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_client_cert_path = Some("/certs/client.pem".to_string());
+    proxy.resolved_tls.client_cert_path = Some("/certs/client.pem".to_string());
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     assert!(
         key.contains("|/certs/client.pem|"),
@@ -406,6 +417,7 @@ fn h2_pool_key_with_mtls_cert() {
 fn h2_pool_key_verify_disabled() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.verify_server_cert = false;
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     assert!(
         key.ends_with("|0"),
@@ -652,6 +664,7 @@ fn h3_pool_key_with_index() {
 fn h3_pool_key_with_ca_cert() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_server_ca_cert_path = Some("/certs/ca.pem".to_string());
+    proxy.resolved_tls.server_ca_cert_path = Some("/certs/ca.pem".to_string());
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
     assert!(
         key.contains("|/certs/ca.pem|"),
@@ -663,6 +676,7 @@ fn h3_pool_key_with_ca_cert() {
 fn h3_pool_key_with_mtls_cert() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_client_cert_path = Some("/certs/client.pem".to_string());
+    proxy.resolved_tls.client_cert_path = Some("/certs/client.pem".to_string());
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
     assert!(
         key.contains("|/certs/client.pem|"),
@@ -674,6 +688,7 @@ fn h3_pool_key_with_mtls_cert() {
 fn h3_pool_key_verify_disabled() {
     let mut proxy = minimal_proxy();
     proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.verify_server_cert = false;
     let key = Http3ConnectionPool::pool_key(&proxy, 0);
     assert!(
         key.ends_with("|0"),
@@ -732,8 +747,10 @@ fn h3_pool_key_different_ports_differ() {
 fn h3_pool_key_different_ca_paths_differ() {
     let mut p1 = minimal_proxy();
     p1.backend_tls_server_ca_cert_path = Some("/ca/one.pem".to_string());
+    p1.resolved_tls.server_ca_cert_path = Some("/ca/one.pem".to_string());
     let mut p2 = minimal_proxy();
     p2.backend_tls_server_ca_cert_path = Some("/ca/two.pem".to_string());
+    p2.resolved_tls.server_ca_cert_path = Some("/ca/two.pem".to_string());
     assert_ne!(
         Http3ConnectionPool::pool_key(&p1, 0),
         Http3ConnectionPool::pool_key(&p2, 0),
@@ -811,6 +828,9 @@ fn h3_pool_key_full_tls_config() {
     proxy.backend_tls_server_ca_cert_path = Some("/ca/bundle.pem".to_string());
     proxy.backend_tls_client_cert_path = Some("/client/cert.pem".to_string());
     proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.server_ca_cert_path = Some("/ca/bundle.pem".to_string());
+    proxy.resolved_tls.client_cert_path = Some("/client/cert.pem".to_string());
+    proxy.resolved_tls.verify_server_cert = false;
     let key = Http3ConnectionPool::pool_key(&proxy, 2);
     assert_eq!(
         key, "backend.example.com|8080|2|/ca/bundle.pem|/client/cert.pem|0",

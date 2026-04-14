@@ -98,12 +98,12 @@ pub fn build_backend_dtls_config(
     tls_no_verify: bool,
     crls: &crate::tls::CrlList,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
-    let skip_verify = !proxy.backend_tls_verify_server_cert || tls_no_verify;
+    let skip_verify = !proxy.resolved_tls.verify_server_cert || tls_no_verify;
 
     // Load client certificate for mutual TLS, or generate an ephemeral one.
     let certificate = if let (Some(cert_path), Some(key_path)) = (
-        &proxy.backend_tls_client_cert_path,
-        &proxy.backend_tls_client_key_path,
+        &proxy.resolved_tls.client_cert_path,
+        &proxy.resolved_tls.client_key_path,
     ) {
         load_dtls_certificate(cert_path, key_path)?
     } else {
@@ -892,7 +892,7 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
 }
 
 fn load_backend_root_store(proxy: &Proxy) -> Result<rustls::RootCertStore, anyhow::Error> {
-    if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
+    if let Some(ca_path) = &proxy.resolved_tls.server_ca_cert_path {
         load_root_store_from_pem(ca_path)
     } else {
         Ok(rustls::RootCertStore::from_iter(

@@ -51,7 +51,8 @@ impl CachedBackendTlsConfig {
         // - Custom CA configured → empty store + only that CA (no public roots)
         // - No CA configured → webpki/system roots as default fallback
         let ca_path = proxy
-            .backend_tls_server_ca_cert_path
+            .resolved_tls
+            .server_ca_cert_path
             .as_deref()
             .or(global_tls_ca_bundle_path);
         let mut root_store = if ca_path.is_some() {
@@ -76,8 +77,8 @@ impl CachedBackendTlsConfig {
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
         let builder = crate::tls::backend_client_config_builder(tls_policy)?;
         let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
-            &proxy.backend_tls_client_cert_path,
-            &proxy.backend_tls_client_key_path,
+            &proxy.resolved_tls.client_cert_path,
+            &proxy.resolved_tls.client_key_path,
         ) {
             let cert_data = std::fs::read(cert_path)?;
             let key_data = std::fs::read(key_path)?;
@@ -96,7 +97,7 @@ impl CachedBackendTlsConfig {
         };
 
         // Disable verification only if explicitly requested
-        if !proxy.backend_tls_verify_server_cert || tls_no_verify {
+        if !proxy.resolved_tls.verify_server_cert || tls_no_verify {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));

@@ -134,6 +134,7 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: ferrum_edge::config::types::AuthMode::Single,

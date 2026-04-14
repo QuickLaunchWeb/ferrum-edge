@@ -108,19 +108,21 @@ impl Http2ConnectionPool {
         buf.push('|');
         buf.push_str(
             proxy
-                .backend_tls_server_ca_cert_path
+                .resolved_tls
+                .server_ca_cert_path
                 .as_deref()
                 .unwrap_or_default(),
         );
         buf.push('|');
         buf.push_str(
             proxy
-                .backend_tls_client_cert_path
+                .resolved_tls
+                .client_cert_path
                 .as_deref()
                 .unwrap_or_default(),
         );
         buf.push('|');
-        buf.push(if proxy.backend_tls_verify_server_cert {
+        buf.push(if proxy.resolved_tls.verify_server_cert {
             '1'
         } else {
             '0'
@@ -437,7 +439,8 @@ impl Http2ConnectionPool {
         // - Custom CA configured → empty store + only that CA (no public roots)
         // - No CA configured → webpki/system roots as default fallback
         let ca_path = proxy
-            .backend_tls_server_ca_cert_path
+            .resolved_tls
+            .server_ca_cert_path
             .as_ref()
             .or(self.global_env_config.tls_ca_bundle_path.as_ref());
         let mut root_store = if ca_path.is_some() {
@@ -466,13 +469,15 @@ impl Http2ConnectionPool {
             );
         }
 
-        // Load mTLS client certificate if configured (proxy-specific overrides take priority)
+        // Load mTLS client certificate if configured (resolved_tls overrides take priority)
         let cert_path = proxy
-            .backend_tls_client_cert_path
+            .resolved_tls
+            .client_cert_path
             .as_ref()
             .or(self.global_env_config.backend_tls_client_cert_path.as_ref());
         let key_path = proxy
-            .backend_tls_client_key_path
+            .resolved_tls
+            .client_key_path
             .as_ref()
             .or(self.global_env_config.backend_tls_client_key_path.as_ref());
 
@@ -533,7 +538,7 @@ impl Http2ConnectionPool {
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
         // Skip server cert verification only if explicitly disabled or global no_verify
-        if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
+        if !proxy.resolved_tls.verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));

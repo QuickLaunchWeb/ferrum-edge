@@ -384,6 +384,7 @@ impl DatabaseStore {
 
         // Normalize canonical in-memory fields before validation.
         config.normalize_fields();
+        config.resolve_upstream_tls();
 
         // Validate all field-level constraints (lengths, ranges, nested configs).
         // Warn-only since data already exists in the database.
@@ -1350,7 +1351,7 @@ impl DatabaseStore {
             .transpose()?;
 
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&upstream.id)
         .bind(&upstream.namespace)
@@ -1361,6 +1362,10 @@ impl DatabaseStore {
         .bind(&hash_on_cookie_config_json)
         .bind(&health_checks_json)
         .bind(&service_discovery_json)
+        .bind(&upstream.backend_tls_client_cert_path)
+        .bind(&upstream.backend_tls_client_key_path)
+        .bind(upstream.backend_tls_verify_server_cert as i32)
+        .bind(&upstream.backend_tls_server_ca_cert_path)
         .bind(upstream.created_at.to_rfc3339())
         .bind(upstream.updated_at.to_rfc3339())
         .execute(&self.pool())
@@ -1393,7 +1398,7 @@ impl DatabaseStore {
             .transpose()?;
 
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, updated_at=? WHERE id=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
@@ -1402,6 +1407,10 @@ impl DatabaseStore {
         .bind(&hash_on_cookie_config_json)
         .bind(&health_checks_json)
         .bind(&service_discovery_json)
+        .bind(&upstream.backend_tls_client_cert_path)
+        .bind(&upstream.backend_tls_client_key_path)
+        .bind(upstream.backend_tls_verify_server_cert as i32)
+        .bind(&upstream.backend_tls_server_ca_cert_path)
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
         .execute(&self.pool())
@@ -2575,7 +2584,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
             let targets_json = serde_json::to_string(&upstream.targets)?;
@@ -2606,6 +2615,10 @@ impl DatabaseStore {
                 .bind(&hash_on_cookie_config_json)
                 .bind(&health_checks_json)
                 .bind(&service_discovery_json)
+                .bind(&upstream.backend_tls_client_cert_path)
+                .bind(&upstream.backend_tls_client_key_path)
+                .bind(upstream.backend_tls_verify_server_cert as i32)
+                .bind(&upstream.backend_tls_server_ca_cert_path)
                 .bind(upstream.created_at.to_rfc3339())
                 .bind(upstream.updated_at.to_rfc3339())
                 .execute(&mut *tx)
@@ -3595,6 +3608,7 @@ fn row_to_proxy(
             .try_get::<f64, _>("udp_max_response_amplification_factor")
             .ok()
             .map(|v| v as f32),
+        resolved_tls: Default::default(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -3732,6 +3746,12 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok());
 
+    // Parse backend TLS fields
+    let backend_tls_verify_server_cert: bool = row
+        .try_get::<i32, _>("backend_tls_verify_server_cert")
+        .map(|v| v != 0)
+        .unwrap_or(true);
+
     Ok(Upstream {
         id: row.try_get("id")?,
         namespace: row
@@ -3744,6 +3764,10 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         hash_on_cookie_config,
         health_checks,
         service_discovery,
+        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
+        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        backend_tls_verify_server_cert,
+        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

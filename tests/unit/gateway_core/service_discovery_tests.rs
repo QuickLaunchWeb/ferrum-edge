@@ -32,6 +32,10 @@ fn make_upstream(
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: sd,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

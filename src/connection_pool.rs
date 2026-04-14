@@ -161,7 +161,7 @@ impl ConnectionPool {
         // Determine whether to skip server cert verification.
         // CA trust chain: proxy CA → global CA → webpki/system roots.
         let skip_verify =
-            !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify;
+            !proxy.resolved_tls.verify_server_cert || self.global_mtls_config.tls_no_verify;
 
         let mut client_builder = reqwest::Client::builder()
             .dns_resolver(dns_resolver)
@@ -227,7 +227,8 @@ impl ConnectionPool {
         // - Custom CA configured -> empty store + only that CA (no public roots)
         // - No CA configured -> webpki/system roots as default fallback
         let ca_path = proxy
-            .backend_tls_server_ca_cert_path
+            .resolved_tls
+            .server_ca_cert_path
             .as_ref()
             .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
 
@@ -263,12 +264,13 @@ impl ConnectionPool {
             .with_webpki_verifier(verifier);
 
         // Add client certificate for mTLS (proxy-specific overrides take priority)
-        let cert_path = proxy.backend_tls_client_cert_path.as_ref().or(self
+        let cert_path = proxy.resolved_tls.client_cert_path.as_ref().or(self
             .global_mtls_config
             .backend_tls_client_cert_path
             .as_ref());
         let key_path = proxy
-            .backend_tls_client_key_path
+            .resolved_tls
+            .client_key_path
             .as_ref()
             .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
 
@@ -297,7 +299,7 @@ impl ConnectionPool {
         };
 
         // Disable server certificate verification if configured (testing only)
-        if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
+        if !proxy.resolved_tls.verify_server_cert || self.global_mtls_config.tls_no_verify {
             tracing::warn!("Backend TLS certificate verification DISABLED (testing mode)");
             client_config
                 .dangerous()
@@ -365,14 +367,16 @@ impl ConnectionPool {
         buf.push('|');
         buf.push_str(
             proxy
-                .backend_tls_server_ca_cert_path
+                .resolved_tls
+                .server_ca_cert_path
                 .as_deref()
                 .unwrap_or_default(),
         );
         buf.push('|');
         buf.push_str(
             proxy
-                .backend_tls_client_cert_path
+                .resolved_tls
+                .client_cert_path
                 .as_deref()
                 .or(self
                     .global_mtls_config
@@ -383,7 +387,8 @@ impl ConnectionPool {
         buf.push('|');
         // Include verify flag — a proxy with verification disabled must not
         // share a client with one that requires verification.
-        let verify = proxy.backend_tls_verify_server_cert && !self.global_mtls_config.tls_no_verify;
+        let verify =
+            proxy.resolved_tls.verify_server_cert && !self.global_mtls_config.tls_no_verify;
         buf.push(if verify { '1' } else { '0' });
     }
 
@@ -461,11 +466,12 @@ impl ConnectionPool {
 
         // Determine whether to skip server certificate verification
         let skip_verify =
-            !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify;
+            !proxy.resolved_tls.verify_server_cert || self.global_mtls_config.tls_no_verify;
 
         // Determine CA path: proxy-specific CA takes priority over global CA bundle
         let ca_path = proxy
-            .backend_tls_server_ca_cert_path
+            .resolved_tls
+            .server_ca_cert_path
             .as_ref()
             .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
 
@@ -518,11 +524,17 @@ impl ConnectionPool {
                     .unwrap_or_else(|_| rustls::ClientConfig::builder())
             };
 
-        // Build client config with optional mTLS
-        let mut client_config = if let (Some(cert_path), Some(key_path)) = (
-            &proxy.backend_tls_client_cert_path,
-            &proxy.backend_tls_client_key_path,
-        ) {
+        // Build client config with optional mTLS (resolved_tls → global fallback)
+        let cert_path = proxy.resolved_tls.client_cert_path.as_ref().or(self
+            .global_mtls_config
+            .backend_tls_client_cert_path
+            .as_ref());
+        let key_path = proxy
+            .resolved_tls
+            .client_key_path
+            .as_ref()
+            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
+        let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
             // mTLS: load client certificate and key
             let cert_file = std::fs::File::open(cert_path).map_err(|e| {
                 anyhow::anyhow!(
