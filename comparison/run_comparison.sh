@@ -125,6 +125,7 @@ wait_for_http() {
     local url="$1"
     local label="$2"
     local max_retries="${3:-15}"
+    local container="${4:-}"
     for i in $(seq 1 "$max_retries"); do
         if curl -skf "$url" > /dev/null 2>&1; then
             log_ok "$label is ready"
@@ -133,6 +134,11 @@ wait_for_http() {
         sleep 1
     done
     log_err "$label failed to start after ${max_retries}s"
+    if [[ -n "$container" ]]; then
+        echo -e "${YELLOW}  ── docker logs ($container) ──${NC}"
+        docker logs --tail 40 "$container" 2>&1 | sed 's/^/    /' || true
+        echo -e "${YELLOW}  ── end docker logs ──${NC}"
+    fi
     return 1
 }
 
@@ -453,7 +459,7 @@ start_ferrum_http() {
         -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
         "$FERRUM_IMAGE"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (HTTP)"
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (HTTP)" 15 "$FERRUM_CONTAINER"
 }
 
 start_ferrum_https() {
@@ -497,7 +503,7 @@ start_ferrum_https() {
         -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
         "$FERRUM_IMAGE"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (HTTPS)" 15
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (HTTPS)" 15 "$FERRUM_CONTAINER"
 }
 
 start_ferrum_e2e_tls() {
@@ -542,7 +548,7 @@ start_ferrum_e2e_tls() {
         -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
         "$FERRUM_IMAGE"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (E2E TLS)" 15
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (E2E TLS)" 15 "$FERRUM_CONTAINER"
 }
 
 stop_ferrum() {
@@ -558,19 +564,31 @@ test_ferrum() {
     prepare_ferrum_config
 
     # HTTP tests
-    start_ferrum_http
-    run_wrk_post "ferrum" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-    stop_ferrum
+    if start_ferrum_http; then
+        run_wrk_post "ferrum" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
+        stop_ferrum
+    else
+        log_warn "Ferrum HTTP failed to start — skipping"
+        stop_ferrum
+    fi
 
     # HTTPS tests (TLS termination — plaintext backend)
-    start_ferrum_https
-    run_wrk_post "ferrum" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_ferrum
+    if start_ferrum_https; then
+        run_wrk_post "ferrum" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_ferrum
+    else
+        log_warn "Ferrum HTTPS failed to start — skipping"
+        stop_ferrum
+    fi
 
     # E2E TLS tests (TLS on both sides)
-    start_ferrum_e2e_tls
-    run_wrk_post "ferrum" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_ferrum
+    if start_ferrum_e2e_tls; then
+        run_wrk_post "ferrum" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_ferrum
+    else
+        log_warn "Ferrum E2E TLS failed to start — skipping"
+        stop_ferrum
+    fi
 }
 
 # ===========================================================================
@@ -588,7 +606,7 @@ start_pingora_http() {
         -e PINGORA_BACKEND_PORT="$BACKEND_PORT" \
         "$PINGORA_IMAGE"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Pingora Docker (HTTP)"
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Pingora Docker (HTTP)" 15 "$PINGORA_CONTAINER"
 }
 
 start_pingora_https() {
@@ -608,7 +626,7 @@ start_pingora_https() {
         -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
         "$PINGORA_IMAGE"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (HTTPS)" 15
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (HTTPS)" 15 "$PINGORA_CONTAINER"
 }
 
 start_pingora_e2e_tls() {
@@ -629,7 +647,7 @@ start_pingora_e2e_tls() {
         -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
         "$PINGORA_IMAGE"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (E2E TLS)" 15
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (E2E TLS)" 15 "$PINGORA_CONTAINER"
 }
 
 stop_pingora() {
@@ -643,14 +661,22 @@ test_pingora() {
     log_header "Testing Pingora (Docker)"
 
     # HTTP tests
-    start_pingora_http
-    run_wrk_post "pingora" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-    stop_pingora
+    if start_pingora_http; then
+        run_wrk_post "pingora" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
+        stop_pingora
+    else
+        log_warn "Pingora HTTP failed to start — skipping"
+        stop_pingora
+    fi
 
     # HTTPS tests (TLS termination — plaintext backend)
-    start_pingora_https
-    run_wrk_post "pingora" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_pingora
+    if start_pingora_https; then
+        run_wrk_post "pingora" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_pingora
+    else
+        log_warn "Pingora HTTPS failed to start — skipping"
+        stop_pingora
+    fi
 
     # E2E TLS tests (TLS on both sides)
     # Pingora's TLS library requires a valid domain (not IP) for upstream SNI,
@@ -692,7 +718,7 @@ start_kong_http() {
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (HTTP)" 20
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (HTTP)" 20 "$KONG_CONTAINER"
 }
 
 start_kong_https() {
@@ -717,7 +743,7 @@ start_kong_https() {
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (HTTPS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (HTTPS)" 20 "$KONG_CONTAINER"
 }
 
 start_kong_e2e_tls() {
@@ -742,7 +768,7 @@ start_kong_e2e_tls() {
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20 "$KONG_CONTAINER"
 }
 
 stop_kong() {
@@ -758,19 +784,31 @@ test_kong() {
     prepare_kong_config
 
     # HTTP tests
-    start_kong_http
-    run_wrk_post "kong" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-    stop_kong
+    if start_kong_http; then
+        run_wrk_post "kong" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
+        stop_kong
+    else
+        log_warn "Kong HTTP failed to start — skipping"
+        stop_kong
+    fi
 
     # HTTPS tests (TLS termination — plaintext backend)
-    start_kong_https
-    run_wrk_post "kong" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_kong
+    if start_kong_https; then
+        run_wrk_post "kong" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_kong
+    else
+        log_warn "Kong HTTPS failed to start — skipping"
+        stop_kong
+    fi
 
     # E2E TLS tests (TLS on both sides)
-    start_kong_e2e_tls
-    run_wrk_post "kong" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_kong
+    if start_kong_e2e_tls; then
+        run_wrk_post "kong" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_kong
+    else
+        log_warn "Kong E2E TLS failed to start — skipping"
+        stop_kong
+    fi
 }
 
 # ===========================================================================
@@ -847,7 +885,7 @@ start_tyk_http() {
         -v "$COMP_DIR/configs/.tyk_runtime_apps:/etc/tyk/apps:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (HTTP)" 20
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (HTTP)" 20 "$TYK_CONTAINER"
 }
 
 start_tyk_https() {
@@ -871,7 +909,7 @@ start_tyk_https() {
         -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (HTTPS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (HTTPS)" 20 "$TYK_CONTAINER"
 }
 
 start_tyk_e2e_tls() {
@@ -895,7 +933,7 @@ start_tyk_e2e_tls() {
         -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (E2E TLS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (E2E TLS)" 20 "$TYK_CONTAINER"
 }
 
 stop_tyk() {
@@ -912,19 +950,32 @@ test_tyk() {
     start_redis
 
     # HTTP tests
-    start_tyk_http
-    run_wrk_post "tyk" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-    stop_tyk
+    if start_tyk_http; then
+        run_wrk_post "tyk" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
+        stop_tyk
+    else
+        log_warn "Tyk HTTP failed to start — skipping"
+        stop_tyk
+    fi
 
     # HTTPS tests (TLS termination — plaintext backend)
-    start_tyk_https
-    run_wrk_post "tyk" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_tyk
+    if start_tyk_https; then
+        run_wrk_post "tyk" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_tyk
+    else
+        log_warn "Tyk HTTPS failed to start — skipping"
+        stop_tyk
+    fi
 
     # E2E TLS tests (TLS on both sides)
-    start_tyk_e2e_tls
-    run_wrk_post "tyk" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_tyk
+    if start_tyk_e2e_tls; then
+        run_wrk_post "tyk" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_tyk
+    else
+        log_warn "Tyk E2E TLS failed to start — skipping"
+        stop_tyk
+    fi
+
     stop_redis
 }
 
@@ -951,7 +1002,7 @@ start_krakend_http() {
         "krakend:${KRAKEND_VERSION}" \
         run -c /etc/krakend/krakend.json
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "KrakenD (HTTP)" 20
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "KrakenD (HTTP)" 20 "$KRAKEND_CONTAINER"
 }
 
 start_krakend_https() {
@@ -967,7 +1018,7 @@ start_krakend_https() {
         "krakend:${KRAKEND_VERSION}" \
         run -c /etc/krakend/krakend.json
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (HTTPS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (HTTPS)" 20 "$KRAKEND_CONTAINER"
 }
 
 start_krakend_e2e_tls() {
@@ -983,7 +1034,7 @@ start_krakend_e2e_tls() {
         "krakend:${KRAKEND_VERSION}" \
         run -c /etc/krakend/krakend.json
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (E2E TLS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (E2E TLS)" 20 "$KRAKEND_CONTAINER"
 }
 
 stop_krakend() {
@@ -999,19 +1050,31 @@ test_krakend() {
     prepare_krakend_config
 
     # HTTP tests
-    start_krakend_http
-    run_wrk_post "krakend" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-    stop_krakend
+    if start_krakend_http; then
+        run_wrk_post "krakend" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
+        stop_krakend
+    else
+        log_warn "KrakenD HTTP failed to start — skipping"
+        stop_krakend
+    fi
 
     # HTTPS tests (TLS termination — plaintext backend)
-    start_krakend_https
-    run_wrk_post "krakend" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_krakend
+    if start_krakend_https; then
+        run_wrk_post "krakend" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_krakend
+    else
+        log_warn "KrakenD HTTPS failed to start — skipping"
+        stop_krakend
+    fi
 
     # E2E TLS tests (TLS on both sides)
-    start_krakend_e2e_tls
-    run_wrk_post "krakend" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_krakend
+    if start_krakend_e2e_tls; then
+        run_wrk_post "krakend" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_krakend
+    else
+        log_warn "KrakenD E2E TLS failed to start — skipping"
+        stop_krakend
+    fi
 }
 
 # ===========================================================================
@@ -1038,7 +1101,7 @@ start_envoy_http() {
         -v "$COMP_DIR/configs/.envoy_runtime_http.yaml:/etc/envoy/envoy.yaml:ro" \
         "envoyproxy/envoy:v${ENVOY_VERSION}"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (HTTP)" 20
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (HTTP)" 20 "$ENVOY_CONTAINER"
 }
 
 start_envoy_https() {
@@ -1053,7 +1116,7 @@ start_envoy_https() {
         -v "$CERTS_DIR/server.key:/etc/envoy/tls/server.key:ro" \
         "envoyproxy/envoy:v${ENVOY_VERSION}"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy Docker (HTTPS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy Docker (HTTPS)" 20 "$ENVOY_CONTAINER"
 }
 
 start_envoy_e2e_tls() {
@@ -1068,7 +1131,7 @@ start_envoy_e2e_tls() {
         -v "$CERTS_DIR/server.key:/etc/envoy/tls/server.key:ro" \
         "envoyproxy/envoy:v${ENVOY_VERSION}"
 
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy Docker (E2E TLS)" 20
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy Docker (E2E TLS)" 20 "$ENVOY_CONTAINER"
 }
 
 stop_envoy() {
@@ -1084,19 +1147,31 @@ test_envoy() {
     prepare_envoy_config
 
     # HTTP tests
-    start_envoy_http
-    run_wrk_post "envoy" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-    stop_envoy
+    if start_envoy_http; then
+        run_wrk_post "envoy" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
+        stop_envoy
+    else
+        log_warn "Envoy HTTP failed to start — skipping"
+        stop_envoy
+    fi
 
     # HTTPS tests (TLS termination — plaintext backend)
-    start_envoy_https
-    run_wrk_post "envoy" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_envoy
+    if start_envoy_https; then
+        run_wrk_post "envoy" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_envoy
+    else
+        log_warn "Envoy HTTPS failed to start — skipping"
+        stop_envoy
+    fi
 
     # E2E TLS tests (TLS on both sides)
-    start_envoy_e2e_tls
-    run_wrk_post "envoy" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
-    stop_envoy
+    if start_envoy_e2e_tls; then
+        run_wrk_post "envoy" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
+        stop_envoy
+    else
+        log_warn "Envoy E2E TLS failed to start — skipping"
+        stop_envoy
+    fi
 }
 
 # ===========================================================================
@@ -1151,7 +1226,11 @@ test_ferrum_key_auth() {
         -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
         "$FERRUM_IMAGE"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (Key Auth)"
+    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (Key Auth)" 15 "$FERRUM_CONTAINER"; then
+        log_warn "Ferrum Key Auth failed to start — skipping"
+        stop_ferrum
+        return 0
+    fi
     run_wrk_key_auth "ferrum" "$GATEWAY_HTTP_PORT"
     stop_ferrum
 }
@@ -1175,7 +1254,11 @@ test_kong_key_auth() {
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
         "kong/kong-gateway:${KONG_VERSION}"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20
+    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20 "$KONG_CONTAINER"; then
+        log_warn "Kong Key Auth failed to start — skipping"
+        stop_kong
+        return 0
+    fi
     run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
     stop_kong
 }
@@ -1200,7 +1283,11 @@ test_tyk_key_auth() {
         -v "$COMP_DIR/configs/.tyk_runtime_apps_key_auth:/etc/tyk/apps:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (Key Auth)" 20
+    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/hello" "Tyk (Key Auth)" 20 "$TYK_CONTAINER"; then
+        log_warn "Tyk Key Auth failed to start — skipping"
+        stop_tyk
+        return 0
+    fi
 
     # Create an API key for the authenticated endpoint
     log_info "Creating Tyk API key..."
@@ -1268,7 +1355,11 @@ test_envoy_key_auth() {
         -v "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml:/etc/envoy/envoy.yaml:ro" \
         "envoyproxy/envoy:v${ENVOY_VERSION}"
 
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20
+    if ! wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20 "$ENVOY_CONTAINER"; then
+        log_warn "Envoy Key Auth failed to start — skipping"
+        stop_envoy
+        return 0
+    fi
     run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
     stop_envoy
 }

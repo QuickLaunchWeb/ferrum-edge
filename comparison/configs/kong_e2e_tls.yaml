@@ -18,6 +18,9 @@ services:
       - name: health-route-e2e
         paths:
           - /health
+        protocols:
+          - http
+          - https
         strip_path: false
         preserve_host: false
 
@@ -33,6 +36,9 @@ services:
       - name: echo-route-e2e
         paths:
           - /api/echo
+        protocols:
+          - http
+          - https
         methods:
           - POST
         strip_path: false
