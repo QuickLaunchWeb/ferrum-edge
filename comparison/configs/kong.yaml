@@ -18,6 +18,9 @@ services:
       - name: health-route
         paths:
           - /health
+        protocols:
+          - http
+          - https
         strip_path: false
         preserve_host: false
 
@@ -32,6 +35,9 @@ services:
       - name: echo-route
         paths:
           - /api/echo
+        protocols:
+          - http
+          - https
         methods:
           - POST
         strip_path: false
