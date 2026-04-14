@@ -60,7 +60,7 @@ pub enum GrpcBody {
 
 impl http_body::Body for GrpcBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -83,14 +83,21 @@ impl http_body::Body for GrpcBody {
                         *bytes_seen += data.len();
                         if *bytes_seen > *max_bytes {
                             exceeded.store(true, Ordering::Release);
-                            // Signal end-of-stream. The caller detects the
-                            // exceeded flag and returns ResourceExhausted.
-                            return Poll::Ready(None);
+                            // Return an error to RST_STREAM the request,
+                            // preventing the backend from treating a truncated
+                            // prefix as a completed stream.
+                            return Poll::Ready(Some(Err(format!(
+                                "gRPC request payload exceeds maximum of {} bytes",
+                                max_bytes
+                            )
+                            .into())));
                         }
                     }
                     Poll::Ready(Some(Ok(frame)))
                 }
-                other => other,
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
             },
         }
     }

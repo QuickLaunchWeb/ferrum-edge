@@ -4995,8 +4995,8 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
-                // Check if the streaming request body exceeded the size limit
-                // after response headers arrived (bidi/client-streaming RPCs).
+                // Check if the streaming request body already exceeded the size
+                // limit before we start forwarding the response.
                 if let Some(ref exceeded) = grpc_streaming.request_body_exceeded
                     && exceeded.load(std::sync::atomic::Ordering::Acquire)
                 {
@@ -5006,9 +5006,13 @@ async fn handle_proxy_request_inner(
                         "gRPC request payload size exceeds maximum",
                     ));
                 }
+                // For bidi/client-streaming RPCs where the request body is still
+                // sending: GrpcBody::Streaming returns an error when exceeded,
+                // which causes hyper to RST_STREAM the request. The backend then
+                // resets the response stream, and the Incoming response body
+                // naturally propagates the h2 error to the client.
 
                 // Stream H2 DATA frames on the gRPC streaming path.
-                // Fast path: skip coalescing when no size limits or threshold configured.
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
