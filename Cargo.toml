@@ -45,6 +45,7 @@ tracing-appender = "0.2"
 tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.5"
 prost = "0.14.3"
+tower = { version = "0.5", features = ["util"] }
 
 # JWT and auth
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }

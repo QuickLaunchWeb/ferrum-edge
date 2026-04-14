@@ -781,7 +781,7 @@ async fn grpc_probe(
     global_ca_path: Option<&str>,
     global_cert_path: Option<&str>,
     global_key_path: Option<&str>,
-    _global_no_verify: bool,
+    global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
     let endpoint_url = format!("{}://{}:{}", scheme, host, port);
@@ -797,7 +797,33 @@ async fn grpc_probe(
         }
     };
 
-    let endpoint = if use_tls {
+    let skip_verify = use_tls && (!tls_config.verify_server_cert || global_no_verify);
+
+    // When skip_verify is true, tonic's ClientTlsConfig doesn't support disabling
+    // cert verification. Build a rustls ClientConfig directly with NoVerifier
+    // (same pattern as grpc_proxy.rs) and use connect_with_connector.
+    let channel = if skip_verify {
+        match build_grpc_probe_channel_no_verify(
+            &endpoint,
+            host,
+            timeout,
+            tls_config,
+            global_ca_path,
+            global_cert_path,
+            global_key_path,
+        )
+        .await
+        {
+            Ok(ch) => ch,
+            Err(e) => {
+                debug!(
+                    "gRPC health probe: connect failed for {}:{}: {}",
+                    host, port, e
+                );
+                return false;
+            }
+        }
+    } else if use_tls {
         let mut tonic_tls = tonic::transport::ClientTlsConfig::new();
 
         // Load CA certs (upstream → global → system roots)
@@ -830,13 +856,7 @@ async fn grpc_probe(
             }
         }
 
-        // Note: tonic's ClientTlsConfig does not expose a skip-verify API.
-        // When skip_verify is true, we accept that gRPC health probes may fail
-        // against self-signed certs unless a CA is explicitly configured.
-        // The proxy gRPC path (grpc_proxy.rs) uses rustls directly with NoVerifier,
-        // but health probes use tonic's higher-level API which doesn't support this.
-
-        match endpoint.tls_config(tonic_tls) {
+        let endpoint = match endpoint.tls_config(tonic_tls) {
             Ok(ep) => ep,
             Err(e) => {
                 debug!(
@@ -845,23 +865,35 @@ async fn grpc_probe(
                 );
                 return false;
             }
+        };
+        match tokio::time::timeout(timeout, endpoint.connect()).await {
+            Ok(Ok(ch)) => ch,
+            Ok(Err(e)) => {
+                debug!(
+                    "gRPC health probe: connect failed for {}:{}: {}",
+                    host, port, e
+                );
+                return false;
+            }
+            Err(_) => {
+                debug!("gRPC health probe: connect timed out for {}:{}", host, port);
+                return false;
+            }
         }
     } else {
-        endpoint
-    };
-
-    let channel = match tokio::time::timeout(timeout, endpoint.connect()).await {
-        Ok(Ok(ch)) => ch,
-        Ok(Err(e)) => {
-            debug!(
-                "gRPC health probe: connect failed for {}:{}: {}",
-                host, port, e
-            );
-            return false;
-        }
-        Err(_) => {
-            debug!("gRPC health probe: connect timed out for {}:{}", host, port);
-            return false;
+        match tokio::time::timeout(timeout, endpoint.connect()).await {
+            Ok(Ok(ch)) => ch,
+            Ok(Err(e)) => {
+                debug!(
+                    "gRPC health probe: connect failed for {}:{}: {}",
+                    host, port, e
+                );
+                return false;
+            }
+            Err(_) => {
+                debug!("gRPC health probe: connect timed out for {}:{}", host, port);
+                return false;
+            }
         }
     };
 
@@ -884,6 +916,86 @@ async fn grpc_probe(
             false
         }
     }
+}
+
+/// Build a tonic gRPC channel with TLS verification disabled (NoVerifier).
+///
+/// Tonic's `ClientTlsConfig` doesn't expose a skip-verify API, so we build
+/// the rustls `ClientConfig` directly (same pattern as `grpc_proxy.rs`) and
+/// use `connect_with_connector` to provide a custom TLS connector.
+#[allow(clippy::too_many_arguments)]
+async fn build_grpc_probe_channel_no_verify(
+    endpoint: &tonic::transport::Endpoint,
+    host: &str,
+    timeout: Duration,
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+    global_cert_path: Option<&str>,
+    global_key_path: Option<&str>,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    // Build root cert store (still needed for mTLS client auth builder)
+    let ca_path = tls_config.server_ca_cert_path.as_deref().or(global_ca_path);
+    let mut root_store = if ca_path.is_some() {
+        rustls::RootCertStore::empty()
+    } else {
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+    };
+    if let Some(ca_path) = ca_path
+        && let Ok(ca_data) = std::fs::read(ca_path)
+    {
+        for cert in rustls_pemfile::certs(&mut &ca_data[..]).flatten() {
+            let _ = root_store.add(cert);
+        }
+    }
+
+    // Build client config with optional mTLS
+    let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
+    let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
+    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        let cert_data = std::fs::read(cert_path)?;
+        let key_data = std::fs::read(key_path)?;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+            .filter_map(|r| r.ok())
+            .collect();
+        let key = rustls_pemfile::private_key(&mut &key_data[..])?.ok_or("No private key found")?;
+        builder.with_client_auth_cert(certs, key)?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // Disable server cert verification
+    client_config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
+    client_config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let tls_connector = TlsConnector::from(Arc::new(client_config));
+    let host_owned = host.to_string();
+
+    let connector = tower::service_fn(move |uri: http::Uri| {
+        let tls_connector = tls_connector.clone();
+        let host = host_owned.clone();
+        async move {
+            let addr = format!(
+                "{}:{}",
+                uri.host().unwrap_or("127.0.0.1"),
+                uri.port_u16().unwrap_or(443)
+            );
+            let tcp = tokio::net::TcpStream::connect(&addr).await?;
+            let server_name = ServerName::try_from(host)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let tls = tls_connector.connect(server_name, tcp).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tls))
+        }
+    });
+
+    let channel =
+        tokio::time::timeout(timeout, endpoint.connect_with_connector(connector)).await??;
+    Ok(channel)
 }
 
 fn build_health_check_client(
