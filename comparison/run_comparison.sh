@@ -643,6 +643,7 @@ start_pingora_e2e_tls() {
         -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
         -e PINGORA_BACKEND_PORT="$BACKEND_HTTPS_PORT" \
         -e PINGORA_BACKEND_TLS=true \
+        -e PINGORA_BACKEND_CA_CERT=/etc/pingora/tls/server.crt \
         -e PINGORA_TLS_CERT=/etc/pingora/tls/server.crt \
         -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
         "$PINGORA_IMAGE"
@@ -933,6 +934,7 @@ start_tyk_e2e_tls() {
         -v "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls:/etc/tyk/apps:ro" \
         -v "$CERTS_DIR/server.crt:/etc/tyk/certs/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/tyk/certs/upstream-ca.crt:ro" \
         "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (E2E TLS)" 20 "$TYK_CONTAINER"
