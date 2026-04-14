@@ -20,14 +20,17 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
@@ -37,9 +40,50 @@ use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
 use crate::tls::{NoVerifier, TlsPolicy};
 
+/// Sum type for gRPC request bodies: either pre-buffered or streaming from the
+/// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
+/// both buffered (retries, plugins) and streaming (zero-copy fast path) bodies.
+pub enum GrpcBody {
+    /// Complete body in memory (retries, plugin transforms).
+    Buffered(Full<Bytes>),
+    /// Streaming body from the client (no retries, no plugins need body).
+    Streaming(Incoming),
+}
+
+impl http_body::Body for GrpcBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            GrpcBody::Buffered(full) => Pin::new(full)
+                .poll_frame(cx)
+                .map_err(|never| match never {}),
+            GrpcBody::Streaming(incoming) => Pin::new(incoming).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            GrpcBody::Buffered(full) => full.is_end_stream(),
+            GrpcBody::Streaming(incoming) => incoming.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            GrpcBody::Buffered(full) => full.size_hint(),
+            GrpcBody::Streaming(incoming) => incoming.size_hint(),
+        }
+    }
+}
+
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
-    sender: http2::SendRequest<Full<Bytes>>,
+    sender: http2::SendRequest<GrpcBody>,
     last_used_epoch_ms: Arc<AtomicU64>,
 }
 
@@ -196,7 +240,7 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let pool_config = self.global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -322,7 +366,7 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -436,7 +480,7 @@ impl GrpcConnectionPool {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
@@ -461,7 +505,7 @@ impl GrpcConnectionPool {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
@@ -832,6 +876,92 @@ pub async fn proxy_grpc_request_from_bytes(
     .await
 }
 
+/// Proxy a gRPC request by streaming the request body directly to the backend
+/// without collecting it into memory first.
+///
+/// Used on the fast path when no plugins need the request body and no retries
+/// are configured. The response is always streamed (since no retries are possible
+/// when the request body has already been consumed).
+///
+/// Request body size limits (`max_grpc_recv_size_bytes`) are NOT enforced on the
+/// streaming path — HTTP/2 flow control already limits in-flight data, and since
+/// each frame is forwarded immediately to the backend, memory usage is bounded
+/// by the H2 window size (~64KB-8MiB depending on config), not the total body size.
+/// The size limit is a defense against buffering the entire body, which doesn't
+/// apply here.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_grpc_request_streaming(
+    req: Request<Incoming>,
+    proxy: &Proxy,
+    backend_url: &str,
+    grpc_pool: &GrpcConnectionPool,
+    dns_cache: &DnsCache,
+    proxy_headers: &HashMap<String, String>,
+) -> Result<GrpcResponseKind, GrpcProxyError> {
+    let (parts, body) = req.into_parts();
+    let grpc_body = GrpcBody::Streaming(body);
+
+    // Build headers, apply proxy transforms
+    let mut headers = parts.headers;
+    headers.remove("connection");
+    headers.remove("transfer-encoding");
+    for (k, v) in proxy_headers {
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+
+    let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
+        Some(grpc_ms) => grpc_ms.min(proxy.backend_read_timeout_ms),
+        None => proxy.backend_read_timeout_ms,
+    };
+
+    let uri: hyper::Uri = backend_url
+        .parse()
+        .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
+
+    let mut backend_req = Request::new(grpc_body);
+    *backend_req.method_mut() = parts.method;
+    *backend_req.uri_mut() = uri;
+    *backend_req.headers_mut() = headers;
+
+    let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
+    let read_timeout = Duration::from_millis(effective_timeout_ms);
+    let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
+        .await
+        .map_err(|_| {
+            warn!(
+                "gRPC: read timeout ({}ms) waiting for backend response (streaming request body)",
+                effective_timeout_ms
+            );
+            GrpcProxyError::BackendTimeout(format!(
+                "gRPC read timeout after {}ms",
+                effective_timeout_ms
+            ))
+        })?
+        .map_err(|e| {
+            error!("gRPC backend request failed (streaming body): {}", e);
+            GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+        })?;
+
+    // Always return streaming response — no retries possible when request body was streamed
+    let status = response.status().as_u16();
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    for (k, v) in response.headers() {
+        if let Ok(vs) = v.to_str() {
+            resp_headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+    Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
+        status,
+        headers: resp_headers,
+        body: response.into_body(),
+    }))
+}
+
 /// Collect the incoming gRPC request body and split the `Request<Incoming>` into
 /// its constituent parts for separate validation and dispatch.
 ///
@@ -917,7 +1047,7 @@ pub(crate) async fn proxy_grpc_request_core(
         None => proxy.backend_read_timeout_ms,
     };
 
-    let mut backend_req = Request::new(Full::new(body_bytes));
+    let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;

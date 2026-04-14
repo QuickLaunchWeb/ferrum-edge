@@ -453,6 +453,16 @@ impl Plugin for AiResponseGuard {
         self.has_patterns
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Only buffer for POST JSON requests — AI/LLM responses to inspect.
+        self.has_patterns
+            && ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+    }
+
     async fn on_response_body(
         &self,
         ctx: &mut RequestContext,

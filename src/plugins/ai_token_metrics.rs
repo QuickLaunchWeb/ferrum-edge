@@ -502,6 +502,16 @@ impl Plugin for AiTokenMetrics {
         true
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Only buffer for POST requests with JSON content-type — these are the
+        // AI/LLM API calls that contain token usage data in the response body.
+        ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
+    }
+
     async fn on_response_body(
         &self,
         ctx: &mut RequestContext,

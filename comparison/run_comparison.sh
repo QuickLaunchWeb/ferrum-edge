@@ -450,7 +450,7 @@ start_ferrum_http() {
         -e FERRUM_MAX_QUERY_PARAMS=0 \
         -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
         -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
+        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
         "$FERRUM_IMAGE"
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (HTTP)"
@@ -494,7 +494,7 @@ start_ferrum_https() {
         -e FERRUM_MAX_QUERY_PARAMS=0 \
         -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
         -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
+        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
         "$FERRUM_IMAGE"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (HTTPS)" 15
@@ -539,7 +539,7 @@ start_ferrum_e2e_tls() {
         -e FERRUM_MAX_QUERY_PARAMS=0 \
         -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
         -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
+        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
         "$FERRUM_IMAGE"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (E2E TLS)" 15
@@ -1148,7 +1148,7 @@ test_ferrum_key_auth() {
         -e FERRUM_MAX_QUERY_PARAMS=0 \
         -e FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
         -e FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
-        -e FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES=0 \
+        -e FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0 \
         "$FERRUM_IMAGE"
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (Key Auth)"
