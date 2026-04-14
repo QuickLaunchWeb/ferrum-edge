@@ -22,6 +22,7 @@ on:
 permissions:
   actions: write
   contents: read
+  deployments: write
 
 jobs:
   cleanup-pending-reviews:
@@ -40,8 +41,8 @@ jobs:
           REJECTED_COUNT=0
           SKIPPED_COUNT=0
 
-          # List workflow runs that are waiting for deployment review (action_required or waiting)
-          WAITING_RUNS=$(gh api "repos/${{ github.repository }}/actions/runs?status=waiting&per_page=100" --jq '.workflow_runs[].id')
+          # List workflow runs that are waiting for deployment review (paginated)
+          WAITING_RUNS=$(gh api --paginate "repos/${{ github.repository }}/actions/runs?status=waiting&per_page=100" --jq '.workflow_runs[].id')
 
           if [[ -z "$WAITING_RUNS" ]]; then
             echo "No workflow runs waiting for deployment review."
