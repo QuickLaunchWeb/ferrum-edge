@@ -19,11 +19,15 @@
 //! If both the base variable and a suffixed variant are set, startup fails
 //! with a conflict error.
 
+#[cfg(feature = "secrets-aws")]
 mod aws;
+#[cfg(feature = "secrets-azure")]
 mod azure;
 mod env;
 mod file;
+#[cfg(feature = "secrets-gcp")]
 mod gcp;
+#[cfg(feature = "secrets-vault")]
 mod vault;
 
 use std::collections::HashMap;
@@ -33,11 +37,23 @@ use tracing::info;
 const FERRUM_PREFIX: &str = "FERRUM_";
 
 /// Default timeout (seconds) for individual secret fetch operations from cloud backends.
+#[cfg(any(
+    feature = "secrets-vault",
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
 const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// Read the secret fetch timeout from `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` env var,
 /// falling back to the default. Called before EnvConfig is parsed (secrets are
 /// resolved first), so this reads the env var directly.
+#[cfg(any(
+    feature = "secrets-vault",
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
 fn secret_fetch_timeout() -> std::time::Duration {
     let secs = crate::config::conf_file::resolve_ferrum_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS")
         .and_then(|v| v.parse::<u64>().ok())
@@ -49,9 +65,13 @@ fn secret_fetch_timeout() -> std::time::Duration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SecretBackend {
     File,
+    #[cfg(feature = "secrets-vault")]
     Vault,
+    #[cfg(feature = "secrets-aws")]
     Aws,
+    #[cfg(feature = "secrets-gcp")]
     Gcp,
+    #[cfg(feature = "secrets-azure")]
     Azure,
 }
 
@@ -67,18 +87,22 @@ struct PendingSecret {
 /// Returns `(base_key, backend)` if the key ends with a recognized suffix.
 fn match_suffix(raw_key: &str) -> Option<(&str, SecretBackend)> {
     // Check longer suffixes first to avoid false prefix matches.
+    #[cfg(feature = "secrets-azure")]
     if let Some(base) = raw_key.strip_suffix("_AZURE") {
         return Some((base, SecretBackend::Azure));
     }
+    #[cfg(feature = "secrets-vault")]
     if let Some(base) = raw_key.strip_suffix("_VAULT") {
         return Some((base, SecretBackend::Vault));
     }
     if let Some(base) = raw_key.strip_suffix("_FILE") {
         return Some((base, SecretBackend::File));
     }
+    #[cfg(feature = "secrets-aws")]
     if let Some(base) = raw_key.strip_suffix("_AWS") {
         return Some((base, SecretBackend::Aws));
     }
+    #[cfg(feature = "secrets-gcp")]
     if let Some(base) = raw_key.strip_suffix("_GCP") {
         return Some((base, SecretBackend::Gcp));
     }
@@ -168,6 +192,12 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     }
 
     // Read the configurable timeout once for all backend fetches.
+    #[cfg(any(
+        feature = "secrets-vault",
+        feature = "secrets-aws",
+        feature = "secrets-gcp",
+        feature = "secrets-azure"
+    ))]
     let fetch_timeout = secret_fetch_timeout();
 
     // Resolve secrets, grouped by backend for client reuse
@@ -185,6 +215,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     }
 
     // Vault secrets (single client, all fetches concurrent via join_all)
+    #[cfg(feature = "secrets-vault")]
     {
         let vault_secrets: Vec<&PendingSecret> = pending
             .iter()
@@ -220,6 +251,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     }
 
     // AWS secrets (single client, all fetches concurrent via join_all)
+    #[cfg(feature = "secrets-aws")]
     {
         let aws_secrets: Vec<&PendingSecret> = pending
             .iter()
@@ -255,6 +287,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     }
 
     // GCP secrets (single client, all fetches concurrent via join_all)
+    #[cfg(feature = "secrets-gcp")]
     {
         let gcp_secrets: Vec<&PendingSecret> = pending
             .iter()
@@ -290,6 +323,7 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     }
 
     // Azure secrets (single credential, all fetches concurrent via join_all)
+    #[cfg(feature = "secrets-azure")]
     {
         let azure_secrets: Vec<&PendingSecret> = pending
             .iter()
@@ -344,15 +378,19 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
     }
 
     // Cloud backends
+    #[cfg(feature = "secrets-vault")]
     if let Some(vault_ref) = vault::resolve_ref(key) {
         sources.push(("vault", vault_ref));
     }
+    #[cfg(feature = "secrets-aws")]
     if let Some(aws_ref) = aws::resolve_ref(key) {
         sources.push(("aws", aws_ref));
     }
+    #[cfg(feature = "secrets-gcp")]
     if let Some(gcp_ref) = gcp::resolve_ref(key) {
         sources.push(("gcp", gcp_ref));
     }
+    #[cfg(feature = "secrets-azure")]
     if let Some(azure_ref) = azure::resolve_ref(key) {
         sources.push(("azure", azure_ref));
     }
@@ -383,6 +421,7 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
                 source: format!("file:{}", reference),
             }))
         }
+        #[cfg(feature = "secrets-vault")]
         "vault" => {
             let value =
                 tokio::time::timeout(secret_fetch_timeout(), vault::fetch_secret(&reference, key))
@@ -400,6 +439,7 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
                 source: format!("vault:{}", reference),
             }))
         }
+        #[cfg(feature = "secrets-aws")]
         "aws" => {
             let value =
                 tokio::time::timeout(secret_fetch_timeout(), aws::fetch_secret(&reference, key))
@@ -417,6 +457,7 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
                 source: format!("aws:{}", reference),
             }))
         }
+        #[cfg(feature = "secrets-gcp")]
         "gcp" => {
             let value =
                 tokio::time::timeout(secret_fetch_timeout(), gcp::fetch_secret(&reference, key))
@@ -434,6 +475,7 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
                 source: format!("gcp:{}", reference),
             }))
         }
+        #[cfg(feature = "secrets-azure")]
         "azure" => {
             let value =
                 tokio::time::timeout(secret_fetch_timeout(), azure::fetch_secret(&reference, key))
@@ -466,6 +508,7 @@ mod tests {
         assert_eq!(backend, SecretBackend::File);
     }
 
+    #[cfg(feature = "secrets-vault")]
     #[test]
     fn match_suffix_vault() {
         let (base, backend) = match_suffix("FERRUM_JWT_SECRET_VAULT").unwrap();
@@ -473,6 +516,7 @@ mod tests {
         assert_eq!(backend, SecretBackend::Vault);
     }
 
+    #[cfg(feature = "secrets-aws")]
     #[test]
     fn match_suffix_aws() {
         let (base, backend) = match_suffix("FERRUM_DB_URL_AWS").unwrap();
@@ -480,6 +524,7 @@ mod tests {
         assert_eq!(backend, SecretBackend::Aws);
     }
 
+    #[cfg(feature = "secrets-gcp")]
     #[test]
     fn match_suffix_gcp() {
         let (base, backend) = match_suffix("FERRUM_DB_URL_GCP").unwrap();
@@ -487,6 +532,7 @@ mod tests {
         assert_eq!(backend, SecretBackend::Gcp);
     }
 
+    #[cfg(feature = "secrets-azure")]
     #[test]
     fn match_suffix_azure() {
         let (base, backend) = match_suffix("FERRUM_DB_URL_AZURE").unwrap();
@@ -509,6 +555,7 @@ mod tests {
         assert_eq!(backend, SecretBackend::File);
     }
 
+    #[cfg(feature = "secrets-azure")]
     #[test]
     fn match_suffix_azure_checked_before_file() {
         // Ensure _AZURE is matched correctly (not confused with other suffixes)
