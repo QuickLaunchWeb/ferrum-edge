@@ -34,6 +34,7 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'pull_request' && 'ci-tests' || '' }}
     services:
       redis:
         image: redis:7-alpine
@@ -157,6 +158,7 @@ jobs:
     name: Performance Regression Check
     runs-on: ubuntu-latest
     needs: [test]
+    environment: ${{ github.event_name == 'pull_request' && 'ci-perf' || '' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -284,7 +286,8 @@ jobs:
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
-    needs: [test, lint]
+    needs: [lint]
+    environment: ${{ github.event_name == 'pull_request' && 'ci-build' || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -393,7 +396,7 @@ jobs:
 
   latest-release:
     name: Update Latest Release
-    needs: build-binaries
+    needs: [build-binaries, test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -463,7 +466,7 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: build-binaries
+    needs: [build-binaries, test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
