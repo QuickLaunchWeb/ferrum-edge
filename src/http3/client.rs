@@ -135,14 +135,16 @@ impl Http3ConnectionPool {
             proxy.backend_port,
             index,
             proxy
-                .backend_tls_server_ca_cert_path
+                .resolved_tls
+                .server_ca_cert_path
                 .as_deref()
                 .unwrap_or_default(),
             proxy
-                .backend_tls_client_cert_path
+                .resolved_tls
+                .client_cert_path
                 .as_deref()
                 .unwrap_or_default(),
-            proxy.backend_tls_verify_server_cert as u8,
+            proxy.resolved_tls.verify_server_cert as u8,
         );
     }
 

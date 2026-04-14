@@ -53,6 +53,10 @@ impl V001InitialSchema {
                 hash_on_cookie_config TEXT,
                 health_checks TEXT,
                 service_discovery TEXT,
+                backend_tls_client_cert_path VARCHAR(2048),
+                backend_tls_client_key_path VARCHAR(2048),
+                backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
+                backend_tls_server_ca_cert_path VARCHAR(2048),
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL
             )
@@ -69,6 +73,10 @@ impl V001InitialSchema {
                 hash_on_cookie_config TEXT,
                 health_checks TEXT,
                 service_discovery TEXT,
+                backend_tls_client_cert_path TEXT,
+                backend_tls_client_key_path TEXT,
+                backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
+                backend_tls_server_ca_cert_path TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

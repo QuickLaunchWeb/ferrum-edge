@@ -628,6 +628,12 @@ impl ProxyState {
         // regular proxy traffic.
         let mut health_checker =
             HealthChecker::with_pool_config(&global_pool_config, dns_cache.clone());
+        health_checker.set_global_tls_config(
+            env_config_arc.tls_ca_bundle_path.clone(),
+            env_config_arc.backend_tls_client_cert_path.clone(),
+            env_config_arc.backend_tls_client_key_path.clone(),
+            env_config_arc.tls_no_verify,
+        );
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
@@ -1130,14 +1136,16 @@ impl ProxyState {
                         target.host,
                         target.port,
                         proxy
-                            .backend_tls_server_ca_cert_path
+                            .resolved_tls
+                            .server_ca_cert_path
                             .as_deref()
                             .unwrap_or_default(),
                         proxy
-                            .backend_tls_client_cert_path
+                            .resolved_tls
+                            .client_cert_path
                             .as_deref()
                             .unwrap_or_default(),
-                        proxy.backend_tls_verify_server_cert as u8,
+                        proxy.resolved_tls.verify_server_cert as u8,
                     );
                     if seen.insert(key) {
                         let pool = self.h3_pool.clone();
@@ -1164,14 +1172,16 @@ impl ProxyState {
                 proxy.backend_host,
                 proxy.backend_port,
                 proxy
-                    .backend_tls_server_ca_cert_path
+                    .resolved_tls
+                    .server_ca_cert_path
                     .as_deref()
                     .unwrap_or_default(),
                 proxy
-                    .backend_tls_client_cert_path
+                    .resolved_tls
+                    .client_cert_path
                     .as_deref()
                     .unwrap_or_default(),
-                proxy.backend_tls_verify_server_cert as u8,
+                proxy.resolved_tls.verify_server_cert as u8,
             );
             if seen.insert(key) {
                 let pool = self.h3_pool.clone();
@@ -1203,8 +1213,11 @@ impl ProxyState {
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
     /// Update the proxy configuration. Returns `true` if changes were applied.
-    pub fn update_config(&self, new_config: GatewayConfig) -> bool {
+    pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
+
+        // Resolve upstream TLS into each proxy's resolved_tls before applying.
+        new_config.resolve_upstream_tls();
 
         // Validate stream proxy port conflicts before applying any config.
         // In DP mode, warn but don't reject — the DP doesn't control its config
@@ -1644,6 +1657,7 @@ impl ProxyState {
 
         // Validate the patched config before applying (same validations as load_full_config)
         new_config.normalize_fields();
+        new_config.resolve_upstream_tls();
         if let Err(errors) = new_config.validate_all_fields_with_ip_policy(
             self.env_config.tls_cert_expiry_warning_days,
             &self.env_config.backend_allow_ips,
@@ -2572,13 +2586,14 @@ fn build_websocket_tls_connector(
     }
 
     // Determine if we should skip server cert verification
-    let skip_verify = env_config.tls_no_verify || !proxy.backend_tls_verify_server_cert;
+    let skip_verify = env_config.tls_no_verify || !proxy.resolved_tls.verify_server_cert;
 
     // Build root certificate store:
     // - Custom CA configured → empty store + only that CA (no public roots)
     // - No CA configured → webpki/system roots as default fallback
     let ca_path = proxy
-        .backend_tls_server_ca_cert_path
+        .resolved_tls
+        .server_ca_cert_path
         .as_ref()
         .or(env_config.tls_ca_bundle_path.as_ref());
     let mut root_store = if ca_path.is_some() {
@@ -2621,13 +2636,15 @@ fn build_websocket_tls_connector(
         }
     };
 
-    // Add client certificate for mTLS (proxy-level overrides take priority)
+    // Add client certificate for mTLS (resolved_tls overrides take priority)
     let cert_path = proxy
-        .backend_tls_client_cert_path
+        .resolved_tls
+        .client_cert_path
         .as_ref()
         .or(env_config.backend_tls_client_cert_path.as_ref());
     let key_path = proxy
-        .backend_tls_client_key_path
+        .resolved_tls
+        .client_key_path
         .as_ref()
         .or(env_config.backend_tls_client_key_path.as_ref());
 

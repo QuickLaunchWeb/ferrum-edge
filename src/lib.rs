@@ -41,7 +41,7 @@ pub mod startup;
 pub mod tls;
 pub mod tls_offload;
 
-pub use config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+pub use config::types::{AuthMode, BackendProtocol, BackendTlsConfig, GatewayConfig, Proxy};
 pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;
 pub use plugin_cache::{PluginCache, PluginCapabilities};

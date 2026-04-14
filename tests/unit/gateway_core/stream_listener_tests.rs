@@ -39,6 +39,7 @@ fn create_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy 
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: false,
         backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: ferrum_edge::config::types::AuthMode::Single,

@@ -24,7 +24,8 @@ mod grpc_health_v1 {
 
 use crate::config::pool_config::PoolConfig;
 use crate::config::types::{
-    ActiveHealthCheck, GatewayConfig, HealthProbeType, PassiveHealthCheck, UpstreamTarget,
+    ActiveHealthCheck, BackendTlsConfig, GatewayConfig, HealthProbeType, PassiveHealthCheck,
+    UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::load_balancer::LoadBalancerCache;
@@ -140,15 +141,27 @@ pub struct HealthChecker {
     /// Two-level index: outer DashMap partitions by proxy_id (one lookup),
     /// inner DashMaps use plain "host:port" keys (shorter, less contention).
     pub passive_health: Arc<DashMap<String, Arc<ProxyHealthState>>>,
-    /// Shared HTTP client for active health check probes, configured with
-    /// the gateway's connection pool settings for proper keep-alive and reuse.
-    http_client: Arc<reqwest::Client>,
+    /// Default HTTP client for active health check probes (no mTLS).
+    /// Used when the upstream has no TLS config.
+    default_http_client: Arc<reqwest::Client>,
     /// Active check abort handles.
     active_check_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Optional reference to the load balancer cache for recording active
     /// probe latencies (used by least-latency algorithm). Set via
     /// `set_load_balancer_cache()` after construction.
     lb_cache: Option<Arc<LoadBalancerCache>>,
+    /// Global pool config for building per-upstream TLS clients.
+    pool_config: PoolConfig,
+    /// DNS cache for building per-upstream TLS clients.
+    dns_cache: Option<DnsCache>,
+    /// Global TLS CA bundle path (fallback when upstream has no CA config).
+    global_tls_ca_bundle_path: Option<String>,
+    /// Global backend mTLS client cert path (fallback).
+    global_backend_tls_client_cert_path: Option<String>,
+    /// Global backend mTLS client key path (fallback).
+    global_backend_tls_client_key_path: Option<String>,
+    /// Global TLS no-verify flag.
+    global_tls_no_verify: bool,
 }
 
 impl Default for HealthChecker {
@@ -171,57 +184,54 @@ impl HealthChecker {
     /// Create a health checker with an HTTP client configured from the
     /// gateway's global pool settings and shared DNS cache.
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
-        let client = build_health_check_client(pool_config, dns_cache);
+        let client = build_health_check_client(pool_config, Some(dns_cache.clone()));
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
-            http_client: Arc::new(client),
+            default_http_client: Arc::new(client),
             active_check_handles: Vec::new(),
             lb_cache: None,
+            pool_config: pool_config.clone(),
+            dns_cache: Some(dns_cache),
+            global_tls_ca_bundle_path: None,
+            global_backend_tls_client_cert_path: None,
+            global_backend_tls_client_key_path: None,
+            global_tls_no_verify: false,
         }
+    }
+
+    /// Set global TLS config from the env config so health check clients
+    /// can fall back to global mTLS credentials and CA bundles.
+    pub fn set_global_tls_config(
+        &mut self,
+        tls_ca_bundle_path: Option<String>,
+        backend_tls_client_cert_path: Option<String>,
+        backend_tls_client_key_path: Option<String>,
+        tls_no_verify: bool,
+    ) {
+        self.global_tls_ca_bundle_path = tls_ca_bundle_path;
+        self.global_backend_tls_client_cert_path = backend_tls_client_cert_path;
+        self.global_backend_tls_client_key_path = backend_tls_client_key_path;
+        self.global_tls_no_verify = tls_no_verify;
     }
 
     /// Create a health checker without DNS cache (for tests).
     fn without_dns_cache(pool_config: &PoolConfig) -> Self {
-        let mut builder = reqwest::Client::builder()
-            .pool_max_idle_per_host(pool_config.max_idle_per_host)
-            .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-            .danger_accept_invalid_certs(true);
-
-        if pool_config.enable_http_keep_alive {
-            builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
-        }
-
-        if pool_config.enable_http2 {
-            builder = builder
-                .http2_keep_alive_interval(Duration::from_secs(
-                    pool_config.http2_keep_alive_interval_seconds,
-                ))
-                .http2_keep_alive_timeout(Duration::from_secs(
-                    pool_config.http2_keep_alive_timeout_seconds,
-                ));
-        }
-
-        let client = match builder.build() {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to build health check HTTP client: {}. \
-                     Falling back to default client.",
-                    e
-                );
-                reqwest::Client::new()
-            }
-        };
-
+        let client = build_health_check_client(pool_config, None);
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
-            http_client: Arc::new(client),
+            default_http_client: Arc::new(client),
             active_check_handles: Vec::new(),
             lb_cache: None,
+            pool_config: pool_config.clone(),
+            dns_cache: None,
+            global_tls_ca_bundle_path: None,
+            global_backend_tls_client_cert_path: None,
+            global_backend_tls_client_key_path: None,
+            global_tls_no_verify: false,
         }
     }
 
@@ -251,12 +261,22 @@ impl HealthChecker {
             if let Some(hc_config) = &upstream.health_checks {
                 // Start active health checks
                 if let Some(active) = &hc_config.active {
+                    // Build a per-upstream HTTP client with the upstream's TLS config
+                    let tls_config = BackendTlsConfig {
+                        client_cert_path: upstream.backend_tls_client_cert_path.clone(),
+                        client_key_path: upstream.backend_tls_client_key_path.clone(),
+                        server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
+                        verify_server_cert: upstream.backend_tls_verify_server_cert,
+                    };
+                    let upstream_client = self.build_upstream_health_client(&tls_config);
                     for target in &upstream.targets {
                         let handle = self.start_active_check(
                             target,
                             active,
                             &upstream.id,
                             shutdown_rx.clone(),
+                            &upstream_client,
+                            &tls_config,
                         );
                         self.active_check_handles.push(handle);
                     }
@@ -505,6 +525,33 @@ impl HealthChecker {
         })
     }
 
+    /// Build a per-upstream HTTP client with the upstream's TLS config.
+    /// Falls back to global TLS settings when the upstream doesn't specify them.
+    fn build_upstream_health_client(&self, tls_config: &BackendTlsConfig) -> Arc<reqwest::Client> {
+        let has_tls_config = tls_config.client_cert_path.is_some()
+            || tls_config.client_key_path.is_some()
+            || tls_config.server_ca_cert_path.is_some()
+            || !tls_config.verify_server_cert
+            || self.global_tls_ca_bundle_path.is_some()
+            || self.global_backend_tls_client_cert_path.is_some()
+            || self.global_tls_no_verify;
+
+        if !has_tls_config {
+            return self.default_http_client.clone();
+        }
+
+        let client = build_health_check_client_with_tls(
+            &self.pool_config,
+            self.dns_cache.clone(),
+            tls_config,
+            &self.global_tls_ca_bundle_path,
+            &self.global_backend_tls_client_cert_path,
+            &self.global_backend_tls_client_key_path,
+            self.global_tls_no_verify,
+        );
+        Arc::new(client)
+    }
+
     /// Start an active health check background task for a target.
     fn start_active_check(
         &self,
@@ -512,6 +559,8 @@ impl HealthChecker {
         config: &ActiveHealthCheck,
         upstream_id: &str,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        upstream_client: &Arc<reqwest::Client>,
+        tls_config: &BackendTlsConfig,
     ) -> tokio::task::JoinHandle<()> {
         let key = active_target_key(upstream_id, target);
         let interval = Duration::from_secs(config.interval_seconds);
@@ -525,7 +574,7 @@ impl HealthChecker {
         let host = target.host.clone();
         let port = target.port;
         let healthy_status_codes = config.healthy_status_codes.clone();
-        let client = self.http_client.clone();
+        let client = upstream_client.clone();
         let scheme = if config.use_tls { "https" } else { "http" };
         let url = format!("{}://{}:{}{}", scheme, host, port, config.http_path);
         let udp_payload = config
@@ -539,6 +588,11 @@ impl HealthChecker {
         let probe_target = target.clone();
         let lb_cache = self.lb_cache.clone();
         let upstream_id_owned = upstream_id.to_owned();
+        let probe_tls_config = tls_config.clone();
+        let probe_global_ca = self.global_tls_ca_bundle_path.clone();
+        let probe_global_cert = self.global_backend_tls_client_cert_path.clone();
+        let probe_global_key = self.global_backend_tls_client_key_path.clone();
+        let probe_no_verify = self.global_tls_no_verify;
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -569,7 +623,19 @@ impl HealthChecker {
                     HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
                     HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
                     HealthProbeType::Grpc => {
-                        grpc_probe(&host, port, timeout, use_tls, &grpc_service_name).await
+                        grpc_probe(
+                            &host,
+                            port,
+                            timeout,
+                            use_tls,
+                            &grpc_service_name,
+                            &probe_tls_config,
+                            probe_global_ca.as_deref(),
+                            probe_global_cert.as_deref(),
+                            probe_global_key.as_deref(),
+                            probe_no_verify,
+                        )
+                        .await
                     }
                 };
 
@@ -700,12 +766,22 @@ async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> 
 }
 
 /// gRPC health probe — performs a unary grpc.health.v1.Health/Check RPC.
+///
+/// When `use_tls` is true, the probe configures TLS using the upstream's
+/// `BackendTlsConfig` (client certs, CA bundle, verify flag) so that health
+/// checks authenticate to backends the same way proxy traffic does.
+#[allow(clippy::too_many_arguments)]
 async fn grpc_probe(
     host: &str,
     port: u16,
     timeout: Duration,
     use_tls: bool,
     service_name: &str,
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+    global_cert_path: Option<&str>,
+    global_key_path: Option<&str>,
+    global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
     let endpoint_url = format!("{}://{}:{}", scheme, host, port);
@@ -722,8 +798,44 @@ async fn grpc_probe(
     };
 
     let endpoint = if use_tls {
-        let tls_config = tonic::transport::ClientTlsConfig::new().with_enabled_roots();
-        match endpoint.tls_config(tls_config) {
+        let skip_verify = !tls_config.verify_server_cert || global_no_verify;
+        let mut tonic_tls = tonic::transport::ClientTlsConfig::new();
+
+        // Load CA certs (upstream → global → system roots)
+        if let Some(ca_path) = tls_config.server_ca_cert_path.as_deref().or(global_ca_path) {
+            match std::fs::read(ca_path) {
+                Ok(pem) => {
+                    let cert = tonic::transport::Certificate::from_pem(pem);
+                    tonic_tls = tonic_tls.ca_certificate(cert);
+                }
+                Err(e) => {
+                    debug!("gRPC health probe: failed to read CA {}: {}", ca_path, e);
+                }
+            }
+        } else {
+            tonic_tls = tonic_tls.with_enabled_roots();
+        }
+
+        // Load mTLS client identity
+        let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
+        let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
+        if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+            match (std::fs::read(cert_path), std::fs::read(key_path)) {
+                (Ok(cert_pem), Ok(key_pem)) => {
+                    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+                    tonic_tls = tonic_tls.identity(identity);
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    debug!("gRPC health probe: failed to read client cert/key: {}", e);
+                }
+            }
+        }
+
+        if skip_verify {
+            tonic_tls = tonic_tls.assume_http2(true);
+        }
+
+        match endpoint.tls_config(tonic_tls) {
             Ok(ep) => ep,
             Err(e) => {
                 debug!(
@@ -773,13 +885,19 @@ async fn grpc_probe(
     }
 }
 
-fn build_health_check_client(pool_config: &PoolConfig, dns_cache: DnsCache) -> reqwest::Client {
-    let resolver = DnsCacheResolver::new(dns_cache);
+fn build_health_check_client(
+    pool_config: &PoolConfig,
+    dns_cache: Option<DnsCache>,
+) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-        .danger_accept_invalid_certs(true)
-        .dns_resolver(Arc::new(resolver));
+        .danger_accept_invalid_certs(true);
+
+    if let Some(dns_cache) = dns_cache {
+        let resolver = DnsCacheResolver::new(dns_cache);
+        builder = builder.dns_resolver(Arc::new(resolver));
+    }
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
@@ -808,6 +926,118 @@ fn build_health_check_client(pool_config: &PoolConfig, dns_cache: DnsCache) -> r
     }
 }
 
+/// Build a health check HTTP client with upstream-specific TLS configuration.
+///
+/// Configures the client with the upstream's CA bundle, client cert/key for mTLS,
+/// and verify settings — so health probes authenticate the same way proxy traffic does.
+fn build_health_check_client_with_tls(
+    pool_config: &PoolConfig,
+    dns_cache: Option<DnsCache>,
+    tls_config: &BackendTlsConfig,
+    global_ca_path: &Option<String>,
+    global_cert_path: &Option<String>,
+    global_key_path: &Option<String>,
+    global_no_verify: bool,
+) -> reqwest::Client {
+    let skip_verify = !tls_config.verify_server_cert || global_no_verify;
+
+    let mut builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(pool_config.max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+        .danger_accept_invalid_certs(skip_verify);
+
+    if let Some(dns_cache) = dns_cache {
+        let resolver = DnsCacheResolver::new(dns_cache);
+        builder = builder.dns_resolver(Arc::new(resolver));
+    }
+
+    // Load CA bundle (upstream → global → system roots)
+    let ca_path = tls_config
+        .server_ca_cert_path
+        .as_ref()
+        .or(global_ca_path.as_ref());
+    if let Some(ca_path) = ca_path {
+        if let Ok(ca_data) = std::fs::read(ca_path) {
+            if let Ok(ca_cert) = reqwest::Certificate::from_pem(&ca_data) {
+                builder = builder
+                    .tls_built_in_root_certs(false)
+                    .add_root_certificate(ca_cert);
+            } else {
+                tracing::warn!(
+                    "Health check: failed to parse CA cert from {}, using system roots",
+                    ca_path
+                );
+            }
+        } else {
+            tracing::warn!(
+                "Health check: failed to read CA cert from {}, using system roots",
+                ca_path
+            );
+        }
+    }
+
+    // Load mTLS client identity
+    let cert_path = tls_config
+        .client_cert_path
+        .as_ref()
+        .or(global_cert_path.as_ref());
+    let key_path = tls_config
+        .client_key_path
+        .as_ref()
+        .or(global_key_path.as_ref());
+    if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        match (std::fs::read(cert_path), std::fs::read(key_path)) {
+            (Ok(cert_data), Ok(key_data)) => {
+                let mut combined = cert_data;
+                combined.extend_from_slice(b"\n");
+                combined.extend_from_slice(&key_data);
+                match reqwest::Identity::from_pem(&combined) {
+                    Ok(identity) => {
+                        builder = builder.identity(identity);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Health check: failed to parse client identity from {} + {}: {}",
+                            cert_path,
+                            key_path,
+                            e
+                        );
+                    }
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!("Health check: failed to read client cert/key: {}", e);
+            }
+        }
+    }
+
+    if pool_config.enable_http_keep_alive {
+        builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+    }
+
+    if pool_config.enable_http2 {
+        builder = builder
+            .http2_keep_alive_interval(Duration::from_secs(
+                pool_config.http2_keep_alive_interval_seconds,
+            ))
+            .http2_keep_alive_timeout(Duration::from_secs(
+                pool_config.http2_keep_alive_timeout_seconds,
+            ));
+    }
+
+    match builder.build() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(
+                "Failed to build TLS health check HTTP client: {}. \
+                 Falling back to default client.",
+                e
+            );
+            reqwest::Client::new()
+        }
+    }
+}
+
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -825,5 +1055,18 @@ pub async fn grpc_probe_for_test(
     use_tls: bool,
     service_name: &str,
 ) -> bool {
-    grpc_probe(host, port, timeout, use_tls, service_name).await
+    let default_tls = BackendTlsConfig::default_verify();
+    grpc_probe(
+        host,
+        port,
+        timeout,
+        use_tls,
+        service_name,
+        &default_tls,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
 }

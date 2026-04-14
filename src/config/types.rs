@@ -389,6 +389,34 @@ pub const MAX_COOKIE_PATH_LENGTH: usize = 2048;
 /// Maximum length for cookie config domain field.
 pub const MAX_COOKIE_DOMAIN_LENGTH: usize = 253;
 
+/// Resolved backend TLS configuration.
+///
+/// At config load time, each proxy's effective TLS config is resolved:
+/// - If the proxy references an upstream, the upstream's TLS fields are used.
+/// - Otherwise, the proxy's own TLS fields are used (direct-backend proxies).
+///
+/// All runtime code (connection pools, health checks, proxy dispatch) reads
+/// from this resolved config rather than raw proxy/upstream fields.
+#[derive(Debug, Clone, Default)]
+pub struct BackendTlsConfig {
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    pub server_ca_cert_path: Option<String>,
+    pub verify_server_cert: bool,
+}
+
+impl BackendTlsConfig {
+    /// Create a config with verification enabled and no client certs.
+    pub fn default_verify() -> Self {
+        Self {
+            client_cert_path: None,
+            client_key_path: None,
+            server_ca_cert_path: None,
+            verify_server_cert: true,
+        }
+    }
+}
+
 /// An upstream defines a group of backend targets with load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
@@ -411,6 +439,18 @@ pub struct Upstream {
     pub health_checks: Option<HealthCheckConfig>,
     #[serde(default)]
     pub service_discovery: Option<ServiceDiscoveryConfig>,
+    /// Path to a PEM client certificate for mTLS with backend targets.
+    #[serde(default)]
+    pub backend_tls_client_cert_path: Option<String>,
+    /// Path to a PEM private key for mTLS with backend targets.
+    #[serde(default)]
+    pub backend_tls_client_key_path: Option<String>,
+    /// Whether to verify the backend server's TLS certificate.
+    #[serde(default = "default_true")]
+    pub backend_tls_verify_server_cert: bool,
+    /// Path to a PEM CA bundle for verifying backend server certificates.
+    #[serde(default)]
+    pub backend_tls_server_ca_cert_path: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -767,14 +807,29 @@ pub struct Proxy {
     pub backend_read_timeout_ms: u64,
     #[serde(default = "default_write_timeout")]
     pub backend_write_timeout_ms: u64,
+    /// Path to a PEM client certificate for mTLS with backend targets.
+    /// Used only for direct-backend proxies (no `upstream_id`). When an upstream
+    /// is referenced, the upstream's TLS config takes precedence.
     #[serde(default)]
     pub backend_tls_client_cert_path: Option<String>,
+    /// Path to a PEM private key for mTLS with backend targets.
+    /// Used only for direct-backend proxies (no `upstream_id`).
     #[serde(default)]
     pub backend_tls_client_key_path: Option<String>,
+    /// Whether to verify the backend server's TLS certificate.
+    /// Used only for direct-backend proxies (no `upstream_id`).
     #[serde(default = "default_true")]
     pub backend_tls_verify_server_cert: bool,
+    /// Path to a PEM CA bundle for verifying backend server certificates.
+    /// Used only for direct-backend proxies (no `upstream_id`).
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
+    /// Resolved backend TLS config (populated at config load time).
+    /// When the proxy references an upstream, this is the upstream's TLS config.
+    /// For direct-backend proxies, this is the proxy's own TLS fields.
+    /// Not serialized — derived from the upstream or proxy fields.
+    #[serde(skip)]
+    pub resolved_tls: BackendTlsConfig,
     #[serde(default)]
     pub dns_override: Option<String>,
     #[serde(default)]
@@ -1150,6 +1205,46 @@ impl GatewayConfig {
         }
         for upstream in &mut self.upstreams {
             upstream.normalize_fields();
+        }
+    }
+
+    /// Resolve each proxy's `resolved_tls` from its upstream (if any) or its own fields.
+    ///
+    /// Must be called after loading/mutating config and before any proxy traffic flows.
+    /// Called by `normalize_fields()` callers, `update_config()`, `apply_incremental()`,
+    /// and admin API mutation handlers.
+    pub fn resolve_upstream_tls(&mut self) {
+        // Build a map of upstream_id → TLS config for O(1) lookups.
+        let upstream_tls: HashMap<&str, BackendTlsConfig> = self
+            .upstreams
+            .iter()
+            .map(|u| {
+                (
+                    u.id.as_str(),
+                    BackendTlsConfig {
+                        client_cert_path: u.backend_tls_client_cert_path.clone(),
+                        client_key_path: u.backend_tls_client_key_path.clone(),
+                        server_ca_cert_path: u.backend_tls_server_ca_cert_path.clone(),
+                        verify_server_cert: u.backend_tls_verify_server_cert,
+                    },
+                )
+            })
+            .collect();
+
+        for proxy in &mut self.proxies {
+            proxy.resolved_tls = if let Some(ref uid) = proxy.upstream_id {
+                upstream_tls
+                    .get(uid.as_str())
+                    .cloned()
+                    .unwrap_or_else(BackendTlsConfig::default_verify)
+            } else {
+                BackendTlsConfig {
+                    client_cert_path: proxy.backend_tls_client_cert_path.clone(),
+                    client_key_path: proxy.backend_tls_client_key_path.clone(),
+                    server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
+                    verify_server_cert: proxy.backend_tls_verify_server_cert,
+                }
+            };
         }
     }
 
@@ -2713,6 +2808,109 @@ impl Upstream {
             }
         }
 
+        // Backend TLS file path lengths
+        if let Some(ref path) = self.backend_tls_client_cert_path
+            && let Err(e) =
+                validate_string_field("backend_tls_client_cert_path", path, MAX_FILE_PATH_LENGTH)
+        {
+            errors.push(e);
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path
+            && let Err(e) =
+                validate_string_field("backend_tls_client_key_path", path, MAX_FILE_PATH_LENGTH)
+        {
+            errors.push(e);
+        }
+        if let Some(ref path) = self.backend_tls_server_ca_cert_path
+            && let Err(e) = validate_string_field(
+                "backend_tls_server_ca_cert_path",
+                path,
+                MAX_FILE_PATH_LENGTH,
+            )
+        {
+            errors.push(e);
+        }
+
+        // TLS cert/key pairing: both must be set or neither
+        match (
+            &self.backend_tls_client_cert_path,
+            &self.backend_tls_client_key_path,
+        ) {
+            (Some(_), None) => {
+                errors.push(
+                    "backend_tls_client_cert_path is set but backend_tls_client_key_path is missing — both must be configured together".to_string(),
+                );
+            }
+            (None, Some(_)) => {
+                errors.push(
+                    "backend_tls_client_key_path is set but backend_tls_client_cert_path is missing — both must be configured together".to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate fields with a shared TLS path cache and cert expiry checking.
+    pub fn validate_fields_with_cache(
+        &self,
+        validated_tls_paths: &mut HashSet<String>,
+        cert_expiry_warning_days: u64,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = match self.validate_fields() {
+            Ok(()) => Vec::new(),
+            Err(errs) => errs,
+        };
+
+        // TLS file content validation with deduplication.
+        if let Some(ref path) = self.backend_tls_client_cert_path {
+            let already_validated = validated_tls_paths.contains(path.as_str());
+            if !already_validated {
+                if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
+                    errors.push(e);
+                } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
+                    path,
+                    "backend_tls_client_cert_path",
+                    cert_expiry_warning_days,
+                ) {
+                    errors.push(e);
+                } else {
+                    validated_tls_paths.insert(path.clone());
+                }
+            }
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path {
+            let already_validated = validated_tls_paths.contains(path.as_str());
+            if !already_validated {
+                if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
+                    errors.push(e);
+                } else {
+                    validated_tls_paths.insert(path.clone());
+                }
+            }
+        }
+        if let Some(ref path) = self.backend_tls_server_ca_cert_path {
+            let already_validated = validated_tls_paths.contains(path.as_str());
+            if !already_validated {
+                if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                    errors.push(e);
+                } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
+                    path,
+                    "backend_tls_server_ca_cert_path",
+                    cert_expiry_warning_days,
+                ) {
+                    errors.push(e);
+                } else {
+                    validated_tls_paths.insert(path.clone());
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -3209,7 +3407,9 @@ impl GatewayConfig {
             }
         }
         for upstream in &self.upstreams {
-            if let Err(errs) = upstream.validate_fields() {
+            if let Err(errs) = upstream
+                .validate_fields_with_cache(&mut validated_tls_paths, cert_expiry_warning_days)
+            {
                 for e in errs {
                     errors.push(format!("Upstream '{}': {}", upstream.id, e));
                 }

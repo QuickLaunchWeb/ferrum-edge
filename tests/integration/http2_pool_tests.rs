@@ -43,6 +43,7 @@ fn create_test_proxy() -> Proxy {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -394,6 +395,7 @@ async fn test_http2_pool_different_tls_verify_gets_separate_entries() {
     proxy_no_verify.backend_host = "localhost".to_string();
     proxy_no_verify.backend_port = port;
     proxy_no_verify.backend_tls_verify_server_cert = false;
+    proxy_no_verify.resolved_tls.verify_server_cert = false;
 
     let _sender1 = pool
         .get_sender(&proxy_no_verify, &dns_cache)
@@ -407,6 +409,7 @@ async fn test_http2_pool_different_tls_verify_gets_separate_entries() {
     proxy_verify.backend_host = "localhost".to_string();
     proxy_verify.backend_port = port;
     proxy_verify.backend_tls_verify_server_cert = true;
+    proxy_verify.resolved_tls.verify_server_cert = true;
 
     let result = pool.get_sender(&proxy_verify, &dns_cache).await;
     // The verify=true connection should fail (self-signed cert, no CA)

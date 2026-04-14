@@ -55,7 +55,7 @@ fn write_pem(dir: &tempfile::TempDir, name: &str, data: &str) -> String {
 }
 
 fn build_dtls_proxy(backend_host: &str, backend_port: u16, ca_path: Option<String>) -> Proxy {
-    serde_json::from_value(serde_json::json!({
+    let mut proxy: Proxy = serde_json::from_value(serde_json::json!({
         "id": "dtls-proxy-test",
         "listen_path": "/",
         "backend_protocol": "dtls",
@@ -65,7 +65,15 @@ fn build_dtls_proxy(backend_host: &str, backend_port: u16, ca_path: Option<Strin
         "backend_tls_verify_server_cert": true,
         "backend_tls_server_ca_cert_path": ca_path,
     }))
-    .expect("build DTLS proxy")
+    .expect("build DTLS proxy");
+    // resolved_tls is #[serde(skip)], so populate it from proxy fields for direct-backend proxies
+    proxy.resolved_tls = ferrum_edge::config::types::BackendTlsConfig {
+        client_cert_path: proxy.backend_tls_client_cert_path.clone(),
+        client_key_path: proxy.backend_tls_client_key_path.clone(),
+        server_ca_cert_path: proxy.backend_tls_server_ca_cert_path.clone(),
+        verify_server_cert: proxy.backend_tls_verify_server_cert,
+    };
+    proxy
 }
 
 async fn drain_dtls_client_outputs(

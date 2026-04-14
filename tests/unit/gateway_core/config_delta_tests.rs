@@ -25,6 +25,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        resolved_tls: Default::default(),
         dns_override: None,
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
@@ -70,6 +71,10 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Ut
         hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
         created_at: updated_at,
         updated_at,
     }
