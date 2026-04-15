@@ -566,6 +566,35 @@ impl GsoBatchBuf {
         self.count = 0;
         self.segment_size = 0;
     }
+
+    /// Drain buffered datagrams into a `SendMmsgBatch` for fallback sending.
+    ///
+    /// Splits the contiguous GSO buffer back into individual datagrams by
+    /// `segment_size` and pushes each into the sendmmsg batch. Returns the
+    /// number of datagrams drained. Clears the GSO buffer after draining.
+    pub fn drain_to_sendmmsg(
+        &mut self,
+        send_batch: &mut SendMmsgBatch,
+        dest: std::net::SocketAddr,
+    ) -> usize {
+        if self.count == 0 || self.segment_size == 0 {
+            return 0;
+        }
+        let mut offset = 0;
+        let mut drained = 0;
+        while offset < self.buf.len() {
+            let end = (offset + self.segment_size).min(self.buf.len());
+            if !send_batch.push(&self.buf[offset..end], dest) {
+                break; // sendmmsg batch full — caller will flush it
+            }
+            offset = end;
+            drained += 1;
+        }
+        self.buf.clear();
+        self.count = 0;
+        self.segment_size = 0;
+        drained
+    }
 }
 
 /// Non-Linux stub for GsoBatchBuf.

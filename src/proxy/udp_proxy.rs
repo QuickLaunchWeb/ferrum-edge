@@ -2104,7 +2104,8 @@ async fn create_session(
                                     e
                                 );
                                 gso_failed = true;
-                                gso_batch.clear();
+                                // Replay buffered datagrams through sendmmsg instead of dropping.
+                                gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
                                 send_batch.push(send_data, client_addr);
                             } else {
                                 gso_batch.push(send_data);
@@ -2207,7 +2208,10 @@ async fn create_session(
                                                     e
                                                 );
                                                 gso_failed = true;
-                                                gso_batch.clear();
+                                                gso_batch.drain_to_sendmmsg(
+                                                    &mut send_batch,
+                                                    client_addr,
+                                                );
                                                 send_batch.push(&buf[..len2], client_addr);
                                             } else {
                                                 gso_batch.push(&buf[..len2]);
@@ -2306,11 +2310,11 @@ async fn create_session(
                             e
                         );
                         gso_failed = true;
-                        gso_batch.clear();
-                        // Note: datagrams in the GSO batch are lost (UDP best-effort).
+                        // Replay buffered datagrams through sendmmsg instead of dropping.
+                        gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
                     }
                 }
-                // Flush sendmmsg batch (used when GSO is disabled/failed).
+                // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
                 if !send_batch.is_empty() {
                     use std::os::unix::io::AsRawFd;
                     let fd = frontend.as_raw_fd();

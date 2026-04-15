@@ -1408,12 +1408,23 @@ async fn bidirectional_splice_io_uring(
         .map(|t| t.as_millis() as u64)
         .unwrap_or(0);
 
+    // Shared last-activity timestamp across both directions. Activity in either
+    // direction refreshes the timestamp, preventing one-way streams (e.g., downloads)
+    // from timing out on the idle send direction.
+    let shared_activity = Arc::new(AtomicU64::new(coarse_now_ms()));
+    let sa_c2b = shared_activity.clone();
+    let sa_b2c = shared_activity;
+
     // Each direction runs on its own blocking thread with its own io_uring ring.
     let c2b_handle = tokio::task::spawn_blocking(move || {
-        io_uring_splice_direction(client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms)
+        io_uring_splice_direction(
+            client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms, &sa_c2b,
+        )
     });
     let b2c_handle = tokio::task::spawn_blocking(move || {
-        io_uring_splice_direction(backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, timeout_ms)
+        io_uring_splice_direction(
+            backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, timeout_ms, &sa_b2c,
+        )
     });
 
     // Wait for both directions. Streams stay alive on this task's stack.
@@ -1447,10 +1458,15 @@ fn io_uring_splice_direction(
     pipe_r: i32,
     dst_fd: i32,
     timeout_ms: u64,
+    shared_activity: &AtomicU64,
 ) -> Result<u64, anyhow::Error> {
-    let start_ms = coarse_now_ms();
     match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
-        src_fd, pipe_w, pipe_r, dst_fd, start_ms, timeout_ms,
+        src_fd,
+        pipe_w,
+        pipe_r,
+        dst_fd,
+        shared_activity,
+        timeout_ms,
     ) {
         Ok(bytes) => Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {

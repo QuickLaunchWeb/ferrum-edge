@@ -832,8 +832,41 @@ pub mod io_uring_splice {
             return IO_URING_AVAILABLE.load(Ordering::Relaxed);
         }
 
-        // Try to create a small ring — if it works, io_uring is available.
-        let available = io_uring::IoUring::new(2).is_ok();
+        // Probe by actually submitting an IORING_OP_SPLICE on a pipe pair.
+        // Ring creation alone is insufficient — seccomp or kernel config may
+        // allow ring setup but reject specific opcodes like SPLICE.
+        let available = (|| -> bool {
+            let mut ring = match io_uring::IoUring::new(2) {
+                Ok(r) => r,
+                Err(_) => return false,
+            };
+            // Create a throwaway pipe to test SPLICE.
+            let mut fds = [0i32; 2];
+            if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
+                return false;
+            }
+            // Submit a splice from pipe_r→pipe_w with 0 bytes — should return 0 (EOF-like)
+            // or EAGAIN. Either means SPLICE opcode is supported.
+            let sqe = io_uring::opcode::Splice::new(
+                io_uring::types::Fd(fds[0]),
+                -1,
+                io_uring::types::Fd(fds[1]),
+                -1,
+            )
+            .len(0)
+            .build();
+            let push_ok = unsafe { ring.submission().push(&sqe).is_ok() };
+            let result = if push_ok {
+                ring.submit_and_wait(1).is_ok()
+            } else {
+                false
+            };
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            result
+        })();
 
         IO_URING_AVAILABLE.store(available, Ordering::Relaxed);
         IO_URING_CHECKED.store(true, Ordering::Relaxed);
@@ -849,15 +882,17 @@ pub mod io_uring_splice {
     /// Returns `Err` with `ErrorKind::Unsupported` if the ring cannot be created,
     /// signaling the caller to fall back to `libc::splice`.
     ///
-    /// `timeout_ms` is the idle timeout — if no data is transferred for this
-    /// duration, returns `ErrorKind::TimedOut`. The activity timestamp is
-    /// refreshed after each successful splice. Pass 0 to disable.
+    /// `timeout_ms` is the idle timeout — if no data is transferred on either
+    /// direction for this duration, returns `ErrorKind::TimedOut`.
+    /// `shared_last_activity_ms` is an `AtomicU64` shared between both splice
+    /// directions so that activity in one direction prevents the other from
+    /// timing out (critical for one-way streaming like downloads).
     pub fn io_uring_splice_loop(
         src_fd: i32,
         pipe_w: i32,
         pipe_r: i32,
         dst_fd: i32,
-        start_ms: u64,
+        shared_last_activity_ms: &std::sync::atomic::AtomicU64,
         timeout_ms: u64,
     ) -> std::io::Result<u64> {
         let mut ring = match io_uring::IoUring::new(8) {
@@ -874,20 +909,18 @@ pub mod io_uring_splice {
         let splice_flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
         let mut total: u64 = 0;
         let chunk_size: u32 = 128 * 1024;
-        // Track last activity for idle timeout — refreshed after each successful splice.
-        let mut last_activity_ms = start_ms;
 
         loop {
-            // Inline idle timeout check — prevents indefinite blocking on
-            // idle connections. Compares against last_activity_ms which is
-            // refreshed after each successful splice transfer, so active
-            // connections are never timed out.
+            // Inline idle timeout check using the shared cross-direction timestamp.
+            // Both splice directions update the same AtomicU64, so activity in either
+            // direction prevents the other from timing out (critical for one-way streams).
             if timeout_ms > 0 {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                if now.saturating_sub(last_activity_ms) >= timeout_ms {
+                let last = shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(last) >= timeout_ms {
                     return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
                 }
             }
@@ -968,12 +1001,14 @@ pub mod io_uring_splice {
                 }
                 remaining -= w as u32;
                 total += w as u64;
-                // Refresh idle timeout — active connections should never time out.
+                // Refresh shared idle timeout — activity in either direction
+                // prevents the connection from timing out.
                 if timeout_ms > 0 {
-                    last_activity_ms = std::time::SystemTime::now()
+                    let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+                    shared_last_activity_ms.store(now, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -993,7 +1028,7 @@ pub mod io_uring_splice {
         _pipe_w: i32,
         _pipe_r: i32,
         _dst_fd: i32,
-        _start_ms: u64,
+        _shared_last_activity_ms: &std::sync::atomic::AtomicU64,
         _timeout_ms: u64,
     ) -> std::io::Result<u64> {
         Err(std::io::Error::new(
