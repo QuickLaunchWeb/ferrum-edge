@@ -27,15 +27,6 @@ on:
         options:
           - sqlite
           - postgres
-      build_profile:
-        description: "Cargo build profile for gateway binary"
-        required: false
-        default: "release"
-        type: choice
-        options:
-          - release
-          - ci-release
-          - dev
 
 jobs:
   scale-benchmark:
@@ -112,16 +103,10 @@ jobs:
           echo "  HEALTH CHECK COMPLETE"
           echo "=========================================="
 
+      # Pre-build the gateway binary so the test harness's internal
+      # `cargo build --release` is a fast no-op.
       - name: Build gateway binary
-        run: cargo build --profile ${{ inputs.build_profile }} --bin ferrum-edge
-
-      - name: Stage gateway binary
-        if: inputs.build_profile != 'release'
-        run: |
-          PROFILE_DIR=${{ inputs.build_profile }}
-          if [ "$PROFILE_DIR" = "dev" ]; then PROFILE_DIR=debug; fi
-          mkdir -p target/release
-          cp "target/${PROFILE_DIR}/ferrum-edge" target/release/ferrum-edge
+        run: cargo build --release --bin ferrum-edge
 
       - name: Run scale benchmark (SQLite)
         if: inputs.db_type == 'sqlite'
@@ -168,14 +153,13 @@ jobs:
         if: always()
         env:
           DB_TYPE: ${{ inputs.db_type }}
-          BUILD_PROFILE: ${{ inputs.build_profile }}
         run: |
           python3 - /tmp/scale_bench_output.txt <<'PYEOF'
           import sys, os, re, json
 
           summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
           db_type = os.environ.get("DB_TYPE", "sqlite")
-          build_profile = os.environ.get("BUILD_PROFILE", "release")
+          build_profile = "release"
 
           output_path = sys.argv[1]
           if not os.path.exists(output_path):
