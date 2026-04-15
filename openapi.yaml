@@ -1129,7 +1129,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Upstream"
+              $ref: "#/components/schemas/UpstreamCreate"
       responses:
         "201":
           description: Created upstream
@@ -1180,7 +1180,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Upstream"
+              $ref: "#/components/schemas/UpstreamCreate"
       responses:
         "200":
           description: Updated upstream
@@ -1366,13 +1366,10 @@ components:
     Proxy:
       type: object
       required:
-        - id
         - listen_path
         - backend_protocol
         - backend_host
         - backend_port
-        - created_at
-        - updated_at
       properties:
         id:
           type: [string, "null"]
@@ -1700,7 +1697,7 @@ components:
     # ── Consumer ────────────────────────────────────────────────────
     Consumer:
       type: object
-      required: [id, username, created_at, updated_at]
+      required: [username]
       properties:
         id:
           type: [string, "null"]
@@ -1892,7 +1889,7 @@ components:
     # ── Plugin Config ───────────────────────────────────────────────
     PluginConfig:
       type: object
-      required: [id, plugin_name, scope, enabled, created_at, updated_at]
+      required: [plugin_name, scope, enabled]
       properties:
         id:
           type: [string, "null"]
@@ -2183,9 +2180,19 @@ components:
           delay_ms: 100
 
     # ── Upstream / Load Balancing ────────────────────────────────────
+    UpstreamCreate:
+      description: |
+        Request body for creating or updating an upstream. Same schema as
+        Upstream but `id`, `created_at`, and `updated_at` are optional
+        (server-managed).
+      allOf:
+        - $ref: "#/components/schemas/Upstream"
+      required:
+        - targets
+
     Upstream:
       type: object
-      required: [id, targets, created_at, updated_at]
+      required: [targets]
       properties:
         id:
           type: [string, "null"]
@@ -2994,7 +3001,7 @@ components:
         upstreams:
           type: array
           items:
-            $ref: "#/components/schemas/Upstream"
+            $ref: "#/components/schemas/UpstreamCreate"
           description: Upstreams to create
 
     BatchCreateResponse:
