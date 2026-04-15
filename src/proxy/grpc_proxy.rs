@@ -424,9 +424,16 @@ impl GrpcConnectionPool {
         let addr = format!("{}:{}", target_host, port);
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
+        // Parse the already-resolved address into a SocketAddr for TcpSocket.
+        // The target_host is an IP from dns_cache.resolve(), so this parse
+        // should always succeed.
+        let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+            GrpcProxyError::BackendUnavailable(format!("Invalid backend address {}: {}", addr, e))
+        })?;
+
         // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
         // before connect() so the kernel can co-select ephemeral ports.
-        let tcp = tokio::time::timeout(connect_timeout, Self::connect_with_opts(&addr))
+        let tcp = tokio::time::timeout(connect_timeout, Self::connect_with_opts(sock_addr))
             .await
             .map_err(|_| {
                 warn!(
@@ -504,15 +511,11 @@ impl GrpcConnectionPool {
         builder
     }
 
-    /// Connect to a backend address with `IP_BIND_ADDRESS_NO_PORT` set before
-    /// `connect()` so the kernel can co-select ephemeral ports using 4-tuple
-    /// optimization. Falls back to plain `TcpStream::connect` on non-Unix.
-    async fn connect_with_opts(addr: &str) -> std::io::Result<TcpStream> {
-        let sock_addr: std::net::SocketAddr = tokio::net::lookup_host(addr)
-            .await?
-            .next()
-            .ok_or_else(|| std::io::Error::other("DNS returned no addresses"))?;
-
+    /// Connect to a pre-resolved `SocketAddr` with `IP_BIND_ADDRESS_NO_PORT`
+    /// set before `connect()` so the kernel can co-select ephemeral ports
+    /// using 4-tuple optimization. The caller must resolve the hostname via
+    /// the shared DNS cache before calling this — no DNS lookup happens here.
+    async fn connect_with_opts(sock_addr: std::net::SocketAddr) -> std::io::Result<TcpStream> {
         let socket = if sock_addr.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?
         } else {
