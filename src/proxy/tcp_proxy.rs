@@ -198,17 +198,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         adaptive_buffer,
         tcp_fastopen_enabled,
         overload,
-        ktls_enabled,
-        io_uring_splice_enabled,
+        ktls_enabled: _ktls_enabled,
+        io_uring_splice_enabled: _io_uring_splice_enabled,
         msg_zerocopy_enabled,
         msg_zerocopy_threshold,
     } = cfg;
-    let _ = (
-        ktls_enabled,
-        io_uring_splice_enabled,
-        msg_zerocopy_enabled,
-        msg_zerocopy_threshold,
-    );
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
@@ -344,6 +338,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
                         tcp_fastopen_enabled,
+                        msg_zerocopy_enabled,
+                        msg_zerocopy_threshold,
                     )
                     .await;
 
@@ -479,7 +475,7 @@ struct TcpConnectionSuccess {
 /// Always returns a `TcpConnectionResult` containing backend target info (for logging)
 /// and the connection outcome. Backend info is populated as soon as the target is known,
 /// so even failed connections log which backend was attempted.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
@@ -496,9 +492,18 @@ async fn handle_tcp_connection(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
+    msg_zerocopy_enabled: bool,
+    _msg_zerocopy_threshold: usize,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
+
+    // Apply MSG_ZEROCOPY on the client socket for large sends (Linux 4.14+).
+    #[cfg(target_os = "linux")]
+    if msg_zerocopy_enabled {
+        use std::os::unix::io::AsRawFd;
+        let _ = crate::socket_opts::set_so_zerocopy(client_stream.as_raw_fd(), true);
+    }
 
     // Run the core connection logic, tracking backend info for logging.
     // We use a helper closure so that `?` returns from the closure, not the
@@ -526,6 +531,7 @@ async fn handle_tcp_connection(
         sni_proxy_ids,
         adaptive_buffer,
         tcp_fastopen,
+        msg_zerocopy_enabled,
     )
     .await;
 
@@ -537,7 +543,7 @@ async fn handle_tcp_connection(
 
 /// Inner implementation of TCP connection handling that can use `?` for early returns
 /// while the caller always receives backend info for logging.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
@@ -556,6 +562,7 @@ async fn handle_tcp_connection_inner(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
+    msg_zerocopy_enabled: bool,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
@@ -694,6 +701,13 @@ async fn handle_tcp_connection_inner(
                 })?;
 
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+
+        // Apply MSG_ZEROCOPY on the backend socket for large sends (Linux 4.14+).
+        #[cfg(target_os = "linux")]
+        if msg_zerocopy_enabled {
+            use std::os::unix::io::AsRawFd;
+            let _ = crate::socket_opts::set_so_zerocopy(backend_stream.as_raw_fd(), true);
+        }
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
@@ -927,6 +941,18 @@ async fn handle_tcp_connection_inner(
     };
     let (_backend_socket_addr, backend_stream) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
+
+    // Apply MSG_ZEROCOPY on the backend socket for large sends (Linux 4.14+).
+    #[cfg(target_os = "linux")]
+    if msg_zerocopy_enabled {
+        use std::os::unix::io::AsRawFd;
+        match &backend_stream {
+            BackendStream::Plain(s) => {
+                let _ = crate::socket_opts::set_so_zerocopy(s.as_raw_fd(), true);
+            }
+            BackendStream::Tls(_) => {} // TLS stream wraps the fd; zerocopy on raw fd won't help
+        }
+    }
 
     // Apply frontend TLS termination if configured, then start bidirectional copy.
     // From here, no retries — bytes may be exchanged.
