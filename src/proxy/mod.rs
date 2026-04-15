@@ -4980,6 +4980,19 @@ async fn handle_proxy_request_inner(
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
+                // Check if the streaming request body already exceeded the size
+                // limit before we start forwarding the response.
+                if let Some(ref exceeded) = grpc_streaming.request_body_exceeded
+                    && exceeded.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    // gRPC errors are HTTP 200 with grpc-status trailers.
+                    record_request(&state, 200);
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "gRPC request payload size exceeds maximum",
+                    ));
+                }
+
                 record_request(&state, grpc_streaming.status);
 
                 // Build the response with the live Incoming body — hyper will forward
@@ -4993,18 +5006,6 @@ async fn handle_proxy_request_inner(
                     ) {
                         resp_builder = resp_builder.header(name, val);
                     }
-                }
-
-                // Check if the streaming request body already exceeded the size
-                // limit before we start forwarding the response.
-                if let Some(ref exceeded) = grpc_streaming.request_body_exceeded
-                    && exceeded.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    record_request(&state, 413);
-                    return Ok(grpc_proxy::build_grpc_error_response(
-                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
-                        "gRPC request payload size exceeds maximum",
-                    ));
                 }
                 // For bidi/client-streaming RPCs where the request body is still
                 // sending: GrpcBody::Streaming returns an error when exceeded,
@@ -6918,9 +6919,9 @@ async fn proxy_to_backend(
 /// of Content-Length. Currently covers SSE (`text/event-stream`).
 #[inline]
 fn is_streaming_content_type(resp_headers: &HashMap<String, String>) -> bool {
-    resp_headers
-        .get("content-type")
-        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    resp_headers.get("content-type").is_some_and(|ct| {
+        ct.len() >= 17 && ct.as_bytes()[..17].eq_ignore_ascii_case(b"text/event-stream")
+    })
 }
 
 /// Collect a response body with a size limit, returning Err with error body if exceeded.
