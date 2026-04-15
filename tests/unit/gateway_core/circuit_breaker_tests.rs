@@ -903,14 +903,21 @@ fn test_cache_config_change_replaces_breaker() {
         ..default_config()
     };
 
-    // Create with config1
+    // Create with config1 (failure_threshold=3) and trip it open
     let cb1 = cache.get_or_create("proxy1", Some("target1"), &config1);
     cb1.record_failure(500, false);
+    cb1.record_failure(500, false);
+    cb1.record_failure(500, false);
+    assert_eq!(
+        cb1.state_name(),
+        "open",
+        "Breaker should be open after 3 failures"
+    );
 
     // Get with config2 — should replace the breaker (config changed)
     let cb2 = cache.get_or_create("proxy1", Some("target1"), &config2);
 
-    // New breaker should be fresh (closed, no failures)
+    // New breaker should be fresh (closed, not open) proving replacement
     assert_eq!(cb2.state_name(), "closed");
     assert!(cb2.can_execute().is_ok());
 }

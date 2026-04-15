@@ -913,11 +913,15 @@ async fn test_evict_expired_removes_stale_entries() {
     // Wait for entries to expire past stale deadline
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
+    let before = cache.cache_len();
     cache.evict_expired();
 
-    // Entries should be evicted (IPs may or may not be cached depending on impl)
-    // The key test is that evict_expired doesn't panic and reduces cache size
-    // when entries are past stale deadline
+    assert!(
+        cache.cache_len() < before,
+        "evict_expired should reduce cache size from {} but got {}",
+        before,
+        cache.cache_len()
+    );
 }
 
 #[tokio::test]
