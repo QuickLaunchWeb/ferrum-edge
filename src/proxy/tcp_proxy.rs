@@ -1078,7 +1078,17 @@ async fn connect_backend_plain(
     let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
+        .map_err(|e| {
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "tcp_proxy: PORT EXHAUSTION connecting to backend {}: {} — \
+                     reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                    addr,
+                    e
+                );
+            }
+            anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
+        })?;
     let _ = stream.set_nodelay(true);
 
     // Apply Linux/Unix socket optimizations on the connected socket.

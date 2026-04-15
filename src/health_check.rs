@@ -714,7 +714,15 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
         Ok(Ok(_stream)) => true,
         Ok(Err(e)) => {
-            debug!("TCP health probe connection failed for {}: {}", addr, e);
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "TCP health probe: PORT EXHAUSTION connecting to {}: {}",
+                    addr,
+                    e
+                );
+            } else {
+                debug!("TCP health probe connection failed for {}: {}", addr, e);
+            }
             false
         }
         Err(_) => {

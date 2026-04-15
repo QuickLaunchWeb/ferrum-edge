@@ -367,3 +367,93 @@ fn test_boxed_error_unknown_fallback() {
     let err: Box<dyn std::error::Error + Send + Sync> = "some unknown error".into();
     assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::RequestError);
 }
+
+// ── Port exhaustion (EADDRNOTAVAIL) classification ─────────────────
+
+#[test]
+fn test_is_port_exhaustion_with_io_error_linux() {
+    // OS error 99 is EADDRNOTAVAIL on Linux
+    let io_err = std::io::Error::from_raw_os_error(99);
+    assert!(ferrum_edge::retry::is_port_exhaustion(&io_err));
+}
+
+#[test]
+fn test_is_port_exhaustion_with_io_error_macos() {
+    // OS error 49 is EADDRNOTAVAIL on macOS/BSD
+    let io_err = std::io::Error::from_raw_os_error(49);
+    assert!(ferrum_edge::retry::is_port_exhaustion(&io_err));
+}
+
+#[test]
+fn test_is_port_exhaustion_false_for_connection_refused() {
+    // OS error 111 is ECONNREFUSED on Linux
+    let io_err = std::io::Error::from_raw_os_error(111);
+    assert!(!ferrum_edge::retry::is_port_exhaustion(&io_err));
+}
+
+#[test]
+fn test_is_port_exhaustion_false_for_generic_error() {
+    let err = std::io::Error::other("something else");
+    assert!(!ferrum_edge::retry::is_port_exhaustion(&err));
+}
+
+#[test]
+fn test_is_port_exhaustion_message_linux() {
+    assert!(ferrum_edge::retry::is_port_exhaustion_message(
+        "Connection failed: Cannot assign requested address (os error 99)"
+    ));
+}
+
+#[test]
+fn test_is_port_exhaustion_message_macos() {
+    assert!(ferrum_edge::retry::is_port_exhaustion_message(
+        "Connection failed: Can't assign requested address (os error 49)"
+    ));
+}
+
+#[test]
+fn test_is_port_exhaustion_message_text() {
+    assert!(ferrum_edge::retry::is_port_exhaustion_message(
+        "address not available"
+    ));
+}
+
+#[test]
+fn test_is_port_exhaustion_message_false() {
+    assert!(!ferrum_edge::retry::is_port_exhaustion_message(
+        "Connection refused"
+    ));
+}
+
+#[test]
+fn test_grpc_port_exhaustion_classified() {
+    let err = GrpcProxyError::BackendUnavailable(
+        "Connection failed: Can't assign requested address (os error 99)".into(),
+    );
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::PortExhaustion);
+}
+
+#[test]
+fn test_boxed_error_port_exhaustion_linux() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "Backend connect failed: Can't assign requested address (os error 99)".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::PortExhaustion
+    );
+}
+
+#[test]
+fn test_boxed_error_port_exhaustion_macos() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "Backend connect failed: Can't assign requested address (os error 49)".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::PortExhaustion
+    );
+}
+
+#[test]
+fn test_port_exhaustion_display() {
+    assert_eq!(format!("{}", ErrorClass::PortExhaustion), "port_exhaustion");
+}

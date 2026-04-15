@@ -438,12 +438,28 @@ impl GrpcConnectionPool {
                 ))
             })?
             .map_err(|e| {
-                warn!("gRPC: failed to connect to backend {}: {}", addr, e);
+                if crate::retry::is_port_exhaustion(&e) {
+                    tracing::error!(
+                        "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                        addr,
+                        e
+                    );
+                } else {
+                    warn!("gRPC: failed to connect to backend {}: {}", addr, e);
+                }
                 GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
             })?;
 
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
+
+        // Defer ephemeral port allocation to connect() for better 4-tuple distribution.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = crate::socket_opts::set_ip_bind_address_no_port(tcp.as_raw_fd(), true);
+        }
 
         // Apply TCP keepalive using per-proxy pool config
         let pool_config = self.global_pool_config.for_proxy(proxy);
