@@ -966,9 +966,9 @@ async fn test_srv_resolution_nonexistent_service() {
     let config = DnsConfig::default();
     let cache = DnsCache::new(config);
 
-    let result = cache
-        .resolve_srv("_nonexistent._tcp.invalid.test.local")
-        .await;
+    // Use .invalid TLD (RFC 6761 §6.4) — guaranteed to never resolve,
+    // unlike .local which can trigger mDNS in some environments.
+    let result = cache.resolve_srv("_nonexistent._tcp.test.invalid").await;
     assert!(
         result.is_err(),
         "SRV resolution of nonexistent service should fail"
@@ -976,25 +976,29 @@ async fn test_srv_resolution_nonexistent_service() {
 }
 
 // ============================================================================
-// Per-proxy TTL override priority tests
+// Per-proxy TTL override tests
 // ============================================================================
 
 #[tokio::test]
-async fn test_per_proxy_ttl_override_takes_precedence() {
+async fn test_per_proxy_ttl_override_does_not_affect_resolution() {
+    // Per-proxy TTL override is an internal caching parameter — it should not
+    // change the resolved IP, only how long the entry lives in cache.
     let config = DnsConfig {
-        ttl_override_seconds: Some(300), // Global override: 300s
+        ttl_override_seconds: Some(300),
         ..DnsConfig::default()
     };
     let cache = DnsCache::new(config);
 
-    // Resolve with per-proxy TTL override (should take precedence over global)
-    let result = cache.resolve("127.0.0.1", None, Some(10)).await;
+    // Resolve with a per-proxy TTL override of 1s
+    let result = cache.resolve("127.0.0.1", None, Some(1)).await;
     assert!(result.is_ok());
 
-    // Resolve same hostname without per-proxy override
-    let result2 = cache.resolve("127.0.0.1", None, None).await;
-    assert!(result2.is_ok());
+    // Wait for the per-proxy TTL to expire (but global 300s TTL would still hold)
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // Both should resolve successfully — the TTL difference is internal
+    // Entry should still resolve (still cached; per-proxy TTL affects the
+    // internal expires_at but the entry is served stale-while-revalidate)
+    let result2 = cache.resolve("127.0.0.1", None, Some(1)).await;
+    assert!(result2.is_ok());
     assert_eq!(result.unwrap(), result2.unwrap());
 }
