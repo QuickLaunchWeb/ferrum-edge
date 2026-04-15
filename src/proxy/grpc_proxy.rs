@@ -961,18 +961,12 @@ pub async fn proxy_grpc_request_streaming(
         }
     }
 
-    // Parse gRPC deadline for the streaming path. Unlike the buffered path,
-    // we do NOT wrap send_request in tokio::time::timeout because the future
-    // includes both the upload duration (client→proxy→backend body streaming)
-    // and the backend response wait. For client-streaming RPCs where the
-    // backend responds only after the full upload, a fixed timeout would
-    // penalize slow uploads on healthy backends.
-    //
-    // Instead, deadline enforcement relies on:
-    // 1. The grpc-timeout header forwarded to the backend (backend-side cancel)
-    // 2. H2 connection keepalive (detects dead connections)
-    // 3. The client's own deadline (client-side cancel → stream reset)
-    let _effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
+    // For the streaming path, send_request() covers both body upload and
+    // response header wait. Use the gRPC deadline when the client sets one
+    // (it accounts for upload time), capped by backend_read_timeout_ms.
+    // When no gRPC deadline is set, fall back to backend_read_timeout_ms
+    // as a safety net against indefinitely stalled backends.
+    let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
         Some(grpc_ms) => grpc_ms.min(proxy.backend_read_timeout_ms),
         None => proxy.backend_read_timeout_ms,
     };
@@ -987,21 +981,34 @@ pub async fn proxy_grpc_request_streaming(
     *backend_req.headers_mut() = headers;
 
     let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
-    let response = sender.send_request(backend_req).await.map_err(|e| {
-        // Check if the failure was caused by the request body exceeding the
-        // size limit. The GrpcBody::Streaming error triggers an h2 stream
-        // reset which surfaces here as a send_request error. Return
-        // ResourceExhausted instead of BackendUnavailable so clients get
-        // the correct gRPC status code.
-        if body_size_exceeded.load(Ordering::Acquire) {
-            return GrpcProxyError::ResourceExhausted(format!(
-                "gRPC request payload size exceeds maximum of {} bytes",
-                max_grpc_recv_size_bytes
-            ));
-        }
-        error!("gRPC backend request failed (streaming body): {}", e);
-        GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
-    })?;
+    let read_timeout = Duration::from_millis(effective_timeout_ms);
+    let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
+        .await
+        .map_err(|_| {
+            warn!(
+                "gRPC: timeout ({}ms) waiting for streaming RPC completion",
+                effective_timeout_ms
+            );
+            GrpcProxyError::BackendTimeout(format!(
+                "gRPC streaming RPC timeout after {}ms",
+                effective_timeout_ms
+            ))
+        })?
+        .map_err(|e| {
+            // Check if the failure was caused by the request body exceeding the
+            // size limit. The GrpcBody::Streaming error triggers an h2 stream
+            // reset which surfaces here as a send_request error. Return
+            // ResourceExhausted instead of BackendUnavailable so clients get
+            // the correct gRPC status code.
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return GrpcProxyError::ResourceExhausted(format!(
+                    "gRPC request payload size exceeds maximum of {} bytes",
+                    max_grpc_recv_size_bytes
+                ));
+            }
+            error!("gRPC backend request failed (streaming body): {}", e);
+            GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+        })?;
 
     // Check if the request body already exceeded the limit before response
     // headers arrived. If so, fail immediately with a clear error.
