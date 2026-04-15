@@ -956,6 +956,91 @@ pub mod io_uring_splice {
     }
 }
 
+// ── Auto-detection probes ──────────────────────────────────────────────
+
+/// Check if TCP Fast Open is enabled on this kernel via sysctl.
+///
+/// Reads `/proc/sys/net/ipv4/tcp_fastopen` and checks that both the
+/// server bit (0x1) and client bit (0x2) are set. Returns `true` if
+/// the sysctl value has bits 0x3 set (both server and client TFO enabled).
+#[cfg(target_os = "linux")]
+pub fn is_tcp_fastopen_available() -> bool {
+    if let Ok(val) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen") {
+        if let Ok(n) = val.trim().parse::<u32>() {
+            return (n & 0x3) == 0x3; // bits 0 (server) + 1 (client) both set
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn is_tcp_fastopen_available() -> bool {
+    false
+}
+
+/// Check if UDP GRO is available by probing `setsockopt(UDP_GRO)` on a temp socket.
+///
+/// Creates a temporary UDP socket, attempts to set `UDP_GRO=1`, and closes it.
+/// Returns `true` if the setsockopt succeeds (Linux 5.0+).
+#[cfg(target_os = "linux")]
+pub fn is_udp_gro_available() -> bool {
+    const UDP_GRO: libc::c_int = 104;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_UDP,
+            UDP_GRO,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    ret == 0
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn is_udp_gro_available() -> bool {
+    false
+}
+
+/// Check if UDP GSO is available by probing `setsockopt(UDP_SEGMENT)` on a temp socket.
+///
+/// Creates a temporary UDP socket, attempts to set `UDP_SEGMENT=1400`, and closes it.
+/// Returns `true` if the setsockopt succeeds (Linux 4.18+).
+#[cfg(target_os = "linux")]
+pub fn is_udp_gso_available() -> bool {
+    const UDP_SEGMENT: libc::c_int = 103;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let val: libc::c_int = 1400; // typical segment size for probe
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_UDP,
+            UDP_SEGMENT,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    ret == 0
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn is_udp_gso_available() -> bool {
+    false
+}
+
 // ── Connected UDP sockets ──────────────────────────────────────────────
 
 /// Create a connected UDP socket for a specific client address.

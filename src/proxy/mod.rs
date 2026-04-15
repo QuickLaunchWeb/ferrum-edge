@@ -693,7 +693,9 @@ impl ProxyState {
             crls.clone(),
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
-            env_config_arc.tcp_fastopen_enabled,
+            env_config_arc
+                .tcp_fastopen_enabled
+                .resolve(crate::socket_opts::is_tcp_fastopen_available),
             overload.clone(),
             env_config_arc
                 .ktls_enabled
@@ -707,8 +709,12 @@ impl ProxyState {
             }),
             env_config_arc.msg_zerocopy_threshold,
             env_config_arc.so_busy_poll_us,
-            env_config_arc.udp_gro_enabled,
-            env_config_arc.udp_gso_enabled,
+            env_config_arc
+                .udp_gro_enabled
+                .resolve(crate::socket_opts::is_udp_gro_available),
+            env_config_arc
+                .udp_gso_enabled
+                .resolve(crate::socket_opts::is_udp_gso_available),
             env_config_arc.udp_connected_sockets_enabled.resolve(|| {
                 // Connected UDP sockets work on all Linux kernels.
                 cfg!(target_os = "linux")
@@ -3144,7 +3150,11 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let accept_threads = state.env_config.accept_threads.max(1);
-    let tfo_queue = if state.env_config.tcp_fastopen_enabled {
+    let tfo_enabled = state
+        .env_config
+        .tcp_fastopen_enabled
+        .resolve(crate::socket_opts::is_tcp_fastopen_available);
+    let tfo_queue = if tfo_enabled {
         Some(state.env_config.tcp_fastopen_queue_len)
     } else {
         None

@@ -793,8 +793,10 @@ pub struct EnvConfig {
     /// Enable TCP Fast Open on server (listening) and client (connecting) sockets.
     /// Saves 1 RTT on repeat connections by allowing data in the SYN packet.
     /// Requires Linux 4.11+ and `net.ipv4.tcp_fastopen` sysctl bit 0x1 (server)
-    /// or 0x2 (client) enabled. No-op on non-Linux. Default: true.
-    pub tcp_fastopen_enabled: bool,
+    /// or 0x2 (client) enabled. No-op on non-Linux.
+    /// Values: `auto` (check sysctl at startup), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub tcp_fastopen_enabled: AutoBool,
     /// TCP Fast Open server queue length — maximum pending TFO connections.
     /// Only used when `tcp_fastopen_enabled` is true. Default: 256.
     pub tcp_fastopen_queue_len: u16,
@@ -815,12 +817,16 @@ pub struct EnvConfig {
     pub io_uring_splice_enabled: AutoBool,
     /// Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+).
     /// Kernel coalesces multiple same-size UDP datagrams into a single large buffer,
-    /// more efficient than recvmmsg. Default: true.
-    pub udp_gro_enabled: bool,
+    /// more efficient than recvmmsg.
+    /// Values: `auto` (probe setsockopt on temp socket), `true`, `false`.
+    /// Default: `auto`.
+    pub udp_gro_enabled: AutoBool,
     /// Enable UDP GSO (Generic Segmentation Offload) for batched UDP sending (Linux 4.18+).
     /// Sends multiple datagrams in a single sendmsg() by specifying a segment size via
-    /// ancillary data. The kernel splits them at the NIC level. Default: true.
-    pub udp_gso_enabled: bool,
+    /// ancillary data. The kernel splits them at the NIC level.
+    /// Values: `auto` (probe sendmsg with UDP_SEGMENT on temp socket), `true`, `false`.
+    /// Default: `auto`.
+    pub udp_gso_enabled: AutoBool,
     /// SO_BUSY_POLL duration in microseconds for latency-sensitive UDP sockets (Linux 3.11+).
     /// When > 0, the kernel spins for this many microseconds waiting for incoming data
     /// before sleeping. Reduces receive latency at the cost of CPU. 0 = disabled. Default: 0.
@@ -1023,12 +1029,12 @@ impl Default for EnvConfig {
             shutdown_drain_seconds: 30,
             status_metrics_window_seconds: 30,
             tls_offload_threads: 0,
-            tcp_fastopen_enabled: true,
+            tcp_fastopen_enabled: AutoBool::Auto,
             tcp_fastopen_queue_len: 256,
             ktls_enabled: AutoBool::Auto,
             io_uring_splice_enabled: AutoBool::Auto,
-            udp_gro_enabled: true,
-            udp_gso_enabled: true,
+            udp_gro_enabled: AutoBool::Auto,
+            udp_gso_enabled: AutoBool::Auto,
             so_busy_poll_us: 0,
             msg_zerocopy_enabled: AutoBool::Auto,
             msg_zerocopy_threshold: 32_768,
@@ -1632,7 +1638,11 @@ impl EnvConfig {
             )
             .max(1),
             tls_offload_threads: resolve_usize(conf, "FERRUM_TLS_OFFLOAD_THREADS", 0),
-            tcp_fastopen_enabled: resolve_bool(conf, "FERRUM_TCP_FASTOPEN_ENABLED", true),
+            tcp_fastopen_enabled: resolve_auto_bool(
+                conf,
+                "FERRUM_TCP_FASTOPEN_ENABLED",
+                AutoBool::Auto,
+            ),
             tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
@@ -1642,8 +1652,8 @@ impl EnvConfig {
                 "FERRUM_IO_URING_SPLICE_ENABLED",
                 AutoBool::Auto,
             ),
-            udp_gro_enabled: resolve_bool(conf, "FERRUM_UDP_GRO_ENABLED", true),
-            udp_gso_enabled: resolve_bool(conf, "FERRUM_UDP_GSO_ENABLED", true),
+            udp_gro_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GRO_ENABLED", AutoBool::Auto),
+            udp_gso_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GSO_ENABLED", AutoBool::Auto),
             so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),

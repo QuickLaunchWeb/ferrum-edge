@@ -1108,13 +1108,13 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_OVERLOAD_LOOP_WARN_US` | `10000` | Event loop latency (μs) for warning log |
 | `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | `500000` | Event loop latency (μs) to reject new connections |
 | `FERRUM_SHUTDOWN_DRAIN_SECONDS` | `30` | Seconds to wait for in-flight connections to drain on shutdown. `0` = immediate |
-| `FERRUM_TCP_FASTOPEN_ENABLED` | `true` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | `auto` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients. Values: `auto` (check sysctl)/`true`/`false` |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | `256` | TCP Fast Open pending connection queue length |
 | `FERRUM_TLS_OFFLOAD_THREADS` | `0` | Dedicated TLS handshake offload threads (0 = disabled). Total threads = value (shards auto-computed). Isolates CPU-intensive TLS handshakes from the main event loop |
 | `FERRUM_KTLS_ENABLED` | `auto` | Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+). Installs symmetric keys into kernel after handshake so splice(2) works on encrypted connections. Values: `auto`/`true`/`false` |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | Enable io_uring-based splice (`IORING_OP_SPLICE`) for TCP proxy zero-copy relay (Linux 5.6+). Each direction gets its own ring on a blocking thread. Falls back to libc splice if unavailable. Values: `auto`/`true`/`false` |
-| `FERRUM_UDP_GRO_ENABLED` | `true` | Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+). Kernel coalesces same-size datagrams |
-| `FERRUM_UDP_GSO_ENABLED` | `true` | Enable UDP GSO (Generic Segmentation Offload) for batched sending (Linux 4.18+). Multiple datagrams in single sendmsg |
+| `FERRUM_UDP_GRO_ENABLED` | `auto` | Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+). Kernel coalesces same-size datagrams. Values: `auto`/`true`/`false` |
+| `FERRUM_UDP_GSO_ENABLED` | `auto` | Enable UDP GSO (Generic Segmentation Offload) for batched sending (Linux 4.18+). Multiple datagrams in single sendmsg. Values: `auto`/`true`/`false` |
 | `FERRUM_SO_BUSY_POLL_US` | `0` | SO_BUSY_POLL duration in microseconds for UDP sockets (Linux 3.11+). Reduces receive latency at cost of CPU. `0` = disabled |
 | `FERRUM_MSG_ZEROCOPY_ENABLED` | `auto` | Enable MSG_ZEROCOPY for large TCP stream proxy sends (Linux 4.14+). Avoids data copy for sends above threshold. Values: `auto`/`true`/`false` |
 | `FERRUM_MSG_ZEROCOPY_THRESHOLD` | `32768` | Minimum payload size in bytes to use MSG_ZEROCOPY (32 KB crossover point). Smaller payloads use regular send |
