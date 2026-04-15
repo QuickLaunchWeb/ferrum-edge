@@ -1478,12 +1478,12 @@ fn libc_splice_loop(
     dst_fd: i32,
     timeout_ms: u64,
 ) -> Result<u64, anyhow::Error> {
-    let start_ms = coarse_now_ms();
+    let mut last_activity_ms = coarse_now_ms();
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
     let mut total: u64 = 0;
 
     loop {
-        if timeout_ms > 0 && coarse_now_ms().saturating_sub(start_ms) >= timeout_ms {
+        if timeout_ms > 0 && coarse_now_ms().saturating_sub(last_activity_ms) >= timeout_ms {
             return Err(anyhow::anyhow!("TCP idle timeout (libc splice fallback)"));
         }
 
@@ -1514,6 +1514,10 @@ fn libc_splice_loop(
                 if written > 0 {
                     remaining -= written as usize;
                     total += written as u64;
+                    // Refresh idle timeout on activity.
+                    if timeout_ms > 0 {
+                        last_activity_ms = coarse_now_ms();
+                    }
                 } else if written == 0 {
                     return Ok(total);
                 } else {

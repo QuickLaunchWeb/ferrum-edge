@@ -40,6 +40,12 @@ pub struct RecvMmsgBatch {
     iovecs: Vec<libc::iovec>,
     /// Pre-allocated mmsghdr array (one per slot).
     msgs: Vec<libc::mmsghdr>,
+    /// Per-slot cmsg buffers for GRO segment size metadata (UDP_GRO cmsg).
+    /// Each slot has enough space for one cmsg header + u16 segment size.
+    cmsg_bufs: Vec<Vec<u8>>,
+    /// Per-slot GRO segment size parsed from cmsg after recvmmsg.
+    /// `None` = single datagram (no GRO coalescing), `Some(n)` = coalesced with segment size n.
+    gro_segments: Vec<Option<u16>>,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -64,6 +70,8 @@ impl RecvMmsgBatch {
     /// arrays. This is a one-time allocation at listener startup.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
+        // cmsg buffer size: enough for one cmsg header + u16 (GRO segment size).
+        let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
         Self {
             bufs: (0..capacity).map(|_| vec![0u8; MAX_DGRAM_SIZE]).collect(),
             result_addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); capacity],
@@ -77,6 +85,8 @@ impl RecvMmsgBatch {
                 capacity
             ],
             msgs: vec![unsafe { std::mem::zeroed() }; capacity],
+            cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
+            gro_segments: vec![None; capacity],
             capacity,
             count: 0,
         }
@@ -97,6 +107,17 @@ impl RecvMmsgBatch {
             &self.bufs[i][..self.result_lens[i] as usize],
             self.result_addrs[i],
         )
+    }
+
+    /// Returns the GRO segment size for slot `i`, if the kernel coalesced
+    /// multiple datagrams into one buffer via UDP_GRO.
+    ///
+    /// Returns `None` for single (non-coalesced) datagrams.
+    /// When `Some(seg_size)`, the datagram data should be split into
+    /// `seg_size`-byte chunks (the last chunk may be shorter).
+    pub fn gro_segment_size(&self, i: usize) -> Option<u16> {
+        debug_assert!(i < self.count);
+        self.gro_segments[i]
     }
 
     /// Receive up to `max_count` datagrams in a single `recvmmsg` syscall.
@@ -131,6 +152,9 @@ impl RecvMmsgBatch {
                 iov_len: MAX_DGRAM_SIZE,
             };
 
+            // Zero the cmsg buffer for GRO metadata.
+            self.cmsg_bufs[i].fill(0);
+
             self.msgs[i] = unsafe { std::mem::zeroed() };
             self.msgs[i].msg_hdr.msg_name =
                 std::ptr::addr_of_mut!(self.raw_addrs[i]) as *mut libc::c_void;
@@ -138,6 +162,9 @@ impl RecvMmsgBatch {
                 std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
             self.msgs[i].msg_hdr.msg_iovlen = 1;
+            // Attach cmsg buffer for GRO segment size metadata.
+            self.msgs[i].msg_hdr.msg_control = self.cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
+            self.msgs[i].msg_hdr.msg_controllen = self.cmsg_bufs[i].len();
         }
 
         // Single syscall to receive up to n datagrams.
@@ -160,6 +187,9 @@ impl RecvMmsgBatch {
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
             self.result_addrs[i] = sockaddr_storage_to_std(&self.raw_addrs[i])?;
+            // Parse GRO cmsg to get segment size (if kernel coalesced datagrams).
+            self.gro_segments[i] =
+                crate::socket_opts::extract_gro_segment_size(&self.msgs[i].msg_hdr);
         }
         self.count = received;
         Ok(received)
