@@ -339,7 +339,7 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A background checker polls every 1 second to compare the last activity timestamp against the timeout
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely
+- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
 
 ```yaml
 proxies:
@@ -389,7 +389,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per-plugin protocol matrix.
 
 Notes:
-- `access_control` applies to TCP stream proxies, not plain UDP sessions.
+- `access_control` applies to both TCP and UDP stream proxies. For TCP+TLS and UDP+DTLS, pair with `mtls_auth` for certificate-based consumer identification → ACL group/username authorization.
 - `mtls_auth` applies to both TCP+TLS and UDP+DTLS stream proxies. It only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented during the TLS/DTLS handshake.
 
 ## Environment Variables
@@ -404,6 +404,22 @@ Notes:
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 | `FERRUM_UDP_RECV_BATCH_LIMIT` | `6000` | Max datagrams drained per recv wakeup. Higher values improve burst throughput; lower values improve event loop fairness |
+
+### Linux Performance Tuning
+
+These Linux-specific options auto-detect kernel support at startup when set to `auto` (default). Set to `true` to force enable or `false` to disable.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS: install TLS keys into kernel after handshake so `splice(2)` works on encrypted TCP connections (Linux 4.13+, AES-128-GCM / AES-256-GCM). Probes `/proc/modules` for `tls` module |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice infrastructure (Linux 5.6+). Probes `io_uring_setup` syscall |
+| `FERRUM_UDP_GRO_ENABLED` | `true` | UDP Generic Receive Offload — kernel coalesces same-size datagrams; recv path splits them via GRO cmsg (Linux 5.0+) |
+| `FERRUM_UDP_GSO_ENABLED` | `true` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Falls back to `sendmmsg` on failure |
+| `FERRUM_MSG_ZEROCOPY_ENABLED` | `auto` | `SO_ZEROCOPY` on TCP stream proxy sockets for large sends (Linux 4.14+). Threshold: `FERRUM_MSG_ZEROCOPY_THRESHOLD` (default 32768 bytes) |
+| `FERRUM_UDP_CONNECTED_SOCKETS_ENABLED` | `auto` | Per-client connected UDP sockets bypass routing table lookup on `send()`. 5-10% CPU savings for repeat clients |
+| `FERRUM_SO_BUSY_POLL_US` | `0` | Kernel busy-poll duration (µs) on UDP sockets. Reduces latency at cost of CPU. `0` = disabled |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | `true` | TCP Fast Open on listener and outbound sockets. Saves 1 RTT for repeat connections |
+| `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall (1-1024). Each slot allocates 65535 bytes |
 
 ## Validation Rules
 
