@@ -325,28 +325,50 @@ impl Http2ConnectionPool {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        // Resolve backend hostname via DNS cache
-        let target_host = match dns_cache
+        // Resolve backend hostname via DNS cache, keeping the IpAddr to
+        // construct SocketAddr directly (avoids IPv6 bracketing issues with
+        // string parsing).
+        let resolved_ip = dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
             )
             .await
-        {
-            Ok(ip) => ip.to_string(),
-            Err(_) => host.clone(),
+            .ok();
+
+        let target_host = match &resolved_ip {
+            Some(ip) => ip.to_string(),
+            None => host.clone(),
         };
 
         let addr = format!("{}:{}", target_host, port);
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
-        // Parse the already-resolved address into a SocketAddr for TcpSocket.
-        // The target_host is an IP from dns_cache.resolve(), so this parse
-        // should always succeed.
-        let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
-            Http2PoolError::BackendUnavailable(format!("Invalid backend address {}: {}", addr, e))
-        })?;
+        // Build SocketAddr from the resolved IpAddr + port directly.
+        // When DNS resolution failed, fall back to ToSocketAddrs via
+        // tokio::net::lookup_host (which handles hostname:port strings).
+        let sock_addr: std::net::SocketAddr = match resolved_ip {
+            Some(ip) => std::net::SocketAddr::new(ip, port),
+            None => {
+                // Fallback: hostname didn't resolve via cache, use system DNS
+                tokio::net::lookup_host(&addr)
+                    .await
+                    .map_err(|e| {
+                        Http2PoolError::BackendUnavailable(format!(
+                            "DNS resolution failed for {}: {}",
+                            addr, e
+                        ))
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        Http2PoolError::BackendUnavailable(format!(
+                            "DNS returned no addresses for {}",
+                            addr
+                        ))
+                    })?
+            }
+        };
 
         // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
         // before connect() so the kernel can co-select ephemeral ports.
