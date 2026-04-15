@@ -4931,6 +4931,26 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
+                // Check if the streaming request body exceeded the size limit
+                // BEFORE logging — otherwise the transaction summary captures a
+                // success status while we're about to return RESOURCE_EXHAUSTED.
+                let body_exceeded = grpc_streaming
+                    .request_body_exceeded
+                    .as_ref()
+                    .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
+
+                // Determine the final status for logging and metrics.
+                let final_status = if body_exceeded {
+                    200_u16
+                } else {
+                    grpc_streaming.status
+                };
+                let final_error_class: Option<retry::ErrorClass> = if body_exceeded {
+                    Some(retry::ErrorClass::RequestBodyTooLarge)
+                } else {
+                    None
+                };
+
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
                 let plugin_external_io_ms =
@@ -4962,7 +4982,7 @@ async fn handle_proxy_request_inner(
                         matched_proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
-                        response_status_code: grpc_streaming.status,
+                        response_status_code: final_status,
                         latency_total_ms: total_ms,
                         latency_gateway_processing_ms: gateway_processing_ms,
                         latency_backend_ttfb_ms: backend_total_ms,
@@ -4971,21 +4991,16 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        response_streamed: true,
+                        response_streamed: !body_exceeded,
                         client_disconnected: false,
-                        error_class: None,
+                        error_class: final_error_class,
                         mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
 
-                // Check if the streaming request body already exceeded the size
-                // limit before we start forwarding the response.
-                if let Some(ref exceeded) = grpc_streaming.request_body_exceeded
-                    && exceeded.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    // gRPC errors are HTTP 200 with grpc-status trailers.
+                if body_exceeded {
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
