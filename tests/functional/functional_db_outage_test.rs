@@ -169,16 +169,21 @@ impl DbOutageTestHarness {
         format!("Bearer {}", token)
     }
 
-    /// Simulate database outage by truncating the SQLite file to zero bytes.
+    /// Simulate database outage by corrupting the SQLite files.
     /// SQLite keeps file descriptors open, so renaming or chmod won't break
-    /// existing pooled connections. Truncating modifies the inode content
-    /// visible through all FDs, causing "database disk image is malformed"
-    /// errors on the next query.
+    /// existing pooled connections. Overwriting file contents modifies the
+    /// inode data visible through all FDs, causing errors on the next query.
     ///
-    /// IMPORTANT: The SHM file is NOT truncated because WAL mode memory-maps
-    /// it. Truncating a memory-mapped file triggers SIGBUS (fatal signal).
-    /// Truncating just the main DB and WAL files is sufficient to produce
-    /// query errors.
+    /// WAL mode complications:
+    /// - The SHM file is memory-mapped. Truncating it (changing file size)
+    ///   triggers SIGBUS. Instead, we overwrite it with zeros (same size) to
+    ///   invalidate the WAL index without causing a signal.
+    /// - The main DB is overwritten with garbage (not truncated to 0 bytes)
+    ///   to prevent `?mode=rwc` from treating it as a fresh empty database
+    ///   when the pool creates new connections.
+    /// - Existing connections may have pages in SQLite's page cache. Zeroing
+    ///   the SHM invalidates the WAL index, forcing SQLite to re-read and
+    ///   detect the corruption on the next transaction.
     fn simulate_db_outage(&self) {
         // Back up the DB (and WAL/SHM) before corrupting
         let backup_path = self.db_path.with_extension("db.backup");
@@ -192,15 +197,22 @@ impl DbOutageTestHarness {
             let _ = std::fs::copy(&shm_path, shm_path.with_extension("shm.backup"));
         }
 
-        // Truncate DB to 0 bytes to cause malformed DB errors
-        std::fs::write(&self.db_path, b"").expect("Failed to truncate DB file");
-        // Also truncate WAL
+        // Overwrite DB with garbage bytes — not empty (prevents ?mode=rwc
+        // from auto-creating a fresh valid database on new connections).
+        let garbage = vec![0xFFu8; 4096];
+        std::fs::write(&self.db_path, &garbage).expect("Failed to corrupt DB file");
+        // Overwrite WAL with garbage
         if wal_path.exists() {
-            let _ = std::fs::write(&wal_path, b"");
+            let _ = std::fs::write(&wal_path, &garbage);
         }
-        // Do NOT truncate the SHM file — it is memory-mapped by SQLite in
-        // WAL mode and truncating it causes SIGBUS.
-        println!("  DB file truncated to simulate outage");
+        // Overwrite SHM with zeros (same size) to invalidate the WAL index.
+        // MUST NOT truncate/resize — the file is memory-mapped and changing
+        // its size triggers SIGBUS.
+        if let Ok(meta) = std::fs::metadata(&shm_path) {
+            let zeros = vec![0u8; meta.len() as usize];
+            let _ = std::fs::write(&shm_path, &zeros);
+        }
+        println!("  DB file corrupted to simulate outage");
     }
 
     /// Restore database by copying the backup back
