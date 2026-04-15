@@ -325,34 +325,27 @@ impl Http2ConnectionPool {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        // Resolve backend hostname via DNS cache
-        let target_host = match dns_cache
+        // Resolve backend hostname via the shared DNS cache. Errors propagate
+        // — no silent fallback to raw hostname that would bypass the cache.
+        let resolved_ip = dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
             )
             .await
-        {
-            Ok(ip) => ip.to_string(),
-            Err(_) => host.clone(),
-        };
-
-        // Build SocketAddr from host + port. Parses the host as an IpAddr
-        // first (handles both IPv4 and IPv6 from dns_cache), then constructs
-        // SocketAddr directly to avoid IPv6 bracketing issues with string
-        // formatting. Falls back to "host:port" string parsing for raw
-        // hostnames (DNS cache miss where host is still a hostname string).
-        let sock_addr = target_host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| std::net::SocketAddr::new(ip, port))
-            .or_else(|_| format!("{}:{}", target_host, port).parse::<std::net::SocketAddr>())
             .map_err(|e| {
                 Http2PoolError::BackendUnavailable(format!(
-                    "Invalid backend address {}:{}: {}",
-                    target_host, port, e
+                    "DNS resolution failed for {}: {}",
+                    host, e
                 ))
             })?;
+
+        // Construct SocketAddr from the resolved IpAddr + port directly.
+        // This handles both IPv4 and IPv6 correctly without string formatting
+        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
+        // which breaks "ip:port" string parsing).
+        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
         let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
