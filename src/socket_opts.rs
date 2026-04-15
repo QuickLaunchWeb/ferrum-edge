@@ -812,7 +812,7 @@ pub mod io_uring_splice {
                 pipe_w,
                 std::ptr::null_mut(),
                 len,
-                flags as libc::c_int,
+                flags,
             )
         };
         if n < 0 {
@@ -833,7 +833,7 @@ pub mod io_uring_splice {
                     fd_out,
                     std::ptr::null_mut(),
                     remaining,
-                    flags as libc::c_int,
+                    flags,
                 )
             };
             if written < 0 {
