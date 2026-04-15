@@ -962,12 +962,20 @@ pub async fn proxy_grpc_request_streaming(
     }
 
     // For the streaming path, send_request() covers both body upload and
-    // response header wait. Use the gRPC deadline when the client sets one
-    // (it accounts for upload time), capped by backend_read_timeout_ms.
-    // When no gRPC deadline is set, fall back to backend_read_timeout_ms
-    // as a safety net against indefinitely stalled backends.
+    // response header wait. Unlike the buffered path (where body sends
+    // instantly so backend_read_timeout_ms ≈ response wait), the streaming
+    // timeout must account for upload time.
+    //
+    // When a gRPC deadline is set: use it directly WITHOUT capping by
+    // backend_read_timeout_ms. The client's deadline covers the entire RPC
+    // lifecycle including upload — capping it would penalize large uploads
+    // that the client explicitly budgeted time for.
+    //
+    // When no gRPC deadline is set: fall back to backend_read_timeout_ms
+    // as a safety net against indefinitely stalled backends. Slow uploads
+    // without deadlines should be bounded.
     let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
-        Some(grpc_ms) => grpc_ms.min(proxy.backend_read_timeout_ms),
+        Some(grpc_ms) => grpc_ms,
         None => proxy.backend_read_timeout_ms,
     };
 
