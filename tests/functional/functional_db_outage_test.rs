@@ -174,6 +174,11 @@ impl DbOutageTestHarness {
     /// existing pooled connections. Truncating modifies the inode content
     /// visible through all FDs, causing "database disk image is malformed"
     /// errors on the next query.
+    ///
+    /// IMPORTANT: The SHM file is NOT truncated because WAL mode memory-maps
+    /// it. Truncating a memory-mapped file triggers SIGBUS (fatal signal).
+    /// Truncating just the main DB and WAL files is sufficient to produce
+    /// query errors.
     fn simulate_db_outage(&self) {
         // Back up the DB (and WAL/SHM) before corrupting
         let backup_path = self.db_path.with_extension("db.backup");
@@ -193,9 +198,8 @@ impl DbOutageTestHarness {
         if wal_path.exists() {
             let _ = std::fs::write(&wal_path, b"");
         }
-        if shm_path.exists() {
-            let _ = std::fs::write(&shm_path, b"");
-        }
+        // Do NOT truncate the SHM file — it is memory-mapped by SQLite in
+        // WAL mode and truncating it causes SIGBUS.
         println!("  DB file truncated to simulate outage");
     }
 
