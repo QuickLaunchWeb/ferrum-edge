@@ -412,7 +412,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_KTLS_ENABLED` | `auto` | kTLS: install TLS keys into kernel after handshake so `splice(2)` works on encrypted TCP connections (Linux 4.13+, AES-128-GCM / AES-256-GCM). Probes `/proc/modules` for `tls` module |
-| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice infrastructure (Linux 5.6+). Probes `io_uring_setup` syscall |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup |
 | `FERRUM_UDP_GRO_ENABLED` | `true` | UDP Generic Receive Offload — kernel coalesces same-size datagrams; recv path splits them via GRO cmsg (Linux 5.0+) |
 | `FERRUM_UDP_GSO_ENABLED` | `true` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Falls back to `sendmmsg` on failure |
 | `FERRUM_MSG_ZEROCOPY_ENABLED` | `auto` | `SO_ZEROCOPY` on TCP stream proxy sockets for large sends (Linux 4.14+). Threshold: `FERRUM_MSG_ZEROCOPY_THRESHOLD` (default 32768 bytes) |

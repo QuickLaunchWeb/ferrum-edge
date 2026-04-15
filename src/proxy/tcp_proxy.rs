@@ -199,7 +199,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tcp_fastopen_enabled,
         overload,
         ktls_enabled,
-        io_uring_splice_enabled: _io_uring_splice_enabled,
+        io_uring_splice_enabled,
         msg_zerocopy_enabled,
         msg_zerocopy_threshold,
     } = cfg;
@@ -341,6 +341,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         msg_zerocopy_enabled,
                         msg_zerocopy_threshold,
                         ktls_enabled,
+                        io_uring_splice_enabled,
                     )
                     .await;
 
@@ -496,6 +497,7 @@ async fn handle_tcp_connection(
     msg_zerocopy_enabled: bool,
     _msg_zerocopy_threshold: usize,
     ktls_enabled: bool,
+    io_uring_splice_enabled: bool,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -535,6 +537,7 @@ async fn handle_tcp_connection(
         tcp_fastopen,
         msg_zerocopy_enabled,
         ktls_enabled,
+        io_uring_splice_enabled,
     )
     .await;
 
@@ -567,6 +570,7 @@ async fn handle_tcp_connection_inner(
     tcp_fastopen: bool,
     msg_zerocopy_enabled: bool,
     ktls_enabled: bool,
+    io_uring_splice_enabled: bool,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
@@ -715,9 +719,14 @@ async fn handle_tcp_connection_inner(
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
+        // When io_uring is enabled, use IORING_OP_SPLICE on dedicated blocking threads.
         #[cfg(target_os = "linux")]
-        let copy_result =
-            bidirectional_splice(client_stream, backend_stream, idle_timeout, buf_size).await;
+        let copy_result = if io_uring_splice_enabled {
+            bidirectional_splice_io_uring(client_stream, backend_stream, idle_timeout, buf_size)
+                .await
+        } else {
+            bidirectional_splice(client_stream, backend_stream, idle_timeout, buf_size).await
+        };
         #[cfg(not(target_os = "linux"))]
         let copy_result =
             bidirectional_copy(client_stream, backend_stream, idle_timeout, buf_size).await;
@@ -1059,10 +1068,16 @@ async fn handle_tcp_connection_inner(
             BackendStream::Plain(bs) => {
                 // On Linux, use splice(2) for zero-copy relay when both sides
                 // are raw TCP (no frontend TLS, no backend TLS).
+                // When io_uring is enabled, use IORING_OP_SPLICE on blocking threads.
                 #[cfg(target_os = "linux")]
                 {
                     used_splice = true;
-                    bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
+                    if io_uring_splice_enabled {
+                        bidirectional_splice_io_uring(client_stream, bs, idle_timeout, buf_size)
+                            .await
+                    } else {
+                        bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -1358,6 +1373,87 @@ async fn bidirectional_splice(
             // Idle timeout check — wake every second.
             _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
                 continue; // loop back to check idle timeout at top
+            }
+        }
+    }
+}
+
+/// Bidirectional zero-copy relay using io_uring `IORING_OP_SPLICE`.
+///
+/// Each direction gets its own io_uring ring (8 entries) and runs on a
+/// dedicated blocking thread via `tokio::task::spawn_blocking`. This avoids
+/// the async yield_now polling loop used by the libc splice path and reduces
+/// per-operation syscall overhead.
+///
+/// The caller must keep `client` and `backend` alive until this function
+/// returns (they own the fds that the blocking threads use).
+#[cfg(target_os = "linux")]
+async fn bidirectional_splice_io_uring(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    pipe_size: usize,
+) -> Result<(u64, u64), anyhow::Error> {
+    use std::os::unix::io::AsRawFd;
+
+    let client_fd = client.as_raw_fd();
+    let backend_fd = backend.as_raw_fd();
+
+    // Create pipes — managed manually since spawn_blocking captures fd ints.
+    let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+
+    let timeout_ms = idle_timeout
+        .filter(|t| !t.is_zero())
+        .map(|t| t.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Each direction runs on its own blocking thread with its own io_uring ring.
+    let c2b_handle = tokio::task::spawn_blocking(move || {
+        io_uring_splice_direction(client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms)
+    });
+    let b2c_handle = tokio::task::spawn_blocking(move || {
+        io_uring_splice_direction(backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, timeout_ms)
+    });
+
+    // Wait for both directions. Streams stay alive on this task's stack.
+    let (c2b_result, b2c_result) = tokio::join!(c2b_handle, b2c_handle);
+
+    // Close pipes after both directions complete.
+    unsafe {
+        libc::close(c2b_pipe_r);
+        libc::close(c2b_pipe_w);
+        libc::close(b2c_pipe_r);
+        libc::close(b2c_pipe_w);
+    }
+
+    // Keep streams alive until pipes are closed.
+    let _ = (&client, &backend);
+
+    let c2b = c2b_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
+    let b2c = b2c_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
+    Ok((c2b, b2c))
+}
+
+/// Run the io_uring splice loop for one direction on a blocking thread.
+#[cfg(target_os = "linux")]
+fn io_uring_splice_direction(
+    src_fd: i32,
+    pipe_w: i32,
+    pipe_r: i32,
+    dst_fd: i32,
+    timeout_ms: u64,
+) -> Result<u64, anyhow::Error> {
+    let start = coarse_now_ms();
+    match crate::socket_opts::io_uring_splice::io_uring_splice_loop(src_fd, pipe_w, pipe_r, dst_fd)
+    {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            // Check for idle timeout
+            if timeout_ms > 0 && coarse_now_ms().saturating_sub(start) >= timeout_ms {
+                Err(anyhow::anyhow!("TCP idle timeout (io_uring splice)"))
+            } else {
+                Err(anyhow::anyhow!("io_uring splice error: {}", e))
             }
         }
     }

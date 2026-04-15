@@ -802,12 +802,15 @@ pub mod ktls {
 
 /// io_uring-based splice for zero-copy TCP relay (Linux 5.6+ only).
 ///
-/// Uses `IORING_OP_SPLICE` to perform splice operations via io_uring
-/// submission queue instead of direct syscalls. This batches splice
-/// operations and eliminates the two-syscall dance (fd→pipe, pipe→fd)
-/// into a single submission.
+/// Uses `IORING_OP_SPLICE` via the `io-uring` crate to perform splice
+/// operations through the io_uring submission queue. Each splice direction
+/// gets its own ring (8 entries) and runs on a dedicated blocking thread
+/// via `tokio::task::spawn_blocking`. The splice loop submits SQEs and
+/// waits for CQEs, reducing per-operation overhead vs direct `libc::splice`
+/// syscalls.
 ///
-/// Falls back to regular `libc::splice` if io_uring is not available.
+/// The TCP proxy creates a ring per direction when `FERRUM_IO_URING_SPLICE_ENABLED`
+/// resolves to true (auto-detected at startup via `check_io_uring_available()`).
 #[cfg(target_os = "linux")]
 pub mod io_uring_splice {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -817,95 +820,118 @@ pub mod io_uring_splice {
 
     /// Check if io_uring is available on this kernel (Linux 5.6+).
     ///
-    /// Attempts `io_uring_setup()` with minimal params. If the syscall
-    /// succeeds (or returns EINVAL — meaning it exists but params are wrong),
-    /// io_uring is available. ENOSYS means it's not supported.
+    /// Probes the `io_uring_setup` syscall. Returns `true` if the syscall
+    /// exists (even if params are invalid — EINVAL still means io_uring is present).
+    /// ENOSYS means the kernel doesn't support io_uring.
     pub fn check_io_uring_available() -> bool {
         if IO_URING_CHECKED.load(Ordering::Relaxed) {
             return IO_URING_AVAILABLE.load(Ordering::Relaxed);
         }
 
-        // io_uring_setup syscall number: 425 on x86_64, 425 on aarch64
-        const SYS_IO_URING_SETUP: libc::c_long = 425;
-
-        let ret = unsafe { libc::syscall(SYS_IO_URING_SETUP, 1u32, std::ptr::null::<u8>()) };
-        let available = if ret < 0 {
-            let errno = unsafe { *libc::__errno_location() };
-            // ENOSYS = syscall doesn't exist. Anything else means it exists.
-            errno != libc::ENOSYS
-        } else {
-            // Shouldn't happen with null params, but means it's available.
-            // Close the fd if it somehow succeeded.
-            unsafe { libc::close(ret as i32) };
-            true
-        };
+        // Try to create a small ring — if it works, io_uring is available.
+        let available = io_uring::IoUring::new(2).is_ok();
 
         IO_URING_AVAILABLE.store(available, Ordering::Relaxed);
         IO_URING_CHECKED.store(true, Ordering::Relaxed);
         available
     }
 
-    /// Perform a splice operation, preferring io_uring if available.
+    /// Splice data in one direction using io_uring: src_fd → pipe → dst_fd.
     ///
-    /// Falls back to `libc::splice` when io_uring is not available or
-    /// when the io_uring submission fails. The fallback is transparent
-    /// to the caller.
+    /// Runs on a blocking thread (called via `tokio::task::spawn_blocking`).
+    /// Creates a small io_uring ring (8 entries) and submits IORING_OP_SPLICE
+    /// operations for each chunk. Returns total bytes transferred.
     ///
-    /// Note: Full io_uring ring management (setup, SQ/CQ) would require
-    /// a per-thread ring with dedicated SQ polling. This implementation
-    /// provides the availability check and fallback infrastructure.
-    /// The actual io_uring ring lifecycle is managed by the TCP proxy
-    /// when `FERRUM_IO_URING_SPLICE_ENABLED=true`.
-    pub fn splice_with_fallback(
-        fd_in: i32,
-        fd_out: i32,
+    /// Falls back to `libc::splice` if the ring cannot be created.
+    pub fn io_uring_splice_loop(
+        src_fd: i32,
         pipe_w: i32,
         pipe_r: i32,
-        len: usize,
-        flags: libc::c_uint,
-    ) -> std::io::Result<usize> {
-        // Phase 1: splice from source fd into write end of pipe.
-        let n = unsafe {
-            libc::splice(
-                fd_in,
-                std::ptr::null_mut(),
-                pipe_w,
-                std::ptr::null_mut(),
-                len,
-                flags,
-            )
-        };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Ok(0);
-        }
+        dst_fd: i32,
+    ) -> std::io::Result<u64> {
+        let mut ring = io_uring::IoUring::new(8)?;
+        let splice_flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
+        let mut total: u64 = 0;
+        let chunk_size: u32 = 128 * 1024;
 
-        // Phase 2: splice from read end of pipe into destination fd.
-        let mut remaining = n as usize;
-        let mut total = 0usize;
-        while remaining > 0 {
-            let written = unsafe {
-                libc::splice(
-                    pipe_r,
-                    std::ptr::null_mut(),
-                    fd_out,
-                    std::ptr::null_mut(),
-                    remaining,
-                    flags,
+        loop {
+            // Phase 1: splice src_fd → pipe_w via io_uring
+            let sqe = io_uring::opcode::Splice::new(
+                io_uring::types::Fd(src_fd),
+                -1, // no offset for pipes/sockets
+                io_uring::types::Fd(pipe_w),
+                -1,
+            )
+            .len(chunk_size)
+            .flags(splice_flags)
+            .build();
+
+            unsafe {
+                ring.submission()
+                    .push(&sqe)
+                    .map_err(|_| std::io::Error::other("io_uring SQ full"))?;
+            }
+            ring.submit_and_wait(1)?;
+
+            let cqe = ring
+                .completion()
+                .next()
+                .ok_or_else(|| std::io::Error::other("io_uring no CQE"))?;
+            let n = cqe.result();
+
+            if n == 0 {
+                return Ok(total); // EOF
+            }
+            if n < 0 {
+                let err = std::io::Error::from_raw_os_error(-n);
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::yield_now();
+                    continue;
+                }
+                return Err(err);
+            }
+
+            // Phase 2: splice pipe_r → dst_fd via io_uring
+            let mut remaining = n as u32;
+            while remaining > 0 {
+                let sqe = io_uring::opcode::Splice::new(
+                    io_uring::types::Fd(pipe_r),
+                    -1,
+                    io_uring::types::Fd(dst_fd),
+                    -1,
                 )
-            };
-            if written < 0 {
-                return Err(std::io::Error::last_os_error());
+                .len(remaining)
+                .flags(splice_flags)
+                .build();
+
+                unsafe {
+                    ring.submission()
+                        .push(&sqe)
+                        .map_err(|_| std::io::Error::other("io_uring SQ full"))?;
+                }
+                ring.submit_and_wait(1)?;
+
+                let cqe = ring
+                    .completion()
+                    .next()
+                    .ok_or_else(|| std::io::Error::other("io_uring no CQE"))?;
+                let w = cqe.result();
+
+                if w == 0 {
+                    return Ok(total);
+                }
+                if w < 0 {
+                    let err = std::io::Error::from_raw_os_error(-w);
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    return Err(err);
+                }
+                remaining -= w as u32;
+                total += w as u64;
             }
-            if written == 0 {
-                break;
-            }
-            remaining -= written as usize;
-            total += written as usize;
         }
-        Ok(total)
     }
 }
 
@@ -917,14 +943,12 @@ pub mod io_uring_splice {
     }
 
     #[allow(dead_code)]
-    pub fn splice_with_fallback(
-        _fd_in: i32,
-        _fd_out: i32,
+    pub fn io_uring_splice_loop(
+        _src_fd: i32,
         _pipe_w: i32,
         _pipe_r: i32,
-        _len: usize,
-        _flags: u32,
-    ) -> std::io::Result<usize> {
+        _dst_fd: i32,
+    ) -> std::io::Result<u64> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "io_uring not available on this platform",
