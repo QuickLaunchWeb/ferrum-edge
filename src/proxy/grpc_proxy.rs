@@ -408,50 +408,36 @@ impl GrpcConnectionPool {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        // Resolve backend hostname via DNS cache, keeping the IpAddr to
-        // construct SocketAddr directly (avoids IPv6 bracketing issues with
-        // string parsing).
-        let resolved_ip = dns_cache
+        // Resolve backend hostname via DNS cache
+        let target_host = match dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
             )
             .await
-            .ok();
-
-        let target_host = match &resolved_ip {
-            Some(ip) => ip.to_string(),
-            None => host.clone(),
+        {
+            Ok(ip) => ip.to_string(),
+            Err(_) => host.clone(),
         };
 
-        let addr = format!("{}:{}", target_host, port);
+        // Build SocketAddr from host + port. Parses the host as an IpAddr
+        // first (handles both IPv4 and IPv6 from dns_cache), then constructs
+        // SocketAddr directly to avoid IPv6 bracketing issues with string
+        // formatting. Falls back to "host:port" string parsing for raw
+        // hostnames (DNS cache miss where host is still a hostname string).
+        let sock_addr = target_host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .or_else(|_| format!("{}:{}", target_host, port).parse::<std::net::SocketAddr>())
+            .map_err(|e| {
+                GrpcProxyError::BackendUnavailable(format!(
+                    "Invalid backend address {}:{}: {}",
+                    target_host, port, e
+                ))
+            })?;
+        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-
-        // Build SocketAddr from the resolved IpAddr + port directly.
-        // When DNS resolution failed, fall back to ToSocketAddrs via
-        // tokio::net::lookup_host (which handles hostname:port strings).
-        let sock_addr: std::net::SocketAddr = match resolved_ip {
-            Some(ip) => std::net::SocketAddr::new(ip, port),
-            None => {
-                // Fallback: hostname didn't resolve via cache, use system DNS
-                tokio::net::lookup_host(&addr)
-                    .await
-                    .map_err(|e| {
-                        GrpcProxyError::BackendUnavailable(format!(
-                            "DNS resolution failed for {}: {}",
-                            addr, e
-                        ))
-                    })?
-                    .next()
-                    .ok_or_else(|| {
-                        GrpcProxyError::BackendUnavailable(format!(
-                            "DNS returned no addresses for {}",
-                            addr
-                        ))
-                    })?
-            }
-        };
 
         // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
         // before connect() so the kernel can co-select ephemeral ports.
