@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run mode (no actual cancellation)'
+        description: 'Dry run mode (no actual rejection)'
         required: false
         default: 'false'
         type: choice
@@ -14,21 +14,21 @@ on:
           - 'true'
           - 'false'
       max_age_minutes:
-        description: 'Cancel runs waiting for review longer than this many minutes'
+        description: 'Reject pending reviews older than this many minutes'
         required: false
         default: '20'
         type: string
 
-permissions:
-  actions: write
-  contents: read
+# Note: REVIEW_TOKEN secret (a PAT from a named environment reviewer) is
+# required because GITHUB_TOKEN cannot approve/reject deployment reviews.
+# The PAT needs repo scope (classic) or actions:write (fine-grained).
 
 jobs:
   cleanup-pending-reviews:
-    name: Cancel stale pending reviews
+    name: Auto-reject stale pending reviews
     runs-on: ubuntu-latest
     steps:
-      - name: Cancel stale workflow runs waiting for deployment review
+      - name: Reject stale pending deployment reviews
         run: |
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           MAX_AGE_MINUTES="${{ github.event.inputs.max_age_minutes || '20' }}"
@@ -37,7 +37,7 @@ jobs:
           echo "Max age threshold: $MAX_AGE_MINUTES minutes"
 
           CUTOFF_EPOCH=$(date -d "$MAX_AGE_MINUTES minutes ago" +%s 2>/dev/null || date -v-${MAX_AGE_MINUTES}M +%s)
-          CANCELLED_COUNT=0
+          REJECTED_COUNT=0
           SKIPPED_COUNT=0
 
           # List workflow runs that are waiting for deployment review (paginated)
@@ -71,27 +71,50 @@ jobs:
             AGE_SECONDS=$(($(date +%s) - STARTED_EPOCH))
             AGE_MINUTES=$((AGE_SECONDS / 60))
 
-            if [[ "$STARTED_EPOCH" -le "$CUTOFF_EPOCH" ]]; then
-              echo "  Run is ${AGE_MINUTES}m old (>= ${MAX_AGE_MINUTES}m threshold)"
-              if [[ "$DRY_RUN" == "true" ]]; then
-                echo "  [DRY RUN] Would cancel run $RUN_ID"
-              else
-                echo "  Cancelling run $RUN_ID..."
-                if gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/cancel" \
-                  --method POST > /dev/null 2>&1; then
-                  echo "  Cancelled run $RUN_ID"
-                else
-                  echo "  Warning: cancel failed for run $RUN_ID (may have already completed)"
-                fi
-              fi
-              CANCELLED_COUNT=$((CANCELLED_COUNT + 1))
-            else
+            if [[ "$STARTED_EPOCH" -gt "$CUTOFF_EPOCH" ]]; then
               echo "  Run is ${AGE_MINUTES}m old (< ${MAX_AGE_MINUTES}m threshold), skipping"
               SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
             fi
+
+            echo "  Run is ${AGE_MINUTES}m old (>= ${MAX_AGE_MINUTES}m threshold)"
+
+            # Get pending deployment environment IDs for this run
+            PENDING_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" 2>/dev/null || echo "[]")
+            ENV_IDS=$(echo "$PENDING_JSON" | jq '[.[].environment.id]')
+            ENV_COUNT=$(echo "$ENV_IDS" | jq 'length')
+
+            if [[ "$ENV_COUNT" -eq 0 ]]; then
+              echo "  No pending deployments, skipping"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            ENV_NAMES=$(echo "$PENDING_JSON" | jq -r '[.[].environment.name] | join(", ")')
+            echo "  Found $ENV_COUNT pending environment(s): $ENV_NAMES"
+
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "  [DRY RUN] Would reject $ENV_COUNT environment(s) for run $RUN_ID"
+            else
+              echo "  Rejecting $ENV_COUNT environment(s) for run $RUN_ID..."
+              PAYLOAD=$(jq -n --argjson ids "$ENV_IDS" '{
+                environment_ids: $ids,
+                state: "rejected",
+                comment: "Auto-rejected: pending > '"$MAX_AGE_MINUTES"' minutes (cleanup-pending-reviews workflow)"
+              }')
+
+              RESPONSE=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" \
+                --method POST \
+                --input - <<< "$PAYLOAD" 2>&1) && {
+                echo "  Rejected run $RUN_ID"
+              } || {
+                echo "  Warning: rejection failed for run $RUN_ID: $RESPONSE"
+              }
+            fi
+            REJECTED_COUNT=$((REJECTED_COUNT + 1))
           done <<< "$WAITING_RUNS"
 
           echo ""
-          echo "Summary: $CANCELLED_COUNT run(s) cancelled, $SKIPPED_COUNT skipped"
+          echo "Summary: $REJECTED_COUNT run(s) rejected, $SKIPPED_COUNT skipped"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.REVIEW_TOKEN }}
