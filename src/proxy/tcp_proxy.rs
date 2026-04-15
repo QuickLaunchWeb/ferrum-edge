@@ -1436,6 +1436,10 @@ async fn bidirectional_splice_io_uring(
 }
 
 /// Run the io_uring splice loop for one direction on a blocking thread.
+///
+/// Falls back to libc::splice if io_uring ring creation fails (memlock
+/// pressure, resource limits). The idle timeout is checked inline inside
+/// the io_uring loop to prevent indefinite blocking on idle connections.
 #[cfg(target_os = "linux")]
 fn io_uring_splice_direction(
     src_fd: i32,
@@ -1444,17 +1448,92 @@ fn io_uring_splice_direction(
     dst_fd: i32,
     timeout_ms: u64,
 ) -> Result<u64, anyhow::Error> {
-    let start = coarse_now_ms();
-    match crate::socket_opts::io_uring_splice::io_uring_splice_loop(src_fd, pipe_w, pipe_r, dst_fd)
-    {
+    let start_ms = coarse_now_ms();
+    match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
+        src_fd, pipe_w, pipe_r, dst_fd, start_ms, timeout_ms,
+    ) {
         Ok(bytes) => Ok(bytes),
-        Err(e) => {
-            // Check for idle timeout
-            if timeout_ms > 0 && coarse_now_ms().saturating_sub(start) >= timeout_ms {
-                Err(anyhow::anyhow!("TCP idle timeout (io_uring splice)"))
-            } else {
-                Err(anyhow::anyhow!("io_uring splice error: {}", e))
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            // io_uring ring creation failed — fall back to libc::splice.
+            // This can happen under memlock pressure even though startup
+            // probing succeeded.
+            tracing::debug!("io_uring ring creation failed, falling back to libc splice");
+            libc_splice_loop(src_fd, pipe_w, pipe_r, dst_fd, timeout_ms)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(anyhow::anyhow!("TCP idle timeout (io_uring splice)"))
+        }
+        Err(e) => Err(anyhow::anyhow!("io_uring splice error: {}", e)),
+    }
+}
+
+/// Fallback libc::splice loop for when io_uring ring creation fails.
+/// Same logic as `splice_one_direction_no_guard` but synchronous (runs
+/// on a blocking thread).
+#[cfg(target_os = "linux")]
+fn libc_splice_loop(
+    src_fd: i32,
+    pipe_w: i32,
+    pipe_r: i32,
+    dst_fd: i32,
+    timeout_ms: u64,
+) -> Result<u64, anyhow::Error> {
+    let start_ms = coarse_now_ms();
+    let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
+    let mut total: u64 = 0;
+
+    loop {
+        if timeout_ms > 0 && coarse_now_ms().saturating_sub(start_ms) >= timeout_ms {
+            return Err(anyhow::anyhow!("TCP idle timeout (libc splice fallback)"));
+        }
+
+        let n = unsafe {
+            libc::splice(
+                src_fd,
+                std::ptr::null_mut(),
+                pipe_w,
+                std::ptr::null_mut(),
+                128 * 1024,
+                splice_flags,
+            )
+        };
+
+        if n > 0 {
+            let mut remaining = n as usize;
+            while remaining > 0 {
+                let written = unsafe {
+                    libc::splice(
+                        pipe_r,
+                        std::ptr::null_mut(),
+                        dst_fd,
+                        std::ptr::null_mut(),
+                        remaining,
+                        splice_flags,
+                    )
+                };
+                if written > 0 {
+                    remaining -= written as usize;
+                    total += written as u64;
+                } else if written == 0 {
+                    return Ok(total);
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("splice write error: {}", err));
+                }
             }
+        } else if n == 0 {
+            return Ok(total);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            return Err(anyhow::anyhow!("splice read error: {}", err));
         }
     }
 }

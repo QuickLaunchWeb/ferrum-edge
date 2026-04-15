@@ -842,19 +842,48 @@ pub mod io_uring_splice {
     /// Creates a small io_uring ring (8 entries) and submits IORING_OP_SPLICE
     /// operations for each chunk. Returns total bytes transferred.
     ///
-    /// Falls back to `libc::splice` if the ring cannot be created.
+    /// Returns `Err` with `ErrorKind::Unsupported` if the ring cannot be created,
+    /// signaling the caller to fall back to `libc::splice`.
+    ///
+    /// `timeout_ms` is checked between splice iterations — if elapsed time since
+    /// `start_ms` exceeds the timeout, returns `ErrorKind::TimedOut`. Pass 0 to
+    /// disable the idle timeout.
     pub fn io_uring_splice_loop(
         src_fd: i32,
         pipe_w: i32,
         pipe_r: i32,
         dst_fd: i32,
+        start_ms: u64,
+        timeout_ms: u64,
     ) -> std::io::Result<u64> {
-        let mut ring = io_uring::IoUring::new(8)?;
+        let mut ring = match io_uring::IoUring::new(8) {
+            Ok(r) => r,
+            Err(_) => {
+                // Ring creation failed (memlock pressure, resource limits).
+                // Signal caller to fall back to libc::splice.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "io_uring ring creation failed, falling back to libc splice",
+                ));
+            }
+        };
         let splice_flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
         let mut total: u64 = 0;
         let chunk_size: u32 = 128 * 1024;
 
         loop {
+            // Inline idle timeout check — prevents indefinite blocking on
+            // idle connections (matches the libc splice path behavior).
+            if timeout_ms > 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if now.saturating_sub(start_ms) >= timeout_ms {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+            }
+
             // Phase 1: splice src_fd → pipe_w via io_uring
             let sqe = io_uring::opcode::Splice::new(
                 io_uring::types::Fd(src_fd),
@@ -885,7 +914,8 @@ pub mod io_uring_splice {
             if n < 0 {
                 let err = std::io::Error::from_raw_os_error(-n);
                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                    std::thread::yield_now();
+                    // Back off to avoid tight spin — sleep 1ms then retry.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 return Err(err);
@@ -923,7 +953,7 @@ pub mod io_uring_splice {
                 if w < 0 {
                     let err = std::io::Error::from_raw_os_error(-w);
                     if err.kind() == std::io::ErrorKind::WouldBlock {
-                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
                     return Err(err);
@@ -948,6 +978,8 @@ pub mod io_uring_splice {
         _pipe_w: i32,
         _pipe_r: i32,
         _dst_fd: i32,
+        _start_ms: u64,
+        _timeout_ms: u64,
     ) -> std::io::Result<u64> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
