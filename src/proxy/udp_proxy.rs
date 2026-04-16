@@ -310,12 +310,16 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             let _ = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us);
             let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
         }
-        // UDP_GRO: kernel coalesces same-size datagrams into a single large buffer (Linux 5.0+).
-        // The recvmmsg path uses cmsg buffers to extract the GRO segment size and splits
-        // coalesced payloads into individual datagrams before processing.
-        if udp_gro_enabled && let Err(e) = crate::socket_opts::set_udp_gro(fd, true) {
-            warn!(proxy_id = %proxy_id, "Failed to enable UDP_GRO: {} (falling back to non-GRO)", e);
-        }
+        // UDP_GRO cannot be enabled because the primary receive path uses
+        // tokio's recv_from() in the select! loop, which doesn't expose cmsg
+        // metadata. GRO-coalesced buffers from recv_from would be forwarded as
+        // single oversized datagrams, breaking UDP message boundaries.
+        // The recvmmsg drain loop has cmsg parsing for GRO splitting, but it's
+        // only the secondary path — the first datagram per wakeup always goes
+        // through recv_from. GRO requires ALL receive paths to support cmsg.
+        // To enable GRO, the entire receive loop would need to be rewritten to
+        // use recvmmsg as the primary wakeup mechanism (via AsyncFd + try_io).
+        let _ = udp_gro_enabled;
     }
 
     // GSO is applied at send time in the reply handler — the flag is threaded through
@@ -2068,8 +2072,17 @@ async fn create_session(
                                     e
                                 );
                                 gso_failed = true;
-                                // Replay buffered datagrams through sendmmsg instead of dropping.
-                                gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
+                                // Replay buffered datagrams through sendmmsg.
+                                // Loop: drain may partially fill send_batch — flush and repeat.
+                                loop {
+                                    gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
+                                    if gso_batch.is_empty() {
+                                        break;
+                                    }
+                                    // send_batch full — flush it and drain more.
+                                    use std::os::unix::io::AsRawFd;
+                                    let _ = send_batch.flush(frontend.as_raw_fd());
+                                }
                                 send_batch.push(send_data, client_addr);
                             } else {
                                 gso_batch.push(send_data);
@@ -2163,10 +2176,17 @@ async fn create_session(
                                                     e
                                                 );
                                                 gso_failed = true;
-                                                gso_batch.drain_to_sendmmsg(
-                                                    &mut send_batch,
-                                                    client_addr,
-                                                );
+                                                loop {
+                                                    gso_batch.drain_to_sendmmsg(
+                                                        &mut send_batch,
+                                                        client_addr,
+                                                    );
+                                                    if gso_batch.is_empty() {
+                                                        break;
+                                                    }
+                                                    use std::os::unix::io::AsRawFd;
+                                                    let _ = send_batch.flush(frontend.as_raw_fd());
+                                                }
                                                 send_batch.push(&buf[..len2], client_addr);
                                             } else {
                                                 gso_batch.push(&buf[..len2]);
@@ -2246,8 +2266,15 @@ async fn create_session(
                             e
                         );
                         gso_failed = true;
-                        // Replay buffered datagrams through sendmmsg instead of dropping.
-                        gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
+                        // Replay all buffered datagrams through sendmmsg.
+                        loop {
+                            gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
+                            if gso_batch.is_empty() {
+                                break;
+                            }
+                            use std::os::unix::io::AsRawFd;
+                            let _ = send_batch.flush(frontend.as_raw_fd());
+                        }
                     }
                 }
                 // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).
