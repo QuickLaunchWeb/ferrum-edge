@@ -163,7 +163,7 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
 
-Retries fire on transport errors and 5xx responses. A **4xx response aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`.
+Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
 
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
@@ -1004,7 +1004,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `max_retries` | integer | `3` | Retry attempts on failure |
 | `retry_delay_ms` | integer | `1000` | Delay between retries |
 
-Retries fire on transport errors and 5xx responses. A **4xx response aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`.
+Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests, which Loki uses for ingestion throttling) are transient signals and are retried within the configured budget.
 
 ### `transaction_debugger`
 

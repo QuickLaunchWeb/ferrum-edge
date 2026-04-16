@@ -419,8 +419,15 @@ async fn send_batch(cfg: &LokiBatchConfig, batch: Vec<LokiEntry>) {
                     "Loki logging batch failed with status {} (attempt {}/{})",
                     status, attempt, total_attempts,
                 );
-                // 4xx is a client error (bad payload, auth) — retrying won't fix it.
-                if status.is_client_error() {
+                // 4xx is a client error (bad payload, auth) — retrying won't
+                // fix it. Exceptions: 408 (Request Timeout) and 429 (Too Many
+                // Requests) are transient throttling signals (Loki uses 429
+                // for ingestion rate-limits) and should be retried within the
+                // configured budget.
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
                     warn!(
                         "Loki logging batch discarded due to {} response ({} entries lost)",
                         status, entry_count,
