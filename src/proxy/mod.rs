@@ -693,23 +693,58 @@ impl ProxyState {
             crls.clone(),
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
-            env_config_arc
-                .tcp_fastopen_enabled
-                .resolve(crate::socket_opts::is_tcp_fastopen_available),
+            {
+                let v = env_config_arc
+                    .tcp_fastopen_enabled
+                    .resolve(crate::socket_opts::is_tcp_fastopen_available);
+                tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
+                v
+            },
             overload.clone(),
-            env_config_arc
-                .ktls_enabled
-                .resolve(crate::socket_opts::ktls::is_ktls_available),
-            env_config_arc
-                .io_uring_splice_enabled
-                .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available),
+            {
+                let v = env_config_arc
+                    .ktls_enabled
+                    .resolve(crate::socket_opts::ktls::is_ktls_available);
+                if v {
+                    tracing::info!("kTLS auto-detection: enabled (full key install probe passed)");
+                } else {
+                    tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
+                }
+                v
+            },
+            {
+                let v = env_config_arc
+                    .io_uring_splice_enabled
+                    .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
+                if v {
+                    tracing::info!(
+                        "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
+                    );
+                } else {
+                    tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
+                }
+                v
+            },
             env_config_arc.so_busy_poll_us,
-            env_config_arc
-                .udp_gro_enabled
-                .resolve(crate::socket_opts::is_udp_gro_available),
-            env_config_arc
-                .udp_gso_enabled
-                .resolve(crate::socket_opts::is_udp_gso_available),
+            {
+                let v = env_config_arc
+                    .udp_gro_enabled
+                    .resolve(crate::socket_opts::is_udp_gro_available);
+                // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
+                tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
+                v
+            },
+            {
+                let v = env_config_arc
+                    .udp_gso_enabled
+                    .resolve(crate::socket_opts::is_udp_gso_available);
+                if v {
+                    tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
+                } else {
+                    tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
+                }
+                v
+            },
         ));
 
         Ok(Self {
