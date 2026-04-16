@@ -91,6 +91,25 @@ pub mod _test_support {
         .await
     }
 
+    /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
+    /// unit tests. Only available on Linux — on other platforms there is no
+    /// splice path to exercise.
+    #[cfg(target_os = "linux")]
+    pub async fn bidirectional_splice_for_test(
+        client: tokio::net::TcpStream,
+        backend: tokio::net::TcpStream,
+        idle_timeout: Option<std::time::Duration>,
+        pipe_size: usize,
+    ) -> StreamCopyResult {
+        crate::proxy::tcp_proxy::bidirectional_splice_for_test(
+            client,
+            backend,
+            idle_timeout,
+            pipe_size,
+        )
+        .await
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two

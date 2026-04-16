@@ -274,3 +274,154 @@ async fn test_bidirectional_copy_half_close_idle_timeout_fires_in_phase2() {
     assert_eq!(*dir, Direction::Unknown);
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
 }
+
+// ── bidirectional_splice direction tests (Linux only) ────────────────────────
+
+/// Helper: returns two real connected `TcpStream`s over the loopback interface.
+/// Needed because splice(2) operates on raw file descriptors and cannot be
+/// driven through `tokio::io::duplex`.
+#[cfg(target_os = "linux")]
+async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    use tokio::net::{TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client_res, server_res) =
+        tokio::join!(TcpStream::connect(addr), async { listener.accept().await });
+    let client = client_res.unwrap();
+    let (server, _peer_addr) = server_res.unwrap();
+    (client, server)
+}
+
+/// Regression test for the Linux splice path — mirror of
+/// `test_bidirectional_copy_half_close_delayed_response_not_truncated`.
+///
+/// Before the fix, `bidirectional_splice`'s Phase 2 unconditionally wrapped the
+/// remaining direction in a 100ms grace timeout, truncating slow backend
+/// responses on plaintext TCP passthrough (SMTP, IMAP, HTTP-over-TCP).
+/// With the fix, clean EOF on one side transitions to an unbounded wait on
+/// the other (still bounded by the overall idle timeout).
+///
+/// Note: this test does not rely on half-close FIN propagation across the
+/// proxy (which `splice_one_direction_no_guard` does not do — unlike the
+/// `copy_one_direction` path, which calls `writer.shutdown()` on EOF). The
+/// backend reads a fixed request length, then starts its response delay.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_half_close_delayed_response_not_truncated() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let request = b"REQUEST";
+
+    // External client sends the request, then half-closes its write side so
+    // the proxy sees EOF on its c2b read. The splice c2b direction completes
+    // cleanly (clean_eof path) while b2c is still pending.
+    tokio::spawn(async move {
+        let _ = external_client.write_all(request).await;
+        let _ = external_client.shutdown().await;
+        // Hold the read side open to receive the response.
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+
+    // External backend reads exactly `request.len()` bytes, then delays past
+    // BIDIRECTIONAL_DRAIN_GRACE (300ms > 100ms) before writing the response.
+    let response_len: usize = 1024;
+    let expected_request_len = request.len();
+    tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut buf = [0u8; 32];
+        while received < expected_request_len {
+            match external_backend.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(_) => break,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let response = vec![0xAAu8; response_len];
+        let _ = external_backend.write_all(&response).await;
+        let _ = external_backend.shutdown().await;
+    });
+
+    // Generous idle timeout so it never fires during the 300ms delay.
+    let result = bidirectional_splice_for_test(
+        proxy_client_side,
+        proxy_backend_side,
+        Some(Duration::from_secs(5)),
+        64 * 1024,
+    )
+    .await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "half-close + delayed response on splice path should complete cleanly, got {:?}",
+        result.first_failure
+    );
+    // The entire backend response must reach the client — without the fix,
+    // b2c would be cut off at 100ms.
+    assert_eq!(
+        result.bytes_backend_to_client, response_len as u64,
+        "full backend response must be relayed on splice path; got {} of {} bytes",
+        result.bytes_backend_to_client, response_len
+    );
+    assert_eq!(result.bytes_client_to_backend, request.len() as u64);
+}
+
+/// Verify the idle-timeout fallback still fires on the splice path during the
+/// unbounded Phase 2 wait when the backend never responds after a clean
+/// client half-close.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_half_close_idle_timeout_fires_in_phase2() {
+    use ferrum_edge::_test_support::bidirectional_splice_for_test;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let request = b"PING";
+
+    // External client sends and half-closes immediately.
+    tokio::spawn(async move {
+        let _ = external_client.write_all(request).await;
+        let _ = external_client.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+
+    // External backend reads the fixed-length request, then holds the
+    // connection open without writing anything — forces b2c to stall.
+    let expected_request_len = request.len();
+    tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut buf = [0u8; 32];
+        while received < expected_request_len {
+            match external_backend.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(_) => break,
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+
+    // Short idle timeout so the test completes quickly.
+    let result = bidirectional_splice_for_test(
+        proxy_client_side,
+        proxy_backend_side,
+        Some(Duration::from_millis(500)),
+        64 * 1024,
+    )
+    .await;
+
+    let (dir, class) = result
+        .first_failure
+        .as_ref()
+        .expect("idle timeout on stalled backend (splice path) must produce first_failure");
+    assert_eq!(*dir, Direction::Unknown);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+}

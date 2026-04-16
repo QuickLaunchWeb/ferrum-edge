@@ -66,6 +66,20 @@ where
     bidirectional_copy(client, backend, idle_timeout, buf_size).await
 }
 
+/// Crate-visible entry point to the Linux `bidirectional_splice` for the
+/// `_test_support` module. Only available on Linux because splice(2) is the
+/// Linux zero-copy relay path; on other platforms `bidirectional_copy` is used.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) async fn bidirectional_splice_for_test(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    pipe_size: usize,
+) -> StreamCopyResult {
+    bidirectional_splice(client, backend, idle_timeout, pipe_size).await
+}
+
 /// Cached backend TLS configuration to avoid reading certificate files from
 /// disk on every connection. Built once per listener lifecycle and reused.
 struct CachedBackendTlsConfig {
@@ -1591,12 +1605,23 @@ where
 ///
 /// Creates a kernel pipe for each direction (client→backend, backend→client) and
 /// uses `splice()` to move data through the pipe without userspace copies.
-/// Returns (bytes_client_to_backend, bytes_backend_to_client).
 ///
 /// Both directions run within a single task using `tokio::select!` instead of
 /// spawning two separate tasks. This halves task overhead (creation, scheduling,
-/// memory) per TCP connection. When one direction hits EOF, the other gets a brief
-/// grace period to drain remaining data.
+/// memory) per TCP connection.
+///
+/// After Phase 1 (race the two directions) completes, Phase 2 waits for the
+/// remaining direction with the same semantics as `bidirectional_copy`:
+///
+/// * If Phase 1 ended with a **clean EOF** (one side finished its splice without
+///   error), the remaining direction is awaited **unbounded** — this preserves
+///   half-close semantics for request/response protocols (SMTP, IMAP,
+///   HTTP-over-TCP passthrough) where the client finishes sending first and
+///   the backend then takes arbitrary time to respond. The idle timeout still
+///   applies, so a stuck peer cannot wedge the connection indefinitely.
+/// * If Phase 1 ended with an **error** or the **idle timeout** fired, the
+///   remaining direction is awaited with a short 100ms grace window so we
+///   can capture any error it would produce without hanging on a bad peer.
 ///
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
@@ -1715,27 +1740,97 @@ async fn bidirectional_splice(
         }
     }
 
-    // Phase 2: give the other half a brief grace window to drain remaining data.
+    // Phase 2: drain the remaining direction.
+    //
+    // Two cases:
+    //
+    // * **Clean EOF** (`first_failure.is_none()`): one side finished its splice
+    //   without error — most commonly a half-close where the client finished
+    //   sending and the backend is still generating a large/slow response (or
+    //   vice versa). Wait for the remaining direction to complete naturally,
+    //   bounded only by the idle timeout. Capping this at 100ms would truncate
+    //   response bodies on request/response protocols (SMTP, IMAP, HTTP-over-
+    //   TCP passthrough) whenever the peer takes longer than 100ms to respond.
+    //
+    // * **Error or idle timeout** (`first_failure.is_some()`): both halves are
+    //   likely in a bad state. Give the remaining direction a brief grace
+    //   window to capture any error it would produce, then move on. Do not
+    //   block the connection teardown on a stuck peer.
+    let clean_eof = first_failure.is_none();
     if !c2b_done {
-        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if first_failure.is_none() {
-                    first_failure = Some((Direction::ClientToBackend, classify_stream_error(&e)));
+        if clean_eof {
+            // Unbounded wait, still bounded by the idle timeout so a stuck
+            // peer can't wedge the connection indefinitely.
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut c2b_fut => {
+                        if let Err(e) = result {
+                            first_failure =
+                                Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                        if let Some(ref la) = last_activity {
+                            let last = la.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                                first_failure =
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            Err(_) => {}
+        } else {
+            match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_failure.is_none() {
+                        first_failure =
+                            Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                    }
+                }
+                Err(_) => { /* grace expired — leave counters as-is */ }
+            }
         }
     }
     if !b2c_done {
-        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if first_failure.is_none() {
-                    first_failure = Some((Direction::BackendToClient, classify_stream_error(&e)));
+        if clean_eof {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut b2c_fut => {
+                        if let Err(e) = result {
+                            first_failure =
+                                Some((Direction::BackendToClient, classify_stream_error(&e)));
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                        if let Some(ref la) = last_activity {
+                            let last = la.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                                first_failure =
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            Err(_) => {}
+        } else {
+            match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_failure.is_none() {
+                        first_failure =
+                            Some((Direction::BackendToClient, classify_stream_error(&e)));
+                    }
+                }
+                Err(_) => { /* grace expired — leave counters as-is */ }
+            }
         }
     }
 
