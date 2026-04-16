@@ -194,7 +194,6 @@ impl ProxyBody {
     /// `log_with_mirror` fires after the body reaches a terminal state
     /// (successful completion, streaming error, or client disconnect)
     /// rather than at the moment response headers are flushed.
-    #[allow(dead_code)]
     pub fn with_logger(
         mut self,
         logger: Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,

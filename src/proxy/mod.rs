@@ -5184,7 +5184,12 @@ async fn handle_proxy_request_inner(
                 let gateway_overhead_ms =
                     (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
-                if !plugins.is_empty() {
+                // Build the summary up front so we can either log synchronously
+                // (body_exceeded early-return path) or defer via the streaming
+                // body wrapper (non-exceeded streaming path).
+                let deferred_grpc_logger: Option<
+                    Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
+                > = if !plugins.is_empty() {
                     let grpc_resolved_ip = state
                         .dns_cache
                         .resolve(
@@ -5225,8 +5230,24 @@ async fn handle_proxy_request_inner(
                         mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-                }
+                    if body_exceeded {
+                        // Request body exceeded the size limit; we're about to
+                        // return a trailers-only RESOURCE_EXHAUSTED error. The
+                        // response body never streams, so log synchronously here.
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        None
+                    } else {
+                        // Streaming gRPC response: defer so the summary reflects
+                        // mid-body RST, client cancellation, and partial bytes.
+                        Some(crate::proxy::deferred_log::DeferredTransactionLogger::new(
+                            summary,
+                            Arc::clone(&plugins),
+                            Arc::new(ctx.clone()),
+                        ))
+                    }
+                } else {
+                    None
+                };
 
                 if body_exceeded {
                     record_request(&state, 200);
@@ -5270,6 +5291,11 @@ async fn handle_proxy_request_inner(
                         cl,
                         state.h2_coalesce_target_bytes,
                     )
+                };
+                let body = if let Some(logger) = deferred_grpc_logger {
+                    body.with_logger(logger)
+                } else {
+                    body
                 };
 
                 return Ok(resp_builder.body(body).unwrap_or_else(|_| {
@@ -5973,40 +5999,73 @@ async fn handle_proxy_request_inner(
     let gateway_processing_ms = total_ms - effective_backend_ms;
     let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
 
-    // Log phase — skip TransactionSummary construction when no plugins need it
-    if !plugins.is_empty() {
-        let summary = TransactionSummary {
-            namespace: proxy.namespace.clone(),
-            timestamp_received: ctx.timestamp_received.to_rfc3339(),
-            client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx.effective_identity().map(str::to_owned),
-            http_method: method,
-            request_path: path,
-            matched_proxy_id: Some(proxy.id.clone()),
-            matched_proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-            backend_resolved_ip,
-            response_status_code: response_status,
-            latency_total_ms: total_ms,
-            latency_gateway_processing_ms: gateway_processing_ms,
-            latency_backend_ttfb_ms: backend_ttfb_ms,
-            latency_backend_total_ms: backend_total_ms,
-            latency_plugin_execution_ms: plugin_execution_ms,
-            latency_plugin_external_io_ms: plugin_external_io_ms,
-            latency_gateway_overhead_ms: gateway_overhead_ms,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
-            response_streamed: is_streaming_response,
-            client_disconnected: false,
-            error_class: backend_error_class,
-            body_error_class: None,
-            body_completed: false,
-            bytes_streamed_to_client: 0,
-            mirror: false,
-            metadata: ctx.metadata.clone(),
-        };
+    // Log phase — skip TransactionSummary construction when no plugins need it.
+    //
+    // For streaming responses (Streaming / StreamingH2 / StreamingH3), defer
+    // the log until the response body reaches a terminal state. At this point
+    // only response headers have been flushed to hyper; the body is still being
+    // polled out. Firing the log synchronously would record
+    // `client_disconnected=false, body_completed=false` even if hyper then
+    // cancels the connection mid-stream. The DeferredTransactionLogger attaches
+    // to the ProxyBody wrapper and fires on success (Ready(None)), streaming
+    // error (Ready(Some(Err))), or the Drop safety net (client disconnected
+    // before completion). See `src/proxy/deferred_log.rs`.
+    //
+    // Note: a plugin reject during after_proxy/on_response_body/on_final_response_body
+    // can replace the originally-streaming body with a Buffered one. We branch on
+    // the *current* `response_body` rather than the captured `is_streaming_response`
+    // (which tracks the original backend behavior for observability).
+    let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
+        if !plugins.is_empty() {
+            let summary = TransactionSummary {
+                namespace: proxy.namespace.clone(),
+                timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                client_ip: ctx.client_ip.clone(),
+                consumer_username: ctx.effective_identity().map(str::to_owned),
+                http_method: method,
+                request_path: path,
+                matched_proxy_id: Some(proxy.id.clone()),
+                matched_proxy_name: proxy.name.clone(),
+                backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                backend_resolved_ip,
+                response_status_code: response_status,
+                latency_total_ms: total_ms,
+                latency_gateway_processing_ms: gateway_processing_ms,
+                latency_backend_ttfb_ms: backend_ttfb_ms,
+                latency_backend_total_ms: backend_total_ms,
+                latency_plugin_execution_ms: plugin_execution_ms,
+                latency_plugin_external_io_ms: plugin_external_io_ms,
+                latency_gateway_overhead_ms: gateway_overhead_ms,
+                request_user_agent: ctx.headers.get("user-agent").cloned(),
+                response_streamed: is_streaming_response,
+                client_disconnected: false,
+                error_class: backend_error_class,
+                body_error_class: None,
+                body_completed: false,
+                bytes_streamed_to_client: 0,
+                mirror: false,
+                metadata: ctx.metadata.clone(),
+            };
 
-        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-    }
+            let body_will_stream = matches!(
+                &response_body,
+                ResponseBody::Streaming(_)
+                    | ResponseBody::StreamingH2(_)
+                    | ResponseBody::StreamingH3(_)
+            );
+            if body_will_stream {
+                Some(crate::proxy::deferred_log::DeferredTransactionLogger::new(
+                    summary,
+                    Arc::clone(&plugins),
+                    Arc::new(ctx.clone()),
+                ))
+            } else {
+                crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                None
+            }
+        } else {
+            None
+        };
 
     // Inject sticky session cookie when cookie-based consistent hashing selected a new session
     if sticky_cookie_needed
@@ -6203,6 +6262,16 @@ async fn handle_proxy_request_inner(
             }
         }
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
+    };
+
+    // Attach deferred logger to the body so `log_with_mirror` fires when the
+    // body reaches a terminal state (completion, streaming error, or client
+    // disconnect via the Drop safety net) rather than at header-flush time.
+    // `deferred_logger` is `Some` only for streaming responses with plugins.
+    let body = if let Some(logger) = deferred_logger {
+        body.with_logger(logger)
+    } else {
+        body
     };
 
     Ok(resp_builder
