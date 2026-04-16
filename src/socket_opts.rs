@@ -704,11 +704,32 @@ pub mod ktls {
     /// This is a best-effort check — kTLS can still fail per-socket if the
     /// negotiated cipher is unsupported.
     pub fn is_ktls_available() -> bool {
-        // Check if the tls module is already loaded by examining /proc/modules.
-        if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
-            return modules.lines().any(|l| l.starts_with("tls "));
+        // Probe by trying setsockopt(TCP_ULP, "tls") on a temp TCP socket.
+        // This works whether kTLS is a loadable module or built-in (CONFIG_TLS=y).
+        // The /proc/modules approach misses built-in kTLS.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return false;
         }
-        false
+        let ulp_name = b"tls\0";
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_ULP,
+                ulp_name.as_ptr() as *const libc::c_void,
+                ulp_name.len() as libc::socklen_t,
+            )
+        };
+        unsafe { libc::close(fd) };
+        // ENOPROTOOPT = kernel doesn't support kTLS. Any other result (including
+        // ENOTCONN which some kernels return on unconnected sockets) means the
+        // ULP exists — we'll handle per-socket failures in try_ktls_splice().
+        if ret == 0 {
+            return true;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        errno != libc::ENOPROTOOPT
     }
 }
 
@@ -1066,6 +1087,36 @@ pub fn is_udp_gso_available() -> bool {
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 pub fn is_udp_gso_available() -> bool {
+    false
+}
+
+/// Check if MSG_ZEROCOPY (SO_ZEROCOPY) is available by probing on a temp socket.
+///
+/// Creates a temporary TCP socket, attempts `setsockopt(SO_ZEROCOPY, 1)`, and
+/// closes it. Returns `true` if the setsockopt succeeds (Linux 4.14+).
+#[cfg(target_os = "linux")]
+pub fn is_msg_zerocopy_available() -> bool {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return false;
+    }
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ZEROCOPY,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    unsafe { libc::close(fd) };
+    ret == 0
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn is_msg_zerocopy_available() -> bool {
     false
 }
 

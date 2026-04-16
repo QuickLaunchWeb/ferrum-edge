@@ -703,10 +703,9 @@ impl ProxyState {
             env_config_arc
                 .io_uring_splice_enabled
                 .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available),
-            env_config_arc.msg_zerocopy_enabled.resolve(|| {
-                // MSG_ZEROCOPY is available on Linux 4.14+. On non-Linux it's a no-op.
-                cfg!(target_os = "linux")
-            }),
+            env_config_arc
+                .msg_zerocopy_enabled
+                .resolve(crate::socket_opts::is_msg_zerocopy_available),
             env_config_arc.so_busy_poll_us,
             env_config_arc
                 .udp_gro_enabled
