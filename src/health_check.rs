@@ -702,7 +702,15 @@ async fn http_probe(
             }
         }
         Err(e) => {
-            debug!("HTTP health probe failed for {}: {}", url, e);
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "HTTP health probe: PORT EXHAUSTION connecting to {}: {}",
+                    url,
+                    e
+                );
+            } else {
+                debug!("HTTP health probe failed for {}: {}", url, e);
+            }
             false
         }
     }
@@ -824,10 +832,19 @@ async fn grpc_probe(
         {
             Ok(ch) => ch,
             Err(e) => {
-                debug!(
-                    "gRPC health probe: connect failed for {}:{}: {}",
-                    host, port, e
-                );
+                if crate::retry::is_port_exhaustion_message(&format!("{}", e)) {
+                    tracing::error!(
+                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
+                        host,
+                        port,
+                        e
+                    );
+                } else {
+                    debug!(
+                        "gRPC health probe: connect failed for {}:{}: {}",
+                        host, port, e
+                    );
+                }
                 return false;
             }
         }
@@ -877,10 +894,19 @@ async fn grpc_probe(
         match tokio::time::timeout(timeout, endpoint.connect()).await {
             Ok(Ok(ch)) => ch,
             Ok(Err(e)) => {
-                debug!(
-                    "gRPC health probe: connect failed for {}:{}: {}",
-                    host, port, e
-                );
+                if crate::retry::is_port_exhaustion_message(&format!("{}", e)) {
+                    tracing::error!(
+                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
+                        host,
+                        port,
+                        e
+                    );
+                } else {
+                    debug!(
+                        "gRPC health probe: connect failed for {}:{}: {}",
+                        host, port, e
+                    );
+                }
                 return false;
             }
             Err(_) => {
@@ -892,10 +918,19 @@ async fn grpc_probe(
         match tokio::time::timeout(timeout, endpoint.connect()).await {
             Ok(Ok(ch)) => ch,
             Ok(Err(e)) => {
-                debug!(
-                    "gRPC health probe: connect failed for {}:{}: {}",
-                    host, port, e
-                );
+                if crate::retry::is_port_exhaustion_message(&format!("{}", e)) {
+                    tracing::error!(
+                        "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
+                        host,
+                        port,
+                        e
+                    );
+                } else {
+                    debug!(
+                        "gRPC health probe: connect failed for {}:{}: {}",
+                        host, port, e
+                    );
+                }
                 return false;
             }
             Err(_) => {
