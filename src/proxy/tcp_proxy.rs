@@ -1044,8 +1044,14 @@ async fn handle_tcp_connection_inner(
                                     .await
                             }
                             Err(KtlsError::Installed(e)) => {
-                                // kTLS keys were installed but splice failed — connection
-                                // is consumed, propagate the error.
+                                // Unrecoverable: TLS stream was consumed via into_inner()
+                                // + dangerous_extract_secrets(). The raw TcpStream has no
+                                // TLS layer — bidirectional_copy would forward plaintext.
+                                // This path only triggers if SOL_TLS key install fails
+                                // AFTER the pre-flight TCP_ULP probe succeeded (e.g.,
+                                // kernel cipher mismatch or ENOMEM). In practice this is
+                                // extremely rare since we validate cipher/version before
+                                // extracting secrets.
                                 Err(e)
                             }
                         }

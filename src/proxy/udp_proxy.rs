@@ -2083,7 +2083,12 @@ async fn create_session(
                                     use std::os::unix::io::AsRawFd;
                                     let _ = send_batch.flush(frontend.as_raw_fd());
                                 }
-                                send_batch.push(send_data, client_addr);
+                                // Push the current datagram — flush if batch is full from drain.
+                                if !send_batch.push(send_data, client_addr) {
+                                    use std::os::unix::io::AsRawFd;
+                                    let _ = send_batch.flush(frontend.as_raw_fd());
+                                    send_batch.push(send_data, client_addr);
+                                }
                             } else {
                                 gso_batch.push(send_data);
                             }
@@ -2187,7 +2192,11 @@ async fn create_session(
                                                     use std::os::unix::io::AsRawFd;
                                                     let _ = send_batch.flush(frontend.as_raw_fd());
                                                 }
-                                                send_batch.push(&buf[..len2], client_addr);
+                                                if !send_batch.push(&buf[..len2], client_addr) {
+                                                    use std::os::unix::io::AsRawFd;
+                                                    let _ = send_batch.flush(frontend.as_raw_fd());
+                                                    send_batch.push(&buf[..len2], client_addr);
+                                                }
                                             } else {
                                                 gso_batch.push(&buf[..len2]);
                                             }
