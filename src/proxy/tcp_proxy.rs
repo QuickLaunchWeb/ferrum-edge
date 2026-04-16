@@ -1477,8 +1477,8 @@ async fn bidirectional_splice(
 /// the async yield_now polling loop used by the libc splice path and reduces
 /// per-operation syscall overhead.
 ///
-/// The caller must keep `client` and `backend` alive until this function
-/// returns (they own the fds that the blocking threads use).
+/// Resource management is fully RAII: pipe fds are managed by `SplicePipeGuard`,
+/// and `client`/`backend` streams stay alive on the stack until after the join.
 #[cfg(target_os = "linux")]
 async fn bidirectional_splice_io_uring(
     client: TcpStream,
@@ -1491,9 +1491,12 @@ async fn bidirectional_splice_io_uring(
     let client_fd = client.as_raw_fd();
     let backend_fd = backend.as_raw_fd();
 
-    // Create pipes — managed manually since spawn_blocking captures fd ints.
+    // Create pipes with RAII guards — guards close fds on drop, ensuring cleanup
+    // even if spawn_blocking panics or the function returns early.
     let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let _c2b_guard = SplicePipeGuard(c2b_pipe_r, c2b_pipe_w);
     let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+    let _b2c_guard = SplicePipeGuard(b2c_pipe_r, b2c_pipe_w);
 
     let timeout_ms = idle_timeout
         .filter(|t| !t.is_zero())
@@ -1519,28 +1522,17 @@ async fn bidirectional_splice_io_uring(
         )
     });
 
-    // Wait for both directions. Streams stay alive on this task's stack.
+    // Wait for both directions. Streams (`client`, `backend`) stay alive on this
+    // stack frame until the function returns. Pipe guards (`_c2b_guard`, `_b2c_guard`)
+    // close pipe fds on drop. All resource cleanup is RAII — no manual close needed.
     let (c2b_result, b2c_result) = tokio::join!(c2b_handle, b2c_handle);
-
-    // Close pipes after both directions complete.
-    unsafe {
-        libc::close(c2b_pipe_r);
-        libc::close(c2b_pipe_w);
-        libc::close(b2c_pipe_r);
-        libc::close(b2c_pipe_w);
-    }
 
     let c2b = c2b_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
     let b2c = b2c_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
-
-    // Explicitly drop streams AFTER extracting results. The blocking threads
-    // use the raw fds (integers) which are only valid while the streams own them.
-    // This is NOT redundant — without it, the compiler could drop the streams
-    // before the join completes in a future refactor.
-    drop(client);
-    drop(backend);
-
     Ok((c2b, b2c))
+    // Drop order (guaranteed by Rust): c2b, b2c returned → _b2c_guard closes pipes →
+    // _c2b_guard closes pipes → backend dropped (fd closed) → client dropped (fd closed).
+    // Blocking threads have already joined, so raw fds are no longer in use.
 }
 
 /// Run the io_uring splice loop for one direction on a blocking thread.
