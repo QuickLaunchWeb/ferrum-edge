@@ -338,9 +338,9 @@ impl SendMmsgBatch {
         };
 
         if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            self.count = 0;
-            return Err(err);
+            // Preserve the batch on error so the caller can retry or drain.
+            // This is consistent with GsoBatchBuf::flush_to which also preserves.
+            return Err(std::io::Error::last_os_error());
         }
 
         let sent = ret as usize;

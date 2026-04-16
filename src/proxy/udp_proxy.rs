@@ -184,16 +184,11 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
 fn flush_gso_batch(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     frontend: &Arc<UdpSocket>,
-    connected_reply_socket: &Option<std::sync::Arc<UdpSocket>>,
     client_addr: SocketAddr,
 ) -> std::io::Result<usize> {
     use std::os::unix::io::AsRawFd;
-    if let Some(ref cs) = connected_reply_socket {
-        gso_batch.flush_connected(cs.as_raw_fd())
-    } else {
-        let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage_pub(client_addr);
-        gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len)
-    }
+    let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage_pub(client_addr);
+    gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len)
 }
 
 /// Configuration for starting a UDP proxy listener.
@@ -1940,15 +1935,7 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
-        // Connected UDP sockets (SO_REUSEADDR+SO_REUSEPORT bound to the listen port)
-        // would steal incoming datagrams via 4-tuple demux, so they cannot be used
-        // safely in the per-session reply path. The sendmmsg and GSO batch paths
-        // provide equivalent syscall reduction for the reply direction.
-        // The FERRUM_UDP_CONNECTED_SOCKETS_ENABLED flag and create_connected_udp_socket()
-        // infrastructure remain available for future use on the listener recv path
-        // where the socket owns its port exclusively.
-        let connected_reply_socket: Option<std::sync::Arc<UdpSocket>> = None;
-        let _ = reply_udp_connected_sockets;
+        let _ = reply_udp_connected_sockets; // reserved for future recv-path connected sockets
         let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
@@ -2089,12 +2076,8 @@ async fn create_session(
                     if reply_udp_gso && !gso_failed {
                         if !gso_batch.push(send_data) {
                             // Different size or buffer full — flush current batch, then push new.
-                            let flush_result = flush_gso_batch(
-                                &mut gso_batch,
-                                &frontend,
-                                &connected_reply_socket,
-                                client_addr,
-                            );
+                            let flush_result =
+                                flush_gso_batch(&mut gso_batch, &frontend, client_addr);
                             if let Err(e) = flush_result {
                                 // GSO failed — fall back to sendmmsg for the rest of this session.
                                 debug!(
@@ -2115,27 +2098,19 @@ async fn create_session(
                         send_batch.push(send_data, client_addr);
                     }
                 }
-            } else {
-                // Use connected socket (send) when available, fallback to send_to.
-                let send_result = if let Some(ref cs) = connected_reply_socket {
-                    cs.send(send_data).await.map(|_| ())
-                } else {
-                    frontend.send_to(send_data, client_addr).await.map(|_| ())
-                };
-                if let Err(e) = send_result {
-                    debug!(
-                        proxy_id = %reply_proxy_id,
-                        client = %client_addr,
-                        "UDP send to client failed: {}",
-                        e
-                    );
-                    let error_message = e.to_string();
-                    disconnect_error = Some((
-                        error_message.clone(),
-                        crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
-                    ));
-                    break;
-                }
+            } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
+                debug!(
+                    proxy_id = %reply_proxy_id,
+                    client = %client_addr,
+                    "UDP send to client failed: {}",
+                    e
+                );
+                let error_message = e.to_string();
+                disconnect_error = Some((
+                    error_message.clone(),
+                    crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
+                ));
+                break;
             }
 
             // For plain UDP, drain additional pending replies without yielding.
@@ -2197,7 +2172,6 @@ async fn create_session(
                                             let flush_result = flush_gso_batch(
                                                 &mut gso_batch,
                                                 &frontend,
-                                                &connected_reply_socket,
                                                 client_addr,
                                             );
                                             if let Err(e) = flush_result {
@@ -2224,66 +2198,52 @@ async fn create_session(
                                         send_batch.push(&buf[..len2], client_addr);
                                     }
                                 }
-                            } else {
-                                let sr2 = if let Some(ref cs) = connected_reply_socket {
-                                    cs.send(&buf[..len2]).await.map(|_| ())
-                                } else {
-                                    frontend
-                                        .send_to(&buf[..len2], client_addr)
-                                        .await
-                                        .map(|_| ())
-                                };
-                                if let Err(e) = sr2 {
-                                    debug!(
-                                        proxy_id = %reply_proxy_id,
-                                        client = %client_addr,
-                                        "UDP send to client failed: {}",
-                                        e
-                                    );
-                                    // Flush what we have and exit.
-                                    reply_session.last_activity.store(now, Ordering::Relaxed);
-                                    reply_session
-                                        .bytes_received
-                                        .fetch_add(batch_bytes_received, Ordering::Relaxed);
-                                    reply_metrics
-                                        .datagrams_out
-                                        .fetch_add(batch_dgrams, Ordering::Relaxed);
-                                    reply_metrics
-                                        .bytes_out
-                                        .fetch_add(batch_bytes, Ordering::Relaxed);
-                                    // Exit outer loop via return.
-                                    if let Some(ref dtls) = reply_dtls {
-                                        dtls.close().await;
-                                    }
-                                    // Only decrement if we actually removed (cleanup may have already).
-                                    if reply_sessions.remove(&client_addr).is_some() {
-                                        reply_metrics
-                                            .active_sessions
-                                            .fetch_sub(1, Ordering::Relaxed);
-                                        let error_message = e.to_string();
-                                        emit_udp_stream_disconnect(
-                                            &reply_plugins,
-                                            UdpDisconnectContext {
-                                                namespace: &reply_proxy_namespace,
-                                                proxy_id: &reply_proxy_id,
-                                                proxy_name: reply_proxy_name.as_deref(),
-                                                client_addr,
-                                                session: &reply_session,
-                                                backend_protocol: reply_backend_protocol,
-                                                listen_port: reply_listen_port,
-                                                disconnected_ms: now,
-                                                connection_error: Some(error_message.clone()),
-                                                error_class: Some(
-                                                    crate::retry::classify_boxed_error(
-                                                        anyhow::anyhow!(error_message).as_ref(),
-                                                    ),
-                                                ),
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                    return;
+                            } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
+                            {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %client_addr,
+                                    "UDP send to client failed: {}",
+                                    e
+                                );
+                                reply_session.last_activity.store(now, Ordering::Relaxed);
+                                reply_session
+                                    .bytes_received
+                                    .fetch_add(batch_bytes_received, Ordering::Relaxed);
+                                reply_metrics
+                                    .datagrams_out
+                                    .fetch_add(batch_dgrams, Ordering::Relaxed);
+                                reply_metrics
+                                    .bytes_out
+                                    .fetch_add(batch_bytes, Ordering::Relaxed);
+                                if let Some(ref dtls) = reply_dtls {
+                                    dtls.close().await;
                                 }
+                                if reply_sessions.remove(&client_addr).is_some() {
+                                    reply_metrics
+                                        .active_sessions
+                                        .fetch_sub(1, Ordering::Relaxed);
+                                    let error_message = e.to_string();
+                                    emit_udp_stream_disconnect(
+                                        &reply_plugins,
+                                        UdpDisconnectContext {
+                                            namespace: &reply_proxy_namespace,
+                                            proxy_id: &reply_proxy_id,
+                                            proxy_name: reply_proxy_name.as_deref(),
+                                            client_addr,
+                                            session: &reply_session,
+                                            backend_protocol: reply_backend_protocol,
+                                            listen_port: reply_listen_port,
+                                            disconnected_ms: now,
+                                            connection_error: Some(error_message.clone()),
+                                            error_class: Some(crate::retry::classify_boxed_error(
+                                                anyhow::anyhow!(error_message).as_ref(),
+                                            )),
+                                        },
+                                    )
+                                    .await;
+                                }
+                                return;
                             }
                         }
                         Err(_) => break, // WouldBlock — socket drained
@@ -2296,12 +2256,7 @@ async fn create_session(
             if send_batched {
                 // Flush GSO batch first (if used).
                 if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
-                    let flush_result = flush_gso_batch(
-                        &mut gso_batch,
-                        &frontend,
-                        &connected_reply_socket,
-                        client_addr,
-                    );
+                    let flush_result = flush_gso_batch(&mut gso_batch, &frontend, client_addr);
                     if let Err(e) = flush_result {
                         debug!(
                             proxy_id = %reply_proxy_id,

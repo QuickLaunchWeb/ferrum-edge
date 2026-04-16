@@ -685,13 +685,15 @@ pub mod ktls {
             rec_seq: *seq,
         };
         info.key.copy_from_slice(key);
-        // IV layout: first 4 bytes = salt (implicit nonce), next 8 bytes = explicit IV.
-        if iv.len() >= 12 {
-            info.salt.copy_from_slice(&iv[..4]);
-            info.iv.copy_from_slice(&iv[4..12]);
-        } else if iv.len() >= 4 {
-            info.salt.copy_from_slice(&iv[..4]);
+        // IV must be exactly 12 bytes for AES-GCM (4 salt + 8 explicit nonce).
+        if iv.len() < 12 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("AES-128-GCM IV must be 12 bytes, got {}", iv.len()),
+            ));
         }
+        info.salt.copy_from_slice(&iv[..4]);
+        info.iv.copy_from_slice(&iv[4..12]);
 
         let optname = if is_tx { TLS_TX } else { TLS_RX };
         let ret = unsafe {
@@ -733,12 +735,14 @@ pub mod ktls {
             rec_seq: *seq,
         };
         info.key.copy_from_slice(key);
-        if iv.len() >= 12 {
-            info.salt.copy_from_slice(&iv[..4]);
-            info.iv.copy_from_slice(&iv[4..12]);
-        } else if iv.len() >= 4 {
-            info.salt.copy_from_slice(&iv[..4]);
+        if iv.len() < 12 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("AES-256-GCM IV must be 12 bytes, got {}", iv.len()),
+            ));
         }
+        info.salt.copy_from_slice(&iv[..4]);
+        info.iv.copy_from_slice(&iv[4..12]);
 
         let optname = if is_tx { TLS_TX } else { TLS_RX };
         let ret = unsafe {

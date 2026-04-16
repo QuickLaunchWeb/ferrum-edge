@@ -1159,34 +1159,94 @@ fn try_next_target(
 
 /// Connect to a plain TCP backend with the given connect timeout.
 ///
-/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation
-/// to connect() for better 4-tuple distribution) and `TCP_FASTOPEN_CONNECT`
-/// (saves 1 RTT on repeat connections) when `tcp_fastopen` is true.
+/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` and `TCP_FASTOPEN_CONNECT`
+/// BEFORE `connect()` so they take effect on the connection attempt. These
+/// must be set pre-connect: `IP_BIND_ADDRESS_NO_PORT` defers ephemeral port
+/// allocation to `connect()` for 4-tuple co-selection, and `TCP_FASTOPEN_CONNECT`
+/// sends data in the SYN packet.
 async fn connect_backend_plain(
     addr: SocketAddr,
     connect_timeout: Duration,
-    _tcp_fastopen: bool,
+    tcp_fastopen: bool,
 ) -> Result<TcpStream, anyhow::Error> {
-    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
-        .await
-        .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
-    let _ = stream.set_nodelay(true);
-
-    // Apply Linux/Unix socket optimizations on the connected socket.
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-        // IP_BIND_ADDRESS_NO_PORT: defer ephemeral port allocation to connect(),
-        // enabling 4-tuple co-selection to prevent port exhaustion at high rates.
+    // On Linux, create the socket manually so we can set socket options
+    // BEFORE connect(). tokio's TcpStream::connect() creates+connects in
+    // one shot, which is too late for IP_BIND_ADDRESS_NO_PORT and TFO.
+    #[cfg(target_os = "linux")]
+    let stream = {
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        let fd = unsafe {
+            libc::socket(
+                domain,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(anyhow::anyhow!(
+                "socket() failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // Apply options BEFORE connect.
         let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
-        if _tcp_fastopen {
-            // TCP_FASTOPEN_CONNECT: send data in SYN on repeat connections (1 RTT saved).
+        if tcp_fastopen {
             let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
         }
-    }
 
+        // Convert to std TcpStream, then tokio TcpStream for async connect.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        std_stream.set_nonblocking(true).ok();
+        let socket2_sock = socket2::Socket::from(std_stream);
+        let sock_addr = socket2::SockAddr::from(addr);
+
+        // Non-blocking connect — returns WouldBlock immediately.
+        match socket2_sock.connect(&sock_addr) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!("Backend connect failed to {}: {}", addr, e));
+            }
+        }
+
+        let std_stream: std::net::TcpStream = socket2_sock.into();
+        let tokio_stream = TcpStream::from_std(std_stream)
+            .map_err(|e| anyhow::anyhow!("Failed to convert to tokio TcpStream: {}", e))?;
+
+        // Wait for connect to complete (or timeout).
+        tokio::time::timeout(connect_timeout, tokio_stream.writable())
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
+            .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
+
+        // Check for connect error.
+        if let Some(err) = tokio_stream.take_error()? {
+            return Err(anyhow::anyhow!(
+                "Backend connect failed to {}: {}",
+                addr,
+                err
+            ));
+        }
+
+        tokio_stream
+    };
+
+    // Non-Linux: use tokio's built-in connect (no pre-connect options needed).
+    #[cfg(not(target_os = "linux"))]
+    let stream = {
+        let _ = tcp_fastopen;
+        tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
+            .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?
+    };
+
+    let _ = stream.set_nodelay(true);
     Ok(stream)
 }
 
@@ -1438,11 +1498,16 @@ async fn bidirectional_splice_io_uring(
         libc::close(b2c_pipe_w);
     }
 
-    // Keep streams alive until pipes are closed.
-    let _ = (&client, &backend);
-
     let c2b = c2b_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
     let b2c = b2c_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
+
+    // Explicitly drop streams AFTER extracting results. The blocking threads
+    // use the raw fds (integers) which are only valid while the streams own them.
+    // This is NOT redundant — without it, the compiler could drop the streams
+    // before the join completes in a future refactor.
+    drop(client);
+    drop(backend);
+
     Ok((c2b, b2c))
 }
 
@@ -1636,7 +1701,7 @@ async fn splice_one_direction_no_guard(
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
                         // Destination not ready — yield and retry
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
                     }
                     return Err(anyhow::anyhow!("splice write error: {}", err));
@@ -1649,7 +1714,7 @@ async fn splice_one_direction_no_guard(
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
                 // Source not ready — yield and retry
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
                 continue;
             }
             return Err(anyhow::anyhow!("splice read error: {}", err));
