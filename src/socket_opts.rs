@@ -10,6 +10,29 @@
 #[cfg(target_os = "linux")]
 use tracing::debug;
 
+// ── Monotonic coarse clock ──────────────────────────────────────────────────
+
+/// Returns monotonic milliseconds since the first call to this function.
+///
+/// Uses `std::time::Instant` under a `OnceLock` so the clock NEVER goes
+/// backwards, regardless of NTP slew, admin clock changes, or daylight
+/// savings transitions. `SystemTime::now()` (wall clock) must not be used
+/// for idle-timeout tracking because `saturating_sub` would pin the
+/// elapsed duration at 0 after a backwards clock jump, and the timeout
+/// would never fire.
+///
+/// Resolution is sub-microsecond (matches `Instant`). The value has no
+/// meaningful zero — it is only defined relative to prior calls within
+/// the same process.
+#[inline]
+pub fn monotonic_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as u64
+}
+
 // ── IP_BIND_ADDRESS_NO_PORT ─────────────────────────────────────────────────
 
 /// Enable `IP_BIND_ADDRESS_NO_PORT` on a socket (Linux only).
@@ -678,49 +701,148 @@ pub mod ktls {
         // the ULP but reject key installation (e.g., CONFIG_TLS=y but cipher support
         // missing), causing connection drops at runtime.
         //
+        // IMPORTANT: We MUST use real TCP sockets here, not AF_UNIX socketpair.
+        // TCP_ULP with IPPROTO_TCP is only valid on TCP sockets; an AF_UNIX socket
+        // will return EOPNOTSUPP/ENOPROTOOPT on every kernel — even ones that
+        // fully support kTLS. Using socketpair(AF_UNIX, ...) would make this
+        // probe silently return false forever and defeat kTLS auto-detection.
+        //
         // Cost: ~1ms at startup (one-time). Worth it to avoid silent runtime failures.
+        unsafe { probe_ktls_via_tcp_loopback() }
+    }
+
+    /// Set up a real TCP loopback connection and run the kTLS setsockopt sequence
+    /// on the accepted server-side socket. Returns `true` iff BOTH the TCP_ULP
+    /// install AND the dummy AES-128-GCM TX key install returned 0.
+    ///
+    /// All syscalls are raw libc. On any failure anywhere in setup, we close
+    /// whatever fds we managed to open and return `false`.
+    #[allow(clippy::cast_possible_truncation)]
+    unsafe fn probe_ktls_via_tcp_loopback() -> bool {
         unsafe {
-            // Create a connected pair via socketpair (loopback).
-            let mut fds = [0i32; 2];
-            if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) < 0 {
+            // 1. Create listener socket, bind to 127.0.0.1:0, listen.
+            let listener_fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            if listener_fd < 0 {
                 return false;
             }
 
-            // Step 1: Install TCP_ULP "tls".
+            let mut addr: libc::sockaddr_in = std::mem::zeroed();
+            addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            // 127.0.0.1 in network byte order.
+            addr.sin_addr.s_addr = u32::to_be(0x7f000001);
+            addr.sin_port = 0;
+
+            let addr_ptr = &addr as *const libc::sockaddr_in as *const libc::sockaddr;
+            if libc::bind(
+                listener_fd,
+                addr_ptr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ) < 0
+            {
+                libc::close(listener_fd);
+                return false;
+            }
+
+            if libc::listen(listener_fd, 1) < 0 {
+                libc::close(listener_fd);
+                return false;
+            }
+
+            // Read back the assigned ephemeral port.
+            let mut assigned: libc::sockaddr_in = std::mem::zeroed();
+            let mut assigned_len: libc::socklen_t =
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            if libc::getsockname(
+                listener_fd,
+                &mut assigned as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                &mut assigned_len,
+            ) < 0
+            {
+                libc::close(listener_fd);
+                return false;
+            }
+
+            // 2. Create client socket, set O_NONBLOCK, connect (EINPROGRESS expected).
+            let client_fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            if client_fd < 0 {
+                libc::close(listener_fd);
+                return false;
+            }
+
+            let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
+            if flags < 0 || libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                libc::close(client_fd);
+                libc::close(listener_fd);
+                return false;
+            }
+
+            let connect_ret = libc::connect(
+                client_fd,
+                &assigned as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            if connect_ret < 0 {
+                let err = *libc::__errno_location();
+                if err != libc::EINPROGRESS {
+                    libc::close(client_fd);
+                    libc::close(listener_fd);
+                    return false;
+                }
+            }
+
+            // 3. Accept on listener.
+            let mut peer: libc::sockaddr_in = std::mem::zeroed();
+            let mut peer_len: libc::socklen_t =
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            let server_fd = libc::accept(
+                listener_fd,
+                &mut peer as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                &mut peer_len,
+            );
+            if server_fd < 0 {
+                libc::close(client_fd);
+                libc::close(listener_fd);
+                return false;
+            }
+
+            // We no longer need the listener.
+            libc::close(listener_fd);
+
+            // 4. Install TCP_ULP "tls" on the server-side TCP socket.
             let ulp_name = b"tls\0";
-            let ret = libc::setsockopt(
-                fds[0],
+            let ulp_ret = libc::setsockopt(
+                server_fd,
                 libc::IPPROTO_TCP,
                 libc::TCP_ULP,
                 ulp_name.as_ptr() as *const libc::c_void,
                 ulp_name.len() as libc::socklen_t,
             );
-            if ret != 0 {
-                libc::close(fds[0]);
-                libc::close(fds[1]);
+            if ulp_ret != 0 {
+                libc::close(server_fd);
+                libc::close(client_fd);
                 return false;
             }
 
-            // Step 2: Install dummy AES-128-GCM TX key.
+            // 5. Install dummy AES-128-GCM TX key to confirm the full path works.
             let info = TlsCryptoInfoAes128Gcm {
-                version: TLS_1_3_VERSION,
+                version: TLS_1_2_VERSION,
                 cipher_type: TLS_CIPHER_AES_GCM_128,
                 iv: [0u8; 8],
                 key: [0u8; 16],
                 salt: [0u8; 4],
                 rec_seq: [0u8; 8],
             };
-            let ret = libc::setsockopt(
-                fds[0],
+            let tx_ret = libc::setsockopt(
+                server_fd,
                 SOL_TLS,
                 TLS_TX,
                 &info as *const TlsCryptoInfoAes128Gcm as *const libc::c_void,
                 std::mem::size_of::<TlsCryptoInfoAes128Gcm>() as libc::socklen_t,
             );
 
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            ret == 0
+            libc::close(server_fd);
+            libc::close(client_fd);
+            tx_ret == 0
         }
     }
 }
@@ -811,12 +933,21 @@ pub mod io_uring_splice {
             .build();
             let push_ok = unsafe { ring.submission().push(&sqe).is_ok() };
             let result = if push_ok && ring.submit_and_wait(1).is_ok() {
-                // Check the CQE result — submit_and_wait succeeding only means
-                // the kernel processed the SQE. The CQE may carry -EINVAL or
-                // -EOPNOTSUPP if the SPLICE opcode is rejected by seccomp/config.
-                ring.completion()
-                    .next()
-                    .is_some_and(|cqe| cqe.result() >= 0)
+                // Check the CQE result. `result() >= 0` means the kernel accepted
+                // SPLICE and returned a byte count (possibly 0 for a 0-byte probe).
+                //
+                // We ALSO accept `result() == -EAGAIN`: for a 0-byte splice on an
+                // empty pipe, some kernels return -EAGAIN which indicates the
+                // SPLICE opcode was recognized and dispatched, but there was no
+                // data to move. That is exactly the expected state for this probe,
+                // so EAGAIN still proves the opcode is supported.
+                //
+                // Rejections we still treat as "io_uring SPLICE unavailable":
+                //   -EINVAL, -EOPNOTSUPP, -ENOSYS (seccomp or kernel config).
+                ring.completion().next().is_some_and(|cqe| {
+                    let r = cqe.result();
+                    r >= 0 || r == -libc::EAGAIN
+                })
             } else {
                 false
             };
@@ -873,11 +1004,15 @@ pub mod io_uring_splice {
             // Inline idle timeout check using the shared cross-direction timestamp.
             // Both splice directions update the same AtomicU64, so activity in either
             // direction prevents the other from timing out (critical for one-way streams).
+            //
+            // Uses `monotonic_now_ms()` (Instant-based) — NOT `SystemTime::now()` —
+            // because wall-clock time can slew backwards under NTP correction or
+            // admin clock changes, which would pin `saturating_sub` at 0 forever
+            // and cause the timeout to never fire. `shared_last_activity_ms` is
+            // also written by the libc fallback loop using the same helper, so the
+            // clocks on both sides of the shared atomic agree.
             if timeout_ms > 0 {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let now = super::monotonic_now_ms();
                 let last = shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if now.saturating_sub(last) >= timeout_ms {
                     return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
@@ -961,13 +1096,14 @@ pub mod io_uring_splice {
                 remaining -= w as u32;
                 total += w as u64;
                 // Refresh shared idle timeout — activity in either direction
-                // prevents the connection from timing out.
+                // prevents the connection from timing out. Must use the same
+                // monotonic clock as the reader loop above (and the libc
+                // fallback's `coarse_now_ms`) so the shared atomic is coherent.
                 if timeout_ms > 0 {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    shared_last_activity_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+                    shared_last_activity_ms.store(
+                        super::monotonic_now_ms(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         }

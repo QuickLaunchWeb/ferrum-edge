@@ -191,6 +191,86 @@ fn flush_gso_batch(
     gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len)
 }
 
+/// Try to enqueue a datagram into the GSO batch; on batch-full or size-mismatch,
+/// flush and retry, and on GSO socket failure drain the buffered datagrams
+/// through the sendmmsg fallback.
+///
+/// This collapses three near-identical GSO→sendmmsg fallback blocks that
+/// previously existed inline in `create_session`. Centralising it means the
+/// "post-flush push dropped the datagram" silent-drop guard (tracked as MED-5
+/// in the PR review) only has to be fixed in one place.
+///
+/// `gso_failed` is set to `true` if we have to abandon GSO for this session.
+/// The caller must stop calling this helper after that and drive `send_batch`
+/// directly.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn try_gso_send_or_fallback(
+    gso_batch: &mut super::udp_batch::GsoBatchBuf,
+    send_batch: &mut super::udp_batch::SendMmsgBatch,
+    frontend: &Arc<UdpSocket>,
+    client_addr: SocketAddr,
+    data: &[u8],
+    gso_failed: &mut bool,
+    proxy_id: &str,
+) {
+    use std::os::unix::io::AsRawFd;
+
+    if gso_batch.push(data) {
+        return;
+    }
+    // Batch full or size-mismatch — flush current batch and try once more.
+    match flush_gso_batch(gso_batch, frontend, client_addr) {
+        Ok(_) => {
+            if !gso_batch.push(data) {
+                // Post-flush push still refused (oversize / >max_bytes). Previously
+                // this datagram was silently dropped. Log and send it directly as
+                // a best-effort single datagram so at least we don't vanish it.
+                debug!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    size = data.len(),
+                    "GSO post-flush push refused datagram, sending directly"
+                );
+                let _ = frontend.send_to(data, client_addr).await;
+            }
+        }
+        Err(e) => {
+            // GSO sendmsg itself failed — abandon GSO for this session.
+            debug!(
+                proxy_id = %proxy_id,
+                client = %client_addr,
+                "GSO send failed ({}), falling back to sendmmsg",
+                e
+            );
+            *gso_failed = true;
+            // Drain already-buffered GSO datagrams through sendmmsg. Loop because
+            // `drain_to_sendmmsg` may partially fill `send_batch`; in that case we
+            // flush and keep draining.
+            loop {
+                gso_batch.drain_to_sendmmsg(send_batch, client_addr);
+                if gso_batch.is_empty() {
+                    break;
+                }
+                let _ = send_batch.flush(frontend.as_raw_fd());
+            }
+            // Now push the current datagram, flushing once if necessary.
+            if !send_batch.push(data, client_addr) {
+                let _ = send_batch.flush(frontend.as_raw_fd());
+                if !send_batch.push(data, client_addr) {
+                    debug!(
+                        proxy_id = %proxy_id,
+                        client = %client_addr,
+                        size = data.len(),
+                        "sendmmsg post-flush push refused datagram, sending directly"
+                    );
+                    let _ = frontend.send_to(data, client_addr).await;
+                }
+            }
+        }
+    }
+}
+
 /// Configuration for starting a UDP proxy listener.
 pub struct UdpListenerConfig {
     pub port: u16,
@@ -2059,40 +2139,16 @@ async fn create_session(
                 #[cfg(target_os = "linux")]
                 {
                     if reply_udp_gso && !gso_failed {
-                        if !gso_batch.push(send_data) {
-                            // Different size or buffer full — flush current batch, then push new.
-                            let flush_result =
-                                flush_gso_batch(&mut gso_batch, &frontend, client_addr);
-                            if let Err(e) = flush_result {
-                                // GSO failed — fall back to sendmmsg for the rest of this session.
-                                debug!(
-                                    proxy_id = %reply_proxy_id,
-                                    client = %client_addr,
-                                    "GSO send failed ({}), falling back to sendmmsg",
-                                    e
-                                );
-                                gso_failed = true;
-                                // Replay buffered datagrams through sendmmsg.
-                                // Loop: drain may partially fill send_batch — flush and repeat.
-                                loop {
-                                    gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
-                                    if gso_batch.is_empty() {
-                                        break;
-                                    }
-                                    // send_batch full — flush it and drain more.
-                                    use std::os::unix::io::AsRawFd;
-                                    let _ = send_batch.flush(frontend.as_raw_fd());
-                                }
-                                // Push the current datagram — flush if batch is full from drain.
-                                if !send_batch.push(send_data, client_addr) {
-                                    use std::os::unix::io::AsRawFd;
-                                    let _ = send_batch.flush(frontend.as_raw_fd());
-                                    send_batch.push(send_data, client_addr);
-                                }
-                            } else {
-                                gso_batch.push(send_data);
-                            }
-                        }
+                        try_gso_send_or_fallback(
+                            &mut gso_batch,
+                            &mut send_batch,
+                            &frontend,
+                            client_addr,
+                            send_data,
+                            &mut gso_failed,
+                            &reply_proxy_id,
+                        )
+                        .await;
                     } else {
                         send_batch.push(send_data, client_addr);
                     }
@@ -2166,41 +2222,16 @@ async fn create_session(
                                 #[cfg(target_os = "linux")]
                                 {
                                     if reply_udp_gso && !gso_failed {
-                                        if !gso_batch.push(&buf[..len2]) {
-                                            // Flush current GSO batch, then push the new datagram.
-                                            let flush_result = flush_gso_batch(
-                                                &mut gso_batch,
-                                                &frontend,
-                                                client_addr,
-                                            );
-                                            if let Err(e) = flush_result {
-                                                debug!(
-                                                    proxy_id = %reply_proxy_id,
-                                                    client = %client_addr,
-                                                    "GSO send failed ({}), falling back to sendmmsg",
-                                                    e
-                                                );
-                                                gso_failed = true;
-                                                loop {
-                                                    gso_batch.drain_to_sendmmsg(
-                                                        &mut send_batch,
-                                                        client_addr,
-                                                    );
-                                                    if gso_batch.is_empty() {
-                                                        break;
-                                                    }
-                                                    use std::os::unix::io::AsRawFd;
-                                                    let _ = send_batch.flush(frontend.as_raw_fd());
-                                                }
-                                                if !send_batch.push(&buf[..len2], client_addr) {
-                                                    use std::os::unix::io::AsRawFd;
-                                                    let _ = send_batch.flush(frontend.as_raw_fd());
-                                                    send_batch.push(&buf[..len2], client_addr);
-                                                }
-                                            } else {
-                                                gso_batch.push(&buf[..len2]);
-                                            }
-                                        }
+                                        try_gso_send_or_fallback(
+                                            &mut gso_batch,
+                                            &mut send_batch,
+                                            &frontend,
+                                            client_addr,
+                                            &buf[..len2],
+                                            &mut gso_failed,
+                                            &reply_proxy_id,
+                                        )
+                                        .await;
                                     } else if !send_batch.push(&buf[..len2], client_addr) {
                                         // Batch full — flush and push again.
                                         use std::os::unix::io::AsRawFd;

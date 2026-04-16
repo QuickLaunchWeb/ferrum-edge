@@ -1667,13 +1667,18 @@ impl Drop for SplicePipeGuard {
     }
 }
 
-/// Returns the current time as milliseconds since the Unix epoch.
-/// Used for coarse idle tracking — does not need sub-millisecond precision.
+/// Returns monotonic milliseconds since the process's first call to the shared
+/// clock helper. Used for coarse idle tracking — does not need sub-millisecond
+/// precision, but MUST be monotonic so wall-clock slew or NTP corrections
+/// cannot cause `saturating_sub` to pin the elapsed duration at 0 (which would
+/// disable the idle timeout).
+///
+/// Delegates to `crate::socket_opts::monotonic_now_ms` so the libc splice loop
+/// and the io_uring splice loop share the same clock via the
+/// `shared_last_activity_ms: Arc<AtomicU64>` they both read/write.
+#[inline]
 fn coarse_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::socket_opts::monotonic_now_ms()
 }
 
 /// Wraps an `AsyncRead + AsyncWrite` stream, updating a shared timestamp
@@ -1753,12 +1758,18 @@ enum KtlsError {
 /// Attempt kTLS-accelerated splice for a frontend-TLS + plain-backend connection.
 ///
 /// 1. Check that the negotiated cipher is AES-128-GCM or AES-256-GCM.
-/// 2. Extract TLS session keys via `dangerous_extract_secrets()`.
-/// 3. Install keys into the kernel via `enable_ktls()`.
-/// 4. Use `bidirectional_splice()` for zero-copy relay.
+/// 2. Check that the negotiated TLS version is TLS 1.2 (see below).
+/// 3. Extract TLS session keys via `dangerous_extract_secrets()`.
+/// 4. Install keys into the kernel via `enable_ktls()`.
+/// 5. Use `bidirectional_splice()` for zero-copy relay.
 ///
 /// Returns `KtlsError::Unsupported` with the original streams if kTLS cannot
 /// be used, allowing the caller to fall back to userspace `bidirectional_copy`.
+///
+/// **TLS 1.2 ONLY.** TLS 1.3 connections fall back to userspace relay because
+/// this implementation does not handle KeyUpdate — the kernel holds a static
+/// copy of the application traffic secret, and a peer-initiated KeyUpdate
+/// would silently desynchronize decryption mid-stream.
 #[cfg(target_os = "linux")]
 async fn try_ktls_splice(
     tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
@@ -1788,14 +1799,30 @@ async fn try_ktls_splice(
         ))));
     }
 
-    // Check TLS version — kTLS supports TLS 1.2 and 1.3.
+    // Check TLS version — kTLS is restricted to TLS 1.2 ONLY in this gateway.
+    //
+    // TLS 1.3 is intentionally NOT supported because `dangerous_extract_secrets()`
+    // returns the CURRENT application traffic secret. In TLS 1.3 either peer may
+    // issue a KeyUpdate message at any time (RFC 8446 §4.6.3) to rotate keys.
+    // Because we install keys into the kernel ONCE and then splice the socket
+    // directly (no userspace TLS state machine), a peer-initiated KeyUpdate
+    // would silently desynchronize the kernel from the negotiated peer state
+    // mid-stream, producing decryption failures with no opportunity to rekey
+    // the kernel. For long-lived TCP streams this is a reachable correctness
+    // bug, so we fall back to userspace TLS for TLS 1.3 connections.
     let tls_version = {
         let (_, server_conn) = tls_stream.get_ref();
         server_conn.protocol_version()
     };
     let tls_ver_u16 = match tls_version {
         Some(rustls::ProtocolVersion::TLSv1_2) => 0x0303_u16,
-        Some(rustls::ProtocolVersion::TLSv1_3) => 0x0304_u16,
+        Some(rustls::ProtocolVersion::TLSv1_3) => {
+            debug!("kTLS: TLS 1.3 KeyUpdate handling not implemented, falling back to userspace");
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
+        }
         _ => {
             debug!(
                 "kTLS: unsupported TLS version {:?}, falling back",
@@ -1938,4 +1965,124 @@ fn build_ktls_params(
         rx_iv,
         rx_seq: rx_seq.to_be_bytes(),
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_param_tests {
+    //! Tests for `build_ktls_params` — the rustls-ExtractedSecrets to
+    //! KtlsParams mapping. These run inline because `build_ktls_params`
+    //! is a private function and the rustls types it consumes are not
+    //! re-exported from the gateway crate.
+    //!
+    //! We use `AeadKey::from([u8; 32])` (the only stable public constructor)
+    //! which yields a 32-byte key regardless of the cipher's real key length.
+    //! That is harmless for this unit test since we are exercising the match
+    //! arm selection and byte plumbing, not the kernel install path.
+
+    use super::build_ktls_params;
+    use crate::socket_opts::ktls::KtlsCipher;
+    use rustls::ConnectionTrafficSecrets;
+    use rustls::ExtractedSecrets;
+    use rustls::crypto::cipher::{AeadKey, Iv};
+
+    fn aead_key(byte: u8) -> AeadKey {
+        AeadKey::from([byte; 32])
+    }
+
+    fn iv(byte: u8) -> Iv {
+        Iv::from([byte; 12])
+    }
+
+    #[test]
+    fn aes128_gcm_both_sides_maps_to_aes128() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                0x1122_3344_5566_7788,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                0xdead_beef_0000_0001,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        let params = build_ktls_params(0x0303, &secrets).expect("AES-128 pair must map");
+        assert!(matches!(params.cipher_suite, KtlsCipher::Aes128Gcm));
+        assert_eq!(params.tls_version, 0x0303);
+        assert_eq!(params.tx_seq, 0x1122_3344_5566_7788_u64.to_be_bytes());
+        assert_eq!(params.rx_seq, 0xdead_beef_0000_0001_u64.to_be_bytes());
+        assert_eq!(params.tx_iv.len(), 12);
+        assert_eq!(params.rx_iv.len(), 12);
+    }
+
+    #[test]
+    fn aes256_gcm_both_sides_maps_to_aes256() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                1,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: aead_key(0xaa),
+                    iv: iv(0xbb),
+                },
+            ),
+            rx: (
+                2,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: aead_key(0xcc),
+                    iv: iv(0xdd),
+                },
+            ),
+        };
+        let params = build_ktls_params(0x0303, &secrets).expect("AES-256 pair must map");
+        assert!(matches!(params.cipher_suite, KtlsCipher::Aes256Gcm));
+        assert_eq!(params.tx_seq, 1u64.to_be_bytes());
+        assert_eq!(params.rx_seq, 2u64.to_be_bytes());
+    }
+
+    #[test]
+    fn mismatched_cipher_families_return_none() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                0,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                0,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
+
+    #[test]
+    fn chacha20_returns_none() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                0,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                0,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
 }

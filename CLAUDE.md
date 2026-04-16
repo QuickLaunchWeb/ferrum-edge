@@ -857,7 +857,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
 2. **Constructor must return `Result<Self, String>`** — every plugin's `new()` must validate its config and return `Err` with a clear message if the config is invalid. See the "Plugin Config Validation" section below for rules.
 3. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-4. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_TCP_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
+4. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
 5. Register in the plugin registry (`create_plugin_with_http_client()` match arm in `mod.rs`) — use `?` on the `new()` call (e.g., `Ok(Some(Arc::new(my_plugin::MyPlugin::new(config)?)))`)
 6. Add the plugin name to `available_plugins()` in `mod.rs`
 7. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs` — include tests for both valid configs (`.unwrap()`) and invalid configs (`.is_err()` / `.err().unwrap()`)

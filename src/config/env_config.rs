@@ -155,6 +155,15 @@ impl AutoBool {
             Self::False => false,
         }
     }
+
+    /// Returns `true` if the resolved value could POSSIBLY be `true` — i.e.
+    /// every variant except `False`. Used by callers that must commit to a
+    /// side-effect (e.g. setting `ServerConfig::enable_secret_extraction`)
+    /// before the actual probe runs, and would rather over-enable than
+    /// under-enable.
+    pub fn could_be_enabled(self) -> bool {
+        !matches!(self, Self::False)
+    }
 }
 
 impl std::fmt::Display for AutoBool {

@@ -411,7 +411,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_KTLS_ENABLED` | `auto` | kTLS: install TLS keys into kernel after handshake so `splice(2)` works on encrypted TCP connections (Linux 4.13+, AES-128-GCM / AES-256-GCM). Probes `setsockopt(TCP_ULP)` on temp socket |
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS: install TLS keys into kernel after handshake so `splice(2)` works on encrypted TCP connections (Linux 4.13+, AES-128-GCM / AES-256-GCM, **TLS 1.2 only** — TLS 1.3 falls back to userspace because KeyUpdate rekeying is not handled). Probes real TCP loopback pair with full `TCP_ULP` + dummy key install at startup |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup |
 | `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |
