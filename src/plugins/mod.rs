@@ -504,8 +504,9 @@ pub struct TransactionSummary {
     pub latency_gateway_processing_ms: f64,
     pub latency_backend_ttfb_ms: f64,
     /// For buffered responses: actual total backend time (body fully received).
-    /// For streaming responses: -1.0 (body still transferring at log time;
-    /// use `latency_backend_ttfb_ms` for alerting).
+    /// For streaming responses: actual backend transfer time when the deferred
+    /// log fires after stream completion, or `-1.0` if the stream did not
+    /// complete within `read_timeout + 5s`.
     pub latency_backend_total_ms: f64,
     /// Wall-clock time spent executing all plugin hooks (on_request_received
     /// through after_proxy/on_response_body/transform_response_body/
@@ -522,11 +523,30 @@ pub struct TransactionSummary {
     /// For rejected requests (no backend call): total - plugin_execution.
     pub latency_gateway_overhead_ms: f64,
     pub request_user_agent: Option<String>,
+    /// Total request body bytes received from the client (after any gateway-side
+    /// decoding). `0` when the request had no body or byte tracking was unavailable.
+    pub request_bytes: u64,
+    /// Total response body bytes sent to the client. For buffered responses
+    /// this is exact; for streaming responses the value is updated by the
+    /// deferred log task once the stream completes (or is abandoned). `0` when
+    /// the response had no body or the stream produced no frames before the
+    /// deferred timeout fired.
+    pub response_bytes: u64,
     /// True when the response body was streamed (not buffered).
     /// When true, `latency_backend_total_ms` is -1.0 (unknown at log time).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
+    ///
+    /// **Semantics by response type:**
+    /// - **Streaming responses**: accurate — set by [`StreamingMetrics`] when
+    ///   the body adapter observes a client-disconnect-class error (broken
+    ///   pipe, connection reset, early EOF, etc.) while writing a frame.
+    /// - **Buffered responses**: best-effort. Hyper only signals a send
+    ///   failure at the connection-error handler, which fires *after* this
+    ///   summary has been constructed, so the flag is usually `false` for
+    ///   buffered responses even when the client did drop. Use streaming logs
+    ///   or upstream network metrics to corroborate buffered-response disconnects.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub client_disconnected: bool,
     /// Human-friendly classification of the error when the gateway itself
@@ -564,6 +584,8 @@ impl TransactionSummary {
         mirror.latency_gateway_overhead_ms = 0.0;
         mirror.response_streamed = false;
         mirror.client_disconnected = false;
+        mirror.request_bytes = 0;
+        mirror.response_bytes = 0;
         mirror.error_class = None;
         if let Some(size) = result.mirror_response_size_bytes {
             mirror

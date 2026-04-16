@@ -2041,8 +2041,21 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Check if a hyper connection error indicates a client disconnect.
-fn is_client_disconnect_error(err: &str) -> bool {
+/// Check if a hyper connection error or streaming-body error message indicates
+/// a client disconnect.
+///
+/// Used by:
+/// - The HTTP/1.1 and TLS hyper connection-error handlers to classify
+///   connection-level errors for per-request tracing.
+/// - [`crate::proxy::body::TrackedBody::poll_frame`] to set
+///   [`crate::proxy::body::StreamingMetrics::client_disconnected`] when a
+///   streaming response body adapter yields a disconnect-class error.
+///
+/// String matching (rather than downcasting) is intentional — the error
+/// surface is heterogeneous (`reqwest::Error`, `hyper::Error`, `std::io::Error`,
+/// boxed `&'static str`) and string patterns are stable across those crates.
+/// Only called on the error path, never on the hot path.
+pub(crate) fn is_client_disconnect_error(err: &str) -> bool {
     err.contains("connection reset")
         || err.contains("broken pipe")
         || err.contains("connection abort")
@@ -2338,6 +2351,8 @@ async fn handle_websocket_request_authenticated(
                             latency_plugin_external_io_ms: ws_plugin_external_io_ms,
                             latency_gateway_overhead_ms: ws_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            request_bytes: 0,
+                            response_bytes: 0,
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(ws_error_class),
@@ -2405,6 +2420,8 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_bytes: 0,
+        response_bytes: 0,
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
@@ -3522,6 +3539,8 @@ pub async fn log_rejected_request(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_bytes: 0,
+        response_bytes: 0,
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
@@ -5064,6 +5083,8 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        request_bytes: 0,
+                        response_bytes: 0,
                         response_streamed: streamed,
                         client_disconnected: false,
                         error_class: final_error_class,
@@ -5304,6 +5325,8 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        request_bytes: 0,
+                        response_bytes: 0,
                         response_streamed: false,
                         client_disconnected: false,
                         error_class: None,
@@ -5431,6 +5454,8 @@ async fn handle_proxy_request_inner(
                             latency_plugin_external_io_ms: grpc_plugin_external_io_ms,
                             latency_gateway_overhead_ms: grpc_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            request_bytes: 0,
+                            response_bytes: 0,
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(grpc_error_class),
@@ -5811,8 +5836,28 @@ async fn handle_proxy_request_inner(
     let gateway_processing_ms = total_ms - effective_backend_ms;
     let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
 
-    // Log phase — skip TransactionSummary construction when no plugins need it
-    if !plugins.is_empty() {
+    // Log phase.
+    //
+    // For reqwest-streaming responses with log plugins configured, we defer
+    // `log_with_mirror` into a background task that fires after
+    // `read_timeout + 5s`. The deferred task reads the final `StreamingMetrics`
+    // (bytes sent, completion status, client-disconnect flag, last-frame
+    // elapsed) and patches the summary before calling log plugins — so the
+    // log entry reflects the real end-of-stream state rather than TTFB-only
+    // placeholder values.
+    //
+    // Buffered responses and H2/H3 streams (which don't yet use the
+    // StreamingMetrics machinery) continue to log synchronously with
+    // whatever values are known at this point.
+    //
+    // `response_bytes` for buffered responses is populated from the final
+    // body `Bytes` length; streaming summaries start at 0 and are patched
+    // by the deferred task.
+    let deferred_log_summary: Option<TransactionSummary> = if !plugins.is_empty() {
+        let response_bytes_now = match &response_body {
+            ResponseBody::Buffered(data) => data.len() as u64,
+            _ => 0,
+        };
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -5833,6 +5878,8 @@ async fn handle_proxy_request_inner(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: ctx.headers.get("user-agent").cloned(),
+            request_bytes: 0,
+            response_bytes: response_bytes_now,
             response_streamed: is_streaming_response,
             client_disconnected: false,
             error_class: backend_error_class,
@@ -5840,8 +5887,19 @@ async fn handle_proxy_request_inner(
             metadata: ctx.metadata.clone(),
         };
 
-        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-    }
+        // Defer only for reqwest-streaming — StreamingH2 and StreamingH3
+        // do not yet carry `StreamingMetrics` (wired in a follow-up commit),
+        // so fall back to a synchronous TTFB-time log for those variants to
+        // preserve existing observability.
+        if matches!(&response_body, ResponseBody::Streaming(_)) {
+            Some(summary)
+        } else {
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+            None
+        }
+    } else {
+        None
+    };
 
     // Inject sticky session cookie when cookie-based consistent hashing selected a new session
     if sticky_cookie_needed
@@ -5936,13 +5994,28 @@ async fn handle_proxy_request_inner(
     }
 
     // Build response body: either stream from backend or return buffered data.
-    // When FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true, streaming responses are
-    // wrapped with a TrackedBody that records the final transfer time via a shared
-    // atomic. A deferred task reads it after read_timeout + 5s to emit a
-    // supplementary log with accurate backend_total_ms.
-    // Default (false): streaming responses pass through with zero tracking overhead.
+    //
+    // For reqwest-streaming responses we use a `TrackedBody` whenever either:
+    //   (a) a deferred log_with_mirror is pending (`deferred_log_summary`
+    //       was populated above — i.e., at least one log plugin is configured
+    //       on the proxy), or
+    //   (b) `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true` (operator opt-in
+    //       for tracing-only observability even without log plugins).
+    //
+    // The TrackedBody records final bytes sent, completion status, and
+    // client-disconnect flag via shared atomics. A deferred task reads those
+    // after `read_timeout + 5s` and, if we have a deferred summary, patches
+    // the 4 post-stream fields (`response_bytes`, `client_disconnected`,
+    // `latency_backend_total_ms`, `latency_total_ms`) and fires
+    // `log_with_mirror` so log plugins see accurate values.
+    //
+    // When neither (a) nor (b) applies, streaming responses pass through
+    // with zero tracking overhead via `direct_streaming_body`.
+    let will_defer_log = deferred_log_summary.is_some();
     let body = match response_body {
-        ResponseBody::Streaming(resp) if state.env_config.enable_streaming_latency_tracking => {
+        ResponseBody::Streaming(resp)
+            if will_defer_log || state.env_config.enable_streaming_latency_tracking =>
+        {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
@@ -5960,29 +6033,79 @@ async fn handle_proxy_request_inner(
                 ProxyBody::streaming_tracked(resp, backend_start)
             };
 
-            // Spawn a lightweight deferred task to log the final streaming latency.
-            // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
+            // Capture everything the deferred task needs. We only clone
+            // `plugins` and `ctx` when there is actually a deferred log to
+            // fire — the operator-opt-in tracing path does not need them.
             let deferred_proxy_id = proxy.id.clone();
             let deferred_backend_url = strip_query_params(&backend_url).to_string();
             let read_timeout_ms = proxy.backend_read_timeout_ms;
+            let deferred_start_time = start_time;
+            let deferred_plugins = if will_defer_log {
+                Some(plugins.clone())
+            } else {
+                None
+            };
+            let deferred_ctx = if will_defer_log {
+                Some(ctx.clone())
+            } else {
+                None
+            };
+            let mut deferred_summary = deferred_log_summary;
+
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
                 let completed = metrics.completed();
-                let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                let last_frame_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                let bytes_sent = metrics.bytes_sent();
+                let client_disconnected = metrics.client_disconnected();
+
+                // Tracing diagnostics — preserve the pre-existing behavior
+                // for operators using `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING`
+                // without log plugins, and enrich with the new atomics.
                 if completed {
                     debug!(
                         proxy_id = %deferred_proxy_id,
                         backend_url = %deferred_backend_url,
-                        backend_total_ms = total_ms,
+                        backend_total_ms = last_frame_ms,
+                        response_bytes = bytes_sent,
                         "Streaming response completed"
                     );
                 } else {
                     warn!(
                         proxy_id = %deferred_proxy_id,
                         backend_url = %deferred_backend_url,
-                        backend_last_frame_ms = total_ms,
+                        backend_last_frame_ms = last_frame_ms,
+                        response_bytes = bytes_sent,
+                        client_disconnected,
                         "Streaming response incomplete (client disconnect or timeout)"
                     );
+                }
+
+                // Fire the deferred log_with_mirror with accurate
+                // post-stream values if a summary was queued above.
+                if let (Some(mut summary), Some(plugins), Some(ctx)) =
+                    (deferred_summary.take(), deferred_plugins, deferred_ctx)
+                {
+                    summary.response_bytes = bytes_sent;
+                    summary.client_disconnected = client_disconnected;
+                    summary.latency_backend_total_ms = if completed { last_frame_ms } else { -1.0 };
+                    summary.latency_total_ms = deferred_start_time.elapsed().as_secs_f64() * 1000.0;
+                    // Re-derive gateway_processing_ms and gateway_overhead_ms
+                    // from the updated totals so per-request attribution
+                    // remains accurate after the deferred completion window.
+                    let effective_backend_ms = if summary.latency_backend_total_ms >= 0.0 {
+                        summary.latency_backend_total_ms
+                    } else {
+                        summary.latency_backend_ttfb_ms
+                    };
+                    summary.latency_gateway_processing_ms =
+                        summary.latency_total_ms - effective_backend_ms;
+                    summary.latency_gateway_overhead_ms = (summary.latency_total_ms
+                        - effective_backend_ms
+                        - summary.latency_plugin_execution_ms)
+                        .max(0.0);
+
+                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
             });
 

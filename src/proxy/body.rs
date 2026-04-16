@@ -47,8 +47,16 @@ enum ProxyBodyKind {
 }
 
 /// Lightweight metrics shared between a streaming response body and a
-/// deferred log task. Only an atomic timestamp and a completion flag —
-/// no strings, no closures, no allocations per frame.
+/// deferred log task. Atomic counters only — no strings, no closures, no
+/// allocations per frame.
+///
+/// **Ordering discipline**:
+/// - `bytes_sent`: Relaxed (single writer: `TrackedBody::poll_frame`; single
+///   reader: deferred task, synchronized via spawn happens-before).
+/// - `last_frame_nanos`: Acquire/Release (preserves existing invariant).
+/// - `completed`: Acquire/Release (ensures `last_frame_nanos` is visible when
+///   reader sees `completed == true`).
+/// - `client_disconnected`: Acquire/Release (consistent with `completed`).
 pub struct StreamingMetrics {
     /// Reference `Instant` — stored once at creation. The atomic stores
     /// elapsed nanos relative to this baseline to avoid u64 overflow.
@@ -58,6 +66,16 @@ pub struct StreamingMetrics {
     last_frame_nanos: AtomicU64,
     /// Whether the body completed successfully (all frames sent).
     completed: AtomicBool,
+    /// Total bytes of response data forwarded to the client so far.
+    /// Accumulates across all DATA frames; non-data frames (trailers) do
+    /// not contribute. Populated by [`TrackedBody::poll_frame`].
+    bytes_sent: AtomicU64,
+    /// Set to `true` when a streaming-body adapter observes a
+    /// client-disconnect-class error (broken pipe, connection reset, early
+    /// EOF, etc.) while writing a frame. Stays `false` for clean completion
+    /// or non-disconnect errors (timeout, TLS failure, etc.). Populated by
+    /// [`TrackedBody::poll_frame`].
+    client_disconnected: AtomicBool,
 }
 
 impl StreamingMetrics {
@@ -66,6 +84,8 @@ impl StreamingMetrics {
             baseline,
             last_frame_nanos: AtomicU64::new(0),
             completed: AtomicBool::new(false),
+            bytes_sent: AtomicU64::new(0),
+            client_disconnected: AtomicBool::new(false),
         }
     }
 
@@ -83,6 +103,16 @@ impl StreamingMetrics {
     /// Whether the body finished sending all frames (vs client disconnect / drop).
     pub fn completed(&self) -> bool {
         self.completed.load(Ordering::Acquire)
+    }
+
+    /// Total response body bytes forwarded to the client.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Whether a client-disconnect-class error was observed during streaming.
+    pub fn client_disconnected(&self) -> bool {
+        self.client_disconnected.load(Ordering::Acquire)
     }
 }
 
@@ -123,14 +153,38 @@ impl http_body::Body for TrackedBody {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Ok(frame))) => {
-                // Frame sent — update last-frame timestamp (one atomic store)
+                // Frame sent — update last-frame timestamp (one atomic store).
                 let elapsed = this.metrics.baseline.elapsed().as_nanos() as u64;
                 this.metrics
                     .last_frame_nanos
                     .store(elapsed, Ordering::Release);
+                // Count bytes for DATA frames. Trailers (non-data frames)
+                // contribute nothing — `data_ref()` returns `None` for them.
+                // Relaxed is correct: single writer (this `poll_frame`),
+                // and the deferred reader happens-after via the spawn
+                // happens-before relation.
+                if let Some(data) = frame.data_ref() {
+                    this.metrics
+                        .bytes_sent
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
-            other => other,
+            Poll::Ready(Some(Err(e))) => {
+                // Classify the error: client-disconnect-class errors
+                // (broken pipe, connection reset, early EOF, etc.) set a
+                // dedicated flag so the deferred log task can distinguish
+                // "client bailed" from "backend timeout" in the summary.
+                // `err.to_string()` only happens on the error path, which
+                // is rare — no hot-path allocation.
+                if super::is_client_disconnect_error(&e.to_string()) {
+                    this.metrics
+                        .client_disconnected
+                        .store(true, Ordering::Release);
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -371,6 +425,19 @@ impl SizeLimitedIncoming {
     /// overhead and enabling single-buffer receive on the backend.
     pub fn into_reqwest_body(self) -> reqwest::Body {
         reqwest::Body::wrap(SyncBody::new(self))
+    }
+
+    /// Expose the running total of bytes observed so the proxy handler can
+    /// populate `TransactionSummary::request_bytes` after the body has been
+    /// consumed. Note: `into_reqwest_body(self)` moves this value, so callers
+    /// must read it only when they still own the `SizeLimitedIncoming`.
+    ///
+    /// For the streaming-forward path where ownership is handed to reqwest
+    /// before the body is drained, a shared `Arc<AtomicU64>` counter is the
+    /// preferred mechanism — see `CountingIncoming` (added in a later commit).
+    #[allow(dead_code)] // consumed by request-bytes plumbing in a follow-up commit
+    pub fn bytes_seen(&self) -> usize {
+        self.bytes_seen
     }
 }
 

@@ -27,6 +27,8 @@ fn make_full_summary() -> TransactionSummary {
         latency_plugin_external_io_ms: 0.0,
         latency_gateway_overhead_ms: 2.5,
         request_user_agent: Some("curl/8.0".to_string()),
+        request_bytes: 0,
+        response_bytes: 0,
         response_streamed: false,
         client_disconnected: false,
         error_class: None,

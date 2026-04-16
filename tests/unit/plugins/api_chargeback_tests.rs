@@ -32,6 +32,8 @@ fn make_summary(
         latency_plugin_external_io_ms: 0.0,
         latency_gateway_overhead_ms: 3.0,
         request_user_agent: Some("test-agent".to_string()),
+        request_bytes: 0,
+        response_bytes: 0,
         response_streamed: false,
         client_disconnected: false,
         error_class: None,

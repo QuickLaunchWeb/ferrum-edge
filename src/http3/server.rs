@@ -1178,6 +1178,8 @@ async fn handle_h3_request(
                     latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
                         .max(0.0),
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
+                    request_bytes: 0,
+                    response_bytes: 0,
                     // Backend connection failed before any streaming began — the 502
                     // response body is built and sent synchronously below.
                     response_streamed: false,
@@ -1377,6 +1379,8 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
+            request_bytes: 0,
+            response_bytes: 0,
             response_streamed: true,
             client_disconnected: false,
             error_class: None,
@@ -1543,6 +1547,8 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
+            request_bytes: 0,
+            response_bytes: 0,
             response_streamed: true,
             client_disconnected: false,
             error_class: h3_error_class,
@@ -1863,6 +1869,8 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
+            request_bytes: 0,
+            response_bytes: 0,
             response_streamed: false,
             client_disconnected: false,
             error_class: h3_error_class,
