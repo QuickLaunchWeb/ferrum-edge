@@ -457,3 +457,34 @@ fn test_boxed_error_port_exhaustion_macos() {
 fn test_port_exhaustion_display() {
     assert_eq!(format!("{}", ErrorClass::PortExhaustion), "port_exhaustion");
 }
+
+#[test]
+fn test_is_port_exhaustion_with_io_error_windows() {
+    // OS error 10049 is WSAEADDRNOTAVAIL on Windows
+    let io_err = std::io::Error::from_raw_os_error(10049);
+    assert!(ferrum_edge::retry::is_port_exhaustion(&io_err));
+}
+
+#[test]
+fn test_is_port_exhaustion_message_windows() {
+    assert!(ferrum_edge::retry::is_port_exhaustion_message(
+        "Connection failed: address not available (os error 10049)"
+    ));
+}
+
+#[test]
+fn test_grpc_dns_failure_classified_as_dns_error() {
+    // The H2/gRPC pools now emit "DNS resolution failed for {host}: {err}"
+    // when dns_cache.resolve() fails. Verify the classifier catches this.
+    let err = GrpcProxyError::BackendUnavailable(
+        "DNS resolution failed for backend.example.com: no record found".into(),
+    );
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
+}
+
+#[test]
+fn test_grpc_dns_failure_original_pattern_still_works() {
+    // The original pattern from proxy/mod.rs gRPC dispatch should still work.
+    let err = GrpcProxyError::BackendUnavailable("DNS resolution for backend failed".into());
+    assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
+}

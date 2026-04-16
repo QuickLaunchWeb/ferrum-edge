@@ -74,7 +74,9 @@ impl std::fmt::Display for ErrorClass {
 }
 
 /// Returns `true` if the error's root cause is EADDRNOTAVAIL, which indicates
-/// ephemeral port exhaustion (OS error 99 on Linux, 49 on macOS/BSD).
+/// ephemeral port exhaustion.
+///
+/// OS error codes: Linux = 99, macOS/BSD = 49, Windows = 10049 (WSAEADDRNOTAVAIL).
 ///
 /// Walks the error source chain because transport libraries (reqwest, hyper)
 /// wrap `io::Error` inside multiple layers.
@@ -83,8 +85,8 @@ pub fn is_port_exhaustion(e: &(dyn std::error::Error + 'static)) -> bool {
     while let Some(err) = current {
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             match io_err.raw_os_error() {
-                // EADDRNOTAVAIL: Linux = 99, macOS/BSD = 49
-                Some(99) | Some(49) => return true,
+                // EADDRNOTAVAIL: Linux = 99, macOS/BSD = 49, Windows = 10049
+                Some(99) | Some(49) | Some(10049) => return true,
                 _ => {}
             }
         }
@@ -100,6 +102,7 @@ pub fn is_port_exhaustion_message(msg: &str) -> bool {
     msg.contains("address not available")
         || msg.contains("os error 99")
         || msg.contains("os error 49")
+        || msg.contains("os error 10049")
 }
 
 /// Classify a gRPC proxy error into an `ErrorClass`.
@@ -130,6 +133,7 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 ErrorClass::ProtocolError
             } else if msg.contains("Invalid server name")
                 || msg.contains("DNS resolution for backend failed")
+                || msg.contains("DNS resolution failed for")
             {
                 ErrorClass::DnsLookupError
             } else {
