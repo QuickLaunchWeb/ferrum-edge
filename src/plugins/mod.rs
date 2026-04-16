@@ -199,6 +199,47 @@ pub enum WebSocketFrameDirection {
     BackendToClient,
 }
 
+/// Context passed to `on_ws_disconnect` when a WebSocket session ends.
+///
+/// Mirrors the information made available on `StreamTransactionSummary`
+/// for TCP/UDP streams so logging/metrics plugins have parity across all
+/// three protocols. `direction` identifies which half of the frame relay
+/// terminated first — `None` indicates a clean close initiated by both
+/// peers or an upgrade that never established frame flow.
+///
+/// Populated once per accepted WebSocket upgrade, including H2 Extended
+/// CONNECT (RFC 8441) sessions. The frame relay code should construct
+/// this at session teardown and dispatch it to any plugin whose
+/// `requires_ws_disconnect_hooks()` returns true.
+#[derive(Debug, Clone)]
+pub struct WsDisconnectContext {
+    pub namespace: String,
+    pub proxy_id: String,
+    pub proxy_name: Option<String>,
+    pub client_ip: String,
+    /// Backend target URL (scheme://host:port/path) — matches the
+    /// `backend_target_url` field from the original upgrade request.
+    pub backend_target: String,
+    /// Listener port on the gateway that accepted the upgrade.
+    pub listen_port: u16,
+    /// Total session lifetime in milliseconds (upgrade → close).
+    pub duration_ms: f64,
+    /// Number of frames proxied from client toward backend.
+    pub frames_client_to_backend: u64,
+    /// Number of frames proxied from backend toward client.
+    pub frames_backend_to_client: u64,
+    /// Which direction observed the first terminating error. `None` for
+    /// clean close initiated by either peer.
+    pub direction: Option<Direction>,
+    /// Classification of the terminating error, if any.
+    pub error_class: Option<crate::retry::ErrorClass>,
+    /// Consumer identity associated with the upgrade (copied from
+    /// the originating `RequestContext`).
+    pub consumer_username: Option<String>,
+    /// Correlation ID / tracing metadata inherited from the upgrade request.
+    pub metadata: HashMap<String, String>,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1175,6 +1216,24 @@ pub trait Plugin: Send + Sync {
     fn requires_udp_datagram_hooks(&self) -> bool {
         false
     }
+
+    /// Returns `true` if this plugin needs notification when a WebSocket
+    /// session ends. Zero overhead when `false` (default) — the relay teardown
+    /// path skips constructing the context and iterating plugins.
+    ///
+    /// Mirrors the opt-in pattern used by `requires_ws_frame_hooks()` and
+    /// `requires_udp_datagram_hooks()` so most deployments pay no cost.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        false
+    }
+
+    /// Called when a WebSocket session (H1 upgrade or H2 Extended CONNECT)
+    /// terminates. Receives a summary of the session including directional
+    /// failure classification and per-direction frame counts.
+    ///
+    /// Default no-op. Plugins wanting end-of-session observability should
+    /// override this and set `requires_ws_disconnect_hooks()` to `true`.
+    async fn on_ws_disconnect(&self, _ctx: &WsDisconnectContext) {}
 
     /// Called for each UDP datagram in both directions (client→backend and backend→client).
     ///
