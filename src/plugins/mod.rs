@@ -489,6 +489,45 @@ fn is_default_namespace(ns: &str) -> bool {
     ns == crate::config::types::DEFAULT_NAMESPACE
 }
 
+/// Serde skip predicate: true when the value is zero. Used to keep logs tidy
+/// when new u64 counters are unset for a given transaction.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Which direction of a bidirectional stream experienced a failure first.
+///
+/// Used by TCP/UDP/WebSocket disconnect logging so operators can tell whether
+/// the client or the backend initiated the disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Error originated on the client→backend half of the stream.
+    ClientToBackend,
+    /// Error originated on the backend→client half of the stream.
+    BackendToClient,
+    /// Direction could not be determined (both halves failed simultaneously,
+    /// or the error occurred outside the copy loop).
+    Unknown,
+}
+
+/// Cause of a stream (TCP/UDP) disconnect.
+///
+/// Disambiguates idle-timeout expiry from read/write errors so log consumers
+/// don't have to rely on `error_class: None` as an implicit timeout signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectCause {
+    /// Session exceeded the configured idle timeout without traffic.
+    IdleTimeout,
+    /// Frontend (client-side) recv/read returned an error.
+    RecvError,
+    /// Backend recv/read returned an error (e.g., backend closed the socket).
+    BackendError,
+    /// Clean shutdown initiated by either peer (e.g., FIN, graceful close frame).
+    GracefulShutdown,
+}
+
 /// Transaction summary for logging plugins.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransactionSummary {
@@ -542,6 +581,24 @@ pub struct TransactionSummary {
     /// and normal HTTP error responses from the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
+    /// Classification of an error that occurred while streaming the response
+    /// body to the client (e.g., client RST after headers were sent). `None`
+    /// when the body streamed successfully or when no streaming occurred.
+    ///
+    /// Distinct from `error_class`, which covers errors reaching the backend.
+    /// Populated by the deferred-logging path when the response body wrapper
+    /// returns an error frame or is dropped before completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_error_class: Option<crate::retry::ErrorClass>,
+    /// True when the response body finished streaming all frames successfully.
+    /// False when streaming was interrupted (client disconnect, backend RST,
+    /// body size limit exceeded) or when no streaming occurred.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub body_completed: bool,
+    /// Total bytes of response body actually written to the client. May be
+    /// less than `Content-Length` if streaming was interrupted.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub bytes_streamed_to_client: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
@@ -573,6 +630,9 @@ impl TransactionSummary {
         mirror.response_streamed = false;
         mirror.client_disconnected = false;
         mirror.error_class = None;
+        mirror.body_error_class = None;
+        mirror.body_completed = false;
+        mirror.bytes_streamed_to_client = 0;
         if let Some(size) = result.mirror_response_size_bytes {
             mirror
                 .metadata
@@ -688,6 +748,14 @@ pub struct StreamTransactionSummary {
     /// Mirrors the `ErrorClass` used for HTTP/gRPC transactions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
+    /// Which direction of the bidirectional stream failed first.
+    /// `None` for clean shutdowns or timeouts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_direction: Option<Direction>,
+    /// Cause of the disconnect (idle timeout vs. recv error vs. graceful shutdown).
+    /// Disambiguates the implicit `error_class: None` timeout convention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_cause: Option<DisconnectCause>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
     /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.

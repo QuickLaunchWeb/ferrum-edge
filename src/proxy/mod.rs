@@ -2275,6 +2275,9 @@ async fn handle_websocket_request_authenticated(
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(ws_error_class),
+                            body_error_class: None,
+                            body_completed: false,
+                            bytes_streamed_to_client: 0,
                             mirror: false,
                             metadata,
                         };
@@ -2344,6 +2347,9 @@ async fn handle_websocket_request_authenticated(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        body_error_class: None,
+        body_completed: false,
+        bytes_streamed_to_client: 0,
         mirror: false,
         metadata: ctx.metadata.clone(),
     };
@@ -3459,6 +3465,9 @@ pub async fn log_rejected_request(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        body_error_class: None,
+        body_completed: false,
+        bytes_streamed_to_client: 0,
         mirror: false,
         metadata,
     };
@@ -4994,6 +5003,9 @@ async fn handle_proxy_request_inner(
                         response_streamed: !body_exceeded,
                         client_disconnected: false,
                         error_class: final_error_class,
+                        body_error_class: None,
+                        body_completed: false,
+                        bytes_streamed_to_client: 0,
                         mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
@@ -5234,6 +5246,9 @@ async fn handle_proxy_request_inner(
                         response_streamed: false,
                         client_disconnected: false,
                         error_class: None,
+                        body_error_class: None,
+                        body_completed: false,
+                        bytes_streamed_to_client: 0,
                         mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
@@ -5362,6 +5377,9 @@ async fn handle_proxy_request_inner(
                             response_streamed: false,
                             client_disconnected: false,
                             error_class: Some(grpc_error_class),
+                            body_error_class: None,
+                            body_completed: false,
+                            bytes_streamed_to_client: 0,
                             mirror: false,
                             metadata,
                         };
@@ -5764,6 +5782,9 @@ async fn handle_proxy_request_inner(
             response_streamed: is_streaming_response,
             client_disconnected: false,
             error_class: backend_error_class,
+            body_error_class: None,
+            body_completed: false,
+            bytes_streamed_to_client: 0,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -7285,18 +7306,12 @@ async fn proxy_to_backend_http2(
                 http2_pool::Http2PoolError::Internal(m) => m.clone(),
             };
             // Classify the H2 pool error for accurate error_class reporting.
-            let h2_error_class = if retry::is_port_exhaustion_message(&msg) {
+            // Uses the shared classifier so updates to the taxonomy apply uniformly
+            // instead of scattering ad-hoc substring checks across call sites.
+            let h2_error_class = http2_pool::classify_http2_pool_error(&e);
+            if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
                 state.overload.record_port_exhaustion();
-                retry::ErrorClass::PortExhaustion
-            } else if msg.contains("DNS resolution failed") {
-                retry::ErrorClass::DnsLookupError
-            } else if msg.contains("Connect timeout") {
-                retry::ErrorClass::ConnectionTimeout
-            } else if msg.contains("TLS") || msg.contains("certificate") {
-                retry::ErrorClass::TlsError
-            } else {
-                retry::ErrorClass::ConnectionPoolError
-            };
+            }
             let error_body = if h2_error_class == retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#.to_string()
             } else {

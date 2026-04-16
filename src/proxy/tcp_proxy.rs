@@ -332,7 +332,14 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
                     let disconnected_at = chrono::Utc::now();
                     let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
-                    let (bytes_in, bytes_out, conn_error, error_class) = match &result.outcome {
+                    let (
+                        bytes_in,
+                        bytes_out,
+                        conn_error,
+                        error_class,
+                        disconnect_direction,
+                        disconnect_cause,
+                    ) = match &result.outcome {
                         Ok(s) => {
                             metrics.bytes_in.fetch_add(s.bytes_in, Ordering::Relaxed);
                             metrics.bytes_out.fetch_add(s.bytes_out, Ordering::Relaxed);
@@ -351,7 +358,19 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                                 duration_ms = s.duration.as_millis() as u64,
                                 "TCP connection completed"
                             );
-                            (s.bytes_in, s.bytes_out, None, None)
+                            // Successful completion: body flowed, then either the
+                            // client or backend sent FIN. We can't cheaply determine
+                            // which side FIN'd first here without threading that
+                            // signal through bidirectional_copy, so report a
+                            // graceful shutdown with unknown direction.
+                            (
+                                s.bytes_in,
+                                s.bytes_out,
+                                None,
+                                None,
+                                None,
+                                Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                            )
                         }
                         Err(e) => {
                             debug!(
@@ -361,11 +380,18 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                                 "TCP connection error"
                             );
                             let error_message = e.to_string();
+                            let err_class = classify_stream_error(e);
+                            // Direction is not yet threaded through
+                            // bidirectional_copy/_splice — populated as Unknown.
+                            // TODO(gap-5): capture first-failure direction via
+                            // tokio::select! in bidirectional_copy.
                             (
                                 0,
                                 0,
                                 Some(error_message),
-                                Some(classify_stream_error(e)),
+                                Some(err_class),
+                                Some(crate::plugins::Direction::Unknown),
+                                Some(crate::plugins::DisconnectCause::RecvError),
                             )
                         }
                     };
@@ -386,6 +412,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             bytes_received: bytes_out,
                             connection_error: conn_error,
                             error_class,
+                            disconnect_direction,
+                            disconnect_cause,
                             timestamp_connected: connected_at.to_rfc3339(),
                             timestamp_disconnected: disconnected_at.to_rfc3339(),
                             sni_hostname: stream_ctx.sni_hostname.clone(),

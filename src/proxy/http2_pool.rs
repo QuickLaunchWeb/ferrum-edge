@@ -633,6 +633,56 @@ impl Http2ConnectionPool {
     }
 }
 
+/// Classify an `Http2PoolError` into the shared `ErrorClass` taxonomy.
+///
+/// Previously the H2 direct-pool path produced errors that never made it into
+/// transaction-log `error_class` fields — operators had only the opaque error
+/// string to go on. This helper performs the same pattern-matching strategy as
+/// `classify_boxed_error` for the wrapped message but prefers the variant tag
+/// as the primary signal so classification is stable across minor wording
+/// changes.
+pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorClass {
+    use crate::retry::ErrorClass;
+    let msg = match err {
+        Http2PoolError::BackendUnavailable(m) => m.as_str(),
+        Http2PoolError::BackendTimeout(m) => m.as_str(),
+        Http2PoolError::Internal(m) => m.as_str(),
+    };
+    let lower = msg.to_ascii_lowercase();
+    match err {
+        Http2PoolError::BackendTimeout(_) => {
+            if lower.contains("connect") {
+                ErrorClass::ConnectionTimeout
+            } else {
+                ErrorClass::ReadWriteTimeout
+            }
+        }
+        Http2PoolError::BackendUnavailable(_) => {
+            if crate::retry::is_port_exhaustion_message(&lower) {
+                ErrorClass::PortExhaustion
+            } else if lower.contains("dns") || lower.contains("resolve") {
+                ErrorClass::DnsLookupError
+            } else if lower.contains("tls")
+                || lower.contains("certificate")
+                || lower.contains("handshake")
+            {
+                ErrorClass::TlsError
+            } else if lower.contains("refused") {
+                ErrorClass::ConnectionRefused
+            } else if lower.contains("reset") {
+                ErrorClass::ConnectionReset
+            } else if lower.contains("broken pipe") || lower.contains("closed") {
+                ErrorClass::ConnectionClosed
+            } else if lower.contains("goaway") || lower.contains("protocol") {
+                ErrorClass::ProtocolError
+            } else {
+                ErrorClass::ConnectionPoolError
+            }
+        }
+        Http2PoolError::Internal(_) => ErrorClass::ConnectionPoolError,
+    }
+}
+
 /// Errors specific to HTTP/2 pool operations.
 #[derive(Debug)]
 pub enum Http2PoolError {

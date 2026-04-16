@@ -25,6 +25,85 @@ use tracing::debug;
 
 use crate::config::types::Proxy;
 
+/// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
+///
+/// Walks the error source chain looking for recognizable `quinn::ConnectionError`
+/// variants, and falls back to string heuristics for `h3::Error` wrappers and
+/// anyhow chains. Without this, H3-specific errors previously landed in the
+/// transaction log with no `error_class` because `classify_boxed_error` only
+/// knew about reqwest/hyper patterns.
+pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::retry::ErrorClass {
+    use crate::retry::ErrorClass;
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(node) = current {
+        if let Some(ce) = node.downcast_ref::<quinn::ConnectionError>() {
+            return match ce {
+                quinn::ConnectionError::TimedOut => ErrorClass::ConnectionTimeout,
+                quinn::ConnectionError::Reset => ErrorClass::ConnectionReset,
+                quinn::ConnectionError::ApplicationClosed(_)
+                | quinn::ConnectionError::ConnectionClosed(_)
+                | quinn::ConnectionError::LocallyClosed => ErrorClass::ConnectionClosed,
+                quinn::ConnectionError::VersionMismatch
+                | quinn::ConnectionError::TransportError(_) => ErrorClass::ProtocolError,
+                quinn::ConnectionError::CidsExhausted => ErrorClass::ConnectionPoolError,
+            };
+        }
+        if let Some(ce) = node.downcast_ref::<quinn::ConnectError>() {
+            return match ce {
+                quinn::ConnectError::EndpointStopping
+                | quinn::ConnectError::CidsExhausted
+                | quinn::ConnectError::NoDefaultClientConfig => ErrorClass::ConnectionPoolError,
+                quinn::ConnectError::UnsupportedVersion => ErrorClass::ProtocolError,
+                quinn::ConnectError::InvalidRemoteAddress(_)
+                | quinn::ConnectError::InvalidServerName(_) => ErrorClass::DnsLookupError,
+            };
+        }
+        if let Some(io) = node.downcast_ref::<std::io::Error>() {
+            if matches!(io.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+                return ErrorClass::PortExhaustion;
+            }
+            return match io.kind() {
+                std::io::ErrorKind::TimedOut => ErrorClass::ConnectionTimeout,
+                std::io::ErrorKind::ConnectionRefused => ErrorClass::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset => ErrorClass::ConnectionReset,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+                    ErrorClass::ConnectionClosed
+                }
+                _ => ErrorClass::RequestError,
+            };
+        }
+        current = node.source();
+    }
+
+    // Fallback string heuristics for h3::Error and anyhow-wrapped errors that
+    // don't expose a typed chain.
+    let msg = err.to_string().to_ascii_lowercase();
+    if crate::retry::is_port_exhaustion_message(&msg) {
+        ErrorClass::PortExhaustion
+    } else if msg.contains("dns") || msg.contains("resolve") {
+        ErrorClass::DnsLookupError
+    } else if msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake") {
+        ErrorClass::TlsError
+    } else if msg.contains("timed out") || msg.contains("timeout") {
+        if msg.contains("connect") {
+            ErrorClass::ConnectionTimeout
+        } else {
+            ErrorClass::ReadWriteTimeout
+        }
+    } else if msg.contains("refused") {
+        ErrorClass::ConnectionRefused
+    } else if msg.contains("reset") {
+        ErrorClass::ConnectionReset
+    } else if msg.contains("broken pipe") || msg.contains("closed") {
+        ErrorClass::ConnectionClosed
+    } else if msg.contains("goaway") || msg.contains("protocol") || msg.contains("stream") {
+        ErrorClass::ProtocolError
+    } else {
+        ErrorClass::RequestError
+    }
+}
+
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 

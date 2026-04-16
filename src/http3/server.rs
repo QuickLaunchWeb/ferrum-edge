@@ -1181,6 +1181,9 @@ async fn handle_h3_request(
                     response_streamed: true,
                     client_disconnected: false,
                     error_class: Some(h3_error_class),
+                    body_error_class: None,
+                    body_completed: false,
+                    bytes_streamed_to_client: 0,
                     mirror: false,
                     metadata: ctx.metadata.clone(),
                 };
@@ -1378,6 +1381,9 @@ async fn handle_h3_request(
             response_streamed: true,
             client_disconnected: false,
             error_class: None,
+            body_error_class: None,
+            body_completed: false,
+            bytes_streamed_to_client: 0,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -1544,6 +1550,9 @@ async fn handle_h3_request(
             response_streamed: true,
             client_disconnected: false,
             error_class: h3_error_class,
+            body_error_class: None,
+            body_completed: false,
+            bytes_streamed_to_client: 0,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -1864,6 +1873,9 @@ async fn handle_h3_request(
             response_streamed: false,
             client_disconnected: false,
             error_class: h3_error_class,
+            body_error_class: None,
+            body_completed: false,
+            bytes_streamed_to_client: 0,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -2047,22 +2059,12 @@ fn inject_sticky_cookie(
 }
 
 fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
-    // Single allocation: write the error message directly into a lowercase String.
-    let mut msg = e.to_string();
-    msg.make_ascii_lowercase();
-    if msg.contains("dns") || msg.contains("resolution") {
-        crate::retry::ErrorClass::DnsLookupError
-    } else if msg.contains("timed out") || msg.contains("timeout") {
-        crate::retry::ErrorClass::ConnectionTimeout
-    } else if msg.contains("refused") {
-        crate::retry::ErrorClass::ConnectionRefused
-    } else if msg.contains("reset") {
-        crate::retry::ErrorClass::ConnectionReset
-    } else if msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake") {
-        crate::retry::ErrorClass::TlsError
-    } else {
-        crate::retry::ErrorClass::ConnectionClosed
-    }
+    // Delegate to the shared HTTP/3 classifier, which walks the source chain
+    // for typed quinn::ConnectionError / quinn::ConnectError / io::Error
+    // variants before falling back to string heuristics. This gives more
+    // accurate classifications (e.g., distinguishing ApplicationClosed from
+    // a generic "closed" match) than the previous string-only approach.
+    crate::http3::client::classify_http3_error(e.as_ref())
 }
 
 /// Streaming proxy path: sends backend response chunks directly to the H3 client
