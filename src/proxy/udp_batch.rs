@@ -450,7 +450,7 @@ impl SendMmsgBatch {
 /// with `UDP_SEGMENT` ancillary data (Linux 4.18+).
 ///
 /// Concatenates consecutive same-size datagrams into a contiguous buffer and flushes
-/// via `send_with_gso()` or `send_with_gso_connected()`. When a different-size datagram
+/// via `send_with_gso()`. When a different-size datagram
 /// arrives, the current batch is flushed and a new batch starts. This is complementary
 /// to `SendMmsgBatch` — GSO provides kernel-level segmentation which is more efficient
 /// than `sendmmsg` when datagrams share the same size and destination.
@@ -549,30 +549,6 @@ impl GsoBatchBuf {
             self.segment_size = 0;
         }
         result.map(|_| sent_count)
-    }
-
-    /// Flush the buffer via GSO sendmsg on a connected socket (no destination needed).
-    pub fn flush_connected(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<usize> {
-        if self.count == 0 {
-            return Ok(0);
-        }
-        let result =
-            crate::socket_opts::send_with_gso_connected(fd, &self.buf, self.segment_size as u16);
-        let sent_count = self.count;
-        // Only clear on success — preserve buffer for drain_to_sendmmsg() on failure.
-        if result.is_ok() {
-            self.buf.clear();
-            self.count = 0;
-            self.segment_size = 0;
-        }
-        result.map(|_| sent_count)
-    }
-
-    /// Reset the buffer without sending.
-    pub fn clear(&mut self) {
-        self.buf.clear();
-        self.count = 0;
-        self.segment_size = 0;
     }
 
     /// Drain buffered datagrams into a `SendMmsgBatch` for fallback sending.

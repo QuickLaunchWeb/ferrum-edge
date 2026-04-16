@@ -1649,6 +1649,7 @@ async fn create_session(
     udp_connected_sockets_enabled: bool,
     udp_gso_enabled: bool,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
+    let _ = udp_connected_sockets_enabled; // reserved for future connected-socket recv path
     // Check if this proxy uses passthrough mode (extract from config once).
     let is_passthrough = {
         let current = config.load();
@@ -1925,7 +1926,6 @@ async fn create_session(
     let reply_dgram_proxy_name2 = proxy_name.map(str::to_string);
     let reply_listen_port = listen_port;
     let is_dtls = reply_dtls.is_some();
-    let reply_udp_connected_sockets = udp_connected_sockets_enabled;
     #[cfg(target_os = "linux")]
     let reply_udp_gso = udp_gso_enabled;
     #[cfg(not(target_os = "linux"))]
@@ -1933,7 +1933,6 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
-        let _ = reply_udp_connected_sockets; // reserved for future recv-path connected sockets
         let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
