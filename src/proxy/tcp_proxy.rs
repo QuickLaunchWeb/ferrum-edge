@@ -1101,7 +1101,7 @@ async fn handle_tcp_connection_inner(
                         match try_ktls_splice(tls_stream, bs, idle_timeout, buf_size).await {
                             Ok(result) => {
                                 used_splice = true;
-                                Ok(result)
+                                result
                             }
                             Err(KtlsError::Unsupported(streams)) => {
                                 // kTLS not available for this cipher/version — fall back
@@ -1118,8 +1118,17 @@ async fn handle_tcp_connection_inner(
                                 // AFTER the pre-flight TCP_ULP probe succeeded (e.g.,
                                 // kernel cipher mismatch or ENOMEM). In practice this is
                                 // extremely rare since we validate cipher/version before
-                                // extracting secrets.
-                                Err(e)
+                                // extracting secrets. Attribute the failure at the
+                                // bidirectional-copy boundary — no bytes were exchanged
+                                // through the proxy path, so per-direction counts are 0.
+                                StreamCopyResult {
+                                    bytes_client_to_backend: 0,
+                                    bytes_backend_to_client: 0,
+                                    first_failure: Some((
+                                        Direction::Unknown,
+                                        classify_stream_error(&e),
+                                    )),
+                                }
                             }
                         }
                     } else {
@@ -1752,17 +1761,36 @@ async fn bidirectional_splice_io_uring(
     backend: TcpStream,
     idle_timeout: Option<Duration>,
     pipe_size: usize,
-) -> Result<(u64, u64), anyhow::Error> {
+) -> StreamCopyResult {
     use std::os::unix::io::AsRawFd;
+    use std::sync::OnceLock;
 
     let client_fd = client.as_raw_fd();
     let backend_fd = backend.as_raw_fd();
 
     // Create pipes with RAII guards — guards close fds on drop, ensuring cleanup
     // even if spawn_blocking panics or the function returns early.
-    let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let (c2b_pipe_r, c2b_pipe_w) = match create_splice_pipe(pipe_size) {
+        Ok(p) => p,
+        Err(e) => {
+            return StreamCopyResult {
+                bytes_client_to_backend: 0,
+                bytes_backend_to_client: 0,
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+            };
+        }
+    };
     let _c2b_guard = SplicePipeGuard(c2b_pipe_r, c2b_pipe_w);
-    let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+    let (b2c_pipe_r, b2c_pipe_w) = match create_splice_pipe(pipe_size) {
+        Ok(p) => p,
+        Err(e) => {
+            return StreamCopyResult {
+                bytes_client_to_backend: 0,
+                bytes_backend_to_client: 0,
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+            };
+        }
+    };
     let _b2c_guard = SplicePipeGuard(b2c_pipe_r, b2c_pipe_w);
 
     let timeout_ms = idle_timeout
@@ -1776,6 +1804,13 @@ async fn bidirectional_splice_io_uring(
     let shared_activity = Arc::new(AtomicU64::new(coarse_now_ms()));
     let sa_c2b = shared_activity.clone();
     let sa_b2c = shared_activity;
+
+    // First-failure attribution across the two blocking threads. `OnceLock`'s
+    // first-writer-wins semantics naturally encode "first to fail" — the later
+    // thread's `set()` is silently ignored. `Arc` shares it across threads.
+    let first_failure: Arc<OnceLock<(Direction, ErrorClass)>> = Arc::new(OnceLock::new());
+    let ff_c2b = first_failure.clone();
+    let ff_b2c = first_failure.clone();
 
     // Each direction runs on its own blocking thread with its own io_uring ring.
     let c2b_handle = tokio::task::spawn_blocking(move || {
@@ -1794,10 +1829,43 @@ async fn bidirectional_splice_io_uring(
     // close pipe fds on drop. All resource cleanup is RAII — no manual close needed.
     let (c2b_result, b2c_result) = tokio::join!(c2b_handle, b2c_handle);
 
-    let c2b = c2b_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
-    let b2c = b2c_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
-    Ok((c2b, b2c))
-    // Drop order (guaranteed by Rust): c2b, b2c returned → _b2c_guard closes pipes →
+    let c2b_bytes = match c2b_result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            let _ = ff_c2b.set((Direction::ClientToBackend, classify_stream_error(&e)));
+            0
+        }
+        Err(e) => {
+            let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
+            let _ = ff_c2b.set((
+                Direction::ClientToBackend,
+                classify_stream_error(&anyhow_err),
+            ));
+            0
+        }
+    };
+    let b2c_bytes = match b2c_result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            let _ = ff_b2c.set((Direction::BackendToClient, classify_stream_error(&e)));
+            0
+        }
+        Err(e) => {
+            let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
+            let _ = ff_b2c.set((
+                Direction::BackendToClient,
+                classify_stream_error(&anyhow_err),
+            ));
+            0
+        }
+    };
+
+    StreamCopyResult {
+        bytes_client_to_backend: c2b_bytes,
+        bytes_backend_to_client: b2c_bytes,
+        first_failure: first_failure.get().cloned(),
+    }
+    // Drop order (guaranteed by Rust): result returned → _b2c_guard closes pipes →
     // _c2b_guard closes pipes → backend dropped (fd closed) → client dropped (fd closed).
     // Blocking threads have already joined, so raw fds are no longer in use.
 }
@@ -2110,7 +2178,7 @@ async fn try_ktls_splice(
     backend_stream: TcpStream,
     idle_timeout: Option<Duration>,
     buf_size: usize,
-) -> Result<(u64, u64), KtlsError> {
+) -> Result<StreamCopyResult, KtlsError> {
     use std::os::unix::io::AsRawFd;
 
     // Check cipher suite compatibility AND per-cipher kernel support before
@@ -2254,9 +2322,7 @@ async fn try_ktls_splice(
     match crate::socket_opts::ktls::enable_ktls(fd, &params) {
         Ok(true) => {
             debug!("kTLS installed successfully, using splice for TLS connection");
-            bidirectional_splice(tcp_stream, backend_stream, idle_timeout, buf_size)
-                .await
-                .map_err(KtlsError::Installed)
+            Ok(bidirectional_splice(tcp_stream, backend_stream, idle_timeout, buf_size).await)
         }
         Ok(false) => {
             // Kernel doesn't support kTLS (ENOPROTOOPT) — but we already consumed
