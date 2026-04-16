@@ -317,11 +317,13 @@ async fn flush_loop(
     let mut last_resolve = Instant::now();
 
     loop {
-        if last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
+        // DTLS reconnection is expensive and is handled inside `create_sender`
+        // via the DTLS session — skip the entire re-resolve branch (including
+        // advancing the timer) when DTLS is enabled so we don't needlessly
+        // poll on every iteration.
+        if !cfg.dtls_enabled && last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
             last_resolve = Instant::now();
-            if !cfg.dtls_enabled
-                && let Ok(new_sender) = create_sender(&cfg, dns_cache.as_ref()).await
-            {
+            if let Ok(new_sender) = create_sender(&cfg, dns_cache.as_ref()).await {
                 sender = new_sender;
             }
         }
