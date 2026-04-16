@@ -33,6 +33,7 @@
 pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
+pub mod deferred_log;
 pub mod grpc_proxy;
 pub mod http2_pool;
 pub mod sni;

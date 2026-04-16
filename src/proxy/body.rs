@@ -26,11 +26,25 @@ pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 /// just the handler function scope. This is critical for H2/H3/gRPC streaming
 /// responses where hyper drives the body to completion *after*
 /// `handle_proxy_request` returns.
+///
+/// Optionally also carries a [`DeferredTransactionLogger`] that fires
+/// `log_with_mirror` when the body reaches a terminal state — success
+/// (Ready(None)), streaming error (Ready(Some(Err))), or Drop safety net
+/// (client disconnected before completion). `bytes_streamed_to_client` is
+/// tracked via an atomic counter incremented on each data frame.
 pub struct ProxyBody {
     kind: ProxyBodyKind,
     /// Dropped when hyper finishes sending the body (or the connection closes),
     /// decrementing `OverloadState.active_requests`.
     _request_guard: Option<crate::overload::RequestGuard>,
+    /// Deferred logger that fires after body completion, allowing
+    /// `TransactionSummary.body_completed` / `body_error_class` /
+    /// `client_disconnected` / `bytes_streamed_to_client` to reflect the
+    /// client-visible outcome rather than values at header-flush time.
+    logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>>,
+    /// Monotonic byte count streamed to the client. Updated on each
+    /// successful data frame; read when firing the deferred logger.
+    bytes_streamed: AtomicU64,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -149,6 +163,8 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Full(Full::new(data.into())),
             _request_guard: None,
+            logger: None,
+            bytes_streamed: AtomicU64::new(0),
         }
     }
 
@@ -162,6 +178,8 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Full(Full::default()),
             _request_guard: None,
+            logger: None,
+            bytes_streamed: AtomicU64::new(0),
         }
     }
 
@@ -172,6 +190,19 @@ impl ProxyBody {
         self
     }
 
+    /// Attach a [`DeferredTransactionLogger`] to this body so
+    /// `log_with_mirror` fires after the body reaches a terminal state
+    /// (successful completion, streaming error, or client disconnect)
+    /// rather than at the moment response headers are flushed.
+    #[allow(dead_code)]
+    pub fn with_logger(
+        mut self,
+        logger: Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
+    ) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
     /// Create a streaming body (no completion tracking).
     fn streaming(
         body: Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>,
@@ -179,6 +210,8 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Stream(body),
             _request_guard: None,
+            logger: None,
+            bytes_streamed: AtomicU64::new(0),
         }
     }
 
@@ -205,6 +238,8 @@ impl ProxyBody {
             Self {
                 kind: ProxyBodyKind::Tracked(tracked),
                 _request_guard: None,
+                logger: None,
+                bytes_streamed: AtomicU64::new(0),
             },
             metrics,
         )
@@ -238,6 +273,8 @@ impl ProxyBody {
             Self {
                 kind: ProxyBodyKind::Tracked(tracked),
                 _request_guard: None,
+                logger: None,
+                bytes_streamed: AtomicU64::new(0),
             },
             metrics,
         )
@@ -254,13 +291,44 @@ impl http_body::Body for ProxyBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // SAFETY: Both `Full<Bytes>` and `Pin<Box<...>>` are `Unpin`, so
         // `get_mut` is safe and we can re-pin the inner value.
-        match &mut self.get_mut().kind {
+        let this = self.get_mut();
+        let result = match &mut this.kind {
             ProxyBodyKind::Full(body) => Pin::new(body)
                 .poll_frame(cx)
                 .map(|opt| opt.map(|result| result.map_err(|never| match never {}))),
             ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
             ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
+        };
+
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes_streamed
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(logger) = this.logger.take() {
+                    let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                    let (class, disconnected) =
+                        crate::retry::classify_body_error(&**e as &dyn std::error::Error);
+                    logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
+                        class,
+                        bytes,
+                        disconnected,
+                    ));
+                }
+            }
+            Poll::Ready(None) => {
+                if let Some(logger) = this.logger.take() {
+                    let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                    logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
+                }
+            }
+            Poll::Pending => {}
         }
+
+        result
     }
 
     fn is_end_stream(&self) -> bool {
@@ -276,6 +344,17 @@ impl http_body::Body for ProxyBody {
             ProxyBodyKind::Full(body) => body.size_hint(),
             ProxyBodyKind::Stream(body) => body.size_hint(),
             ProxyBodyKind::Tracked(body) => body.inner.size_hint(),
+        }
+    }
+}
+
+impl Drop for ProxyBody {
+    fn drop(&mut self) {
+        if let Some(logger) = self.logger.take() {
+            let bytes = self.bytes_streamed.load(Ordering::Relaxed);
+            logger.fire(crate::proxy::deferred_log::BodyOutcome::client_disconnect(
+                bytes,
+            ));
         }
     }
 }

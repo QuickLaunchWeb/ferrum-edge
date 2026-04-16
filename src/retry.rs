@@ -263,6 +263,80 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     ErrorClass::RequestError
 }
 
+/// Classify an error that was emitted by a streaming response body wrapper
+/// (i.e. after response headers have been sent to the client).
+///
+/// Returns `(ErrorClass, client_disconnected)` where `client_disconnected`
+/// is `true` when the error chain points to the client closing the
+/// connection (broken pipe, connection reset/aborted while writing, hyper
+/// `is_canceled`, hyper `is_incomplete_message`).
+///
+/// Walks `source()` chain so wrapped `hyper::Error` and `io::Error`
+/// instances are inspected regardless of how many layers of `Box<dyn Error>`
+/// sit between them and the caller.
+pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass, bool) {
+    // Port exhaustion is extremely unlikely during body streaming, but walk
+    // the chain anyway so we never misclassify it as a generic error.
+    if is_port_exhaustion(e) {
+        return (ErrorClass::PortExhaustion, false);
+    }
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted => {
+                    return (ErrorClass::ConnectionClosed, true);
+                }
+                std::io::ErrorKind::TimedOut => {
+                    return (ErrorClass::ReadWriteTimeout, false);
+                }
+                _ => {}
+            }
+        }
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_canceled() || hyper_err.is_incomplete_message() {
+                return (ErrorClass::ClientDisconnect, true);
+            }
+            if hyper_err.is_timeout() {
+                return (ErrorClass::ReadWriteTimeout, false);
+            }
+            // Fall through to string-based inspection below.
+        }
+        current = err.source();
+    }
+
+    // String fallback for boxed backend errors that don't expose typed
+    // downcasts (e.g. reqwest::Error wrapped in Box<dyn Error>).
+    let error_str = format!("{}", e);
+    let debug_str = format!("{:?}", e);
+    if error_str.contains("broken pipe")
+        || debug_str.contains("BrokenPipe")
+        || error_str.contains("connection reset")
+        || debug_str.contains("ConnectionReset")
+        || error_str.contains("connection aborted")
+        || debug_str.contains("ConnectionAborted")
+        || error_str.contains("canceled")
+        || error_str.contains("closed before")
+    {
+        return (ErrorClass::ConnectionClosed, true);
+    }
+    if error_str.contains("timed out") || debug_str.contains("TimedOut") {
+        return (ErrorClass::ReadWriteTimeout, false);
+    }
+    if debug_str.contains("GOAWAY")
+        || debug_str.contains("RESET_STREAM")
+        || debug_str.contains("h2::")
+        || debug_str.contains("h3::")
+    {
+        return (ErrorClass::ProtocolError, false);
+    }
+
+    (ErrorClass::RequestError, false)
+}
+
 /// The response body, either fully buffered or still streaming from the backend.
 pub enum ResponseBody {
     /// Body has been fully collected into memory.
