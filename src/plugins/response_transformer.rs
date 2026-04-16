@@ -65,14 +65,16 @@ impl ResponseTransformer {
 
         if let Some(arr) = config["rules"].as_array() {
             for (idx, r) in arr.iter().enumerate() {
-                // `target` defaults to "header" when ABSENT (backward compat
-                // for terse header-only configs). If present but not a string,
-                // that is a configuration error — reject rather than silently
-                // coerce. Note: `query` is NOT a valid target for
-                // response_transformer; only `header` and `body` are accepted.
+                // `target` defaults to "header" only when the field is
+                // ABSENT (backward compat for terse header-only configs).
+                // An explicit `"target": null` — or any non-string value —
+                // is a configuration error. Silently defaulting an explicit
+                // null would mask typos / misconfiguration. Note: `query`
+                // is NOT a valid target for response_transformer; only
+                // `header` and `body` are accepted.
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),
-                    Some(Value::Null) | None => "header",
+                    None => "header",
                     Some(_) => {
                         return Err(format!(
                             "response_transformer: rule[{idx}]: 'target' must be a string (expected header/body)"

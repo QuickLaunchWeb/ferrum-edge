@@ -5,6 +5,12 @@
 //! - Nested object traversal
 //! - Array indexing via numeric segments (`"items.0.name"`)
 //! - Dot escape via backslash for keys containing literal dots (`"weird\\.key"`)
+//! - Literal backslash escape (`"\\\\"` → single `\`)
+//!
+//! Only `\.` and `\\` are recognized escape sequences. Any other `\X`
+//! preserves both characters literally so that keys containing backslashes
+//! (e.g. `device\serial`) behave the same as they did before dot-escape
+//! support was introduced.
 //!
 //! Used by `request_transformer` and `response_transformer` plugins to
 //! support `target: "body"` rules.
@@ -41,6 +47,11 @@ impl<'a> Iterator for PathSegments<'a> {
 
 /// Build a path-segment iterator. Picks the zero-alloc fast path when the
 /// path contains no `\`.
+///
+/// Only `\.` and `\\` are recognized escape sequences. Any other `\X`
+/// sequence preserves the backslash literally (so `device\serial` yields a
+/// single segment `device\serial`). This matches the behavior of the
+/// pre-dot-escape path parser, which did a plain `split('.')`.
 fn path_segments(path: &str) -> PathSegments<'_> {
     if !path.contains('\\') {
         return PathSegments::Simple(path.split('.'));
@@ -50,6 +61,12 @@ fn path_segments(path: &str) -> PathSegments<'_> {
     let mut escape = false;
     for c in path.chars() {
         if escape {
+            // Only `\.` and `\\` are recognized escapes. Any other `\X`
+            // keeps the backslash as a literal character so keys like
+            // `device\serial` continue to work.
+            if c != '.' && c != '\\' {
+                buf.push('\\');
+            }
             buf.push(c);
             escape = false;
         } else if c == '\\' {
@@ -414,13 +431,12 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
     let mut rules = Vec::new();
     for (idx, r) in arr.iter().enumerate() {
         // `target` is optional — callers (request_transformer) default missing
-        // target to "header". But if `target` is PRESENT and not a string, it
-        // is a configuration error and must not be silently ignored. Missing
-        // `target` or any non-body string target is skipped here — the caller
-        // owns validation for non-body rules.
+        // target to "header", so `None` means "not a body rule, skip". But if
+        // `target` is PRESENT and not a string (including explicit null), it
+        // is a configuration error and must not be silently ignored.
         let target = match r.get("target") {
             Some(Value::String(s)) => s.as_str(),
-            Some(Value::Null) | None => continue,
+            None => continue,
             Some(_) => {
                 return Err(format!(
                     "rule[{idx}]: 'target' must be a string (expected header/query/body)"

@@ -1,6 +1,6 @@
 use ferrum_edge::plugins::utils::body_transform::{
-    get_nested_value, is_json_content_type, remove_nested_value, rename_nested_field,
-    set_nested_value,
+    get_nested_value, is_json_content_type, parse_body_rules, remove_nested_value,
+    rename_nested_field, set_nested_value,
 };
 use serde_json::json;
 
@@ -246,4 +246,64 @@ fn test_rename_nested_field_escaped_dot_in_path() {
     let mut root = json!({"weird.key": "val"});
     assert!(rename_nested_field(&mut root, "weird\\.key", "renamed"));
     assert_eq!(root, json!({"renamed": "val"}));
+}
+
+// ── Literal-backslash preservation ─────────────────────────────────────────
+
+#[test]
+fn test_path_preserves_literal_backslash_in_key() {
+    // Regression: only `\.` and `\\` should be recognized as escapes. Any
+    // other `\X` sequence must preserve the backslash literally, matching the
+    // pre-dot-escape `split('.')` behavior. Keys like `device\serial` are
+    // valid JSON and appear in real payloads — they must continue to work.
+    let root = json!({"device\\serial": "abc-123"});
+
+    // `path\name` style (backslash not followed by `.` or `\`): the parser
+    // must keep the literal `\` and return the stored value.
+    assert_eq!(
+        get_nested_value(&root, "device\\serial"),
+        Some(&json!("abc-123"))
+    );
+
+    // Round-trip via set_nested_value — setting and then reading back the
+    // same path must yield the value we wrote.
+    let mut root = json!({});
+    assert!(set_nested_value(&mut root, "device\\serial", json!("XYZ")));
+    assert_eq!(
+        get_nested_value(&root, "device\\serial"),
+        Some(&json!("XYZ"))
+    );
+    // The key stored in the JSON must be the literal `device\serial`.
+    assert_eq!(root, json!({"device\\serial": "XYZ"}));
+}
+
+#[test]
+fn test_path_double_backslash_escapes_to_single_backslash() {
+    // `\\\\` (two escaped backslashes in a Rust string literal — i.e. two
+    // actual backslashes in the path) collapses to a single literal
+    // backslash segment character. This is the documented `\\` escape.
+    let mut root = json!({});
+    // Path `a\\b` in the raw path string (written `a\\\\b` in Rust source)
+    // should produce the key `a\b` after escape collapse.
+    assert!(set_nested_value(&mut root, "a\\\\b", json!(42)));
+    assert_eq!(root, json!({"a\\b": 42}));
+
+    // And reading with the same escaped path returns the value.
+    assert_eq!(get_nested_value(&root, "a\\\\b"), Some(&json!(42)));
+}
+
+// ── parse_body_rules strict validation ────────────────────────────────────
+
+#[test]
+fn test_body_rules_null_target_rejected() {
+    // `"target": null` is an explicit configuration error and must be
+    // rejected, not silently skipped. Only absent `target` means "not a body
+    // rule — let the caller handle it".
+    let config = json!({
+        "rules": [
+            {"operation": "add", "target": null, "key": "x", "value": "v"}
+        ]
+    });
+    let err = parse_body_rules(&config).expect_err("expected error for null target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
 }

@@ -541,6 +541,21 @@ async fn test_response_transformer_rejects_non_string_target() {
 }
 
 #[tokio::test]
+async fn test_response_transformer_rejects_null_target() {
+    // Explicit `"target": null` must fail config load. Only a completely
+    // absent `target` field may default to "header" for backward-compat.
+    // Silently coercing null would mask misconfiguration.
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": null, "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for null target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
 async fn test_response_transformer_rejects_query_target() {
     // Unlike request_transformer, response_transformer has no `query` target.
     let err = ResponseTransformer::new(&json!({

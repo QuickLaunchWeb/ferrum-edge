@@ -88,13 +88,14 @@ impl RequestTransformer {
 
         if let Some(arr) = config["rules"].as_array() {
             for (idx, r) in arr.iter().enumerate() {
-                // `target` defaults to "header" when ABSENT (backward compat
-                // for terse header-only configs). If present but not a string,
-                // that is a configuration error — reject rather than silently
-                // coerce.
+                // `target` defaults to "header" only when the field is
+                // ABSENT (backward compat for terse header-only configs).
+                // An explicit `"target": null` — or any non-string value —
+                // is a configuration error. Silently defaulting an explicit
+                // null would mask typos / misconfiguration.
                 let target = match r.get("target") {
                     Some(Value::String(s)) => s.as_str(),
-                    Some(Value::Null) | None => "header",
+                    None => "header",
                     Some(_) => {
                         return Err(format!(
                             "request_transformer: rule[{idx}]: 'target' must be a string (expected header/query/body)"
