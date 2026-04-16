@@ -809,9 +809,8 @@ pub struct EnvConfig {
     /// so splice(2) can work on encrypted connections. Dramatically reduces latency
     /// and CPU for TLS TCP proxy paths.
     /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
-    /// Default: `false` — opt-in because the startup probe (TCP_ULP setsockopt) can
-    /// succeed on kernels where actual key installation later fails, causing connection
-    /// drops. Operators should test with `true` on their target kernel before enabling.
+    /// Default: `auto` — probes full kTLS path (ULP install + dummy key install) on
+    /// a loopback socket pair at startup. Only enables if the entire path succeeds.
     pub ktls_enabled: AutoBool,
     /// Enable io_uring-based splice for TCP proxy zero-copy relay (Linux 5.6+ only).
     /// Uses IORING_OP_SPLICE submission queue entries instead of direct libc splice
@@ -1018,7 +1017,7 @@ impl Default for EnvConfig {
             tls_offload_threads: 0,
             tcp_fastopen_enabled: AutoBool::Auto,
             tcp_fastopen_queue_len: 256,
-            ktls_enabled: AutoBool::False,
+            ktls_enabled: AutoBool::Auto,
             io_uring_splice_enabled: AutoBool::Auto,
             udp_gro_enabled: AutoBool::Auto,
             udp_gso_enabled: AutoBool::Auto,
@@ -1630,7 +1629,7 @@ impl EnvConfig {
             tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
-            ktls_enabled: resolve_auto_bool(conf, "FERRUM_KTLS_ENABLED", AutoBool::False),
+            ktls_enabled: resolve_auto_bool(conf, "FERRUM_KTLS_ENABLED", AutoBool::Auto),
             io_uring_splice_enabled: resolve_auto_bool(
                 conf,
                 "FERRUM_IO_URING_SPLICE_ENABLED",

@@ -670,32 +670,58 @@ pub mod ktls {
     /// This is a best-effort check — kTLS can still fail per-socket if the
     /// negotiated cipher is unsupported.
     pub fn is_ktls_available() -> bool {
-        // Probe by trying setsockopt(TCP_ULP, "tls") on a temp TCP socket.
-        // This works whether kTLS is a loadable module or built-in (CONFIG_TLS=y).
-        // The /proc/modules approach misses built-in kTLS.
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        if fd < 0 {
-            return false;
-        }
-        let ulp_name = b"tls\0";
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
+        // Full kTLS probe: create a connected loopback TCP socket pair, install
+        // TCP_ULP "tls", then install dummy AES-128-GCM TX keys. This proves the
+        // entire kTLS path works — not just that the ULP module exists.
+        //
+        // The earlier TCP_ULP-only probe was insufficient: the kernel could accept
+        // the ULP but reject key installation (e.g., CONFIG_TLS=y but cipher support
+        // missing), causing connection drops at runtime.
+        //
+        // Cost: ~1ms at startup (one-time). Worth it to avoid silent runtime failures.
+        unsafe {
+            // Create a connected pair via socketpair (loopback).
+            let mut fds = [0i32; 2];
+            if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) < 0 {
+                return false;
+            }
+
+            // Step 1: Install TCP_ULP "tls".
+            let ulp_name = b"tls\0";
+            let ret = libc::setsockopt(
+                fds[0],
                 libc::IPPROTO_TCP,
                 libc::TCP_ULP,
                 ulp_name.as_ptr() as *const libc::c_void,
                 ulp_name.len() as libc::socklen_t,
-            )
-        };
-        unsafe { libc::close(fd) };
-        // ENOPROTOOPT = kernel doesn't support kTLS. Any other result (including
-        // ENOTCONN which some kernels return on unconnected sockets) means the
-        // ULP exists — we'll handle per-socket failures in try_ktls_splice().
-        if ret == 0 {
-            return true;
+            );
+            if ret != 0 {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return false;
+            }
+
+            // Step 2: Install dummy AES-128-GCM TX key.
+            let info = TlsCryptoInfoAes128Gcm {
+                version: TLS_1_3_VERSION,
+                cipher_type: TLS_CIPHER_AES_GCM_128,
+                iv: [0u8; 8],
+                key: [0u8; 16],
+                salt: [0u8; 4],
+                rec_seq: [0u8; 8],
+            };
+            let ret = libc::setsockopt(
+                fds[0],
+                SOL_TLS,
+                TLS_TX,
+                &info as *const TlsCryptoInfoAes128Gcm as *const libc::c_void,
+                std::mem::size_of::<TlsCryptoInfoAes128Gcm>() as libc::socklen_t,
+            );
+
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            ret == 0
         }
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        errno != libc::ENOPROTOOPT
     }
 }
 
