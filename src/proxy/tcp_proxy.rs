@@ -5,12 +5,10 @@
 //! `tokio::io::copy_bidirectional` for optimal zero-copy throughput.
 
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -24,11 +22,48 @@ use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
-    PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
+    Direction, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
 };
+use crate::retry::ErrorClass;
 
 pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
     crate::retry::classify_boxed_error(error.as_ref())
+}
+
+/// Outcome of a bidirectional stream copy between the client and backend.
+///
+/// Preserves per-direction byte counts even when one half errors — callers
+/// use these to record metrics accurately regardless of which side failed.
+/// `first_failure` is `Some((direction, class))` when a half errored before
+/// both halves observed a clean EOF; `None` indicates graceful shutdown.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct StreamCopyResult {
+    pub bytes_client_to_backend: u64,
+    pub bytes_backend_to_client: u64,
+    pub first_failure: Option<(Direction, ErrorClass)>,
+}
+
+/// Crate-visible entry point to `bidirectional_copy` for the `_test_support`
+/// module. Exposed only so external integration/unit tests can exercise the
+/// direction-tracking behavior without the private function being made `pub`.
+///
+/// Rustc's dead-code analysis cannot see through the generic instantiations in
+/// the `_test_support` re-export (which is consumed by the integration/unit
+/// test crates), so the allow is load-bearing — without it CI's `-D warnings`
+/// clippy gate fails.
+#[allow(dead_code)]
+pub(crate) async fn bidirectional_copy_for_test<C, B>(
+    client: C,
+    backend: B,
+    idle_timeout: Option<Duration>,
+    buf_size: usize,
+) -> StreamCopyResult
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    bidirectional_copy(client, backend, idle_timeout, buf_size).await
 }
 
 /// Cached backend TLS configuration to avoid reading certificate files from
@@ -358,19 +393,47 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                                 duration_ms = s.duration.as_millis() as u64,
                                 "TCP connection completed"
                             );
-                            // Successful completion: body flowed, then either the
-                            // client or backend sent FIN. We can't cheaply determine
-                            // which side FIN'd first here without threading that
-                            // signal through bidirectional_copy, so report a
-                            // graceful shutdown with unknown direction.
-                            (
-                                s.bytes_in,
-                                s.bytes_out,
-                                None,
-                                None,
-                                None,
-                                Some(crate::plugins::DisconnectCause::GracefulShutdown),
-                            )
+                            // Bidirectional copy finished. If `first_failure` is
+                            // set, one half errored before both halves observed
+                            // a clean EOF — surface the real direction & class.
+                            // Otherwise both halves hit EOF cleanly (graceful).
+                            match &s.first_failure {
+                                Some((dir, class)) => {
+                                    let dir = *dir;
+                                    let class = class.clone();
+                                    let cause = match dir {
+                                        Direction::ClientToBackend => {
+                                            crate::plugins::DisconnectCause::RecvError
+                                        }
+                                        Direction::BackendToClient => {
+                                            crate::plugins::DisconnectCause::BackendError
+                                        }
+                                        Direction::Unknown => {
+                                            if class == ErrorClass::ReadWriteTimeout {
+                                                crate::plugins::DisconnectCause::IdleTimeout
+                                            } else {
+                                                crate::plugins::DisconnectCause::RecvError
+                                            }
+                                        }
+                                    };
+                                    (
+                                        s.bytes_in,
+                                        s.bytes_out,
+                                        Some(class.to_string()),
+                                        Some(class),
+                                        Some(dir),
+                                        Some(cause),
+                                    )
+                                }
+                                None => (
+                                    s.bytes_in,
+                                    s.bytes_out,
+                                    None,
+                                    None,
+                                    None,
+                                    Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                                ),
+                            }
                         }
                         Err(e) => {
                             debug!(
@@ -381,16 +444,15 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             );
                             let error_message = e.to_string();
                             let err_class = classify_stream_error(e);
-                            // Direction is not yet threaded through
-                            // bidirectional_copy/_splice — populated as Unknown.
-                            // TODO(gap-5): capture first-failure direction via
-                            // tokio::select! in bidirectional_copy.
+                            // Pre-copy error (DNS, connect, plugin reject, TLS
+                            // handshake). No bytes flowed and direction can't
+                            // be attributed to a specific half, so use Unknown.
                             (
                                 0,
                                 0,
                                 Some(error_message),
                                 Some(err_class),
-                                Some(crate::plugins::Direction::Unknown),
+                                Some(Direction::Unknown),
                                 Some(crate::plugins::DisconnectCause::RecvError),
                             )
                         }
@@ -483,6 +545,9 @@ struct TcpConnectionSuccess {
     duration: Duration,
     /// Whether splice(2) was used for this connection (Linux plaintext paths only).
     splice_used: bool,
+    /// `Some((direction, class))` when the bidirectional copy errored before
+    /// both halves observed a clean EOF. `None` indicates a graceful shutdown.
+    first_failure: Option<(Direction, ErrorClass)>,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -718,9 +783,12 @@ async fn handle_tcp_connection_inner(
         let copy_result =
             bidirectional_copy(client_stream, backend_stream, idle_timeout, buf_size).await;
 
-        if let Ok((c2b, b2c)) = &copy_result {
-            adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
-        }
+        adaptive_buffer.record_connection(
+            proxy_id,
+            copy_result
+                .bytes_client_to_backend
+                .saturating_add(copy_result.bytes_backend_to_client),
+        );
 
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
@@ -729,17 +797,19 @@ async fn handle_tcp_connection_inner(
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
             );
-            match &copy_result {
-                Ok(_) => cb.record_success(),
-                Err(_) => cb.record_failure(502, true),
+            if copy_result.first_failure.is_some() {
+                cb.record_failure(502, true);
+            } else {
+                cb.record_success();
             }
         }
 
-        return copy_result.map(|(bytes_in, bytes_out)| TcpConnectionSuccess {
-            bytes_in,
-            bytes_out,
+        return Ok(TcpConnectionSuccess {
+            bytes_in: copy_result.bytes_client_to_backend,
+            bytes_out: copy_result.bytes_backend_to_client,
             duration: start.elapsed(),
             splice_used: cfg!(target_os = "linux"),
+            first_failure: copy_result.first_failure,
         });
     }
 
@@ -1030,9 +1100,12 @@ async fn handle_tcp_connection_inner(
     };
 
     // Record adaptive buffer stats for the TLS/non-passthrough path.
-    if let Ok((c2b, b2c)) = &copy_result {
-        adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
-    }
+    adaptive_buffer.record_connection(
+        proxy_id,
+        copy_result
+            .bytes_client_to_backend
+            .saturating_add(copy_result.bytes_backend_to_client),
+    );
 
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
@@ -1041,17 +1114,19 @@ async fn handle_tcp_connection_inner(
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
         );
-        match &copy_result {
-            Ok(_) => cb.record_success(),
-            Err(_) => cb.record_failure(502, true),
+        if copy_result.first_failure.is_some() {
+            cb.record_failure(502, true);
+        } else {
+            cb.record_success();
         }
     }
 
-    copy_result.map(|(bytes_in, bytes_out)| TcpConnectionSuccess {
-        bytes_in,
-        bytes_out,
+    Ok(TcpConnectionSuccess {
+        bytes_in: copy_result.bytes_client_to_backend,
+        bytes_out: copy_result.bytes_backend_to_client,
         duration: start.elapsed(),
         splice_used: used_splice,
+        first_failure: copy_result.first_failure,
     })
 }
 
@@ -1171,64 +1246,165 @@ async fn connect_backend_tls_cached(
     Ok(tls_stream)
 }
 
+/// How long to wait for the opposite direction to drain after the first half
+/// finishes (cleanly or with an error). Matches the splice-path grace window.
+const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+/// Copy bytes from `reader` into `writer` until EOF, updating `bytes` and
+/// optionally `last_activity` on each read. Returns `Ok(())` on EOF or an
+/// error on the first read/write failure.
+async fn copy_one_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    buf_size: usize,
+    bytes: Arc<AtomicU64>,
+    last_activity: Option<Arc<AtomicU64>>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; buf_size.max(4096)];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            // Clean EOF — shut down the writer side so the peer observes a
+            // half-close. Ignore shutdown errors (peer may already be gone).
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        writer.write_all(&buf[..n]).await?;
+        bytes.fetch_add(n as u64, Ordering::Relaxed);
+        if let Some(ref la) = last_activity {
+            la.store(coarse_now_ms(), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Bidirectional stream copy between client and backend.
-/// Returns (bytes_client_to_backend, bytes_backend_to_client).
+///
+/// Runs the two half-duplex copies concurrently via `tokio::select!` so that
+/// whichever direction fails first is recorded in `first_failure`. Per-direction
+/// byte counts are preserved even when one half errors. After the first half
+/// finishes, the other is given a brief grace period to drain remaining data.
 ///
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
-/// When `idle_timeout` is `None` or zero, uses the fast path with no overhead.
 async fn bidirectional_copy<C, B>(
-    mut client: C,
-    mut backend: B,
+    client: C,
+    backend: B,
     idle_timeout: Option<Duration>,
     buf_size: usize,
-) -> Result<(u64, u64), anyhow::Error>
+) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    match idle_timeout {
-        Some(timeout) if !timeout.is_zero() => {
-            let last_activity = Arc::new(AtomicU64::new(coarse_now_ms()));
-            let mut tracked_client = IdleTrackingStream::new(client, last_activity.clone());
-            let mut tracked_backend = IdleTrackingStream::new(backend, last_activity.clone());
+    let c2b_bytes = Arc::new(AtomicU64::new(0));
+    let b2c_bytes = Arc::new(AtomicU64::new(0));
 
-            let copy_fut = tokio::io::copy_bidirectional_with_sizes(
-                &mut tracked_client,
-                &mut tracked_backend,
-                buf_size,
-                buf_size,
-            );
-            tokio::pin!(copy_fut);
+    let last_activity = match idle_timeout {
+        Some(t) if !t.is_zero() => Some(Arc::new(AtomicU64::new(coarse_now_ms()))),
+        _ => None,
+    };
 
-            let idle_check = async {
-                let timeout_ms = timeout.as_millis() as u64;
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    let last = last_activity.load(Ordering::Relaxed);
-                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                        return;
+    let (client_read, client_write) = tokio::io::split(client);
+    let (backend_read, backend_write) = tokio::io::split(backend);
+
+    let c2b_bytes_task = c2b_bytes.clone();
+    let b2c_bytes_task = b2c_bytes.clone();
+    let la_c2b = last_activity.clone();
+    let la_b2c = last_activity.clone();
+
+    let c2b_fut = copy_one_direction(client_read, backend_write, buf_size, c2b_bytes_task, la_c2b);
+    let b2c_fut = copy_one_direction(backend_read, client_write, buf_size, b2c_bytes_task, la_b2c);
+    tokio::pin!(c2b_fut);
+    tokio::pin!(b2c_fut);
+
+    let idle_timeout_active = last_activity.is_some();
+    let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
+
+    // Phase 1: race the two directions (plus optional idle check).
+    let mut first_failure: Option<(Direction, ErrorClass)> = None;
+    let mut c2b_done = false;
+    let mut b2c_done = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut c2b_fut, if !c2b_done => {
+                c2b_done = true;
+                if let Err(e) = result {
+                    let err: anyhow::Error =
+                        anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
+                    if first_failure.is_none() {
+                        first_failure =
+                            Some((Direction::ClientToBackend, classify_stream_error(&err)));
                     }
                 }
-            };
-            tokio::pin!(idle_check);
-
-            tokio::select! {
-                result = &mut copy_fut => {
-                    result
-                        .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
+                break;
+            }
+            result = &mut b2c_fut, if !b2c_done => {
+                b2c_done = true;
+                if let Err(e) = result {
+                    let err: anyhow::Error =
+                        anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
+                    if first_failure.is_none() {
+                        first_failure =
+                            Some((Direction::BackendToClient, classify_stream_error(&err)));
+                    }
                 }
-                _ = &mut idle_check => {
-                    Err(anyhow::anyhow!("TCP idle timeout after {}s", timeout.as_secs()))
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                if let Some(ref la) = last_activity {
+                    let last = la.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        // Idle timeout — treat as "unknown" direction since
+                        // neither half produced an error. Use ReadWriteTimeout
+                        // class so disconnect_cause downstream is IdleTimeout.
+                        first_failure =
+                            Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                        break;
+                    }
                 }
             }
         }
-        _ => {
-            // No idle timeout — fast path with zero overhead.
-            tokio::io::copy_bidirectional_with_sizes(&mut client, &mut backend, buf_size, buf_size)
-                .await
-                .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
+    }
+
+    // Phase 2: let the other half drain briefly so we capture its bytes and
+    // (if it errors first during the grace window) its failure.
+    if !c2b_done {
+        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_failure.is_none() {
+                    let err: anyhow::Error =
+                        anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
+                    first_failure = Some((Direction::ClientToBackend, classify_stream_error(&err)));
+                }
+            }
+            Err(_) => { /* grace expired — leave counters as-is */ }
         }
+    }
+    if !b2c_done {
+        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_failure.is_none() {
+                    let err: anyhow::Error =
+                        anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
+                    first_failure = Some((Direction::BackendToClient, classify_stream_error(&err)));
+                }
+            }
+            Err(_) => { /* grace expired — leave counters as-is */ }
+        }
+    }
+
+    StreamCopyResult {
+        bytes_client_to_backend: c2b_bytes.load(Ordering::Relaxed),
+        bytes_backend_to_client: b2c_bytes.load(Ordering::Relaxed),
+        first_failure,
     }
 }
 
@@ -1263,16 +1439,34 @@ async fn bidirectional_splice(
     backend: TcpStream,
     idle_timeout: Option<Duration>,
     pipe_size: usize,
-) -> Result<(u64, u64), anyhow::Error> {
+) -> StreamCopyResult {
     use std::os::unix::io::AsRawFd;
 
     let client_fd = client.as_raw_fd();
     let backend_fd = backend.as_raw_fd();
 
     // Create two pipes: one for each direction. Guards close fds on drop.
-    let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let (c2b_pipe_r, c2b_pipe_w) = match create_splice_pipe(pipe_size) {
+        Ok(p) => p,
+        Err(e) => {
+            return StreamCopyResult {
+                bytes_client_to_backend: 0,
+                bytes_backend_to_client: 0,
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+            };
+        }
+    };
     let _c2b_guard = SplicePipeGuard(c2b_pipe_r, c2b_pipe_w);
-    let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+    let (b2c_pipe_r, b2c_pipe_w) = match create_splice_pipe(pipe_size) {
+        Ok(p) => p,
+        Err(e) => {
+            return StreamCopyResult {
+                bytes_client_to_backend: 0,
+                bytes_backend_to_client: 0,
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+            };
+        }
+    };
     let _b2c_guard = SplicePipeGuard(b2c_pipe_r, b2c_pipe_w);
 
     let last_activity = if idle_timeout.is_some_and(|t| !t.is_zero()) {
@@ -1281,54 +1475,107 @@ async fn bidirectional_splice(
         None
     };
 
+    let c2b_bytes = Arc::new(AtomicU64::new(0));
+    let b2c_bytes = Arc::new(AtomicU64::new(0));
+
     let la_c2b = last_activity.clone();
     let la_b2c = last_activity.clone();
+    let c2b_bytes_task = c2b_bytes.clone();
+    let b2c_bytes_task = b2c_bytes.clone();
 
     // Pin both direction futures for use with select! — no spawned tasks.
-    let c2b_fut =
-        splice_one_direction_no_guard(client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, la_c2b);
-    let b2c_fut =
-        splice_one_direction_no_guard(backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, la_b2c);
+    let c2b_fut = splice_one_direction_no_guard(
+        client_fd,
+        c2b_pipe_w,
+        c2b_pipe_r,
+        backend_fd,
+        la_c2b,
+        c2b_bytes_task,
+    );
+    let b2c_fut = splice_one_direction_no_guard(
+        backend_fd,
+        b2c_pipe_w,
+        b2c_pipe_r,
+        client_fd,
+        la_b2c,
+        b2c_bytes_task,
+    );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
 
     let idle_timeout_active = idle_timeout.is_some_and(|t| !t.is_zero());
+    let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
 
-    // Run both directions concurrently in a single task.
-    // When one finishes (EOF or error), give the other 100ms to drain.
+    let mut first_failure: Option<(Direction, ErrorClass)> = None;
+    let mut c2b_done = false;
+    let mut b2c_done = false;
+
+    // Phase 1: race the two directions (plus optional idle check).
     loop {
-        if idle_timeout_active {
-            let la = last_activity.as_ref().unwrap();
-            let timeout_ms = idle_timeout.unwrap().as_millis() as u64;
-            let last = la.load(Ordering::Relaxed);
-            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                return Err(anyhow::anyhow!(
-                    "TCP idle timeout after {}s",
-                    idle_timeout.unwrap().as_secs()
-                ));
-            }
-        }
-
         tokio::select! {
-            c2b_result = &mut c2b_fut => {
-                let c2b_bytes = c2b_result?;
-                // Client→Backend done (EOF); wait for Backend→Client to finish
-                // fully — the backend may still be sending response data after
-                // the client closed its write half (half-closed TCP flows).
-                let b2c_bytes = b2c_fut.await.unwrap_or(0);
-                return Ok((c2b_bytes, b2c_bytes));
+            biased;
+            c2b_result = &mut c2b_fut, if !c2b_done => {
+                c2b_done = true;
+                if let Err(e) = c2b_result
+                    && first_failure.is_none()
+                {
+                    first_failure =
+                        Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                }
+                break;
             }
-            b2c_result = &mut b2c_fut => {
-                let b2c_bytes = b2c_result?;
-                // Backend→Client done (EOF); wait for Client→Backend to finish.
-                let c2b_bytes = c2b_fut.await.unwrap_or(0);
-                return Ok((c2b_bytes, b2c_bytes));
+            b2c_result = &mut b2c_fut, if !b2c_done => {
+                b2c_done = true;
+                if let Err(e) = b2c_result
+                    && first_failure.is_none()
+                {
+                    first_failure =
+                        Some((Direction::BackendToClient, classify_stream_error(&e)));
+                }
+                break;
             }
             // Idle timeout check — wake every second.
             _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                continue; // loop back to check idle timeout at top
+                if let Some(ref la) = last_activity {
+                    let last = la.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        first_failure =
+                            Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                        break;
+                    }
+                }
             }
         }
+    }
+
+    // Phase 2: give the other half a brief grace window to drain remaining data.
+    if !c2b_done {
+        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_failure.is_none() {
+                    first_failure = Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    if !b2c_done {
+        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if first_failure.is_none() {
+                    first_failure = Some((Direction::BackendToClient, classify_stream_error(&e)));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    StreamCopyResult {
+        bytes_client_to_backend: c2b_bytes.load(Ordering::Relaxed),
+        bytes_backend_to_client: b2c_bytes.load(Ordering::Relaxed),
+        first_failure,
     }
 }
 
@@ -1352,8 +1599,11 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 }
 
 /// Splice data in one direction: src_fd → pipe → dst_fd.
-/// Returns total bytes transferred. Pipe fds are managed by the caller's
-/// `SplicePipeGuard` — this function does not close them.
+///
+/// Bytes transferred are accumulated into `bytes` so the caller can observe
+/// the final count regardless of whether this direction completes cleanly or
+/// errors. Pipe fds are managed by the caller's `SplicePipeGuard` — this
+/// function does not close them.
 #[cfg(target_os = "linux")]
 async fn splice_one_direction_no_guard(
     src_fd: i32,
@@ -1361,8 +1611,8 @@ async fn splice_one_direction_no_guard(
     pipe_r: i32,
     dst_fd: i32,
     last_activity: Option<Arc<AtomicU64>>,
-) -> Result<u64, anyhow::Error> {
-    let mut total: u64 = 0;
+    bytes: Arc<AtomicU64>,
+) -> Result<(), anyhow::Error> {
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
 
     loop {
@@ -1400,9 +1650,9 @@ async fn splice_one_direction_no_guard(
                 };
                 if written > 0 {
                     remaining -= written as usize;
-                    total += written as u64;
+                    bytes.fetch_add(written as u64, Ordering::Relaxed);
                 } else if written == 0 {
-                    return Ok(total);
+                    return Ok(());
                 } else {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -1415,7 +1665,7 @@ async fn splice_one_direction_no_guard(
             }
         } else if n == 0 {
             // EOF — source closed
-            return Ok(total);
+            return Ok(());
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -1449,59 +1699,4 @@ fn coarse_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-/// Wraps an `AsyncRead + AsyncWrite` stream, updating a shared timestamp
-/// whenever bytes are successfully read. Used for idle connection detection.
-///
-/// Only reads are tracked: bidirectional data flow means a read on either
-/// side (client or backend) indicates the connection is actively in use.
-struct IdleTrackingStream<S> {
-    inner: S,
-    last_activity: Arc<AtomicU64>,
-}
-
-impl<S> IdleTrackingStream<S> {
-    fn new(inner: S, last_activity: Arc<AtomicU64>) -> Self {
-        Self {
-            inner,
-            last_activity,
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for IdleTrackingStream<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let before = buf.filled().len();
-        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &result
-            && buf.filled().len() > before
-        {
-            this.last_activity.store(coarse_now_ms(), Ordering::Relaxed);
-        }
-        result
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTrackingStream<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
 }

@@ -68,6 +68,29 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    pub use crate::proxy::tcp_proxy::StreamCopyResult;
+
+    /// Invoke the internal `bidirectional_copy` for unit tests. Generic over
+    /// any streams implementing `AsyncRead + AsyncWrite + Unpin`.
+    pub async fn bidirectional_copy_for_test<C, B>(
+        client: C,
+        backend: B,
+        idle_timeout: Option<std::time::Duration>,
+        buf_size: usize,
+    ) -> StreamCopyResult
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        crate::proxy::tcp_proxy::bidirectional_copy_for_test(
+            client,
+            backend,
+            idle_timeout,
+            buf_size,
+        )
+        .await
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two
