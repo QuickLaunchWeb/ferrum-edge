@@ -1536,6 +1536,20 @@ fn libc_splice_loop(
                 } else {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
+                        // CRITICAL: This inner-loop WouldBlock branch must recheck
+                        // the idle timeout before sleeping. The `while remaining > 0`
+                        // loop has no timeout check, so if the destination socket
+                        // stops reading while data is buffered in the pipe, this
+                        // branch would spin at 1000 iters/sec forever without
+                        // releasing the blocking thread to the tokio pool.
+                        if timeout_ms > 0 {
+                            let last = shared_activity.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                                return Err(anyhow::anyhow!(
+                                    "TCP idle timeout (libc splice fallback, write phase)"
+                                ));
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
@@ -1547,6 +1561,16 @@ fn libc_splice_loop(
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
+                // The outer `loop` at the top rechecks the timeout, but add an
+                // inline check here for uniformity with the Phase 2 branch above.
+                if timeout_ms > 0 {
+                    let last = shared_activity.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        return Err(anyhow::anyhow!(
+                            "TCP idle timeout (libc splice fallback, read phase)"
+                        ));
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
@@ -1779,23 +1803,45 @@ async fn try_ktls_splice(
 ) -> Result<(u64, u64), KtlsError> {
     use std::os::unix::io::AsRawFd;
 
-    // Check cipher suite compatibility before consuming the TLS stream.
-    // Supported ciphers: AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
+    // Check cipher suite compatibility AND per-cipher kernel support before
+    // consuming the TLS stream. Supported ciphers: AES-128-GCM, AES-256-GCM,
+    // and ChaCha20-Poly1305.
+    //
+    // CRITICAL: Each cipher landed in kTLS in a different kernel version
+    // (AES-GCM in 4.13/4.17, ChaCha20-Poly1305 in 5.11+). A blanket
+    // `is_ktls_available()` answer is NOT sufficient: a kernel may accept
+    // the ULP and AES-128 keys while rejecting ChaCha20 keys with
+    // EINVAL/EOPNOTSUPP. If we only checked the cipher suite name and
+    // assumed the kernel supports it, the install would fail AFTER we
+    // have already consumed the TLS stream via `into_inner()` +
+    // `dangerous_extract_secrets()`, forcing a hard connection drop with
+    // no safe fallback to userspace TLS. The per-cipher gate below
+    // prevents this by refusing connections whose kernel probe failed
+    // BEFORE we extract secrets.
     let cipher_ok = {
         let (_, server_conn) = tls_stream.get_ref();
         match server_conn.negotiated_cipher_suite() {
             Some(suite) => {
                 let name = format!("{:?}", suite.suite());
-                name.contains("AES_128_GCM")
-                    || name.contains("AES_256_GCM")
-                    || name.contains("CHACHA20_POLY1305")
+                if name.contains("AES_128_GCM") {
+                    crate::socket_opts::ktls::is_ktls_aes128gcm_available()
+                } else if name.contains("AES_256_GCM") {
+                    crate::socket_opts::ktls::is_ktls_aes256gcm_available()
+                } else if name.contains("CHACHA20_POLY1305") {
+                    crate::socket_opts::ktls::is_ktls_chacha20_poly1305_available()
+                } else {
+                    false
+                }
             }
             None => false,
         }
     };
 
     if !cipher_ok {
-        debug!("kTLS: unsupported cipher suite, falling back to userspace copy");
+        debug!(
+            "kTLS: unsupported cipher suite or kernel lacks per-cipher support, \
+             falling back to userspace copy"
+        );
         return Err(KtlsError::Unsupported(Box::new((
             tls_stream,
             backend_stream,

@@ -818,37 +818,140 @@ pub mod ktls {
 
     /// Check if kTLS is available on this kernel.
     ///
+    /// Per-cipher kTLS availability, probed once at first call to
+    /// `is_ktls_available()` / the per-cipher accessors. The three cipher
+    /// suites kTLS supports landed in different kernel versions (AES-GCM
+    /// in 4.13/4.17, ChaCha20-Poly1305 in 5.11+), so a blanket "kTLS is
+    /// available" answer is incorrect: a kernel may accept the ULP and
+    /// AES-128-GCM key install but reject ChaCha20-Poly1305 with EINVAL /
+    /// EOPNOTSUPP.
+    ///
+    /// We must probe each cipher independently. If we probed only AES-128
+    /// and then tried to install ChaCha20 keys at runtime, the install
+    /// would fail AFTER we have already consumed the TLS stream via
+    /// `into_inner()` + `dangerous_extract_secrets()` — at which point
+    /// there is no safe way back to userspace TLS, forcing a hard
+    /// connection drop. The per-cipher gate in `try_ktls_splice` prevents
+    /// this by refusing connections for ciphers whose kernel probe failed
+    /// BEFORE extracting secrets.
+    struct KtlsAvailability {
+        aes128gcm: bool,
+        aes256gcm: bool,
+        chacha20_poly1305: bool,
+    }
+
+    static KTLS_AVAILABILITY: std::sync::OnceLock<KtlsAvailability> = std::sync::OnceLock::new();
+
+    fn ktls_availability() -> &'static KtlsAvailability {
+        KTLS_AVAILABILITY.get_or_init(|| {
+            // Probe each cipher on its own fresh TCP loopback pair. We cannot
+            // reuse a single socket across all three ciphers because the
+            // kernel refuses further TLS_TX installs on a socket that already
+            // has keys installed. Three separate probes cost ~3ms at startup
+            // (one-time), which is acceptable for one-shot auto-detection.
+            let aes128gcm = unsafe {
+                let info = TlsCryptoInfoAes128Gcm {
+                    version: TLS_1_2_VERSION,
+                    cipher_type: TLS_CIPHER_AES_GCM_128,
+                    iv: [0u8; 8],
+                    key: [0u8; 16],
+                    salt: [0u8; 4],
+                    rec_seq: [0u8; 8],
+                };
+                probe_cipher(
+                    &info as *const TlsCryptoInfoAes128Gcm as *const libc::c_void,
+                    std::mem::size_of::<TlsCryptoInfoAes128Gcm>() as libc::socklen_t,
+                )
+            };
+            let aes256gcm = unsafe {
+                let info = TlsCryptoInfoAes256Gcm {
+                    version: TLS_1_2_VERSION,
+                    cipher_type: TLS_CIPHER_AES_GCM_256,
+                    iv: [0u8; 8],
+                    key: [0u8; 32],
+                    salt: [0u8; 4],
+                    rec_seq: [0u8; 8],
+                };
+                probe_cipher(
+                    &info as *const TlsCryptoInfoAes256Gcm as *const libc::c_void,
+                    std::mem::size_of::<TlsCryptoInfoAes256Gcm>() as libc::socklen_t,
+                )
+            };
+            let chacha20_poly1305 = unsafe {
+                let info = TlsCryptoInfoChaCha20Poly1305 {
+                    version: TLS_1_2_VERSION,
+                    cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
+                    iv: [0u8; 12],
+                    key: [0u8; 32],
+                    salt: [0u8; 4],
+                    rec_seq: [0u8; 8],
+                };
+                probe_cipher(
+                    &info as *const TlsCryptoInfoChaCha20Poly1305 as *const libc::c_void,
+                    std::mem::size_of::<TlsCryptoInfoChaCha20Poly1305>() as libc::socklen_t,
+                )
+            };
+            KtlsAvailability {
+                aes128gcm,
+                aes256gcm,
+                chacha20_poly1305,
+            }
+        })
+    }
+
     /// Attempts to load the TLS ULP module via `modprobe tls` (requires root).
     /// Returns `true` if the module is already loaded or was loaded successfully.
     /// This is a best-effort check — kTLS can still fail per-socket if the
     /// negotiated cipher is unsupported.
+    ///
+    /// Returns `true` iff ANY supported cipher (AES-128-GCM, AES-256-GCM, or
+    /// ChaCha20-Poly1305) can be installed via the TLS ULP. Use the
+    /// per-cipher accessors below to gate cipher-specific code paths before
+    /// consuming the TLS stream — `is_ktls_available()` alone is not
+    /// sufficient because different ciphers landed in different kernel
+    /// versions (see `KtlsAvailability`).
     pub fn is_ktls_available() -> bool {
-        // Full kTLS probe: create a connected loopback TCP socket pair, install
-        // TCP_ULP "tls", then install dummy AES-128-GCM TX keys. This proves the
-        // entire kTLS path works — not just that the ULP module exists.
-        //
-        // The earlier TCP_ULP-only probe was insufficient: the kernel could accept
-        // the ULP but reject key installation (e.g., CONFIG_TLS=y but cipher support
-        // missing), causing connection drops at runtime.
-        //
-        // IMPORTANT: We MUST use real TCP sockets here, not AF_UNIX socketpair.
-        // TCP_ULP with IPPROTO_TCP is only valid on TCP sockets; an AF_UNIX socket
-        // will return EOPNOTSUPP/ENOPROTOOPT on every kernel — even ones that
-        // fully support kTLS. Using socketpair(AF_UNIX, ...) would make this
-        // probe silently return false forever and defeat kTLS auto-detection.
-        //
-        // Cost: ~1ms at startup (one-time). Worth it to avoid silent runtime failures.
-        unsafe { probe_ktls_via_tcp_loopback() }
+        let a = ktls_availability();
+        a.aes128gcm || a.aes256gcm || a.chacha20_poly1305
+    }
+
+    /// Returns `true` if the kernel accepts AES-128-GCM kTLS key installs.
+    /// Gate `try_ktls_splice` on this before extracting secrets for AES-128-GCM
+    /// sessions.
+    pub fn is_ktls_aes128gcm_available() -> bool {
+        ktls_availability().aes128gcm
+    }
+
+    /// Returns `true` if the kernel accepts AES-256-GCM kTLS key installs.
+    pub fn is_ktls_aes256gcm_available() -> bool {
+        ktls_availability().aes256gcm
+    }
+
+    /// Returns `true` if the kernel accepts ChaCha20-Poly1305 kTLS key installs
+    /// (Linux 5.11+). Kernels with AES-GCM kTLS but no ChaCha20 kTLS exist in
+    /// the wild (4.13+ vs 5.11+), so this MUST be checked independently before
+    /// handing a ChaCha20-Poly1305 connection to `try_ktls_splice`.
+    pub fn is_ktls_chacha20_poly1305_available() -> bool {
+        ktls_availability().chacha20_poly1305
     }
 
     /// Set up a real TCP loopback connection and run the kTLS setsockopt sequence
     /// on the accepted server-side socket. Returns `true` iff BOTH the TCP_ULP
-    /// install AND the dummy AES-128-GCM TX key install returned 0.
+    /// install AND the dummy cipher TX key install returned 0.
+    ///
+    /// The `info_ptr` / `info_len` describe the cipher-specific
+    /// `TlsCryptoInfo*` struct to install via `setsockopt(SOL_TLS, TLS_TX)`.
     ///
     /// All syscalls are raw libc. On any failure anywhere in setup, we close
     /// whatever fds we managed to open and return `false`.
+    ///
+    /// IMPORTANT: We MUST use real TCP sockets here, not AF_UNIX socketpair.
+    /// TCP_ULP with IPPROTO_TCP is only valid on TCP sockets; an AF_UNIX socket
+    /// will return EOPNOTSUPP/ENOPROTOOPT on every kernel — even ones that
+    /// fully support kTLS. Using socketpair(AF_UNIX, ...) would make this
+    /// probe silently return false forever and defeat kTLS auto-detection.
     #[allow(clippy::cast_possible_truncation)]
-    unsafe fn probe_ktls_via_tcp_loopback() -> bool {
+    unsafe fn probe_cipher(info_ptr: *const libc::c_void, info_len: libc::socklen_t) -> bool {
         unsafe {
             // 1. Create listener socket, bind to 127.0.0.1:0, listen.
             let listener_fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
@@ -953,22 +1056,10 @@ pub mod ktls {
                 return false;
             }
 
-            // 5. Install dummy AES-128-GCM TX key to confirm the full path works.
-            let info = TlsCryptoInfoAes128Gcm {
-                version: TLS_1_2_VERSION,
-                cipher_type: TLS_CIPHER_AES_GCM_128,
-                iv: [0u8; 8],
-                key: [0u8; 16],
-                salt: [0u8; 4],
-                rec_seq: [0u8; 8],
-            };
-            let tx_ret = libc::setsockopt(
-                server_fd,
-                SOL_TLS,
-                TLS_TX,
-                &info as *const TlsCryptoInfoAes128Gcm as *const libc::c_void,
-                std::mem::size_of::<TlsCryptoInfoAes128Gcm>() as libc::socklen_t,
-            );
+            // 5. Install dummy TX key for the cipher under test. A value of 0
+            //    for tx_ret means the kernel accepted the cipher install and
+            //    the full kTLS path works for this cipher.
+            let tx_ret = libc::setsockopt(server_fd, SOL_TLS, TLS_TX, info_ptr, info_len);
 
             libc::close(server_fd);
             libc::close(client_fd);
@@ -1007,6 +1098,21 @@ pub mod ktls {
 
     #[allow(dead_code)]
     pub fn is_ktls_available() -> bool {
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn is_ktls_aes128gcm_available() -> bool {
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn is_ktls_aes256gcm_available() -> bool {
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn is_ktls_chacha20_poly1305_available() -> bool {
         false
     }
 }
@@ -1182,6 +1288,18 @@ pub mod io_uring_splice {
             if n < 0 {
                 let err = std::io::Error::from_raw_os_error(-n);
                 if err.kind() == std::io::ErrorKind::WouldBlock {
+                    // Recheck idle timeout inline before sleeping, even though the
+                    // outer loop also checks it. Keeping the check here makes the
+                    // two WouldBlock branches (Phase 1 here, Phase 2 below) behave
+                    // uniformly and avoids relying on reviewers to trace control flow.
+                    if timeout_ms > 0 {
+                        let now = super::monotonic_now_ms();
+                        let last =
+                            shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+                        if now.saturating_sub(last) >= timeout_ms {
+                            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                        }
+                    }
                     // Back off to avoid tight spin — sleep 1ms then retry.
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
@@ -1221,6 +1339,20 @@ pub mod io_uring_splice {
                 if w < 0 {
                     let err = std::io::Error::from_raw_os_error(-w);
                     if err.kind() == std::io::ErrorKind::WouldBlock {
+                        // CRITICAL: This inner-loop WouldBlock branch must recheck
+                        // the idle timeout before sleeping. The `while remaining > 0`
+                        // loop has no timeout check, so if the destination socket
+                        // stops reading while data is buffered in the pipe, this
+                        // branch would spin at 1000 iters/sec forever without
+                        // releasing the blocking thread to the tokio pool.
+                        if timeout_ms > 0 {
+                            let now = super::monotonic_now_ms();
+                            let last =
+                                shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+                            if now.saturating_sub(last) >= timeout_ms {
+                                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
@@ -1379,4 +1511,59 @@ pub async fn connect_with_socket_opts(
     }
 
     socket.connect(sock_addr).await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_availability_tests {
+    //! Tests for the per-cipher kTLS availability accessors.
+    //!
+    //! These tests cannot assert specific values (the CI kernel may or may not
+    //! have any given cipher's kTLS support) — they only verify that the
+    //! accessors can be called without panicking and that the composite
+    //! `is_ktls_available()` is consistent with the per-cipher probes.
+    //!
+    //! `OnceLock` makes these probes idempotent — even though multiple tests
+    //! call them, the underlying loopback socketpair probes only run once.
+    use super::ktls::{
+        is_ktls_aes128gcm_available, is_ktls_aes256gcm_available, is_ktls_available,
+        is_ktls_chacha20_poly1305_available,
+    };
+
+    #[test]
+    fn per_cipher_accessors_do_not_panic() {
+        // Calling each accessor must not panic regardless of kernel support.
+        let _ = is_ktls_aes128gcm_available();
+        let _ = is_ktls_aes256gcm_available();
+        let _ = is_ktls_chacha20_poly1305_available();
+    }
+
+    #[test]
+    fn composite_is_any_of_three() {
+        // `is_ktls_available()` must return true iff at least one per-cipher
+        // probe returned true. This invariant is what upstream auto-detection
+        // depends on to set `ktls_enabled`, and is what the `try_ktls_splice`
+        // per-cipher gate relies on to safely refuse connections whose
+        // specific cipher's probe failed.
+        let any_supported = is_ktls_aes128gcm_available()
+            || is_ktls_aes256gcm_available()
+            || is_ktls_chacha20_poly1305_available();
+        assert_eq!(is_ktls_available(), any_supported);
+    }
+
+    #[test]
+    fn per_cipher_probes_are_stable() {
+        // OnceLock caches results. Calling twice must return the same value —
+        // no second loopback socketpair probe should run.
+        let first = (
+            is_ktls_aes128gcm_available(),
+            is_ktls_aes256gcm_available(),
+            is_ktls_chacha20_poly1305_available(),
+        );
+        let second = (
+            is_ktls_aes128gcm_available(),
+            is_ktls_aes256gcm_available(),
+            is_ktls_chacha20_poly1305_available(),
+        );
+        assert_eq!(first, second);
+    }
 }
