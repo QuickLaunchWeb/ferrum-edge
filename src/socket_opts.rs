@@ -299,6 +299,7 @@ pub fn set_so_zerocopy(_fd: i32, _enable: bool) -> std::io::Result<()> {
 ///
 /// No-op on non-Linux platforms.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // GRO infrastructure ready but not active (recv_from lacks cmsg)
 pub fn set_udp_gro(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
     // UDP_GRO = 104 (Linux 5.0+)
     const UDP_GRO: libc::c_int = 104;
