@@ -471,6 +471,7 @@ pub struct GsoBatchBuf {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 impl GsoBatchBuf {
     /// Create a new GSO batch buffer.
     ///

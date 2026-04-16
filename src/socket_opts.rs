@@ -159,6 +159,7 @@ impl TcpConnectionInfo {
 /// Returns RTT, congestion window, and MSS for BDP-optimal buffer sizing.
 /// Linux 2.6+ only. No-op on non-Linux (returns `None`).
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn get_tcp_info(fd: std::os::unix::io::RawFd) -> Option<TcpConnectionInfo> {
     let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
@@ -409,6 +410,7 @@ pub fn send_with_gso(
 /// relying on the socket's connected peer address. Used by the reply handler when
 /// a connected UDP socket is available for the client.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn send_with_gso_connected(
     fd: std::os::unix::io::RawFd,
     data: &[u8],
@@ -1142,6 +1144,7 @@ pub fn is_udp_gso_available() -> bool {
 ///
 /// Returns the connected socket fd, or an error if binding/connecting fails.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn create_connected_udp_socket(
     local_addr: std::net::SocketAddr,
     remote_addr: std::net::SocketAddr,
@@ -1236,6 +1239,7 @@ pub fn create_connected_udp_socket(
 /// Convert a `std::net::SocketAddr` to a raw `sockaddr_storage` + length.
 /// Used by connected UDP socket creation and GSO sends.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn socketaddr_to_raw(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
