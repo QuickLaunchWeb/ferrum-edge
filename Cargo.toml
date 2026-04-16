@@ -27,6 +27,7 @@ rustls = { version = "0.23", features = ["ring", "std"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 webpki-roots = "1.0"
+zeroize = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

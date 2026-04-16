@@ -439,12 +439,14 @@ pub fn extract_gro_segment_size(_msg: &()) -> Option<u16> {
 /// This enables `splice(2)` to work on TLS-encrypted connections because
 /// encryption/decryption is handled in the kernel rather than userspace.
 ///
-/// Only AES-128-GCM and AES-256-GCM are supported as they are the most
-/// common cipher suites negotiated in TLS 1.2/1.3.
+/// Supported cipher suites: AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
+/// AES-GCM kTLS landed in Linux 4.13/4.17; ChaCha20-Poly1305 kTLS requires
+/// Linux 5.11+.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub mod ktls {
     use tracing::debug;
+    use zeroize::{Zeroize, Zeroizing};
 
     // Linux TLS ULP constants (from <linux/tls.h>)
     const SOL_TLS: libc::c_int = 282;
@@ -456,6 +458,8 @@ pub mod ktls {
 
     const TLS_CIPHER_AES_GCM_128: u16 = 51;
     const TLS_CIPHER_AES_GCM_256: u16 = 52;
+    // TLS_CIPHER_CHACHA20_POLY1305 = 54 (Linux 5.11+).
+    const TLS_CIPHER_CHACHA20_POLY1305: u16 = 54;
 
     /// AES-128-GCM crypto info for kTLS (matches `struct tls12_crypto_info_aes_gcm_128`).
     #[repr(C)]
@@ -466,6 +470,18 @@ pub mod ktls {
         key: [u8; 16],
         salt: [u8; 4],
         rec_seq: [u8; 8],
+    }
+
+    // Session keys are confidential. Volatile-zero them on drop so core dumps
+    // or post-free heap reads cannot recover them. `[u8; N]` impls `Zeroize`
+    // for all `N` via the `zeroize` crate, so we can call it field-by-field.
+    impl Drop for TlsCryptoInfoAes128Gcm {
+        fn drop(&mut self) {
+            self.key.zeroize();
+            self.iv.zeroize();
+            self.salt.zeroize();
+            self.rec_seq.zeroize();
+        }
     }
 
     /// AES-256-GCM crypto info for kTLS (matches `struct tls12_crypto_info_aes_gcm_256`).
@@ -479,15 +495,57 @@ pub mod ktls {
         rec_seq: [u8; 8],
     }
 
+    impl Drop for TlsCryptoInfoAes256Gcm {
+        fn drop(&mut self) {
+            self.key.zeroize();
+            self.iv.zeroize();
+            self.salt.zeroize();
+            self.rec_seq.zeroize();
+        }
+    }
+
+    /// ChaCha20-Poly1305 crypto info for kTLS (matches
+    /// `struct tls12_crypto_info_chacha20_poly1305` from Linux 5.11+
+    /// `include/uapi/linux/tls.h`).
+    ///
+    /// Layout: `version`, `cipher_type`, `iv[12]`, `key[32]`, `salt[4]`
+    /// (present but unused by the kernel — ChaCha20-Poly1305 uses the full
+    /// 12-byte IV directly with no salt/explicit-nonce split like AES-GCM),
+    /// `rec_seq[8]`.
+    #[repr(C)]
+    struct TlsCryptoInfoChaCha20Poly1305 {
+        version: u16,
+        cipher_type: u16,
+        iv: [u8; 12],
+        key: [u8; 32],
+        salt: [u8; 4],
+        rec_seq: [u8; 8],
+    }
+
+    impl Drop for TlsCryptoInfoChaCha20Poly1305 {
+        fn drop(&mut self) {
+            self.key.zeroize();
+            self.iv.zeroize();
+            self.salt.zeroize();
+            self.rec_seq.zeroize();
+        }
+    }
+
     /// Parameters needed to install kTLS on a socket.
+    ///
+    /// Key and IV material is wrapped in `Zeroizing<Vec<u8>>` so the
+    /// heap allocations are volatile-zeroed when the params are dropped.
+    /// `Zeroizing<T>` impls `Deref<Target = T>`, so `.as_ref()`,
+    /// `.copy_from_slice()`, `.len()`, and slice indexing all continue
+    /// to work transparently at the call sites.
     pub struct KtlsParams {
         pub tls_version: u16,
         pub cipher_suite: KtlsCipher,
-        pub tx_key: Vec<u8>,
-        pub tx_iv: Vec<u8>,
+        pub tx_key: Zeroizing<Vec<u8>>,
+        pub tx_iv: Zeroizing<Vec<u8>>,
         pub tx_seq: [u8; 8],
-        pub rx_key: Vec<u8>,
-        pub rx_iv: Vec<u8>,
+        pub rx_key: Zeroizing<Vec<u8>>,
+        pub rx_iv: Zeroizing<Vec<u8>>,
         pub rx_seq: [u8; 8],
     }
 
@@ -496,6 +554,9 @@ pub mod ktls {
     pub enum KtlsCipher {
         Aes128Gcm,
         Aes256Gcm,
+        /// ChaCha20-Poly1305 — requires Linux 5.11+ for kTLS support.
+        /// (AES-GCM kTLS support landed in 4.13/4.17.)
+        Chacha20Poly1305,
     }
 
     /// Attempt to enable kTLS on a connected TCP socket.
@@ -573,6 +634,24 @@ pub mod ktls {
                     &params.tx_seq,
                 )?;
                 install_aes256gcm(
+                    fd,
+                    tls_version,
+                    false,
+                    &params.rx_key,
+                    &params.rx_iv,
+                    &params.rx_seq,
+                )?;
+            }
+            KtlsCipher::Chacha20Poly1305 => {
+                install_chacha20_poly1305(
+                    fd,
+                    tls_version,
+                    true,
+                    &params.tx_key,
+                    &params.tx_iv,
+                    &params.tx_seq,
+                )?;
+                install_chacha20_poly1305(
                     fd,
                     tls_version,
                     false,
@@ -678,6 +757,57 @@ pub mod ktls {
                 optname,
                 &info as *const TlsCryptoInfoAes256Gcm as *const libc::c_void,
                 std::mem::size_of::<TlsCryptoInfoAes256Gcm>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn install_chacha20_poly1305(
+        fd: std::os::unix::io::RawFd,
+        version: u16,
+        is_tx: bool,
+        key: &[u8],
+        iv: &[u8],
+        seq: &[u8; 8],
+    ) -> std::io::Result<()> {
+        if key.len() != 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ChaCha20-Poly1305 key must be 32 bytes",
+            ));
+        }
+        // ChaCha20-Poly1305 uses the full 12-byte IV directly (no salt split).
+        if iv.len() != 12 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("ChaCha20-Poly1305 IV must be 12 bytes, got {}", iv.len()),
+            ));
+        }
+
+        let mut info = TlsCryptoInfoChaCha20Poly1305 {
+            version,
+            cipher_type: TLS_CIPHER_CHACHA20_POLY1305,
+            iv: [0u8; 12],
+            key: [0u8; 32],
+            // `salt` is present in the struct for layout parity with AES-GCM
+            // but is unused by the kernel for ChaCha20-Poly1305.
+            salt: [0u8; 4],
+            rec_seq: *seq,
+        };
+        info.key.copy_from_slice(key);
+        info.iv.copy_from_slice(iv);
+
+        let optname = if is_tx { TLS_TX } else { TLS_RX };
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                SOL_TLS,
+                optname,
+                &info as *const TlsCryptoInfoChaCha20Poly1305 as *const libc::c_void,
+                std::mem::size_of::<TlsCryptoInfoChaCha20Poly1305>() as libc::socklen_t,
             )
         };
         if ret != 0 {
@@ -850,14 +980,16 @@ pub mod ktls {
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 pub mod ktls {
+    use zeroize::Zeroizing;
+
     pub struct KtlsParams {
         pub tls_version: u16,
         pub cipher_suite: KtlsCipher,
-        pub tx_key: Vec<u8>,
-        pub tx_iv: Vec<u8>,
+        pub tx_key: Zeroizing<Vec<u8>>,
+        pub tx_iv: Zeroizing<Vec<u8>>,
         pub tx_seq: [u8; 8],
-        pub rx_key: Vec<u8>,
-        pub rx_iv: Vec<u8>,
+        pub rx_key: Zeroizing<Vec<u8>>,
+        pub rx_iv: Zeroizing<Vec<u8>>,
         pub rx_seq: [u8; 8],
     }
 
@@ -865,6 +997,7 @@ pub mod ktls {
     pub enum KtlsCipher {
         Aes128Gcm,
         Aes256Gcm,
+        Chacha20Poly1305,
     }
 
     #[allow(dead_code)]

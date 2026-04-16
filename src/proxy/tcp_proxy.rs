@@ -1780,12 +1780,15 @@ async fn try_ktls_splice(
     use std::os::unix::io::AsRawFd;
 
     // Check cipher suite compatibility before consuming the TLS stream.
+    // Supported ciphers: AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
     let cipher_ok = {
         let (_, server_conn) = tls_stream.get_ref();
         match server_conn.negotiated_cipher_suite() {
             Some(suite) => {
                 let name = format!("{:?}", suite.suite());
-                name.contains("AES_128_GCM") || name.contains("AES_256_GCM")
+                name.contains("AES_128_GCM")
+                    || name.contains("AES_256_GCM")
+                    || name.contains("CHACHA20_POLY1305")
             }
             None => false,
         }
@@ -1919,7 +1922,13 @@ async fn try_ktls_splice(
 
 /// Map rustls `ExtractedSecrets` to `KtlsParams` for the kernel TLS ULP.
 ///
-/// Returns `None` if the cipher suite is not AES-128-GCM or AES-256-GCM.
+/// Returns `None` if the cipher suite is not AES-128-GCM, AES-256-GCM, or
+/// ChaCha20-Poly1305.
+///
+/// Secret material is wrapped in `Zeroizing<Vec<u8>>` so the heap backing
+/// is volatile-zeroed on drop. This applies to the intermediate allocations
+/// in this function (they are `Zeroizing` from the moment they are created)
+/// as well as any downstream storage inside `KtlsParams`.
 #[cfg(target_os = "linux")]
 fn build_ktls_params(
     tls_version: u16,
@@ -1927,6 +1936,7 @@ fn build_ktls_params(
 ) -> Option<crate::socket_opts::ktls::KtlsParams> {
     use crate::socket_opts::ktls::{KtlsCipher, KtlsParams};
     use rustls::ConnectionTrafficSecrets;
+    use zeroize::Zeroizing;
 
     let (tx_seq, ref tx_secrets) = secrets.tx;
     let (rx_seq, ref rx_secrets) = secrets.rx;
@@ -1937,20 +1947,30 @@ fn build_ktls_params(
             ConnectionTrafficSecrets::Aes128Gcm { key: rk, iv: riv },
         ) => (
             KtlsCipher::Aes128Gcm,
-            tk.as_ref().to_vec(),
-            tiv.as_ref().to_vec(),
-            rk.as_ref().to_vec(),
-            riv.as_ref().to_vec(),
+            Zeroizing::new(tk.as_ref().to_vec()),
+            Zeroizing::new(tiv.as_ref().to_vec()),
+            Zeroizing::new(rk.as_ref().to_vec()),
+            Zeroizing::new(riv.as_ref().to_vec()),
         ),
         (
             ConnectionTrafficSecrets::Aes256Gcm { key: tk, iv: tiv },
             ConnectionTrafficSecrets::Aes256Gcm { key: rk, iv: riv },
         ) => (
             KtlsCipher::Aes256Gcm,
-            tk.as_ref().to_vec(),
-            tiv.as_ref().to_vec(),
-            rk.as_ref().to_vec(),
-            riv.as_ref().to_vec(),
+            Zeroizing::new(tk.as_ref().to_vec()),
+            Zeroizing::new(tiv.as_ref().to_vec()),
+            Zeroizing::new(rk.as_ref().to_vec()),
+            Zeroizing::new(riv.as_ref().to_vec()),
+        ),
+        (
+            ConnectionTrafficSecrets::Chacha20Poly1305 { key: tk, iv: tiv },
+            ConnectionTrafficSecrets::Chacha20Poly1305 { key: rk, iv: riv },
+        ) => (
+            KtlsCipher::Chacha20Poly1305,
+            Zeroizing::new(tk.as_ref().to_vec()),
+            Zeroizing::new(tiv.as_ref().to_vec()),
+            Zeroizing::new(rk.as_ref().to_vec()),
+            Zeroizing::new(riv.as_ref().to_vec()),
         ),
         _ => return None,
     };
@@ -2066,7 +2086,36 @@ mod ktls_param_tests {
     }
 
     #[test]
-    fn chacha20_returns_none() {
+    fn chacha20_poly1305_both_sides_maps_to_chacha20() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                7,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                8,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        let params = build_ktls_params(0x0304, &secrets).expect("ChaCha20-Poly1305 pair must map");
+        assert!(matches!(params.cipher_suite, KtlsCipher::Chacha20Poly1305));
+        assert_eq!(params.tls_version, 0x0304);
+        assert_eq!(params.tx_seq, 7u64.to_be_bytes());
+        assert_eq!(params.rx_seq, 8u64.to_be_bytes());
+        // ChaCha20-Poly1305 uses the full 12-byte IV directly.
+        assert_eq!(params.tx_iv.len(), 12);
+        assert_eq!(params.rx_iv.len(), 12);
+    }
+
+    #[test]
+    fn chacha20_mixed_with_aes_returns_none() {
+        // TX ChaCha20, RX AES-128 — not a supported mixed pairing.
         let secrets = ExtractedSecrets {
             tx: (
                 0,
@@ -2077,7 +2126,7 @@ mod ktls_param_tests {
             ),
             rx: (
                 0,
-                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                ConnectionTrafficSecrets::Aes128Gcm {
                     key: aead_key(0x33),
                     iv: iv(0x44),
                 },

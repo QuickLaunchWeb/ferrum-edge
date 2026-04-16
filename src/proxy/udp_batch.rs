@@ -365,15 +365,12 @@ impl SendMmsgBatch {
 
 /// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
 ///
-/// Public alias for use by `flush_gso_batch()` in `udp_proxy.rs`.
+/// `pub(super)` so `flush_gso_batch()` in `udp_proxy.rs` can call it directly
+/// without a wrapper.
 #[cfg(target_os = "linux")]
-pub fn std_to_sockaddr_storage_pub(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    std_to_sockaddr_storage(addr)
-}
-
-/// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
-#[cfg(target_os = "linux")]
-fn std_to_sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+pub(super) fn std_to_sockaddr_storage(
+    addr: SocketAddr,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(v4) => {

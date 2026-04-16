@@ -720,6 +720,24 @@ impl ProxyState {
                     tracing::info!(
                         "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
                     );
+                    // Warn if the tokio blocking-thread pool is too small for the
+                    // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
+                    // tasks per TCP connection (one per direction). With the default
+                    // cap of 512, thousands of concurrent streams will saturate the
+                    // pool and new splices will queue, causing latency spikes. 1024
+                    // is the rule-of-thumb floor; operators with very high connection
+                    // counts should set FERRUM_BLOCKING_THREADS much higher or
+                    // disable io_uring splice entirely.
+                    let effective_blocking_threads = env_config_arc.blocking_threads.unwrap_or(512);
+                    if effective_blocking_threads < 1024 {
+                        tracing::warn!(
+                            blocking_threads = effective_blocking_threads,
+                            "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
+                             each TCP stream consumes 2 blocking threads. \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
+                            effective_blocking_threads
+                        );
+                    }
                 } else {
                     tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
                 }

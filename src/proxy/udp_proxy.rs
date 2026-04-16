@@ -187,7 +187,7 @@ fn flush_gso_batch(
     client_addr: SocketAddr,
 ) -> std::io::Result<usize> {
     use std::os::unix::io::AsRawFd;
-    let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage_pub(client_addr);
+    let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
     gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len)
 }
 
