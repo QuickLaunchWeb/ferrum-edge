@@ -316,10 +316,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         // UDP_GRO: kernel coalesces same-size datagrams into a single large buffer (Linux 5.0+).
         // The recvmmsg path uses cmsg buffers to extract the GRO segment size and splits
         // coalesced payloads into individual datagrams before processing.
-        if udp_gro_enabled {
-            if let Err(e) = crate::socket_opts::set_udp_gro(fd, true) {
-                warn!(proxy_id = %proxy_id, "Failed to enable UDP_GRO: {} (falling back to non-GRO)", e);
-            }
+        if udp_gro_enabled && let Err(e) = crate::socket_opts::set_udp_gro(fd, true) {
+            warn!(proxy_id = %proxy_id, "Failed to enable UDP_GRO: {} (falling back to non-GRO)", e);
         }
     }
 

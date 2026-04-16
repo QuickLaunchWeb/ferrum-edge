@@ -1036,9 +1036,10 @@ async fn handle_tcp_connection_inner(
                                 used_splice = true;
                                 Ok(result)
                             }
-                            Err(KtlsError::Unsupported(tls_stream_back, bs_back)) => {
+                            Err(KtlsError::Unsupported(streams)) => {
                                 // kTLS not available for this cipher/version — fall back
                                 // to userspace copy with the TLS stream intact.
+                                let (tls_stream_back, bs_back) = *streams;
                                 bidirectional_copy(tls_stream_back, bs_back, idle_timeout, buf_size)
                                     .await
                             }
@@ -1174,7 +1175,7 @@ async fn connect_backend_plain(
     // one shot, which is too late for IP_BIND_ADDRESS_NO_PORT and TFO.
     #[cfg(target_os = "linux")]
     let stream = {
-        use std::os::unix::io::{AsRawFd, FromRawFd};
+        use std::os::unix::io::FromRawFd;
         let domain = if addr.is_ipv4() {
             libc::AF_INET
         } else {
@@ -1812,7 +1813,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTrackingStream<S> {
 enum KtlsError {
     /// kTLS could not be installed (unsupported cipher, wrong TLS version, etc.).
     /// The original streams are returned so the caller can fall back to userspace copy.
-    Unsupported(tokio_rustls::server::TlsStream<TcpStream>, TcpStream),
+    Unsupported(Box<(tokio_rustls::server::TlsStream<TcpStream>, TcpStream)>),
     /// kTLS keys were installed into the kernel but the subsequent splice failed.
     /// The TLS stream has been consumed (into_inner + dangerous_extract_secrets)
     /// so there is no way to recover — propagate the error.
@@ -1851,7 +1852,10 @@ async fn try_ktls_splice(
 
     if !cipher_ok {
         debug!("kTLS: unsupported cipher suite, falling back to userspace copy");
-        return Err(KtlsError::Unsupported(tls_stream, backend_stream));
+        return Err(KtlsError::Unsupported(Box::new((
+            tls_stream,
+            backend_stream,
+        ))));
     }
 
     // Check TLS version — kTLS supports TLS 1.2 and 1.3.
@@ -1867,7 +1871,10 @@ async fn try_ktls_splice(
                 "kTLS: unsupported TLS version {:?}, falling back",
                 tls_version
             );
-            return Err(KtlsError::Unsupported(tls_stream, backend_stream));
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
         }
     };
 
@@ -1890,7 +1897,10 @@ async fn try_ktls_splice(
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             debug!("kTLS: TCP_ULP probe failed ({}), falling back", err);
-            return Err(KtlsError::Unsupported(tls_stream, backend_stream));
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
         }
         // TCP_ULP installed successfully — kTLS is available on this socket.
         // Proceed to extract secrets (point of no return after this block).

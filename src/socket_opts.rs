@@ -910,7 +910,7 @@ pub mod io_uring_splice {
                 ));
             }
         };
-        let splice_flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
+        let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
         let mut total: u64 = 0;
         let chunk_size: u32 = 128 * 1024;
 
@@ -1051,10 +1051,10 @@ pub mod io_uring_splice {
 /// the sysctl value has bits 0x3 set (both server and client TFO enabled).
 #[cfg(target_os = "linux")]
 pub fn is_tcp_fastopen_available() -> bool {
-    if let Ok(val) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen") {
-        if let Ok(n) = val.trim().parse::<u32>() {
-            return (n & 0x3) == 0x3; // bits 0 (server) + 1 (client) both set
-        }
+    if let Ok(val) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_fastopen")
+        && let Ok(n) = val.trim().parse::<u32>()
+    {
+        return (n & 0x3) == 0x3; // bits 0 (server) + 1 (client) both set
     }
     false
 }
