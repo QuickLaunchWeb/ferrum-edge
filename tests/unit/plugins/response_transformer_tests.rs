@@ -128,42 +128,27 @@ async fn test_response_transformer_no_config() {
 }
 
 #[tokio::test]
-async fn test_response_transformer_add_without_value_ignored() {
-    let plugin = ResponseTransformer::new(&json!({
+async fn test_response_transformer_add_without_value_rejected() {
+    let err = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "add", "key": "X-NoValue"}
         ]
     }))
-    .unwrap();
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
-    assert!(!headers.contains_key("x-novalue"));
+    .err()
+    .expect("expected error for add without value");
+    assert!(err.contains("requires a 'value'"), "got: {err}");
 }
 
 #[tokio::test]
-async fn test_response_transformer_unknown_operation_ignored() {
-    let plugin = ResponseTransformer::new(&json!({
+async fn test_response_transformer_unknown_operation_rejected() {
+    let err = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "prepend", "key": "X-Test", "value": "val"}
         ]
     }))
-    .unwrap();
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
+    .err()
+    .expect("expected error for unknown operation");
+    assert!(err.contains("unknown operation"), "got: {err}");
 }
 
 #[tokio::test]
@@ -232,25 +217,15 @@ async fn test_response_transformer_rename_header_nonexistent() {
 }
 
 #[tokio::test]
-async fn test_response_transformer_rename_without_new_key_ignored() {
-    let plugin = ResponseTransformer::new(&json!({
+async fn test_response_transformer_rename_without_new_key_rejected() {
+    let err = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "rename", "key": "x-old"}
         ]
     }))
-    .unwrap();
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("x-old".to_string(), "the-value".to_string());
-
-    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
-    // Without new_key, the rename is a no-op — old key should remain
-    assert_eq!(headers.get("x-old").unwrap(), "the-value");
+    .err()
+    .expect("expected error for rename without new_key");
+    assert!(err.contains("requires a 'new_key'"), "got: {err}");
 }
 
 #[tokio::test]
@@ -487,4 +462,66 @@ async fn test_response_transformer_body_vnd_json_content_type() {
         .await;
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["processed"], true);
+}
+
+// ── New behaviour: config validation & new body features ──────────────────
+
+#[tokio::test]
+async fn test_response_transformer_unknown_target_rejected() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "cookie", "key": "X-A", "value": "1"}
+        ]
+    }))
+    .err()
+    .expect("expected error for unknown target");
+    assert!(err.contains("unknown target"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_crlf_in_header_value() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "key": "X-Bad", "value": "x\nSet-Cookie: evil=1"}
+        ]
+    }))
+    .err()
+    .expect("expected error for CRLF in header value");
+    assert!(err.contains("CR or LF"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_body_array_index() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "items.1.name", "value": "updated"}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"items":[{"name":"a"},{"name":"b"}]}"#;
+    let out = plugin
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["items"][0]["name"], "a");
+    assert_eq!(parsed["items"][1]["name"], "updated");
+}
+
+#[tokio::test]
+async fn test_response_transformer_body_remove_array_element() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "body", "key": "items.0"}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"items":[{"id":1},{"id":2}]}"#;
+    let out = plugin
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["items"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["items"][0]["id"], 2);
 }

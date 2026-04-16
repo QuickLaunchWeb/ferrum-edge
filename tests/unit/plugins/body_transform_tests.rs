@@ -114,3 +114,78 @@ fn test_is_json_content_type() {
     assert!(!is_json_content_type("text/html"));
     assert!(!is_json_content_type("application/xml"));
 }
+
+#[test]
+fn test_is_json_content_type_case_insensitive() {
+    // ASCII-insensitive: no allocation needed for mixed-case matches.
+    assert!(is_json_content_type("Application/JSON"));
+    assert!(is_json_content_type("APPLICATION/VND.API+JSON"));
+    assert!(is_json_content_type("Application/JSON; Charset=UTF-8"));
+    assert!(!is_json_content_type("TEXT/HTML"));
+}
+
+// ── Array indexing ────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_nested_value_array_index() {
+    let root = json!({"items": [{"name": "a"}, {"name": "b"}]});
+    assert_eq!(get_nested_value(&root, "items.0.name"), Some(&json!("a")));
+    assert_eq!(get_nested_value(&root, "items.1.name"), Some(&json!("b")));
+}
+
+#[test]
+fn test_get_nested_value_array_index_out_of_bounds() {
+    let root = json!({"items": [{"name": "a"}]});
+    assert_eq!(get_nested_value(&root, "items.5.name"), None);
+}
+
+#[test]
+fn test_set_nested_value_replaces_array_element() {
+    let mut root = json!({"items": [1, 2, 3]});
+    assert!(set_nested_value(&mut root, "items.1", json!(99)));
+    assert_eq!(root, json!({"items": [1, 99, 3]}));
+}
+
+#[test]
+fn test_set_nested_value_array_index_out_of_bounds_fails() {
+    let mut root = json!({"items": [1, 2]});
+    // Cannot auto-grow arrays — out-of-bounds index fails.
+    assert!(!set_nested_value(&mut root, "items.5", json!(9)));
+    assert_eq!(root, json!({"items": [1, 2]}));
+}
+
+#[test]
+fn test_remove_nested_value_array_element() {
+    let mut root = json!({"items": [1, 2, 3]});
+    assert_eq!(remove_nested_value(&mut root, "items.1"), Some(json!(2)));
+    assert_eq!(root, json!({"items": [1, 3]}));
+}
+
+// ── Dot escape ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_get_nested_value_with_dot_escape() {
+    let root = json!({"weird.key": "v", "a": {"b.c": "nested"}});
+    assert_eq!(get_nested_value(&root, "weird\\.key"), Some(&json!("v")));
+    assert_eq!(get_nested_value(&root, "a.b\\.c"), Some(&json!("nested")));
+}
+
+#[test]
+fn test_set_nested_value_with_dot_escape() {
+    let mut root = json!({});
+    assert!(set_nested_value(&mut root, "weird\\.key", json!(42)));
+    assert_eq!(root, json!({"weird.key": 42}));
+}
+
+// ── Rename rollback ───────────────────────────────────────────────────────
+
+#[test]
+fn test_rename_nested_field_rollback_on_set_failure() {
+    // new_path traverses through a non-object ⇒ set_nested_value fails.
+    // The old value must be restored so data isn't lost.
+    let mut root = json!({"user": {"name": "Alice"}, "count": 7});
+    // "count" is a number — navigating through "count.x" fails.
+    assert!(!rename_nested_field(&mut root, "user.name", "count.x"));
+    // Alice must still be at user.name after rollback.
+    assert_eq!(get_nested_value(&root, "user.name"), Some(&json!("Alice")));
+}
