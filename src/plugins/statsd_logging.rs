@@ -383,17 +383,18 @@ async fn flush_loop(
     loop {
         // Opportunistic re-resolve. Stale DNS is the main reason StatsD
         // traffic silently goes into a black hole; 60s is a compromise
-        // between reactivity and resolver load.
-        if last_resolve.elapsed() >= RE_RESOLVE_INTERVAL
-            && let Some(new_addr) = resolve_host(&cfg.hostname, cfg.port, &dns_cache).await
-            && new_addr != current_addr
-            && let Some(new_sock) = bind_and_connect(new_addr).await
-        {
-            current_addr = new_addr;
-            socket = new_sock;
+        // between reactivity and resolver load. Always advance the timer
+        // when the interval elapses so a transient DNS failure doesn't pin
+        // the loop into re-resolving on every iteration.
+        if last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
             last_resolve = Instant::now();
-        } else if last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
-            last_resolve = Instant::now();
+            if let Some(new_addr) = resolve_host(&cfg.hostname, cfg.port, &dns_cache).await
+                && new_addr != current_addr
+                && let Some(new_sock) = bind_and_connect(new_addr).await
+            {
+                current_addr = new_addr;
+                socket = new_sock;
+            }
         }
 
         tokio::select! {
