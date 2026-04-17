@@ -3003,12 +3003,14 @@ async fn run_websocket_proxy(
                     proxy_id = %proxy_id,
                     "WebSocket tunnel: failed to flush buffered frame: {e}"
                 );
-                // `backend_write` is the backend sink, so a failed send means
-                // the backend-facing half broke — attribute to ClientToBackend.
-                // Still run the disconnect hook before returning so observers
-                // see the session teardown event.
+                // The drain consumes buffered backend frames that piggybacked
+                // on the 101 upgrade response, so from an observer's point of
+                // view the data is flowing backend→client. A failed flush on
+                // this path aborts the backend→client delivery of those
+                // buffered frames — attribute as `BackendToClient` so
+                // direction-based metrics don't invert.
                 let drain_failure = Some((
-                    crate::plugins::Direction::ClientToBackend,
+                    crate::plugins::Direction::BackendToClient,
                     retry::classify_boxed_error(&e),
                 ));
                 fire_ws_tunnel_disconnect_hooks(
