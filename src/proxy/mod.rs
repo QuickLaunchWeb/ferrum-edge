@@ -3196,6 +3196,13 @@ async fn run_websocket_proxy(
             }
         }
         debug!("Client -> backend forwarding completed");
+        // Signal the opposite direction to wind down so we can finish the
+        // session together. If the other direction already cancelled this
+        // token (plugin-triggered Close path), `cancel()` is idempotent.
+        // Without this, a natural EOF / error / Close-frame exit on c2b
+        // would leave b2c running; the outer coordinator would then have
+        // to drop b2c (old `tokio::select!`) or hang on it indefinitely.
+        cancel_ctb.cancel();
     };
 
     // Forward messages from backend to client
@@ -3290,17 +3297,20 @@ async fn run_websocket_proxy(
             }
         }
         debug!("Backend -> client forwarding completed");
+        // Mirror of c2b: once b2c exits for any reason, signal c2b to finish
+        // so the outer `tokio::join!` can complete promptly.
+        cancel_btc.cancel();
     };
 
-    // Wait for either direction to complete
-    tokio::select! {
-        _ = client_to_backend => {
-            debug!("Client to backend stream completed first");
-        }
-        _ = backend_to_client => {
-            debug!("Backend to client stream completed first");
-        }
-    }
+    // Wait for BOTH directions to complete before teardown — not just the
+    // first one. Using `tokio::select!` here would drop whichever half is
+    // still running (e.g., client half-closes while the backend is still
+    // draining queued frames), truncating `frames_*` counts, shortening
+    // `duration_ms`, and losing any terminal failure attribution the second
+    // half would have produced. The end-of-future `cancel.cancel()` in each
+    // branch above guarantees the second half winds down quickly after the
+    // first exits, so `join!` cannot hang on a well-behaved peer.
+    let _ = tokio::join!(client_to_backend, backend_to_client);
 
     // Fire the on_ws_disconnect hook exactly once, after both forward halves
     // have wound down. When no plugin opted in the list is empty and we skip
