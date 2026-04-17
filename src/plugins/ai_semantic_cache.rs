@@ -296,9 +296,10 @@ impl AiSemanticCache {
     }
 }
 
-/// HTTP response headers that must never be cached and replayed to other
-/// requests. Replaying these would leak per-response identity, session
-/// state, or backend-specific routing hints to a different consumer/IP.
+/// Exact-match sensitive response headers. Comparisons are ASCII
+/// case-insensitive (RFC 9110 §5.1). See `SENSITIVE_HEADER_PREFIXES` for
+/// families that must match by prefix instead (provider rate-limit
+/// variants, multi-header B3 tracing).
 ///
 /// Hop-by-hop headers (RFC 9110 §7.6.1: `connection`, `keep-alive`,
 /// `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
@@ -307,9 +308,7 @@ impl AiSemanticCache {
 /// (`collect_response_headers`, `collect_hyper_response_headers`,
 /// `grpc_proxy`, `http3/server`) before `on_final_response_body` runs,
 /// so they cannot reach this plugin.
-///
-/// All names are lowercase; comparisons are case-insensitive.
-const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
+const SENSITIVE_EXACT_HEADERS: &[&str] = &[
     // Per-response identity / session state.
     "set-cookie",
     "set-cookie2",
@@ -323,37 +322,64 @@ const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
     "x-request-id",
     "x-correlation-id",
     "x-trace-id",
-    "x-b3-traceid",
-    "x-b3-spanid",
-    "x-b3-parentspanid",
     "traceparent",
     "tracestate",
-    // Per-request rate-limit / retry headers — meaningless on a replay
-    // (the original counters reflect the original request, not the
-    // current one) and actively misleading to the new client.
+    // Zipkin B3 single-header format (RFC-less; defined by openzipkin/b3-propagation).
+    // Multi-header B3 (`x-b3-traceid`, `x-b3-spanid`, `x-b3-parentspanid`,
+    // `x-b3-sampled`, `x-b3-flags`) is covered by the `x-b3-` prefix below.
+    "b3",
+    // Per-request retry signal — the stored value reflects the original
+    // response's retry timing and is misleading on a cache hit.
     "retry-after",
-    "x-ratelimit-limit",
-    "x-ratelimit-remaining",
-    "x-ratelimit-reset",
-    "x-ai-ratelimit-limit",
-    "x-ai-ratelimit-remaining",
-    "x-ai-ratelimit-window",
-    "x-ai-ratelimit-usage",
 ];
 
+/// Case-insensitive prefixes for sensitive header families. These exist
+/// because providers emit suffixed variants that an exact-match list
+/// cannot enumerate safely:
+///
+/// - `x-ratelimit-` covers the IETF-draft canonical names
+///   (`x-ratelimit-limit`, `-remaining`, `-reset`) AND provider variants
+///   like OpenAI's `x-ratelimit-limit-requests`, `-limit-tokens`,
+///   `-remaining-requests`, `-remaining-tokens`, `-reset-requests`,
+///   `-reset-tokens`.
+/// - `x-ai-ratelimit-` covers Ferrum Edge's own `ai_rate_limiter` output
+///   (`-limit`, `-remaining`, `-window`, `-usage`) and future additions.
+/// - `anthropic-ratelimit-` covers Anthropic's rate-limit family
+///   (`anthropic-ratelimit-requests-limit`, `-tokens-remaining`, etc.).
+/// - `x-b3-` covers the multi-header B3 tracing variant
+///   (`x-b3-traceid`, `-spanid`, `-parentspanid`, `-sampled`, `-flags`).
+const SENSITIVE_HEADER_PREFIXES: &[&str] = &[
+    "x-ratelimit-",
+    "x-ai-ratelimit-",
+    "anthropic-ratelimit-",
+    "x-b3-",
+];
+
+/// Case-insensitive check for whether a header name is sensitive.
+/// Uses byte-slice `eq_ignore_ascii_case` to avoid a per-call
+/// `to_ascii_lowercase` allocation. Prefix match is safe on byte
+/// boundaries because all prefixes are ASCII.
+fn is_sensitive_header(name: &str) -> bool {
+    if SENSITIVE_EXACT_HEADERS
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s))
+    {
+        return true;
+    }
+    let name_bytes = name.as_bytes();
+    SENSITIVE_HEADER_PREFIXES.iter().any(|prefix| {
+        let prefix_bytes = prefix.as_bytes();
+        name_bytes.len() >= prefix_bytes.len()
+            && name_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
+    })
+}
+
 /// Strip security-sensitive headers from a response header map before the
-/// cache stores or replays it. Filtering is case-insensitive because HTTP
-/// header names are case-insensitive (RFC 9110 §5.1); using
-/// `eq_ignore_ascii_case` avoids the per-header `to_ascii_lowercase`
-/// allocation that a lowercase-then-compare approach would incur.
+/// cache stores or replays it.
 fn sanitize_cached_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
     headers
         .iter()
-        .filter(|(name, _)| {
-            !SENSITIVE_RESPONSE_HEADERS
-                .iter()
-                .any(|s| name.eq_ignore_ascii_case(s))
-        })
+        .filter(|(name, _)| !is_sensitive_header(name))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
@@ -749,5 +775,77 @@ mod tests {
         assert!(!sanitized.contains_key("X-Request-Id"));
         assert!(!sanitized.contains_key("X-AI-RateLimit-Remaining"));
         assert!(!sanitized.contains_key("retry-after"));
+    }
+
+    #[test]
+    fn sanitize_cached_headers_strips_provider_ratelimit_suffix_variants() {
+        // Providers emit rate-limit headers with request/token suffixes
+        // (OpenAI: x-ratelimit-*-requests / -tokens; Anthropic:
+        // anthropic-ratelimit-requests-* / -tokens-*). Exact-match against
+        // a canonical list would miss these and replay the original
+        // consumer's quota to every cache hit. Prefix matching catches the
+        // whole family.
+        let mut headers = HashMap::new();
+        // OpenAI-style (exact canonical + suffix variants).
+        headers.insert("x-ratelimit-limit".to_string(), "3500".to_string());
+        headers.insert("x-ratelimit-limit-requests".to_string(), "3500".to_string());
+        headers.insert("X-RateLimit-Limit-Tokens".to_string(), "90000".to_string());
+        headers.insert(
+            "x-ratelimit-remaining-requests".to_string(),
+            "3499".to_string(),
+        );
+        headers.insert("x-ratelimit-reset-tokens".to_string(), "6ms".to_string());
+        // Anthropic family.
+        headers.insert(
+            "anthropic-ratelimit-requests-limit".to_string(),
+            "50".to_string(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-tokens-remaining".to_string(),
+            "39000".to_string(),
+        );
+        // Ferrum Edge's own ai_rate_limiter (covered by x-ai-ratelimit-).
+        headers.insert("x-ai-ratelimit-usage".to_string(), "12".to_string());
+        // B3 multi-header tracing (x-b3-) and single-header (b3).
+        headers.insert(
+            "X-B3-TraceId".to_string(),
+            "80f198ee56343ba864fe8b2a57d3eff7".to_string(),
+        );
+        headers.insert("x-b3-sampled".to_string(), "1".to_string());
+        headers.insert("b3".to_string(), "80f198ee-e457912e-1".to_string());
+        // Safe headers that share neighbouring namespaces but must not match.
+        headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
+        headers.insert(
+            "x-ratelimited-by".to_string(), // no trailing dash — different prefix
+            "upstream".to_string(),
+        );
+        headers.insert("content-type".to_string(), "application/json".to_string());
+
+        let sanitized = sanitize_cached_headers(&headers);
+        // All rate-limit / tracing variants stripped.
+        assert!(!sanitized.contains_key("x-ratelimit-limit"));
+        assert!(!sanitized.contains_key("x-ratelimit-limit-requests"));
+        assert!(!sanitized.contains_key("X-RateLimit-Limit-Tokens"));
+        assert!(!sanitized.contains_key("x-ratelimit-remaining-requests"));
+        assert!(!sanitized.contains_key("x-ratelimit-reset-tokens"));
+        assert!(!sanitized.contains_key("anthropic-ratelimit-requests-limit"));
+        assert!(!sanitized.contains_key("anthropic-ratelimit-tokens-remaining"));
+        assert!(!sanitized.contains_key("x-ai-ratelimit-usage"));
+        assert!(!sanitized.contains_key("X-B3-TraceId"));
+        assert!(!sanitized.contains_key("x-b3-sampled"));
+        assert!(!sanitized.contains_key("b3"));
+        // Near-miss names that share a neighbouring namespace are retained.
+        assert_eq!(
+            sanitized.get("x-ai-cache-status").map(String::as_str),
+            Some("HIT"),
+        );
+        assert_eq!(
+            sanitized.get("x-ratelimited-by").map(String::as_str),
+            Some("upstream"),
+        );
+        assert_eq!(
+            sanitized.get("content-type").map(String::as_str),
+            Some("application/json"),
+        );
     }
 }
