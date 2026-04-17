@@ -300,16 +300,26 @@ impl AiSemanticCache {
 /// requests. Replaying these would leak per-response identity, session
 /// state, or backend-specific routing hints to a different consumer/IP.
 ///
-/// All names are lowercase; comparisons must be case-insensitive.
+/// Hop-by-hop headers (RFC 9110 §7.6.1: `connection`, `keep-alive`,
+/// `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+/// `transfer-encoding`, `upgrade`) are intentionally NOT listed here —
+/// they are stripped upstream by the proxy response-collection paths
+/// (`collect_response_headers`, `collect_hyper_response_headers`,
+/// `grpc_proxy`, `http3/server`) before `on_final_response_body` runs,
+/// so they cannot reach this plugin.
+///
+/// All names are lowercase; comparisons are case-insensitive.
 const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
+    // Per-response identity / session state.
     "set-cookie",
     "set-cookie2",
     "authorization",
-    "proxy-authenticate",
     "www-authenticate",
     "x-api-key",
     "x-amz-security-token",
     "x-amzn-requestid",
+    // Per-request trace identifiers — replaying these would splice the
+    // original request's trace into every subsequent cache hit.
     "x-request-id",
     "x-correlation-id",
     "x-trace-id",
@@ -318,16 +328,6 @@ const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
     "x-b3-parentspanid",
     "traceparent",
     "tracestate",
-    // Hop-by-hop headers (RFC 9110 §7.6.1) — already filtered by the
-    // proxy response path, but defense-in-depth in case the cache stores
-    // headers from a non-standard source in the future.
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
     // Per-request rate-limit / retry headers — meaningless on a replay
     // (the original counters reflect the original request, not the
     // current one) and actively misleading to the new client.
@@ -343,13 +343,16 @@ const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
 
 /// Strip security-sensitive headers from a response header map before the
 /// cache stores or replays it. Filtering is case-insensitive because HTTP
-/// header names are case-insensitive (RFC 9110 §5.1).
+/// header names are case-insensitive (RFC 9110 §5.1); using
+/// `eq_ignore_ascii_case` avoids the per-header `to_ascii_lowercase`
+/// allocation that a lowercase-then-compare approach would incur.
 fn sanitize_cached_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
     headers
         .iter()
         .filter(|(name, _)| {
-            let lower = name.to_ascii_lowercase();
-            !SENSITIVE_RESPONSE_HEADERS.contains(&lower.as_str())
+            !SENSITIVE_RESPONSE_HEADERS
+                .iter()
+                .any(|s| name.eq_ignore_ascii_case(s))
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
