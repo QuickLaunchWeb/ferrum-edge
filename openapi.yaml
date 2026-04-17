@@ -4306,28 +4306,36 @@ components:
             depending on `content_type`. JSON and XML escaping are applied
             automatically.
         trigger:
-          type: object
           description: >-
             Optional trigger condition. Without a trigger every request on the
-            proxy is terminated (maintenance-mode default).
-          properties:
-            path_prefix:
-              type: string
-              description: >-
-                Only terminate when the request path starts with this prefix.
-                Mutually exclusive with `header`.
-            header:
-              type: string
-              description: >-
-                Only terminate when this request header is present. The
-                comparison is case-insensitive on the header name. Mutually
-                exclusive with `path_prefix`.
-            header_value:
-              type: string
-              default: ""
-              description: >-
-                Optional exact value for `header`. Empty (default) matches any
-                value, so the trigger fires whenever the header is present.
+            proxy is terminated (maintenance-mode default). When present, the
+            trigger must select exactly one of `path_prefix` or `header`
+            (mutually exclusive — the plugin picks `path_prefix` first and
+            silently ignores `header` when both are set).
+          oneOf:
+            - type: object
+              required: [path_prefix]
+              properties:
+                path_prefix:
+                  type: string
+                  description: >-
+                    Only terminate when the request path starts with this
+                    prefix.
+            - type: object
+              required: [header]
+              properties:
+                header:
+                  type: string
+                  description: >-
+                    Only terminate when this request header is present. The
+                    comparison is case-insensitive on the header name.
+                header_value:
+                  type: string
+                  default: ""
+                  description: >-
+                    Optional exact value for `header`. Empty (default) matches
+                    any value, so the trigger fires whenever the header is
+                    present.
 
     ResponseMockConfig:
       type: object

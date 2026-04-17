@@ -84,20 +84,52 @@ impl RequestTermination {
 fn render_default_body(content_type: &str, status_code: u16, message: Option<&str>) -> String {
     let msg = message.unwrap_or("Service unavailable");
 
-    if content_type.contains("json") {
-        // serde_json::to_string produces a fully-spec-compliant JSON string
-        // literal (quoted, with control chars / non-ASCII / backslashes / quotes
-        // all escaped). Infallible for `&str` input.
-        let encoded = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string());
-        format!(r#"{{"message":{},"status_code":{}}}"#, encoded, status_code)
-    } else if content_type.contains("xml") {
-        let escaped = xml_escape(msg);
-        format!(
-            r#"<?xml version="1.0"?><response><message>{}</message><status_code>{}</status_code></response>"#,
-            escaped, status_code
-        )
+    match classify_media_type(content_type) {
+        MediaType::Json => {
+            // serde_json::to_string produces a fully-spec-compliant JSON string
+            // literal (quoted, with control chars / non-ASCII / backslashes / quotes
+            // all escaped). Infallible for `&str` input.
+            let encoded = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string());
+            format!(r#"{{"message":{},"status_code":{}}}"#, encoded, status_code)
+        }
+        MediaType::Xml => {
+            let escaped = xml_escape(msg);
+            format!(
+                r#"<?xml version="1.0"?><response><message>{}</message><status_code>{}</status_code></response>"#,
+                escaped, status_code
+            )
+        }
+        MediaType::Other => msg.to_string(),
+    }
+}
+
+enum MediaType {
+    Json,
+    Xml,
+    Other,
+}
+
+/// Classifies the subtype of an RFC 6838 media type string. Handles structured
+/// suffixes (`application/hal+json`, `application/vnd.api+xml`) and parameter
+/// stripping (`; charset=utf-8`), without matching bogus types like
+/// `application/notjson`.
+fn classify_media_type(content_type: &str) -> MediaType {
+    // Strip parameters after ';', trim whitespace.
+    let head = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    // Extract subtype after '/'.
+    let subtype = head.rsplit('/').next().unwrap_or(head).trim();
+    // Match exact subtype or RFC 6838 structured suffix (`+json`, `+xml`).
+    let sub_lower = subtype.to_ascii_lowercase();
+    if sub_lower == "json" || sub_lower.ends_with("+json") {
+        MediaType::Json
+    } else if sub_lower == "xml" || sub_lower.ends_with("+xml") {
+        MediaType::Xml
     } else {
-        msg.to_string()
+        MediaType::Other
     }
 }
 

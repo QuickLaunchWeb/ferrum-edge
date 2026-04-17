@@ -441,6 +441,42 @@ async fn test_pre_rendered_xml_body_well_formed_with_special_chars() {
 }
 
 #[tokio::test]
+async fn test_content_type_structured_suffix_json() {
+    // RFC 6838 structured suffix: application/hal+json must render as JSON.
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/hal+json; charset=utf-8",
+        "message": "hi"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["message"], "hi");
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_content_type_bogus_substring_not_json() {
+    // `application/notjson` must NOT be treated as JSON — falls through to
+    // plain text so a JSON-structured body isn't sent with a non-JSON type.
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/notjson",
+        "message": "hi"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            assert_eq!(body, "hi");
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_json_body_escapes_control_chars_and_unicode() {
     // serde_json::to_string handles newlines, tabs, quotes, backslashes, and
     // non-ASCII correctly so operator-supplied messages never produce invalid
