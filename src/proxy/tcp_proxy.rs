@@ -106,12 +106,24 @@ pub fn disconnect_cause_for_failure(
 
 /// Map a pre-copy error class (no bytes flowed, direction unknown) to a
 /// `DisconnectCause`. Backend-facing failure classes (DNS lookup, connect,
-/// TLS handshake, port exhaustion, pool errors) map to `BackendError` so
-/// `stream_disconnects` metrics don't misclassify backend outages as client
-/// recv errors. Genuinely client-side failures (e.g., `ClientDisconnect`)
-/// stay `RecvError`. Timeouts during connect become `BackendError`, not
+/// port exhaustion, pool errors) map to `BackendError` so `stream_disconnects`
+/// metrics don't misclassify backend outages as client recv errors.
+///
+/// `TlsError` is ambiguous — it can come from the frontend TLS handshake
+/// (client-side issue, e.g. invalid client cert) or the backend TLS
+/// origination. We use the error message prefix set at each call site
+/// (`"Frontend TLS handshake failed ..."` vs. backend TLS wrapping) to
+/// disambiguate; when the message doesn't clearly identify the side, we fall
+/// back to the conservative `RecvError` so a client-side TLS error never
+/// trips a backend-error dashboard/alert.
+///
+/// Genuinely client-side failures (e.g., `ClientDisconnect`) stay
+/// `RecvError`. Timeouts during connect become `BackendError`, not
 /// `IdleTimeout`, because idle timeout only applies after the relay starts.
-fn pre_copy_disconnect_cause(class: &ErrorClass) -> crate::plugins::DisconnectCause {
+fn pre_copy_disconnect_cause(
+    class: &ErrorClass,
+    error_message: &str,
+) -> crate::plugins::DisconnectCause {
     use crate::plugins::DisconnectCause;
     match class {
         ErrorClass::DnsLookupError
@@ -119,10 +131,21 @@ fn pre_copy_disconnect_cause(class: &ErrorClass) -> crate::plugins::DisconnectCa
         | ErrorClass::ConnectionRefused
         | ErrorClass::ConnectionReset
         | ErrorClass::ConnectionClosed
-        | ErrorClass::TlsError
         | ErrorClass::PortExhaustion
         | ErrorClass::ConnectionPoolError
         | ErrorClass::ProtocolError => DisconnectCause::BackendError,
+        ErrorClass::TlsError => {
+            if error_message.contains("Frontend TLS handshake failed") {
+                DisconnectCause::RecvError
+            } else if error_message.contains("Backend TLS") || error_message.contains("backend TLS")
+            {
+                DisconnectCause::BackendError
+            } else {
+                // Unknown TLS side — conservative fallback to avoid
+                // misattributing frontend issues to the backend.
+                DisconnectCause::RecvError
+            }
+        }
         ErrorClass::ClientDisconnect => DisconnectCause::RecvError,
         _ => DisconnectCause::RecvError,
     }
@@ -551,7 +574,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             // TLS/port exhaustion) to `BackendError` so cause-
                             // based dashboards aren't misattributed to client
                             // recv errors.
-                            let cause = pre_copy_disconnect_cause(&err_class);
+                            let cause = pre_copy_disconnect_cause(&err_class, &error_message);
                             (
                                 0,
                                 0,
