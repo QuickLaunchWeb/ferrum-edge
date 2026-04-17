@@ -6533,15 +6533,37 @@ async fn handle_proxy_request_inner(
     // body reaches a terminal state (completion, streaming error, or client
     // disconnect via the Drop safety net) rather than at header-flush time.
     // `deferred_logger` is `Some` only for streaming responses with plugins.
-    let body = if let Some(logger) = deferred_logger {
+    let mut body = if let Some(logger) = deferred_logger {
         body.with_logger(logger)
     } else {
         body
     };
 
-    Ok(resp_builder
-        .body(body)
-        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal Server Error"))))
+    // Detach the logger before handing the body to the builder. `http::Error`
+    // doesn't expose the consumed body, so we can't recover the logger after
+    // a builder failure. Re-attach on success; fire an explicit error outcome
+    // on failure so the dropped body isn't miscounted as a client disconnect.
+    let logger = body.take_logger();
+    match resp_builder.body(body) {
+        Ok(mut resp) => {
+            if let Some(logger) = logger {
+                resp.body_mut().set_logger(logger);
+            }
+            Ok(resp)
+        }
+        Err(_) => {
+            if let Some(logger) = logger {
+                logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
+                    crate::retry::ErrorClass::RequestError,
+                    0,
+                    false,
+                ));
+            }
+            Ok(Response::new(ProxyBody::from_string(
+                "Internal Server Error",
+            )))
+        }
+    }
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.

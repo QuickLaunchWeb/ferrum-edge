@@ -205,6 +205,26 @@ impl ProxyBody {
         self
     }
 
+    /// Detach the deferred logger so the caller can fire it explicitly with a
+    /// specific outcome. Used on response-builder failure paths where dropping
+    /// the body would otherwise be misclassified as a client disconnect.
+    pub fn take_logger(
+        &mut self,
+    ) -> Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> {
+        self.logger.take()
+    }
+
+    /// Re-attach a deferred logger to an existing body. Pair with
+    /// [`take_logger`] around `http::response::Builder::body()` calls so the
+    /// logger survives the detach/rebuild round-trip on success and fires a
+    /// caller-supplied outcome on failure.
+    pub fn set_logger(
+        &mut self,
+        logger: Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
+    ) {
+        self.logger = Some(logger);
+    }
+
     /// Create a streaming body (no completion tracking).
     fn streaming(
         body: Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>,
