@@ -524,9 +524,160 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     // same client address (very common in streaming UDP protocols).
     let mut last_client: Option<(SocketAddr, Arc<UdpSession>)> = None;
 
+    // When pktinfo is active on Linux, drive the recv loop via `readable()` +
+    // `recvmmsg` so the first datagram in each wakeup also surfaces its
+    // IP(v6)_PKTINFO cmsg. tokio's `recv_from` wraps `recvfrom(2)` which does
+    // not return cmsg — using it for the first packet loses the destination IP
+    // for one-shot exchanges (e.g. DNS) where the drain loop never runs.
+    #[cfg(target_os = "linux")]
+    let pktinfo_primary = pktinfo_active;
+    #[cfg(not(target_os = "linux"))]
+    let pktinfo_primary = false;
+
     loop {
         tokio::select! {
-            result = frontend_socket.recv_from(&mut buf) => {
+            ready = frontend_socket.readable(), if pktinfo_primary => {
+                if let Err(e) = ready {
+                    warn!(proxy_id = %proxy_id, "UDP readable error: {}", e);
+                    continue;
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    let mut batch_dgrams_in: u64 = 0;
+                    let mut batch_bytes_in: u64 = 0;
+                    let mut batch_dgrams_out: u64 = 0;
+                    let mut batch_bytes_out: u64 = 0;
+                    let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
+
+                    use std::os::fd::AsRawFd;
+                    let fd = frontend_socket.as_raw_fd();
+                    let mut total_drained: usize = 0;
+                    'drain: while total_drained < batch_limit {
+                        let max_this_call =
+                            (batch_limit - total_drained).min(recv_batch.capacity());
+                        match frontend_socket.try_io(tokio::io::Interest::READABLE, || {
+                            recv_batch.recv(fd, max_this_call)
+                        }) {
+                            Ok(n) if n > 0 => {
+                                for i in 0..n {
+                                    let (data, addr2) = recv_batch.datagram(i);
+
+                                    // Reject datagrams from new clients under critical overload.
+                                    // Existing sessions continue to be served.
+                                    if overload.reject_new_connections.load(Ordering::Relaxed)
+                                        && !sessions.contains_key(&addr2)
+                                    {
+                                        continue;
+                                    }
+
+                                    let local2 = recv_batch.local_addr(i);
+
+                                    // GRO splitting: if the kernel coalesced multiple same-size
+                                    // datagrams into one buffer, split by segment size.
+                                    if let Some(seg_size) = recv_batch.gro_segment_size(i) {
+                                        let seg = seg_size as usize;
+                                        if seg > 0 && data.len() > seg {
+                                            let mut offset = 0;
+                                            while offset < data.len() {
+                                                let end = (offset + seg).min(data.len());
+                                                let chunk = &data[offset..end];
+                                                batch_dgrams_in += 1;
+                                                batch_bytes_in += chunk.len() as u64;
+
+                                                let result = process_datagram(
+                                                    chunk,
+                                                    addr2,
+                                                    &proxy_id,
+                                                    &config,
+                                                    &dns_cache,
+                                                    &load_balancer_cache,
+                                                    &frontend_socket,
+                                                    &sessions,
+                                                    &metrics,
+                                                    tls_no_verify,
+                                                    max_sessions,
+                                                    &mut last_client,
+                                                    &mut batch_dgrams_out,
+                                                    &mut batch_bytes_out,
+                                                    &plugins,
+                                                    proxy_name.as_deref(),
+                                                    &proxy_namespace,
+                                                    backend_protocol,
+                                                    port,
+                                                    &circuit_breaker_cache,
+                                                    &consumer_index,
+                                                    has_datagram_plugins,
+                                                    &crls,
+                                                    sni_proxy_ids.as_deref(),
+                                                    &adaptive_buffer,
+                                                    udp_gso_enabled,
+                                                    local2,
+                                                )
+                                                .await;
+                                                if let Err(e) = result {
+                                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                                }
+                                                offset = end;
+                                            }
+                                            continue; // already counted per-segment
+                                        }
+                                    }
+
+                                    // Non-GRO path (single datagram).
+                                    batch_dgrams_in += 1;
+                                    batch_bytes_in += data.len() as u64;
+
+                                    let result = process_datagram(
+                                        data,
+                                        addr2,
+                                        &proxy_id,
+                                        &config,
+                                        &dns_cache,
+                                        &load_balancer_cache,
+                                        &frontend_socket,
+                                        &sessions,
+                                        &metrics,
+                                        tls_no_verify,
+                                        max_sessions,
+                                        &mut last_client,
+                                        &mut batch_dgrams_out,
+                                        &mut batch_bytes_out,
+                                        &plugins,
+                                        proxy_name.as_deref(),
+                                        &proxy_namespace,
+                                        backend_protocol,
+                                        port,
+                                        &circuit_breaker_cache,
+                                        &consumer_index,
+                                        has_datagram_plugins,
+                                        &crls,
+                                        sni_proxy_ids.as_deref(),
+                                        &adaptive_buffer,
+                                        udp_gso_enabled,
+                                        local2,
+                                    )
+                                    .await;
+                                    if let Err(e) = result {
+                                        debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                    }
+                                }
+                                total_drained += n;
+                            }
+                            _ => break 'drain, // WouldBlock or error — socket drained
+                        }
+                    }
+
+                    if batch_dgrams_in > 0 {
+                        adaptive_buffer.record_batch_cycle(&proxy_id, batch_dgrams_in);
+                        metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
+                        metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
+                        metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
+                        metrics.bytes_out.fetch_add(batch_bytes_out, Ordering::Relaxed);
+                    }
+                }
+            }
+            result = frontend_socket.recv_from(&mut buf), if !pktinfo_primary => {
                 let (len, client_addr) = match result {
                     Ok(r) => r,
                     Err(e) => {
@@ -551,10 +702,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 let mut batch_bytes_out: u64 = 0;
 
                 // Process first datagram then drain more with try_recv_from.
-                // Note: the primary `recv_from` path doesn't surface pktinfo
-                // cmsg (tokio API limitation) so `local_addr` is None here —
-                // the session will capture it from the first drain-loop
-                // datagram that does carry pktinfo.
+                // This arm is only used when pktinfo is inactive (non-Linux, or
+                // pktinfo probe failed). `recv_from` uses `recvfrom(2)` which
+                // does not surface cmsg, so `local_addr` is None. When pktinfo
+                // is active on Linux the `readable()` arm above handles the
+                // primary path via `recvmmsg` so the first datagram also carries
+                // its IP(v6)_PKTINFO destination IP.
                 let result = process_datagram(
                     &buf[..len],
                     client_addr,
