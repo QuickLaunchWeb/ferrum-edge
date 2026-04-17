@@ -67,12 +67,16 @@ pub enum StreamIoSide {
 /// preserves the original I/O error text so `StreamTransactionSummary.
 /// connection_error` surfaces concrete syscall/context details instead of just
 /// duplicating the classified `error_class` enum name.
+/// Ordered tuple recording which half failed first: (direction, classified
+/// error, which I/O side within that half, original error text).
+pub type StreamFirstFailure = (Direction, ErrorClass, Option<StreamIoSide>, String);
+
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct StreamCopyResult {
     pub bytes_client_to_backend: u64,
     pub bytes_backend_to_client: u64,
-    pub first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>,
+    pub first_failure: Option<StreamFirstFailure>,
 }
 
 /// Combine a failure's direction and IO side into the front-end / back-end
@@ -725,7 +729,7 @@ struct TcpConnectionSuccess {
     /// graceful shutdown. `side` (when `Some`) tells the caller whether the
     /// failing half errored on its read or write end. `message` is the
     /// original I/O error text preserved for `connection_error` diagnostics.
-    first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>,
+    first_failure: Option<StreamFirstFailure>,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -2326,8 +2330,7 @@ async fn bidirectional_splice_io_uring(
     // rather than a deterministic post-join order. `OnceLock::set()` is
     // first-writer-wins; later writes from the opposite worker (or the
     // post-join fallback) are silently ignored.
-    let first_failure: Arc<OnceLock<(Direction, ErrorClass, Option<StreamIoSide>, String)>> =
-        Arc::new(OnceLock::new());
+    let first_failure: Arc<OnceLock<StreamFirstFailure>> = Arc::new(OnceLock::new());
     let ff_c2b = first_failure.clone();
     let ff_b2c = first_failure.clone();
 
