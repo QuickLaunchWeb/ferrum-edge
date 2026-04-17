@@ -2030,7 +2030,16 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
-        let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
+        // Third tuple element carries the DisconnectCause so the final
+        // metric-emitting branch preserves client-side vs backend-side
+        // attribution (backend recv failures vs. client send failures both
+        // terminate this task, and mislabeling them skews cause-based
+        // alerting).
+        let mut disconnect_error: Option<(
+            String,
+            crate::retry::ErrorClass,
+            crate::plugins::DisconnectCause,
+        )> = None;
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
         let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
@@ -2066,6 +2075,7 @@ async fn create_session(
                             crate::retry::classify_boxed_error(
                                 anyhow::anyhow!(error_message).as_ref(),
                             ),
+                            crate::plugins::DisconnectCause::BackendError,
                         ));
                         break;
                     }
@@ -2091,6 +2101,7 @@ async fn create_session(
                             crate::retry::classify_boxed_error(
                                 anyhow::anyhow!(error_message).as_ref(),
                             ),
+                            crate::plugins::DisconnectCause::BackendError,
                         ));
                         break;
                     }
@@ -2190,9 +2201,12 @@ async fn create_session(
                     e
                 );
                 let error_message = e.to_string();
+                // Client-facing send failure — the backend is healthy, so
+                // attribute the session teardown to the client recv path.
                 disconnect_error = Some((
                     error_message.clone(),
                     crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
+                    crate::plugins::DisconnectCause::RecvError,
                 ));
                 break;
             }
@@ -2369,11 +2383,14 @@ async fn create_session(
                                     e
                                 );
                                 let error_message = e.to_string();
+                                // sendmmsg flush targets the frontend socket
+                                // (client), not the backend — client-side.
                                 disconnect_error = Some((
                                     error_message.clone(),
                                     crate::retry::classify_boxed_error(
                                         anyhow::anyhow!(error_message).as_ref(),
                                     ),
+                                    crate::plugins::DisconnectCause::RecvError,
                                 ));
                                 break;
                             }
@@ -2410,11 +2427,9 @@ async fn create_session(
                 .fetch_sub(1, Ordering::Relaxed);
             let disconnected_ms = coarse_epoch_millis();
             let (connection_error, error_class, disconnect_cause) = match disconnect_error {
-                Some((message, error_class)) => (
-                    Some(message),
-                    Some(error_class),
-                    Some(crate::plugins::DisconnectCause::BackendError),
-                ),
+                Some((message, error_class, cause)) => {
+                    (Some(message), Some(error_class), Some(cause))
+                }
                 None => (
                     None,
                     None,
