@@ -1543,17 +1543,21 @@ Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement
 
 ### `tcp_connection_throttle`
 
-Limits concurrent TCP connections per observed client identity on a per-proxy basis.
+Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded.
 
 **Priority:** 2050
+**Protocols:** TCP only
 
-| Parameter | Type | Description |
-|---|---|---|
-| `max_connections_per_key` | u64 | Maximum active TCP connections for one key |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key |
+| `cleanup_interval_seconds` | u64 | `60` | Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections drop without a corresponding `on_stream_disconnect`. Set to `0` to disable the background sweep — entries are still removed inline by the disconnect path |
 
 **Key selection:**
-- If a prior stream auth plugin identified a Consumer, the key is `consumer:<username>`
-- Otherwise the key is `ip:<client_ip>`
+- If a prior stream auth plugin identified a Consumer, the key is `proxy:{proxy_id}:consumer:{username}`
+- Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`
+
+The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
@@ -1618,10 +1622,22 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 
 **Priority:** 2900
 
+**Configure rate windows in one of two ways:**
+1. `window_seconds` + `max_requests` — exact custom window of any duration
+2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
+
+At least one rate window must be configured (the plugin rejects empty configs at load time). When multiple windows are configured, each request must satisfy ALL windows.
+
+**Algorithm selection** (automatic):
+- Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)
+- Windows > 5 seconds → sliding window with exact request-timestamp tracking (O(n) memory per key, no boundary-burst vulnerability)
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
+| `window_seconds` | u64 (optional) | — | Custom window duration in seconds. Pair with `max_requests`. |
+| `max_requests` | u64 (optional) | — | Max requests within `window_seconds`. Required when `window_seconds` is set. |
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
@@ -2198,12 +2214,14 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed request body size in bytes |
+| `max_bytes` | u64 | **(required, > 0)** | Maximum allowed request body size in bytes. The plugin errors at construction if absent or zero. |
 
 Enforcement happens in three places:
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
 - `before_proxy` checks the buffered raw body when another plugin already needed early body access.
 - `on_final_request_body` re-checks the final buffered body after request transforms, so body-rewriting plugins cannot expand the request past the configured limit before it reaches the backend.
+
+For chunked/streaming requests without `Content-Length` where no other plugin buffers the body, the global `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` limit applies at the proxy layer.
 
 ### `response_size_limiting`
 
@@ -2213,8 +2231,14 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
-| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent |
+| `max_bytes` | u64 | **(required, > 0)** | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |
+| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent. Adds memory overhead — only enable when needed. |
+
+Enforcement happens in two places:
+- `after_proxy` rejects oversized `Content-Length` response headers via the fast path (no body buffering required).
+- `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
+
+For streaming responses without `Content-Length` where buffering is disabled, the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).
 
 ### `response_caching`
 

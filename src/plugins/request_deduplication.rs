@@ -38,13 +38,24 @@ struct CachedResponse {
 }
 
 /// In-flight marker to handle concurrent duplicate requests.
+///
+/// `InFlight` carries the timestamp it was inserted so stale markers (from
+/// requests that died after `before_proxy` but before `on_final_response_body`,
+/// e.g., backend timeout, downstream plugin reject, dropped connection) can be
+/// detected and replaced rather than indefinitely returning 409 Conflict.
 #[derive(Debug, Clone)]
 enum DeduplicationEntry {
-    /// Request is currently being processed.
-    InFlight,
+    /// Request is currently being processed. `started_at` allows stale-marker
+    /// detection so abandoned in-flight entries don't permanently block retries.
+    InFlight { started_at: Instant },
     /// Response has been cached.
     Completed(CachedResponse),
 }
+
+/// How long an `InFlight` marker remains valid before being treated as stale
+/// and replaced by a new request. This caps the duration that a duplicate
+/// request will receive 409 Conflict when the original request has died.
+const INFLIGHT_TTL: Duration = Duration::from_secs(60);
 
 pub struct RequestDeduplication {
     /// Header name to read the idempotency key from.
@@ -222,20 +233,29 @@ impl RequestDeduplication {
             DeduplicationEntry::Completed(cached) => {
                 now.duration_since(cached.inserted_at) < self.ttl
             }
-            DeduplicationEntry::InFlight => true, // Keep in-flight entries
+            // Drop in-flight markers that have exceeded INFLIGHT_TTL — the
+            // originating request must have died (timeout, downstream reject,
+            // connection drop) without ever reaching `on_final_response_body`.
+            // Without this, duplicate requests would receive 409 Conflict
+            // forever (until LRU max-entries eviction).
+            DeduplicationEntry::InFlight { started_at } => {
+                now.duration_since(*started_at) < INFLIGHT_TTL
+            }
         });
 
-        // Enforce max entries by removing oldest if over limit
+        // Enforce max entries by removing oldest if over limit. Both completed
+        // and in-flight entries are eligible for LRU eviction so a flood of
+        // abandoned in-flight markers cannot starve the cache.
         if self.local_cache.len() > self.max_entries {
-            // Simple eviction: remove entries that are oldest
             let mut entries_with_time: Vec<(String, Instant)> = self
                 .local_cache
                 .iter()
-                .filter_map(|entry| match entry.value() {
-                    DeduplicationEntry::Completed(cached) => {
-                        Some((entry.key().clone(), cached.inserted_at))
-                    }
-                    DeduplicationEntry::InFlight => None,
+                .map(|entry| {
+                    let timestamp = match entry.value() {
+                        DeduplicationEntry::Completed(cached) => cached.inserted_at,
+                        DeduplicationEntry::InFlight { started_at } => *started_at,
+                    };
+                    (entry.key().clone(), timestamp)
                 })
                 .collect();
             entries_with_time.sort_by_key(|(_, t)| *t);
@@ -331,11 +351,12 @@ impl Plugin for RequestDeduplication {
         }
 
         // Check local cache
+        let now = Instant::now();
         if let Some(entry) = self.local_cache.get(&key) {
             match entry.value() {
                 DeduplicationEntry::Completed(cached) => {
                     // Check TTL
-                    if Instant::now().duration_since(cached.inserted_at) < self.ttl {
+                    if now.duration_since(cached.inserted_at) < self.ttl {
                         debug!(
                             "request_deduplication: cache hit for key '{}', replaying response",
                             idempotency_value
@@ -353,23 +374,38 @@ impl Plugin for RequestDeduplication {
                     drop(entry);
                     self.local_cache.remove(&key);
                 }
-                DeduplicationEntry::InFlight => {
-                    // Another request with the same key is in-flight.
-                    // Return 409 Conflict rather than both hitting the backend.
-                    drop(entry);
-                    return PluginResult::Reject {
-                        status_code: 409,
-                        body: r#"{"error":"A request with this idempotency key is already in progress"}"#
-                            .to_string(),
-                        headers: HashMap::new(),
-                    };
+                DeduplicationEntry::InFlight { started_at } => {
+                    // If the in-flight marker has exceeded INFLIGHT_TTL, the
+                    // original request must have died without ever reaching
+                    // on_final_response_body. Treat as a fresh request and
+                    // replace the marker rather than blocking forever.
+                    if now.duration_since(*started_at) >= INFLIGHT_TTL {
+                        debug!(
+                            "request_deduplication: stale in-flight marker for key '{}' (age >= {:?}), treating as fresh request",
+                            idempotency_value, INFLIGHT_TTL
+                        );
+                        drop(entry);
+                        // Fall through to insert new InFlight marker below
+                    } else {
+                        // Another request with the same key is in-flight.
+                        // Return 409 Conflict rather than both hitting the backend.
+                        drop(entry);
+                        return PluginResult::Reject {
+                            status_code: 409,
+                            body: r#"{"error":"A request with this idempotency key is already in progress"}"#
+                                .to_string(),
+                            headers: HashMap::new(),
+                        };
+                    }
                 }
             }
         }
 
-        // Mark as in-flight
-        self.local_cache
-            .insert(key.clone(), DeduplicationEntry::InFlight);
+        // Mark as in-flight (replacing any expired marker)
+        self.local_cache.insert(
+            key.clone(),
+            DeduplicationEntry::InFlight { started_at: now },
+        );
 
         // Store the key in metadata so on_final_response_body can cache the response
         ctx.metadata.insert("_dedup_key".to_string(), key);
