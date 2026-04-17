@@ -99,9 +99,9 @@ pub struct UdpRateLimiting {
     /// Startup instant used to compute window epochs from Instant::now().
     epoch_base: Instant,
     /// Seconds-since-`epoch_base` of the last eviction sweep. Lock-free —
-    /// CLAUDE.md forbids `Mutex` on the data path. Initialised to 0 so the
-    /// first eligible sweep always runs (cooldown gate compares against the
-    /// current `secs_since_base`, which is necessarily ≥ 0).
+    /// CLAUDE.md forbids `Mutex` on the data path. Initialised to 0; the
+    /// first sweep runs once one `EVICTION_COOLDOWN_SECS` window has elapsed
+    /// since startup (nothing is stale before then anyway).
     last_eviction_secs: AtomicU64,
 }
 
@@ -161,7 +161,12 @@ impl UdpRateLimiting {
             // CAS guards against multiple concurrent sweeps — the loser of the
             // race exits without scanning. Equivalent to the previous
             // `last_eviction.lock()` mutex but without taking a lock on the
-            // hot path.
+            // hot path. Note: the winner stamps `last_eviction_secs` *before*
+            // running `retain`, so the cooldown measures from sweep start, not
+            // end. Under sustained high-cardinality pressure this is
+            // at-least-one-sweep-per-cooldown rather than at-most — intentional,
+            // since the goal is memory containment, not strict rate-limiting
+            // of the sweep itself.
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
                 && self
                     .last_eviction_secs

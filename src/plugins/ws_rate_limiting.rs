@@ -139,7 +139,7 @@ impl WsRateLimiting {
             .unwrap_or("Frame rate exceeded")
             .to_string();
         if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
-            tracing::warn!(
+            tracing::debug!(
                 max_bytes = Self::MAX_CLOSE_REASON_BYTES,
                 "ws_rate_limiting: 'close_reason' exceeds WebSocket control-frame limit — truncating"
             );
