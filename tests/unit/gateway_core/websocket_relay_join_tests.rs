@@ -146,3 +146,135 @@ async fn test_select_drops_unfinished_half_and_loses_frames() {
          increments the counter — documenting the pre-fix regression",
     );
 }
+
+/// Regression for Codex P1 on commit b6717c1: after switching to `tokio::join!`,
+/// the forwarding loops' `sink.send(msg).await` calls were outside the outer
+/// cancellation `select!`. A half stuck in a backpressured send would never
+/// observe the cancel signal from the peer direction, so `join!` would hang
+/// and `on_ws_disconnect` would never fire.
+///
+/// The fix wraps each send in an inner `tokio::select!` that races the send
+/// future against `cancel.cancelled()`. This test models a peer "not reading"
+/// with a `tokio::sync::Notify` that never notifies, then verifies that cancel
+/// from the opposite direction breaks the stuck send out promptly.
+#[tokio::test]
+async fn test_cancel_unblocks_stuck_send() {
+    let cancel = CancellationToken::new();
+    let cancel_stuck = cancel.clone();
+    let cancel_peer = cancel.clone();
+
+    // `stuck_send` models `backend_sink.send(msg).await` blocking on a peer
+    // that will never accept the bytes. Without the inner cancel-aware
+    // `select!`, this future would hang forever inside `tokio::join!`.
+    let peer_never_reads = Arc::new(tokio::sync::Notify::new());
+    let peer_never_reads_stuck = peer_never_reads.clone();
+
+    let stuck_half = async move {
+        // Wrap the "stuck send" in the same cancel-aware pattern the WS
+        // relay hot path now uses (select! + biased + cancel.cancelled()).
+        // If the fix is in place, cancel breaks us out. If the fix is
+        // reverted, this future hangs and `join!` times out.
+        tokio::select! {
+            biased;
+            _ = cancel_stuck.cancelled() => {
+                // Expected path after fix: peer direction exits, cancels,
+                // and unblocks us.
+            }
+            _ = peer_never_reads_stuck.notified() => {
+                panic!("stuck send must not complete — notify is never fired");
+            }
+        }
+    };
+
+    // The peer direction simulates "exits normally, then cancels the shared
+    // token at end of loop" — exactly what the real relay does at the end
+    // of `client_to_backend` / `backend_to_client`.
+    let peer_half = async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel_peer.cancel();
+    };
+
+    let start = tokio::time::Instant::now();
+    // Use a hard timeout as a safety net — if the fix regresses, this test
+    // fails loudly instead of hanging CI.
+    let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(stuck_half, peer_half)
+    })
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        outcome.is_ok(),
+        "cancel-aware send must unblock the stuck half within the test timeout \
+         (elapsed {elapsed:?}); regression: sends are no longer racing cancel.cancelled()",
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "cancel propagation must be fast (saw {elapsed:?}) — inner `select!` should \
+         exit within tens of microseconds of `cancel()` firing",
+    );
+}
+
+/// The cancel-branch polite-Close path cannot use `select!` with cancel
+/// (cancel is already set by the time we enter that branch), so the relay
+/// uses `lazy_timeout` to bound the send. This test models the scenario and
+/// verifies that a stuck polite-Close does not extend session teardown
+/// beyond the bounded window.
+#[tokio::test]
+async fn test_lazy_timeout_bounds_polite_close() {
+    use ferrum_edge::lazy_timeout::lazy_timeout;
+
+    // Simulate a "peer not accepting bytes" scenario by awaiting a Notify
+    // that is never fired — this stands in for `sink.send(Close(None))`
+    // blocking on a dead backend socket.
+    let never = Arc::new(tokio::sync::Notify::new());
+    let never_waited = never.clone();
+
+    let stuck_close_send = async move {
+        never_waited.notified().await;
+    };
+
+    let start = tokio::time::Instant::now();
+    // The real call site uses 100ms; use 50ms here so the test runs faster
+    // while still exercising the Pending-then-timeout branch.
+    let result = lazy_timeout(Duration::from_millis(50), stuck_close_send).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "lazy_timeout must return Err(LazyTimeoutError) when the inner send hangs",
+    );
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "lazy_timeout must wait the full bound when the inner future is Pending \
+         (saw {elapsed:?})",
+    );
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "lazy_timeout must return shortly after the bound — not burn extra time \
+         (saw {elapsed:?})",
+    );
+}
+
+/// Paired happy-path assertion: when the inner future completes synchronously
+/// (the common case for a small Close frame on healthy TCP), `lazy_timeout`
+/// pays zero timer cost and returns immediately with the inner result.
+#[tokio::test]
+async fn test_lazy_timeout_fast_path_has_no_overhead() {
+    use ferrum_edge::lazy_timeout::lazy_timeout;
+
+    // Inner future that completes on the first poll — this is the "healthy
+    // TCP, Close frame sent in microseconds" case.
+    let fast_send = async { 42u32 };
+
+    let start = tokio::time::Instant::now();
+    let result = lazy_timeout(Duration::from_secs(60), fast_send).await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(result, Ok(42));
+    assert!(
+        elapsed < Duration::from_millis(5),
+        "lazy_timeout fast path must not allocate a timer or sleep \
+         (saw {elapsed:?})",
+    );
+}

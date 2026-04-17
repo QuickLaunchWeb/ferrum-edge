@@ -2949,6 +2949,14 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// and moving it has zero additional cost.
 /// `websocket_tunnel_mode` — when true and no frame plugins are configured, bypass
 /// WebSocket frame parsing and use raw TCP bidirectional copy for maximum throughput.
+///
+/// Polite-close bound used when the cancel branch of each forward loop fires.
+/// The opposite direction has already cancelled, so a plain `.await` on the
+/// polite-Close send could hang indefinitely if the peer socket is dead or
+/// backpressured. A Close control frame is small and completes in microseconds
+/// on a healthy TCP connection, so 100ms is generous for the happy path while
+/// still bounding teardown for pathological peers.
+const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
 #[allow(clippy::too_many_arguments)]
 async fn run_websocket_proxy(
     upgraded: Upgraded,
@@ -3112,7 +3120,19 @@ async fn run_websocket_proxy(
                 biased;
                 _ = cancel_ctb.cancelled() => {
                     debug!("Client->backend: other direction triggered close");
-                    let _ = backend_sink.send(Message::Close(None)).await;
+                    // Bounded polite-close: the opposite direction has already
+                    // cancelled us, so a plain `.await` on `backend_sink.send()`
+                    // could hang forever if the backend socket is backpressured
+                    // or dead. `lazy_timeout` pays zero cost when the send
+                    // completes synchronously (common for small Close frames on
+                    // healthy TCP) and only registers a timer on Pending.
+                    // Cannot use select+cancel here — cancel is already signaled
+                    // and would skip the Close entirely.
+                    let _ = crate::lazy_timeout::lazy_timeout(
+                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+                        backend_sink.send(Message::Close(None)),
+                    )
+                    .await;
                     break;
                 }
                 msg = ws_stream.next() => {
@@ -3139,10 +3159,17 @@ async fn run_websocket_proxy(
                                 }
                                 current
                             };
-                            // If a plugin transformed the frame into a Close, close both sides
+                            // If a plugin transformed the frame into a Close, close both sides.
+                            // Race cancel in case the opposite direction already exited while we
+                            // were running plugin hooks — keeps teardown prompt without dropping
+                            // the Close on the happy path.
                             if matches!(&outgoing, Message::Close(_)) {
                                 debug!("Plugin triggered close on client->backend frame");
-                                let _ = backend_sink.send(outgoing).await;
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel_ctb.cancelled() => {}
+                                    _ = backend_sink.send(outgoing) => {}
+                                }
                                 cancel_ctb.cancel(); // signal other direction
                                 break;
                             }
@@ -3154,24 +3181,50 @@ async fn run_websocket_proxy(
                                 Message::Ping(_) => trace!("Client -> Backend: Ping"),
                                 _ => {}
                             }
-                            if let Err(e) = backend_sink.send(outgoing).await {
-                                error!("Failed to send message to backend: {}", e);
-                                // Write-side failure on the c2b path means the
-                                // backend socket errored while we were pushing
-                                // into it — attribute to the c2b direction.
-                                let _ = first_failure_ctb.set((
-                                    crate::plugins::Direction::ClientToBackend,
-                                    retry::classify_boxed_error(&e),
-                                ));
-                                break;
+                            // Cancel-aware send: if the opposite direction has exited and
+                            // cancelled us while this send is blocked on backend backpressure,
+                            // `select!` breaks us out instead of hanging `tokio::join!` forever.
+                            // Overhead is one atomic load per frame (CancellationToken state
+                            // check); the send future is polled first on wakeup so successful
+                            // sends pay no extra latency. No heap allocation, no timer wheel.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_ctb.cancelled() => {
+                                    debug!("Client->backend: cancel fired mid-send");
+                                    break;
+                                }
+                                res = backend_sink.send(outgoing) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send message to backend: {}", e);
+                                        // Write-side failure on the c2b path means the
+                                        // backend socket errored while we were pushing
+                                        // into it — attribute to the c2b direction.
+                                        let _ = first_failure_ctb.set((
+                                            crate::plugins::Direction::ClientToBackend,
+                                            retry::classify_boxed_error(&e),
+                                        ));
+                                        break;
+                                    }
+                                    // Count the frame that successfully reached the backend.
+                                    frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-                            // Count the frame that successfully reached the backend.
-                            frames_c2b_task.fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Client sent close frame");
-                            if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
-                                error!("Failed to send close to backend: {}", e);
+                            // Race cancel in case the opposite direction already exited while
+                            // we were decoding this Close frame. The send future is polled
+                            // first after the cancel check so the happy path does not block.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_ctb.cancelled() => {
+                                    debug!("Client->backend: cancel fired during client-close forward");
+                                }
+                                res = backend_sink.send(Message::Close(close_frame)) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send close to backend: {}", e);
+                                    }
+                                }
                             }
                             break;
                         }
@@ -3213,7 +3266,15 @@ async fn run_websocket_proxy(
                 biased;
                 _ = cancel_btc.cancelled() => {
                     debug!("Backend->client: other direction triggered close");
-                    let _ = ws_sink.send(Message::Close(None)).await;
+                    // Mirror of the c2b cancel branch: bounded polite-close with
+                    // `lazy_timeout` so the client sink cannot hang `tokio::join!`
+                    // forever if the client socket is dead or not reading. See
+                    // `WS_CANCEL_CLOSE_TIMEOUT_MS` for the rationale.
+                    let _ = crate::lazy_timeout::lazy_timeout(
+                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+                        ws_sink.send(Message::Close(None)),
+                    )
+                    .await;
                     break;
                 }
                 msg = backend_stream.next() => {
@@ -3240,10 +3301,16 @@ async fn run_websocket_proxy(
                                 }
                                 current
                             };
-                            // If a plugin transformed the frame into a Close, close both sides
+                            // If a plugin transformed the frame into a Close, close both sides.
+                            // Race cancel — the opposite direction may have already exited while
+                            // we were running plugin hooks.
                             if matches!(&outgoing, Message::Close(_)) {
                                 debug!("Plugin triggered close on backend->client frame");
-                                let _ = ws_sink.send(outgoing).await;
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel_btc.cancelled() => {}
+                                    _ = ws_sink.send(outgoing) => {}
+                                }
                                 cancel_btc.cancel(); // signal other direction
                                 break;
                             }
@@ -3255,24 +3322,47 @@ async fn run_websocket_proxy(
                                 Message::Ping(_) => trace!("Backend -> Client: Ping"),
                                 _ => {}
                             }
-                            if let Err(e) = ws_sink.send(outgoing).await {
-                                error!("Failed to send message to client: {}", e);
-                                // Write-side failure on the b2c path means the
-                                // client dropped/reset while we were pushing
-                                // bytes to it — attribute to b2c direction.
-                                let _ = first_failure_btc.set((
-                                    crate::plugins::Direction::BackendToClient,
-                                    retry::classify_boxed_error(&e),
-                                ));
-                                break;
+                            // Cancel-aware send (mirror of c2b hot path): prevents
+                            // `tokio::join!` from hanging when c2b has already exited and the
+                            // client socket is backpressured so our `ws_sink.send()` would
+                            // otherwise block indefinitely. One atomic load per frame; send
+                            // polled first so successful frames pay no extra latency.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_btc.cancelled() => {
+                                    debug!("Backend->client: cancel fired mid-send");
+                                    break;
+                                }
+                                res = ws_sink.send(outgoing) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send message to client: {}", e);
+                                        // Write-side failure on the b2c path means the
+                                        // client dropped/reset while we were pushing
+                                        // bytes to it — attribute to b2c direction.
+                                        let _ = first_failure_btc.set((
+                                            crate::plugins::Direction::BackendToClient,
+                                            retry::classify_boxed_error(&e),
+                                        ));
+                                        break;
+                                    }
+                                    // Count the frame that successfully reached the client.
+                                    frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-                            // Count the frame that successfully reached the client.
-                            frames_b2c_task.fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Backend sent close frame");
-                            if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
-                                error!("Failed to send close to client: {}", e);
+                            // Race cancel in case c2b has already exited.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_btc.cancelled() => {
+                                    debug!("Backend->client: cancel fired during backend-close forward");
+                                }
+                                res = ws_sink.send(Message::Close(close_frame)) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send close to client: {}", e);
+                                    }
+                                }
                             }
                             break;
                         }
