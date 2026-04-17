@@ -1707,6 +1707,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 - On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
 - Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
 - Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
+- LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 

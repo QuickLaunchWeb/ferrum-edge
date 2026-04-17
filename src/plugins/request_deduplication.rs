@@ -256,25 +256,30 @@ impl RequestDeduplication {
             }
         });
 
-        // Enforce max entries by removing oldest if over limit. Both completed
-        // and in-flight entries are eligible for LRU eviction so a flood of
-        // abandoned in-flight markers cannot starve the cache.
+        // Enforce max entries by removing oldest Completed entries first. Active
+        // (non-stale) InFlight markers are NEVER evicted by LRU because evicting
+        // them would release the in-flight lock while the original request is
+        // still executing — a duplicate retry for that key would then bypass the
+        // lock and re-execute side-effecting operations. Stale InFlight markers
+        // (age >= inflight_ttl) are already dropped by the retain() above. This
+        // means max_entries can be temporarily exceeded if the cache is
+        // saturated with active in-flight work; correctness (no duplicate
+        // writes) is strictly preferred over hitting the memory cap.
         if self.local_cache.len() > self.max_entries {
-            let mut entries_with_time: Vec<(String, Instant)> = self
+            let mut completed_with_time: Vec<(String, Instant)> = self
                 .local_cache
                 .iter()
-                .map(|entry| {
-                    let timestamp = match entry.value() {
-                        DeduplicationEntry::Completed(cached) => cached.inserted_at,
-                        DeduplicationEntry::InFlight { started_at } => *started_at,
-                    };
-                    (entry.key().clone(), timestamp)
+                .filter_map(|entry| match entry.value() {
+                    DeduplicationEntry::Completed(cached) => {
+                        Some((entry.key().clone(), cached.inserted_at))
+                    }
+                    DeduplicationEntry::InFlight { .. } => None,
                 })
                 .collect();
-            entries_with_time.sort_by_key(|(_, t)| *t);
+            completed_with_time.sort_by_key(|(_, t)| *t);
 
             let to_remove = self.local_cache.len().saturating_sub(self.max_entries);
-            for (key, _) in entries_with_time.into_iter().take(to_remove) {
+            for (key, _) in completed_with_time.into_iter().take(to_remove) {
                 self.local_cache.remove(&key);
             }
         }
@@ -468,5 +473,82 @@ impl Plugin for RequestDeduplication {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.local_cache.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::PluginHttpClient;
+    use serde_json::json;
+
+    /// LRU eviction under `max_entries` pressure must NOT evict active in-flight
+    /// markers. Evicting a live InFlight entry would release the in-flight lock
+    /// while the original request is still executing, so a duplicate retry for
+    /// the same idempotency key would bypass the lock and re-execute the
+    /// side-effecting operation.
+    #[test]
+    fn cleanup_preserves_active_inflight_over_max_entries() {
+        let config = json!({ "max_entries": 2 });
+        let plugin = RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap();
+
+        // 3 active in-flight markers, cap is 2 → over limit.
+        let now = Instant::now();
+        for i in 0..3 {
+            plugin.local_cache.insert(
+                format!("inflight-{i}"),
+                DeduplicationEntry::InFlight { started_at: now },
+            );
+        }
+        assert_eq!(plugin.local_cache.len(), 3);
+
+        // Force cleanup to run (bypass the 30s gate).
+        plugin.last_cleanup.store(0, Ordering::Relaxed);
+        plugin.cleanup_local_cache();
+
+        // All 3 active in-flight entries must still be present — LRU eviction
+        // is not allowed to drop active locks.
+        assert_eq!(plugin.local_cache.len(), 3);
+        for i in 0..3 {
+            assert!(plugin.local_cache.contains_key(&format!("inflight-{i}")));
+        }
+    }
+
+    /// Completed entries ARE LRU-eligible. When over `max_entries`, the oldest
+    /// Completed entries get evicted while active InFlight markers are kept.
+    #[test]
+    fn cleanup_evicts_oldest_completed_preserves_inflight() {
+        let config = json!({ "max_entries": 2 });
+        let plugin = RequestDeduplication::new(&config, PluginHttpClient::default()).unwrap();
+
+        let now = Instant::now();
+        // 1 active in-flight
+        plugin.local_cache.insert(
+            "inflight-key".to_string(),
+            DeduplicationEntry::InFlight { started_at: now },
+        );
+        // 3 completed entries with increasing age (oldest first)
+        for i in 0..3 {
+            let inserted = now - Duration::from_secs(10 - i);
+            plugin.local_cache.insert(
+                format!("completed-{i}"),
+                DeduplicationEntry::Completed(CachedResponse {
+                    status_code: 200,
+                    headers: HashMap::new(),
+                    body: Bytes::new(),
+                    inserted_at: inserted,
+                }),
+            );
+        }
+        assert_eq!(plugin.local_cache.len(), 4);
+
+        plugin.last_cleanup.store(0, Ordering::Relaxed);
+        plugin.cleanup_local_cache();
+
+        // Cap is 2. InFlight kept. 2 oldest Completed evicted, 1 newest Completed kept.
+        assert!(plugin.local_cache.contains_key("inflight-key"));
+        assert!(!plugin.local_cache.contains_key("completed-0"));
+        assert!(!plugin.local_cache.contains_key("completed-1"));
+        assert!(plugin.local_cache.contains_key("completed-2"));
     }
 }
