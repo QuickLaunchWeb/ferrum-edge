@@ -236,3 +236,203 @@ fn test_warmup_hostnames() {
     let hostnames = plugin.warmup_hostnames();
     assert_eq!(hostnames, vec!["internal.example.com"]);
 }
+
+// === Constructor validation ===
+
+#[test]
+fn test_creation_rejects_non_http_scheme() {
+    let err = SpecExpose::new(
+        &json!({ "spec_url": "file:///etc/passwd" }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-http scheme must be rejected");
+    assert!(err.contains("http or https"), "got: {err}");
+}
+
+#[test]
+fn test_creation_rejects_non_string_content_type() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "content_type": 42
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-string content_type must be rejected");
+    assert!(
+        err.contains("'content_type' must be a string"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_creation_rejects_non_integer_cache_ttl() {
+    let err = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "cache_ttl_seconds": "forever"
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-integer cache_ttl_seconds must be rejected");
+    assert!(err.contains("cache_ttl_seconds"), "got: {err}");
+}
+
+#[test]
+fn test_creation_accepts_zero_cache_ttl() {
+    // Zero TTL = caching disabled — should not error
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": "https://example.com/openapi.yaml",
+            "cache_ttl_seconds": 0
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(plugin.is_ok());
+}
+
+// === Caching behavior ===
+
+#[tokio::test]
+async fn test_cache_hits_avoid_repeat_fetches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_string("openapi: 3.0.0\n"),
+        )
+        .expect(1) // Critical: we expect EXACTLY 1 upstream fetch
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let r1 = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(
+        r1,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+
+    let mut ctx2 = make_ctx("GET", "/api/specz", "/api");
+    let r2 = plugin.on_request_received(&mut ctx2).await;
+    assert!(matches!(
+        r2,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+
+    // Drop drains expectations: panics if upstream was hit anything other than once
+}
+
+#[tokio::test]
+async fn test_cache_disabled_when_ttl_zero() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_string("openapi: 3.0.0\n"),
+        )
+        .expect(2) // ttl=0 means every request re-fetches
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let mut ctx = make_ctx("GET", "/api/specz", "/api");
+        let r = plugin.on_request_received(&mut ctx).await;
+        assert!(matches!(
+            r,
+            PluginResult::RejectBinary {
+                status_code: 200,
+                ..
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn test_cache_does_not_store_failed_fetches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    // First mock: returns 500 — should NOT be cached
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    // Second mock: returns 200
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_string("openapi: 3.0.0\n"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let plugin = SpecExpose::new(
+        &json!({
+            "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+            "cache_ttl_seconds": 60
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // First request: 502 (upstream returned 500)
+    let mut ctx = make_ctx("GET", "/api/specz", "/api");
+    let r1 = plugin.on_request_received(&mut ctx).await;
+    match r1 {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 502),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+
+    // Second request: should re-fetch (failures are not cached) and succeed
+    let mut ctx2 = make_ctx("GET", "/api/specz", "/api");
+    let r2 = plugin.on_request_received(&mut ctx2).await;
+    assert!(matches!(
+        r2,
+        PluginResult::RejectBinary {
+            status_code: 200,
+            ..
+        }
+    ));
+}

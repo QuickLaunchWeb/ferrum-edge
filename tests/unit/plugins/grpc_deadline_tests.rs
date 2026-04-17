@@ -37,7 +37,7 @@ fn test_in_available_plugins() {
 
 #[test]
 fn test_supported_protocols() {
-    let config = json!({});
+    let config = json!({ "max_deadline_ms": 30000 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
     let protocols = plugin.supported_protocols();
     assert_eq!(protocols.len(), 1);
@@ -46,9 +46,47 @@ fn test_supported_protocols() {
 
 #[test]
 fn test_modifies_request_headers() {
-    let config = json!({});
+    let config = json!({ "max_deadline_ms": 30000 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
     assert!(plugin.modifies_request_headers());
+}
+
+// ── Constructor validation ─────────────────────────────────────────
+
+#[test]
+fn test_empty_config_rejected() {
+    // Plugin with no rules would be a no-op — must be rejected per CLAUDE.md
+    let err = create_plugin("grpc_deadline", &json!({}))
+        .err()
+        .expect("empty config should be rejected");
+    assert!(err.contains("no rules configured"), "got: {err}");
+}
+
+#[test]
+fn test_zero_max_deadline_rejected() {
+    let err = create_plugin("grpc_deadline", &json!({ "max_deadline_ms": 0 }))
+        .err()
+        .expect("max_deadline_ms=0 should be rejected");
+    assert!(err.contains("greater than zero"), "got: {err}");
+}
+
+#[test]
+fn test_zero_default_deadline_rejected() {
+    let err = create_plugin("grpc_deadline", &json!({ "default_deadline_ms": 0 }))
+        .err()
+        .expect("default_deadline_ms=0 should be rejected");
+    assert!(err.contains("greater than zero"), "got: {err}");
+}
+
+#[test]
+fn test_default_exceeds_max_rejected() {
+    let err = create_plugin(
+        "grpc_deadline",
+        &json!({ "default_deadline_ms": 60000, "max_deadline_ms": 5000 }),
+    )
+    .err()
+    .expect("default exceeding max should be rejected");
+    assert!(err.contains("cannot exceed"), "got: {err}");
 }
 
 // ── grpc-timeout parsing ──
@@ -296,16 +334,19 @@ async fn test_subtract_gateway_processing() {
 #[tokio::test]
 async fn test_subtract_gateway_processing_deadline_exceeded() {
     let config = json!({
-        "default_deadline_ms": 0,
+        "default_deadline_ms": 1,
         "subtract_gateway_processing": true
     });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
+    // Build a context whose timestamp_received is well in the past so that
+    // subtract_gateway_processing immediately consumes the entire budget.
     let mut ctx = create_grpc_context_with_timeout(None);
+    ctx.timestamp_received = chrono::Utc::now() - chrono::Duration::seconds(60);
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
-    // Deadline of 0ms should be exceeded immediately
+    // Effective deadline (1ms - 60s elapsed) is exceeded → trailers-only DEADLINE_EXCEEDED
     match result {
         PluginResult::Reject {
             status_code,
@@ -324,13 +365,14 @@ async fn test_subtract_gateway_processing_deadline_exceeded() {
 
 #[tokio::test]
 async fn test_combined_default_and_max() {
+    // default == max: default applies, no cap needed
     let config = json!({
-        "default_deadline_ms": 60000,
+        "default_deadline_ms": 30000,
         "max_deadline_ms": 30000
     });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
-    // No timeout provided: default (60000) gets capped to max (30000)
+    // No timeout provided: default (30000) gets used; cap is identical so no change
     let mut ctx = create_grpc_context_with_timeout(None);
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -340,13 +382,24 @@ async fn test_combined_default_and_max() {
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "30000"
     );
+
+    // A larger client-supplied timeout still gets capped
+    let mut ctx2 = create_grpc_context_with_timeout(Some("60S"));
+    let mut headers2 = HashMap::new();
+    headers2.insert("grpc-timeout".to_string(), "60S".to_string());
+    plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert_eq!(
+        ctx2.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
+        "30000"
+    );
 }
 
 // ── Empty config passes through ──
 
 #[tokio::test]
-async fn test_empty_config_passes_through() {
-    let config = json!({});
+async fn test_minimal_config_passes_through() {
+    // With max_deadline_ms set, but client timeout below cap, the value passes through.
+    let config = json!({ "max_deadline_ms": 999_999_999 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
@@ -379,8 +432,10 @@ async fn test_modified_timeout_header_takes_precedence_over_original_request() {
 }
 
 #[tokio::test]
-async fn test_empty_config_no_timeout_passes() {
-    let config = json!({});
+async fn test_minimal_config_no_timeout_passes() {
+    // With only max_deadline_ms, a request with no timeout passes through unchanged
+    // (no default to inject, no rejection rule).
+    let config = json!({ "max_deadline_ms": 30_000 });
     let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
 
     let mut ctx = create_grpc_context_with_timeout(None);
@@ -542,6 +597,46 @@ async fn test_multi_char_unit_rejected() {
     assert_eq!(
         ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
         "1000"
+    );
+}
+
+// ── Robustness against malformed inputs ──
+
+#[tokio::test]
+async fn test_non_ascii_timeout_does_not_panic() {
+    // Previously the parser used str::split_at(len-1) which panics on a
+    // non-char-boundary. Multi-byte UTF-8 in the timeout must be rejected
+    // (treated as missing) rather than crashing the worker.
+    let config = json!({ "default_deadline_ms": 1000 });
+    let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(Some("5η"));
+    let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5η".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    // Malformed value falls back to default
+    assert_eq!(
+        ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
+        "1000"
+    );
+}
+
+#[tokio::test]
+async fn test_non_digit_value_treated_as_missing() {
+    let config = json!({ "default_deadline_ms": 2000 });
+    let plugin = create_plugin("grpc_deadline", &config).unwrap().unwrap();
+
+    let mut ctx = create_grpc_context_with_timeout(Some("abcS"));
+    let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "abcS".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    assert_eq!(
+        ctx.metadata.get("grpc_adjusted_deadline_ms").unwrap(),
+        "2000"
     );
 }
 

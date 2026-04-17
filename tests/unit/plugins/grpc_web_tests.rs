@@ -123,6 +123,52 @@ async fn test_ignores_missing_content_type() {
     assert!(!ctx.metadata.contains_key("grpc_web_mode"));
 }
 
+// Regression: a client could spoof the internal `x-grpc-web-mode` header to
+// trigger base64 decoding of a non-gRPC-Web request body. The plugin must
+// strip the inbound header unconditionally; only `before_proxy` may inject
+// it after a content-type-based detection.
+#[tokio::test]
+async fn test_strips_client_supplied_x_grpc_web_mode_for_non_grpc_web() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/json");
+    ctx.headers
+        .insert("x-grpc-web-mode".to_string(), "text".to_string());
+
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(
+        !ctx.headers.contains_key("x-grpc-web-mode"),
+        "client-supplied x-grpc-web-mode must be removed before backend dispatch"
+    );
+    assert!(
+        !ctx.metadata.contains_key("grpc_web_mode"),
+        "non-grpc-web request must not be flagged as grpc-web"
+    );
+}
+
+#[tokio::test]
+async fn test_strips_client_supplied_x_grpc_web_mode_then_redetects() {
+    // Client sends a real grpc-web-text request AND a misleading marker — plugin
+    // should ignore the client's marker, detect via content-type, and re-inject
+    // its own marker in before_proxy.
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    ctx.headers
+        .insert("x-grpc-web-mode".to_string(), "binary".to_string());
+
+    plugin.on_request_received(&mut ctx).await;
+    // Content-type-based detection wins
+    assert_eq!(ctx.metadata.get("grpc_web_mode").unwrap(), "text");
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web-text".to_string(),
+    );
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(headers.get("x-grpc-web-mode").unwrap(), "text");
+}
+
 // ── before_proxy — outgoing header rewriting ──
 
 #[tokio::test]
@@ -443,6 +489,89 @@ async fn test_after_proxy_noop_for_non_grpc_web() {
     assert_eq!(
         response_headers.get("content-type").unwrap(),
         "application/grpc"
+    );
+}
+
+#[tokio::test]
+async fn test_after_proxy_sets_expose_headers_when_backend_omits_them() {
+    // Regression test: previously, after_proxy only added expose-headers when
+    // the backend response already contained the header. That left browsers
+    // unable to read grpc-status/grpc-message on backends without CORS config.
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    let expose = response_headers
+        .get("access-control-expose-headers")
+        .expect("access-control-expose-headers must be set");
+    assert!(expose.contains("grpc-status"));
+    assert!(expose.contains("grpc-message"));
+    assert!(expose.contains("grpc-status-details-bin"));
+}
+
+#[tokio::test]
+async fn test_after_proxy_merges_expose_headers_with_existing() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert(
+        "access-control-expose-headers".to_string(),
+        "x-trace-id".to_string(),
+    );
+
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    let expose = response_headers
+        .get("access-control-expose-headers")
+        .expect("access-control-expose-headers must be set");
+    assert!(expose.contains("x-trace-id"), "should preserve existing");
+    assert!(expose.contains("grpc-status"), "should add grpc-status");
+    assert!(expose.contains("grpc-message"), "should add grpc-message");
+}
+
+#[tokio::test]
+async fn test_after_proxy_does_not_duplicate_existing_grpc_status_token() {
+    // Token-based dedup: don't add "grpc-status" if it's already a token in the
+    // existing list. The previous substring-based check would falsely match
+    // "grpc-status" inside "grpc-status-details-bin" — token-based avoids that.
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert(
+        "access-control-expose-headers".to_string(),
+        "grpc-status, grpc-message".to_string(),
+    );
+
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+
+    let expose = response_headers
+        .get("access-control-expose-headers")
+        .expect("access-control-expose-headers must be set");
+    let count = expose
+        .split(',')
+        .filter(|tok| tok.trim().eq_ignore_ascii_case("grpc-status"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "grpc-status must not be duplicated, got: {expose}"
     );
 }
 
