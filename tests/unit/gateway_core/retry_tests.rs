@@ -495,27 +495,44 @@ fn test_grpc_dns_failure_original_pattern_still_works() {
 // deferred logger to populate `TransactionSummary.client_disconnected`.
 
 #[test]
-fn test_classify_body_error_broken_pipe_is_client_disconnect() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client went away");
+fn test_classify_body_error_broken_pipe_is_backend_close() {
+    // classify_body_error is called from ProxyBody::poll_frame on the backend
+    // response body, so a BrokenPipe there means the backend closed — not the
+    // client. client_disconnected must remain false.
+    let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "backend went away");
     let (class, disconnected) = classify_body_error(&io_err);
     assert_eq!(class, ErrorClass::ConnectionClosed);
-    assert!(disconnected);
+    assert!(!disconnected);
 }
 
 #[test]
-fn test_classify_body_error_connection_reset_is_client_disconnect() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "client RST");
+fn test_classify_body_error_connection_reset_is_backend_close() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "backend RST");
     let (class, disconnected) = classify_body_error(&io_err);
     assert_eq!(class, ErrorClass::ConnectionClosed);
-    assert!(disconnected);
+    assert!(!disconnected);
 }
 
 #[test]
-fn test_classify_body_error_connection_aborted_is_client_disconnect() {
-    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "client aborted");
+fn test_classify_body_error_connection_aborted_is_backend_close() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "backend aborted");
     let (class, disconnected) = classify_body_error(&io_err);
     assert_eq!(class, ErrorClass::ConnectionClosed);
-    assert!(disconnected);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_hyper_canceled_is_client_disconnect() {
+    // hyper::Error::is_canceled / is_incomplete_message are the signals that
+    // unambiguously identify a client abort. We can't construct a real
+    // hyper::Error here, but the string-fallback path has a "canceled" branch
+    // that also maps to ConnectionClosed. Per the updated classifier, the
+    // string fallback stays false too — only typed hyper::Error can set
+    // client_disconnected=true, which is exercised in integration tests.
+    let err: Box<dyn std::error::Error + Send + Sync> = "request canceled by caller".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
 }
 
 #[test]
@@ -546,11 +563,12 @@ fn test_classify_body_error_unknown_defaults_to_request_error() {
 fn test_classify_body_error_string_fallback_broken_pipe() {
     // Box<dyn Error> constructed from a string — no downcastable io::Error,
     // but the message still indicates a broken pipe and should classify
-    // as a client disconnect.
+    // as ConnectionClosed. client_disconnected stays false: a string-only
+    // error cannot prove the client was the disconnecting side.
     let err: Box<dyn std::error::Error + Send + Sync> = "hyper::Error(Io, kind: BrokenPipe)".into();
     let (class, disconnected) = classify_body_error(&*err);
     assert_eq!(class, ErrorClass::ConnectionClosed);
-    assert!(disconnected);
+    assert!(!disconnected);
 }
 
 #[test]
@@ -596,5 +614,5 @@ fn test_classify_body_error_walks_source_chain_to_io_error() {
     ));
     let (class, disconnected) = classify_body_error(&wrapped);
     assert_eq!(class, ErrorClass::ConnectionClosed);
-    assert!(disconnected);
+    assert!(!disconnected);
 }

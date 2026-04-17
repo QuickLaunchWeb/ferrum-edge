@@ -267,9 +267,12 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
 /// (i.e. after response headers have been sent to the client).
 ///
 /// Returns `(ErrorClass, client_disconnected)` where `client_disconnected`
-/// is `true` when the error chain points to the client closing the
-/// connection (broken pipe, connection reset/aborted while writing, hyper
-/// `is_canceled`, hyper `is_incomplete_message`).
+/// is `true` only when the error chain specifically identifies the client as
+/// the disconnecting side — i.e. hyper `is_canceled` or `is_incomplete_message`.
+/// Raw IO resets (`BrokenPipe`/`ConnectionReset`/`ConnectionAborted`) are
+/// returned with `client_disconnected=false` because in this classifier's
+/// context (`ProxyBody::poll_frame` reading the backend response body) those
+/// signals identify a backend mid-stream failure, not a client abort.
 ///
 /// Walks `source()` chain so wrapped `hyper::Error` and `io::Error`
 /// instances are inspected regardless of how many layers of `Box<dyn Error>`
@@ -288,7 +291,8 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
                 std::io::ErrorKind::BrokenPipe
                 | std::io::ErrorKind::ConnectionReset
                 | std::io::ErrorKind::ConnectionAborted => {
-                    return (ErrorClass::ConnectionClosed, true);
+                    // Backend closed mid-stream — not a client disconnect.
+                    return (ErrorClass::ConnectionClosed, false);
                 }
                 std::io::ErrorKind::TimedOut => {
                     return (ErrorClass::ReadWriteTimeout, false);
@@ -327,7 +331,9 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
         || error_str.contains("canceled")
         || error_str.contains("closed before")
     {
-        return (ErrorClass::ConnectionClosed, true);
+        // Backend-side close during body streaming — keep client_disconnected
+        // false so backend resets don't inflate client-disconnect metrics.
+        return (ErrorClass::ConnectionClosed, false);
     }
     if error_str.contains("timed out") || debug_str.contains("TimedOut") {
         return (ErrorClass::ReadWriteTimeout, false);
