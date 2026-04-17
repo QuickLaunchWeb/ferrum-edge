@@ -365,16 +365,19 @@ impl Plugin for CompressionPlugin {
             headers.remove("accept-encoding");
         }
 
-        // For request decompression: remove Content-Encoding from the backend
-        // request headers since we'll decompress the body before forwarding.
+        // For request decompression: save the Content-Encoding value before
+        // removing it, so transform_request_body can find it. The private header
+        // x-ferrum-original-content-encoding is used because transform_request_body
+        // receives the same headers map (with content-encoding already removed).
         if self.config.decompress_request
             && let Some(ce) = headers.get("content-encoding")
         {
             let ce_lower = ce.to_lowercase();
             if ce_lower == "gzip" || ce_lower == "br" {
                 ctx.metadata
-                    .insert("compression:request_encoding".to_string(), ce_lower);
+                    .insert("compression:request_encoding".to_string(), ce_lower.clone());
                 headers.remove("content-encoding");
+                headers.insert("x-ferrum-original-content-encoding".to_string(), ce_lower);
                 // Content-Length will be wrong after decompression; remove it
                 // so the backend uses chunked transfer or recalculates.
                 headers.remove("content-length");
@@ -472,9 +475,12 @@ impl Plugin for CompressionPlugin {
             return None;
         }
 
-        // Check Content-Encoding to decide how to decompress.
+        // Check Content-Encoding to decide how to decompress. The original
+        // header was removed in before_proxy and saved under the private key
+        // x-ferrum-original-content-encoding so the backend doesn't see it.
         let encoding = request_headers
-            .get("content-encoding")
+            .get("x-ferrum-original-content-encoding")
+            .or_else(|| request_headers.get("content-encoding"))
             .map(|v| v.to_lowercase())?;
 
         match self.decompress(&encoding, body, self.config.max_decompressed_request_size) {
