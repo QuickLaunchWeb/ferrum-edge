@@ -296,6 +296,65 @@ impl AiSemanticCache {
     }
 }
 
+/// HTTP response headers that must never be cached and replayed to other
+/// requests. Replaying these would leak per-response identity, session
+/// state, or backend-specific routing hints to a different consumer/IP.
+///
+/// All names are lowercase; comparisons must be case-insensitive.
+const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
+    "set-cookie",
+    "set-cookie2",
+    "authorization",
+    "proxy-authenticate",
+    "www-authenticate",
+    "x-api-key",
+    "x-amz-security-token",
+    "x-amzn-requestid",
+    "x-request-id",
+    "x-correlation-id",
+    "x-trace-id",
+    "x-b3-traceid",
+    "x-b3-spanid",
+    "x-b3-parentspanid",
+    "traceparent",
+    "tracestate",
+    // Hop-by-hop headers (RFC 9110 §7.6.1) — already filtered by the
+    // proxy response path, but defense-in-depth in case the cache stores
+    // headers from a non-standard source in the future.
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    // Per-request rate-limit / retry headers — meaningless on a replay
+    // (the original counters reflect the original request, not the
+    // current one) and actively misleading to the new client.
+    "retry-after",
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "x-ai-ratelimit-limit",
+    "x-ai-ratelimit-remaining",
+    "x-ai-ratelimit-window",
+    "x-ai-ratelimit-usage",
+];
+
+/// Strip security-sensitive headers from a response header map before the
+/// cache stores or replays it. Filtering is case-insensitive because HTTP
+/// header names are case-insensitive (RFC 9110 §5.1).
+fn sanitize_cached_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !SENSITIVE_RESPONSE_HEADERS.contains(&lower.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 /// Normalize text: lowercase, collapse whitespace to single spaces, trim.
 ///
 /// Single-pass: previously called `to_ascii_lowercase()` first (one extra
@@ -512,9 +571,16 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
+        // Strip security-sensitive headers before caching. Cookies, auth
+        // tokens, per-request trace IDs, and rate-limit counters from the
+        // original response would otherwise be replayed verbatim to every
+        // cache-hit consumer — leaking session state and misleading
+        // downstream clients about their own rate-limit/trace context.
+        let safe_headers = sanitize_cached_headers(response_headers);
+
         let entry = CacheEntry {
             status_code: response_status,
-            headers: response_headers.clone(),
+            headers: safe_headers.clone(),
             body: Bytes::from(body.to_vec()),
             inserted_at: Instant::now(),
             approx_size: body.len(),
@@ -535,7 +601,7 @@ impl Plugin for AiSemanticCache {
         {
             let serializable = SerializableCacheEntry {
                 status_code: response_status,
-                headers: response_headers.clone(),
+                headers: safe_headers,
                 body: body.to_vec(),
             };
             if let Ok(data) = serde_json::to_vec(&serializable) {
@@ -647,5 +713,38 @@ mod tests {
         );
         assert_eq!(normalize_text(""), "");
         assert_eq!(normalize_text("   "), "");
+    }
+
+    #[test]
+    fn sanitize_cached_headers_strips_security_sensitive_keys() {
+        // Cached responses must never replay per-response identity (cookies,
+        // auth tokens, trace IDs) or per-request rate-limit counters to a
+        // different consumer. The stripper is case-insensitive because HTTP
+        // header names are case-insensitive.
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("Set-Cookie".to_string(), "session=abc123".to_string());
+        headers.insert("authorization".to_string(), "Bearer xyz".to_string());
+        headers.insert("X-Request-Id".to_string(), "req-12345-abcdef".to_string());
+        headers.insert("X-AI-RateLimit-Remaining".to_string(), "42".to_string());
+        headers.insert("retry-after".to_string(), "30".to_string());
+        headers.insert("x-custom-app-header".to_string(), "keep-me".to_string());
+
+        let sanitized = sanitize_cached_headers(&headers);
+        // Safe headers are retained
+        assert_eq!(
+            sanitized.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            sanitized.get("x-custom-app-header").map(String::as_str),
+            Some("keep-me")
+        );
+        // Sensitive headers are stripped, regardless of case
+        assert!(!sanitized.contains_key("Set-Cookie"));
+        assert!(!sanitized.contains_key("authorization"));
+        assert!(!sanitized.contains_key("X-Request-Id"));
+        assert!(!sanitized.contains_key("X-AI-RateLimit-Remaining"));
+        assert!(!sanitized.contains_key("retry-after"));
     }
 }
