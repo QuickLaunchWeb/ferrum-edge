@@ -2985,93 +2985,24 @@ async fn run_websocket_proxy(
             connection_id,
             "WebSocket tunnel mode: no frame plugins, using raw bidirectional copy"
         );
-        // Drain any frames the backend sent piggybacked with the 101 response
-        // before switching to raw mode. This prevents data loss for server-push
-        // protocols that send immediately after the upgrade handshake.
-        use futures_util::StreamExt;
-        let (backend_write, mut backend_read) = backend_ws_stream.split();
-        // Wrap the client-side upgraded transport in a WebSocketStream so we
-        // can re-serialize drained frames with correct framing/masking on the
-        // way to the client. Role::Server — the gateway is the WS server for
-        // the downstream client.
-        let client_io = TokioIo::new(upgraded);
-        let client_ws = WebSocketStream::from_raw_socket(
-            client_io,
-            tokio_tungstenite::tungstenite::protocol::Role::Server,
-            None,
-        )
-        .await;
-        let (mut client_sink, client_read) = client_ws.split();
-
-        // Non-blocking drain: read any already-buffered frames from the
-        // backend and forward them to the client sink. In practice this is 0
-        // frames for request-response protocols, 1-2 for server-push
-        // protocols (e.g., stock tickers).
-        while let std::task::Poll::Ready(Some(Ok(msg))) = futures_util::poll!(backend_read.next()) {
-            if let Err(e) = client_sink.send(msg).await {
-                warn!(
-                    proxy_id = %proxy_id,
-                    "WebSocket tunnel: failed to flush buffered frame to client: {e}"
-                );
-                // Read succeeded from backend, write failed toward client —
-                // attribute to BackendToClient.
-                let drain_failure = Some((
-                    crate::plugins::Direction::BackendToClient,
-                    retry::classify_boxed_error(&e),
-                ));
-                fire_ws_tunnel_disconnect_hooks(
-                    &ws_disconnect_plugins,
-                    proxy_id,
-                    &session_meta,
-                    drain_failure,
-                )
-                .await;
-                return Ok(());
-            }
-        }
-        // Reunite the backend stream and extract the raw transport. If the
-        // halves can't be reunited (should not happen since both came from the
-        // same split), still run the disconnect hook so observers see the
-        // session end instead of silently swallowing it.
-        let backend_ws = match backend_read.reunite(backend_write) {
-            Ok(ws) => ws,
-            Err(e) => {
-                let reunite_failure = Some((
-                    crate::plugins::Direction::Unknown,
-                    crate::retry::ErrorClass::RequestError,
-                ));
-                fire_ws_tunnel_disconnect_hooks(
-                    &ws_disconnect_plugins,
-                    proxy_id,
-                    &session_meta,
-                    reunite_failure,
-                )
-                .await;
-                return Err(Box::new(e));
-            }
-        };
-        let mut backend = backend_ws.into_inner();
-        // Reunite the client stream and extract the raw transport for
-        // copy_bidirectional. Any drained frames have already been flushed to
-        // the sink before we unwrap.
-        let client_ws = match client_read.reunite(client_sink) {
-            Ok(ws) => ws,
-            Err(e) => {
-                let reunite_failure = Some((
-                    crate::plugins::Direction::Unknown,
-                    crate::retry::ErrorClass::RequestError,
-                ));
-                fire_ws_tunnel_disconnect_hooks(
-                    &ws_disconnect_plugins,
-                    proxy_id,
-                    &session_meta,
-                    reunite_failure,
-                )
-                .await;
-                return Err(Box::new(e));
-            }
-        };
-        let mut client_io = client_ws.into_inner();
+        // Unwrap both WebSocket wrappers back to their raw transports for
+        // raw bidirectional copy. We intentionally do NOT drain buffered
+        // frames from `backend_ws_stream` here: `poll_next` can partially
+        // consume a fragmented frame into tungstenite's internal read buffer
+        // and return `Pending` before yielding the frame; those bytes would
+        // then be silently discarded by `into_inner()`. By skipping the
+        // drain we keep any pending bytes in the kernel TCP socket buffer
+        // where `copy_bidirectional` forwards them intact.
+        //
+        // Known limitation: if the backend's handshake response coincidentally
+        // carried WebSocket frame bytes in the same TCP segment as the 101
+        // Switching Protocols response, tungstenite may have already pulled
+        // those bytes into its internal read buffer during handshake parsing,
+        // and `into_inner()` will drop them. Deployments where the backend
+        // sends immediately after upgrade should use frame-parsing mode (set
+        // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
+        let mut backend = backend_ws_stream.into_inner();
+        let mut client_io = TokioIo::new(upgraded);
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
             &mut client_io,

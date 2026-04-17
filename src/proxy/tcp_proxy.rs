@@ -2260,17 +2260,17 @@ async fn bidirectional_splice_io_uring(
     client: TcpStream,
     backend: TcpStream,
     idle_timeout: Option<Duration>,
-    _half_close_cap: Option<Duration>,
+    half_close_cap: Option<Duration>,
     pipe_size: usize,
 ) -> StreamCopyResult {
-    // Note: `_half_close_cap` is accepted for signature parity with
-    // `bidirectional_splice` / `bidirectional_copy`, but the io_uring path
-    // runs both directions on dedicated blocking threads that don't observe
-    // a Phase 1 / Phase 2 split — the idle timeout inside each worker
-    // (`io_uring_splice_direction`) is the only bound. Adding a hard cap
-    // here would require cross-thread signalling; the io_uring path already
-    // uses `timeout_ms` internally, so in practice operators enabling the
-    // io_uring path should set `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` > 0.
+    // `half_close_cap` bounds the time we wait for the second direction once
+    // the first has completed. The io_uring workers run on blocking threads
+    // and cannot observe a Phase 1 / Phase 2 split directly, so we enforce
+    // the cap by racing the join with a timer and — on timeout — calling
+    // `shutdown(SHUT_RDWR)` on both sockets. That forces the splice syscall
+    // in the still-running worker to return, letting the blocking thread
+    // unwind instead of pinning under a stalled peer when
+    // `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`.
     use std::os::unix::io::AsRawFd;
     use std::sync::OnceLock;
 
@@ -2382,10 +2382,58 @@ async fn bidirectional_splice_io_uring(
         res
     });
 
-    // Wait for both directions. Streams (`client`, `backend`) stay alive on this
-    // stack frame until the function returns. Pipe guards (`_c2b_guard`, `_b2c_guard`)
-    // close pipe fds on drop. All resource cleanup is RAII — no manual close needed.
-    let (c2b_result, b2c_result) = tokio::join!(c2b_handle, b2c_handle);
+    // Wait for the first direction to complete, then bound the second with
+    // `half_close_cap`. On cap timeout, force-shutdown both sockets so the
+    // splice syscall in the remaining blocking worker returns and the
+    // thread unwinds. Pipe guards (`_c2b_guard`, `_b2c_guard`) close pipe
+    // fds on drop regardless.
+    let mut c2b_handle = c2b_handle;
+    let mut b2c_handle = b2c_handle;
+    let ff_cap = first_failure.clone();
+    let force_shutdown = move || unsafe {
+        libc::shutdown(client_fd, libc::SHUT_RDWR);
+        libc::shutdown(backend_fd, libc::SHUT_RDWR);
+    };
+    let (c2b_result, b2c_result) = tokio::select! {
+        c2b_res = &mut c2b_handle => {
+            let b2c_res = match half_close_cap.filter(|t| !t.is_zero()) {
+                Some(cap) => match tokio::time::timeout(cap, &mut b2c_handle).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = ff_cap.set((
+                            Direction::BackendToClient,
+                            ErrorClass::ReadWriteTimeout,
+                            None,
+                            "TCP half-close cap exceeded (io_uring splice)".to_string(),
+                        ));
+                        force_shutdown();
+                        (&mut b2c_handle).await
+                    }
+                },
+                None => (&mut b2c_handle).await,
+            };
+            (c2b_res, b2c_res)
+        }
+        b2c_res = &mut b2c_handle => {
+            let c2b_res = match half_close_cap.filter(|t| !t.is_zero()) {
+                Some(cap) => match tokio::time::timeout(cap, &mut c2b_handle).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = ff_cap.set((
+                            Direction::ClientToBackend,
+                            ErrorClass::ReadWriteTimeout,
+                            None,
+                            "TCP half-close cap exceeded (io_uring splice)".to_string(),
+                        ));
+                        force_shutdown();
+                        (&mut c2b_handle).await
+                    }
+                },
+                None => (&mut c2b_handle).await,
+            };
+            (c2b_res, b2c_res)
+        }
+    };
 
     let c2b_bytes = match c2b_result {
         Ok(Ok(n)) => n,
