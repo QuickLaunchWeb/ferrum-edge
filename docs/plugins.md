@@ -1022,14 +1022,16 @@ Emits verbose request/response diagnostics via `tracing::debug!` on the `transac
 
 ### `correlation_id`
 
-Generates and propagates correlation IDs for request tracing across services.
+Generates and propagates correlation IDs for request tracing across services. When the inbound request already includes the configured header (and the value is no longer than 256 characters), the existing value is preserved and forwarded; otherwise the plugin generates a fresh UUID v4 and stores it in `ctx.metadata["request_id"]` for downstream logging plugins to pick up.
 
 **Priority:** 50
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `header_name` | String | `x-request-id` | Header name used for inbound, outbound, and echoed IDs |
-| `echo_downstream` | bool | `true` | Include correlation ID in response headers |
+| `header_name` | String | `x-request-id` | Header name used for inbound, outbound, and echoed IDs. Lowercased internally. Must be a non-empty valid HTTP header token (RFC 7230 §3.2.6) — non-string values, empty strings, and values containing separators like `:` are rejected at plugin load time. |
+| `echo_downstream` | bool | `true` | Include correlation ID in response headers. Non-boolean values are rejected at plugin load time. |
+
+The plugin runs across all protocols (HTTP, gRPC, WebSocket, TCP, UDP). For stream protocols the ID is generated and stashed at `on_stream_connect`.
 
 ### `prometheus_metrics`
 
@@ -1926,9 +1928,10 @@ Useful for providing a common, discoverable pattern for API specifications acros
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`) |
-| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.) |
-| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates |
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`). Must use `http` or `https` scheme; other schemes (e.g., `file://`) are rejected at plugin load time. |
+| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.). |
+| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates. |
+| `cache_ttl_seconds` | u64 | `300` | TTL for the in-process spec body cache. The first `/specz` request fetches the spec from `spec_url` and caches it in memory; subsequent requests within the TTL window are served directly from the cache without re-fetching. Failed fetches are never cached — every failure is retried on the next request. Set to `0` to disable caching entirely (every request re-fetches). |
 
 ```yaml
 # Example: Expose an OpenAPI spec for an API behind /my/api/v1
@@ -1945,7 +1948,16 @@ config:
   tls_no_verify: true
 ```
 
-**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response with details. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames.
+```yaml
+# Example: Disable caching for a frequently changing spec
+config:
+  spec_url: "https://internal-service.corp.net/docs/openapi.yaml"
+  cache_ttl_seconds: 0
+```
+
+**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames. Failed fetches are NOT cached, so a transient upstream error is retried on the very next request.
+
+**Caching:** Successful fetches are cached in-process with `cache_ttl_seconds` (default 5 min). This protects the upstream document store from request floods on `/specz` and removes the per-request fetch cost from the hot path. The cache is per-plugin-instance and lives in the gateway's address space — restarting the gateway clears it. There is no manual invalidation; if you need to push a new spec, either wait for the TTL to expire or reload the gateway.
 
 **Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
@@ -2247,6 +2259,18 @@ Behavior:
 - **Responses containing `Set-Cookie` headers are never cached.** Set-Cookie headers are per-client and replaying them from a shared cache would leak session cookies to other users (RFC 7234 §8).
 - The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
 
+`X-Cache-Status` values (when `add_cache_status_header` is enabled):
+
+| Value | Meaning |
+|---|---|
+| `MISS` | Cacheable request not found in cache; response will be considered for caching |
+| `HIT` | Served from cache |
+| `REVALIDATED` | Conditional request matched a fresh cached validator; returned `304 Not Modified` |
+| `BYPASS` | Cache bypassed: non-cacheable method, or client sent `Cache-Control: no-cache`/`no-store` |
+| `PREDICTED-BYPASS` | Cache lookup skipped because this exact variant (including Vary dimensions) was previously known to be uncacheable |
+
+**Cacheability predictor**: The plugin maintains a bounded LRU of cache-key variants that were observed to be uncacheable (e.g., responses with `Set-Cookie`, `Cache-Control: no-store`, `private`, or non-cacheable status codes). Subsequent requests for those same variants short-circuit the cache lookup with `X-Cache-Status: PREDICTED-BYPASS`, avoiding the `DashMap` read on the hot path. The predictor is keyed on the *full* cache key (including Vary dimensions), so an uncacheable variant for one `Accept-Encoding` value does not suppress lookups for other variants. When a previously uncacheable variant becomes cacheable (e.g., the backend stops sending `Set-Cookie`), the predictor clears the entry on the next successful insert.
+
 Compression note:
 - The `compression` plugin (priority 4050) can generate gzip or brotli responses at the gateway. When both `response_caching` and `compression` are enabled on the same proxy, the cache stores the uncompressed backend response (since `response_caching` at 3500 runs before `compression` at 4050). Compression is applied after cache retrieval, so cached responses are compressed on each cache hit.
 - Without the `compression` plugin, the gateway forwards backend `Content-Encoding` as-is and caches compressed variants correctly when the origin sends the matching `Vary` header.
@@ -2266,11 +2290,13 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `max_complexity` | u32 (optional) | — | Maximum allowed field count |
 | `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or authenticated identity (`consumer`) |
+| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type (`query`, `mutation`, `subscription`) |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
+
+The plugin requires at least one rule (`max_depth`, `max_complexity`, `max_aliases`, `introspection_allowed: false`, `type_rate_limits`, or `operation_rate_limits`) — an empty config is rejected so it cannot be a no-op.
 
 Populates `ctx.metadata` with `graphql_operation_type`, `graphql_operation_name`, `graphql_depth`, and `graphql_complexity`.
 
@@ -2327,11 +2353,11 @@ Parses the gRPC path (`/package.Service/Method`) and enables per-method access c
 | `allow_methods` | String[] | *(none)* | Only these gRPC methods are permitted (allowlist) |
 | `deny_methods` | String[] | `[]` | These gRPC methods are explicitly blocked (checked before allow) |
 | `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path |
-| `limit_by` | String | `ip` | Rate limit key: `ip` or authenticated identity (`consumer`) |
+| `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
 
-Each rate limit entry: `{max_requests: u64, window_seconds: u64}`.
+Each rate limit entry: `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit.
 
-Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+The plugin requires at least one rule (`allow_methods`, `deny_methods`, or `method_rate_limits`) — an empty config is rejected. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
 
 Populates `ctx.metadata` with `grpc_service`, `grpc_method`, and `grpc_full_method` in the `on_request_received` phase.
 
@@ -2359,12 +2385,12 @@ Manages the `grpc-timeout` metadata header at the gateway. Can enforce maximum d
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds) |
-| `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it |
+| `max_deadline_ms` | u64 (optional) | *(none)* | Cap incoming deadlines to this value (milliseconds). Must be positive — `0` is rejected at plugin load time (it would reject every request). |
+| `default_deadline_ms` | u64 (optional) | *(none)* | Inject `grpc-timeout` when client omits it. Must be positive — `0` is rejected. If both are set, `default_deadline_ms` cannot exceed `max_deadline_ms`. |
 | `subtract_gateway_processing` | bool | `false` | Subtract elapsed gateway time before forwarding |
 | `reject_no_deadline` | bool | `false` | Reject requests missing `grpc-timeout` (gRPC clients receive normalized `grpc-status`) |
 
-Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds).
+The plugin requires at least one rule — empty configs are rejected at load time so it cannot be a no-op. Parses all gRPC timeout units: `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), `n` (nanoseconds). Malformed values (non-ASCII, non-digit, or unknown unit) are treated as missing and fall back to `default_deadline_ms` if configured — they never panic the worker.
 
 Forwarded deadlines are re-encoded to stay within the gRPC wire-format limit of 8 digits, preserving millisecond precision whenever it fits.
 
