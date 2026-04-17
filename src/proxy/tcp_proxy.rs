@@ -2151,17 +2151,29 @@ async fn bidirectional_splice_io_uring(
     let ff_b2c = first_failure.clone();
 
     // Each direction runs on its own blocking thread with its own io_uring ring.
+    // Idle expirations from the splice loop are reported as anyhow errors whose
+    // text starts with "TCP idle timeout" — classify them directly as
+    // `ReadWriteTimeout` + `Direction::Unknown` + `side: None` so
+    // `disconnect_cause_for_failure` maps them to `IdleTimeout`. Running them
+    // through `classify_stream_error` would return `ConnectionTimeout` (or even
+    // `RequestError`), which the mapper treats as a recv/backend error.
     let c2b_handle = tokio::task::spawn_blocking(move || {
         let res = io_uring_splice_direction(
             client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms, &sa_c2b,
         );
         if let Err((side, ref e)) = res {
-            let _ = ff_c2b.set((
-                Direction::ClientToBackend,
-                classify_stream_error(e),
-                Some(side),
-                e.to_string(),
-            ));
+            let msg = e.to_string();
+            let entry = if msg.starts_with("TCP idle timeout") {
+                (Direction::Unknown, ErrorClass::ReadWriteTimeout, None, msg)
+            } else {
+                (
+                    Direction::ClientToBackend,
+                    classify_stream_error(e),
+                    Some(side),
+                    msg,
+                )
+            };
+            let _ = ff_c2b.set(entry);
         }
         res
     });
@@ -2170,12 +2182,18 @@ async fn bidirectional_splice_io_uring(
             backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, timeout_ms, &sa_b2c,
         );
         if let Err((side, ref e)) = res {
-            let _ = ff_b2c.set((
-                Direction::BackendToClient,
-                classify_stream_error(e),
-                Some(side),
-                e.to_string(),
-            ));
+            let msg = e.to_string();
+            let entry = if msg.starts_with("TCP idle timeout") {
+                (Direction::Unknown, ErrorClass::ReadWriteTimeout, None, msg)
+            } else {
+                (
+                    Direction::BackendToClient,
+                    classify_stream_error(e),
+                    Some(side),
+                    msg,
+                )
+            };
+            let _ = ff_b2c.set(entry);
         }
         res
     });
