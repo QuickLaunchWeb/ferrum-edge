@@ -25,10 +25,10 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_https_h2
                 codec_type: HTTP2
-                http2_protocol_options:
-                  initial_stream_window_size: 8388608
-                  initial_connection_window_size: 33554432
-                  max_concurrent_streams: 1000
+                # HTTP/2 flow-control uses Envoy defaults (256KB stream / 1MB
+                # connection window) so the benchmark compares each gateway
+                # as-shipped. Kong/Tyk/KrakenD can't easily match Ferrum's
+                # 8MB/32MB defaults, so explicit tuning here would bias results.
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -54,10 +54,8 @@ static_resources:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http2_protocol_options:
-              initial_stream_window_size: 8388608
-              initial_connection_window_size: 33554432
-              max_concurrent_streams: 1000
+            # Upstream HTTP/2 with Envoy defaults — see note on downstream above.
+            http2_protocol_options: {}
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:

@@ -63,12 +63,15 @@ esac
 # Returns 0 if the gateway supports the protocol, 1 otherwise.
 supports() {
     local gw="$1" proto="$2"
+    # KrakenD Community Edition does NOT support gRPC proxying (Enterprise Edition only),
+    # so krakend is intentionally omitted from the grpcs arm. See
+    # https://www.krakend.io/docs/enterprise/backends/grpc/
     case "$gw:$proto" in
         ferrum:*)  return 0 ;;
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:http2|kong:http3|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
         tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss|tyk:tcp-tls) return 0 ;;
-        krakend:http1-tls|krakend:http2|krakend:grpcs|krakend:wss) return 0 ;;
+        krakend:http1-tls|krakend:http2|krakend:wss) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -98,12 +101,15 @@ bench_params() {
 }
 
 # ── Docker images ────────────────────────────────────────────────────────────
+# All tags are pinned to exact patch versions (not floating `-latest` / minor-only
+# tags) so benchmark runs remain reproducible over time. Bump deliberately when
+# upgrading; do not revert to floating tags.
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
-ENVOY_IMAGE="envoyproxy/envoy:v1.33-latest"
-KONG_IMAGE="kong/kong-gateway:3.10"
+ENVOY_IMAGE="envoyproxy/envoy:v1.33.5"
+KONG_IMAGE="kong/kong-gateway:3.10.0.0"
 TYK_IMAGE="tykio/tyk-gateway:v5.3.0"
-REDIS_IMAGE="redis:7-alpine"
-KRAKEND_IMAGE="krakend:2.13"
+REDIS_IMAGE="redis:7.4.1-alpine"
+KRAKEND_IMAGE="krakend:2.13.2"
 
 # ── State ────────────────────────────────────────────────────────────────────
 BACKEND_PID=""
@@ -171,9 +177,9 @@ start_ferrum() {
     local config_file="$SCRIPT_DIR/configs/$(ferrum_config_name)"
     echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_file")..."
 
+    # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
     case "$PROTOCOL" in
-        http2) extra_env+=(-e "FERRUM_POOL_ENABLE_HTTP2=true") ;;
         http3) extra_env+=(-e "FERRUM_ENABLE_HTTP3=true") ;;
     esac
 
@@ -396,6 +402,27 @@ krakend_config_name() {
 }
 
 # ── Gateway readiness check ─────────────────────────────────────────────────
+# Verifies the gateway container is alive and (where possible) listening.
+# For UDP/QUIC we cannot TCP-probe, so we verify the container is still running
+# and scan its recent logs for fatal markers — this catches the common case
+# where the gateway crashes during startup (port bind failure, bad config).
+container_alive() {
+    [ -z "$GATEWAY_CID" ] && return 1
+    local state
+    state=$(docker inspect -f '{{.State.Running}}' "$GATEWAY_CID" 2>/dev/null || echo "false")
+    [ "$state" = "true" ]
+}
+
+container_has_fatal_log() {
+    [ -z "$GATEWAY_CID" ] && return 1
+    # Patterns chosen to match fatal startup errors across all 5 gateways;
+    # avoids matching benign log lines like "error_log /var/log/..." (nginx
+    # config) or routine "debug: error handling" messages.
+    docker logs "$GATEWAY_CID" 2>&1 | tail -100 | \
+        grep -qE "FATAL|PANIC|bind: address already in use|failed to bind|cert file not found|no such file|permission denied|listen tcp .*: bind:" && return 0
+    return 1
+}
+
 wait_for_gateway() {
     local target_port
     case "$PROTOCOL" in
@@ -407,18 +434,32 @@ wait_for_gateway() {
     esac
 
     for i in $(seq 1 40); do
-        # For TCP: check if port is listening. For UDP: just sleep (we can't probe).
         case "$PROTOCOL" in
             udp|udp-dtls|http3)
-                # UDP/QUIC — no TCP probe possible; grace period.
+                # UDP/QUIC: no TCP handshake to probe. Give the listener a
+                # moment to bind, then verify container health + clean logs.
+                if [ "$i" -ge 6 ]; then
+                    if container_has_fatal_log; then
+                        echo "[gateway] fatal log entry detected for $PROTOCOL" >&2
+                        docker logs "$GATEWAY_CID" 2>&1 | tail -30 >&2 || true
+                        return 1
+                    fi
+                    if container_alive; then
+                        echo "[gateway] container alive for $PROTOCOL (udp/quic — no port probe)"
+                        sleep 1
+                        return 0
+                    fi
+                    echo "[gateway] container exited for $PROTOCOL" >&2
+                    docker logs "$GATEWAY_CID" 2>&1 | tail -30 >&2 || true
+                    return 1
+                fi
                 sleep 0.5
-                if [ "$i" -ge 6 ]; then return; fi
                 ;;
             *)
                 if bash -c ">/dev/tcp/127.0.0.1/$target_port" 2>/dev/null; then
                     echo "[gateway] ready on port $target_port"
                     sleep 1  # grace period
-                    return
+                    return 0
                 fi
                 sleep 0.5
                 ;;
@@ -438,6 +479,19 @@ stop_gateway() {
 }
 
 # ── Bench runner ────────────────────────────────────────────────────────────
+# Auto-scales concurrency down for large payloads so an ubuntu-latest runner
+# (7 GB RAM) doesn't OOM on 5MB × 100 concurrent in-flight bodies.
+scale_concurrency_for_payload() {
+    local size="$1" base="$2"
+    if [ "$size" -ge 5242880 ]; then
+        echo $(( base / 4 > 4 ? base / 4 : 4 ))
+    elif [ "$size" -ge 1048576 ]; then
+        echo $(( base / 2 > 4 ? base / 2 : 4 ))
+    else
+        echo "$base"
+    fi
+}
+
 run_bench() {
     local gateway="$1"
     local payload="$2"
@@ -453,26 +507,28 @@ run_bench() {
         bench_target="${params[1]}"
     fi
     local extra_args=("${params[@]:3}")
+    local effective_concurrency
+    effective_concurrency=$(scale_concurrency_for_payload "$payload" "$CONCURRENCY")
 
     local out="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.json"
-    echo "[bench] $gateway/$PROTOCOL payload=${payload}B → $bench_target"
+    echo "[bench] $gateway/$PROTOCOL payload=${payload}B concurrency=${effective_concurrency} → $bench_target"
 
     if ! "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
         --target "$bench_target" \
         --duration "$DURATION" \
-        --concurrency "$CONCURRENCY" \
+        --concurrency "$effective_concurrency" \
         --payload-size "$payload" \
         --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"; then
         echo "[bench] FAILED: $gateway/$PROTOCOL payload=${payload}B — see ${out}.err"
         # Leave a stub JSON so aggregation can detect the failure.
-        echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"error\":\"bench failed\",\"rps\":0}" > "$out"
+        echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"effective_concurrency\":$effective_concurrency,\"error\":\"bench failed\",\"rps\":0}" > "$out"
         return 0
     fi
 
     # Stamp metadata into JSON for aggregation.
-    python3 - "$out" "$gateway" "$payload" <<'PYEOF'
+    python3 - "$out" "$gateway" "$payload" "$effective_concurrency" <<'PYEOF'
 import json, sys
-path, gateway, payload = sys.argv[1], sys.argv[2], int(sys.argv[3])
+path, gateway, payload, concurrency = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 try:
     with open(path) as f:
         d = json.load(f)
@@ -480,6 +536,7 @@ except Exception:
     d = {"rps": 0, "error": "unparseable"}
 d["gateway"] = gateway
 d["payload_size"] = payload
+d["effective_concurrency"] = concurrency
 with open(path, "w") as f:
     json.dump(d, f, indent=2)
 PYEOF
