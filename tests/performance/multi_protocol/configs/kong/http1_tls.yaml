@@ -1,0 +1,39 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — HTTP/1.1 over TLS
+# Gateway HTTPS (TLS termination) → HTTP/1.1 backend on 3001
+# Listener is configured via KONG_PROXY_LISTEN env var in harness script.
+
+services:
+  - name: echo-service
+    host: 127.0.0.1
+    port: 3001
+    protocol: http
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: echo-route
+        paths:
+          - /echo
+        protocols:
+          - http
+          - https
+        strip_path: false
+        preserve_host: false
+
+  - name: health-service
+    host: 127.0.0.1
+    port: 3010
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        protocols:
+          - http
+          - https
+        strip_path: false

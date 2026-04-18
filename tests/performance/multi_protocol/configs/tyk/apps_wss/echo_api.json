@@ -1,0 +1,19 @@
+{
+  "name": "Echo API (WSS)",
+  "slug": "echo-wss",
+  "api_id": "echo-wss",
+  "org_id": "default",
+  "use_keyless": true,
+  "active": true,
+  "enable_websockets": true,
+  "proxy": {
+    "listen_path": "/ws",
+    "target_url": "http://127.0.0.1:3003/",
+    "strip_listen_path": true
+  },
+  "version_data": {
+    "not_versioned": true,
+    "default_version": "Default",
+    "versions": { "Default": { "name": "Default" } }
+  }
+}

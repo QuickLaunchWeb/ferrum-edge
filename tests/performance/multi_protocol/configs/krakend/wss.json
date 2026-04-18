@@ -1,0 +1,53 @@
+{
+  "$schema": "https://www.krakend.io/schema/krakend.json",
+  "version": 3,
+  "name": "Ferrum Benchmark - KrakenD WSS",
+  "port": 8443,
+  "timeout": "1h",
+  "cache_ttl": "0s",
+  "max_idle_connections": 500,
+  "max_idle_connections_per_host": 500,
+  "disable_keep_alives": false,
+  "dialer_timeout": "5s",
+  "read_timeout": "1h",
+  "write_timeout": "1h",
+  "idle_timeout": "1h",
+  "tls": {
+    "public_key": "CERT_PATH",
+    "private_key": "KEY_PATH"
+  },
+  "endpoints": [
+    {
+      "endpoint": "/ws",
+      "method": "GET",
+      "output_encoding": "no-op",
+      "backend": [
+        {
+          "host": ["http://127.0.0.1:3003"],
+          "url_pattern": "/",
+          "encoding": "no-op",
+          "disable_host_sanitize": true,
+          "extra_config": {
+            "modifier/websocket": {
+              "connect_event": true,
+              "disconnect_event": true,
+              "max_retries": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "output_encoding": "no-op",
+      "backend": [
+        {
+          "host": ["http://127.0.0.1:3010"],
+          "url_pattern": "/health",
+          "encoding": "no-op"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,530 @@
+#!/bin/bash
+# Multi-gateway, multi-payload protocol benchmark for gateways-protocol-benchmark.yml.
+#
+# For one protocol, runs proto_bench against every supporting gateway at every
+# requested payload size, plus a direct-backend baseline. Writes per-bench JSON
+# to the output directory named `<gateway>_<protocol>_<payload>.json`.
+#
+# Usage: ./run_gateway_protocol_bench.sh <protocol> [options]
+#   Protocol: http1-tls | http2 | http3 | grpcs | wss | tcp-tls | udp | udp-dtls
+#
+# Options:
+#   --gateways "ferrum envoy kong tyk krakend"   (auto-filtered by protocol support)
+#   --payload-sizes "10240 71680 512000 1048576 5242880"  (UDP & UDP+DTLS forced to 1024)
+#   --duration 10
+#   --concurrency 100
+#   --output-dir /tmp/gateway-protocol-results
+#   --skip-build                (reuse existing proto_bench binaries + ferrum docker image)
+#   --skip-direct               (skip direct-backend baseline)
+#
+# All gateways (including Ferrum) run in Docker with --network host so no gateway
+# has a native-binary advantage. proto_backend and proto_bench run natively
+# since they are the backend and client under test, not gateways being benchmarked.
+#
+# Exit code: 0 on success (some benches may fail individually — check JSON files).
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+PROTOCOL="${1:-}"
+[ -z "$PROTOCOL" ] && { echo "usage: $0 <protocol> [options]" >&2; exit 2; }
+shift
+
+GATEWAYS="ferrum envoy kong tyk krakend"
+PAYLOAD_SIZES="10240 71680 512000 1048576 5242880"
+DURATION=10
+CONCURRENCY=100
+OUTPUT_DIR="/tmp/gateway-protocol-results"
+SKIP_BUILD=false
+SKIP_DIRECT=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --gateways) GATEWAYS="$2"; shift 2 ;;
+        --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
+        --duration) DURATION="$2"; shift 2 ;;
+        --concurrency) CONCURRENCY="$2"; shift 2 ;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --skip-build) SKIP_BUILD=true; shift ;;
+        --skip-direct) SKIP_DIRECT=true; shift ;;
+        *) echo "unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+# UDP protocols are fixed to 1 KB regardless of caller.
+case "$PROTOCOL" in
+    udp|udp-dtls) PAYLOAD_SIZES="1024" ;;
+esac
+
+# ── Gateway × protocol support matrix ─────────────────────────────────────────
+# Returns 0 if the gateway supports the protocol, 1 otherwise.
+supports() {
+    local gw="$1" proto="$2"
+    case "$gw:$proto" in
+        ferrum:*)  return 0 ;;
+        envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
+        kong:http1-tls|kong:http2|kong:http3|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
+        tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss|tyk:tcp-tls) return 0 ;;
+        krakend:http1-tls|krakend:http2|krakend:grpcs|krakend:wss) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── Protocol plumbing ─────────────────────────────────────────────────────────
+# Standard gateway listen ports (all gateways listen on these so bench targets
+# match regardless of which gateway is under test).
+GATEWAY_HTTP_PORT=8000
+GATEWAY_HTTPS_PORT=8443
+GATEWAY_TCP_TLS_PORT=5001
+GATEWAY_UDP_PORT=5003
+GATEWAY_UDP_DTLS_PORT=5004
+
+# Returns: <bench_proto> <bench_target> <direct_target> [extra_bench_args]
+bench_params() {
+    case "$PROTOCOL" in
+        http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo http://127.0.0.1:3001/echo" ;;
+        http2)     echo "http2 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
+        http3)     echo "http3 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3445/echo" ;;
+        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} http://127.0.0.1:50052 --tls" ;;
+        wss)       echo "ws wss://127.0.0.1:${GATEWAY_HTTPS_PORT}/ws ws://127.0.0.1:3003" ;;
+        tcp-tls)   echo "tcp 127.0.0.1:${GATEWAY_TCP_TLS_PORT} 127.0.0.1:3444 --tls" ;;
+        udp)       echo "udp 127.0.0.1:${GATEWAY_UDP_PORT} 127.0.0.1:3005" ;;
+        udp-dtls)  echo "udp 127.0.0.1:${GATEWAY_UDP_DTLS_PORT} 127.0.0.1:3006 --tls" ;;
+        *) echo "unknown protocol: $PROTOCOL" >&2; exit 2 ;;
+    esac
+}
+
+# ── Docker images ────────────────────────────────────────────────────────────
+FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
+ENVOY_IMAGE="envoyproxy/envoy:v1.33-latest"
+KONG_IMAGE="kong/kong-gateway:3.10"
+TYK_IMAGE="tykio/tyk-gateway:v5.3.0"
+REDIS_IMAGE="redis:7-alpine"
+KRAKEND_IMAGE="krakend:2.13"
+
+# ── State ────────────────────────────────────────────────────────────────────
+BACKEND_PID=""
+REDIS_CID=""
+GATEWAY_CID=""
+CERT_DIR="$SCRIPT_DIR/certs"
+
+cleanup() {
+    echo "[cleanup] stopping all processes..."
+    [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
+    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
+    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
+                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
+                $GATEWAY_TCP_TLS_PORT $GATEWAY_UDP_PORT $GATEWAY_UDP_DTLS_PORT \
+                15000 9901 6379; do
+        lsof -ti:"$port" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+
+# ── Build ────────────────────────────────────────────────────────────────────
+build_binaries() {
+    if $SKIP_BUILD; then
+        echo "[build] skipping (--skip-build)"
+        return
+    fi
+    echo "[build] building proto_bench/proto_backend (harness tools only)..."
+    ( cd "$SCRIPT_DIR" && cargo build --release 2>&1 | tail -3 )
+
+    echo "[build] verifying ferrum Docker image '$FERRUM_IMAGE' exists..."
+    if ! docker image inspect "$FERRUM_IMAGE" >/dev/null 2>&1; then
+        echo "[build] building ferrum Docker image from $PROJECT_ROOT/Dockerfile..."
+        docker build -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" 2>&1 | tail -5
+    else
+        echo "[build] ferrum image '$FERRUM_IMAGE' already present"
+    fi
+}
+
+# ── Backend ──────────────────────────────────────────────────────────────────
+start_backend() {
+    echo "[backend] starting proto_backend..."
+    cd "$SCRIPT_DIR"
+    ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
+    BACKEND_PID=$!
+    for i in $(seq 1 20); do
+        if curl -sf http://127.0.0.1:3010/health >/dev/null 2>&1; then
+            echo "[backend] healthy (pid $BACKEND_PID)"
+            # Wait for cert generation
+            for j in $(seq 1 10); do
+                [ -f "$CERT_DIR/cert.pem" ] && break
+                sleep 0.5
+            done
+            return
+        fi
+        sleep 0.5
+    done
+    echo "[backend] failed to start" >&2
+    tail -30 "$SCRIPT_DIR/backend.log" >&2
+    exit 1
+}
+
+# ── Ferrum (docker, distroless image from repo Dockerfile) ──────────────────
+start_ferrum() {
+    local config_file="$SCRIPT_DIR/configs/$(ferrum_config_name)"
+    echo "[ferrum] starting ($FERRUM_IMAGE) with $(basename "$config_file")..."
+
+    local extra_env=()
+    case "$PROTOCOL" in
+        http2) extra_env+=(-e "FERRUM_POOL_ENABLE_HTTP2=true") ;;
+        http3) extra_env+=(-e "FERRUM_ENABLE_HTTP3=true") ;;
+    esac
+
+    GATEWAY_CID=$(docker run -d --rm --network host \
+        -v "$config_file:/etc/ferrum/config.yaml:ro" \
+        -v "$CERT_DIR:/etc/ferrum/tls:ro" \
+        -e "FERRUM_MODE=file" \
+        -e "FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml" \
+        -e "FERRUM_PROXY_HTTP_PORT=$GATEWAY_HTTP_PORT" \
+        -e "FERRUM_PROXY_HTTPS_PORT=$GATEWAY_HTTPS_PORT" \
+        -e "FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/cert.pem" \
+        -e "FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/key.pem" \
+        -e "FERRUM_DTLS_CERT_PATH=/etc/ferrum/tls/cert.pem" \
+        -e "FERRUM_DTLS_KEY_PATH=/etc/ferrum/tls/key.pem" \
+        -e "FERRUM_LOG_LEVEL=error" \
+        -e "FERRUM_ADD_VIA_HEADER=false" \
+        -e "FERRUM_ADD_FORWARDED_HEADER=false" \
+        -e "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0" \
+        -e "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0" \
+        -e "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0" \
+        -e "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0" \
+        -e "FERRUM_MAX_CONNECTIONS=0" \
+        -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
+        -e "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true" \
+        -e "FERRUM_POOL_WARMUP_ENABLED=true" \
+        -e "FERRUM_TLS_NO_VERIFY=true" \
+        -e "FERRUM_WEBSOCKET_TUNNEL_MODE=true" \
+        -e "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608" \
+        -e "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432" \
+        -e "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true" \
+        -e "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576" \
+        -e "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
+        -e "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
+        -e "FERRUM_UDP_MAX_SESSIONS=10000" \
+        -e "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64" \
+        "${extra_env[@]}" \
+        "$FERRUM_IMAGE")
+
+    wait_for_gateway
+}
+
+ferrum_config_name() {
+    case "$PROTOCOL" in
+        http1-tls) echo "http1_tls_perf.yaml" ;;
+        http2)     echo "http2_perf.yaml" ;;
+        http3)     echo "http3_perf.yaml" ;;
+        grpcs)     echo "grpc_perf.yaml" ;;
+        wss)       echo "ws_perf.yaml" ;;
+        tcp-tls)   echo "tcp_tls_perf.yaml" ;;
+        udp)       echo "udp_perf.yaml" ;;
+        udp-dtls)  echo "udp_dtls_perf.yaml" ;;
+    esac
+}
+
+# ── Envoy (docker) ──────────────────────────────────────────────────────────
+start_envoy() {
+    local cfg_src="$SCRIPT_DIR/configs/envoy/$(envoy_config_name)"
+    local cfg_dst="$SCRIPT_DIR/envoy_runtime.yaml"
+    # Substitute CERT_PATH/KEY_PATH to mount points inside container
+    sed -e "s|CERT_PATH|/certs/cert.pem|g" \
+        -e "s|KEY_PATH|/certs/key.pem|g" \
+        "$cfg_src" > "$cfg_dst"
+
+    echo "[envoy] starting..."
+    GATEWAY_CID=$(docker run -d --rm --network host \
+        -v "$cfg_dst:/etc/envoy/envoy.yaml:ro" \
+        -v "$CERT_DIR:/certs:ro" \
+        "$ENVOY_IMAGE" \
+        envoy -c /etc/envoy/envoy.yaml --concurrency "$(nproc 2>/dev/null || echo 4)" -l error --disable-hot-restart)
+
+    wait_for_gateway
+}
+
+envoy_config_name() {
+    case "$PROTOCOL" in
+        http1-tls) echo "http1_tls.yaml" ;;
+        http2)     echo "http2_tls.yaml" ;;
+        http3)     echo "http3.yaml" ;;
+        grpcs)     echo "grpcs.yaml" ;;
+        wss)       echo "wss.yaml" ;;
+        tcp-tls)   echo "tcp_tls.yaml" ;;
+        udp)       echo "udp.yaml" ;;
+    esac
+}
+
+# ── Kong (docker, DB-less) ──────────────────────────────────────────────────
+start_kong() {
+    local cfg_src="$SCRIPT_DIR/configs/kong/$(kong_config_name)"
+    echo "[kong] starting..."
+
+    local proxy_listen_env
+    local stream_listen_env=""
+    case "$PROTOCOL" in
+        http1-tls)
+            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl"
+            ;;
+        http2|grpcs)
+            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl http2"
+            ;;
+        http3)
+            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl http2 http3 quic reuseport"
+            ;;
+        wss)
+            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl"
+            ;;
+        tcp-tls)
+            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}"
+            stream_listen_env="0.0.0.0:${GATEWAY_TCP_TLS_PORT} ssl"
+            ;;
+        udp)
+            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}"
+            stream_listen_env="0.0.0.0:${GATEWAY_UDP_PORT} udp reuseport"
+            ;;
+    esac
+
+    local extra_env=()
+    [ -n "$stream_listen_env" ] && extra_env+=(-e "KONG_STREAM_LISTEN=$stream_listen_env")
+
+    GATEWAY_CID=$(docker run -d --rm --network host \
+        -e "KONG_DATABASE=off" \
+        -e "KONG_DECLARATIVE_CONFIG=/kong/kong.yaml" \
+        -e "KONG_PROXY_LISTEN=$proxy_listen_env" \
+        -e "KONG_LOG_LEVEL=error" \
+        -e "KONG_PROXY_ACCESS_LOG=off" \
+        -e "KONG_PROXY_ERROR_LOG=/dev/stderr" \
+        -e "KONG_ADMIN_LISTEN=0.0.0.0:8001" \
+        -e "KONG_SSL_CERT=/certs/cert.pem" \
+        -e "KONG_SSL_CERT_KEY=/certs/key.pem" \
+        -e "KONG_STREAM_SSL_CERT=/certs/cert.pem" \
+        -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
+        -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
+        -e "KONG_NGINX_PROXY_PROXY_SSL_VERIFY=off" \
+        -e "KONG_NGINX_STREAM_PROXY_SSL_VERIFY=off" \
+        "${extra_env[@]}" \
+        -v "$cfg_src:/kong/kong.yaml:ro" \
+        -v "$CERT_DIR:/certs:ro" \
+        "$KONG_IMAGE")
+
+    wait_for_gateway
+}
+
+kong_config_name() {
+    case "$PROTOCOL" in
+        http1-tls) echo "http1_tls.yaml" ;;
+        http2)     echo "http2_tls.yaml" ;;
+        http3)     echo "http3.yaml" ;;
+        grpcs)     echo "grpcs.yaml" ;;
+        wss)       echo "wss.yaml" ;;
+        tcp-tls)   echo "tcp_tls.yaml" ;;
+        udp)       echo "udp.yaml" ;;
+    esac
+}
+
+# ── Tyk (docker + redis) ────────────────────────────────────────────────────
+start_redis() {
+    echo "[redis] starting..."
+    REDIS_CID=$(docker run -d --rm --network host "$REDIS_IMAGE" redis-server --bind 127.0.0.1 --port 6379)
+    for i in $(seq 1 20); do
+        if docker exec "$REDIS_CID" redis-cli ping 2>/dev/null | grep -q PONG; then
+            return
+        fi
+        sleep 0.5
+    done
+    echo "[redis] failed to start" >&2
+    exit 1
+}
+
+start_tyk() {
+    start_redis
+    local apps_dir="$SCRIPT_DIR/configs/tyk/apps_$(tyk_apps_suffix)"
+    local tyk_conf="$SCRIPT_DIR/configs/tyk/tyk.conf"
+    # Tyk listens on 8443 when TLS is enabled in tyk.conf
+    echo "[tyk] starting with apps=$apps_dir..."
+
+    GATEWAY_CID=$(docker run -d --rm --network host \
+        -v "$apps_dir:/etc/tyk/apps:ro" \
+        -v "$tyk_conf:/opt/tyk-gateway/tyk.conf:ro" \
+        -v "$CERT_DIR:/etc/tyk/certs:ro" \
+        "$TYK_IMAGE")
+
+    wait_for_gateway
+}
+
+tyk_apps_suffix() {
+    case "$PROTOCOL" in
+        http1-tls) echo "http1_tls" ;;
+        http2)     echo "http2_tls" ;;
+        grpcs)     echo "grpcs" ;;
+        wss)       echo "wss" ;;
+        tcp-tls)   echo "tcp_tls" ;;
+    esac
+}
+
+# ── KrakenD (docker) ────────────────────────────────────────────────────────
+start_krakend() {
+    local cfg_src="$SCRIPT_DIR/configs/krakend/$(krakend_config_name)"
+    local cfg_dst="$SCRIPT_DIR/krakend_runtime.json"
+
+    sed -e "s|CERT_PATH|/certs/cert.pem|g" \
+        -e "s|KEY_PATH|/certs/key.pem|g" \
+        "$cfg_src" > "$cfg_dst"
+
+    echo "[krakend] starting..."
+    GATEWAY_CID=$(docker run -d --rm --network host \
+        -v "$cfg_dst:/etc/krakend/krakend.json:ro" \
+        -v "$CERT_DIR:/certs:ro" \
+        "$KRAKEND_IMAGE" \
+        run -c /etc/krakend/krakend.json)
+
+    wait_for_gateway
+}
+
+krakend_config_name() {
+    case "$PROTOCOL" in
+        http1-tls) echo "http1_tls.json" ;;
+        http2)     echo "http2_tls.json" ;;
+        grpcs)     echo "grpcs.json" ;;
+        wss)       echo "wss.json" ;;
+    esac
+}
+
+# ── Gateway readiness check ─────────────────────────────────────────────────
+wait_for_gateway() {
+    local target_port
+    case "$PROTOCOL" in
+        tcp-tls) target_port=$GATEWAY_TCP_TLS_PORT ;;
+        udp) target_port=$GATEWAY_UDP_PORT ;;
+        udp-dtls) target_port=$GATEWAY_UDP_DTLS_PORT ;;
+        http3) target_port=$GATEWAY_HTTPS_PORT ;;
+        *) target_port=$GATEWAY_HTTPS_PORT ;;
+    esac
+
+    for i in $(seq 1 40); do
+        # For TCP: check if port is listening. For UDP: just sleep (we can't probe).
+        case "$PROTOCOL" in
+            udp|udp-dtls|http3)
+                # UDP/QUIC — no TCP probe possible; grace period.
+                sleep 0.5
+                if [ "$i" -ge 6 ]; then return; fi
+                ;;
+            *)
+                if bash -c ">/dev/tcp/127.0.0.1/$target_port" 2>/dev/null; then
+                    echo "[gateway] ready on port $target_port"
+                    sleep 1  # grace period
+                    return
+                fi
+                sleep 0.5
+                ;;
+        esac
+    done
+    echo "[gateway] failed to become ready on port $target_port" >&2
+    [ -n "$GATEWAY_CID" ] && docker logs "$GATEWAY_CID" 2>&1 | tail -50 >&2 || true
+    return 1
+}
+
+stop_gateway() {
+    [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
+    [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
+    GATEWAY_CID=""
+    REDIS_CID=""
+    sleep 2
+}
+
+# ── Bench runner ────────────────────────────────────────────────────────────
+run_bench() {
+    local gateway="$1"
+    local payload="$2"
+    local target="$3"  # "gateway" or "direct"
+
+    local params
+    params=($(bench_params))
+    local bench_proto="${params[0]}"
+    local bench_target
+    if [ "$target" = "direct" ]; then
+        bench_target="${params[2]}"
+    else
+        bench_target="${params[1]}"
+    fi
+    local extra_args=("${params[@]:3}")
+
+    local out="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.json"
+    echo "[bench] $gateway/$PROTOCOL payload=${payload}B → $bench_target"
+
+    if ! "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
+        --target "$bench_target" \
+        --duration "$DURATION" \
+        --concurrency "$CONCURRENCY" \
+        --payload-size "$payload" \
+        --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"; then
+        echo "[bench] FAILED: $gateway/$PROTOCOL payload=${payload}B — see ${out}.err"
+        # Leave a stub JSON so aggregation can detect the failure.
+        echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"error\":\"bench failed\",\"rps\":0}" > "$out"
+        return 0
+    fi
+
+    # Stamp metadata into JSON for aggregation.
+    python3 - "$out" "$gateway" "$payload" <<'PYEOF'
+import json, sys
+path, gateway, payload = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    d = {"rps": 0, "error": "unparseable"}
+d["gateway"] = gateway
+d["payload_size"] = payload
+with open(path, "w") as f:
+    json.dump(d, f, indent=2)
+PYEOF
+    local rps
+    rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
+    echo "[bench]   → RPS=$rps"
+}
+
+# ── Orchestration ───────────────────────────────────────────────────────────
+main() {
+    mkdir -p "$OUTPUT_DIR"
+    echo "[main] protocol=$PROTOCOL sizes=$PAYLOAD_SIZES gateways=$GATEWAYS"
+
+    build_binaries
+    start_backend
+
+    # Direct baseline first (no gateway interference)
+    if ! $SKIP_DIRECT; then
+        for size in $PAYLOAD_SIZES; do
+            run_bench "direct" "$size" "direct"
+        done
+    fi
+
+    for gw in $GATEWAYS; do
+        if ! supports "$gw" "$PROTOCOL"; then
+            echo "[main] skipping $gw: does not support $PROTOCOL"
+            continue
+        fi
+        echo "[main] === $gw ==="
+        case "$gw" in
+            ferrum)  start_ferrum ;;
+            envoy)   start_envoy ;;
+            kong)    start_kong ;;
+            tyk)     start_tyk ;;
+            krakend) start_krakend ;;
+        esac || { echo "[main] $gw failed to start, skipping"; stop_gateway; continue; }
+
+        for size in $PAYLOAD_SIZES; do
+            run_bench "$gw" "$size" "gateway"
+        done
+        stop_gateway
+    done
+
+    echo "[main] done. results in $OUTPUT_DIR"
+    ls -la "$OUTPUT_DIR"
+}
+
+main

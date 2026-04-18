@@ -1,0 +1,58 @@
+# Envoy WebSocket Secure (WSS) reverse proxy config
+# Listener on 8443 with TLS termination + WebSocket upgrade → plain WS backend on 3003
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 15000 }
+
+static_resources:
+  listeners:
+    - name: wss_listener
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 8443 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: CERT_PATH }
+                    private_key: { filename: KEY_PATH }
+                alpn_protocols: ["http/1.1"]
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_wss
+                codec_type: HTTP1
+                upgrade_configs:
+                  - upgrade_type: websocket
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/ws" }
+                          route:
+                            cluster: backend_ws
+                            timeout: 0s
+                            prefix_rewrite: "/"
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                access_log: []
+
+  clusters:
+    - name: backend_ws
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_ws
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 3003 }

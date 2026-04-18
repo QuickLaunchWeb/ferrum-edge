@@ -1,0 +1,38 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — gRPC over TLS (grpcs)
+# Gateway grpcs (TLS termination, ALPN h2) → gRPC h2c backend on 50052
+# KONG_PROXY_LISTEN must include http2 so Kong accepts h2 ALPN.
+
+services:
+  - name: grpc-service
+    host: 127.0.0.1
+    port: 50052
+    protocol: grpc
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: grpc-route
+        paths:
+          - /bench.BenchService
+        protocols:
+          - grpc
+          - grpcs
+        strip_path: false
+
+  - name: health-service
+    host: 127.0.0.1
+    port: 3010
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        protocols:
+          - http
+          - https
+        strip_path: false
