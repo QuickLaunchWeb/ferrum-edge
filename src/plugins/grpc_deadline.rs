@@ -57,14 +57,19 @@ impl GrpcDeadline {
 
         // Reject configurations where the plugin does no useful work — same policy as
         // other admission/observability plugins (see CLAUDE.md "Plugin Config Validation").
-        let has_any_rule = max_deadline_ms.is_some()
-            || default_deadline_ms.is_some()
-            || subtract_gateway_processing
-            || reject_no_deadline;
-        if !has_any_rule {
+        //
+        // `subtract_gateway_processing` is a *modifier*: it only acts when there is an
+        // inbound deadline to subtract from. On its own — with no max/default deadline
+        // and no reject-on-missing rule — the plugin silently becomes a no-op whenever
+        // clients omit `grpc-timeout`. Require it to be paired with at least one
+        // actionable rule so misconfig cannot hide behind a "modifier-only" config.
+        let has_actionable_rule =
+            max_deadline_ms.is_some() || default_deadline_ms.is_some() || reject_no_deadline;
+        if !has_actionable_rule {
             return Err(
-                "grpc_deadline: no rules configured — set at least one of 'max_deadline_ms', \
-                 'default_deadline_ms', 'subtract_gateway_processing', or 'reject_no_deadline'"
+                "grpc_deadline: no actionable rules configured — set at least one of \
+                 'max_deadline_ms', 'default_deadline_ms', or 'reject_no_deadline' \
+                 ('subtract_gateway_processing' is a modifier and cannot stand alone)"
                     .to_string(),
             );
         }

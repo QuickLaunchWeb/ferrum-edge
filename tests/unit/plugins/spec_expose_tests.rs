@@ -436,3 +436,60 @@ async fn test_cache_does_not_store_failed_fetches() {
         }
     ));
 }
+
+// Regression: cold-cache concurrent requests must not all fan out to the
+// upstream. The single-flight guard inside on_request_received serializes
+// cache-miss fetches so the upstream sees exactly one request even when
+// dozens of /specz calls arrive simultaneously.
+#[tokio::test]
+async fn test_concurrent_cold_cache_fetches_deduplicated() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_string("openapi: 3.0.0\n")
+                // Slow the upstream so concurrent fetches actually race.
+                .set_delay(std::time::Duration::from_millis(150)),
+        )
+        // Critical: only ONE upstream fetch even with N concurrent callers.
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(
+        SpecExpose::new(
+            &json!({
+                "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+                "cache_ttl_seconds": 60
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+
+    // Fire 8 concurrent requests against a cold cache.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let plugin = plugin.clone();
+        handles.push(tokio::spawn(async move {
+            let mut ctx = make_ctx("GET", "/api/specz", "/api");
+            plugin.on_request_received(&mut ctx).await
+        }));
+    }
+    for h in handles {
+        let result = h.await.unwrap();
+        assert!(matches!(
+            result,
+            PluginResult::RejectBinary {
+                status_code: 200,
+                ..
+            }
+        ));
+    }
+    // MockServer drops with .expect(1) — panics if more than one hit.
+}

@@ -41,6 +41,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::dns::DnsCacheResolver;
 
@@ -63,6 +64,13 @@ pub struct SpecExpose {
     content_type_override: Option<String>,
     cache_ttl: Duration,
     cache: ArcSwap<Option<CachedSpec>>,
+    /// Single-flight lock around the upstream fetch. Concurrent cache-miss
+    /// callers serialize here; whoever acquires first does the upstream fetch
+    /// and populates the cache, and the rest observe the fresh entry via
+    /// `cached_spec()` after the lock releases. Prevents a cold-cache request
+    /// flood from fanning out to the upstream document store (the exact DoS
+    /// the cache was added to prevent).
+    fetch_lock: Mutex<()>,
     http_client: reqwest::Client,
 }
 
@@ -161,6 +169,7 @@ impl SpecExpose {
             content_type_override,
             cache_ttl,
             cache: ArcSwap::from_pointee(None),
+            fetch_lock: Mutex::new(()),
             http_client,
         })
     }
@@ -322,13 +331,25 @@ impl Plugin for SpecExpose {
             return PluginResult::Continue;
         }
 
-        // Try the cache first; on miss or expiry, fetch and cache.
+        // Try the cache first; on miss or expiry, fetch and cache with a
+        // single-flight guard so a burst of cold-cache requests does not
+        // fan out to the upstream document store.
         let entry = match self.cached_spec() {
             Some(entry) => entry,
-            None => match self.fetch_and_cache().await {
-                Ok(entry) => entry,
-                Err(reject) => return reject,
-            },
+            None => {
+                let _guard = self.fetch_lock.lock().await;
+                // Re-check the cache after acquiring the lock: another task
+                // may have populated it while we were waiting. Skip the check
+                // when caching is disabled (TTL=0) so every request re-fetches.
+                if let Some(entry) = self.cached_spec() {
+                    entry
+                } else {
+                    match self.fetch_and_cache().await {
+                        Ok(entry) => entry,
+                        Err(reject) => return reject,
+                    }
+                }
+            }
         };
 
         let mut headers = HashMap::new();

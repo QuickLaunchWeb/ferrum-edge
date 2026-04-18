@@ -146,6 +146,52 @@ async fn test_strips_client_supplied_x_grpc_web_mode_for_non_grpc_web() {
     );
 }
 
+// Regression: end-to-end verification that a spoofed `x-grpc-web-mode: text`
+// on a non-gRPC-Web content-type does NOT trigger base64-decoding of the
+// request body in `transform_request_body`. Even if a client plants the
+// internal marker alongside an `application/json` body, the strip in
+// `on_request_received` must ensure the header never reaches downstream
+// phases, so base64 is never attempted on non-gRPC-Web bodies (which would
+// turn them into garbage that backends would reject or mis-parse).
+#[tokio::test]
+async fn test_spoofed_x_grpc_web_mode_does_not_base64_decode_non_grpc_web_body() {
+    use base64::Engine;
+    let plugin = create_plugin_default();
+
+    // A valid-looking base64 JSON body the attacker wants decoded
+    let json_body = br#"{"user":"alice","action":"delete"}"#;
+    let base64_body = base64::engine::general_purpose::STANDARD.encode(json_body);
+
+    let mut ctx = create_grpc_web_context("application/json");
+    ctx.headers
+        .insert("x-grpc-web-mode".to_string(), "text".to_string());
+
+    // on_request_received must strip the spoofed header and NOT mark the
+    // request as gRPC-Web, since the content-type is JSON.
+    plugin.on_request_received(&mut ctx).await;
+    assert!(!ctx.headers.contains_key("x-grpc-web-mode"));
+    assert!(!ctx.metadata.contains_key("grpc_web_mode"));
+
+    // Simulate the downstream dispatch: `before_proxy` sees no
+    // `grpc_web_mode` in metadata, so it doesn't re-inject the header.
+    let mut outgoing = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut outgoing).await;
+    assert!(
+        !outgoing.contains_key("x-grpc-web-mode"),
+        "before_proxy must not re-inject the marker for non-gRPC-Web requests"
+    );
+
+    // `transform_request_body` receives the outgoing headers — with the
+    // marker absent, it must NOT attempt base64 decoding.
+    let decoded = plugin
+        .transform_request_body(base64_body.as_bytes(), Some("application/json"), &outgoing)
+        .await;
+    assert!(
+        decoded.is_none(),
+        "transform_request_body must leave non-gRPC-Web bodies untouched, got: {decoded:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_strips_client_supplied_x_grpc_web_mode_then_redetects() {
     // Client sends a real grpc-web-text request AND a misleading marker — plugin

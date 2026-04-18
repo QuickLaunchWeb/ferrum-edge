@@ -59,7 +59,7 @@ fn test_empty_config_rejected() {
     let err = create_plugin("grpc_deadline", &json!({}))
         .err()
         .expect("empty config should be rejected");
-    assert!(err.contains("no rules configured"), "got: {err}");
+    assert!(err.contains("no actionable rules"), "got: {err}");
 }
 
 #[test]
@@ -87,6 +87,42 @@ fn test_default_exceeds_max_rejected() {
     .err()
     .expect("default exceeding max should be rejected");
     assert!(err.contains("cannot exceed"), "got: {err}");
+}
+
+// subtract_gateway_processing is a modifier: it only has an effect on existing
+// deadlines. Without an actionable rule (max/default/reject_no_deadline),
+// the plugin silently no-ops whenever clients omit `grpc-timeout`.
+#[test]
+fn test_subtract_gateway_processing_alone_rejected() {
+    let err = create_plugin(
+        "grpc_deadline",
+        &json!({ "subtract_gateway_processing": true }),
+    )
+    .err()
+    .expect("subtract_gateway_processing alone should be rejected");
+    assert!(err.contains("actionable"), "got: {err}");
+    assert!(err.contains("modifier"), "got: {err}");
+}
+
+#[test]
+fn test_subtract_gateway_processing_with_max_accepted() {
+    // Modifier paired with any actionable rule should be fine.
+    let result = create_plugin(
+        "grpc_deadline",
+        &json!({
+            "subtract_gateway_processing": true,
+            "max_deadline_ms": 30000
+        }),
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_reject_no_deadline_alone_accepted() {
+    // reject_no_deadline is an actionable rule on its own — rejects any request
+    // arriving without a grpc-timeout header.
+    let result = create_plugin("grpc_deadline", &json!({ "reject_no_deadline": true }));
+    assert!(result.is_ok());
 }
 
 // ── grpc-timeout parsing ──
