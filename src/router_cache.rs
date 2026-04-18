@@ -1075,17 +1075,21 @@ fn split_cache_key(key: &str) -> (&str, &str) {
 }
 
 /// Returns true when `cached_host` would have been routed through an
-/// affected host-only pattern. Supports exact-host strings and `*.suffix`
-/// wildcard patterns (mirrors the host-only tier lookup logic).
+/// affected host-only pattern. Uses the same matching semantics as the
+/// router (`wildcard_matches`) so eviction never over-matches unrelated
+/// cache entries — e.g. pattern `*.example.com` must not evict
+/// `notexample.com` or the bare `example.com`.
 fn host_matches_for_eviction(affected_host: &str, cached_host: &str) -> bool {
     if cached_host.is_empty() {
         return false;
     }
-    if let Some(suffix) = affected_host.strip_prefix("*.") {
+    if affected_host.starts_with("*.") {
+        // Wildcard pattern → use the router's wildcard semantics.
+        // `wildcard_matches` requires exactly one label before the suffix
+        // and explicitly rejects the bare base domain.
         wildcard_matches(affected_host, cached_host)
-            || cached_host.eq_ignore_ascii_case(suffix)
-            || cached_host.ends_with(suffix)
     } else {
+        // Exact host → HTTP hostnames are case-insensitive.
         cached_host.eq_ignore_ascii_case(affected_host)
     }
 }
@@ -1359,5 +1363,79 @@ mod tests {
         map.insert("a".into(), ());
         let removed = frequency_aware_evict(&map, &sketch, 3);
         assert_eq!(removed, 0);
+    }
+
+    // ── host_matches_for_eviction tests ──────────────────────────────────
+    //
+    // Must mirror the router's `wildcard_matches` semantics exactly so cache
+    // eviction never over-matches unrelated hosts (which would flush valid
+    // cache entries on every host-only add/remove).
+
+    #[test]
+    fn eviction_exact_host_matches_case_insensitively() {
+        assert!(host_matches_for_eviction(
+            "api.example.com",
+            "api.example.com"
+        ));
+        assert!(host_matches_for_eviction(
+            "api.example.com",
+            "API.EXAMPLE.COM"
+        ));
+    }
+
+    #[test]
+    fn eviction_exact_host_does_not_match_different_host() {
+        assert!(!host_matches_for_eviction(
+            "api.example.com",
+            "other.example.com"
+        ));
+        assert!(!host_matches_for_eviction(
+            "api.example.com",
+            "api.example.org"
+        ));
+    }
+
+    #[test]
+    fn eviction_wildcard_matches_single_label_subdomain() {
+        assert!(host_matches_for_eviction(
+            "*.example.com",
+            "api.example.com"
+        ));
+        assert!(host_matches_for_eviction(
+            "*.example.com",
+            "www.example.com"
+        ));
+    }
+
+    #[test]
+    fn eviction_wildcard_does_not_match_base_domain() {
+        // Router's wildcard_matches rejects the bare suffix — eviction must too.
+        assert!(!host_matches_for_eviction("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn eviction_wildcard_does_not_match_deep_subdomain() {
+        // *.example.com requires exactly one label before the suffix.
+        assert!(!host_matches_for_eviction(
+            "*.example.com",
+            "api.v2.example.com"
+        ));
+    }
+
+    #[test]
+    fn eviction_wildcard_does_not_match_lookalike_suffix() {
+        // Without the dot boundary, `notexample.com` ends with `example.com`
+        // but is NOT a subdomain. Router wouldn't route it here either.
+        assert!(!host_matches_for_eviction(
+            "*.example.com",
+            "notexample.com"
+        ));
+        assert!(!host_matches_for_eviction("*.example.com", "example.org"));
+    }
+
+    #[test]
+    fn eviction_empty_cached_host_never_matches() {
+        assert!(!host_matches_for_eviction("api.example.com", ""));
+        assert!(!host_matches_for_eviction("*.example.com", ""));
     }
 }
