@@ -4818,6 +4818,14 @@ async fn handle_proxy_request_inner(
                     Ok(buffered) => {
                         if let ClientRequestBody::Buffered(body) = &buffered {
                             store_request_body_metadata(&mut ctx, body, needs_body_bytes);
+                            // Seed request_bytes_observed from the prebuffered
+                            // body so before_proxy rejects (logged via
+                            // `log_rejected_request`) surface the real on-wire
+                            // size instead of 0. `fetch_max` is safe against
+                            // later proxy_to_backend updates — the largest
+                            // observed value always wins.
+                            ctx.request_bytes_observed
+                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
                         }
                         buffered
                     }
@@ -7211,6 +7219,21 @@ async fn proxy_to_backend(
 
         match client_request_body {
             ClientRequestBody::Buffered(body_bytes) => {
+                // Record pre-transform body length (bytes as received from the
+                // client — already buffered by an earlier phase such as
+                // request_mirror prebuffering) BEFORE running plugin transforms
+                // or final-body hooks. Recording here rather than after the
+                // hooks ensures:
+                //   1. Consistency with the Streaming-then-buffered, gRPC, and
+                //      HTTP/3 paths, which all record pre-transform bytes.
+                //   2. Rejections from `run_final_request_body_hooks` still
+                //      surface the original on-wire size in the log summary.
+                // `fetch_max` preserves the largest observed value across
+                // retries where plugin transforms may shrink the body.
+                ctx_request_bytes_observed.fetch_max(
+                    body_bytes.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
                 match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
                     PluginResult::Continue => {}
@@ -7222,13 +7245,6 @@ async fn proxy_to_backend(
                         );
                     }
                 }
-                // Record bytes observed (post-transform body length) for summary.
-                // Max ordering chosen so retry attempts see the largest observed
-                // value rather than overwriting with a partial re-collect count.
-                ctx_request_bytes_observed.fetch_max(
-                    body_bytes.len() as u64,
-                    std::sync::atomic::Ordering::Release,
-                );
                 if !body_bytes.is_empty() {
                     if retain_request_body {
                         retained_body = Some(body_bytes.clone());
