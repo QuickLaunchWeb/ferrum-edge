@@ -955,10 +955,22 @@ mod inner {
             // overlaps that `hosts_overlap` must recognize. Fetch candidates
             // and run the full overlap check in Rust (typically ≤ a handful
             // of rows per bucket).
+            //
+            // Exclude stream proxies (tcp/tcp_tls/udp/dtls) from the query —
+            // they also serialize `listen_path` as null, and they commonly
+            // have empty `hosts` (which `hosts_overlap` treats as catch-all).
+            // Without this exclusion, a host-only HTTP create/update can be
+            // falsely rejected whenever any stream proxy exists in the
+            // namespace. Stream proxies have their own uniqueness check
+            // (`check_listen_port_unique`). Matches the sqlx impl.
             let mut filter = match listen_path {
                 Some(path) => doc! { "namespace": namespace, "listen_path": path },
                 None => doc! { "namespace": namespace, "listen_path": null },
             };
+            filter.insert(
+                "backend_protocol",
+                doc! { "$nin": ["tcp", "tcp_tls", "udp", "dtls"] },
+            );
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
