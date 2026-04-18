@@ -31,12 +31,15 @@ use uuid::Uuid;
 /// Spawn a minimal HTTP echo backend that returns `200 OK` with a fixed body.
 /// Used to verify proxy routing works when the gateway is bootstrapped from a
 /// config backup while the DB is unreachable.
-async fn start_static_backend(
-    port: u16,
+///
+/// Takes a pre-bound `TcpListener` rather than a port number so the caller can
+/// hold the port atomically from allocation through server startup — no
+/// bind→drop→rebind race where another process could steal the port.
+fn start_static_backend(
+    listener: tokio::net::TcpListener,
     body: &'static str,
-) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    let handle = tokio::spawn(async move {
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let body = body.to_string();
             tokio::spawn(async move {
@@ -59,8 +62,7 @@ async fn start_static_backend(
                 let _ = writer.write_all(response.as_bytes()).await;
             });
         }
-    });
-    Ok(handle)
+    })
 }
 
 fn auth_header(jwt_secret: &str, jwt_issuer: &str) -> String {
@@ -267,14 +269,13 @@ async fn test_db_config_backup_bootstrap() {
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        // Bind the backend listener early and hold it — we pass it into the
-        // echo task directly to avoid the race that comes with drop-and-rebind.
+        // Bind the backend listener early and pass it directly into the echo
+        // task — no drop-and-rebind, so the port is held atomically from
+        // allocation through server startup. This eliminates the race where
+        // another process could steal the numeric port between drop and rebind.
         let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
-        drop(backend_listener);
-        let _backend = start_static_backend(backend_port, "backup-bootstrap-ok")
-            .await
-            .expect("backend start");
+        let _backend = start_static_backend(backend_listener, "backup-bootstrap-ok");
 
         // Write a minimal backup JSON that wires a proxy to the echo backend.
         // `namespace` defaults to "ferrum" via serde, matching the gateway's
@@ -380,13 +381,13 @@ async fn test_db_config_backup_bootstrap() {
         return;
     }
 
-    // Gateway did not become healthy with unreachable primary + backup JSON
-    // across all attempts. This may indicate the backup-bootstrap feature is
-    // not fully wired for this exact scenario on this platform/build; log and
-    // skip the strict health assertion rather than fail. The other DB failover
-    // test (`test_db_failover_urls_startup`) covers the common failover case.
-    eprintln!(
-        "Config backup bootstrap did not bring gateway healthy after {} attempts: {} — skipping",
+    // Exhausted all retries without the gateway becoming healthy. This is a
+    // real regression signal — `FERRUM_DB_CONFIG_BACKUP_PATH` bootstrap must
+    // bring the proxy HTTP listener up when the primary DB is unreachable,
+    // otherwise operators relying on this fallback will find their pods can't
+    // serve traffic during a DB outage. Fail the test rather than skipping.
+    panic!(
+        "Config backup bootstrap did not bring gateway healthy after {} attempts: {}",
         MAX_ATTEMPTS, last_err
     );
 }
@@ -395,18 +396,18 @@ async fn test_db_config_backup_bootstrap() {
 // Test 3: Read replica happy path
 // ============================================================================
 
-/// Start the gateway with a reachable primary AND a reachable read replica
-/// (two distinct SQLite files). The gateway should come up healthy, prove the
-/// replica-connect codepath was exercised, and accept admin writes (which
-/// always target the primary).
+/// Start the gateway with a reachable primary AND a reachable read replica.
 ///
-/// We deliberately do NOT assert that a proxy written to the primary shows up
-/// in a GET served by the replica. In production those are the same logical
-/// DB reached via two URLs; with two unrelated SQLite files the primary-write
-/// side and replica-read side diverge, so replica reads would show the
-/// replica's (empty) state regardless. That behaviour is intentional and
-/// tested at the unit level (`effective_db_read_replica_url` parsing) — here
-/// we validate startup and post-recovery stability.
+/// In production, primary and replica are the same logical database reached
+/// via two URLs — the replica sees the primary's schema via streaming
+/// replication. To simulate that with SQLite, we point both URLs at the same
+/// file: migrations run on the primary URL, creating tables, and the replica
+/// URL opens the same file so reads through the replica pool succeed. This
+/// exercises the real codepath (replica connect, polling via replica) without
+/// needing a multi-database setup.
+///
+/// The test asserts the gateway comes up healthy, the replica pool connects,
+/// and admin writes succeed (writes always target the primary pool).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_db_read_replica_startup() {
@@ -418,8 +419,7 @@ async fn test_db_read_replica_startup() {
 
     for attempt in 1..=MAX_ATTEMPTS {
         let temp_dir = TempDir::new().expect("temp dir");
-        let primary_path = temp_dir.path().join("primary.db");
-        let replica_path = temp_dir.path().join("replica.db");
+        let db_path = temp_dir.path().join("gateway.db");
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let admin_port = admin_listener.local_addr().unwrap().port();
@@ -428,8 +428,11 @@ async fn test_db_read_replica_startup() {
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         drop(proxy_listener);
 
-        let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
-        let replica_url = format!("sqlite:{}?mode=rwc", replica_path.to_string_lossy());
+        // Primary and replica point at the same SQLite file — replicates real
+        // production semantics where both URLs resolve to the same logical DB
+        // with shared schema.
+        let primary_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+        let replica_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
 
         let jwt_secret = "replica-startup-test-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-replica-test".to_string();
@@ -464,10 +467,9 @@ async fn test_db_read_replica_startup() {
 
         println!("  Gateway healthy with primary + replica configured");
 
-        // Primary schema should have been created (migrations ran); replica
-        // was connected without migrations. Both SQLite files must exist.
-        assert!(primary_path.exists(), "primary.db should exist");
-        assert!(replica_path.exists(), "replica.db should exist");
+        // Schema should have been created (migrations ran on the primary URL).
+        // Replica connected to the same file without re-running migrations.
+        assert!(db_path.exists(), "gateway.db should exist after startup");
 
         let client = reqwest::Client::new();
         let auth = auth_header(&jwt_secret, &jwt_issuer);
@@ -515,12 +517,11 @@ async fn test_db_read_replica_startup() {
         return;
     }
 
-    // Read-replica startup did not complete across attempts. This variant of
-    // the test seeds two SQLite databases and expects the gateway to read from
-    // the replica; local SQLite replica wiring can be platform-specific. Log
-    // and skip rather than fail the strict assertion.
-    eprintln!(
-        "Read replica startup test did not complete after {} attempts: {} — skipping",
+    // Exhausted all retries without the gateway becoming healthy. A regression
+    // in `FERRUM_DB_READ_REPLICA_URL` wiring (e.g., the replica connect call
+    // silently blocking startup) should fail the suite, not be swallowed.
+    panic!(
+        "Read replica startup test did not complete after {} attempts: {}",
         MAX_ATTEMPTS, last_err
     );
 }

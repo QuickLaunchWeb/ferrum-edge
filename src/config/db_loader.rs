@@ -322,6 +322,60 @@ impl DatabaseStore {
         Ok(store)
     }
 
+    /// Construct a `DatabaseStore` with a lazy pool — no TCP connection is
+    /// opened and no migrations run. The first query will trigger connection
+    /// (and may fail). Use this only as a bootstrap fallback when eager
+    /// connection has failed but a backup config is being loaded from disk:
+    /// the gateway serves from cached config while the background polling
+    /// loop retries the pool until the DB becomes reachable again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_offline_with_tls_config(
+        db_type: &str,
+        db_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+        pool_config: DbPoolConfig,
+    ) -> Result<Self, anyhow::Error> {
+        sqlx::any::install_default_drivers();
+
+        let mut final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
+            Self::build_tls_connection_url(
+                db_url,
+                db_type,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )?
+        } else {
+            db_url.to_string()
+        };
+
+        final_url =
+            Self::append_connect_timeout(&final_url, db_type, pool_config.connect_timeout_seconds);
+
+        // `connect_lazy` does not attempt a connection — the pool is ready to
+        // hand out connections on first query. Migrations are deferred until
+        // the database becomes reachable and the polling loop drives a
+        // successful `reconnect()`.
+        let pool =
+            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(&final_url)?;
+
+        Ok(Self {
+            pool: Arc::new(ArcSwap::from_pointee(pool)),
+            read_replica_pool: None,
+            db_type: db_type.to_string(),
+            failover_urls: Vec::new(),
+            pool_config,
+            slow_query_threshold_ms: None,
+            cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
+            backend_allow_ips: crate::config::BackendAllowIps::Both,
+        })
+    }
+
     /// Build a TLS-aware connection URL for Postgres and MySQL.
     fn build_tls_connection_url(
         base_url: &str,

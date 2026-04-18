@@ -352,12 +352,10 @@ async fn functional_tls_only_health_cli_auto_detects_tls() {
     //     CLI must auto-detect TLS because FERRUM_ADMIN_HTTP_PORT=0, and pick
     //     up FERRUM_ADMIN_HTTPS_PORT.
     //
-    // NOTE: The `health` subcommand currently fails with a rustls
-    // CryptoProvider panic on some builds because the TLS-capable path in the
-    // CLI doesn't go through the same provider-install code as `run`. We log
-    // the result for visibility but do not fail the test on this — the
-    // `--tls-no-verify` sub-check below exercises the same code path and
-    // surfaces the underlying issue the same way.
+    // The auto-detect path is sensitive to env-var propagation. We exercise it
+    // and log the outcome for visibility, but accept the explicit-flag path
+    // (3b below) as the definitive assertion target — a failure there is
+    // unambiguously a CLI bug because every TLS input is provided directly.
     let auto = Command::new(gateway_binary_path())
         .arg("health")
         .env("FERRUM_ADMIN_HTTP_PORT", "0")
@@ -389,20 +387,22 @@ async fn functional_tls_only_health_cli_auto_detects_tls() {
         String::from_utf8_lossy(&explicit.stderr),
     );
 
-    // The `health` subcommand currently panics when HTTPS is required because
-    // rustls' CryptoProvider isn't installed on that code path (bug #tbd).
-    // Log the observed status rather than fail this test — the real health
-    // surface is covered by the direct admin HTTPS request earlier in this
-    // file, which did succeed.
-    if !(auto.status.success() || explicit.status.success()) {
-        eprintln!(
-            "NOTE: `ferrum-edge health` failed on both auto-detect and explicit paths. \
-             This documents that the health CLI subcommand does not install the rustls \
-             CryptoProvider when reaching an HTTPS admin endpoint. Fix in src/cli.rs."
-        );
-    }
-
+    // At least one of the two probes MUST succeed. If both fail, the health
+    // CLI is not reaching an HTTPS admin endpoint — that is exactly the
+    // regression this test was written to catch (e.g., missing rustls
+    // CryptoProvider install on the health code path, broken TLS client
+    // config, or a URL-scheme bug). Silently skipping turns a real bug into
+    // a false positive.
     stop(&mut gw);
+    assert!(
+        auto.status.success() || explicit.status.success(),
+        "`ferrum-edge health` failed on both auto-detect and explicit --tls paths. \
+         auto status={} stderr={:?} | explicit status={} stderr={:?}",
+        auto.status,
+        String::from_utf8_lossy(&auto.stderr),
+        explicit.status,
+        String::from_utf8_lossy(&explicit.stderr),
+    );
 }
 
 // ── Test 4: Warning when plaintext disabled with no TLS ───────────────────

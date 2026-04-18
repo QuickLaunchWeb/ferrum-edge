@@ -45,6 +45,12 @@ pub async fn run(
 
     let effective_replica_url = env_config.effective_db_read_replica_url();
 
+    // Tracks whether the initial connect succeeded. When `true`, the gateway
+    // started via `FERRUM_DB_CONFIG_BACKUP_PATH` because every configured DB
+    // URL was unreachable — polling will retry and flip this back to normal
+    // operation once the database recovers.
+    let mut bootstrap_from_backup = false;
+
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
         "mongodb" => {
@@ -81,7 +87,7 @@ pub async fn run(
                 connect_timeout_seconds: env_config.db_pool_connect_timeout_seconds,
                 statement_timeout_seconds: env_config.db_pool_statement_timeout_seconds,
             };
-            let mut store = DatabaseStore::connect_with_failover(
+            let mut store = match DatabaseStore::connect_with_failover(
                 db_type,
                 &effective_url,
                 &failover_urls,
@@ -90,9 +96,41 @@ pub async fn run(
                 env_config.db_tls_client_cert_path.as_deref(),
                 env_config.db_tls_client_key_path.as_deref(),
                 env_config.db_tls_insecure,
-                pool_config,
+                pool_config.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // Every URL failed. If the operator provided
+                    // `FERRUM_DB_CONFIG_BACKUP_PATH`, build a lazy-pool store
+                    // so the gateway can still come up serving from the
+                    // on-disk backup. The polling loop will retry the primary
+                    // URL and flip `db_available` to true when it recovers.
+                    if env_config.db_config_backup_path.is_some() {
+                        warn!(
+                            "All database URLs failed ({}). \
+                             FERRUM_DB_CONFIG_BACKUP_PATH is set — bootstrapping \
+                             from backup with a lazy pool. Polling will retry \
+                             the primary URL in the background.",
+                            e
+                        );
+                        bootstrap_from_backup = true;
+                        DatabaseStore::connect_offline_with_tls_config(
+                            db_type,
+                            &effective_url,
+                            env_config.db_tls_enabled,
+                            env_config.db_tls_ca_cert_path.as_deref(),
+                            env_config.db_tls_client_cert_path.as_deref(),
+                            env_config.db_tls_client_key_path.as_deref(),
+                            env_config.db_tls_insecure,
+                            pool_config,
+                        )?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
             store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
@@ -465,9 +503,12 @@ pub async fn run(
 
     // Shared flag: DB polling loop sets this to false when the database is
     // unreachable, causing the admin API to reject writes early and preserve
-    // the cached config until the DB recovers.
+    // the cached config until the DB recovers. When we bootstrapped from a
+    // backup file because every DB URL was down at startup, initialize to
+    // `false` so `/health` and the admin API report the true state
+    // immediately — before the first polling tick runs.
     let startup_ready = Arc::new(AtomicBool::new(false));
-    let db_available = Arc::new(AtomicBool::new(true));
+    let db_available = Arc::new(AtomicBool::new(!bootstrap_from_backup));
 
     let admin_state = AdminState {
         db: Some(db.clone()),
