@@ -496,12 +496,25 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
         match cfg.http_client.execute(req, "otel_export").await {
             Ok(response) if response.status().is_success() => return,
             Ok(response) => {
+                let status = response.status();
                 warn!(
                     "OTLP export failed with status {} (attempt {}/{})",
-                    response.status(),
-                    attempt,
-                    total_attempts,
+                    status, attempt, total_attempts,
                 );
+                // 4xx is a client error — retrying a malformed/unauthorized
+                // payload just delays the drop. Bail immediately, except for
+                // 408 (Request Timeout) and 429 (Too Many Requests) which are
+                // transient and worth retrying within the configured budget.
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    warn!(
+                        "OTLP export batch discarded due to {} response ({} spans lost)",
+                        status, entry_count,
+                    );
+                    return;
+                }
             }
             Err(e) => {
                 warn!(
@@ -720,12 +733,10 @@ fn hex_to_base64(hex: &str) -> String {
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .filter_map(|i| {
-            // Clamp the upper bound to hex.len() so an odd-length input
-            // doesn't panic. `i.saturating_add(2).min(hex.len())` yields
-            // either `i+2` or `hex.len()`; if the resulting slice has fewer
-            // than 2 hex digits, `from_str_radix` returns Err and the byte
-            // is filtered out.
-            let end = i.saturating_add(2).min(hex.len());
+            let end = i + 2;
+            if end > hex.len() {
+                return None;
+            }
             u8::from_str_radix(&hex[i..end], 16).ok()
         })
         .collect();
@@ -762,9 +773,8 @@ mod tests {
     #[test]
     fn hex_to_base64_handles_odd_length_without_panic() {
         // Defensive: odd-length should not panic. The trailing half-byte
-        // is simply dropped (from_str_radix on a single hex char succeeds,
-        // so we get one extra nibble — but the previous formula would
-        // attempt to slice past the end and panic).
+        // is dropped (the final iteration would slice past hex.len() and
+        // is filtered out via the `end > hex.len()` guard).
         let _ = hex_to_base64("abc");
         let _ = hex_to_base64("4bf92f3577b34da6a3ce929d0e0e473");
     }

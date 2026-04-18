@@ -439,19 +439,21 @@ The `global_tags` config maps directly to DogStatsD tag format (`|#key:value,key
 
 ### `ws_logging`
 
-Sends transaction summaries as JSON to an external WebSocket endpoint. Like `http_logging`, entries are buffered and sent in batches (as a JSON array text messages) to reduce per-message overhead. The WebSocket connection is maintained persistently with automatic reconnection on failure.
+Sends transaction summaries as JSON to an external WebSocket endpoint. Like `http_logging`, entries are buffered and sent in batches (as JSON-array text messages) to reduce per-message overhead. The WebSocket connection is maintained persistently with automatic reconnection on failure. Logs both HTTP/gRPC `TransactionSummary` entries and stream `StreamTransactionSummary` entries (TCP/UDP), so the plugin applies to all proxy protocols.
 
 **Priority:** 9175
 
+**Protocols:** all (HTTP, gRPC, WebSocket, TCP, UDP)
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | `""` | WebSocket URL to send transaction logs to |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname. Malformed or non-WebSocket schemes are rejected at config load time. |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (minimum 1) |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (minimum 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `buffer_capacity` | Integer | `10000` | Channel capacity (minimum 1) — new entries are dropped on the proxy hot path when the in-memory buffer is full, with a warning log |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection.
 
@@ -1524,16 +1526,17 @@ This enables full authentication + authorization pipelines for both TCP+TLS and
 UDP+DTLS streams via certificate-based consumer mapping.
 
 **Priority:** 2000
+**Supported protocols:** HTTP, gRPC, WebSocket, TCP, UDP
 
-| Parameter | Type | Description |
-|---|---|---|
-| `allowed_consumers` | String[] | Usernames allowed access (empty = no username-level allow rule) |
-| `disallowed_consumers` | String[] | Usernames explicitly denied |
-| `allowed_groups` | String[] | ACL group names allowed access — matches against the consumer's `acl_groups` list (empty = no group-level allow rule) |
-| `disallowed_groups` | String[] | ACL group names explicitly denied — matches against the consumer's `acl_groups` list |
-| `allow_authenticated_identity` | bool | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. |
 
-At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`).
+At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). All checks use `HashSet<String>` for O(1) membership.
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
@@ -1542,35 +1545,64 @@ rejected if any of their groups appear in `disallowed_groups`.
 
 Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement.
 
+```yaml
+# Consumer-only allow list
+plugin_name: access_control
+config:
+  allowed_consumers: [alice, bob]
+
+# Group-based allow with an explicit deny-list override
+plugin_name: access_control
+config:
+  allowed_groups: [engineering, sre]
+  disallowed_groups: [contractors]
+  disallowed_consumers: [legacy-bot]
+
+# Allow externally-authenticated identities (no gateway Consumer required)
+plugin_name: access_control
+config:
+  allow_authenticated_identity: true
+```
+
 ### `tcp_connection_throttle`
 
-Limits concurrent TCP connections per observed client identity on a per-proxy basis.
+Limits concurrent TCP connections per observed client identity on a per-proxy basis. Returns HTTP 429 (mapped to a refused connection at the TCP layer) when the limit is exceeded.
 
 **Priority:** 2050
+**Protocols:** TCP only
 
-| Parameter | Type | Description |
-|---|---|---|
-| `max_connections_per_key` | u64 | Maximum active TCP connections for one key |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key |
+| `cleanup_interval_seconds` | u64 | `60` | Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections drop without a corresponding `on_stream_disconnect`. Set to `0` to disable the background sweep — entries are still removed inline by the disconnect path |
 
 **Key selection:**
-- If a prior stream auth plugin identified a Consumer, the key is `consumer:<username>`
-- Otherwise the key is `ip:<client_ip>`
+- If a prior stream auth plugin identified a Consumer, the key is `proxy:{proxy_id}:consumer:{username}`
+- Otherwise the key is `proxy:{proxy_id}:ip:{client_ip}`
+
+The proxy ID is included so the same identity can hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP/UDP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range.
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
 
 **Priority:** 150
 
-| Parameter | Type | Description |
-|---|---|---|
-| `allow` | String[] | Allowed IP addresses or CIDR ranges |
-| `deny` | String[] | Denied IP addresses or CIDR ranges |
-| `mode` | String | `allow_first` (default) or `deny_first` |
+**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
 
-Rules are validated at config load time. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allow` | String[] | `[]` | Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty disables allow-list enforcement. |
+| `deny` | String[] | `[]` | Denied IP addresses or CIDR ranges (IPv4 or IPv6). Empty disables deny-list enforcement. |
+| `mode` | String | `allow_first` | `allow_first` or `deny_first` — controls list evaluation order for non-overlapping rules. Deny always wins on overlap. |
+
+At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
+
+Rules are validated and pre-parsed at config load time into integer bitmasks; invalid IP/CIDR entries reject plugin creation instead of being silently ignored. The hot path is pure integer comparison — no per-request string parsing. Supports IPv4 (`/0`–`/32`) and IPv6 (`/0`–`/128`); IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching so a malformed `X-Forwarded-For` entry never silently bypasses a deny rule.
+
+When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
 ### `geo_restriction`
 
@@ -1583,12 +1615,14 @@ Restricts access based on the geographic location of the client IP address using
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `db_path` | String | (required) | Path to MaxMind `.mmdb` file |
-| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode) |
-| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode) |
-| `inject_headers` | bool | `false` | Inject `X-Geo-Country` header into upstream requests |
-| `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails: `allow` or `deny` |
+| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. |
+| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. |
+| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. HTTP-family proxies only — ignored for TCP/UDP streams. |
+| `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails (private IP, unallocated range, missing `.mmdb` on data plane): `allow` or `deny`. |
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
+
+Country code matches are O(1) — both lists are stored as `HashSet<String>` and compared in uppercase.
 
 The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart (or config reload) is required to pick up a new database file.
 
@@ -1619,10 +1653,22 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 
 **Priority:** 2900
 
+**Configure rate windows in one of two ways:**
+1. `window_seconds` + `max_requests` — exact custom window of any duration
+2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
+
+At least one rate window must be configured (the plugin rejects empty configs at load time). When multiple windows are configured, each request must satisfy ALL windows.
+
+**Algorithm selection** (automatic):
+- Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)
+- Windows > 5 seconds → sliding window with exact request-timestamp tracking (O(n) memory per key, no boundary-burst vulnerability)
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
+| `window_seconds` | u64 (optional) | — | Custom window duration in seconds. Use with `max_requests` as an alternative to the preset per-second/minute/hour fields |
+| `max_requests` | u64 | `10` | Maximum requests allowed within `window_seconds`. Only used when `window_seconds` is set. Must be greater than zero |
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
@@ -1673,6 +1719,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 |---|---|---|---|
 | `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive) |
 | `ttl_seconds` | u64 | `300` | Time-to-live for cached responses (must be > 0) |
+| `inflight_ttl_seconds` | u64 | `ttl_seconds` | How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request (must be > 0). Set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to `ttl_seconds` |
 | `max_entries` | u64 | `10000` | Maximum number of cached entries (local mode) |
 | `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to |
 | `scope_by_consumer` | bool | `true` | Scope keys by authenticated consumer identity |
@@ -1690,6 +1737,8 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 **Behavior:**
 - On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
 - Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
+- Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
+- LRU eviction under `max_entries` pressure only evicts completed entries. Active (non-stale) in-flight markers are never evicted — evicting a live marker would release the in-flight lock while the original request is still executing. As a result, `max_entries` can be temporarily exceeded if the cache is saturated with active in-flight work; correctness is preferred over the memory cap
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 
@@ -1729,32 +1778,63 @@ See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshoot
 
 ### `bot_detection`
 
-Detects and blocks bot traffic based on User-Agent patterns.
+Detects and blocks bot traffic based on case-insensitive User-Agent substring matching. The allow list is consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry.
 
 **Priority:** 200
+**Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests",...]` | User-Agent substrings to block |
-| `allow_list` | String[] | `[]` | User-Agent substrings to always allow |
-| `allow_missing_user_agent` | bool | `true` | Allow requests with no User-Agent header |
-| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests |
+| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults — pass `[]` to disable substring blocking. |
+| `allow_list` | String[] | `[]` | User-Agent substrings that always pass. Evaluated before `blocked_patterns`. Case-insensitive. |
+| `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
+| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
+
+```yaml
+plugin_name: bot_detection
+config:
+  blocked_patterns: [curl, wget, "python-requests"]
+  allow_list: [googlebot, bingbot, ferrum-internal-monitor]
+  custom_response_code: 429
+```
 
 ### `request_termination`
 
 Returns a predefined response without proxying to the backend. Useful for maintenance mode, mocking, or header/path-based short-circuiting. It runs immediately after CORS so browser preflight requests still receive valid CORS responses, and opted-in header plugins such as CORS can still decorate the rejected response.
 
+The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
+
 **Priority:** 125
+**Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `status_code` | u16 | `503` | HTTP status code to return |
-| `body` | String | `""` | Explicit response body. When set, `message` is ignored |
-| `content_type` | String | `application/json` | Response `Content-Type` header |
-| `message` | String | `"Service unavailable"` | Message used to build the default JSON/XML/plain-text body |
-| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix |
-| `trigger.header` | String | _(none)_ | Only terminate when this request header is present |
-| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`; empty means any value |
+| `status_code` | u16 | `503` | HTTP status code to return. Values outside 100–599 are coerced to 503. |
+| `body` | String | `""` | Explicit response body. When set (non-empty) it is returned verbatim and `message` is ignored. |
+| `content_type` | String | `application/json` | Response `Content-Type` header. Substring match for `json` / `xml` decides how `message` is rendered. |
+| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is empty. JSON and XML special characters are escaped automatically. |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Mutually exclusive with `trigger.header`. |
+| `trigger.header` | String | _(none)_ | Only terminate when this request header is present. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
+| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches any value. |
+
+Without a trigger every request on the proxy is terminated (maintenance-mode default).
+
+```yaml
+# Maintenance window: short-circuit every request with a JSON body
+plugin_name: request_termination
+config:
+  status_code: 503
+  message: Scheduled maintenance — back at 02:00 UTC
+
+# Block /admin during business hours but pass other paths through
+plugin_name: request_termination
+config:
+  status_code: 403
+  content_type: text/plain
+  message: Forbidden
+  trigger:
+    path_prefix: /admin
+```
 
 ---
 
@@ -1804,14 +1884,16 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"` |
+| `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
 | `forward_body` | bool | `false` | Include request body in function payload |
-| `forward_headers` | String[] | `[]` | Header names to forward to the function |
+| `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load) |
 | `forward_query_params` | bool | `false` | Include query parameters in function payload |
-| `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds |
-| `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB) |
-| `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally |
-| `error_status_code` | u16 | `502` | HTTP status when rejecting on error |
+| `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
+| `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
+| `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally. Unknown values rejected at plugin load |
+| `error_status_code` | u16 | `502` | HTTP status when rejecting on error. Must be in range 100-599 |
+
+**Strict config validation:** unknown `provider`, `mode`, or `on_error` values are rejected at plugin construction (no silent defaulting). Non-string values for `mode` / `on_error`, `timeout_ms` of `0`, `max_response_body_bytes` of `0`, and `error_status_code` outside 100-599 are also rejected.
 
 #### Function Request Payload
 
@@ -2048,8 +2130,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties) |
-| `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes) |
+| `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties). Accepts `"gzip"`, `"br"`, or `"brotli"` (alias for `"br"`). Unknown values, non-string entries, or non-array configs are rejected at plugin load — typos surface immediately rather than producing a partially-functional plugin. An empty array is also rejected |
+| `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
 | `disable_on_etag` | bool | `false` | Skip compression when the response has an ETag header |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |
@@ -2199,12 +2281,14 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed request body size in bytes |
+| `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if absent or zero. |
 
 Enforcement happens in three places:
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
 - `before_proxy` checks the buffered raw body when another plugin already needed early body access.
 - `on_final_request_body` re-checks the final buffered body after request transforms, so body-rewriting plugins cannot expand the request past the configured limit before it reaches the backend.
+
+For chunked/streaming requests without `Content-Length` where no other plugin buffers the body, the global `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` limit applies at the proxy layer.
 
 ### `response_size_limiting`
 
@@ -2214,8 +2298,14 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
-| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent |
+| `max_bytes` | u64 | — (required, > 0) | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |
+| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent. Adds memory overhead — only enable when needed. |
+
+Enforcement happens in two places:
+- `after_proxy` rejects oversized `Content-Length` response headers via the fast path (no body buffering required).
+- `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
+
+For streaming responses without `Content-Length` where buffering is disabled, the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).
 
 ### `response_caching`
 
@@ -2486,9 +2576,10 @@ Seven plugins purpose-built for AI/LLM API gateway use cases. They auto-detect t
 
 Recent releases tightened config validation for several AI plugins. Operators upgrading should audit existing plugin configs before rolling out — previously-accepted configs that silently degraded to a no-op are now rejected at load time.
 
-- **`ai_request_guard`** now rejects configs with no policies configured. At least one policy field (e.g. `max_prompt_length`, `blocked_patterns`, `required_fields`, `allowed_models`, `blocked_models`, `max_messages`, `max_temperature`, `require_user_field`) must be set.
-- **`ai_prompt_shield`** and **`ai_response_guard`** now reject unknown built-in pattern names and built-in patterns that fail to compile. Previously these were logged as warnings and silently skipped.
+- **`ai_request_guard`** now rejects configs with no policies configured. At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be set. Additionally, `temperature_range` is now validated strictly: it must be a 2-element array of finite numbers with `min <= max`. Previously, an inverted `[max, min]` would silently reject every request, and non-finite bounds would silently allow every request (NaN comparisons always return false).
+- **`ai_prompt_shield`** and **`ai_response_guard`** now reject unknown built-in pattern names and built-in patterns that fail to compile. Previously these were logged as warnings and silently skipped. Both plugins also pre-render their per-pattern redaction placeholders at config-load time, eliminating per-request `String::replace` on the hot redaction path.
 - **`ai_rate_limiter`** now rejects unknown `count_mode` and `limit_by` values. Previously these silently fell back to defaults.
+- **`ai_token_metrics`** now rejects negative or non-finite (`NaN`/`Inf`) values for `cost_per_prompt_token` and `cost_per_completion_token`. Negative cost rates would emit nonsensical negative cost metrics that pollute observability and chargeback pipelines; non-finite rates would break Prometheus exporters. Zero is still accepted (e.g., free-tier accounting).
 
 Validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
 
@@ -2612,6 +2703,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
 - **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
 - **Eviction (local mode)**: When the cache exceeds `max_entries`, eviction uses partial-select (`select_nth_unstable_by_key`) to identify the oldest entries in O(n) average time instead of a full O(n log n) sort. Oldest-first semantics by `inserted_at` are preserved.
+- **Sensitive header stripping**: Per-response identity headers (`Set-Cookie`, `Set-Cookie2`, `Authorization`, `WWW-Authenticate`, `X-API-Key`, AWS session tokens), per-request trace IDs (`X-Request-Id`, `X-Correlation-Id`, `X-Trace-Id`, `traceparent`/`tracestate`, `b3`, and all `X-B3-*` headers), and per-request rate-limit counters (`Retry-After`, plus all headers under the `X-RateLimit-*`, `X-AI-RateLimit-*`, and `Anthropic-RateLimit-*` prefixes — which covers OpenAI's suffix variants like `X-RateLimit-Limit-Requests`/`-Tokens` and Anthropic's `Anthropic-RateLimit-Requests-*`/`-Tokens-*`) are stripped from cached responses before storage. This prevents the cache from leaking the original consumer's session state to other consumers on a cache hit, and avoids replaying stale rate-limit / trace context to the new client. Filtering is case-insensitive. Hop-by-hop headers (RFC 9110 §7.6.1) including `Proxy-Authenticate` are not re-filtered here because the proxy response path strips them before plugins observe the response.
 
 ```yaml
 plugin_name: ai_semantic_cache
@@ -2904,16 +2996,16 @@ WebSocket plugins operate at the frame level via the `on_ws_frame` lifecycle hoo
 
 ### `ws_message_size_limiting`
 
-Enforces maximum frame size for WebSocket connections. Closes the connection with code 1009 (Message Too Big) when a Text, Binary, or Ping frame exceeds the configured limit. Operates in both directions (client-to-backend and backend-to-client).
+Enforces maximum frame size for WebSocket connections. Closes the connection with close code **1009 (Message Too Big)** per RFC 6455 §7.4 when a Text, Binary, or Ping frame exceeds the configured limit. Operates in both directions (client-to-backend and backend-to-client).
 
 **Priority:** 2810
 
+**Protocols:** WebSocket only
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_frame_bytes` | u64 | `0` | Maximum allowed frame size in bytes (0 = no effect) |
-| `close_reason` | String | `"Message too large"` | Close frame reason text |
-
-`close_reason` is truncated to the WebSocket protocol limit for close-frame reason strings (123 UTF-8 bytes).
+| `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. |
+| `close_reason` | String | `"Message too large"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 
 ```yaml
 plugin_name: ws_message_size_limiting
@@ -2921,17 +3013,21 @@ config:
   max_frame_bytes: 65536
 ```
 
+The plugin opts the WebSocket connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode by returning `true` from `requires_ws_frame_hooks()`, so frame inspection always runs when this plugin is configured.
+
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with code 1008 (Policy Violation) when the configured frame rate is exceeded.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket.
 
 **Priority:** 2910
 
+**Protocols:** WebSocket only
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `frames_per_second` | u64 | `100` | Maximum frames per second per connection |
-| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance) |
-| `close_reason` | String | `"Frame rate exceeded"` | Close frame reason text |
+| `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
+| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Setting this to `0` causes the bucket to start empty and reject all frames. |
+| `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -2944,7 +3040,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, Redis keys are namespaced per gateway instance to avoid cross-instance collisions; this mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands. If Redis becomes unreachable, falls back to local in-memory rate limiting automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 ```yaml
 plugin_name: ws_rate_limiting
@@ -2964,7 +3060,7 @@ Logs metadata for every WebSocket frame passing through the proxy. Provides fram
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` |
+| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` (case-sensitive — unknown values are rejected at config load time) |
 | `include_payload_preview` | bool | `false` | Include a payload preview in log entries |
 | `payload_preview_bytes` | u64 | `128` | Maximum payload bytes to preview (clamped to 64 KiB) |
 | `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
@@ -2977,6 +3073,45 @@ config:
   payload_preview_bytes: 256
   log_ping_pong: false
 ```
+
+Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview` (text borrowed from the frame, or hex-encoded for binary). Preview computation is skipped when the configured tracing level is filtered out, so disabling logging at the tracing layer eliminates per-frame allocation.
+
+---
+
+## UDP Plugins
+
+UDP plugins operate at the datagram level via the `on_udp_datagram` lifecycle hook. They fire on every datagram in both directions (client-to-backend and backend-to-client). Use `UdpDatagramContext.direction` to distinguish.
+
+### `udp_rate_limiting`
+
+Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm with atomic counters. Excess datagrams are silently dropped (standard UDP flood mitigation — there is no equivalent of an HTTP 429 response in plain UDP). Both client-to-backend and backend-to-client datagrams count toward the same per-client window.
+
+**Priority:** 2915
+
+**Protocols:** UDP only
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `datagrams_per_second` | u64 (optional) | — | Maximum datagrams per `window_seconds` per client IP |
+| `bytes_per_second` | u64 (optional) | — | Maximum bytes per `window_seconds` per client IP (sum of datagram payload sizes) |
+| `window_seconds` | u64 | `1` | Window length in seconds (minimum 1). The effective per-window cap is `datagrams_per_second × window_seconds` (and similarly for bytes). |
+
+At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+
+```yaml
+plugin_name: udp_rate_limiting
+config:
+  datagrams_per_second: 1000
+  bytes_per_second: 1048576
+  window_seconds: 1
+```
+
+**Memory protection:** The plugin tracks per-client state in a `DashMap` capped at 100,000 entries. When the cap is exceeded, only datagrams from already-tracked client IPs are forwarded — datagrams from new IPs are dropped without inserting state. This prevents spoofed-source-IP floods from causing unbounded memory growth. Stale entries (idle for `window_seconds × 2`, minimum 10 seconds) are evicted by a periodic sweep gated to once per second; the cooldown gate uses an atomic `compare_exchange` so concurrent sweeps cannot pile up under load.
+
+**Hot-path contract:** Per-datagram bookkeeping is lock-free — counts, byte totals, window epoch, and last-activity timestamps are all `AtomicU64`. The plugin opts in via `requires_udp_datagram_hooks() = true`, so when no UDP plugin is configured on a proxy the datagram forwarding loop pays zero overhead.
+
+**Direction handling:** The plugin examines `ctx.direction` only implicitly — both directions update the same per-client window. This is intentional: the goal is to cap total UDP traffic per client IP, not just inbound. Plugins that need direction-specific behavior should branch on `ctx.direction` themselves.
+
 
 ---
 
