@@ -936,15 +936,32 @@ mod inner {
         async fn check_listen_path_unique(
             &self,
             namespace: &str,
-            listen_path: &str,
+            listen_path: Option<&str>,
             hosts: &[String],
             exclude_proxy_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "namespace": namespace, "listen_path": listen_path };
+            // Defensive: `None` listen_path + empty hosts is rejected by
+            // validate_fields_inner. Guard so the DB layer never admits
+            // a "match everything" proxy if a caller slips past validation.
+            if listen_path.is_none() && hosts.is_empty() {
+                return Ok(false);
+            }
+
+            // `proxy_to_doc` uses `strip_null_fields` so host-only docs omit
+            // `listen_path` entirely. Mongo's equality-to-null matches both a
+            // missing field and a literal null, so `{listen_path: null}` is
+            // the correct filter for the host-only bucket.
+            let mut filter = match listen_path {
+                Some(path) => doc! { "namespace": namespace, "listen_path": path },
+                None => doc! { "namespace": namespace, "listen_path": null },
+            };
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
-            // Check for overlapping hosts (empty hosts = catch-all, always conflicts)
+            // `Some(path) + empty hosts` is a catch-all for the path — match
+            // anything else in this bucket, regardless of hosts. For non-empty
+            // hosts, match existing rows whose hosts list is empty (catch-all
+            // on the existing row) or shares any host with the candidate.
             if !hosts.is_empty() {
                 filter.insert(
                     "$or",
@@ -1306,6 +1323,28 @@ mod inner {
                         .build(),
                 )
                 .await?;
+            // (namespace, listen_path) unique index. Uses a partial filter
+            // so only documents where `listen_path` is a string participate
+            // — host-only HTTP proxies (None) and stream proxies (None) serialize
+            // as BSON null, and `sparse(true)` would NOT exclude null-valued
+            // fields (sparse only excludes documents where the field is entirely
+            // absent). The partial_filter_expression explicitly requires the
+            // indexed field to be a string.
+            self.proxies()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "listen_path": 1 })
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "listen_path": { "$type": "string" }
+                                })
+                                .build(),
+                        )
+                        .build(),
+                )
+                .await?;
             self.proxies()
                 .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
                 .await?;
@@ -1578,7 +1617,7 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 name: Some("My Proxy".to_string()),
                 hosts: vec!["example.com".to_string()],
-                listen_path: "/api".to_string(),
+                listen_path: Some("/api".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Https,
                 backend_host: "backend.internal".to_string(),
                 backend_port: 8443,
@@ -1738,7 +1777,7 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/".to_string(),
+                listen_path: Some("/".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Http,
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
@@ -1830,7 +1869,7 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/test".to_string(),
+                listen_path: Some("/test".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Http,
                 backend_host: "backend.local".to_string(),
                 backend_port: 8080,

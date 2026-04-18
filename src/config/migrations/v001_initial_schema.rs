@@ -119,7 +119,7 @@ impl V001InitialSchema {
                 namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255),
                 hosts TEXT NOT NULL,
-                listen_path VARCHAR(500) NOT NULL,
+                listen_path VARCHAR(500),
                 backend_protocol VARCHAR(20) NOT NULL DEFAULT 'http',
                 backend_host VARCHAR(255) NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
@@ -178,7 +178,7 @@ impl V001InitialSchema {
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 name TEXT,
                 hosts TEXT NOT NULL DEFAULT '[]',
-                listen_path TEXT NOT NULL,
+                listen_path TEXT,
                 backend_protocol TEXT NOT NULL DEFAULT 'http',
                 backend_host TEXT NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
@@ -361,6 +361,33 @@ impl V001InitialSchema {
             }
         } else {
             sqlx::query(unique_listen_port_sql).execute(pool).await?;
+        }
+
+        // Unique index on (namespace, listen_path) for HTTP-family proxies. listen_path
+        // is NULL for stream proxies and for host-only HTTP proxies — both of those
+        // forms should not participate in this uniqueness check (stream proxies
+        // already have listen_port uniqueness; host-only proxies are disambiguated
+        // by hosts in validate_unique_listen_paths and in DB CRUD check_listen_path_unique).
+        // PostgreSQL/SQLite use partial indexes to skip NULL rows. MySQL's unique
+        // indexes natively treat each NULL as distinct, so a plain composite
+        // unique index achieves the same effect.
+        let unique_listen_path_sql = if is_mysql {
+            "CREATE UNIQUE INDEX idx_proxies_unique_listen_path ON proxies (namespace, listen_path)"
+        } else {
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_unique_listen_path ON proxies (namespace, listen_path) WHERE listen_path IS NOT NULL"
+        };
+        if is_mysql {
+            match sqlx::query(unique_listen_path_sql).execute(pool).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("1061") {
+                        return Err(e.into());
+                    }
+                }
+            }
+        } else {
+            sqlx::query(unique_listen_path_sql).execute(pool).await?;
         }
 
         // Composite unique indexes for namespace-scoped uniqueness.
