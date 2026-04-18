@@ -1319,12 +1319,38 @@ mod inner {
             // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
             // createIndex is idempotent — no-op if the index already exists.
 
+            // Drop legacy unique+sparse compound indexes so they can be
+            // recreated as unique+partialFilterExpression below. Older
+            // deployments may have the sparse form from pre-fix versions,
+            // which is buggy: MongoDB compound sparse indexes index a
+            // document whenever ANY compound field is present, treating
+            // the missing companion as an explicit null. That caused
+            // `{namespace, listen_port}` on HTTP proxies (which have no
+            // listen_port) to collide on `{ns, null}` across every HTTP
+            // proxy in the same namespace. `partial_filter_expression`
+            // with a type filter only indexes docs where the sparse field
+            // is actually a string/number, which is what we want.
+            //
+            // `drop_index` errors out when the index does not exist; this
+            // happens on fresh deployments and is expected — ignore.
+            let _ = self.proxies().drop_index("namespace_1_name_1").await;
+            let _ = self.proxies().drop_index("namespace_1_listen_port_1").await;
+            let _ = self.consumers().drop_index("namespace_1_custom_id_1").await;
+            let _ = self.upstreams().drop_index("namespace_1_name_1").await;
+
             // proxies indexes — uniqueness scoped to namespace
             self.proxies()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "name": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "name": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1342,7 +1368,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "listen_port": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "listen_port": { "$type": "number" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1370,7 +1403,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "custom_id": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "custom_id": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1426,7 +1466,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "name": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "name": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
