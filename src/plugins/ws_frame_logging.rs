@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use super::{
+    Direction, Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
+    WsDisconnectContext,
+};
 
 /// Log level for frame logging output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +304,87 @@ impl Plugin for WsFrameLogging {
 
         // Never transform frames — purely observational
         None
+    }
+
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        // Match the frame-level log's structure so operators can correlate
+        // the session end with the per-frame stream on the same `ws_frame_log`
+        // target. Direction/error_class/frames are always emitted so even
+        // clean closes produce a final record suitable for session accounting.
+        let direction_label = match ctx.direction {
+            Some(Direction::ClientToBackend) => "client_to_backend",
+            Some(Direction::BackendToClient) => "backend_to_client",
+            Some(Direction::Unknown) => "unknown",
+            None => "none",
+        };
+        let error_class_label = ctx
+            .error_class
+            .as_ref()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".to_string());
+
+        // Pick a tracing macro at the plugin's configured level so that log
+        // targets routed by `ws_frame_log` match the frame output volume.
+        match self.log_level {
+            LogLevel::Trace => tracing::trace!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+            LogLevel::Debug => tracing::debug!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+            LogLevel::Info => tracing::info!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+        }
     }
 }
 
