@@ -51,19 +51,18 @@ use tracing_subscriber::fmt::MakeWriter;
 /// The Ferrum Edge binary version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Severity-routing `MakeWriter` that sends `ERROR`-level events to a
-/// non-blocking stderr appender and everything else to a non-blocking stdout
-/// appender.
+/// Severity-routing `MakeWriter` that splits log events across stdout and
+/// stderr non-blocking appenders:
 ///
-/// Rationale: logs in general are diagnostic output that belongs on stdout
-/// under this project's convention (log aggregators, Docker, Kubernetes all
-/// scrape it). But FATAL/ERROR events are the ones operators, process
-/// supervisors, and the `ferrum-edge`-binary functional tests expect on
-/// stderr — it's the Unix convention for "something went wrong" and is
-/// what `2>&1`-style pipelines rely on.
+/// | Level         | Sink   | Reasoning                                         |
+/// |---------------|--------|---------------------------------------------------|
+/// | `ERROR`       | stderr | Fatal/failure signals — Unix convention, what process supervisors (systemd, Kubernetes liveness), alerting pipelines, and `2>&1`-style scripts key off. |
+/// | `WARN`        | stderr | Non-fatal but operator-noteworthy: matches `cargo`, `gcc`, `make`, and most CLI ecosystems that treat warnings as diagnostic output rather than "primary output". |
+/// | `INFO`        | stdout | Normal operational telemetry — this is what log aggregators (Fluentd/Promtail/Vector) ship; belongs with the bulk of structured-JSON output. |
+/// | `DEBUG`/`TRACE` | stdout | Developer-facing verbose output, gated behind `FERRUM_LOG_LEVEL=debug`/`trace`. Staying on stdout keeps them in the same stream as INFO so developers tailing a container see a contiguous timeline. |
 ///
-/// Both writers are `tracing_appender::non_blocking::NonBlocking`, so the
-/// hot path remains a channel send rather than a blocking I/O write. The
+/// Both sinks are `tracing_appender::non_blocking::NonBlocking`, so the hot
+/// path remains a channel send rather than a blocking I/O write. The
 /// corresponding `WorkerGuard`s are owned by `run_gateway()` so they drop
 /// (and flush buffered events) when it returns — see the ownership
 /// comment on those bindings for the full reasoning.
@@ -82,10 +81,12 @@ impl<'a> MakeWriter<'a> for SeverityWriter {
     }
 
     fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
-        if *meta.level() == Level::ERROR {
-            self.stderr.clone()
-        } else {
-            self.stdout.clone()
+        // ERROR and WARN → stderr; INFO/DEBUG/TRACE → stdout.
+        // See the type-level docstring above for the level → sink table
+        // and the rationale for each row.
+        match *meta.level() {
+            Level::ERROR | Level::WARN => self.stderr.clone(),
+            Level::INFO | Level::DEBUG | Level::TRACE => self.stdout.clone(),
         }
     }
 }
