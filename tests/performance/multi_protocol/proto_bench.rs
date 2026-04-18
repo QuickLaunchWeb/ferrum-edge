@@ -70,6 +70,14 @@ struct BenchArgs {
     #[arg(long, default_value = "false")]
     tls: bool,
 
+    /// Path to a PEM-encoded CA certificate used to validate the server's
+    /// certificate. Required for gRPC-over-TLS when targeting a self-signed
+    /// backend — tonic 0.14 does not expose an "accept invalid" toggle, so we
+    /// must explicitly trust the benchmark backend's cert. HTTP/1, HTTP/2,
+    /// HTTP/3, and WS use an in-process insecure verifier and ignore this.
+    #[arg(long)]
+    ca_cert: Option<std::path::PathBuf>,
+
     /// Output JSON instead of text
     #[arg(long, default_value = "false")]
     json: bool,
@@ -513,6 +521,22 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let payload = vec![0xABu8; args.payload_size];
 
+    // gRPC TLS requires explicit trust configuration — tonic 0.14 has no
+    // "accept invalid certs" toggle, so without --ca-cert the handshake
+    // against the self-signed benchmark backend would fail and every bench
+    // would emit rps=0. Read the CA once here and reuse for every channel.
+    let is_tls = args.target.starts_with("https://");
+    let ca_pem = if is_tls {
+        let ca_path = args.ca_cert.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("gRPC over TLS requires --ca-cert <path-to-pem>")
+        })?;
+        Some(std::fs::read(ca_path).with_context(|| {
+            format!("reading gRPC CA certificate from {}", ca_path.display())
+        })?)
+    } else {
+        None
+    };
+
     // gRPC uses HTTP/2 multiplexing. Share a pool of channels across tasks
     // (~10 streams per channel) instead of one channel per task.
     let num_conns = std::cmp::max(
@@ -525,13 +549,27 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     let mut channels = Vec::with_capacity(num_conns);
 
     for _ in 0..num_conns {
-        let channel = tonic::transport::Channel::from_shared(args.target.clone())
+        let mut endpoint = tonic::transport::Channel::from_shared(args.target.clone())
             .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
             .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
             .initial_connection_window_size(33_554_432) // 32 MiB
             .tcp_nodelay(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_while_idle(true)
+            .keep_alive_while_idle(true);
+
+        if let Some(pem) = &ca_pem {
+            let ca = tonic::transport::Certificate::from_pem(pem);
+            let tls = tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(ca)
+                // Benchmark certs are issued for "localhost"; force SNI/name
+                // check to match regardless of the numeric host in the URI.
+                .domain_name("localhost");
+            endpoint = endpoint.tls_config(tls).map_err(|e| {
+                anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target)
+            })?;
+        }
+
+        let channel = endpoint
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("gRPC connect to {}: {e}", args.target))?;

@@ -86,12 +86,16 @@ GATEWAY_UDP_PORT=5003
 GATEWAY_UDP_DTLS_PORT=5004
 
 # Returns: <bench_proto> <bench_target> <direct_target> [extra_bench_args]
+#
+# grpcs: tonic 0.14 has no insecure-TLS toggle, so we explicitly trust the
+# benchmark backend's self-signed CA. The --ca-cert flag is harmlessly
+# ignored when the bench target uses http:// (the direct-backend leg).
 bench_params() {
     case "$PROTOCOL" in
         http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo http://127.0.0.1:3001/echo" ;;
         http2)     echo "http2 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
         http3)     echo "http3 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3445/echo" ;;
-        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} http://127.0.0.1:50052 --tls" ;;
+        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} http://127.0.0.1:50052 --ca-cert ${CERT_DIR}/cert.pem" ;;
         wss)       echo "ws wss://127.0.0.1:${GATEWAY_HTTPS_PORT}/ws ws://127.0.0.1:3003" ;;
         tcp-tls)   echo "tcp 127.0.0.1:${GATEWAY_TCP_TLS_PORT} 127.0.0.1:3444 --tls" ;;
         udp)       echo "udp 127.0.0.1:${GATEWAY_UDP_PORT} 127.0.0.1:3005" ;;
