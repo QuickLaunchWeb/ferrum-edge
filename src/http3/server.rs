@@ -1447,6 +1447,13 @@ async fn handle_h3_request(
         }
     }
 
+    // Capture the on-wire request body length BEFORE plugin transforms run.
+    // The buffered-response summary and the streaming-response `request_bytes`
+    // field both use this value, so `request_bytes` reflects bytes actually
+    // received from the client — consistent with the pre-transform semantics
+    // of the HTTP/1.1, HTTP/2, and gRPC paths.
+    let raw_request_body_bytes = body_data.len() as u64;
+
     // Transform request body via plugins when buffering is active
     let body_data = if needs_request_buffering
         && !body_data.is_empty()
@@ -1508,12 +1515,13 @@ async fn handle_h3_request(
         // Response body is streamed, but request body was collected because
         // plugins needed it or it was prebuffered.
         let client_ip_owned = ctx.client_ip.clone();
-        // Capture request-body byte count before moving `body_data` into the
-        // streaming helper. `body_data` is collected from the H3 recv stream
-        // above and reflects the exact bytes received from the client (post
-        // plugin body transforms, if any ran) — this is the canonical
-        // request_bytes value for the buffered-request H3 path.
-        let request_body_bytes = body_data.len() as u64;
+        // Use the pre-transform length captured before the plugin
+        // `transform_request_body` loop ran. `body_data` at this point may
+        // have been rewritten by a request-body plugin; logging its current
+        // length would misreport the on-wire size. `raw_request_body_bytes`
+        // is the canonical `request_bytes` value for the H3 buffered-request
+        // path on both the streaming and buffered response branches.
+        let request_body_bytes = raw_request_body_bytes;
         let streaming_result = proxy_to_backend_h3_streaming(
             &state,
             &proxy,
@@ -1894,10 +1902,12 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
-        // Request bytes: `body_data` (passed by reference to proxy_to_backend_h3)
-        // holds the collected client request body. Response bytes: the H3
-        // buffered-response path has `response_body` in scope — its `Vec<u8>`
-        // length is what will flow to the client.
+        // Request bytes: `raw_request_body_bytes` captured the on-wire size
+        // before plugin `transform_request_body` ran, so the summary reflects
+        // bytes actually received from the client rather than the possibly
+        // rewritten `body_data.len()`. Response bytes: the H3 buffered-response
+        // path has `response_body` in scope — its `Vec<u8>` length is what
+        // will flow to the client.
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1919,7 +1929,7 @@ async fn handle_h3_request(
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             error_class: h3_error_class,
-            request_bytes: body_data.len() as u64,
+            request_bytes: raw_request_body_bytes,
             response_bytes: response_body.len() as u64,
             metadata: ctx.metadata.clone(),
             ..TransactionSummary::default()
