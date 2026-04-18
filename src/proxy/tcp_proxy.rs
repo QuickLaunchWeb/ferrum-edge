@@ -45,6 +45,22 @@ pub(crate) const STREAM_ERR_REJECTED_BY_POLICY: &str = "rejected by policy";
 pub(crate) const STREAM_ERR_THROTTLED: &str = "throttled";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 
+/// Sentinel prefix used by the Linux splice paths
+/// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
+/// idle timer expired. The splice blocking-thread wrappers
+/// (`bidirectional_splice_io_uring`) detect this prefix via `starts_with`
+/// and map the error to `ErrorClass::ReadWriteTimeout` +
+/// `Direction::Unknown` so `disconnect_cause_for_failure` reports
+/// `IdleTimeout` — feeding the string through `classify_stream_error`
+/// would yield `ConnectionTimeout`, which the cause mapper treats as a
+/// recv/backend error. Keep this constant as the sole source of truth
+/// for both the emission sites (inside splice loops) and the sentinel
+/// checks (in the spawn_blocking closures); a drift between the two
+/// would silently skew the `IdleTimeout` slice of `stream_disconnects`
+/// metrics. Gated on Linux because splice(2) is Linux-only.
+#[cfg(target_os = "linux")]
+pub(crate) const STREAM_SPLICE_IDLE_TIMEOUT_PREFIX: &str = "TCP idle timeout";
+
 /// Which end of a half-duplex copy produced the error.
 ///
 /// A single direction of the bidirectional relay consists of a read on the
@@ -142,18 +158,32 @@ pub fn disconnect_cause_for_failure(
 /// Genuinely client-side failures (e.g., `ClientDisconnect`) stay
 /// `RecvError`. Timeouts during connect become `BackendError`, not
 /// `IdleTimeout`, because idle timeout only applies after the relay starts.
+///
+/// The match is **exhaustive over `ErrorClass`** (no `_ => ...` catch-all)
+/// so that adding a new variant triggers a compile error here. This
+/// prevents the silent "unhandled class → RecvError" drift that Codex
+/// flagged — every backend-facing variant must be explicitly routed to
+/// `BackendError`, and every client-facing variant to `RecvError`.
 fn pre_copy_disconnect_cause(
     class: &ErrorClass,
     error_message: &str,
 ) -> crate::plugins::DisconnectCause {
     use crate::plugins::DisconnectCause;
     match class {
+        // Backend-facing failure classes — the client never saw a reply,
+        // so these are always backend problems regardless of message.
         ErrorClass::DnsLookupError
         | ErrorClass::ConnectionTimeout
         | ErrorClass::ConnectionRefused
         | ErrorClass::PortExhaustion
         | ErrorClass::ConnectionPoolError
-        | ErrorClass::ProtocolError => DisconnectCause::BackendError,
+        | ErrorClass::ProtocolError
+        // Pre-copy `ReadWriteTimeout` only fires if a backend-facing read/
+        // write (e.g., TLS handshake I/O) stalls — no traffic has crossed
+        // to the client, so it's backend-side.
+        | ErrorClass::ReadWriteTimeout
+        // Backend oversized its response — by definition backend-side.
+        | ErrorClass::ResponseBodyTooLarge => DisconnectCause::BackendError,
         // `ConnectionReset` / `ConnectionClosed` can originate on either
         // side: a frontend TLS handshake abort from a client that resets
         // mid-handshake surfaces here too. Disambiguate by the message
@@ -176,11 +206,18 @@ fn pre_copy_disconnect_cause(
                 DisconnectCause::RecvError
             }
         }
-        ErrorClass::ClientDisconnect => DisconnectCause::RecvError,
-        // `RequestError` is a catch-all; disambiguate via the prefix constants
-        // so plugin/policy rejections (client-side) don't get reported as
-        // backend outages, while backend resolution failures
-        // (`STREAM_ERR_NO_HEALTHY_TARGETS`) still surface as `BackendError`.
+        // Client-facing failure classes — the client is the problem or
+        // the one that disconnected, so these are always recv-side.
+        ErrorClass::ClientDisconnect | ErrorClass::RequestBodyTooLarge => {
+            DisconnectCause::RecvError
+        }
+        // `RequestError` is a semantic catch-all emitted across many paths
+        // (plugin rejects, policy denials, upstream resolution failures).
+        // Disambiguate via the prefix constants: plugin/policy rejections
+        // are client-side; backend resolution / "no healthy targets" are
+        // backend-side. Messages mentioning "upstream" or "backend" that
+        // aren't covered by a specific constant are conservatively treated
+        // as backend-facing so outages surface on the right dashboards.
         ErrorClass::RequestError => {
             if error_message.contains(STREAM_ERR_REJECTED_BY_PLUGIN)
                 || error_message.contains(STREAM_ERR_REJECTED_BY_ACL)
@@ -198,7 +235,6 @@ fn pre_copy_disconnect_cause(
                 DisconnectCause::RecvError
             }
         }
-        _ => DisconnectCause::RecvError,
     }
 }
 
@@ -1616,6 +1652,19 @@ const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// distinguishes whether the error came from reading the source or writing
 /// to the destination, which the caller uses to attribute the failure to
 /// the correct socket (frontend vs backend).
+///
+/// **Idle-timer refresh pattern (two-phase):**
+/// `last_activity` is stored **before** `write_all` (post-read, pre-write)
+/// AND **after** `write_all` (post-write). The pre-write refresh is
+/// critical — without it, a successful read followed by a backpressured
+/// write could park inside `write_all` longer than `idle_timeout`, and
+/// the `bidirectional_copy` watchdog (which polls `last_activity` once per
+/// second) would see the stale timestamp and falsely fire an idle timeout
+/// even though bytes were just read from the source. The post-write
+/// refresh additionally credits the direction for write progress. Do not
+/// collapse these into a single store — the scenario Codex P1 flagged
+/// (backpressure masquerading as inactivity) is exactly what the pre-write
+/// store prevents.
 async fn copy_one_direction<R, W>(
     mut reader: R,
     mut writer: W,
@@ -2425,18 +2474,21 @@ async fn bidirectional_splice_io_uring(
 
     // Each direction runs on its own blocking thread with its own io_uring ring.
     // Idle expirations from the splice loop are reported as anyhow errors whose
-    // text starts with "TCP idle timeout" — classify them directly as
-    // `ReadWriteTimeout` + `Direction::Unknown` + `side: None` so
-    // `disconnect_cause_for_failure` maps them to `IdleTimeout`. Running them
-    // through `classify_stream_error` would return `ConnectionTimeout` (or even
-    // `RequestError`), which the mapper treats as a recv/backend error.
+    // text starts with `STREAM_SPLICE_IDLE_TIMEOUT_PREFIX` ("TCP idle timeout")
+    // — classify them directly as `ReadWriteTimeout` + `Direction::Unknown` +
+    // `side: None` so `disconnect_cause_for_failure` maps them to `IdleTimeout`.
+    // Running them through `classify_stream_error` would return
+    // `ConnectionTimeout` (or even `RequestError`), which the mapper treats as
+    // a recv/backend error. The emission sites in `io_uring_splice_direction`
+    // and `libc_splice_loop` reference the same constant so a rename is a
+    // compile-time coupling, not a silent drift.
     let c2b_handle = tokio::task::spawn_blocking(move || {
         let res = io_uring_splice_direction(
             client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms, &sa_c2b,
         );
         if let Err((side, ref e)) = res {
             let msg = e.to_string();
-            let entry = if msg.starts_with("TCP idle timeout") {
+            let entry = if msg.starts_with(STREAM_SPLICE_IDLE_TIMEOUT_PREFIX) {
                 (Direction::Unknown, ErrorClass::ReadWriteTimeout, None, msg)
             } else {
                 (
@@ -2456,7 +2508,7 @@ async fn bidirectional_splice_io_uring(
         );
         if let Err((side, ref e)) = res {
             let msg = e.to_string();
-            let entry = if msg.starts_with("TCP idle timeout") {
+            let entry = if msg.starts_with(STREAM_SPLICE_IDLE_TIMEOUT_PREFIX) {
                 (Direction::Unknown, ErrorClass::ReadWriteTimeout, None, msg)
             } else {
                 (
@@ -2604,7 +2656,10 @@ fn io_uring_splice_direction(
                 StreamIoSide::Read
             };
             if e.source.kind() == std::io::ErrorKind::TimedOut {
-                Err((side, anyhow::anyhow!("TCP idle timeout (io_uring splice)")))
+                Err((
+                    side,
+                    anyhow::anyhow!("{} (io_uring splice)", STREAM_SPLICE_IDLE_TIMEOUT_PREFIX),
+                ))
             } else {
                 Err((side, anyhow::anyhow!("io_uring splice error: {}", e.source)))
             }
@@ -2635,7 +2690,10 @@ fn libc_splice_loop(
             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                 return Err((
                     StreamIoSide::Read,
-                    anyhow::anyhow!("TCP idle timeout (libc splice fallback)"),
+                    anyhow::anyhow!(
+                        "{} (libc splice fallback)",
+                        STREAM_SPLICE_IDLE_TIMEOUT_PREFIX
+                    ),
                 ));
             }
         }
@@ -2688,7 +2746,8 @@ fn libc_splice_loop(
                                 return Err((
                                     StreamIoSide::Write,
                                     anyhow::anyhow!(
-                                        "TCP idle timeout (libc splice fallback, write phase)"
+                                        "{} (libc splice fallback, write phase)",
+                                        STREAM_SPLICE_IDLE_TIMEOUT_PREFIX
                                     ),
                                 ));
                             }
@@ -2714,7 +2773,10 @@ fn libc_splice_loop(
                     if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                         return Err((
                             StreamIoSide::Read,
-                            anyhow::anyhow!("TCP idle timeout (libc splice fallback, read phase)"),
+                            anyhow::anyhow!(
+                                "{} (libc splice fallback, read phase)",
+                                STREAM_SPLICE_IDLE_TIMEOUT_PREFIX
+                            ),
                         ));
                     }
                 }

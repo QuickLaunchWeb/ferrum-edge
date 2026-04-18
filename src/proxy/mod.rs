@@ -5470,18 +5470,48 @@ async fn handle_proxy_request_inner(
                         state.h2_coalesce_target_bytes,
                     )
                 };
-                let body = if let Some(logger) = deferred_grpc_logger {
+                let mut body = if let Some(logger) = deferred_grpc_logger {
                     body.with_logger(logger)
                 } else {
                     body
                 };
 
-                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
-                    grpc_proxy::build_grpc_error_response(
-                        grpc_proxy::grpc_status::UNAVAILABLE,
-                        "Internal gateway error",
-                    )
-                }));
+                // Detach the deferred logger before handing the body to
+                // `resp_builder.body(...)`. If the build fails (e.g. plugin/
+                // header mutations left the builder in an error state), the
+                // body is dropped before we can react — which would fire the
+                // logger's Drop safety net as `client_disconnect`, incorrectly
+                // billing a server-side build failure as a client abort and
+                // inflating disconnect/body-error metrics. By taking the
+                // logger first we can fire a specific server-side outcome on
+                // failure and reattach on success. Mirrors the HTTP path's
+                // `take_logger` → reattach-or-fire pattern.
+                let logger = body.take_logger();
+                match resp_builder.body(body) {
+                    Ok(mut resp) => {
+                        if let Some(logger) = logger {
+                            resp.body_mut().set_logger(logger);
+                        }
+                        return Ok(resp);
+                    }
+                    Err(_) => {
+                        if let Some(logger) = logger {
+                            // Classify as `ProtocolError` (not `RequestError`)
+                            // because gRPC errors ride on HTTP/2 and this is
+                            // a framing/build failure on the response stream,
+                            // not a client-initiated request failure.
+                            logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
+                                crate::retry::ErrorClass::ProtocolError,
+                                0,
+                                false,
+                            ));
+                        }
+                        return Ok(grpc_proxy::build_grpc_error_response(
+                            grpc_proxy::grpc_status::UNAVAILABLE,
+                            "Internal gateway error",
+                        ));
+                    }
+                }
             }
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
