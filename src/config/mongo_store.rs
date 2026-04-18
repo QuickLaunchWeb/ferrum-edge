@@ -1323,28 +1323,12 @@ mod inner {
                         .build(),
                 )
                 .await?;
-            // (namespace, listen_path) unique index. Uses a partial filter
-            // so only documents where `listen_path` is a string participate
-            // — host-only HTTP proxies (None) and stream proxies (None) serialize
-            // as BSON null, and `sparse(true)` would NOT exclude null-valued
-            // fields (sparse only excludes documents where the field is entirely
-            // absent). The partial_filter_expression explicitly requires the
-            // indexed field to be a string.
-            self.proxies()
-                .create_index(
-                    IndexModel::builder()
-                        .keys(doc! { "namespace": 1, "listen_path": 1 })
-                        .options(
-                            IndexOptions::builder()
-                                .unique(true)
-                                .partial_filter_expression(doc! {
-                                    "listen_path": { "$type": "string" }
-                                })
-                                .build(),
-                        )
-                        .build(),
-                )
-                .await?;
+            // Intentionally NO unique index on (namespace, listen_path). Path
+            // uniqueness is host-scoped: two HTTP proxies may share a
+            // listen_path if their `hosts` lists do not overlap. A plain
+            // unique index would reject valid host-partitioned routes before
+            // the host-overlap check in `check_listen_path_unique` runs.
+            // Uniqueness is enforced at the application layer instead.
             self.proxies()
                 .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
                 .await?;

@@ -363,32 +363,13 @@ impl V001InitialSchema {
             sqlx::query(unique_listen_port_sql).execute(pool).await?;
         }
 
-        // Unique index on (namespace, listen_path) for HTTP-family proxies. listen_path
-        // is NULL for stream proxies and for host-only HTTP proxies — both of those
-        // forms should not participate in this uniqueness check (stream proxies
-        // already have listen_port uniqueness; host-only proxies are disambiguated
-        // by hosts in validate_unique_listen_paths and in DB CRUD check_listen_path_unique).
-        // PostgreSQL/SQLite use partial indexes to skip NULL rows. MySQL's unique
-        // indexes natively treat each NULL as distinct, so a plain composite
-        // unique index achieves the same effect.
-        let unique_listen_path_sql = if is_mysql {
-            "CREATE UNIQUE INDEX idx_proxies_unique_listen_path ON proxies (namespace, listen_path)"
-        } else {
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_unique_listen_path ON proxies (namespace, listen_path) WHERE listen_path IS NOT NULL"
-        };
-        if is_mysql {
-            match sqlx::query(unique_listen_path_sql).execute(pool).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let msg = e.to_string();
-                    if !msg.contains("1061") {
-                        return Err(e.into());
-                    }
-                }
-            }
-        } else {
-            sqlx::query(unique_listen_path_sql).execute(pool).await?;
-        }
+        // Intentionally NO unique index on (namespace, listen_path). Path
+        // uniqueness is host-scoped: two HTTP proxies may share a listen_path
+        // if their `hosts` lists do not overlap (a Kong-style contract). A
+        // plain unique index on `(namespace, listen_path)` would reject valid
+        // host-partitioned routes before the host-overlap check in
+        // `DatabaseBackend::check_listen_path_unique` / `validate_unique_listen_paths`
+        // runs. Uniqueness is enforced at the application layer instead.
 
         // Composite unique indexes for namespace-scoped uniqueness.
         // These replace the per-column UNIQUE constraints that were removed
