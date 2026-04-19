@@ -167,6 +167,13 @@ impl TestGateway {
         self.child.take()
     }
 
+    /// OS PID of the running gateway process, if any. Use for `kill -HUP <pid>`
+    /// in file-mode config-reload tests without relinquishing ownership
+    /// (Drop still cleans up).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     /// Write a YAML/JSON file into the harness's temp dir. Returns the
     /// absolute path. The file is cleaned up when the harness drops.
     pub fn write_temp_file(&self, name: &str, contents: &str) -> Result<PathBuf, std::io::Error> {
