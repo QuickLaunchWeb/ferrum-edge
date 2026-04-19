@@ -21,6 +21,7 @@ use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
 
 /// Unsafe validation that skips signature verification, used only to extract
@@ -50,10 +51,14 @@ impl JwtAuth {
         })
     }
 
-    fn extract_token(&self, ctx: &RequestContext) -> Option<String> {
+    fn extract_token(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> Option<String> {
         if self.token_lookup.starts_with("header:") {
             let header_name = &self.token_lookup["header:".len()..];
-            ctx.headers.get(&header_name.to_lowercase()).map(|v| {
+            headers.get(&header_name.to_lowercase()).map(|v| {
                 strip_auth_scheme(v, "Bearer")
                     .unwrap_or(v.as_str())
                     .to_string()
@@ -62,10 +67,99 @@ impl JwtAuth {
             let param_name = &self.token_lookup["query:".len()..];
             ctx.query_params.get(param_name).cloned()
         } else {
-            ctx.headers
+            headers
                 .get("authorization")
                 .and_then(|v| strip_auth_scheme(v, "Bearer").map(str::to_string))
         }
+    }
+}
+
+#[async_trait]
+impl AuthMechanism for JwtAuth {
+    fn mechanism_name(&self) -> &str {
+        "jwt_auth"
+    }
+
+    fn extract(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> ExtractedCredential {
+        match self.extract_token(ctx, headers) {
+            Some(token) => ExtractedCredential::BearerToken(token),
+            None => ExtractedCredential::Missing,
+        }
+    }
+
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::BearerToken(token) = credential else {
+            return VerifyOutcome::NotApplicable;
+        };
+
+        // O(1) lookup: decode claims without verification to extract identity,
+        // then look up the consumer by identity and verify with their secret only.
+        let claims = match decode_claims_only(&token) {
+            Some(claims) => claims,
+            None => {
+                debug!("jwt_auth: failed to decode JWT structure");
+                return VerifyOutcome::Invalid(r#"{"error":"Invalid JWT token"}"#.into());
+            }
+        };
+
+        let identity = match claims
+            .get(&self.consumer_claim_field)
+            .and_then(|value| value.as_str())
+        {
+            Some(identity) => identity,
+            None => {
+                debug!(
+                    "jwt_auth: JWT missing identity claim '{}'",
+                    self.consumer_claim_field
+                );
+                return VerifyOutcome::Invalid(r#"{"error":"JWT missing identity claim"}"#.into());
+            }
+        };
+
+        let consumer = match consumer_index.find_by_identity(identity) {
+            Some(consumer) => consumer,
+            None => {
+                debug!("jwt_auth: no consumer found for identity '{}'", identity);
+                return VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid JWT token"}"#.into());
+            }
+        };
+
+        let jwt_entries = consumer.credential_entries("jwt");
+        if jwt_entries.is_empty() {
+            debug!(
+                "jwt_auth: consumer '{}' has no JWT secret configured",
+                consumer.username
+            );
+            return VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into());
+        }
+
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.required_spec_claims.clear();
+
+        for jwt_cred in &jwt_entries {
+            if let Some(secret) = jwt_cred.get("secret").and_then(|secret| secret.as_str()) {
+                let key = DecodingKey::from_secret(secret.as_bytes());
+                if decode::<serde_json::Value>(&token, &key, &validation).is_ok() {
+                    return VerifyOutcome::Success {
+                        consumer: Some(consumer),
+                        external_identity: None,
+                        external_identity_header: None,
+                    };
+                }
+            }
+        }
+
+        debug!("jwt_auth: signature verification failed for all secrets");
+        VerifyOutcome::VerificationFailed(r#"{"error":"Invalid JWT token"}"#.into())
     }
 }
 
@@ -92,100 +186,6 @@ impl Plugin for JwtAuth {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        let token = match self.extract_token(ctx) {
-            Some(t) => t,
-            None => {
-                debug!("jwt_auth: no token found");
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // O(1) lookup: decode claims without verification to extract identity,
-        // then look up the consumer by identity and verify with their secret only.
-        let claims = match decode_claims_only(&token) {
-            Some(c) => c,
-            None => {
-                debug!("jwt_auth: failed to decode JWT structure");
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        let identity = match claims
-            .get(&self.consumer_claim_field)
-            .and_then(|v| v.as_str())
-        {
-            Some(id) => id,
-            None => {
-                debug!(
-                    "jwt_auth: JWT missing identity claim '{}'",
-                    self.consumer_claim_field
-                );
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"JWT missing identity claim"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // O(1) consumer lookup by identity (sub claim or configured field)
-        let consumer = match consumer_index.find_by_identity(identity) {
-            Some(c) => c,
-            None => {
-                debug!("jwt_auth: no consumer found for identity '{}'", identity);
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // Try all JWT secrets for this consumer (supports multiple credentials
-        // per type for zero-downtime rotation). First successful decode wins.
-        let jwt_entries = consumer.credential_entries("jwt");
-        if jwt_entries.is_empty() {
-            debug!(
-                "jwt_auth: consumer '{}' has no JWT secret configured",
-                consumer.username
-            );
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid JWT token"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        validation.required_spec_claims.clear();
-
-        for jwt_cred in &jwt_entries {
-            if let Some(secret) = jwt_cred.get("secret").and_then(|s| s.as_str()) {
-                let key = DecodingKey::from_secret(secret.as_bytes());
-                if decode::<serde_json::Value>(&token, &key, &validation).is_ok() {
-                    if ctx.identified_consumer.is_none() {
-                        debug!("jwt_auth: identified consumer '{}'", consumer.username);
-                        ctx.identified_consumer = Some(consumer);
-                    }
-                    return PluginResult::Continue;
-                }
-            }
-        }
-
-        debug!("jwt_auth: signature verification failed for all secrets");
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"Invalid JWT token"}"#.into(),
-            headers: HashMap::new(),
-        }
+        auth_flow::run_auth(self, ctx, consumer_index).await
     }
 }
