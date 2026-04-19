@@ -192,10 +192,6 @@ impl AuthTestHarness {
         })
     }
 
-    async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(())
-    }
-
     fn generate_admin_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         Ok(self._gw.admin_token())
     }
@@ -395,7 +391,7 @@ fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -
 #[tokio::test]
 #[ignore]
 async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
-    let mut harness = AuthTestHarness::new()
+    let harness = AuthTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -407,11 +403,6 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
     let _backend = start_echo_backend(backend_port)
         .await
         .expect("Failed to start echo backend");
-
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
 
     let client = reqwest::Client::new();
     let admin_token = harness
@@ -589,7 +580,7 @@ async fn test_auth_acl_comprehensive() {
     println!("\n=== Starting Auth/ACL Functional Test ===\n");
 
     // --- Setup ---
-    let mut harness = AuthTestHarness::new()
+    let harness = AuthTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -602,12 +593,6 @@ async fn test_auth_acl_comprehensive() {
     let _backend = start_echo_backend(backend_port)
         .await
         .expect("Failed to start echo backend");
-
-    // Start gateway
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
 
     let client = reqwest::Client::new();
     let admin_token = harness

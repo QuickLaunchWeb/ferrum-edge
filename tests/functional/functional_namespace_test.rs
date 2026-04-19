@@ -154,6 +154,9 @@ impl NsHarness {
                 .jwt_secret(JWT_SECRET)
                 .jwt_issuer(JWT_ISSUER)
                 .db_poll_interval_seconds(1)
+                // The outer loop resets the backing store between attempts,
+                // so each harness attempt should be a single fresh spawn.
+                .max_attempts(1)
                 .log_level("warn");
             if matches!(backend, Backend::Mongodb) {
                 builder = builder.env("FERRUM_MONGO_DATABASE", "ferrum_test");

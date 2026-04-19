@@ -43,10 +43,6 @@ impl LoggingTestHarness {
         })
     }
 
-    async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(())
-    }
-
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         Ok(self.gw.admin_token())
     }
@@ -277,11 +273,6 @@ async fn test_logging_gateway_startup_logs() {
         .await
         .expect("Failed to create harness");
 
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
-
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     let logs = harness.stop_and_collect_logs();
@@ -341,11 +332,6 @@ async fn test_logging_transaction_summary_on_proxied_request() {
     let _backend = start_echo_backend(backend_port)
         .await
         .expect("Failed to start backend");
-
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
 
     let client = reqwest::Client::new();
     let token = harness.generate_token().expect("Failed to generate token");
@@ -512,11 +498,6 @@ async fn test_logging_rejected_request_has_rejection_phase() {
         .await
         .expect("Failed to start backend");
 
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
-
     let client = reqwest::Client::new();
     let token = harness.generate_token().expect("Failed to generate token");
     let auth_header = format!("Bearer {}", token);
@@ -646,11 +627,6 @@ async fn test_logging_no_match_request() {
         .await
         .expect("Failed to create harness");
 
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
-
     let client = reqwest::Client::new();
 
     // Send a request to a path with no matching proxy — should get 404
@@ -710,11 +686,6 @@ async fn test_logging_multiple_requests_produce_individual_entries() {
     let _backend = start_echo_backend(backend_port)
         .await
         .expect("Failed to start backend");
-
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
 
     let client = reqwest::Client::new();
     let token = harness.generate_token().expect("Failed to generate token");

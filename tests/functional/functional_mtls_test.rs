@@ -245,6 +245,8 @@ where
 
         let mut builder = TestGateway::builder()
             .mode_file(config_content)
+            // The outer loop rewrites the config and allocates fresh ports,
+            // so each harness attempt intentionally gets one gateway spawn.
             .max_attempts(1)
             .capture_output()
             .env("FERRUM_PROXY_HTTP_PORT", ports.proxy_http.to_string())

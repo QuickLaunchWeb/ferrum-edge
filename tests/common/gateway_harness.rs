@@ -390,9 +390,9 @@ impl TestGatewayBuilder {
         self
     }
 
-    /// Start from a clean environment, preserving only a small set of base
-    /// process vars (`PATH`, `HOME`, `TMPDIR`) before applying the builder's
-    /// explicit `FERRUM_*` settings.
+    /// Start from a clean environment, preserving only command lookup,
+    /// home/temp dirs, locale vars, and platform loader paths before
+    /// applying the builder's explicit `FERRUM_*` settings.
     pub fn clear_env(mut self) -> Self {
         self.clear_env = true;
         self
@@ -547,14 +547,8 @@ impl TestGatewayBuilder {
             db_url = env.get("FERRUM_DB_URL").cloned();
         }
 
-        let effective_proxy_port = env
-            .get("FERRUM_PROXY_HTTP_PORT")
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(proxy_port);
-        let effective_admin_port = env
-            .get("FERRUM_ADMIN_HTTP_PORT")
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(admin_port);
+        let effective_proxy_port = parse_port_override(&env, "FERRUM_PROXY_HTTP_PORT", proxy_port)?;
+        let effective_admin_port = parse_port_override(&env, "FERRUM_ADMIN_HTTP_PORT", admin_port)?;
 
         let mut gw = TestGateway {
             temp_dir,
@@ -617,6 +611,8 @@ impl TestGatewayBuilder {
         for (k, v) in &env {
             cmd.env(k, v);
         }
+        parse_port_override(&env, "FERRUM_PROXY_HTTP_PORT", proxy_port)?;
+        parse_port_override(&env, "FERRUM_ADMIN_HTTP_PORT", admin_port)?;
         let stdout_path = temp_dir.path().join("gateway.stdout.log");
         let stderr_path = temp_dir.path().join("gateway.stderr.log");
         cmd.stdin(Stdio::null())
@@ -664,6 +660,7 @@ impl TestGatewayBuilder {
     }
 }
 
+#[derive(Debug)]
 pub struct FailedGatewayStart {
     pub status: Option<ExitStatus>,
     pub stdout: String,
@@ -889,9 +886,42 @@ async fn wait_for_health_inner(
     }
 }
 
+fn parse_port_override(
+    env: &HashMap<String, String>,
+    key: &str,
+    fallback: u16,
+) -> Result<u16, std::io::Error> {
+    match env.get(key) {
+        Some(raw) => raw.parse::<u16>().map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid {key} override '{raw}': {err}"),
+            )
+        }),
+        None => Ok(fallback),
+    }
+}
+
 fn preserve_base_env(cmd: &mut Command) {
-    for key in ["PATH", "HOME", "TMPDIR"] {
+    for key in [
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ] {
         if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
+    for (key, value) in std::env::vars() {
+        if key.starts_with("LC_") && key != "LC_ALL" && key != "LC_CTYPE" {
             cmd.env(key, value);
         }
     }
