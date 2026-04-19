@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::Full;
@@ -24,7 +22,7 @@ pub(crate) struct ValidationCtx<'a> {
 }
 
 impl<'a> ValidationCtx<'a> {
-    fn from_state(state: &'a AdminState) -> Self {
+    pub(crate) fn from_state(state: &'a AdminState) -> Self {
         Self {
             reserved_ports: &state.reserved_ports,
             stream_bind_address: &state.stream_proxy_bind_address,
@@ -285,6 +283,29 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Ok(false) => Ok(not_found_response::<R>()),
         Err(error) => Ok(R::map_delete_db_error(&error)),
     }
+}
+
+pub(crate) fn prepare_batch_resource<R: AdminResource>(
+    resource: &mut R,
+    namespace: &str,
+    now: DateTime<Utc>,
+    validation_ctx: &ValidationCtx<'_>,
+) -> Result<(), Vec<String>> {
+    if resource.id().is_empty() {
+        resource.set_id(Uuid::new_v4().to_string());
+    } else if let Err(message) = validate_resource_id(resource.id()) {
+        return Err(vec![message]);
+    }
+
+    resource.normalize();
+    resource.set_namespace(namespace.to_string());
+    resource.validate(validation_ctx)?;
+    if let Err(message) = resource.prepare_for_write() {
+        return Err(vec![message]);
+    }
+    resource.set_created_at(now);
+    resource.set_updated_at(now);
+    Ok(())
 }
 
 pub(crate) fn redact_consumer_for_response(consumer: &Consumer) -> Consumer {
@@ -684,9 +705,7 @@ impl AdminResource for Proxy {
     }
 
     fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
-        if let Err(field_errors) = self.validate_fields() {
-            return Err(field_errors);
-        }
+        self.validate_fields()?;
 
         for host in &self.hosts {
             if let Err(message) = crate::config::types::validate_host_entry(host) {

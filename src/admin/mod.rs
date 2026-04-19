@@ -22,20 +22,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::admin::jwt_auth::{JwtError, JwtManager};
+use crate::config::admin_api::{
+    BackupCounts, BackupPayload, RestorePayload, filter_config_by_namespace,
+    parse_backup_resources, parse_restore_confirm,
+};
 use crate::config::db_backend::DatabaseBackend;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
-    validate_resource_id,
 };
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Cached result of the database health check to avoid hitting the DB on every
 /// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
@@ -709,6 +711,235 @@ pub async fn handle_admin_request(
 
 // ---- Consumer CRUD ----
 
+fn require_db(state: &AdminState) -> Result<&Arc<dyn DatabaseBackend>, Response<Full<Bytes>>> {
+    state.db.as_ref().ok_or_else(|| {
+        json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database"}),
+        )
+    })
+}
+
+fn consumer_not_found_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_FOUND,
+        &json!({"error": "Consumer not found"}),
+    )
+}
+
+fn invalid_credential_type_response(cred_type: &str) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": format!(
+            "Unknown credential type '{}'. Allowed types: {:?}",
+            cred_type, ALLOWED_CREDENTIAL_TYPES
+        )}),
+    )
+}
+
+fn invalid_credential_fields_response(field_errors: &[String]) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        &json!({"error": format!(
+            "Invalid credential fields: {}",
+            field_errors.join("; ")
+        )}),
+    )
+}
+
+fn parse_json_value(body: &[u8]) -> Result<Value, Response<Full<Bytes>>> {
+    serde_json::from_slice(body).map_err(|e| {
+        json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid body: {}", e)}),
+        )
+    })
+}
+
+fn extend_prefixed_errors(
+    validation_errors: &mut Vec<String>,
+    kind: &str,
+    id: &str,
+    errors: Vec<String>,
+) {
+    validation_errors.extend(
+        errors
+            .into_iter()
+            .map(|error| format!("{} '{}': {}", kind, id, error)),
+    );
+}
+
+fn prepare_batch_items<R: crud::AdminResource>(
+    items: &mut [R],
+    kind: &str,
+    namespace: &str,
+    now: chrono::DateTime<Utc>,
+    validation_ctx: &crud::ValidationCtx<'_>,
+    validation_errors: &mut Vec<String>,
+) {
+    for item in items {
+        if let Err(errors) = crud::prepare_batch_resource(item, namespace, now, validation_ctx) {
+            extend_prefixed_errors(validation_errors, kind, item.id(), errors);
+        }
+    }
+}
+
+async fn load_consumer_in_namespace(
+    db: &dyn DatabaseBackend,
+    consumer_id: &str,
+    namespace: &str,
+) -> Result<Consumer, Response<Full<Bytes>>> {
+    match db.get_consumer(consumer_id).await {
+        Ok(Some(consumer)) if consumer.namespace == namespace => Ok(consumer),
+        Ok(Some(_)) | Ok(None) => Err(consumer_not_found_response()),
+        Err(e) => Err(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&e),
+        )),
+    }
+}
+
+fn hash_credential_if_needed(
+    cred_type: &str,
+    cred_value: &mut Value,
+) -> Result<(), Response<Full<Bytes>>> {
+    if cred_type == "basicauth"
+        && let Err(e) = crud::hash_basic_auth_credentials(cred_value)
+    {
+        return Err(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": e}),
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_credential_unique(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    consumer_id: &str,
+    cred_type: &str,
+    cred_value: &Value,
+) -> Result<(), Response<Full<Bytes>>> {
+    match crud::check_credential_value_uniqueness(
+        db,
+        namespace,
+        cred_type,
+        cred_value,
+        Some(consumer_id),
+    )
+    .await
+    {
+        Ok(Some(message)) => Err(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": message}),
+        )),
+        Ok(None) => Ok(()),
+        Err(e) => Err(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &db_error_response(&e),
+        )),
+    }
+}
+
+async fn persist_consumer_update(
+    db: &dyn DatabaseBackend,
+    mut consumer: Consumer,
+    success_status: StatusCode,
+) -> Response<Full<Bytes>> {
+    consumer.updated_at = Utc::now();
+    match db.update_consumer(&consumer).await {
+        Ok(_) if success_status == StatusCode::NO_CONTENT => {
+            json_response(StatusCode::NO_CONTENT, &json!({}))
+        }
+        Ok(_) => {
+            let body = crud::consumer_response_body(&consumer);
+            json_response(success_status, &body)
+        }
+        Err(e) => crud::consumer_persist_error_response(&e),
+    }
+}
+
+fn apply_payload_namespace(payload: &mut RestorePayload, namespace: &str) {
+    for proxy in &mut payload.proxies {
+        proxy.namespace = namespace.to_string();
+    }
+    for consumer in &mut payload.consumers {
+        consumer.namespace = namespace.to_string();
+    }
+    for plugin_config in &mut payload.plugin_configs {
+        plugin_config.namespace = namespace.to_string();
+    }
+    for upstream in &mut payload.upstreams {
+        upstream.namespace = namespace.to_string();
+    }
+}
+
+fn hash_payload_consumers(consumers: &mut [Consumer], errors: &mut Vec<String>) {
+    for consumer in consumers {
+        if let Err(e) = crud::hash_consumer_credentials(consumer) {
+            errors.push(format!("consumer {} secret hashing: {}", consumer.id, e));
+        }
+    }
+}
+
+#[derive(Default)]
+struct PersistCounts {
+    proxies: usize,
+    consumers: usize,
+    plugin_configs: usize,
+    upstreams: usize,
+}
+
+async fn persist_payload_resources(
+    db: &dyn DatabaseBackend,
+    payload: &RestorePayload,
+    halt_on_error: bool,
+) -> (PersistCounts, Vec<String>) {
+    let mut counts = PersistCounts::default();
+    let mut errors = Vec::new();
+    let should_continue = |errors: &[String]| !halt_on_error || errors.is_empty();
+
+    if should_continue(&errors) && !payload.consumers.is_empty() {
+        match db.batch_create_consumers(&payload.consumers).await {
+            Ok(n) => counts.consumers = n,
+            Err(e) => errors.push(format!("consumers: {}", e)),
+        }
+    }
+    if should_continue(&errors) && !payload.upstreams.is_empty() {
+        match db.batch_create_upstreams(&payload.upstreams).await {
+            Ok(n) => counts.upstreams = n,
+            Err(e) => errors.push(format!("upstreams: {}", e)),
+        }
+    }
+    if should_continue(&errors) && !payload.proxies.is_empty() {
+        match db
+            .batch_create_proxies_without_plugins(&payload.proxies)
+            .await
+        {
+            Ok(n) => counts.proxies = n,
+            Err(e) => errors.push(format!("proxies: {}", e)),
+        }
+    }
+    if should_continue(&errors) && !payload.plugin_configs.is_empty() {
+        match db
+            .batch_create_plugin_configs(&payload.plugin_configs)
+            .await
+        {
+            Ok(n) => counts.plugin_configs = n,
+            Err(e) => errors.push(format!("plugin_configs: {}", e)),
+        }
+    }
+    if should_continue(&errors)
+        && !payload.proxies.is_empty()
+        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies).await
+    {
+        errors.push(format!("proxy_plugins: {}", e));
+    }
+
+    (counts, errors)
+}
+
 /// Allowed credential types for consumer authentication plugins.
 pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
     &["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
@@ -724,108 +955,41 @@ async fn handle_update_credentials(
         return Ok(resp);
     }
 
-    // Validate credential type against whitelist
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!(
-                "Unknown credential type '{}'. Allowed types: {:?}",
-                cred_type, ALLOWED_CREDENTIAL_TYPES
-            )}),
-        ));
+        return Ok(invalid_credential_type_response(cred_type));
     }
 
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(resp),
     };
 
-    let cred_value: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid body: {}", e)}),
-            ));
-        }
+    let mut cred_value = match parse_json_value(body) {
+        Ok(value) => value,
+        Err(resp) => return Ok(resp),
     };
-
-    match db.get_consumer(consumer_id).await {
-        Ok(Some(mut consumer)) => {
-            if consumer.namespace != namespace {
-                return Ok(json_response(
-                    StatusCode::NOT_FOUND,
-                    &json!({"error": "Consumer not found"}),
-                ));
-            }
-            let mut hashed_cred = cred_value.clone();
-            if cred_type == "basicauth"
-                && let Err(e) = crud::hash_basic_auth_credentials(&mut hashed_cred)
-            {
-                return Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": e}),
-                ));
-            }
-            match crud::check_credential_value_uniqueness(
-                db.as_ref(),
-                namespace,
-                cred_type,
-                &hashed_cred,
-                Some(consumer_id),
-            )
-            .await
-            {
-                Ok(Some(message)) => {
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        &json!({"error": message}),
-                    ));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &db_error_response(&e),
-                    ));
-                }
-            }
-
-            consumer
-                .credentials
-                .insert(cred_type.to_string(), hashed_cred);
-
-            // Validate credential field lengths and sizes after modification
-            if let Err(field_errors) = consumer.validate_fields() {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("Invalid credential fields: {}", field_errors.join("; "))}),
-                ));
-            }
-
-            consumer.updated_at = Utc::now();
-            match db.update_consumer(&consumer).await {
-                Ok(_) => {
-                    let body = crud::consumer_response_body(&consumer);
-                    Ok(json_response(StatusCode::OK, &body))
-                }
-                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
-            }
-        }
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Consumer not found"}),
-        )),
-        Err(e) => Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+    if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
+        return Ok(resp);
     }
+    if let Err(resp) =
+        ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &cred_value).await
+    {
+        return Ok(resp);
+    }
+
+    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+        Ok(consumer) => consumer,
+        Err(resp) => return Ok(resp),
+    };
+    consumer
+        .credentials
+        .insert(cred_type.to_string(), cred_value);
+
+    if let Err(field_errors) = consumer.validate_fields() {
+        return Ok(invalid_credential_fields_response(&field_errors));
+    }
+
+    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::OK).await)
 }
 
 async fn handle_delete_credentials(
@@ -838,56 +1002,24 @@ async fn handle_delete_credentials(
         return Ok(resp);
     }
 
-    // Validate credential type against whitelist
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!(
-                "Unknown credential type '{}'. Allowed types: {:?}",
-                cred_type, ALLOWED_CREDENTIAL_TYPES
-            )}),
-        ));
+        return Ok(invalid_credential_type_response(cred_type));
     }
 
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(resp),
     };
 
-    match db.get_consumer(consumer_id).await {
-        Ok(Some(mut consumer)) => {
-            if consumer.namespace != namespace {
-                return Ok(json_response(
-                    StatusCode::NOT_FOUND,
-                    &json!({"error": "Consumer not found"}),
-                ));
-            }
-            consumer.credentials.remove(cred_type);
-            consumer.updated_at = Utc::now();
-            match db.update_consumer(&consumer).await {
-                Ok(_) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
-                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
-            }
-        }
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Consumer not found"}),
-        )),
-        Err(e) => Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
-    }
+    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+        Ok(consumer) => consumer,
+        Err(resp) => return Ok(resp),
+    };
+    consumer.credentials.remove(cred_type);
+    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::NO_CONTENT).await)
 }
 
 /// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
-///
-/// Converts existing single-object credential to an array if needed, then appends the new entry.
 async fn handle_append_credential(
     state: &AdminState,
     consumer_id: &str,
@@ -900,142 +1032,68 @@ async fn handle_append_credential(
     }
 
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!(
-                "Unknown credential type '{}'. Allowed types: {:?}",
-                cred_type, ALLOWED_CREDENTIAL_TYPES
-            )}),
-        ));
+        return Ok(invalid_credential_type_response(cred_type));
     }
 
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(resp),
     };
 
-    let mut new_cred: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid body: {}", e)}),
-            ));
-        }
+    let mut new_cred = match parse_json_value(body) {
+        Ok(value) => value,
+        Err(resp) => return Ok(resp),
     };
-
     if !new_cred.is_object() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": "Credential entry must be a JSON object"}),
         ));
     }
-
-    match db.get_consumer(consumer_id).await {
-        Ok(Some(mut consumer)) => {
-            if consumer.namespace != namespace {
-                return Ok(json_response(
-                    StatusCode::NOT_FOUND,
-                    &json!({"error": "Consumer not found"}),
-                ));
-            }
-            if cred_type == "basicauth"
-                && let Err(e) = crud::hash_basic_auth_credentials(&mut new_cred)
-            {
-                return Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": e}),
-                ));
-            }
-
-            match crud::check_credential_value_uniqueness(
-                db.as_ref(),
-                namespace,
-                cred_type,
-                &new_cred,
-                Some(consumer_id),
-            )
-            .await
-            {
-                Ok(Some(message)) => {
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        &json!({"error": message}),
-                    ));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &db_error_response(&e),
-                    ));
-                }
-            }
-
-            // Build the new credential array
-            let new_value = match consumer.credentials.get(cred_type) {
-                Some(Value::Array(arr)) => {
-                    let mut new_arr = arr.clone();
-                    new_arr.push(new_cred);
-                    Value::Array(new_arr)
-                }
-                Some(existing) if existing.is_object() => {
-                    Value::Array(vec![existing.clone(), new_cred])
-                }
-                _ => {
-                    // No existing credential — store as single object for backward compat
-                    new_cred
-                }
-            };
-
-            // Check max entries per type
-            let limit = max_credentials_per_type();
-            if let Value::Array(ref arr) = new_value
-                && arr.len() > limit
-            {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!(
-                        "Cannot exceed {} credentials per type (currently {})",
-                        limit, arr.len()
-                    )}),
-                ));
-            }
-
-            consumer
-                .credentials
-                .insert(cred_type.to_string(), new_value);
-
-            if let Err(field_errors) = consumer.validate_fields() {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("Invalid credential fields: {}", field_errors.join("; "))}),
-                ));
-            }
-
-            consumer.updated_at = Utc::now();
-            match db.update_consumer(&consumer).await {
-                Ok(_) => {
-                    let body = crud::consumer_response_body(&consumer);
-                    Ok(json_response(StatusCode::OK, &body))
-                }
-                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
-            }
-        }
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Consumer not found"}),
-        )),
-        Err(e) => Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+    if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
+        return Ok(resp);
     }
+    if let Err(resp) =
+        ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &new_cred).await
+    {
+        return Ok(resp);
+    }
+
+    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+        Ok(consumer) => consumer,
+        Err(resp) => return Ok(resp),
+    };
+    let new_value = match consumer.credentials.get(cred_type) {
+        Some(Value::Array(arr)) => {
+            let mut new_arr = arr.clone();
+            new_arr.push(new_cred);
+            Value::Array(new_arr)
+        }
+        Some(existing) if existing.is_object() => Value::Array(vec![existing.clone(), new_cred]),
+        _ => new_cred,
+    };
+
+    let limit = max_credentials_per_type();
+    if let Value::Array(ref arr) = new_value
+        && arr.len() > limit
+    {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "Cannot exceed {} credentials per type (currently {})",
+                limit, arr.len()
+            )}),
+        ));
+    }
+    consumer
+        .credentials
+        .insert(cred_type.to_string(), new_value);
+
+    if let Err(field_errors) = consumer.validate_fields() {
+        return Ok(invalid_credential_fields_response(&field_errors));
+    }
+
+    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::OK).await)
 }
 
 /// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
@@ -1053,13 +1111,7 @@ async fn handle_delete_credential_by_index(
     }
 
     if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!(
-                "Unknown credential type '{}'. Allowed types: {:?}",
-                cred_type, ALLOWED_CREDENTIAL_TYPES
-            )}),
-        ));
+        return Ok(invalid_credential_type_response(cred_type));
     }
 
     let index: usize = match index_str.parse() {
@@ -1072,92 +1124,65 @@ async fn handle_delete_credential_by_index(
         }
     };
 
-    let db = match &state.db {
-        Some(db) => db,
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(resp),
+    };
+
+    let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
+        Ok(consumer) => consumer,
+        Err(resp) => return Ok(resp),
+    };
+    let cred_value = match consumer.credentials.get_mut(cred_type) {
+        Some(value) => value,
         None => {
             return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("No '{}' credentials found", cred_type)}),
             ));
         }
     };
 
-    match db.get_consumer(consumer_id).await {
-        Ok(Some(mut consumer)) => {
-            if consumer.namespace != namespace {
+    match cred_value {
+        Value::Array(arr) => {
+            if index >= arr.len() {
                 return Ok(json_response(
                     StatusCode::NOT_FOUND,
-                    &json!({"error": "Consumer not found"}),
+                    &json!({"error": format!(
+                        "Credential index {} out of range (have {} entries)",
+                        index, arr.len()
+                    )}),
                 ));
             }
-            let cred_value = match consumer.credentials.get_mut(cred_type) {
-                Some(v) => v,
-                None => {
-                    return Ok(json_response(
-                        StatusCode::NOT_FOUND,
-                        &json!({"error": format!("No '{}' credentials found", cred_type)}),
-                    ));
-                }
-            };
-
-            match cred_value {
-                Value::Array(arr) => {
-                    if index >= arr.len() {
-                        return Ok(json_response(
-                            StatusCode::NOT_FOUND,
-                            &json!({"error": format!(
-                                "Credential index {} out of range (have {} entries)",
-                                index, arr.len()
-                            )}),
-                        ));
-                    }
-                    arr.remove(index);
-                    // Collapse single-element array back to a plain object
-                    if arr.len() == 1 {
-                        let single = arr.remove(0);
-                        consumer.credentials.insert(cred_type.to_string(), single);
-                    } else if arr.is_empty() {
-                        consumer.credentials.remove(cred_type);
-                    }
-                }
-                Value::Object(_) => {
-                    if index != 0 {
-                        return Ok(json_response(
-                            StatusCode::NOT_FOUND,
-                            &json!({"error": format!(
-                                "Credential index {} out of range (have 1 entry)",
-                                index
-                            )}),
-                        ));
-                    }
-                    consumer.credentials.remove(cred_type);
-                }
-                _ => {
-                    return Ok(json_response(
-                        StatusCode::NOT_FOUND,
-                        &json!({"error": format!("No '{}' credentials found", cred_type)}),
-                    ));
-                }
-            }
-
-            consumer.updated_at = Utc::now();
-            match db.update_consumer(&consumer).await {
-                Ok(_) => {
-                    let body = crud::consumer_response_body(&consumer);
-                    Ok(json_response(StatusCode::OK, &body))
-                }
-                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
+            arr.remove(index);
+            if arr.len() == 1 {
+                let single = arr.remove(0);
+                consumer.credentials.insert(cred_type.to_string(), single);
+            } else if arr.is_empty() {
+                consumer.credentials.remove(cred_type);
             }
         }
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Consumer not found"}),
-        )),
-        Err(e) => Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+        Value::Object(_) => {
+            if index != 0 {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": format!(
+                        "Credential index {} out of range (have 1 entry)",
+                        index
+                    )}),
+                ));
+            }
+            consumer.credentials.remove(cred_type);
+        }
+        _ => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": format!("No '{}' credentials found", cred_type)}),
+            ));
+        }
     }
+
+    Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::OK).await)
 }
 
 // ---- Plugin CRUD ----
@@ -1465,14 +1490,9 @@ async fn handle_batch_create(
         return Ok(resp);
     }
 
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(resp),
     };
 
     let mut batch: RestorePayload = match serde_json::from_slice(body) {
@@ -1486,86 +1506,49 @@ async fn handle_batch_create(
     };
 
     let now = Utc::now();
+    let validation_ctx = crud::ValidationCtx::from_state(state);
     let known_plugins = crate::plugins::available_plugins();
     let mut validation_errors: Vec<String> = Vec::new();
 
-    for consumer in &mut batch.consumers {
-        if consumer.id.is_empty() {
-            consumer.id = Uuid::new_v4().to_string();
-        } else if let Err(msg) = validate_resource_id(&consumer.id) {
-            validation_errors.push(format!("Consumer '{}': {}", consumer.id, msg));
-        }
-        consumer.normalize_fields();
-        if let Err(field_errs) = consumer.validate_fields() {
-            for err in field_errs {
-                validation_errors.push(format!("Consumer '{}': {}", consumer.id, err));
-            }
-        }
-        consumer.namespace = namespace.to_string();
-        consumer.created_at = now;
-        consumer.updated_at = now;
-        if let Err(err) = hash_consumer_secrets(consumer) {
-            validation_errors.push(format!("Consumer '{}': {}", consumer.id, err));
-        }
-    }
+    prepare_batch_items(
+        &mut batch.consumers,
+        "Consumer",
+        namespace,
+        now,
+        &validation_ctx,
+        &mut validation_errors,
+    );
+    prepare_batch_items(
+        &mut batch.upstreams,
+        "Upstream",
+        namespace,
+        now,
+        &validation_ctx,
+        &mut validation_errors,
+    );
+    prepare_batch_items(
+        &mut batch.proxies,
+        "Proxy",
+        namespace,
+        now,
+        &validation_ctx,
+        &mut validation_errors,
+    );
+    prepare_batch_items(
+        &mut batch.plugin_configs,
+        "PluginConfig",
+        namespace,
+        now,
+        &validation_ctx,
+        &mut validation_errors,
+    );
 
-    for upstream in &mut batch.upstreams {
-        if upstream.id.is_empty() {
-            upstream.id = Uuid::new_v4().to_string();
-        } else if let Err(msg) = validate_resource_id(&upstream.id) {
-            validation_errors.push(format!("Upstream '{}': {}", upstream.id, msg));
-        }
-        upstream.normalize_fields();
-        upstream.namespace = namespace.to_string();
-        if let Err(field_errs) = upstream.validate_fields() {
-            for err in field_errs {
-                validation_errors.push(format!("Upstream '{}': {}", upstream.id, err));
-            }
-        }
-        upstream.created_at = now;
-        upstream.updated_at = now;
-    }
-
-    for proxy in &mut batch.proxies {
-        if proxy.id.is_empty() {
-            proxy.id = Uuid::new_v4().to_string();
-        } else if let Err(msg) = validate_resource_id(&proxy.id) {
-            validation_errors.push(format!("Proxy '{}': {}", proxy.id, msg));
-        }
-        if let Some(ref mut methods) = proxy.allowed_methods {
-            for method in methods.iter_mut() {
-                *method = method.to_uppercase();
-            }
-        }
-        proxy.normalize_fields();
-        proxy.namespace = namespace.to_string();
-        if let Err(field_errs) = proxy.validate_fields() {
-            for err in field_errs {
-                validation_errors.push(format!("Proxy '{}': {}", proxy.id, err));
-            }
-        }
-        proxy.created_at = now;
-        proxy.updated_at = now;
-    }
-
-    for plugin_config in &mut batch.plugin_configs {
-        if plugin_config.id.is_empty() {
-            plugin_config.id = Uuid::new_v4().to_string();
-        } else if let Err(msg) = validate_resource_id(&plugin_config.id) {
-            validation_errors.push(format!("PluginConfig '{}': {}", plugin_config.id, msg));
-        }
-        plugin_config.normalize_fields();
-        plugin_config.namespace = namespace.to_string();
+    for plugin_config in &batch.plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
             validation_errors.push(format!(
                 "PluginConfig '{}': unknown plugin name '{}'",
                 plugin_config.id, plugin_config.plugin_name
             ));
-        }
-        if let Err(field_errs) = plugin_config.validate_fields() {
-            for err in field_errs {
-                validation_errors.push(format!("PluginConfig '{}': {}", plugin_config.id, err));
-            }
         }
         if let Err(err) = validate_plugin_config_definition(plugin_config) {
             validation_errors.push(format!(
@@ -1573,8 +1556,6 @@ async fn handle_batch_create(
                 plugin_config.id, err
             ));
         }
-        plugin_config.created_at = now;
-        plugin_config.updated_at = now;
     }
 
     // Cross-resource validations require a GatewayConfig view over the batch.
@@ -1724,56 +1705,14 @@ async fn handle_batch_create(
         ));
     }
 
-    let mut created_proxies = 0usize;
-    let mut created_consumers = 0usize;
-    let mut created_plugin_configs = 0usize;
-    let mut created_upstreams = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-
-    if !batch.consumers.is_empty() {
-        match db.batch_create_consumers(&batch.consumers).await {
-            Ok(n) => created_consumers = n,
-            Err(e) => errors.push(format!("consumers: {}", e)),
-        }
-    }
-
-    if errors.is_empty() && !batch.upstreams.is_empty() {
-        match db.batch_create_upstreams(&batch.upstreams).await {
-            Ok(n) => created_upstreams = n,
-            Err(e) => errors.push(format!("upstreams: {}", e)),
-        }
-    }
-
-    if errors.is_empty() && !batch.proxies.is_empty() {
-        match db
-            .batch_create_proxies_without_plugins(&batch.proxies)
-            .await
-        {
-            Ok(n) => created_proxies = n,
-            Err(e) => errors.push(format!("proxies: {}", e)),
-        }
-    }
-
-    if errors.is_empty() && !batch.plugin_configs.is_empty() {
-        match db.batch_create_plugin_configs(&batch.plugin_configs).await {
-            Ok(n) => created_plugin_configs = n,
-            Err(e) => errors.push(format!("plugin_configs: {}", e)),
-        }
-    }
-
-    if errors.is_empty()
-        && !batch.proxies.is_empty()
-        && let Err(e) = db.batch_attach_proxy_plugins(&batch.proxies).await
-    {
-        errors.push(format!("proxy_plugins: {}", e));
-    }
+    let (created, errors) = persist_payload_resources(db.as_ref(), &batch, true).await;
 
     let mut response = json!({
         "created": {
-            "proxies": created_proxies,
-            "consumers": created_consumers,
-            "plugin_configs": created_plugin_configs,
-            "upstreams": created_upstreams,
+            "proxies": created.proxies,
+            "consumers": created.consumers,
+            "plugin_configs": created.plugin_configs,
+            "upstreams": created.upstreams,
         }
     });
 
@@ -1786,45 +1725,6 @@ async fn handle_batch_create(
 }
 
 // ---- Backup & Restore ----
-
-/// Parse the `resources` query parameter into a set of included resource types.
-/// Returns `None` when no filter is specified (include all).
-fn parse_backup_resources(query: Option<&str>) -> Option<std::collections::HashSet<&str>> {
-    let query = query?;
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        if let (Some(key), Some(val)) = (parts.next(), parts.next())
-            && key == "resources"
-        {
-            return Some(val.split(',').collect());
-        }
-    }
-    None
-}
-
-/// Typed backup payload — serializes directly from config structs without an
-/// intermediate `serde_json::Value` tree. At 30K proxies / 90K plugins this
-/// saves ~80 MB of peak heap vs the `json!()` macro approach.
-#[derive(Serialize)]
-struct BackupPayload<'a> {
-    version: &'a str,
-    ferrum_version: &'a str,
-    exported_at: String,
-    source: &'a str,
-    counts: BackupCounts,
-    proxies: &'a [Proxy],
-    consumers: &'a [Consumer],
-    plugin_configs: &'a [PluginConfig],
-    upstreams: &'a [Upstream],
-}
-
-#[derive(Serialize)]
-struct BackupCounts {
-    proxies: usize,
-    consumers: usize,
-    plugin_configs: usize,
-    upstreams: usize,
-}
 
 /// Export the full gateway configuration as a JSON backup.
 ///
@@ -1965,44 +1865,6 @@ async fn handle_backup(
     Ok(resp)
 }
 
-/// Check whether `confirm=true` is present in the query string.
-fn parse_restore_confirm(query: Option<&str>) -> bool {
-    let query = match query {
-        Some(q) => q,
-        None => return false,
-    };
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        if let (Some(key), Some(val)) = (parts.next(), parts.next())
-            && key == "confirm"
-            && val == "true"
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Typed restore payload — deserializes directly into typed structs without an
-/// intermediate `serde_json::Value` tree. This halves peak memory usage vs the
-/// two-pass `Value → from_value` approach.
-///
-/// Extra fields from `GET /backup` (version, exported_at, source, counts) are
-/// silently ignored via `#[serde(default)]`.
-#[derive(Deserialize)]
-struct RestorePayload {
-    #[serde(default)]
-    version: String,
-    #[serde(default)]
-    proxies: Vec<Proxy>,
-    #[serde(default)]
-    consumers: Vec<Consumer>,
-    #[serde(default)]
-    plugin_configs: Vec<PluginConfig>,
-    #[serde(default)]
-    upstreams: Vec<Upstream>,
-}
-
 /// Restore the gateway configuration from a backup payload.
 ///
 /// This is a **destructive** operation that replaces all existing configuration:
@@ -2026,14 +1888,9 @@ async fn handle_restore(
         return Ok(resp);
     }
 
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
+    let db = match require_db(state) {
+        Ok(db) => db,
+        Err(resp) => return Ok(resp),
     };
 
     if !parse_restore_confirm(query) {
@@ -2171,90 +2028,25 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let mut errors: Vec<String> = Vec::new();
-    let mut created_consumers = 0usize;
-    let mut created_upstreams = 0usize;
-    let mut created_proxies = 0usize;
-    let mut created_plugin_configs = 0usize;
-
-    // Set namespace on all payload resources before persisting
     let mut payload = payload;
-    for p in &mut payload.proxies {
-        p.namespace = namespace.to_string();
-    }
-    for c in &mut payload.consumers {
-        c.namespace = namespace.to_string();
-    }
-    for pc in &mut payload.plugin_configs {
-        pc.namespace = namespace.to_string();
-    }
-    for u in &mut payload.upstreams {
-        u.namespace = namespace.to_string();
-    }
-
-    // Consumers first (no dependencies) — hash secrets before persisting
-    if !payload.consumers.is_empty() {
-        let mut consumers = payload.consumers.clone();
-        for consumer in &mut consumers {
-            if let Err(e) = hash_consumer_secrets(consumer) {
-                errors.push(format!("consumer {} secret hashing: {}", consumer.id, e));
-            }
-        }
-        match db.batch_create_consumers(&consumers).await {
-            Ok(n) => created_consumers = n,
-            Err(e) => errors.push(format!("consumers: {}", e)),
-        }
-    }
-
-    // Upstreams (no dependencies)
-    if !payload.upstreams.is_empty() {
-        match db.batch_create_upstreams(&payload.upstreams).await {
-            Ok(n) => created_upstreams = n,
-            Err(e) => errors.push(format!("upstreams: {}", e)),
-        }
-    }
-
-    // Proxies (may reference upstreams). Persist rows first; proxy/plugin
-    // associations are attached after plugin configs exist.
-    if !payload.proxies.is_empty() {
-        match db
-            .batch_create_proxies_without_plugins(&payload.proxies)
-            .await
-        {
-            Ok(n) => created_proxies = n,
-            Err(e) => errors.push(format!("proxies: {}", e)),
-        }
-    }
-
-    // Plugin configs (may reference proxies)
-    if !payload.plugin_configs.is_empty() {
-        match db
-            .batch_create_plugin_configs(&payload.plugin_configs)
-            .await
-        {
-            Ok(n) => created_plugin_configs = n,
-            Err(e) => errors.push(format!("plugin_configs: {}", e)),
-        }
-    }
-
-    if errors.is_empty()
-        && !payload.proxies.is_empty()
-        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies).await
-    {
-        errors.push(format!("proxy_plugins: {}", e));
-    }
+    let mut errors = Vec::new();
+    apply_payload_namespace(&mut payload, namespace);
+    hash_payload_consumers(&mut payload.consumers, &mut errors);
+    let (created, mut persist_errors) =
+        persist_payload_resources(db.as_ref(), &payload, false).await;
+    errors.append(&mut persist_errors);
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
-        created_proxies, created_consumers, created_plugin_configs, created_upstreams
+        created.proxies, created.consumers, created.plugin_configs, created.upstreams
     );
 
     let mut response = json!({
         "restored": {
-            "proxies": created_proxies,
-            "consumers": created_consumers,
-            "plugin_configs": created_plugin_configs,
-            "upstreams": created_upstreams,
+            "proxies": created.proxies,
+            "consumers": created.consumers,
+            "plugin_configs": created.plugin_configs,
+            "upstreams": created.upstreams,
         }
     });
 
@@ -2288,39 +2080,6 @@ async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Byte
             StatusCode::OK,
             &json!([crate::config::types::DEFAULT_NAMESPACE]),
         ))
-    }
-}
-
-/// Filter a GatewayConfig to only include resources matching the given namespace.
-fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str) -> GatewayConfig {
-    GatewayConfig {
-        version: config.version.clone(),
-        proxies: config
-            .proxies
-            .iter()
-            .filter(|p| p.namespace == namespace)
-            .cloned()
-            .collect(),
-        consumers: config
-            .consumers
-            .iter()
-            .filter(|c| c.namespace == namespace)
-            .cloned()
-            .collect(),
-        plugin_configs: config
-            .plugin_configs
-            .iter()
-            .filter(|pc| pc.namespace == namespace)
-            .cloned()
-            .collect(),
-        upstreams: config
-            .upstreams
-            .iter()
-            .filter(|u| u.namespace == namespace)
-            .cloned()
-            .collect(),
-        loaded_at: config.loaded_at,
-        known_namespaces: config.known_namespaces.clone(),
     }
 }
 
@@ -2381,125 +2140,17 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
 /// Create a copy of the consumer with sensitive credential values redacted
 /// for safe inclusion in API responses.
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
-    let mut redacted = consumer.clone();
-
-    /// Redact a secret field in a credential value, handling both single-object
-    /// and array-of-objects formats.
-    fn redact_field(cred_value: &mut serde_json::Value, field: &str) {
-        match cred_value {
-            serde_json::Value::Array(arr) => {
-                for entry in arr.iter_mut() {
-                    if let Some(obj) = entry.as_object_mut()
-                        && obj.contains_key(field)
-                    {
-                        obj.insert(field.to_string(), json!("[REDACTED]"));
-                    }
-                }
-            }
-            serde_json::Value::Object(obj) if obj.contains_key(field) => {
-                obj.insert(field.to_string(), json!("[REDACTED]"));
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(basic) = redacted.credentials.get_mut("basicauth") {
-        redact_field(basic, "password_hash");
-    }
-    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
-        redact_field(hmac, "secret");
-    }
-    if let Some(jwt) = redacted.credentials.get_mut("jwt") {
-        redact_field(jwt, "secret");
-    }
-    redacted
+    crate::config::types::redact_consumer_credentials(consumer)
 }
 
 fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
-    // Hash basicauth passwords — supports both single-object and array formats
-    if let Some(basic) = consumer.credentials.get_mut("basicauth") {
-        match basic {
-            serde_json::Value::Array(arr) => {
-                for entry in arr.iter_mut() {
-                    if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                        let hash = hash_basic_auth_password(pass).map_err(|e| {
-                            format!(
-                                "Failed to hash password for consumer {}: {}",
-                                consumer.id, e
-                            )
-                        })?;
-                        entry["password_hash"] = json!(hash);
-                        if let Some(obj) = entry.as_object_mut() {
-                            obj.remove("password");
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Some(pass) = basic.get("password").and_then(|p| p.as_str()) {
-                    let hash = hash_basic_auth_password(pass).map_err(|e| {
-                        format!(
-                            "Failed to hash password for consumer {}: {}",
-                            consumer.id, e
-                        )
-                    })?;
-                    basic["password_hash"] = json!(hash);
-                    if let Some(obj) = basic.as_object_mut() {
-                        obj.remove("password");
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Hash a plaintext password for basic_auth storage.
-///
-/// Uses HMAC-SHA256 with the configured secret (or default) for ~1μs verification.
-/// Falls back to bcrypt ($2b$, ~100ms) only if HMAC instance creation fails.
-fn hash_basic_auth_password(password: &str) -> Result<String, String> {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
-    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| crate::plugins::basic_auth::DEFAULT_HMAC_SECRET.to_string());
-
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
-    mac.update(password.as_bytes());
-    let hash = hex::encode(mac.finalize().into_bytes());
-    Ok(format!("hmac_sha256:{}", hash))
+    crate::config::types::hash_consumer_secrets(consumer)
 }
 
 /// Hash passwords in a basicauth credential value (single object or array).
 /// Used by `handle_update_credentials()` where the credential type is already known.
 fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
-    match cred {
-        serde_json::Value::Array(arr) => {
-            for entry in arr.iter_mut() {
-                if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
-                    let hash = hash_basic_auth_password(pass)?;
-                    entry["password_hash"] = json!(hash);
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.remove("password");
-                    }
-                }
-            }
-        }
-        _ => {
-            if let Some(pass) = cred.get("password").and_then(|p| p.as_str()) {
-                let hash = hash_basic_auth_password(pass)?;
-                cred["password_hash"] = json!(hash);
-                if let Some(obj) = cred.as_object_mut() {
-                    obj.remove("password");
-                }
-            }
-        }
-    }
-    Ok(())
+    crate::config::types::hash_credential_passwords(cred)
 }
 
 /// Best-effort OS-level port availability check.
