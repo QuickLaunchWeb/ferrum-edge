@@ -49,6 +49,7 @@ pub enum VerifyOutcome {
     ConsumerNotFound(String),
     VerificationFailed(String),
     Forbidden(String),
+    Internal(String),
 }
 
 #[async_trait]
@@ -107,15 +108,15 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity,
                 external_identity_header,
             } => {
-                if let Some(consumer) = consumer {
-                    if ctx.identified_consumer.is_none() {
-                        debug!(
-                            "{}: identified consumer '{}'",
-                            mechanism.mechanism_name(),
-                            consumer.username
-                        );
-                        ctx.identified_consumer = Some(consumer);
-                    }
+                if let Some(consumer) = consumer
+                    && ctx.identified_consumer.is_none()
+                {
+                    debug!(
+                        "{}: identified consumer '{}'",
+                        mechanism.mechanism_name(),
+                        consumer.username
+                    );
+                    ctx.identified_consumer = Some(consumer);
                 }
 
                 if allow_external_identity {
@@ -135,6 +136,7 @@ async fn run_auth_impl<M: AuthMechanism>(
             | VerifyOutcome::ConsumerNotFound(body)
             | VerifyOutcome::VerificationFailed(body) => reject(401, body),
             VerifyOutcome::Forbidden(body) => reject(403, body),
+            VerifyOutcome::Internal(body) => reject(500, body),
         },
     }
 }

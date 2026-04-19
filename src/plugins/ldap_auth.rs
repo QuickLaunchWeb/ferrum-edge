@@ -705,7 +705,7 @@ impl AuthMechanism for LdapAuth {
                 }
                 Err(e) => {
                     warn!("{}", e);
-                    return VerifyOutcome::Invalid(
+                    return VerifyOutcome::Internal(
                         r#"{"error":"LDAP group membership check failed"}"#.into(),
                     );
                 }

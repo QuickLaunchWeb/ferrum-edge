@@ -427,7 +427,7 @@ impl AuthMechanism for JwksAuth {
                 return if status == 403 {
                     VerifyOutcome::Forbidden(body.to_string())
                 } else {
-                    VerifyOutcome::Invalid(body.to_string())
+                    VerifyOutcome::InvalidFormat(body.to_string())
                 };
             }
         };

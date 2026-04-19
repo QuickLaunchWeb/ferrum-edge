@@ -498,6 +498,11 @@ impl Plugin for MtlsAuth {
                 body,
                 headers: HashMap::new(),
             },
+            VerifyOutcome::Internal(body) => PluginResult::Reject {
+                status_code: 500,
+                body,
+                headers: HashMap::new(),
+            },
             VerifyOutcome::Invalid(body)
             | VerifyOutcome::InvalidFormat(body)
             | VerifyOutcome::ConsumerNotFound(body)
