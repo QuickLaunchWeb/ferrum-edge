@@ -1,10 +1,10 @@
 //! HTTP access logging plugin — batched async log shipping.
 //!
 //! Serializes `TransactionSummary` entries and sends them to a remote HTTP
-//! endpoint in batches. Uses an mpsc channel to decouple the proxy hot path
-//! from network I/O: the `log()` hook enqueues the entry (non-blocking), and
-//! a background task drains the channel in configurable batch sizes with a
-//! flush interval timer. Failed batches are retried with configurable delay.
+//! endpoint in batches. Uses `BatchingLogger<LogEntry>` to decouple the proxy
+//! hot path from network I/O: the `log()` hook enqueues the entry
+//! non-blockingly, and a shared background task drains the queue in
+//! configurable batch sizes with a flush interval timer.
 //!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
 //! `LogEntry` union type, and uses the shared `PluginHttpClient` for
@@ -13,12 +13,11 @@
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 use url::Url;
 
-use super::utils::PluginHttpClient;
+use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// Union type for log entries sent through the batched channel.
@@ -29,18 +28,15 @@ enum LogEntry {
     Stream(StreamTransactionSummary),
 }
 
-struct BatchConfig {
+#[derive(Clone)]
+struct HttpFlushConfig {
     endpoint_url: String,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
-    batch_size: usize,
-    flush_interval: Duration,
-    max_retries: u32,
-    retry_delay: Duration,
 }
 
 pub struct HttpLogging {
-    sender: mpsc::Sender<LogEntry>,
+    logger: BatchingLogger<LogEntry>,
     endpoint_hostname: Option<String>,
 }
 
@@ -93,29 +89,36 @@ impl HttpLogging {
                 let header_value = HeaderValue::from_str(v).map_err(|e| {
                     format!("http_logging: invalid custom_headers value for '{key}': {e}")
                 })?;
-                // Deduplicate case-insensitively — last value wins.
-                custom_headers.retain(|(k, _)| *k != header_name);
+                custom_headers.retain(|(existing, _)| *existing != header_name);
                 custom_headers.push((header_name, header_value));
             }
         }
 
-        let batch_config = BatchConfig {
+        let flush_config = HttpFlushConfig {
             endpoint_url,
             custom_headers,
             http_client,
-            batch_size,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries: config["max_retries"].as_u64().unwrap_or(3) as u32,
-            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
         };
-
-        let endpoint_hostname = parsed_url.host_str().map(|h| h.to_string());
-
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, batch_config));
+        let endpoint_hostname = parsed_url.host_str().map(|host| host.to_string());
+        let logger = BatchingLogger::spawn(
+            BatchConfig {
+                batch_size,
+                flush_interval: Duration::from_millis(flush_interval_ms),
+                buffer_capacity,
+                retry: RetryPolicy {
+                    max_attempts: config["max_retries"].as_u64().unwrap_or(3) as u32 + 1,
+                    delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
+                },
+                plugin_name: "http_logging",
+            },
+            move |batch| {
+                let flush_config = flush_config.clone();
+                async move { send_batch(&flush_config, batch).await }
+            },
+        );
 
         Ok(Self {
-            sender,
+            logger,
             endpoint_hostname,
         })
     }
@@ -136,127 +139,45 @@ impl Plugin for HttpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Stream(summary.clone()))
-            .is_err()
-        {
-            warn!("HTTP logging buffer full — dropping stream log entry");
-        }
+        self.logger.try_send(LogEntry::Stream(summary.clone()));
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if self
-            .sender
-            .try_send(LogEntry::Http(summary.clone()))
-            .is_err()
-        {
-            warn!("HTTP logging buffer full — dropping log entry");
-        }
+        self.logger.try_send(LogEntry::Http(summary.clone()));
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
         self.endpoint_hostname
             .as_ref()
-            .map(|h| vec![h.clone()])
+            .map(|host| vec![host.clone()])
             .unwrap_or_default()
     }
 }
 
-async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: BatchConfig) {
-    if cfg.endpoint_url.is_empty() {
-        // Drain the channel without sending anything.
-        while receiver.recv().await.is_some() {}
-        return;
-    }
-
-    let mut buffer: Vec<LogEntry> = Vec::with_capacity(cfg.batch_size);
-    let mut timer = tokio::time::interval(cfg.flush_interval);
-    // The first tick completes immediately — consume it so the first real
-    // flush waits for one full interval.
-    timer.tick().await;
-
-    loop {
-        tokio::select! {
-            biased;
-
-            msg = receiver.recv() => {
-                match msg {
-                    Some(summary) => {
-                        buffer.push(summary);
-                        if buffer.len() >= cfg.batch_size {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&cfg, batch).await;
-                        }
-                    }
-                    None => {
-                        // Channel closed — flush remaining entries and exit.
-                        if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            send_batch(&cfg, batch).await;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            _ = timer.tick() => {
-                if !buffer.is_empty() {
-                    let batch = std::mem::take(&mut buffer);
-                    send_batch(&cfg, batch).await;
-                }
-            }
-        }
-    }
-}
-
-async fn send_batch(cfg: &BatchConfig, batch: Vec<LogEntry>) {
-    let total_attempts = cfg.max_retries + 1;
+async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<LogEntry>) -> Result<(), String> {
     let entry_count = batch.len();
-
-    for attempt in 1..=total_attempts {
-        let mut req = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
-        for (name, value) in &cfg.custom_headers {
-            req = req.header(name.clone(), value.clone());
-        }
-        match cfg.http_client.execute(req, "http_logging").await {
-            Ok(response) if response.status().is_success() => return,
-            Ok(response) => {
-                let status = response.status();
-                warn!(
-                    "HTTP logging batch failed with status {} (attempt {}/{})",
-                    status, attempt, total_attempts,
-                );
-                // 4xx is a client error — retrying a malformed/unauthorized
-                // payload just delays the drop. Bail immediately, except for
-                // 408 (Request Timeout) and 429 (Too Many Requests) which are
-                // transient and worth retrying within the configured budget.
-                if status.is_client_error()
-                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-                {
-                    warn!(
-                        "HTTP logging batch discarded due to {} response ({} entries lost)",
-                        status, entry_count,
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "HTTP logging batch failed: {} (attempt {}/{})",
-                    e, attempt, total_attempts,
-                );
-            }
-        }
-        if attempt < total_attempts {
-            tokio::time::sleep(cfg.retry_delay).await;
-        }
+    let mut req = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
+    for (name, value) in &cfg.custom_headers {
+        req = req.header(name.clone(), value.clone());
     }
 
-    warn!(
-        "HTTP logging batch discarded after {} attempts ({} entries lost)",
-        total_attempts, entry_count,
-    );
-    // `batch` is dropped here, freeing memory.
+    match cfg.http_client.execute(req, "http_logging").await {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => {
+            let status = response.status();
+            if status.is_client_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            {
+                warn!(
+                    "HTTP logging batch discarded due to {} response ({} entries lost)",
+                    status, entry_count,
+                );
+                Ok(())
+            } else {
+                Err(format!("HTTP logging batch failed with status {status}"))
+            }
+        }
+        Err(error) => Err(format!("HTTP logging batch failed: {error}")),
+    }
 }
