@@ -617,16 +617,20 @@ pub async fn handle_admin_request(
 
         // Consumers CRUD
         (Method::GET, ["consumers"]) => {
-            handle_list_consumers(&state, &pagination, &namespace).await
+            crud::handle_list::<Consumer>(&state, &pagination, &namespace).await
         }
         (Method::POST, ["consumers"]) => {
-            handle_create_consumer(&state, &body_bytes, &namespace).await
+            crud::handle_create::<Consumer>(&state, &body_bytes, &namespace).await
         }
-        (Method::GET, ["consumers", id]) => handle_get_consumer(&state, id, &namespace).await,
+        (Method::GET, ["consumers", id]) => {
+            crud::handle_get::<Consumer>(&state, id, &namespace).await
+        }
         (Method::PUT, ["consumers", id]) => {
-            handle_update_consumer(&state, id, &body_bytes, &namespace).await
+            crud::handle_update::<Consumer>(&state, id, &body_bytes, &namespace).await
         }
-        (Method::DELETE, ["consumers", id]) => handle_delete_consumer(&state, id, &namespace).await,
+        (Method::DELETE, ["consumers", id]) => {
+            crud::handle_delete::<Consumer>(&state, id, &namespace).await
+        }
 
         // Consumer credentials
         (Method::PUT, ["consumers", consumer_id, "credentials", cred_type]) => {
@@ -705,463 +709,6 @@ pub async fn handle_admin_request(
 
 // ---- Consumer CRUD ----
 
-async fn handle_list_consumers(
-    state: &AdminState,
-    pagination: &PaginationParams,
-    namespace: &str,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Try database-level pagination first, fall back to cached config for resilience
-    if let Some(ref db) = state.db {
-        match db
-            .list_consumers_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
-            .await
-        {
-            Ok(result) => {
-                let redacted: Vec<_> = result
-                    .items
-                    .iter()
-                    .map(redact_consumer_credentials)
-                    .collect();
-                let body = paginate_db_response(&redacted, result.total, pagination);
-                return Ok(json_response(StatusCode::OK, &body));
-            }
-            Err(e) => {
-                warn!(
-                    "Database unavailable for list consumers, falling back to cached config: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    // Fallback: serve from in-memory cached config
-    if let Some(config) = state.cached_gateway_config() {
-        let redacted: Vec<_> = config
-            .consumers
-            .iter()
-            .filter(|c| c.namespace == namespace)
-            .map(redact_consumer_credentials)
-            .collect();
-        let body = paginate_response(&json!(redacted), pagination);
-        Ok(json_response_with_stale(StatusCode::OK, &body))
-    } else {
-        Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": "No database and no cached config available"}),
-        ))
-    }
-}
-
-async fn handle_create_consumer(
-    state: &AdminState,
-    body: &[u8],
-    namespace: &str,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Check if admin API is in read-only mode
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
-
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
-    };
-
-    let mut consumer: Consumer = match serde_json::from_slice(body) {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid body: {}", e)}),
-            ));
-        }
-    };
-
-    if consumer.id.is_empty() {
-        consumer.id = Uuid::new_v4().to_string();
-    } else if let Err(msg) = validate_resource_id(&consumer.id) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": msg}),
-        ));
-    }
-
-    consumer.normalize_fields();
-    consumer.namespace = namespace.to_string();
-
-    // Validate field lengths, credential sizes, and control characters
-    if let Err(field_errors) = consumer.validate_fields() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid consumer fields: {}", field_errors.join("; "))}),
-        ));
-    }
-
-    consumer.created_at = Utc::now();
-    consumer.updated_at = Utc::now();
-
-    // Check ID uniqueness
-    match db.get_consumer(&consumer.id).await {
-        Ok(Some(_)) => {
-            return Ok(json_response(
-                StatusCode::CONFLICT,
-                &json!({"error": format!("Consumer with ID '{}' already exists", consumer.id)}),
-            ));
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &db_error_response(&e),
-            ));
-        }
-    }
-
-    match db
-        .check_consumer_identity_unique(
-            namespace,
-            &consumer.username,
-            consumer.custom_id.as_deref(),
-            None,
-        )
-        .await
-    {
-        Ok(Some(msg)) => {
-            return Ok(json_response(StatusCode::CONFLICT, &json!({"error": msg})));
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &db_error_response(&e),
-            ));
-        }
-    }
-
-    // Hash any secrets in credentials
-    if let Err(e) = hash_consumer_secrets(&mut consumer) {
-        return Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": e}),
-        ));
-    }
-
-    // Check keyauth API key uniqueness for all entries (supports arrays)
-    for key_creds in consumer.credential_entries("keyauth") {
-        if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
-            match db.check_keyauth_key_unique(namespace, key, None).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        &json!({"error": "A consumer with this API key already exists"}),
-                    ));
-                }
-                Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &db_error_response(&e),
-                    ));
-                }
-            }
-        }
-    }
-
-    // Check mTLS identity uniqueness for all entries (supports arrays)
-    for mtls_creds in consumer.credential_entries("mtls_auth") {
-        if let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
-            match db
-                .check_mtls_identity_unique(namespace, identity, None)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        &json!({"error": "A consumer with this mTLS identity already exists"}),
-                    ));
-                }
-                Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &db_error_response(&e),
-                    ));
-                }
-            }
-        }
-    }
-
-    match db.create_consumer(&consumer).await {
-        Ok(_) => Ok(json_response(
-            StatusCode::CREATED,
-            &json!(redact_consumer_credentials(&consumer)),
-        )),
-        Err(e) => {
-            let msg = format!("{}", e);
-            let status = if is_unique_constraint_violation(&msg) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            Ok(json_response(status, &json!({"error": msg})))
-        }
-    }
-}
-
-async fn handle_get_consumer(
-    state: &AdminState,
-    id: &str,
-    namespace: &str,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Try database first
-    if let Some(ref db) = state.db {
-        match db.get_consumer(id).await {
-            Ok(Some(c)) => {
-                if c.namespace != namespace {
-                    return Ok(json_response(
-                        StatusCode::NOT_FOUND,
-                        &json!({"error": "Consumer not found"}),
-                    ));
-                }
-                return Ok(json_response(
-                    StatusCode::OK,
-                    &json!(redact_consumer_credentials(&c)),
-                ));
-            }
-            Ok(None) => {
-                return Ok(json_response(
-                    StatusCode::NOT_FOUND,
-                    &json!({"error": "Consumer not found"}),
-                ));
-            }
-            Err(e) => {
-                warn!(
-                    "Database unavailable for get consumer, falling back to cached config: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    // Fallback: search in cached config
-    if let Some(config) = state.cached_gateway_config() {
-        match config
-            .consumers
-            .iter()
-            .find(|c| c.id == id && c.namespace == namespace)
-        {
-            Some(consumer) => Ok(json_response_with_stale(
-                StatusCode::OK,
-                &json!(redact_consumer_credentials(consumer)),
-            )),
-            None => Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": "Consumer not found"}),
-            )),
-        }
-    } else {
-        Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": "No database and no cached config available"}),
-        ))
-    }
-}
-
-async fn handle_update_consumer(
-    state: &AdminState,
-    id: &str,
-    body: &[u8],
-    namespace: &str,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Check if admin API is in read-only mode
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
-
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
-    };
-
-    let mut consumer: Consumer = match serde_json::from_slice(body) {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("Invalid body: {}", e)}),
-            ));
-        }
-    };
-
-    consumer.id = id.to_string();
-    consumer.updated_at = Utc::now();
-    consumer.normalize_fields();
-    consumer.namespace = namespace.to_string();
-
-    // Validate field lengths, credential sizes, and control characters
-    if let Err(field_errors) = consumer.validate_fields() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Invalid consumer fields: {}", field_errors.join("; "))}),
-        ));
-    }
-
-    if let Err(e) = hash_consumer_secrets(&mut consumer) {
-        return Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": e}),
-        ));
-    }
-
-    match db
-        .check_consumer_identity_unique(
-            namespace,
-            &consumer.username,
-            consumer.custom_id.as_deref(),
-            Some(id),
-        )
-        .await
-    {
-        Ok(Some(msg)) => {
-            return Ok(json_response(StatusCode::CONFLICT, &json!({"error": msg})));
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &db_error_response(&e),
-            ));
-        }
-    }
-
-    // Check keyauth API key uniqueness excluding self for all entries (supports arrays)
-    for key_creds in consumer.credential_entries("keyauth") {
-        if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
-            match db.check_keyauth_key_unique(namespace, key, Some(id)).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        &json!({"error": "A consumer with this API key already exists"}),
-                    ));
-                }
-                Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &db_error_response(&e),
-                    ));
-                }
-            }
-        }
-    }
-
-    // Check mTLS identity uniqueness excluding self for all entries (supports arrays)
-    for mtls_creds in consumer.credential_entries("mtls_auth") {
-        if let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
-            match db
-                .check_mtls_identity_unique(namespace, identity, Some(id))
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(json_response(
-                        StatusCode::CONFLICT,
-                        &json!({"error": "A consumer with this mTLS identity already exists"}),
-                    ));
-                }
-                Err(e) => {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &db_error_response(&e),
-                    ));
-                }
-            }
-        }
-    }
-
-    match db.update_consumer(&consumer).await {
-        Ok(_) => Ok(json_response(
-            StatusCode::OK,
-            &json!(redact_consumer_credentials(&consumer)),
-        )),
-        Err(e) => {
-            let msg = format!("{}", e);
-            let status = if is_unique_constraint_violation(&msg) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            Ok(json_response(status, &json!({"error": msg})))
-        }
-    }
-}
-
-async fn handle_delete_consumer(
-    state: &AdminState,
-    id: &str,
-    namespace: &str,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Check if admin API is in read-only mode
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
-
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
-        }
-    };
-
-    // Verify the consumer belongs to the requested namespace before deleting
-    match db.get_consumer(id).await {
-        Ok(Some(c)) if c.namespace != namespace => {
-            return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": "Consumer not found"}),
-            ));
-        }
-        Ok(None) => {
-            return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": "Consumer not found"}),
-            ));
-        }
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("{}", e)}),
-            ));
-        }
-        _ => {}
-    }
-
-    match db.delete_consumer(id).await {
-        Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
-        Ok(false) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Consumer not found"}),
-        )),
-        Err(e) => Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
-    }
-}
-
 /// Allowed credential types for consumer authentication plugins.
 pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
     &["basicauth", "keyauth", "jwt", "hmac_auth", "mtls_auth"];
@@ -1217,73 +764,35 @@ async fn handle_update_credentials(
                 ));
             }
             let mut hashed_cred = cred_value.clone();
-            // Hash password if basicauth (supports both single object and array)
             if cred_type == "basicauth"
-                && let Err(e) = hash_credential_passwords(&mut hashed_cred)
+                && let Err(e) = crud::hash_basic_auth_credentials(&mut hashed_cred)
             {
                 return Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({"error": e}),
                 ));
             }
-            // Check keyauth API key uniqueness for all entries before updating
-            if cred_type == "keyauth" {
-                let entries: Vec<&serde_json::Value> = match &hashed_cred {
-                    serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
-                    val if val.is_object() => vec![val],
-                    _ => vec![],
-                };
-                for entry in entries {
-                    if let Some(key) = entry.get("key").and_then(|k| k.as_str()) {
-                        match db
-                            .check_keyauth_key_unique(namespace, key, Some(consumer_id))
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                return Ok(json_response(
-                                    StatusCode::CONFLICT,
-                                    &json!({"error": "A consumer with this API key already exists"}),
-                                ));
-                            }
-                            Err(e) => {
-                                return Ok(json_response(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    &db_error_response(&e),
-                                ));
-                            }
-                        }
-                    }
+            match crud::check_credential_value_uniqueness(
+                db.as_ref(),
+                namespace,
+                cred_type,
+                &hashed_cred,
+                Some(consumer_id),
+            )
+            .await
+            {
+                Ok(Some(message)) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": message}),
+                    ));
                 }
-            }
-            // Check mTLS identity uniqueness for all entries before updating
-            if cred_type == "mtls_auth" {
-                let entries: Vec<&serde_json::Value> = match &hashed_cred {
-                    serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
-                    val if val.is_object() => vec![val],
-                    _ => vec![],
-                };
-                for entry in entries {
-                    if let Some(identity) = entry.get("identity").and_then(|i| i.as_str()) {
-                        match db
-                            .check_mtls_identity_unique(namespace, identity, Some(consumer_id))
-                            .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                return Ok(json_response(
-                                    StatusCode::CONFLICT,
-                                    &json!({"error": "A consumer with this mTLS identity already exists"}),
-                                ));
-                            }
-                            Err(e) => {
-                                return Ok(json_response(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    &db_error_response(&e),
-                                ));
-                            }
-                        }
-                    }
+                Ok(None) => {}
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
                 }
             }
 
@@ -1301,14 +810,11 @@ async fn handle_update_credentials(
 
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
-                Ok(_) => Ok(json_response(
-                    StatusCode::OK,
-                    &json!(redact_consumer_credentials(&consumer)),
-                )),
-                Err(e) => Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": format!("{}", e)}),
-                )),
+                Ok(_) => {
+                    let body = crud::consumer_response_body(&consumer);
+                    Ok(json_response(StatusCode::OK, &body))
+                }
+                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
             }
         }
         Ok(None) => Ok(json_response(
@@ -1365,10 +871,7 @@ async fn handle_delete_credentials(
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
                 Ok(_) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
-                Err(e) => Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": format!("{}", e)}),
-                )),
+                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
             }
         }
         Ok(None) => Ok(json_response(
@@ -1441,9 +944,8 @@ async fn handle_append_credential(
                     &json!({"error": "Consumer not found"}),
                 ));
             }
-            // Hash password if basicauth
             if cred_type == "basicauth"
-                && let Err(e) = hash_credential_passwords(&mut new_cred)
+                && let Err(e) = crud::hash_basic_auth_credentials(&mut new_cred)
             {
                 return Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1451,49 +953,27 @@ async fn handle_append_credential(
                 ));
             }
 
-            // Check uniqueness for the new entry
-            if cred_type == "keyauth"
-                && let Some(key) = new_cred.get("key").and_then(|k| k.as_str())
+            match crud::check_credential_value_uniqueness(
+                db.as_ref(),
+                namespace,
+                cred_type,
+                &new_cred,
+                Some(consumer_id),
+            )
+            .await
             {
-                match db
-                    .check_keyauth_key_unique(namespace, key, Some(consumer_id))
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Ok(json_response(
-                            StatusCode::CONFLICT,
-                            &json!({"error": "A consumer with this API key already exists"}),
-                        ));
-                    }
-                    Err(e) => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &db_error_response(&e),
-                        ));
-                    }
+                Ok(Some(message)) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": message}),
+                    ));
                 }
-            }
-            if cred_type == "mtls_auth"
-                && let Some(identity) = new_cred.get("identity").and_then(|i| i.as_str())
-            {
-                match db
-                    .check_mtls_identity_unique(namespace, identity, Some(consumer_id))
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Ok(json_response(
-                            StatusCode::CONFLICT,
-                            &json!({"error": "A consumer with this mTLS identity already exists"}),
-                        ));
-                    }
-                    Err(e) => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &db_error_response(&e),
-                        ));
-                    }
+                Ok(None) => {}
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
                 }
             }
 
@@ -1540,14 +1020,11 @@ async fn handle_append_credential(
 
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
-                Ok(_) => Ok(json_response(
-                    StatusCode::OK,
-                    &json!(redact_consumer_credentials(&consumer)),
-                )),
-                Err(e) => Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": format!("{}", e)}),
-                )),
+                Ok(_) => {
+                    let body = crud::consumer_response_body(&consumer);
+                    Ok(json_response(StatusCode::OK, &body))
+                }
+                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
             }
         }
         Ok(None) => Ok(json_response(
@@ -1665,14 +1142,11 @@ async fn handle_delete_credential_by_index(
 
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
-                Ok(_) => Ok(json_response(
-                    StatusCode::OK,
-                    &json!(redact_consumer_credentials(&consumer)),
-                )),
-                Err(e) => Ok(json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": format!("{}", e)}),
-                )),
+                Ok(_) => {
+                    let body = crud::consumer_response_body(&consumer);
+                    Ok(json_response(StatusCode::OK, &body))
+                }
+                Err(e) => Ok(crud::consumer_persist_error_response(&e)),
             }
         }
         Ok(None) => Ok(json_response(

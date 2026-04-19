@@ -295,6 +295,16 @@ pub(crate) fn consumer_response_body(consumer: &Consumer) -> Value {
     json!(redact_consumer_for_response(consumer))
 }
 
+pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    let message = error.to_string();
+    let status = if super::is_unique_constraint_violation(&message) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    super::json_response(status, &json!({"error": message}))
+}
+
 pub(crate) fn hash_consumer_credentials(consumer: &mut Consumer) -> Result<(), String> {
     super::hash_consumer_secrets(consumer)
 }
@@ -321,38 +331,75 @@ pub(crate) async fn check_consumer_credential_uniqueness(
     consumer: &Consumer,
     exclude_consumer_id: Option<&str>,
 ) -> DbResult<Option<String>> {
-    for key_creds in consumer.credential_entries("keyauth") {
-        if let Some(key) = key_creds.get("key").and_then(|value| value.as_str()) {
-            match db
-                .check_keyauth_key_unique(namespace, key, exclude_consumer_id)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(Some(
-                        "A consumer with this API key already exists".to_string(),
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
+    for cred_type in ["keyauth", "mtls_auth"] {
+        if let Some(cred_value) = consumer.credentials.get(cred_type)
+            && let Some(message) = check_credential_value_uniqueness(
+                db,
+                namespace,
+                cred_type,
+                cred_value,
+                exclude_consumer_id,
+            )
+            .await?
+        {
+            return Ok(Some(message));
         }
     }
 
-    for mtls_creds in consumer.credential_entries("mtls_auth") {
-        if let Some(identity) = mtls_creds.get("identity").and_then(|value| value.as_str()) {
-            match db
-                .check_mtls_identity_unique(namespace, identity, exclude_consumer_id)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(Some(
-                        "A consumer with this mTLS identity already exists".to_string(),
-                    ));
+    Ok(None)
+}
+
+pub(crate) async fn check_credential_value_uniqueness(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    cred_type: &str,
+    cred_value: &Value,
+    exclude_consumer_id: Option<&str>,
+) -> DbResult<Option<String>> {
+    let entries: Vec<&Value> = match cred_value {
+        Value::Array(arr) => arr.iter().filter(|value| value.is_object()).collect(),
+        value if value.is_object() => vec![value],
+        _ => vec![],
+    };
+
+    match cred_type {
+        "keyauth" => {
+            for entry in entries {
+                if let Some(key) = entry.get("key").and_then(|value| value.as_str()) {
+                    match db
+                        .check_keyauth_key_unique(namespace, key, exclude_consumer_id)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Ok(Some(
+                                "A consumer with this API key already exists".to_string(),
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
+        "mtls_auth" => {
+            for entry in entries {
+                if let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) {
+                    match db
+                        .check_mtls_identity_unique(namespace, identity, exclude_consumer_id)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Ok(Some(
+                                "A consumer with this mTLS identity already exists".to_string(),
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(None)
@@ -884,6 +931,112 @@ impl AdminResource for Proxy {
         }
 
         Ok(())
+    }
+}
+
+impl AdminResource for Consumer {
+    const RESOURCE_NAME: &'static str = "consumer";
+    const RESOURCE_LABEL: &'static str = "Consumer";
+    const VALIDATION_ERROR_LABEL: &'static str = "consumer fields";
+    const NOT_FOUND_MESSAGE: &'static str = "Consumer not found";
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn set_namespace(&mut self, ns: String) {
+        self.namespace = ns;
+    }
+
+    fn set_created_at(&mut self, now: DateTime<Utc>) {
+        self.created_at = now;
+    }
+
+    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+        self.updated_at = now;
+    }
+
+    fn normalize(&mut self) {
+        self.normalize_fields();
+    }
+
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
+        self.validate_fields()
+    }
+
+    fn cached_items(config: &GatewayConfig) -> &[Self] {
+        &config.consumers
+    }
+
+    fn response_body(resource: &Self) -> Value {
+        consumer_response_body(resource)
+    }
+
+    fn prepare_for_write(&mut self) -> Result<(), String> {
+        hash_consumer_credentials(self)
+    }
+
+    fn map_persist_db_error(
+        error: &anyhow::Error,
+        _action: WriteAction<'_>,
+    ) -> Response<Full<Bytes>> {
+        consumer_persist_error_response(error)
+    }
+
+    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        db.get_consumer(id).await
+    }
+
+    async fn db_list(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_consumers_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
+            .await
+    }
+
+    async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.create_consumer(resource).await
+    }
+
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.update_consumer(resource).await
+    }
+
+    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
+        db.delete_consumer(id).await
+    }
+
+    async fn check_uniqueness(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        resource: &Self,
+        exclude_id: Option<&str>,
+    ) -> DbResult<Option<String>> {
+        match db
+            .check_consumer_identity_unique(
+                namespace,
+                &resource.username,
+                resource.custom_id.as_deref(),
+                exclude_id,
+            )
+            .await
+        {
+            Ok(Some(message)) => return Ok(Some(message)),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+
+        check_consumer_credential_uniqueness(db, namespace, resource, exclude_id).await
     }
 }
 
