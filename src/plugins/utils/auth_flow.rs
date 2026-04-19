@@ -108,12 +108,14 @@ async fn run_auth_impl<M: AuthMechanism>(
                 external_identity_header,
             } => {
                 if let Some(consumer) = consumer {
-                    debug!(
-                        "{}: identified consumer '{}'",
-                        mechanism.mechanism_name(),
-                        consumer.username
-                    );
-                    ctx.identified_consumer = Some(consumer);
+                    if ctx.identified_consumer.is_none() {
+                        debug!(
+                            "{}: identified consumer '{}'",
+                            mechanism.mechanism_name(),
+                            consumer.username
+                        );
+                        ctx.identified_consumer = Some(consumer);
+                    }
                 }
 
                 if allow_external_identity {

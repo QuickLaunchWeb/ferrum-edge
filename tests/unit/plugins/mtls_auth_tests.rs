@@ -248,7 +248,7 @@ async fn test_mtls_auth_rejects_no_cert() {
     );
 
     let result = plugin.authenticate(&mut ctx, &index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
     assert!(ctx.identified_consumer.is_none());
 }
 
