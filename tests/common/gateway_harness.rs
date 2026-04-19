@@ -559,6 +559,8 @@ async fn build_env(
         }
         GatewayMode::DataPlane { cp_grpc_urls } => {
             env.insert("FERRUM_MODE".into(), "dp".into());
+            env.insert("FERRUM_ADMIN_JWT_SECRET".into(), b.jwt_secret.clone());
+            env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), b.jwt_issuer.clone());
             env.insert(
                 "FERRUM_CP_DP_GRPC_JWT_SECRET".into(),
                 "ferrum-edge-shared-harness-grpc-secret00".into(),
