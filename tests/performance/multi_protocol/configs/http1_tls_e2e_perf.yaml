@@ -8,7 +8,7 @@ proxies:
     listen_path: "/echo"
     backend_protocol: https
     backend_host: "127.0.0.1"
-    backend_port: 3443
+    backend_port: 3447
     strip_listen_path: false
     preserve_host_header: false
     backend_connect_timeout_ms: 5000

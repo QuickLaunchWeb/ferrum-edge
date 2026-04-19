@@ -7,7 +7,7 @@ _format_version: "3.0"
 services:
   - name: echo-service
     host: 127.0.0.1
-    port: 3443
+    port: 3447
     protocol: https
     tls_verify: false
     connect_timeout: 5000

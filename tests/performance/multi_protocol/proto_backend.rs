@@ -5,7 +5,7 @@
 //!   WebSocket:      3003    WSS:       3446
 //!   TCP echo:       3004    TCP+TLS:   3444
 //!   UDP echo:       3005    DTLS echo: 3006
-//!   HTTP/3 (QUIC):  3445
+//!   HTTP/3 (QUIC):  3445    H1+TLS:    3447
 //!   gRPC h2c:      50052    gRPC+TLS: 50053
 
 use std::convert::Infallible;
@@ -170,6 +170,30 @@ async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
                 .adaptive_window(true)
                 .max_frame_size(1_048_576) // 1 MiB
                 .max_concurrent_streams(1000)
+                .serve_connection(io, hyper::service::service_fn(handle_http))
+                .await;
+        });
+    }
+}
+
+async fn run_h1_tls_server(
+    addr: SocketAddr,
+    tls_cfg: Arc<rustls::ServerConfig>,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("binding h1-tls listener")?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let io = TokioIo::new(tls_stream);
+            let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, hyper::service::service_fn(handle_http))
                 .await;
         });
@@ -581,6 +605,7 @@ async fn main() -> anyhow::Result<()> {
     println!("HTTP/1.1 Health:  127.0.0.1:3010");
     println!("HTTP/2 (h2c):    127.0.0.1:3002");
     println!("HTTPS/H2 (TLS):  127.0.0.1:3443");
+    println!("HTTP/1.1+TLS:     127.0.0.1:3447");
     println!("WebSocket:        127.0.0.1:3003");
     println!("WSS (TLS):         127.0.0.1:3446");
     println!("gRPC (h2c):       127.0.0.1:50052");
@@ -617,6 +642,17 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("h2-tls server error: {e}");
         }
     });
+    {
+        let h1_tls = Arc::new(
+            tls_utils::make_server_tls_config(&cert_path, &key_path)
+                .context("building h1-tls server config")?,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = run_h1_tls_server("127.0.0.1:3447".parse().unwrap(), h1_tls).await {
+                eprintln!("h1-tls server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async {
         if let Err(e) = run_ws_server("127.0.0.1:3003".parse().unwrap()).await {
             eprintln!("ws server error: {e}");

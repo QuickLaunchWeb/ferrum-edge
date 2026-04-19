@@ -26,7 +26,7 @@
       "output_encoding": "no-op",
       "backend": [
         {
-          "host": ["https://127.0.0.1:3443"],
+          "host": ["https://127.0.0.1:3447"],
           "url_pattern": "/echo",
           "encoding": "no-op",
           "disable_host_sanitize": true

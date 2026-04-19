@@ -105,7 +105,7 @@ GATEWAY_UDP_DTLS_PORT=5004
 # benchmark backend's self-signed CA via --ca-cert for both legs.
 bench_params() {
     case "$PROTOCOL" in
-        http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
+        http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3447/echo" ;;
         http2)     echo "http2 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
         http3)     echo "http3 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3445/echo" ;;
         grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} https://127.0.0.1:50053 --ca-cert ${CERT_DIR}/cert.pem" ;;
@@ -139,7 +139,8 @@ cleanup() {
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     [ -n "$GATEWAY_CID" ] && docker rm -f "$GATEWAY_CID" >/dev/null 2>&1 || true
     [ -n "$REDIS_CID" ] && docker rm -f "$REDIS_CID" >/dev/null 2>&1 || true
-    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
+    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
+                50052 50053 \
                 $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT \
                 $GATEWAY_TCP_TLS_PORT $GATEWAY_UDP_PORT $GATEWAY_UDP_DTLS_PORT \
                 15000 9901 6379; do

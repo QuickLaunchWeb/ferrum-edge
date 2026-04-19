@@ -1,6 +1,7 @@
 # Envoy HTTP/1.1 end-to-end TLS reverse proxy config.
-# Listener on 8443 with TLS termination → HTTPS/H2 backend on 3443 (H1 over TLS).
-# Every hop encrypted; matches Ferrum's http1_tls_e2e_perf.yaml.
+# Listener on 8443 with TLS termination → HTTP/1.1+TLS backend on 3447.
+# (Port 3443 is H2-only; 3447 is dedicated H1-over-TLS.) All hops encrypted.
+# Matches Ferrum's http1_tls_e2e_perf.yaml.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 15000 }
@@ -65,4 +66,4 @@ static_resources:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: 127.0.0.1, port_value: 3443 }
+                    socket_address: { address: 127.0.0.1, port_value: 3447 }
