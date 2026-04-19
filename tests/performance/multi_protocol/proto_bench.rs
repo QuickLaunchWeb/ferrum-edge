@@ -266,7 +266,19 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .context("invalid address")?;
-    let path = url.path().to_string();
+    // HTTP/2 requires requests built with a full absolute URI so hyper can
+    // populate the mandatory `:authority` pseudo-header. Using only the path
+    // (e.g. "/echo") emits a HEADERS frame with no `:authority`, which
+    // strict HTTP/2 servers (Envoy) reject as a "Violation in HTTP
+    // messaging rule" protocol error — GOAWAY + broken pipe on every
+    // stream, 0 RPS. See RFC 9113 §8.3.1.
+    let authority = format!("{host}:{port}");
+    let request_uri = format!(
+        "{}://{}{}",
+        if is_tls { "https" } else { "http" },
+        authority,
+        url.path()
+    );
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
 
@@ -347,12 +359,12 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
         let mut send_req = senders[i as usize % num_conns].clone();
-        let path = path.clone();
+        let uri = request_uri.clone();
         let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
             while Instant::now() < deadline {
-                let req = hyper::Request::post(&path)
+                let req = hyper::Request::post(&uri)
                     .body(http_body_util::Full::new(payload.clone()))
                     .unwrap();
                 let start = Instant::now();
