@@ -1,7 +1,4 @@
-//! Admin API for Ferrum Edge
-//!
-//! Provides REST API for managing proxies, consumers, and plugins
-//! with JWT-based authentication and authorization.
+//! Admin API for Ferrum Edge.
 
 pub(crate) mod crud;
 pub mod jwt_auth;
@@ -711,12 +708,12 @@ pub async fn handle_admin_request(
 
 // ---- Consumer CRUD ----
 
-fn require_db(state: &AdminState) -> Result<&Arc<dyn DatabaseBackend>, Response<Full<Bytes>>> {
+fn require_db(state: &AdminState) -> Result<&Arc<dyn DatabaseBackend>, Box<Response<Full<Bytes>>>> {
     state.db.as_ref().ok_or_else(|| {
-        json_response(
+        Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database"}),
-        )
+        ))
     })
 }
 
@@ -747,12 +744,12 @@ fn invalid_credential_fields_response(field_errors: &[String]) -> Response<Full<
     )
 }
 
-fn parse_json_value(body: &[u8]) -> Result<Value, Response<Full<Bytes>>> {
+fn parse_json_value(body: &[u8]) -> Result<Value, Box<Response<Full<Bytes>>>> {
     serde_json::from_slice(body).map_err(|e| {
-        json_response(
+        Box::new(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": format!("Invalid body: {}", e)}),
-        )
+        ))
     })
 }
 
@@ -788,28 +785,28 @@ async fn load_consumer_in_namespace(
     db: &dyn DatabaseBackend,
     consumer_id: &str,
     namespace: &str,
-) -> Result<Consumer, Response<Full<Bytes>>> {
+) -> Result<Consumer, Box<Response<Full<Bytes>>>> {
     match db.get_consumer(consumer_id).await {
         Ok(Some(consumer)) if consumer.namespace == namespace => Ok(consumer),
-        Ok(Some(_)) | Ok(None) => Err(consumer_not_found_response()),
-        Err(e) => Err(json_response(
+        Ok(Some(_)) | Ok(None) => Err(Box::new(consumer_not_found_response())),
+        Err(e) => Err(Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &db_error_response(&e),
-        )),
+        ))),
     }
 }
 
 fn hash_credential_if_needed(
     cred_type: &str,
     cred_value: &mut Value,
-) -> Result<(), Response<Full<Bytes>>> {
+) -> Result<(), Box<Response<Full<Bytes>>>> {
     if cred_type == "basicauth"
         && let Err(e) = crud::hash_basic_auth_credentials(cred_value)
     {
-        return Err(json_response(
+        return Err(Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": e}),
-        ));
+        )));
     }
     Ok(())
 }
@@ -820,7 +817,7 @@ async fn ensure_credential_unique(
     consumer_id: &str,
     cred_type: &str,
     cred_value: &Value,
-) -> Result<(), Response<Full<Bytes>>> {
+) -> Result<(), Box<Response<Full<Bytes>>>> {
     match crud::check_credential_value_uniqueness(
         db,
         namespace,
@@ -830,15 +827,15 @@ async fn ensure_credential_unique(
     )
     .await
     {
-        Ok(Some(message)) => Err(json_response(
+        Ok(Some(message)) => Err(Box::new(json_response(
             StatusCode::CONFLICT,
             &json!({"error": message}),
-        )),
+        ))),
         Ok(None) => Ok(()),
-        Err(e) => Err(json_response(
+        Err(e) => Err(Box::new(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &db_error_response(&e),
-        )),
+        ))),
     }
 }
 
@@ -961,25 +958,25 @@ async fn handle_update_credentials(
 
     let db = match require_db(state) {
         Ok(db) => db,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
 
     let mut cred_value = match parse_json_value(body) {
         Ok(value) => value,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
-        return Ok(resp);
+        return Ok(*resp);
     }
     if let Err(resp) =
         ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &cred_value).await
     {
-        return Ok(resp);
+        return Ok(*resp);
     }
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
     consumer
         .credentials
@@ -1008,12 +1005,12 @@ async fn handle_delete_credentials(
 
     let db = match require_db(state) {
         Ok(db) => db,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
     consumer.credentials.remove(cred_type);
     Ok(persist_consumer_update(db.as_ref(), consumer, StatusCode::NO_CONTENT).await)
@@ -1037,12 +1034,12 @@ async fn handle_append_credential(
 
     let db = match require_db(state) {
         Ok(db) => db,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
 
     let mut new_cred = match parse_json_value(body) {
         Ok(value) => value,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
     if !new_cred.is_object() {
         return Ok(json_response(
@@ -1051,17 +1048,17 @@ async fn handle_append_credential(
         ));
     }
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
-        return Ok(resp);
+        return Ok(*resp);
     }
     if let Err(resp) =
         ensure_credential_unique(db.as_ref(), namespace, consumer_id, cred_type, &new_cred).await
     {
-        return Ok(resp);
+        return Ok(*resp);
     }
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
     let new_value = match consumer.credentials.get(cred_type) {
         Some(Value::Array(arr)) => {
@@ -1126,12 +1123,12 @@ async fn handle_delete_credential_by_index(
 
     let db = match require_db(state) {
         Ok(db) => db,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
 
     let mut consumer = match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
         Ok(consumer) => consumer,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
     let cred_value = match consumer.credentials.get_mut(cred_type) {
         Some(value) => value,
@@ -1208,7 +1205,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Process-global cache for the metrics JSON response.
-/// Uses a static to avoid adding a field to AdminState (which has 30+ construction sites).
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
 
 fn metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
@@ -1468,19 +1464,7 @@ fn build_metrics(state: &AdminState) -> Value {
 
 // ---- Batch Create ----
 
-/// Batch create endpoint — accepts multiple resources in a single request,
-/// persists them in a single database transaction per resource type.
-///
-/// Request body format:
-/// ```json
-/// {
-///   "proxies": [...],
-///   "consumers": [...],
-///   "plugin_configs": [...],
-///   "upstreams": [...]
-/// }
-/// ```
-/// All fields are optional. Returns counts of created resources.
+/// Batch create endpoint for proxies, consumers, plugin configs, and upstreams.
 async fn handle_batch_create(
     state: &AdminState,
     body: &[u8],
@@ -1492,7 +1476,7 @@ async fn handle_batch_create(
 
     let db = match require_db(state) {
         Ok(db) => db,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
 
     let mut batch: RestorePayload = match serde_json::from_slice(body) {
@@ -1726,21 +1710,7 @@ async fn handle_batch_create(
 
 // ---- Backup & Restore ----
 
-/// Export the full gateway configuration as a JSON backup.
-///
-/// Returns the complete config (proxies, consumers, plugin_configs, upstreams)
-/// in the same format accepted by `POST /batch` and `POST /restore`, so the
-/// output can be directly used to restore the gateway.
-///
-/// Consumer credentials are included **unredacted** (this is a backup endpoint).
-///
-/// Supports `?resources=proxies,consumers` to export only specific resource types.
-///
-/// Reads from the database first; falls back to the in-memory cached config
-/// when the database is unavailable.
-///
-/// Memory: serializes directly from the config structs (no intermediate
-/// `serde_json::Value` copy), so peak memory is config + output buffer.
+/// Export the current gateway config as a JSON backup payload.
 async fn handle_backup(
     state: &AdminState,
     query: Option<&str>,
@@ -1866,18 +1836,6 @@ async fn handle_backup(
 }
 
 /// Restore the gateway configuration from a backup payload.
-///
-/// This is a **destructive** operation that replaces all existing configuration:
-/// 1. Parses and validates the entire payload (fail-fast before any deletion)
-/// 2. Deletes ALL existing resources (proxies, consumers, plugin_configs, upstreams)
-/// 3. Imports the provided resources in dependency order using chunked transactions
-///
-/// Requires `?confirm=true` query parameter to prevent accidental invocation.
-///
-/// Memory: deserializes directly into typed structs (no intermediate
-/// `serde_json::Value` copy), so peak memory is body bytes + parsed structs.
-/// Database inserts are chunked into 1,000-record transactions to keep WAL
-/// size bounded and avoid prolonged lock holds.
 async fn handle_restore(
     state: &AdminState,
     body: &[u8],
@@ -1890,7 +1848,7 @@ async fn handle_restore(
 
     let db = match require_db(state) {
         Ok(db) => db,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return Ok(*resp),
     };
 
     if !parse_restore_confirm(query) {
@@ -2153,17 +2111,7 @@ fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String>
     crate::config::types::hash_credential_passwords(cred)
 }
 
-/// Best-effort OS-level port availability check.
-///
-/// Probes only the transport that the stream proxy will actually bind (TCP or
-/// UDP), matching the runtime behavior in `stream_listener.rs`. This avoids
-/// false positives where an unrelated service on a different transport occupies
-/// the same numeric port.
-///
-/// There is an inherent TOCTOU race (the port could be taken between the check
-/// and the actual listener bind), but this catches the vast majority of real
-/// conflicts and provides a clear error at the admin API level rather than a
-/// silent startup failure.
+/// Best-effort OS-level port availability check for stream proxy listeners.
 async fn check_port_available(port: u16, bind_address: &str, udp: bool) -> Result<(), String> {
     let ip: std::net::IpAddr = bind_address
         .parse()
