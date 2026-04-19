@@ -9,10 +9,17 @@ _format_version: "3.0"
 # so the CA trust for upstream cert verification comes from the global
 # KONG_LUA_SSL_TRUSTED_CERTIFICATE env var set by the harness, which
 # points at the benchmark's ca.pem.
+#
+# `host: localhost` (not 127.0.0.1) matters — Kong 3.10's Lua WebSocket
+# upstream TLS verifier matches the connect hostname against cert DNS
+# SANs, not IP SANs. The bench cert has both DNS:localhost and
+# IP:127.0.0.1, but using `127.0.0.1` here triggers "certificate host
+# mismatch" 502s on every WS upgrade. `localhost` matches the DNS SAN
+# and, with `--network host`, resolves to the backend on the runner.
 
 services:
   - name: ws-service
-    host: 127.0.0.1
+    host: localhost
     port: 3446
     protocol: wss
     tls_verify: true
