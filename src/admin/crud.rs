@@ -11,7 +11,9 @@ use uuid::Uuid;
 
 use crate::admin::AdminState;
 use crate::config::db_backend::{DatabaseBackend, PaginatedResult};
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Upstream, validate_resource_id};
+use crate::config::types::{
+    Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
+};
 
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
@@ -40,6 +42,7 @@ pub(crate) enum WriteAction<'a> {
 pub(crate) enum AfterValidateError {
     BadRequest(Vec<String>),
     Db(anyhow::Error),
+    Response(Response<Full<Bytes>>),
 }
 
 #[allow(async_fn_in_trait)]
@@ -594,6 +597,296 @@ impl AdminResource for PluginConfig {
     }
 }
 
+impl AdminResource for Proxy {
+    const RESOURCE_NAME: &'static str = "proxy";
+    const RESOURCE_LABEL: &'static str = "Proxy";
+    const VALIDATION_ERROR_LABEL: &'static str = "proxy fields";
+    const NOT_FOUND_MESSAGE: &'static str = "Proxy not found";
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn set_namespace(&mut self, ns: String) {
+        self.namespace = ns;
+    }
+
+    fn set_created_at(&mut self, now: DateTime<Utc>) {
+        self.created_at = now;
+    }
+
+    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+        self.updated_at = now;
+    }
+
+    fn normalize(&mut self) {
+        if let Some(methods) = self.allowed_methods.as_mut() {
+            for method in methods {
+                *method = method.to_uppercase();
+            }
+        }
+        self.normalize_fields();
+    }
+
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
+        if let Err(field_errors) = self.validate_fields() {
+            return Err(field_errors);
+        }
+
+        for host in &self.hosts {
+            if let Err(message) = crate::config::types::validate_host_entry(host) {
+                return Err(vec![format!("Invalid proxy hosts: {}", message)]);
+            }
+        }
+
+        if !self.backend_protocol.is_stream_proxy()
+            && let Some(path) = self.listen_path.as_deref()
+            && let Some(pattern) = path.strip_prefix('~')
+            && !pattern.is_empty()
+        {
+            let anchored = crate::config::types::anchor_regex_pattern(pattern);
+            if let Err(error) = regex::Regex::new(&anchored) {
+                return Err(vec![format!(
+                    "Invalid proxy listen_path: invalid regex '{}': {}",
+                    path, error
+                )]);
+            }
+        }
+
+        if self.backend_protocol.is_stream_proxy() {
+            match self.listen_port {
+                None => {
+                    return Err(vec![format!(
+                        "Stream proxy (protocol {}) must have a listen_port",
+                        self.backend_protocol
+                    )]);
+                }
+                Some(0) => {
+                    return Err(vec!["listen_port 0 must be >= 1".to_string()]);
+                }
+                Some(_) => {}
+            }
+        } else if self.listen_port.is_some() {
+            return Err(vec![format!(
+                "HTTP proxy (protocol {}) must not set listen_port",
+                self.backend_protocol
+            )]);
+        }
+
+        Ok(())
+    }
+
+    fn cached_items(config: &GatewayConfig) -> &[Self] {
+        &config.proxies
+    }
+
+    fn map_validation_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        if errors.len() == 1
+            && (errors[0].starts_with("Invalid proxy hosts:")
+                || errors[0].starts_with("Invalid proxy listen_path:")
+                || errors[0].starts_with("Stream proxy (protocol ")
+                || errors[0].starts_with("HTTP proxy (protocol ")
+                || errors[0].starts_with("listen_port "))
+        {
+            return super::json_response(StatusCode::BAD_REQUEST, &json!({"error": errors[0]}));
+        }
+
+        validation_error_response::<Self>(errors)
+    }
+
+    fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": errors.join("; ")}),
+        )
+    }
+
+    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        db.get_proxy(id).await
+    }
+
+    async fn db_list(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_proxies_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
+            .await
+    }
+
+    async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.create_proxy(resource).await
+    }
+
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.update_proxy(resource).await
+    }
+
+    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
+        db.delete_proxy(id).await
+    }
+
+    async fn check_uniqueness(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        resource: &Self,
+        exclude_id: Option<&str>,
+    ) -> DbResult<Option<String>> {
+        if !resource.backend_protocol.is_stream_proxy() {
+            match db
+                .check_listen_path_unique(
+                    namespace,
+                    resource.listen_path.as_deref(),
+                    &resource.hosts,
+                    exclude_id,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(Some(
+                        "A proxy with overlapping hosts and listen_path already exists".to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if let Some(name) = resource.name.as_deref() {
+            match db
+                .check_proxy_name_unique(namespace, name, exclude_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return Ok(Some(format!("Proxy name '{}' already exists", name))),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if resource.backend_protocol.is_stream_proxy()
+            && let Some(port) = resource.listen_port
+        {
+            match db
+                .check_listen_port_unique(namespace, port, exclude_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(Some(format!(
+                        "listen_port {} is already in use by another proxy",
+                        port
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn after_validate(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        _namespace: &str,
+        resource: &Self,
+        existing: Option<&Self>,
+        ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        if let Some(upstream_id) = resource.upstream_id.as_deref() {
+            match db.check_upstream_exists(upstream_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(AfterValidateError::BadRequest(vec![format!(
+                        "upstream_id '{}' does not exist",
+                        upstream_id
+                    )]));
+                }
+                Err(error) => return Err(AfterValidateError::Db(error)),
+            }
+        }
+
+        match db
+            .validate_proxy_plugin_associations(resource.id(), &resource.plugins)
+            .await
+        {
+            Ok(errors) if !errors.is_empty() => {
+                return Err(AfterValidateError::BadRequest(vec![format!(
+                    "Invalid proxy plugin associations: {}",
+                    errors.join("; ")
+                )]));
+            }
+            Ok(_) => {}
+            Err(error) => return Err(AfterValidateError::Db(error)),
+        }
+
+        if resource.backend_protocol.is_stream_proxy()
+            && let Some(port) = resource.listen_port
+            && ctx.mode != "cp"
+        {
+            if ctx.reserved_ports.contains(&port) {
+                return Err(AfterValidateError::Response(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
+                        port
+                    )}),
+                )));
+            }
+
+            let port_changed = existing.and_then(|proxy| proxy.listen_port) != Some(port);
+            let transport_changed = existing
+                .map(|proxy| proxy.backend_protocol.is_udp() != resource.backend_protocol.is_udp())
+                .unwrap_or(false);
+            let should_probe = existing.is_none() || port_changed || transport_changed;
+            if should_probe
+                && let Err(error) = check_port_available(
+                    port,
+                    ctx.stream_bind_address,
+                    resource.backend_protocol.is_udp(),
+                )
+                .await
+            {
+                return Err(AfterValidateError::Response(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "listen_port {} is not available on the host: {}",
+                        port, error
+                    )}),
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn after_write(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        _namespace: &str,
+        resource: &Self,
+        existing: Option<&Self>,
+        action: WriteAction<'_>,
+    ) -> DbResult<()> {
+        if matches!(action, WriteAction::Update { .. })
+            && let Some(old_proxy) = existing
+            && let Some(old_upstream_id) = old_proxy.upstream_id.as_deref()
+            && resource.upstream_id.as_deref() != Some(old_upstream_id)
+        {
+            db.cleanup_orphaned_upstream(old_upstream_id).await?;
+        }
+
+        Ok(())
+    }
+}
+
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     super::json_response(
         StatusCode::NOT_FOUND,
@@ -718,6 +1011,7 @@ async fn handle_write<R: AdminResource>(
                 R::map_after_validate_errors(&field_errors)
             }
             AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
+            AfterValidateError::Response(response) => response,
         });
     }
 
