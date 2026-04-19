@@ -37,6 +37,11 @@ pub(crate) enum WriteAction<'a> {
     Update { id: &'a str },
 }
 
+pub(crate) enum AfterValidateError {
+    BadRequest(Vec<String>),
+    Db(anyhow::Error),
+}
+
 #[allow(async_fn_in_trait)]
 pub(crate) trait AdminResource:
     Send + Sync + Serialize + DeserializeOwned + Clone + Sized + 'static
@@ -65,6 +70,14 @@ pub(crate) trait AdminResource:
 
     fn prepare_for_write(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn map_validation_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        validation_error_response::<Self>(errors)
+    }
+
+    fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        Self::map_validation_errors(errors)
     }
 
     fn map_precheck_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
@@ -115,7 +128,7 @@ pub(crate) trait AdminResource:
         _resource: &Self,
         _existing: Option<&Self>,
         _ctx: &ValidationCtx<'_>,
-    ) -> Result<(), Vec<String>> {
+    ) -> Result<(), AfterValidateError> {
         Ok(())
     }
 
@@ -453,6 +466,134 @@ impl AdminResource for Upstream {
     }
 }
 
+impl AdminResource for PluginConfig {
+    const RESOURCE_NAME: &'static str = "plugin config";
+    const RESOURCE_LABEL: &'static str = "Plugin config";
+    const VALIDATION_ERROR_LABEL: &'static str = "plugin config fields";
+    const NOT_FOUND_MESSAGE: &'static str = "Plugin config not found";
+    const ID_CONFLICT_LABEL: &'static str = "PluginConfig";
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn set_id(&mut self, id: String) {
+        self.id = id;
+    }
+
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn set_namespace(&mut self, ns: String) {
+        self.namespace = ns;
+    }
+
+    fn set_created_at(&mut self, now: DateTime<Utc>) {
+        self.created_at = now;
+    }
+
+    fn set_updated_at(&mut self, now: DateTime<Utc>) {
+        self.updated_at = now;
+    }
+
+    fn normalize(&mut self) {
+        self.normalize_fields();
+    }
+
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
+        self.validate_fields()
+    }
+
+    fn cached_items(config: &GatewayConfig) -> &[Self] {
+        &config.plugin_configs
+    }
+
+    fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
+        super::json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": errors.join("; ")}),
+        )
+    }
+
+    async fn db_get(db: &dyn DatabaseBackend, id: &str) -> DbResult<Option<Self>> {
+        db.get_plugin_config(id).await
+    }
+
+    async fn db_list(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        pagination: &super::PaginationParams,
+    ) -> DbResult<PaginatedResult<Self>> {
+        db.list_plugin_configs_paginated(
+            namespace,
+            pagination.limit as i64,
+            pagination.offset as i64,
+        )
+        .await
+    }
+
+    async fn db_create(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.create_plugin_config(resource).await
+    }
+
+    async fn db_update(db: &dyn DatabaseBackend, resource: &Self) -> DbResult<()> {
+        db.update_plugin_config(resource).await
+    }
+
+    async fn db_delete(db: &dyn DatabaseBackend, id: &str) -> DbResult<bool> {
+        db.delete_plugin_config(id).await
+    }
+
+    async fn check_uniqueness(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _resource: &Self,
+        _exclude_id: Option<&str>,
+    ) -> DbResult<Option<String>> {
+        Ok(None)
+    }
+
+    async fn after_validate(
+        db: &dyn DatabaseBackend,
+        _state: &AdminState,
+        _namespace: &str,
+        resource: &Self,
+        _existing: Option<&Self>,
+        _ctx: &ValidationCtx<'_>,
+    ) -> Result<(), AfterValidateError> {
+        let known_plugins = crate::plugins::available_plugins();
+        if !known_plugins.contains(&resource.plugin_name.as_str()) {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "Unknown plugin name '{}'. Available plugins: {:?}",
+                resource.plugin_name, known_plugins
+            )]));
+        }
+
+        if let Some(proxy_id) = resource.proxy_id.as_deref() {
+            match db.check_proxy_exists(proxy_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(AfterValidateError::BadRequest(vec![format!(
+                        "proxy_id '{}' does not exist",
+                        proxy_id
+                    )]));
+                }
+                Err(error) => return Err(AfterValidateError::Db(error)),
+            }
+        }
+
+        if let Err(error) = validate_plugin_config_definition(resource) {
+            return Err(AfterValidateError::BadRequest(vec![format!(
+                "Invalid plugin config: {}",
+                error
+            )]));
+        }
+
+        Ok(())
+    }
+}
+
 fn not_found_response<R: AdminResource>() -> Response<Full<Bytes>> {
     super::json_response(
         StatusCode::NOT_FOUND,
@@ -527,7 +668,7 @@ async fn handle_write<R: AdminResource>(
 
     let validation_ctx = ValidationCtx::from_state(state);
     if let Err(field_errors) = resource.validate(&validation_ctx) {
-        return Ok(validation_error_response::<R>(&field_errors));
+        return Ok(R::map_validation_errors(&field_errors));
     }
 
     if matches!(action, WriteAction::Create) {
@@ -562,7 +703,7 @@ async fn handle_write<R: AdminResource>(
         Err(error) => return Ok(R::map_precheck_db_error(&error)),
     }
 
-    if let Err(field_errors) = R::after_validate(
+    if let Err(error) = R::after_validate(
         db,
         state,
         namespace,
@@ -572,7 +713,12 @@ async fn handle_write<R: AdminResource>(
     )
     .await
     {
-        return Ok(validation_error_response::<R>(&field_errors));
+        return Ok(match error {
+            AfterValidateError::BadRequest(field_errors) => {
+                R::map_after_validate_errors(&field_errors)
+            }
+            AfterValidateError::Db(error) => R::map_precheck_db_error(&error),
+        });
     }
 
     if let Err(message) = resource.prepare_for_write() {
