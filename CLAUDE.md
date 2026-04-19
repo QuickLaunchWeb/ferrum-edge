@@ -310,7 +310,7 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | namespace, listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
+| `Proxy` | A route + backend target | namespace, hosts (Vec), listen_path (Option<String>), listen_port (Option<u16>), backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough. HTTP proxies require at least one of `hosts` or `listen_path`. Stream proxies use `listen_port` and MUST have `listen_path = None`. |
 | `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation; JWT secrets must be at least 32 characters), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | namespace, targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), scope (Global/Proxy/ProxyGroup), proxy_id (Option), priority_override (Option<u16>) |
@@ -326,6 +326,7 @@ Routes are matched in priority order within each host tier (exact host → wildc
 
 1. **Prefix routes first** — longest-prefix match via HashMap index (O(path_depth), typically 2-5 lookups)
 2. **Regex routes second** — first match via RegexSet (O(path_length) single DFA pass, independent of pattern count)
+3. **Host-only fallback** — proxies with `listen_path: None` (hosts set, no path) are the per-host catch-all, evaluated only when both prefix and regex tiers miss. Never applies to the catch-all host tier — a proxy with `hosts: []` + `listen_path: None` is rejected at validation (it would mean "match literally every request").
 
 **Prefix route matching uses `IndexedPrefixRoutes`** — a HashMap that maps each `listen_path` to its proxy, built at config-load time. On a cache miss, the router walks the request path backwards through `/` segment boundaries doing O(1) HashMap lookups at each step. This is **O(path_depth)** regardless of how many proxies are configured, replacing the previous O(n) linear scan that degraded throughput by 30-46% as proxy count grew from 50 to 500+. **Do not replace this with a linear scan or any algorithm whose per-request cost scales with total proxy count.** The HashMap index is applied to all three host tiers (exact, wildcard, catch-all). The `IndexedPrefixRoutes` struct in `src/router_cache.rs` bundles the sorted `Vec<RouteEntry>` (for `apply_delta` retain scans) with the `HashMap<String, Arc<Proxy>>` index.
 
@@ -334,6 +335,24 @@ Routes are matched in priority order within each host tier (exact host → wildc
 **Router lookup cache** (`DashMap` in `RouterCache`) caches `(host, path) → proxy` results for O(1) repeated lookups. Cache size is controlled by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default: auto-scales as `max(10_000, proxies × 3)`). Both prefix and regex matches have separate cache partitions to prevent high-cardinality regex paths from evicting prefix entries. Negative lookups (no route matched) are also cached to prevent repeated scans from scanner traffic.
 
 **Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
+
+### HTTP proxy `hosts` / `listen_path` contract
+
+The Proxy struct routes differently per protocol family. The required-ness of `hosts`/`listen_path`/`listen_port` is enforced at validation time (admin API, file loader, DB loader) and repeated here for contributor reference:
+
+| Protocol family | Routing on | Field rules |
+|---|---|---|
+| HTTP-family (`http`/`https`/`ws`/`wss`/`grpc`/`grpcs`/`h3`) | `hosts` + `listen_path` | At least one of `hosts` or `listen_path` MUST be set. Both may be set together. `listen_port` MUST be `None`. |
+| Stream-family (`tcp`/`tcp_tls`/`udp`/`dtls`) | `listen_port` | `listen_port` MUST be set. `listen_path` MUST be `None` — a populated `listen_path` on a stream proxy is a hard error. |
+
+A host-only HTTP proxy (`hosts: [...]`, no `listen_path`) matches **any path** under the configured hosts — effectively a per-host catch-all. `strip_listen_path: true` is a silent no-op on host-only proxies (there's nothing to strip); `backend_path` still prepends to the forwarded path if set. A proxy with `hosts: []` AND `listen_path: None` is rejected by `validate_fields_inner` — it would mean "match literally every request on every host" and collides with every other catch-all.
+
+**Uniqueness semantics:**
+- Two HTTP proxies with the same `listen_path` conflict iff their `hosts` overlap (empty hosts = catch-all, overlaps with everything).
+- Two host-only HTTP proxies conflict iff their `hosts` overlap.
+- A host-only proxy and a path-carrying proxy on the same host do NOT conflict — they occupy different match tiers (path wins on match, host-only is fallback).
+
+`DatabaseBackend::check_listen_path_unique(namespace, listen_path: Option<&str>, hosts, exclude_id)` implements this for the SQL/Mongo backends. See [db_backend.rs](src/config/db_backend.rs:216) for the full trait docstring. The V001 schema stores `listen_path` as NULLABLE with a partial unique index keyed by `(namespace, listen_path)` where listen_path is non-null.
 
 ### Protocol-Level Request Validation
 
