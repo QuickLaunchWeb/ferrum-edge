@@ -1,26 +1,21 @@
 _format_version: "3.0"
-# Upstream TLS CA trust anchor. run_gateway_protocol_bench.sh::start_kong
-# reads proto_backend's generated self-signed cert and substitutes the PEM
-# content into the placeholder below. The cert carries basicConstraints
-# CA:TRUE so Kong's declarative ca_certificates entity accepts it.
-ca_certificates:
-  - id: "00000000-0000-0000-0000-000000000001"
-    cert: |
-      __BENCH_CA_PEM__
-
 
 # Kong DB-less declarative configuration — WSS end-to-end TLS.
 # Client WSS → Kong (TLS termination + WS upgrade) → WSS upstream on 3446.
-# Every hop encrypted. Kong proxies WebSocket transparently over HTTPS routes.
+#
+# Uses `protocol: wss` + `protocols: [ws, wss]` on the route so Kong
+# uses its native WebSocket proxy path. With `protocol: wss`, Kong
+# rejects per-service `ca_certificates` (schema conditional validation),
+# so the CA trust for upstream cert verification comes from the global
+# KONG_LUA_SSL_TRUSTED_CERTIFICATE env var set by the harness, which
+# points at the benchmark's ca.pem.
 
 services:
   - name: ws-service
     host: 127.0.0.1
     port: 3446
-    protocol: https
+    protocol: wss
     tls_verify: true
-    ca_certificates:
-      - "00000000-0000-0000-0000-000000000001"
     connect_timeout: 5000
     read_timeout: 3600000
     write_timeout: 3600000
@@ -29,8 +24,8 @@ services:
         paths:
           - /ws
         protocols:
-          - http
-          - https
+          - ws
+          - wss
         strip_path: true
         preserve_host: false
 
