@@ -1,5 +1,5 @@
 {
-  "name": "Echo TCP (TLS)",
+  "name": "Echo TCP (E2E TLS)",
   "slug": "echo-tcp-tls",
   "api_id": "echo-tcp-tls",
   "org_id": "default",
@@ -9,8 +9,11 @@
   "listen_port": 5001,
   "certificates": ["*"],
   "proxy": {
-    "target_url": "tcp://127.0.0.1:3004",
-    "listen_path": "/"
+    "target_url": "tls://127.0.0.1:3444",
+    "listen_path": "/",
+    "transport": {
+      "ssl_insecure_skip_verify": true
+    }
   },
   "version_data": {
     "not_versioned": true,

@@ -165,11 +165,13 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         id: gateways
         run: |
-          # KrakenD Community Edition does NOT support gRPC proxying
-          # (Enterprise Edition only — see docs/enterprise/backends/grpc/),
-          # so it is omitted from the grpcs arm.
+          # KrakenD Community Edition does NOT support gRPC proxying OR
+          # WebSocket proxying — both are Enterprise-only. We ship CE
+          # (krakend:2.13.2), so krakend is omitted from both grpcs and wss.
+          # Docs: /docs/enterprise/backends/grpc/, /docs/enterprise/websockets/
           case "${{ matrix.protocol }}" in
-            http1-tls|http2|wss) all="ferrum envoy kong tyk krakend" ;;
+            http1-tls|http2) all="ferrum envoy kong tyk krakend" ;;
+            wss)      all="ferrum envoy kong tyk" ;;
             grpcs)    all="ferrum envoy kong tyk" ;;
             http3)    all="ferrum envoy kong" ;;
             tcp-tls)  all="ferrum envoy kong tyk" ;;

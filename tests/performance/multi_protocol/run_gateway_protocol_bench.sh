@@ -71,15 +71,17 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 # Returns 0 if the gateway supports the protocol, 1 otherwise.
 supports() {
     local gw="$1" proto="$2"
-    # KrakenD Community Edition does NOT support gRPC proxying (Enterprise Edition only),
-    # so krakend is intentionally omitted from the grpcs arm. See
-    # https://www.krakend.io/docs/enterprise/backends/grpc/
+    # KrakenD Community Edition does NOT support gRPC proxying or WebSocket
+    # proxying — both are Enterprise-only (see
+    # https://www.krakend.io/docs/enterprise/backends/grpc/ and
+    # https://www.krakend.io/docs/enterprise/websockets/). We ship the CE
+    # image (krakend:2.13.2), so krakend is omitted from both grpcs and wss.
     case "$gw:$proto" in
         ferrum:*)  return 0 ;;
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:http2|kong:http3|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
         tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss|tyk:tcp-tls) return 0 ;;
-        krakend:http1-tls|krakend:http2|krakend:wss) return 0 ;;
+        krakend:http1-tls|krakend:http2) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -95,16 +97,19 @@ GATEWAY_UDP_DTLS_PORT=5004
 
 # Returns: <bench_proto> <bench_target> <direct_target> [extra_bench_args]
 #
+# Direct-backend targets mirror the gateway's upstream so the baseline reflects
+# the same end-to-end TLS cost every gateway must pay. proto_backend exposes:
+#   3443 HTTPS/H2, 3444 TCP+TLS, 3445 HTTP/3, 3446 WSS, 3006 DTLS, 50053 grpc+TLS.
+#
 # grpcs: tonic 0.14 has no insecure-TLS toggle, so we explicitly trust the
-# benchmark backend's self-signed CA. The --ca-cert flag is harmlessly
-# ignored when the bench target uses http:// (the direct-backend leg).
+# benchmark backend's self-signed CA via --ca-cert for both legs.
 bench_params() {
     case "$PROTOCOL" in
-        http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo http://127.0.0.1:3001/echo" ;;
+        http1-tls) echo "http1 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
         http2)     echo "http2 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3443/echo" ;;
         http3)     echo "http3 https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo https://127.0.0.1:3445/echo" ;;
-        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} http://127.0.0.1:50052 --ca-cert ${CERT_DIR}/cert.pem" ;;
-        wss)       echo "ws wss://127.0.0.1:${GATEWAY_HTTPS_PORT}/ws ws://127.0.0.1:3003" ;;
+        grpcs)     echo "grpc https://127.0.0.1:${GATEWAY_HTTPS_PORT} https://127.0.0.1:50053 --ca-cert ${CERT_DIR}/cert.pem" ;;
+        wss)       echo "ws wss://127.0.0.1:${GATEWAY_HTTPS_PORT}/ws wss://127.0.0.1:3446" ;;
         tcp-tls)   echo "tcp 127.0.0.1:${GATEWAY_TCP_TLS_PORT} 127.0.0.1:3444 --tls" ;;
         udp)       echo "udp 127.0.0.1:${GATEWAY_UDP_PORT} 127.0.0.1:3005" ;;
         udp-dtls)  echo "udp 127.0.0.1:${GATEWAY_UDP_DTLS_PORT} 127.0.0.1:3006 --tls" ;;
@@ -246,15 +251,20 @@ start_ferrum() {
 }
 
 ferrum_config_name() {
+    # For TLS-capable protocols, use the *_e2e_perf.yaml variants which proxy
+    # to TLS backends (3443/3446/50053/3444/3006) — matching the other
+    # gateways' configs and the benchmark's "TLS end-to-end" design.
+    # http2 and http3 perf configs already target TLS backends (3443/3445).
+    # udp stays plaintext by design (it's the plaintext-vs-encrypted baseline).
     case "$PROTOCOL" in
-        http1-tls) echo "http1_tls_perf.yaml" ;;
+        http1-tls) echo "http1_tls_e2e_perf.yaml" ;;
         http2)     echo "http2_perf.yaml" ;;
         http3)     echo "http3_perf.yaml" ;;
-        grpcs)     echo "grpc_perf.yaml" ;;
-        wss)       echo "ws_perf.yaml" ;;
-        tcp-tls)   echo "tcp_tls_perf.yaml" ;;
+        grpcs)     echo "grpcs_e2e_perf.yaml" ;;
+        wss)       echo "wss_e2e_perf.yaml" ;;
+        tcp-tls)   echo "tcp_tls_e2e_perf.yaml" ;;
         udp)       echo "udp_perf.yaml" ;;
-        udp-dtls)  echo "udp_dtls_perf.yaml" ;;
+        udp-dtls)  echo "udp_dtls_e2e_perf.yaml" ;;
     esac
 }
 

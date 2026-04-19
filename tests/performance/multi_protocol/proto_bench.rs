@@ -469,20 +469,34 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
 async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::Connector;
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = Vec::new();
     let payload = vec![0xABu8; args.payload_size];
 
+    // For wss://, plug our insecure rustls ClientConfig so tungstenite doesn't
+    // reject proto_backend's self-signed cert. For ws://, pass None so the
+    // default plaintext path is used.
+    let connector: Option<Connector> = if args.target.starts_with("wss://") {
+        Some(Connector::Rustls(Arc::new(
+            tls_utils::make_client_tls_config_insecure(),
+        )))
+    } else {
+        None
+    };
+
     for _ in 0..args.concurrency {
         let target = args.target.clone();
         let payload = payload.clone();
+        let connector = connector.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
 
-            let (ws, _) = tokio_tungstenite::connect_async(&target)
-                .await
-                .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
+            let (ws, _) =
+                tokio_tungstenite::connect_async_tls_with_config(&target, None, false, connector)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
             let (mut write, mut read) = ws.split();
 
             while Instant::now() < deadline {

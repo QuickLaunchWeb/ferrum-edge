@@ -2,10 +2,11 @@
 //!
 //! Starts servers on the following ports:
 //!   HTTP/2 h2c:     3002    HTTPS/H2:  3443
-//!   WebSocket:      3003    gRPC h2c:  50052
+//!   WebSocket:      3003    WSS:       3446
 //!   TCP echo:       3004    TCP+TLS:   3444
 //!   UDP echo:       3005    DTLS echo: 3006
 //!   HTTP/3 (QUIC):  3445
+//!   gRPC h2c:      50052    gRPC+TLS: 50053
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -226,6 +227,36 @@ async fn run_ws_server(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
+async fn run_wss_server(
+    addr: SocketAddr,
+    tls_cfg: Arc<rustls::ServerConfig>,
+) -> anyhow::Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("binding wss listener")?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(tls_stream).await else {
+                return;
+            };
+            let (mut write, mut read) = ws.split();
+            while let Some(Ok(msg)) = read.next().await {
+                if (msg.is_text() || msg.is_binary()) && write.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
     tonic::transport::Server::builder()
         .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
@@ -235,6 +266,28 @@ async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
         .serve(addr)
         .await
         .context("gRPC server error")
+}
+
+async fn run_grpcs_server(
+    addr: SocketAddr,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let cert_pem = std::fs::read(cert_path).context("reading grpcs cert")?;
+    let key_pem = std::fs::read(key_path).context("reading grpcs key")?;
+    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+    let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+    tonic::transport::Server::builder()
+        .tls_config(tls)
+        .context("configuring grpcs TLS")?
+        .initial_stream_window_size(8_388_608)
+        .initial_connection_window_size(33_554_432)
+        .tcp_nodelay(true)
+        .add_service(BenchServiceServer::new(BenchServiceImpl))
+        .serve(addr)
+        .await
+        .context("grpcs server error")
 }
 
 async fn run_tcp_echo(addr: SocketAddr) -> anyhow::Result<()> {
@@ -529,7 +582,9 @@ async fn main() -> anyhow::Result<()> {
     println!("HTTP/2 (h2c):    127.0.0.1:3002");
     println!("HTTPS/H2 (TLS):  127.0.0.1:3443");
     println!("WebSocket:        127.0.0.1:3003");
+    println!("WSS (TLS):         127.0.0.1:3446");
     println!("gRPC (h2c):       127.0.0.1:50052");
+    println!("gRPC+TLS:         127.0.0.1:50053");
     println!("TCP Echo:          127.0.0.1:3004");
     println!("TCP+TLS Echo:      127.0.0.1:3444");
     println!("UDP Echo:          127.0.0.1:3005");
@@ -567,11 +622,37 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("ws server error: {e}");
         }
     });
+    {
+        let wss_tls = Arc::new(
+            tls_utils::make_server_tls_config(&cert_path, &key_path)
+                .context("building wss server config")?,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = run_wss_server("127.0.0.1:3446".parse().unwrap(), wss_tls).await {
+                eprintln!("wss server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async {
         if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap()).await {
             eprintln!("grpc server error: {e}");
         }
     });
+    {
+        let grpcs_cert = cert_path.clone();
+        let grpcs_key = key_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_grpcs_server(
+                "127.0.0.1:50053".parse().unwrap(),
+                &grpcs_cert,
+                &grpcs_key,
+            )
+            .await
+            {
+                eprintln!("grpcs server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async {
         if let Err(e) = run_tcp_echo("127.0.0.1:3004".parse().unwrap()).await {
             eprintln!("tcp echo error: {e}");

@@ -1,14 +1,15 @@
 _format_version: "3.0"
 
-# Kong DB-less declarative configuration — WebSocket Secure (WSS)
-# Gateway WSS (TLS termination) → plain WS backend on 3003
-# Kong proxies WebSocket transparently over HTTP routes.
+# Kong DB-less declarative configuration — WSS end-to-end TLS.
+# Client WSS → Kong (TLS termination + WS upgrade) → WSS upstream on 3446.
+# Every hop encrypted. Kong proxies WebSocket transparently over HTTPS routes.
 
 services:
   - name: ws-service
     host: 127.0.0.1
-    port: 3003
-    protocol: http
+    port: 3446
+    protocol: https
+    tls_verify: false
     connect_timeout: 5000
     read_timeout: 3600000
     write_timeout: 3600000

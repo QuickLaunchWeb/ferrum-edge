@@ -1,5 +1,5 @@
 {
-  "name": "Bench Service (gRPC+TLS)",
+  "name": "Bench Service (gRPC E2E TLS)",
   "slug": "bench-grpcs",
   "api_id": "bench-grpcs",
   "org_id": "default",
@@ -8,7 +8,7 @@
   "protocol": "",
   "proxy": {
     "listen_path": "/bench.BenchService",
-    "target_url": "http://127.0.0.1:50052",
+    "target_url": "https://127.0.0.1:50053",
     "strip_listen_path": false,
     "transport": {
       "ssl_insecure_skip_verify": true
