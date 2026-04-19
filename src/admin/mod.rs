@@ -3,6 +3,7 @@
 //! Provides REST API for managing proxies, consumers, and plugins
 //! with JWT-based authentication and authorization.
 
+pub(crate) mod crud;
 pub mod jwt_auth;
 
 use bytes::Bytes;
@@ -247,7 +248,7 @@ async fn handle_admin_connection(
 }
 
 /// Pagination parameters parsed from query string.
-struct PaginationParams {
+pub(crate) struct PaginationParams {
     offset: usize,
     limit: usize,
     /// True when caller explicitly provided `limit` or `offset` query params.
