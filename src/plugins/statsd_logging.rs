@@ -13,14 +13,15 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tokio::time::Instant;
 
-use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
 
@@ -43,12 +44,7 @@ fn sanitize_tag_value(input: &str) -> String {
     out
 }
 
-/// Union type for entries sent through the channel.
-#[derive(Clone)]
-enum MetricEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
+type MetricEntry = SummaryLogEntry;
 
 #[derive(Clone)]
 struct StatsdFlushConfig {
@@ -60,7 +56,7 @@ struct StatsdFlushConfig {
 }
 
 struct StatsdFlushState {
-    socket: Option<UdpSocket>,
+    socket: Option<tokio::net::UdpSocket>,
     current_addr: Option<SocketAddr>,
     last_resolve: Instant,
 }
@@ -110,10 +106,6 @@ impl StatsdLogging {
             }
         };
 
-        let flush_interval_ms = config["flush_interval_ms"].as_u64().unwrap_or(500).max(50);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
-        let max_batch_lines = config["max_batch_lines"].as_u64().unwrap_or(50).max(1) as usize;
-
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
             port: port as u16,
@@ -127,16 +119,19 @@ impl StatsdLogging {
             last_resolve: Instant::now(),
         }));
         let logger = BatchingLogger::spawn(
-            BatchConfig {
-                batch_size: max_batch_lines,
-                flush_interval: Duration::from_millis(flush_interval_ms),
-                buffer_capacity,
-                retry: RetryPolicy {
-                    max_attempts: 1,
-                    delay: Duration::from_millis(0),
+            build_batch_config(
+                config,
+                "statsd_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "max_batch_lines",
+                    batch_size: 50,
+                    flush_interval_ms: 500,
+                    min_flush_interval_ms: 50,
+                    buffer_capacity: 10000,
+                    max_retries: 0,
+                    retry_delay_ms: 0,
                 },
-                plugin_name: "statsd_logging",
-            },
+            ),
             move |batch| {
                 let flush_config = flush_config.clone();
                 let state = Arc::clone(&state);
@@ -166,11 +161,11 @@ impl Plugin for StatsdLogging {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(MetricEntry::Http(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(MetricEntry::Stream(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -291,57 +286,6 @@ fn format_stream_metrics(
     let _ = writeln!(buf, "{prefix}.stream.disconnect:1|c{tags}");
 }
 
-/// Resolve the StatsD hostname to an IP address.
-async fn resolve_host(
-    hostname: &str,
-    port: u16,
-    dns_cache: Option<&DnsCache>,
-) -> Option<SocketAddr> {
-    if let Some(cache) = dns_cache {
-        match cache.resolve(hostname, None, None).await {
-            Ok(ip) => return Some(SocketAddr::new(ip, port)),
-            Err(error) => {
-                warn!(
-                    "statsd_logging: DNS cache resolution failed for '{hostname}': {error} — falling back to system DNS"
-                );
-            }
-        }
-    }
-
-    let addr_str = format!("{hostname}:{port}");
-    match tokio::net::lookup_host(&addr_str).await {
-        Ok(mut addrs) => addrs.next(),
-        Err(error) => {
-            warn!("statsd_logging: failed to resolve '{addr_str}': {error}");
-            None
-        }
-    }
-}
-
-/// Bind a UDP socket whose address family matches the resolved endpoint.
-async fn bind_and_connect(addr: SocketAddr) -> Option<UdpSocket> {
-    let bind_addr = if addr.ip() == IpAddr::from([0u8; 16]) || addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = match UdpSocket::bind(bind_addr).await {
-        Ok(socket) => socket,
-        Err(error) => {
-            warn!("statsd_logging: failed to bind UDP socket: {error}");
-            return None;
-        }
-    };
-    if let Err(error) = socket.connect(addr).await {
-        warn!("statsd_logging: failed to connect UDP socket to {addr}: {error}");
-        return None;
-    }
-    Some(socket)
-}
-
-/// How often to re-resolve the StatsD hostname even when sends succeed.
-const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
-
 async fn send_batch(
     cfg: &StatsdFlushConfig,
     state: &Mutex<StatsdFlushState>,
@@ -365,30 +309,30 @@ async fn send_batch(
 
     let mut state = state.lock().await;
     if state.socket.is_none() {
-        let Some(current_addr) =
-            resolve_host(&cfg.hostname, cfg.port, cfg.dns_cache.as_ref()).await
-        else {
-            return Err(format!(
-                "statsd_logging: could not resolve '{}:{}'",
-                cfg.hostname, cfg.port
-            ));
-        };
-        let Some(socket) = bind_and_connect(current_addr).await else {
-            return Err(format!(
-                "statsd_logging: failed to connect UDP socket to {}",
-                current_addr
-            ));
-        };
+        let current_addr = resolve_udp_endpoint(
+            &cfg.hostname,
+            cfg.port,
+            cfg.dns_cache.as_ref(),
+            "statsd_logging",
+        )
+        .await?;
+        let socket = bind_connected_udp_socket(current_addr, "statsd_logging").await?;
         state.current_addr = Some(current_addr);
         state.socket = Some(socket);
         state.last_resolve = Instant::now();
     }
 
-    if state.last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
+    if state.last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
         state.last_resolve = Instant::now();
-        if let Some(new_addr) = resolve_host(&cfg.hostname, cfg.port, cfg.dns_cache.as_ref()).await
+        if let Ok(new_addr) = resolve_udp_endpoint(
+            &cfg.hostname,
+            cfg.port,
+            cfg.dns_cache.as_ref(),
+            "statsd_logging",
+        )
+        .await
             && state.current_addr != Some(new_addr)
-            && let Some(new_socket) = bind_and_connect(new_addr).await
+            && let Ok(new_socket) = bind_connected_udp_socket(new_addr, "statsd_logging").await
         {
             state.current_addr = Some(new_addr);
             state.socket = Some(new_socket);

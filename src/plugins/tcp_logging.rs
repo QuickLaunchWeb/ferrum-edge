@@ -22,16 +22,10 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
-use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
-
-/// Union type for log entries sent through the batched channel.
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
 
 #[derive(Clone)]
 struct TcpFlushConfig {
@@ -45,7 +39,7 @@ struct TcpFlushConfig {
 }
 
 pub struct TcpLogging {
-    logger: BatchingLogger<LogEntry>,
+    logger: BatchingLogger<SummaryLogEntry>,
     endpoint_hostname: String,
 }
 
@@ -75,12 +69,6 @@ impl TcpLogging {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(1000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
         let connect_timeout_ms = config["connect_timeout_ms"]
             .as_u64()
             .unwrap_or(5000)
@@ -97,16 +85,19 @@ impl TcpLogging {
         };
         let writer = Arc::new(Mutex::new(None));
         let logger = BatchingLogger::spawn(
-            BatchConfig {
-                batch_size,
-                flush_interval: Duration::from_millis(flush_interval_ms),
-                buffer_capacity,
-                retry: RetryPolicy {
-                    max_attempts: config["max_retries"].as_u64().unwrap_or(3) as u32 + 1,
-                    delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
+            build_batch_config(
+                config,
+                "tcp_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "batch_size",
+                    batch_size: 50,
+                    flush_interval_ms: 1000,
+                    min_flush_interval_ms: 100,
+                    buffer_capacity: 10000,
+                    max_retries: 3,
+                    retry_delay_ms: 1000,
                 },
-                plugin_name: "tcp_logging",
-            },
+            ),
             move |batch| {
                 let flush_config = flush_config.clone();
                 let writer = Arc::clone(&writer);
@@ -136,11 +127,11 @@ impl Plugin for TcpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(LogEntry::Stream(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(LogEntry::Http(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -293,7 +284,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn send_batch(
     cfg: &TcpFlushConfig,
     writer_state: &Mutex<Option<TcpWriter>>,
-    batch: Vec<LogEntry>,
+    batch: Vec<SummaryLogEntry>,
 ) -> Result<(), String> {
     let mut payload = Vec::with_capacity(batch.len() * 256);
     for entry in &batch {

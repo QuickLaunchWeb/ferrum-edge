@@ -21,11 +21,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use tokio::time::Duration;
 use tracing::warn;
-use url::Url;
 
-use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, build_batch_config,
+    handle_http_batch_response, parse_http_endpoint,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// A log entry with pre-computed labels and a JSON log line.
@@ -63,42 +64,13 @@ struct LabelConfig {
 
 pub struct LokiLogging {
     logger: BatchingLogger<LokiEntry>,
-    endpoint_hostname: Option<String>,
+    endpoint_hostname: String,
     label_config: LabelConfig,
 }
 
 impl LokiLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        let endpoint_url = config["endpoint_url"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "loki_logging: 'endpoint_url' is required — logs will have nowhere to send"
-                    .to_string()
-            })?
-            .to_string();
-        let parsed_url = Url::parse(&endpoint_url)
-            .map_err(|e| format!("loki_logging: invalid 'endpoint_url': {e}"))?;
-        match parsed_url.scheme() {
-            "http" | "https" => {}
-            scheme => {
-                return Err(format!(
-                    "loki_logging: 'endpoint_url' must use http:// or https:// (got '{scheme}')"
-                ));
-            }
-        }
-        if parsed_url.host_str().is_none() {
-            return Err(
-                "loki_logging: 'endpoint_url' must include a hostname or IP address".to_string(),
-            );
-        }
-
-        let batch_size = config["batch_size"].as_u64().unwrap_or(100).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(1000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
+        let (endpoint_url, endpoint_hostname) = parse_http_endpoint(config, "loki_logging")?;
         let gzip = config["gzip"].as_bool().unwrap_or(true);
 
         // Parse static labels from config.
@@ -146,18 +118,20 @@ impl LokiLogging {
             http_client,
             gzip,
         };
-        let endpoint_hostname = parsed_url.host_str().map(|host| host.to_string());
         let logger = BatchingLogger::spawn(
-            BatchConfig {
-                batch_size,
-                flush_interval: Duration::from_millis(flush_interval_ms),
-                buffer_capacity,
-                retry: RetryPolicy {
-                    max_attempts: config["max_retries"].as_u64().unwrap_or(3) as u32 + 1,
-                    delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
+            build_batch_config(
+                config,
+                "loki_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "batch_size",
+                    batch_size: 100,
+                    flush_interval_ms: 1000,
+                    min_flush_interval_ms: 100,
+                    buffer_capacity: 10000,
+                    max_retries: 3,
+                    retry_delay_ms: 1000,
                 },
-                plugin_name: "loki_logging",
-            },
+            ),
             move |batch| {
                 let flush_config = flush_config.clone();
                 async move { send_batch(&flush_config, batch).await }
@@ -169,6 +143,27 @@ impl LokiLogging {
             endpoint_hostname,
             label_config,
         })
+    }
+
+    fn queue_entry<T: serde::Serialize>(
+        &self,
+        value: &T,
+        labels: BTreeMap<String, String>,
+        timestamp: &str,
+        kind: &str,
+    ) {
+        let line = match serde_json::to_string(value) {
+            Ok(line) => line,
+            Err(error) => {
+                warn!("Loki logging: failed to serialize {kind}: {error}");
+                return;
+            }
+        };
+        self.logger.try_send(LokiEntry {
+            labels,
+            timestamp_ns: timestamp_nanos_from_rfc3339(timestamp),
+            line,
+        });
     }
 
     /// Build labels for an HTTP/gRPC/WebSocket transaction.
@@ -242,42 +237,25 @@ impl Plugin for LokiLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let labels = self.build_stream_labels(summary);
-        let line = match serde_json::to_string(summary) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!("Loki logging: failed to serialize stream summary: {error}");
-                return;
-            }
-        };
-        self.logger.try_send(LokiEntry {
-            labels,
-            timestamp_ns: timestamp_nanos_from_rfc3339(&summary.timestamp_disconnected),
-            line,
-        });
+        self.queue_entry(
+            summary,
+            self.build_stream_labels(summary),
+            &summary.timestamp_disconnected,
+            "stream summary",
+        );
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        let labels = self.build_http_labels(summary);
-        let line = match serde_json::to_string(summary) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!("Loki logging: failed to serialize transaction summary: {error}");
-                return;
-            }
-        };
-        self.logger.try_send(LokiEntry {
-            labels,
-            timestamp_ns: timestamp_nanos_from_rfc3339(&summary.timestamp_received),
-            line,
-        });
+        self.queue_entry(
+            summary,
+            self.build_http_labels(summary),
+            &summary.timestamp_received,
+            "transaction summary",
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.endpoint_hostname
-            .as_ref()
-            .map(|host| vec![host.clone()])
-            .unwrap_or_default()
+        vec![self.endpoint_hostname.clone()]
     }
 }
 
@@ -351,25 +329,11 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
         req = req.header(key.as_str(), value.as_str());
     }
 
-    match cfg.http_client.execute(req, "loki_logging").await {
-        Ok(response) if response.status().is_success() => Ok(()),
-        Ok(response) => {
-            let status = response.status();
-            if status.is_client_error()
-                && status != reqwest::StatusCode::REQUEST_TIMEOUT
-                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-            {
-                warn!(
-                    "Loki logging batch discarded due to {} response ({} entries lost)",
-                    status, entry_count,
-                );
-                Ok(())
-            } else {
-                Err(format!("Loki logging batch failed with status {status}"))
-            }
-        }
-        Err(error) => Err(format!("Loki logging batch failed: {error}")),
-    }
+    handle_http_batch_response(
+        "Loki logging",
+        entry_count,
+        cfg.http_client.execute(req, "loki_logging").await,
+    )
 }
 
 /// Gzip-compress a JSON value.

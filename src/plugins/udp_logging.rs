@@ -14,30 +14,22 @@
 //! network MTU (typically ~1400 bytes for DTLS, ~1472 for plain UDP over
 //! Ethernet). Oversized datagrams may be fragmented or dropped.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tracing::warn;
 
-use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
+use super::utils::{
+    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, resolve_udp_endpoint,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
-
-/// How often to re-resolve the remote UDP endpoint even if sends succeed.
-const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Union type for log entries sent through the batched channel.
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
 
 #[derive(Clone)]
 struct UdpFlushConfig {
@@ -58,8 +50,8 @@ struct UdpFlushState {
 }
 
 pub struct UdpLogging {
-    logger: BatchingLogger<LogEntry>,
-    endpoint_hostname: Option<String>,
+    logger: BatchingLogger<SummaryLogEntry>,
+    endpoint_hostname: String,
 }
 
 impl UdpLogging {
@@ -91,14 +83,6 @@ impl UdpLogging {
             );
         }
 
-        let batch_size = config["batch_size"].as_u64().unwrap_or(10).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(1000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
-        let retry_delay = Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(500));
-
         let flush_config = UdpFlushConfig {
             host: host.clone(),
             port: port as u16,
@@ -115,16 +99,19 @@ impl UdpLogging {
             last_resolve: Instant::now(),
         }));
         let logger = BatchingLogger::spawn(
-            BatchConfig {
-                batch_size,
-                flush_interval: Duration::from_millis(flush_interval_ms),
-                buffer_capacity,
-                retry: RetryPolicy {
-                    max_attempts: config["max_retries"].as_u64().unwrap_or(1) as u32 + 1,
-                    delay: retry_delay,
+            build_batch_config(
+                config,
+                "udp_logging",
+                BatchConfigDefaults {
+                    batch_size_key: "batch_size",
+                    batch_size: 10,
+                    flush_interval_ms: 1000,
+                    min_flush_interval_ms: 100,
+                    buffer_capacity: 10000,
+                    max_retries: 1,
+                    retry_delay_ms: 500,
                 },
-                plugin_name: "udp_logging",
-            },
+            ),
             move |batch| {
                 let flush_config = flush_config.clone();
                 let state = Arc::clone(&state);
@@ -134,7 +121,7 @@ impl UdpLogging {
 
         Ok(Self {
             logger,
-            endpoint_hostname: Some(host),
+            endpoint_hostname: host,
         })
     }
 }
@@ -154,18 +141,15 @@ impl Plugin for UdpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(LogEntry::Stream(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(LogEntry::Http(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        self.endpoint_hostname
-            .as_ref()
-            .map(|host| vec![host.clone()])
-            .unwrap_or_default()
+        vec![self.endpoint_hostname.clone()]
     }
 }
 
@@ -191,37 +175,11 @@ impl UdpSender {
     }
 }
 
-/// Resolve the remote UDP endpoint. Prefers the gateway's shared `DnsCache`
-/// and falls back to `tokio::net::lookup_host` when no cache is present.
-async fn resolve_endpoint(
-    host: &str,
-    port: u16,
-    dns_cache: Option<&DnsCache>,
-) -> Result<SocketAddr, String> {
-    if let Some(cache) = dns_cache {
-        match cache.resolve(host, None, None).await {
-            Ok(ip) => return Ok(SocketAddr::new(ip, port)),
-            Err(error) => {
-                warn!(
-                    "udp_logging: DNS cache resolution failed for '{host}': {error} — falling back to system DNS"
-                );
-            }
-        }
-    }
-
-    let addr_str = format!("{host}:{port}");
-    tokio::net::lookup_host(&addr_str)
-        .await
-        .map_err(|error| format!("udp_logging: DNS resolution failed for {addr_str}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("udp_logging: no addresses resolved for {addr_str}"))
-}
-
 async fn create_sender(
     cfg: &UdpFlushConfig,
     dns_cache: Option<&DnsCache>,
 ) -> Result<(UdpSender, SocketAddr), String> {
-    let remote_addr = resolve_endpoint(&cfg.host, cfg.port, dns_cache).await?;
+    let remote_addr = resolve_udp_endpoint(&cfg.host, cfg.port, dns_cache, "udp_logging").await?;
     let sender = build_sender_for_addr(cfg, remote_addr).await?;
     Ok((sender, remote_addr))
 }
@@ -232,18 +190,7 @@ async fn build_sender_for_addr(
     cfg: &UdpFlushConfig,
     remote_addr: SocketAddr,
 ) -> Result<UdpSender, String> {
-    let bind_addr = if remote_addr.is_ipv4() {
-        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-    } else {
-        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-    };
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|error| format!("udp_logging: bind failed: {error}"))?;
-    socket
-        .connect(remote_addr)
-        .await
-        .map_err(|error| format!("udp_logging: connect to {remote_addr} failed: {error}"))?;
+    let socket = bind_connected_udp_socket(remote_addr, "udp_logging").await?;
 
     if cfg.dtls_enabled {
         let certificate =
@@ -296,7 +243,7 @@ async fn build_sender_for_addr(
 async fn send_batch(
     cfg: &UdpFlushConfig,
     state: &Mutex<UdpFlushState>,
-    batch: Vec<LogEntry>,
+    batch: Vec<SummaryLogEntry>,
 ) -> Result<(), String> {
     let payload = match serde_json::to_vec(&batch) {
         Ok(payload) => payload,
@@ -315,9 +262,10 @@ async fn send_batch(
         state.last_resolve = Instant::now();
     }
 
-    if !cfg.dtls_enabled && state.last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
+    if !cfg.dtls_enabled && state.last_resolve.elapsed() >= UDP_RE_RESOLVE_INTERVAL {
         state.last_resolve = Instant::now();
-        if let Ok(new_addr) = resolve_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref()).await
+        if let Ok(new_addr) =
+            resolve_udp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "udp_logging").await
             && state.current_addr != Some(new_addr)
             && let Ok(new_sender) = build_sender_for_addr(cfg, new_addr).await
         {

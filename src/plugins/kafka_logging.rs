@@ -11,33 +11,14 @@ use std::time::Duration;
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
+use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy, SummaryLogEntry};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
-
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-enum LogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
 
 #[derive(Clone, Copy)]
 enum KeyField {
     ClientIp,
     ProxyId,
     None,
-}
-
-impl LogEntry {
-    fn partition_key(&self, key_field: &KeyField) -> Option<String> {
-        match (self, key_field) {
-            (_, KeyField::None) => None,
-            (LogEntry::Http(summary), KeyField::ClientIp) => Some(summary.client_ip.clone()),
-            (LogEntry::Stream(summary), KeyField::ClientIp) => Some(summary.client_ip.clone()),
-            (LogEntry::Http(summary), KeyField::ProxyId) => summary.matched_proxy_id.clone(),
-            (LogEntry::Stream(summary), KeyField::ProxyId) => Some(summary.proxy_id.clone()),
-        }
-    }
 }
 
 struct KafkaFlushState {
@@ -52,7 +33,7 @@ impl Drop for KafkaFlushState {
 }
 
 pub struct KafkaLogging {
-    logger: BatchingLogger<LogEntry>,
+    logger: BatchingLogger<SummaryLogEntry>,
     broker_hostnames: Vec<String>,
 }
 
@@ -227,11 +208,11 @@ impl Plugin for KafkaLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(LogEntry::Stream(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(LogEntry::Http(summary.clone()));
+        self.logger.try_send(summary.into());
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -243,7 +224,7 @@ async fn send_batch(
     state: &Arc<KafkaFlushState>,
     topic: &str,
     key_field: KeyField,
-    batch: Vec<LogEntry>,
+    batch: Vec<SummaryLogEntry>,
 ) -> Result<(), String> {
     for entry in batch {
         let payload = match serde_json::to_string(&entry) {
@@ -253,7 +234,11 @@ async fn send_batch(
                 continue;
             }
         };
-        let key = entry.partition_key(&key_field);
+        let key = match key_field {
+            KeyField::None => None,
+            KeyField::ClientIp => Some(entry.client_ip().to_string()),
+            KeyField::ProxyId => entry.proxy_id().map(str::to_string),
+        };
         let state = Arc::clone(state);
         let topic = topic.to_string();
 
