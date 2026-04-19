@@ -60,6 +60,13 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
           common_tls_context:
             alpn_protocols: ["h2"]
+            # Trust the benchmark's self-signed CA so the upstream TLS
+            # handshake verifies instead of silently accepting any cert.
+            # The cert file is mounted at /certs/cert.pem inside the
+            # container by run_gateway_protocol_bench.sh::start_envoy.
+            validation_context:
+              trusted_ca:
+                filename: /certs/cert.pem
       load_assignment:
         cluster_name: backend_grpc
         endpoints:

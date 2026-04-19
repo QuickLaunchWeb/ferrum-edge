@@ -9,7 +9,7 @@ services:
     host: 127.0.0.1
     port: 3447
     protocol: https
-    tls_verify: false
+    tls_verify: true
     connect_timeout: 5000
     read_timeout: 30000
     write_timeout: 30000

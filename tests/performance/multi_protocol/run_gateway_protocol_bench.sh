@@ -94,11 +94,19 @@ supports() {
     #   Docker image bundles no third-party H2-upstream module. So a
     #   Kong/http2 row would measure client→H2→Kong→H1→backend, i.e. not
     #   uniform H2 end-to-end. http2 therefore excludes kong.
+    #
+    # - Tyk tcp-tls: Tyk Gateway v5.3 rejects per-API `listen_port` +
+    #   `protocol: "tls"` definitions with "trying to open disabled
+    #   port" unless the port is pre-registered at the gateway level,
+    #   which requires enterprise/custom-domain config the OSS image
+    #   doesn't ship. Documented as a Tyk OSS limitation, not a bench
+    #   harness bug. Remove once Tyk OSS supports secondary TCP/TLS
+    #   listener ports or the bench config moves Tyk TCP onto :8443.
     case "$gw:$proto" in
         ferrum:*)  return 0 ;;
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
-        tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss|tyk:tcp-tls) return 0 ;;
+        tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss) return 0 ;;
         krakend:http1-tls|krakend:http2) return 0 ;;
         *) return 1 ;;
     esac
@@ -253,7 +261,6 @@ start_ferrum() {
         -e "FERRUM_POOL_MAX_IDLE_PER_HOST=200" \
         -e "FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true" \
         -e "FERRUM_POOL_WARMUP_ENABLED=true" \
-        -e "FERRUM_TLS_NO_VERIFY=true" \
         -e "FERRUM_WEBSOCKET_TUNNEL_MODE=true" \
         -e "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608" \
         -e "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432" \
@@ -366,8 +373,7 @@ start_kong() {
         -e "KONG_STREAM_SSL_CERT=/certs/cert.pem" \
         -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
         -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
-        -e "KONG_NGINX_PROXY_PROXY_SSL_VERIFY=off" \
-        -e "KONG_NGINX_STREAM_PROXY_SSL_VERIFY=off" \
+        -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/cert.pem" \
         "${extra_env[@]}" \
         -v "$cfg_src:/kong/kong.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
@@ -476,6 +482,18 @@ container_has_fatal_log() {
     return 1
 }
 
+# Active UDP probe — sends a datagram and waits briefly for an echo reply.
+# Returns 0 iff the reply content matches. Used to confirm an echo-style
+# UDP gateway (Ferrum/Envoy/Kong plain UDP) is fully forwarding before
+# the bench fires, because the nginx-stream / udp_proxy cold-start window
+# can swallow the first datagrams and cause 0 RPS benchmarks.
+probe_udp_echo() {
+    local port=$1
+    local out
+    out=$(echo -n "bench-probe" | nc -u -w 1 127.0.0.1 "$port" 2>/dev/null | head -c 32)
+    [ "$out" = "bench-probe" ]
+}
+
 wait_for_gateway() {
     local target_port
     case "$PROTOCOL" in
@@ -488,9 +506,37 @@ wait_for_gateway() {
 
     for i in $(seq 1 40); do
         case "$PROTOCOL" in
-            udp|udp-dtls|http3)
-                # UDP/QUIC: no TCP handshake to probe. Give the listener a
-                # moment to bind, then verify container health + clean logs.
+            udp)
+                # Plain UDP: container-alive check is not enough because
+                # Kong's stream-subsystem cold start can drop datagrams
+                # for 5-15 seconds after the listener binds. Actively
+                # probe with a UDP packet and wait for the echo reply;
+                # only declare ready when a round-trip actually completes.
+                if [ "$i" -ge 6 ]; then
+                    if container_has_fatal_log; then
+                        echo "[gateway] fatal log entry detected for $PROTOCOL" >&2
+                        docker logs "$GATEWAY_CID" 2>&1 | tail -30 >&2 || true
+                        return 1
+                    fi
+                    if ! container_alive; then
+                        echo "[gateway] container exited for $PROTOCOL" >&2
+                        docker logs "$GATEWAY_CID" 2>&1 | tail -30 >&2 || true
+                        return 1
+                    fi
+                    if probe_udp_echo "$target_port"; then
+                        echo "[gateway] udp ready on port $target_port (active probe)"
+                        sleep 1
+                        return 0
+                    fi
+                fi
+                sleep 0.5
+                ;;
+            udp-dtls|http3)
+                # UDP/DTLS + QUIC cannot be probed with a plain UDP datagram
+                # because the first packet has to be a DTLS/QUIC ClientHello.
+                # Fall back to container-alive + fatal-log scan, same as
+                # before — these protocols don't exhibit the Kong-style
+                # cold-start drop problem in the current matrix.
                 if [ "$i" -ge 6 ]; then
                     if container_has_fatal_log; then
                         echo "[gateway] fatal log entry detected for $PROTOCOL" >&2
@@ -498,7 +544,7 @@ wait_for_gateway() {
                         return 1
                     fi
                     if container_alive; then
-                        echo "[gateway] container alive for $PROTOCOL (udp/quic — no port probe)"
+                        echo "[gateway] container alive for $PROTOCOL (udp-encrypted/quic — no active probe)"
                         sleep 1
                         return 0
                     fi
