@@ -763,18 +763,44 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             tokio::task::yield_now().await;
                         }
                     }
+                    // Shut down the write half cleanly so the peer sees EOF
+                    // and stops echoing. Without this, the writer task drops
+                    // `wr` at deadline in the middle of a repeated payload
+                    // cycle — the LAST payload is only partially sent, the
+                    // reader is mid-way through a `read_exact(payload.len())`
+                    // that will never complete (the remaining bytes will
+                    // never arrive because we're no longer writing), and the
+                    // TCP FIN is never issued because `rd` on the other task
+                    // still keeps the TlsStream alive. Reader hangs forever
+                    // until the process wallclock-kills. Reproduced locally
+                    // at 500 KiB × 100 conns: ~6/100 connections wedge in
+                    // ESTABLISHED with half-received payloads.
+                    let _ = wr.shutdown().await;
                     Ok(())
                 });
 
+                // Read with a short per-attempt timeout so a stalled backend
+                // or partial echo cannot wedge the task indefinitely. 5s is
+                // generous — a healthy 5 MiB read at concurrency 25 completes
+                // in <250ms on localhost, so any stall beyond that is a real
+                // failure that should be surfaced, not papered over.
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    match rd.read_exact(&mut buf).await {
-                        Ok(_) => {
+                    let read_timeout = Duration::from_secs(5);
+                    match tokio::time::timeout(read_timeout, rd.read_exact(&mut buf)).await {
+                        Ok(Ok(_)) => {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
+                        Ok(Err(_)) => {
+                            metrics.record_error();
+                            break;
+                        }
                         Err(_) => {
+                            // Read timeout — no bytes flowing. Record as an
+                            // error and bail so the bench doesn't wallclock
+                            // itself into oblivion on a wedged connection.
                             metrics.record_error();
                             break;
                         }
