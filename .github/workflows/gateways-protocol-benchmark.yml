@@ -599,7 +599,10 @@ jobs:
           lines.append("- Gateways that do not support a protocol are omitted from that protocol's tables.")
           lines.append("- `direct` = bench against `proto_backend` directly (no gateway), as the baseline.")
           lines.append("- UDP and UDP+DTLS use a fixed 1KB payload; all other protocols sweep 10KB–5MB.")
-          lines.append("- Kong HTTP/3 is enabled via OpenResty QUIC directives; upstream leg is HTTPS/H2.")
+          lines.append("- HTTP/3 runs Ferrum vs Envoy only — Kong has no supported HTTP/3 config path "
+                       "(KONG_PROXY_LISTEN does not accept http3/quic flags); Tyk and KrakenD CE have no "
+                       "HTTP/3 support at all.")
+          lines.append("- KrakenD CE does not proxy gRPC, WebSockets, TCP, UDP, or DTLS (Enterprise-only).")
 
           summary = "\n".join(lines) + "\n"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:

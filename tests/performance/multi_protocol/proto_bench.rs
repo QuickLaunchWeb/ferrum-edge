@@ -478,10 +478,18 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
     // For wss://, plug our insecure rustls ClientConfig so tungstenite doesn't
     // reject proto_backend's self-signed cert. For ws://, pass None so the
     // default plaintext path is used.
+    //
+    // ALPN is restricted to `http/1.1` only: the shared helper advertises
+    // `h2` first by default, which HTTP/2-capable gateways (Ferrum defaults,
+    // Tyk with enable_http2, Kong with http2 listen flag) will happily
+    // negotiate — and then the WebSocket upgrade (an HTTP/1.1-only
+    // mechanism) fails at handshake time, producing 0 RPS. WSS clients
+    // must explicitly offer only http/1.1 to force the gateway down the
+    // WebSocket-upgradeable path.
     let connector: Option<Connector> = if args.target.starts_with("wss://") {
-        Some(Connector::Rustls(Arc::new(
-            tls_utils::make_client_tls_config_insecure(),
-        )))
+        let mut tls_cfg = tls_utils::make_client_tls_config_insecure();
+        tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Some(Connector::Rustls(Arc::new(tls_cfg)))
     } else {
         None
     };
