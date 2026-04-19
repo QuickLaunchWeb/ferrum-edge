@@ -11,10 +11,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::utils::auth_flow::{self, AuthMechanism, ExtractedCredential, VerifyOutcome};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct KeyAuth {
@@ -50,23 +50,72 @@ impl KeyAuth {
         })
     }
 
-    fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
+    fn extract_key(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> Option<String> {
         if let Some(ref lower) = self.header_name_lower {
-            ctx.headers
+            headers
                 .get(lower.as_str())
                 .or_else(|| {
                     self.header_name_original
                         .as_ref()
-                        .and_then(|orig| ctx.headers.get(orig.as_str()))
+                        .and_then(|orig| headers.get(orig.as_str()))
                 })
                 .cloned()
         } else if let Some(ref param) = self.query_param_name {
             ctx.query_params.get(param.as_str()).cloned()
         } else {
-            ctx.headers
+            headers
                 .get("x-api-key")
-                .or_else(|| ctx.headers.get("X-API-Key"))
+                .or_else(|| headers.get("X-API-Key"))
                 .cloned()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthMechanism for KeyAuth {
+    fn mechanism_name(&self) -> &str {
+        "key_auth"
+    }
+
+    fn extract(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> ExtractedCredential {
+        match self.extract_key(ctx, headers) {
+            Some(key) => ExtractedCredential::ApiKey(key),
+            None => ExtractedCredential::Missing,
+        }
+    }
+
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::ApiKey(api_key) = credential else {
+            return VerifyOutcome::NotApplicable;
+        };
+
+        // Reject empty / whitespace-only keys before hitting the index. This
+        // prevents a misconfigured consumer (with an empty `key` value) from
+        // accidentally matching every request that sends a blank header, and
+        // gives clients a clearer error than a generic "Invalid API key".
+        if api_key.trim().is_empty() {
+            return VerifyOutcome::Invalid(r#"{"error":"Missing API key"}"#.into());
+        }
+
+        match consumer_index.find_by_api_key(&api_key) {
+            Some(consumer) => VerifyOutcome::Success {
+                consumer: Some(consumer),
+                external_identity: None,
+                external_identity_header: None,
+            },
+            None => VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid API key"}"#.into()),
         }
     }
 }
@@ -94,42 +143,6 @@ impl Plugin for KeyAuth {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        let api_key = match self.extract_key(ctx) {
-            Some(k) => k,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing API key"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // Reject empty / whitespace-only keys before hitting the index. This
-        // prevents a misconfigured consumer (with an empty `key` value) from
-        // accidentally matching every request that sends a blank header, and
-        // gives clients a clearer error than a generic "Invalid API key".
-        if api_key.trim().is_empty() {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Missing API key"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-
-        // O(1) lookup by API key via ConsumerIndex
-        if let Some(consumer) = consumer_index.find_by_api_key(&api_key) {
-            if ctx.identified_consumer.is_none() {
-                debug!("key_auth: identified consumer '{}'", consumer.username);
-                ctx.identified_consumer = Some(consumer);
-            }
-            return PluginResult::Continue;
-        }
-
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"Invalid API key"}"#.into(),
-            headers: HashMap::new(),
-        }
+        auth_flow::run_auth(self, ctx, consumer_index).await
     }
 }
