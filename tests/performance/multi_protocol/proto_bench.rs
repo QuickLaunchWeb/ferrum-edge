@@ -229,7 +229,17 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                         }
                     }
                     Err(_) => {
+                        // Break out of the per-task loop on connection-level
+                        // send errors (matches run_http2 / run_grpc). Without
+                        // the break, a broken connection that reports fast
+                        // errors without flipping is_closed() can spin the
+                        // loop ~millions of times per second, inflating
+                        // total_errors into the tens of millions at large
+                        // payload sizes. Dropping the task is preferable —
+                        // the other N-1 workers continue producing clean
+                        // throughput data.
                         metrics.record_error();
+                        break;
                     }
                 }
             }
@@ -501,10 +511,23 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
 
-            let (ws, _) =
-                tokio_tungstenite::connect_async_tls_with_config(&target, None, false, connector)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
+            // Count connect failures as errors in the JSON report rather than
+            // propagating via `?`. Otherwise the task returns Err, collect_results
+            // prints a stderr line, and the aggregated metrics show 0 errors /
+            // 0 requests — indistinguishable from "bench didn't run" and
+            // suppressed by the aggregator's all-zero scenario filter.
+            let ws = match tokio_tungstenite::connect_async_tls_with_config(
+                &target, None, false, connector,
+            )
+            .await
+            {
+                Ok((ws, _)) => ws,
+                Err(e) => {
+                    eprintln!("  task error: ws connect: {e}");
+                    metrics.record_error();
+                    return Ok::<_, anyhow::Error>(metrics);
+                }
+            };
             let (mut write, mut read) = ws.split();
 
             while Instant::now() < deadline {
@@ -604,7 +627,14 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
         let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
-            let mut client = BenchServiceClient::new(channel);
+            // tonic defaults to a 4 MiB cap on request + response message
+            // size; the bench sweeps payloads up to 5 MiB. Without raising
+            // both caps, every 5 MiB RPC fails with OutOfRange on the
+            // encode side (client) or RESOURCE_EXHAUSTED on the decode
+            // side (server). Must match proto_backend's cap.
+            let mut client = BenchServiceClient::new(channel)
+                .max_decoding_message_size(8 * 1024 * 1024)
+                .max_encoding_message_size(8 * 1024 * 1024);
 
             while Instant::now() < deadline {
                 let req = tonic::Request::new(EchoRequest {

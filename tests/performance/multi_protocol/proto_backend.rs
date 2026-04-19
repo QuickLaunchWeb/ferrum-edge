@@ -32,6 +32,11 @@ pub mod bench_proto {
 use bench_proto::bench_service_server::{BenchService, BenchServiceServer};
 use bench_proto::{EchoRequest, EchoResponse};
 
+// Max inbound+outbound protobuf message size for the bench gRPC service.
+// tonic defaults to 4 MiB; the benchmark sweeps payloads up to 5 MiB, so
+// keep client (proto_bench) and server (proto_backend) in lockstep here.
+const GRPC_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Default)]
 struct BenchServiceImpl;
 
@@ -286,7 +291,15 @@ async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
         .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
         .initial_connection_window_size(33_554_432) // 32 MiB
         .tcp_nodelay(true)
-        .add_service(BenchServiceServer::new(BenchServiceImpl))
+        .add_service(
+            BenchServiceServer::new(BenchServiceImpl)
+                // tonic defaults to a 4 MiB cap on request + response message
+                // size; the bench sweeps up to 5 MiB payloads. Without raising
+                // this, every 5 MiB RPC fails with RESOURCE_EXHAUSTED on both
+                // the direct-backend baseline and every gateway.
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES),
+        )
         .serve(addr)
         .await
         .context("gRPC server error")
@@ -308,7 +321,11 @@ async fn run_grpcs_server(
         .initial_stream_window_size(8_388_608)
         .initial_connection_window_size(33_554_432)
         .tcp_nodelay(true)
-        .add_service(BenchServiceServer::new(BenchServiceImpl))
+        .add_service(
+            BenchServiceServer::new(BenchServiceImpl)
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES),
+        )
         .serve(addr)
         .await
         .context("grpcs server error")

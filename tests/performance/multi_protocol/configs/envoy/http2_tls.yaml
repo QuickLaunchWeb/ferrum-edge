@@ -18,7 +18,13 @@ static_resources:
                 tls_certificates:
                   - certificate_chain: { filename: CERT_PATH }
                     private_key: { filename: KEY_PATH }
-                alpn_protocols: ["h2", "http/1.1"]
+                # Force ALPN h2 only. With `["h2", "http/1.1"]` Envoy will
+                # silently negotiate http/1.1 for bench clients that offer
+                # both, then hyper's HTTP/2 client-side handshake fails on
+                # the first send_request — producing 0 RPS / 100 errors.
+                # Matching grpcs.yaml's h2-only ALPN forces every client to
+                # either get h2 or fail the TLS handshake cleanly.
+                alpn_protocols: ["h2"]
           filters:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
