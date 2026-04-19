@@ -76,7 +76,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
 
     fn record_drop(&self, reason: &str) {
         let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if dropped == 1 || dropped % DROP_WARN_EVERY == 0 {
+        if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
             warn!(
                 plugin = self.plugin_name,
                 "{}: dropping queued log entry because {} ({} dropped total; logging every {} drops)",

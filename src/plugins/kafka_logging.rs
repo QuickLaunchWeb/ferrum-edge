@@ -1,12 +1,6 @@
-//! Kafka access logging plugin — async log shipping to Apache Kafka.
-//!
-//! Serializes `TransactionSummary` entries and produces them to a Kafka topic.
-//! Uses `BatchingLogger<LogEntry>` to decouple the proxy hot path from Kafka
-//! I/O while keeping librdkafka responsible for its own internal batching,
-//! compression, and delivery retries.
-//!
-//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
-//! `LogEntry` union type.
+//! Kafka access logging plugin — async log shipping to Apache Kafka via
+//! `BatchingLogger<LogEntry>`, with librdkafka still owning internal batching,
+//! compression, and delivery retries for both HTTP and stream summaries.
 
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -20,7 +14,6 @@ use tracing::warn;
 use super::utils::{BatchConfig, BatchingLogger, PluginHttpClient, RetryPolicy};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
-/// Union type for log entries sent through the batched channel.
 #[derive(Clone, serde::Serialize)]
 #[serde(untagged)]
 enum LogEntry {
@@ -28,14 +21,10 @@ enum LogEntry {
     Stream(StreamTransactionSummary),
 }
 
-/// Which `TransactionSummary` field to use as the Kafka partition key.
 #[derive(Clone, Copy)]
 enum KeyField {
-    /// Partition by client IP (default) — groups a client's logs together.
     ClientIp,
-    /// Partition by proxy/route ID.
     ProxyId,
-    /// Null key — round-robin across partitions.
     None,
 }
 
