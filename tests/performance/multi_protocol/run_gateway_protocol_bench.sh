@@ -566,15 +566,35 @@ run_bench() {
     local out="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.json"
     echo "[bench] $gateway/$PROTOCOL payload=${payload}B concurrency=${effective_concurrency} → $bench_target"
 
-    if ! "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
+    # Wall-clock kill-switch. proto_bench has its own per-iteration I/O
+    # timeouts, but this outer `timeout` is a belt-and-suspenders guard
+    # against any future hang path (new protocol handler, dependency change,
+    # etc.) that would otherwise let a single stuck bench eat the workflow's
+    # 75-minute step budget. DURATION seconds of actual work + 60s head-room
+    # for connect/handshake/teardown.
+    local bench_wallclock=$(( DURATION + 60 ))
+
+    # `|| rc=$?` captures the exit code without tripping `set -e`. Using an
+    # `if !` branch here would clear $? inside the then-block (bash semantics
+    # of the `!` negation), so we'd lose the ability to distinguish a 124
+    # (timeout) from a generic non-zero exit.
+    local rc=0
+    timeout "${bench_wallclock}s" \
+        "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
         --target "$bench_target" \
         --duration "$DURATION" \
         --concurrency "$effective_concurrency" \
         --payload-size "$payload" \
-        --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"; then
-        echo "[bench] FAILED: $gateway/$PROTOCOL payload=${payload}B — see ${out}.err"
-        # Leave a stub JSON so aggregation can detect the failure.
-        echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"effective_concurrency\":$effective_concurrency,\"error\":\"bench failed\",\"rps\":0}" > "$out"
+        --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
+        || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+            echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"
+            echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"effective_concurrency\":$effective_concurrency,\"error\":\"bench wallclock timeout\",\"rps\":0}" > "$out"
+        else
+            echo "[bench] FAILED (rc=$rc): $gateway/$PROTOCOL payload=${payload}B — see ${out}.err"
+            echo "{\"gateway\":\"$gateway\",\"protocol\":\"$PROTOCOL\",\"payload_size\":$payload,\"effective_concurrency\":$effective_concurrency,\"error\":\"bench failed\",\"rps\":0}" > "$out"
+        fi
         return 0
     fi
 

@@ -687,28 +687,100 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
             let tcp = tokio::net::TcpStream::connect(addr).await?;
             let _ = tcp.set_nodelay(true);
 
+            // Run write_all and read_exact CONCURRENTLY via split + try_join.
+            // The previous sequential `write_all(N); read_exact(N)` pattern
+            // symmetric-deadlocks when N exceeds the kernel socket buffers
+            // (~212 KB default) and both peers try to push at once: each
+            // side's SNDBUF fills before the other drains, neither can
+            // progress. Reproduced locally at payload=1 MiB / concurrency>=10
+            // against proto_backend's TCP+TLS echo — every task stalled
+            // indefinitely and ran out the workflow's 75-min step budget.
+            //
+            // With full-duplex I/O the writer pushes bytes while the reader
+            // simultaneously drains the echo, so 50 conns × 1 MiB completes
+            // well inside DURATION.
             if let Some(tls_cfg) = tls_cfg {
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);
                 let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
                     .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
-                let mut stream = connector.connect(server_name, tcp).await?;
+                let stream = connector.connect(server_name, tcp).await?;
+                // Spawn writer and reader on SEPARATE tasks. A single-task
+                // `try_join!` over `tokio::io::split(tls_stream)` shares
+                // a BiLock between halves and still deadlocks the TLS
+                // case — confirmed locally at 1 MiB × 50 conns. With
+                // two tasks the reader half can run on a different worker
+                // while the writer is holding the BiLock between chunks.
+                let (mut rd, mut wr) = tokio::io::split(stream);
+                let payload_bytes = payload.clone();
+                let write_deadline = deadline;
+                let write_task = tokio::spawn(async move {
+                    // Chunk the write + yield_now() between chunks.
+                    // tokio::io::split over tokio_rustls::TlsStream shares a
+                    // BiLock between the read and write halves. poll_write
+                    // on the TLS stream produces Ready synchronously as
+                    // long as the underlying TCP has buffer space — which
+                    // means a naive `wr.write_all(5 MiB)` can complete
+                    // without ever returning Pending, never releases the
+                    // BiLock, and the reader on the other half is starved.
+                    // Reproduced locally at 5 MiB × 25 conns: the writer
+                    // task ran hot while read_exact never got scheduled.
+                    //
+                    // Chunked writes with explicit yield_now() between
+                    // chunks force cooperative yielding so the reader
+                    // can acquire the BiLock and drain the echo stream.
+                    const CHUNK: usize = 65_536;
+                    while Instant::now() < write_deadline {
+                        let mut offset = 0;
+                        while offset < payload_bytes.len() {
+                            let end = (offset + CHUNK).min(payload_bytes.len());
+                            if wr.write_all(&payload_bytes[offset..end]).await.is_err() {
+                                return Err::<(), ()>(());
+                            }
+                            offset = end;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Ok(())
+                });
+
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    stream.write_all(&payload).await?;
-                    stream.read_exact(&mut buf).await?;
-                    let latency = start.elapsed().as_micros() as u64;
-                    metrics.record(latency, buf.len());
+                    match rd.read_exact(&mut buf).await {
+                        Ok(_) => {
+                            let latency = start.elapsed().as_micros() as u64;
+                            metrics.record(latency, buf.len());
+                        }
+                        Err(_) => {
+                            metrics.record_error();
+                            break;
+                        }
+                    }
                 }
+                // Abort the writer in case the reader exited first (deadline
+                // or error) — otherwise it could keep writing into a dropped
+                // socket until the write fails.
+                write_task.abort();
+                let _ = write_task.await;
             } else {
-                let mut stream = tcp;
+                let (mut rd, mut wr) = tcp.into_split();
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    stream.write_all(&payload).await?;
-                    stream.read_exact(&mut buf).await?;
-                    let latency = start.elapsed().as_micros() as u64;
-                    metrics.record(latency, buf.len());
+                    let res = tokio::try_join!(
+                        async { wr.write_all(&payload).await },
+                        async { rd.read_exact(&mut buf).await.map(|_| ()) },
+                    );
+                    match res {
+                        Ok(_) => {
+                            let latency = start.elapsed().as_micros() as u64;
+                            metrics.record(latency, buf.len());
+                        }
+                        Err(_) => {
+                            metrics.record_error();
+                            break;
+                        }
+                    }
                 }
             }
             Ok::<_, anyhow::Error>(metrics)
@@ -881,12 +953,37 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                 let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
                 sock.connect(addr).await?;
                 let mut buf = vec![0u8; 65535];
+                // UDP is lossy by nature, and a misconfigured gateway (e.g.
+                // stream proxy that accepts datagrams but never forwards a
+                // reply) can leave `sock.recv` blocked forever. Without a
+                // recv timeout, every task in the bench hangs past the
+                // outer deadline and the workflow's 75-minute step budget
+                // fires. Cap each round-trip at 1s; on timeout, count an
+                // error and continue so legitimate packet loss doesn't
+                // kill the task but a total backend silence still lets the
+                // deadline check terminate the loop.
+                let recv_timeout = Duration::from_secs(1);
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    sock.send(&payload).await?;
-                    let n = sock.recv(&mut buf).await?;
-                    let latency = start.elapsed().as_micros() as u64;
-                    metrics.record(latency, n);
+                    if sock.send(&payload).await.is_err() {
+                        metrics.record_error();
+                        break;
+                    }
+                    match tokio::time::timeout(recv_timeout, sock.recv(&mut buf)).await {
+                        Ok(Ok(n)) => {
+                            let latency = start.elapsed().as_micros() as u64;
+                            metrics.record(latency, n);
+                        }
+                        Ok(Err(_)) => {
+                            metrics.record_error();
+                            break;
+                        }
+                        Err(_) => {
+                            metrics.record_error();
+                            // Don't break — UDP loss is expected; let the
+                            // outer deadline stop us if it's permanent.
+                        }
+                    }
                 }
             }
             Ok::<_, anyhow::Error>(metrics)
