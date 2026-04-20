@@ -79,25 +79,47 @@ pub struct BackendTlsConfigBuilder<'a> {
 
 impl<'a> BackendTlsConfigBuilder<'a> {
     pub fn build_rustls(&self) -> Result<ClientConfig, TlsError> {
-        self.build_rustls_with_skip_verify_warning(
+        let builder = backend_client_config_builder(self.policy)
+            .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
+        self.build_rustls_with_builder(
+            builder,
             "Backend TLS certificate verification DISABLED (testing mode)",
         )
     }
 
     /// Keep the HTTP/3 backend path on a distinct entry point so the call site
     /// makes the QUIC-specific intent obvious in logs and future refactors.
+    ///
+    /// QUIC requires a TLS 1.3-compatible config. If the general backend TLS
+    /// policy is incompatible, fall back to rustls safe defaults for the QUIC
+    /// builder only, then continue applying the normal verifier and mTLS logic.
     pub fn build_rustls_quic(&self) -> Result<ClientConfig, TlsError> {
-        self.build_rustls_with_skip_verify_warning(
+        let builder = match backend_client_config_builder(self.policy) {
+            Ok(builder) => builder,
+            Err(err) => {
+                tracing::warn!(
+                    "Backend TLS policy is incompatible with HTTP/3/QUIC ({}); falling back to rustls safe defaults for the QUIC builder",
+                    err
+                );
+                backend_client_config_builder(None).map_err(|fallback_err| {
+                    TlsError::Rustls(format!(
+                        "Failed to build default HTTP/3 backend TLS config: {}",
+                        fallback_err
+                    ))
+                })?
+            }
+        };
+        self.build_rustls_with_builder(
+            builder,
             "Backend TLS certificate verification DISABLED for HTTP/3 backend",
         )
     }
 
-    fn build_rustls_with_skip_verify_warning(
+    fn build_rustls_with_builder(
         &self,
+        builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>,
         skip_verify_warning: &'static str,
     ) -> Result<ClientConfig, TlsError> {
-        let builder = backend_client_config_builder(self.policy)
-            .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
         let client_auth = self.load_client_auth()?;
 
         let mut client_config = if self.skip_verification() {
@@ -247,7 +269,7 @@ fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'st
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::sync::Once;
+    use std::sync::{Arc, Once};
 
     use chrono::Utc;
     use rcgen::{
@@ -436,6 +458,25 @@ mod tests {
         }
     }
 
+    fn quic_incompatible_policy() -> TlsPolicy {
+        let base_provider = rustls::crypto::ring::default_provider();
+        let provider = rustls::crypto::CryptoProvider {
+            cipher_suites: vec![
+                rustls::crypto::ring::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ],
+            kx_groups: vec![rustls::crypto::ring::kx_group::X25519],
+            ..base_provider
+        };
+
+        TlsPolicy {
+            protocol_versions: vec![&rustls::version::TLS13],
+            crypto_provider: Arc::new(provider),
+            prefer_server_cipher_order: false,
+            session_cache_size: 4096,
+            early_data_max_size: 0,
+        }
+    }
+
     #[test]
     fn build_root_cert_store_prefers_proxy_ca_exclusively() {
         let dir = TempDir::new().unwrap();
@@ -535,6 +576,34 @@ mod tests {
         builder_for(&proxy, None, false, None, None, &[])
             .build_rustls_quic()
             .expect("HTTP/3 skip-verify should bypass CA loading");
+    }
+
+    #[test]
+    fn build_rustls_quic_falls_back_when_tls_policy_is_quic_incompatible() {
+        ensure_crypto_provider();
+        let proxy = test_proxy();
+        let policy = quic_incompatible_policy();
+        let mut builder = builder_for(&proxy, None, false, None, None, &[]);
+        builder.policy = Some(&policy);
+
+        builder
+            .build_rustls_quic()
+            .expect("HTTP/3 should fall back to safe defaults when TLS policy is incompatible");
+    }
+
+    #[test]
+    fn build_rustls_still_errors_when_tls_policy_is_incompatible() {
+        ensure_crypto_provider();
+        let proxy = test_proxy();
+        let policy = quic_incompatible_policy();
+        let mut builder = builder_for(&proxy, None, false, None, None, &[]);
+        builder.policy = Some(&policy);
+
+        let err = builder.build_rustls().unwrap_err();
+
+        assert!(
+            matches!(err, TlsError::Rustls(message) if message.contains("Failed to apply backend TLS policy"))
+        );
     }
 
     #[test]
