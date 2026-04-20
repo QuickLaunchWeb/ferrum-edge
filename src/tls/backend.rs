@@ -100,28 +100,31 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
         let client_auth = self.load_client_auth()?;
 
-        if self.skip_verification() {
+        let mut client_config = if self.skip_verification() {
             tracing::warn!("{}", skip_verify_warning);
             let dangerous = builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier));
-            return match client_auth {
+            match client_auth {
                 Some((certs, key)) => dangerous.with_client_auth_cert(certs, key).map_err(|e| {
                     TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
                 }),
                 None => Ok(dangerous.with_no_client_auth()),
-            };
-        }
+            }
+        } else {
+            let verifier = self.build_server_verifier()?;
+            let builder = builder.with_webpki_verifier(verifier);
 
-        let verifier = self.build_server_verifier()?;
-        let builder = builder.with_webpki_verifier(verifier);
+            match client_auth {
+                Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
+                    TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
+                }),
+                None => Ok(builder.with_no_client_auth()),
+            }
+        }?;
 
-        match client_auth {
-            Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
-                TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
-            }),
-            None => Ok(builder.with_no_client_auth()),
-        }
+        crate::tls::apply_client_session_resumption(&mut client_config, self.policy);
+        Ok(client_config)
     }
 
     pub fn build_reqwest(&self) -> Result<ClientBuilder, TlsError> {
