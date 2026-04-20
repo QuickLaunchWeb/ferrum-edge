@@ -488,6 +488,26 @@ fn test_http3_coalesce_min_allows_large_value_when_max_raised() {
 }
 
 #[test]
+fn test_http3_coalesce_min_non_numeric_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_COALESCE_MIN_BYTES", "abc"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_COALESCE_MIN_BYTES"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_http3_flush_interval_default() {
     with_env_vars(
         &[

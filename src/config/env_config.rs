@@ -1437,9 +1437,10 @@ impl EnvConfig {
         // `http3_coalesce_min_bytes` depends on the runtime-parsed
         // `http3_coalesce_max_bytes`, so it lives outside the macro block.
         let http3_coalesce_min_bytes: usize = {
-            let raw = resolve_var(conf, "FERRUM_HTTP3_COALESCE_MIN_BYTES")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(crate::http3::config::H3_COALESCE_MAX_DEFAULT);
+            let raw: usize =
+                env_config_macro::resolve_default(conf, "FERRUM_HTTP3_COALESCE_MIN_BYTES", || {
+                    crate::http3::config::H3_COALESCE_MAX_DEFAULT
+                })?;
             let clamped = raw.clamp(
                 crate::http3::config::H3_COALESCE_MIN_FLOOR,
                 http3_coalesce_max_bytes,
