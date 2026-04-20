@@ -28,6 +28,17 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
+# ── Portable `timeout` command (GNU coreutils) ──────────────────────────────
+# macOS/BSD ships without `timeout`; Homebrew installs it as `gtimeout`.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    TIMEOUT_CMD=""
+    echo "[warn] Neither 'timeout' nor 'gtimeout' found — bench runs will have no wallclock kill-switch" >&2
+fi
+
 # ── Defaults ─────────────────────────────────────────────────────────────────
 PROTOCOL="${1:-}"
 [ -z "$PROTOCOL" ] && { echo "usage: $0 <protocol> [options]" >&2; exit 2; }
@@ -688,14 +699,24 @@ run_bench() {
     # of the `!` negation), so we'd lose the ability to distinguish a 124
     # (timeout) from a generic non-zero exit.
     local rc=0
-    timeout "${bench_wallclock}s" \
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD "${bench_wallclock}s" \
+            "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
+            --target "$bench_target" \
+            --duration "$DURATION" \
+            --concurrency "$effective_concurrency" \
+            --payload-size "$payload" \
+            --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
+            || rc=$?
+    else
         "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
-        --target "$bench_target" \
-        --duration "$DURATION" \
-        --concurrency "$effective_concurrency" \
-        --payload-size "$payload" \
-        --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
-        || rc=$?
+            --target "$bench_target" \
+            --duration "$DURATION" \
+            --concurrency "$effective_concurrency" \
+            --payload-size "$payload" \
+            --json "${extra_args[@]}" > "$out" 2>"$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err" \
+            || rc=$?
+    fi
     if [ "$rc" -ne 0 ]; then
         if [ "$rc" -eq 124 ]; then
             echo "[bench] TIMED OUT after ${bench_wallclock}s: $gateway/$PROTOCOL payload=${payload}B"

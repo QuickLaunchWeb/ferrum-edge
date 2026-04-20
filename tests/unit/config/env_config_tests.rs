@@ -621,6 +621,46 @@ fn test_http3_initial_mtu_above_max_rejected() {
 }
 
 #[test]
+fn test_http3_initial_mtu_u16_overflow_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "70000"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_INITIAL_MTU"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_http3_initial_mtu_non_numeric_rejected() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP3_INITIAL_MTU", "abc"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.err().unwrap();
+            assert!(
+                err.contains("FERRUM_HTTP3_INITIAL_MTU"),
+                "unexpected error: {err}"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_http2_reset_and_websocket_limits_custom() {
     with_env_vars(
         &[
