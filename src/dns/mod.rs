@@ -15,10 +15,10 @@ use dashmap::DashMap;
 use futures_util::stream::{self, StreamExt};
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
-    NameServerConfig, NameServerConfigGroup, ResolveHosts, ResolverConfig, ResolverOpts,
+    ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
 };
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
@@ -142,7 +142,7 @@ struct DnsCacheEntry {
 pub struct DnsCache {
     cache: Arc<DashMap<String, DnsCacheEntry>>,
     global_overrides: HashMap<String, String>,
-    resolver: Arc<Resolver<TokioConnectionProvider>>,
+    resolver: Arc<Resolver<TokioRuntimeProvider>>,
     dns_order: Vec<DnsRecordOrder>,
     /// When set, ALL records use this fixed TTL regardless of DNS response.
     /// None = respect each record's native TTL (default).
@@ -630,7 +630,14 @@ impl DnsCache {
             match record_type {
                 CachedRecordType::A => match self.resolver.ipv4_lookup(hostname).await {
                     Ok(lookup) => {
-                        let addrs: Vec<IpAddr> = lookup.iter().map(|a| IpAddr::V4(a.0)).collect();
+                        let addrs: Vec<IpAddr> = lookup
+                            .answers()
+                            .iter()
+                            .filter_map(|r| match &r.data {
+                                RData::A(a) => Some(IpAddr::V4(a.0)),
+                                _ => None,
+                            })
+                            .collect();
                         if !addrs.is_empty() {
                             let native_ttl = extract_ttl(lookup.valid_until());
                             return Ok((addrs, Some(CachedRecordType::A), native_ttl));
@@ -640,7 +647,14 @@ impl DnsCache {
                 },
                 CachedRecordType::Aaaa => match self.resolver.ipv6_lookup(hostname).await {
                     Ok(lookup) => {
-                        let addrs: Vec<IpAddr> = lookup.iter().map(|a| IpAddr::V6(a.0)).collect();
+                        let addrs: Vec<IpAddr> = lookup
+                            .answers()
+                            .iter()
+                            .filter_map(|r| match &r.data {
+                                RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
+                                _ => None,
+                            })
+                            .collect();
                         if !addrs.is_empty() {
                             let native_ttl = extract_ttl(lookup.valid_until());
                             return Ok((addrs, Some(CachedRecordType::Aaaa), native_ttl));
@@ -651,10 +665,13 @@ impl DnsCache {
                 CachedRecordType::Srv => {
                     match self.resolver.srv_lookup(hostname).await {
                         Ok(srv_lookup) => {
-                            let srv_ttl = extract_ttl(srv_lookup.as_lookup().valid_until());
+                            let srv_ttl = extract_ttl(srv_lookup.valid_until());
                             // SRV records point to target hostnames -- resolve them to IPs
-                            for srv in srv_lookup.iter() {
-                                let target = srv.target().to_string();
+                            for record in srv_lookup.answers() {
+                                let RData::SRV(ref srv) = record.data else {
+                                    continue;
+                                };
+                                let target = srv.target.to_string();
                                 // Remove trailing dot if present
                                 let target = target.trim_end_matches('.');
                                 if let Ok(ip_lookup) = self.resolver.lookup_ip(target).await {
@@ -724,10 +741,13 @@ impl DnsCache {
             .map_err(|e| anyhow::anyhow!("SRV lookup failed for {}: {}", service_name, e))?;
 
         let mut results = Vec::new();
-        for record in srv_lookup.iter() {
-            let target = record.target().to_string();
+        for record in srv_lookup.answers() {
+            let RData::SRV(ref srv) = record.data else {
+                continue;
+            };
+            let target = srv.target.to_string();
             let target = target.trim_end_matches('.').to_string();
-            results.push((target, record.port(), record.priority()));
+            results.push((target, srv.port, srv.priority));
         }
 
         Ok(results)
@@ -1027,7 +1047,7 @@ impl DnsCache {
 }
 
 /// Build a hickory-resolver `Resolver` from a `DnsConfig`.
-fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
+fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
     // Start with system configuration as the base
     let (mut resolver_config, mut resolver_opts) =
         match hickory_resolver::system_conf::read_system_conf() {
@@ -1051,12 +1071,11 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
     if let Some(ref addr_str) = config.resolver_addresses {
         let nameservers = parse_nameserver_addresses(addr_str);
         if !nameservers.is_empty() {
-            let ns_group = NameServerConfigGroup::from(nameservers);
             // Preserve system search/domain settings but replace nameservers
             resolver_config = ResolverConfig::from_parts(
                 resolver_config.domain().cloned(),
                 resolver_config.search().to_vec(),
-                ns_group,
+                nameservers,
             );
             info!("DNS: using custom nameservers from FERRUM_DNS_RESOLVER_ADDRESS");
         } else {
@@ -1084,9 +1103,9 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
 
     // Build the resolver
     let mut builder =
-        Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default());
+        Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default());
     *builder.options_mut() = resolver_opts;
-    let mut resolver = builder.build();
+    let mut resolver = builder.build().expect("failed to build DNS resolver");
 
     // Load custom hosts file if specified
     if let Some(ref hosts_path) = config.hosts_file_path {
@@ -1124,9 +1143,11 @@ fn parse_nameserver_addresses(addr_str: &str) -> Vec<NameServerConfig> {
         let socket_addr = parse_addr_with_port(entry, 53);
         match socket_addr {
             Some(addr) => {
-                // Add both UDP and TCP for each nameserver
-                configs.push(NameServerConfig::new(addr, Protocol::Udp));
-                configs.push(NameServerConfig::new(addr, Protocol::Tcp));
+                let mut udp = ConnectionConfig::udp();
+                udp.port = addr.port();
+                let mut tcp = ConnectionConfig::tcp();
+                tcp.port = addr.port();
+                configs.push(NameServerConfig::new(addr.ip(), true, vec![udp, tcp]));
                 debug!("DNS: added nameserver {}", addr);
             }
             None => {
