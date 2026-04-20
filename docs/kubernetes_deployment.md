@@ -462,6 +462,31 @@ Recommended options:
 - Use a sidecar or reloader controller that updates the config and sends `SIGHUP`.
 - Keep readiness on `/health` so pods stay in rotation during a clean rolling restart.
 
+## TLS Certificate Rotation on Kubernetes
+
+Ferrum Edge does **not** hot-reload file-based TLS certificates or keys.
+
+This applies to:
+
+- frontend TLS / admin TLS certs and keys
+- DTLS certs and keys
+- backend TLS CA bundles
+- backend mTLS client certs and keys
+
+Important Kubernetes nuance:
+
+- Kubernetes can update mounted `Secret` and projected volume contents in a running Pod.
+- Ferrum Edge does **not** watch those files and does **not** rebuild its TLS state just because the mounted file changed.
+- Updating a Secret at the same mount path is therefore **not sufficient by itself** to make Ferrum use the new cert material.
+
+Operational recommendation:
+
+- Update the `Secret` or certificate source.
+- Perform a **rolling restart / rolling redeploy** of the Ferrum workload so each Pod starts fresh and reloads the new TLS files from disk.
+- Keep readiness probes enabled so traffic stays on healthy Pods during the rollout.
+
+If you use `subPath` mounts for cert files, note that Kubernetes does not propagate Secret updates to those paths in running Pods. In that setup, a restart is required even to get the new file content into the container filesystem.
+
 ## Database Outage Restart Protection
 
 If you run database or Control Plane mode and want pods to restart cleanly while the database is temporarily unavailable, mount a backup config and set:

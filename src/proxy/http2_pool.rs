@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -19,7 +20,8 @@ use tracing::{debug, warn};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::DnsCache;
-use crate::tls::{NoVerifier, TlsPolicy};
+use crate::tls::TlsPolicy;
+use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -59,6 +61,9 @@ pub struct Http2ConnectionPool {
     tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
     crls: crate::tls::CrlList,
+    /// Shared H2 backend TLS configs so new pooled connections reuse rustls'
+    /// session resumption state instead of rebuilding from scratch.
+    tls_configs: BackendTlsConfigCache,
 }
 
 impl Default for Http2ConnectionPool {
@@ -86,6 +91,7 @@ impl Http2ConnectionPool {
             global_env_config,
             tls_policy,
             crls,
+            tls_configs: BackendTlsConfigCache::new(),
         };
 
         pool.start_cleanup_task();
@@ -457,6 +463,50 @@ impl Http2ConnectionPool {
         }
     }
 
+    fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
+        self.tls_configs
+            .get_or_try_build(Self::pool_key_owned(proxy), || {
+                let mut tls_config = BackendTlsConfigBuilder {
+                    proxy,
+                    policy: self.tls_policy.as_deref(),
+                    global_ca: self
+                        .global_env_config
+                        .tls_ca_bundle_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_no_verify: self.global_env_config.tls_no_verify,
+                    global_client_cert: self
+                        .global_env_config
+                        .backend_tls_client_cert_path
+                        .as_deref()
+                        .map(Path::new),
+                    global_client_key: self
+                        .global_env_config
+                        .backend_tls_client_key_path
+                        .as_deref()
+                        .map(Path::new),
+                    crls: &self.crls,
+                }
+                .build_rustls()
+                .map_err(|e| {
+                    let message = format!("Failed to build backend TLS config: {}", e);
+                    let source = match e {
+                        crate::tls::backend::TlsError::Io { source, .. } => {
+                            Some(InternalSource::Io(source))
+                        }
+                        crate::tls::backend::TlsError::Pem { .. }
+                        | crate::tls::backend::TlsError::Rustls(_) => {
+                            Some(InternalSource::Message(message.clone()))
+                        }
+                    };
+                    Http2PoolError::Internal { message, source }
+                })?;
+
+                tls_config.alpn_protocols = vec![b"h2".to_vec()];
+                Ok(tls_config)
+            })
+    }
+
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
     async fn create_tls_connection(
         &self,
@@ -468,125 +518,8 @@ impl Http2ConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        // Build root certificate store:
-        // - Custom CA configured → empty store + only that CA (no public roots)
-        // - No CA configured → webpki/system roots as default fallback
-        let ca_path = proxy
-            .resolved_tls
-            .server_ca_cert_path
-            .as_ref()
-            .or(self.global_env_config.tls_ca_bundle_path.as_ref());
-        let mut root_store = if ca_path.is_some() {
-            rustls::RootCertStore::empty()
-        } else {
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-        };
-
-        if let Some(ca_bundle_path) = ca_path {
-            let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| Http2PoolError::Internal {
-                message: format!("Failed to read CA bundle from {}: {}", ca_bundle_path, e),
-                source: Some(InternalSource::Io(e)),
-            })?;
-            let mut reader = std::io::BufReader::new(&ca_pem[..]);
-            let certs = rustls_pemfile::certs(&mut reader);
-            for cert in certs.flatten() {
-                if let Err(e) = root_store.add(cert) {
-                    warn!("http2_pool: failed to add CA cert from bundle: {}", e);
-                }
-            }
-            debug!(
-                "http2_pool: loaded custom CA bundle from {}",
-                ca_bundle_path
-            );
-        }
-
-        // Load mTLS client certificate if configured (resolved_tls overrides take priority)
-        let cert_path = proxy
-            .resolved_tls
-            .client_cert_path
-            .as_ref()
-            .or(self.global_env_config.backend_tls_client_cert_path.as_ref());
-        let key_path = proxy
-            .resolved_tls
-            .client_key_path
-            .as_ref()
-            .or(self.global_env_config.backend_tls_client_key_path.as_ref());
-
-        let tls_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            // Load client cert chain
-            let cert_pem = std::fs::read(cert_path).map_err(|e| Http2PoolError::Internal {
-                message: format!("Failed to read client cert from {}: {}", cert_path, e),
-                source: Some(InternalSource::Io(e)),
-            })?;
-            let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
-                .flatten()
-                .collect();
-
-            // Load client private key
-            let key_pem = std::fs::read(key_path).map_err(|e| Http2PoolError::Internal {
-                message: format!("Failed to read client key from {}: {}", key_path, e),
-                source: Some(InternalSource::Io(e)),
-            })?;
-            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(&key_pem[..]))
-                .map_err(|e| Http2PoolError::Internal {
-                    message: format!("Failed to parse client key: {}", e),
-                    source: Some(InternalSource::Io(e)),
-                })?
-                .ok_or_else(|| Http2PoolError::Internal {
-                    message: format!("No private key found in {}", key_path),
-                    source: None,
-                })?;
-
-            debug!(
-                "http2_pool: using mTLS client cert from {} and key from {}",
-                cert_path, key_path
-            );
-
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
-                .map_err(|e| Http2PoolError::Internal {
-                    message: format!("CRL verifier error: {}", e),
-                    source: Some(InternalSource::Message(e.to_string())),
-                })?;
-            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
-                .map_err(|e| Http2PoolError::Internal {
-                    message: format!("TLS policy error: {}", e),
-                    source: Some(InternalSource::Message(e.to_string())),
-                })?
-                .with_webpki_verifier(verifier)
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| Http2PoolError::Internal {
-                    message: format!("Invalid client certificate/key: {}", e),
-                    source: Some(InternalSource::Rustls(e)),
-                })?
-        } else {
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
-                .map_err(|e| Http2PoolError::Internal {
-                    message: format!("CRL verifier error: {}", e),
-                    source: Some(InternalSource::Message(e.to_string())),
-                })?;
-            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
-                .map_err(|e| Http2PoolError::Internal {
-                    message: format!("TLS policy error: {}", e),
-                    source: Some(InternalSource::Message(e.to_string())),
-                })?
-                .with_webpki_verifier(verifier)
-                .with_no_client_auth()
-        };
-
-        // Apply remaining TLS options
-        let mut tls_config = tls_config;
-
-        // Force HTTP/2 via ALPN
-        tls_config.alpn_protocols = vec![b"h2".to_vec()];
-
-        // Skip server cert verification only if explicitly disabled or global no_verify
-        if !proxy.resolved_tls.verify_server_cert || self.global_env_config.tls_no_verify {
-            tls_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifier));
-        }
-
-        let connector = TlsConnector::from(Arc::new(tls_config));
+        let tls_config = self.get_tls_config(proxy)?;
+        let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
             // Invalid SNI server name is a configuration/DNS problem, not a
             // transient backend issue — classify as DNS lookup.
@@ -980,8 +913,6 @@ impl std::fmt::Display for BackendUnavailableSource {
 pub enum InternalSource {
     /// Filesystem read / PEM parse failure.
     Io(std::io::Error),
-    /// rustls configuration error (invalid cert chain, bad key, etc.).
-    Rustls(rustls::Error),
     /// A string-only error from an upstream helper that doesn't expose a
     /// typed chain. Kept last-resort so we don't pretend we have more
     /// information than we actually do.
@@ -992,7 +923,6 @@ impl std::error::Error for InternalSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Rustls(e) => Some(e),
             Self::Message(_) => None,
         }
     }
@@ -1002,7 +932,6 @@ impl std::fmt::Display for InternalSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{}", e),
-            Self::Rustls(e) => write!(f, "{}", e),
             Self::Message(m) => write!(f, "{}", m),
         }
     }

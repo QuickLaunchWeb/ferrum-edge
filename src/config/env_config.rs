@@ -623,7 +623,8 @@ pub struct EnvConfig {
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
     /// TLS session resumption cache size for TLS 1.2 stateful session IDs.
-    /// TLS 1.3 uses stateless tickets (unlimited) so this only affects TLS 1.2 clients.
+    /// TLS 1.3 uses stateless tickets (unlimited). Applies to inbound listeners
+    /// and outbound/backend client configs that opt into rustls session caching.
     /// (default: 4096)
     pub tls_session_cache_size: usize,
     /// Number of days before certificate expiration to emit a warning log.
