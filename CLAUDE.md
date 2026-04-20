@@ -174,6 +174,23 @@ Within each mode (database/file/dp), after config is loaded:
 18. **Connection pool warmup** — When `FERRUM_POOL_WARMUP_ENABLED=true` (default), pre-establishes backend connections for HTTP-family pools (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS warmup. TCP/UDP stream proxies are skipped (no persistent pools). Upstream targets are expanded so each target gets a warmed connection. Failures are logged as warnings but never block startup.
 19. **Overload monitor** — Background task started in all proxy-serving modes (database/file/dp). Monitors FD usage, active connection count, active request/stream count, and event loop latency at `FERRUM_OVERLOAD_CHECK_INTERVAL_MS` intervals (default: 1s). Sets atomic action flags (`disable_keepalive`, `reject_new_connections`, `reject_new_requests`) when thresholds are breached. See `src/overload.rs`.
 
+### TLS Rotation Contract
+
+Ferrum Edge currently treats **all file-based TLS materials as static operational inputs**:
+
+- Frontend/admin/DTLS/server certs are loaded when the process starts.
+- Backend TLS CA bundles and backend mTLS client cert/key files are validated at config load time, then loaded into protocol-specific client configs when those pools/configs are built.
+- Config reload updates config resources, but it is **not** a general-purpose certificate hot-reload mechanism.
+
+Do **not** assume that changing certificate files in place will be picked up live, even if the runtime environment updates the mounted files underneath the process (for example Kubernetes Secret/projected volumes or sidecar-written shared volumes).
+
+Current operational expectation:
+
+- Rotating any file-based TLS certificate, key, or CA bundle requires a **gateway restart** to guarantee the new material is picked up everywhere.
+- In Kubernetes, the supported operational pattern is a **rolling redeploy / rolling restart** after updating the Secret or certificate source.
+
+If the project later needs live certificate updates via the admin API, that should be implemented as a first-class certificate resource rather than inferred from file replacement at the same path.
+
 ### Graceful Shutdown & Connection Draining
 
 On SIGTERM/SIGINT the gateway performs a graceful drain:

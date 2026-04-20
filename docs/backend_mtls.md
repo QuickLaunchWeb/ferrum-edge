@@ -207,6 +207,28 @@ cargo test test_backend_mtls_global_config -- --nocapture
 3. **Certificate Rotation**: Implement regular certificate rotation procedures. **Note:** Ferrum Edge does not watch certificate files for changes or reload them dynamically. **No TLS surface supports hot reload — not frontend, not backend, not admin, not DTLS, not gRPC.** All TLS certificate files are read from disk either at process startup or when the connection pool entry for a proxy is first created. A config reload (SIGHUP, database poll, or gRPC sync) refreshes routing, plugins, consumers, and upstreams but does **not** re-read any TLS certificate files from disk for existing connection pool entries. To pick up rotated certificates, you must **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach.
 4. **Monitoring**: Monitor certificate expiration and renewal.
 
+### Operational Contract for File-Based Certificates
+
+Ferrum Edge currently treats all file-based TLS materials as **static inputs**:
+
+- **Frontend/admin/DTLS/server-side TLS** certs and keys are loaded when the process starts.
+- **Backend client certs, backend client keys, and backend CA bundles** are validated at config load time and then loaded into protocol-specific backend TLS configs when those connection pools are created.
+- **Config reload** updates routing and resources, but it is **not** a general-purpose TLS file reload mechanism.
+
+This matters in Kubernetes and similar environments:
+
+- A mounted `Secret`, `ConfigMap`, CSI certificate volume, or sidecar-managed shared volume can update files at the same path while the Pod is still running.
+- Ferrum Edge does **not** watch those files and does **not** rebuild existing backend TLS configs just because the file contents changed.
+- If you rotate certificates in place, treat that rotation as requiring a **rolling redeploy / rolling restart** of Ferrum pods.
+
+Recommended practice:
+
+- Store TLS materials in Kubernetes `Secret` objects or your preferred cert delivery mechanism.
+- Update the Secret or mounted files as usual.
+- Trigger a **rolling restart** of the Deployment/StatefulSet so every pod re-reads the new cert/key/CA material.
+
+If you need live, admin-API-driven certificate updates in the future, that should be implemented as a first-class certificate resource rather than relying on file replacement semantics.
+
 ## Implementation Details
 
 The mTLS implementation uses:
@@ -230,6 +252,7 @@ The mTLS implementation uses:
 
   Two proxies pointing at the same backend host but with different cert paths will **not** share connections. This is required because `reqwest::Client` and `rustls::ClientConfig` bake TLS identity and root certificates in at build time. Changing a proxy's cert paths in a config reload creates a new pool entry on the next request; the old pool entry is eventually evicted by idle timeout.
 - Certificate files are read from disk both at validation time (startup/config load) and when the connection pool entry is first created. Subsequent requests reuse the cached client.
+- Replacing the contents of a cert/key/CA file at the **same path** does not refresh already-built backend TLS configs. Use a process restart or Kubernetes rolling redeploy to pick up in-place rotations.
 - If certificate file reading or parsing fails at request time (e.g., file deleted after startup), the request fails with an error. This behavior is consistent across all backend protocols (HTTP/1.1, H2, and HTTP/3). The gateway continues running and serves other proxies normally.
 - Connection reuse respects the original mTLS configuration
 
