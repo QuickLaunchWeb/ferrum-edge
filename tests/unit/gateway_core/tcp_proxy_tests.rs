@@ -758,20 +758,17 @@ impl AsyncWrite for NeverReadStream {
 /// never completes a write — `poll_write` always returns `Pending`. Used to
 /// simulate a peer whose TCP send buffer is stuck (we're writing to them,
 /// they're not draining).
-struct NeverWriteStream {
-    offset: usize,
-}
+struct NeverWriteStream;
 
 impl AsyncRead for NeverWriteStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let n = buf.remaining().min(1024);
         buf.initialize_unfilled_to(n);
         buf.advance(n);
-        self.offset = self.offset.wrapping_add(n);
         Poll::Ready(Ok(()))
     }
 }
@@ -860,8 +857,8 @@ async fn test_backend_read_timeout_fires_on_silent_backend() {
 async fn test_backend_write_timeout_fires_on_stuck_backend() {
     // Client: produces bytes forever. Backend: accepts no writes (send
     // buffer permanently stuck) but is silent on reads.
-    let client = NeverWriteStream { offset: 0 };
-    let backend = NeverWriteStream { offset: 0 };
+    let client = NeverWriteStream;
+    let backend = NeverWriteStream;
 
     let start = std::time::Instant::now();
     let result = bidirectional_copy_for_test_with_timeouts(
