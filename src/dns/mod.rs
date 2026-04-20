@@ -1101,6 +1101,15 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioRuntimeProvider> {
     // Always check hosts file
     resolver_opts.use_hosts_file = ResolveHosts::Always;
 
+    // Retry over TCP when UDP responses are truncated or fail
+    resolver_opts.try_tcp_on_error = true;
+
+    // Race queries against 3 nameservers in parallel to reduce P99 latency
+    resolver_opts.num_concurrent_reqs = 3;
+
+    // Allow more in-flight queries per connection during bulk warmup
+    resolver_opts.max_active_requests = 128;
+
     // Build the resolver
     let mut builder =
         Resolver::builder_with_config(resolver_config, TokioRuntimeProvider::default());
