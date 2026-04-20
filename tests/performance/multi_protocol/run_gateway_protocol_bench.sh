@@ -230,6 +230,14 @@ start_ferrum() {
     case "$PROTOCOL" in
         http3) extra_env+=(-e "FERRUM_ENABLE_HTTP3=true") ;;
     esac
+    # Optional extra env var injection for per-experiment tuning. Set
+    # FERRUM_EXTRA_ENV to a space-separated list of KEY=VALUE pairs, e.g.:
+    #   FERRUM_EXTRA_ENV='FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE=524288 FERRUM_HTTP3_INITIAL_MTU=1472'
+    if [ -n "${FERRUM_EXTRA_ENV:-}" ]; then
+        for pair in $FERRUM_EXTRA_ENV; do
+            extra_env+=(-e "$pair")
+        done
+    fi
 
     GATEWAY_CID=$(docker run -d --rm --network host \
         -v "$config_file:/etc/ferrum/config.yaml:ro" \

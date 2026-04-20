@@ -446,6 +446,16 @@ pub fn enable_early_data(config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy)
     }
 }
 
+/// Enable TLS session resumption on an outbound `ClientConfig` using the shared
+/// `FERRUM_TLS_SESSION_CACHE_SIZE` knob; falls back to 4096 when no policy is set.
+pub fn apply_client_session_resumption(
+    config: &mut rustls::ClientConfig,
+    tls_policy: Option<&TlsPolicy>,
+) {
+    let cache_size = tls_policy.map(|p| p.session_cache_size).unwrap_or(4096);
+    config.resumption = rustls::client::Resumption::in_memory_sessions(cache_size);
+}
+
 /// Build a rustls `ClientConfig` builder for backend/outbound connections
 /// using the TLS policy's cipher suites, key exchange groups, and protocol versions.
 ///
@@ -665,4 +675,40 @@ pub fn check_cert_expiry_for_validation(
     warning_days: u64,
 ) -> Result<(), String> {
     check_cert_expiry(pem_path, field_name, warning_days).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_test_client_config() -> rustls::ClientConfig {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+    }
+
+    #[test]
+    fn apply_client_session_resumption_compiles_and_runs() {
+        let mut config = new_test_client_config();
+        apply_client_session_resumption(&mut config, None);
+        // Rustls does not expose Resumption introspection publicly, so this test
+        // asserts only that the call compiles and does not panic with None policy.
+        // Behavioural coverage comes from the integration bench.
+    }
+
+    #[test]
+    fn apply_client_session_resumption_with_policy() {
+        let policy = TlsPolicy {
+            protocol_versions: vec![&rustls::version::TLS13],
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+            prefer_server_cipher_order: false,
+            session_cache_size: 123,
+            early_data_max_size: 0,
+        };
+        let mut config = new_test_client_config();
+        apply_client_session_resumption(&mut config, Some(&policy));
+    }
 }

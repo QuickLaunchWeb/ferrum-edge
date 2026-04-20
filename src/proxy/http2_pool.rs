@@ -586,6 +586,8 @@ impl Http2ConnectionPool {
                 .set_certificate_verifier(Arc::new(NoVerifier));
         }
 
+        crate::tls::apply_client_session_resumption(&mut tls_config, self.tls_policy.as_deref());
+
         let connector = TlsConnector::from(Arc::new(tls_config));
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
             // Invalid SNI server name is a configuration/DNS problem, not a

@@ -306,6 +306,8 @@ impl ConnectionPool {
                 .set_certificate_verifier(Arc::new(NoVerifier));
         }
 
+        crate::tls::apply_client_session_resumption(&mut client_config, self.tls_policy.as_deref());
+
         Ok(client_config)
     }
 
@@ -597,6 +599,8 @@ impl ConnectionPool {
 
         // HTTP/3 requires ALPN protocol "h3"
         client_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        crate::tls::apply_client_session_resumption(&mut client_config, self.tls_policy.as_deref());
 
         Ok(Arc::new(client_config))
     }
