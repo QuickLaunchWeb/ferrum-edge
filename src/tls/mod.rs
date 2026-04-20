@@ -14,6 +14,8 @@
 //! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
 //! both inbound listeners and outbound backend connections.
 
+pub mod backend;
+
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
