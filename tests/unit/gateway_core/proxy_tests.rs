@@ -343,9 +343,13 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
     let result =
         run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    let (status_code, body, _headers) = result.expect("missing credentials should reject");
+    let (status_code, body, headers) = result.expect("missing credentials should reject");
     assert_eq!(status_code, 401);
     assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some("ferrum-edge")
+    );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }
@@ -370,9 +374,13 @@ async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
     let result =
         run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index).await;
 
-    let (status_code, body, _headers) = result.expect("all-missing multi-auth should reject");
+    let (status_code, body, headers) = result.expect("all-missing multi-auth should reject");
     assert_eq!(status_code, 401);
     assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some("ferrum-edge")
+    );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }

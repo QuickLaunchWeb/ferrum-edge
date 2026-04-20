@@ -4172,12 +4172,12 @@ pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
     ctx.effective_identity().is_some()
 }
 
+const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required"}"#;
+
 fn missing_authentication_reject() -> (u16, Vec<u8>, HashMap<String, String>) {
-    (
-        401,
-        br#"{"error":"Authentication required"}"#.to_vec(),
-        HashMap::new(),
-    )
+    let mut headers = HashMap::new();
+    headers.insert("WWW-Authenticate".to_string(), "ferrum-edge".to_string());
+    (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
 }
 
 pub async fn run_authentication_phase(
