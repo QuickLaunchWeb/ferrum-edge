@@ -1353,61 +1353,13 @@ where
     }
 }
 
-// -- CoalescingH2Body ---------------------------------------------------------
-
-/// A response body adapter that coalesces small HTTP/2 DATA frames from a
-/// hyper `Incoming` body into larger frames for efficient forwarding.
-///
-/// This is the HTTP/2 equivalent of [`CoalescingBody`] (which wraps reqwest
-/// byte streams). The adapter accumulates small DATA frames until the buffer
-/// reaches the coalesce target or the inner body returns `Pending`/`None`,
-/// then yields the accumulated data as a single frame.
-///
-/// **Trailer-safe**: When a non-data frame (TRAILERS) arrives while the buffer
-/// has unflushed data, the adapter stashes the trailer, flushes the buffer on
-/// the current poll, and returns the stashed trailer on the next poll. This
-/// preserves gRPC trailer semantics (grpc-status, grpc-message) without
-/// buffering the entire response.
-pub(crate) struct CoalescingH2Body {
-    inner: Incoming,
-    buffer: BytesMut,
-    done: bool,
-    /// Stashed non-data frame (trailer) that arrived while buffer was non-empty.
-    /// Returned on the next poll_frame call after the buffer is flushed.
-    stashed_trailer: Option<Frame<Bytes>>,
-    /// Error stashed while flushing buffered data. Returned on the next
-    /// `poll_frame` call after the buffer has been drained.
-    stashed_error: Option<hyper::Error>,
-    /// Exact body length from Content-Length (if known). Forwarded via
-    /// `size_hint()` so hyper can write a Content-Length response.
-    content_length: Option<u64>,
-    /// Coalesce target in bytes. Configurable via `FERRUM_H2_COALESCE_TARGET_BYTES`.
-    coalesce_target: usize,
-}
-
-/// Wraps a hyper `Incoming` body into a coalescing adapter.
-///
-/// `content_length` should be the value of the backend's Content-Length header
-/// (if present) so the adapter can propagate an exact size hint.
-/// `coalesce_target` is the minimum chunk size before yielding (from env config).
 pub(crate) fn coalescing_h2_body(
     body: Incoming,
     content_length: Option<u64>,
     coalesce_target: usize,
 ) -> ProxyBody {
-    use http_body_util::BodyExt;
-
-    let coalescing = CoalescingH2Body {
-        inner: body,
-        buffer: BytesMut::new(),
-        done: false,
-        stashed_trailer: None,
-        stashed_error: None,
-        content_length,
-        coalesce_target,
-    };
-    let mapped = coalescing.map_err(|e| Box::new(e) as ProxyBodyError);
-    ProxyBody::streaming(Box::pin(mapped))
+    let coalescing = Coalescing::new(body, coalesce_target, content_length);
+    ProxyBody::streaming(Box::pin(coalescing))
 }
 
 /// Wraps a hyper `Incoming` body into a direct streaming body without coalescing.
