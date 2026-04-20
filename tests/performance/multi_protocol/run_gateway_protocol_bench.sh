@@ -271,6 +271,8 @@ start_ferrum() {
         -e "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
         -e "FERRUM_UDP_MAX_SESSIONS=10000" \
         -e "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64" \
+        -e "FERRUM_TCP_IDLE_TIMEOUT_SECONDS=30" \
+        -e "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=30" \
         "${extra_env[@]}" \
         "$FERRUM_IMAGE")
 
