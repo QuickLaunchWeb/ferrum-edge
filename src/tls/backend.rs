@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use reqwest::ClientBuilder;
@@ -16,10 +16,19 @@ use crate::tls::{
 
 #[derive(Debug, Error)]
 pub enum TlsError {
-    #[error("TLS file I/O: {0}")]
-    Io(String),
-    #[error("TLS PEM parse: {0}")]
-    Pem(String),
+    #[error("Failed to read {kind} from {path}: {source}")]
+    Io {
+        kind: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Failed to parse {kind} from {path}: {details}")]
+    Pem {
+        kind: &'static str,
+        path: PathBuf,
+        details: String,
+    },
     #[error("rustls: {0}")]
     Rustls(String),
 }
@@ -29,7 +38,6 @@ pub enum TlsError {
 pub fn build_root_cert_store(
     proxy_ca: Option<&Path>,
     global_ca: Option<&Path>,
-    _crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<RootCertStore, TlsError> {
     let ca_path = proxy_ca.or(global_ca);
     let mut root_store = if ca_path.is_some() {
@@ -39,7 +47,7 @@ pub fn build_root_cert_store(
     };
 
     if let Some(ca_path) = ca_path {
-        let certs = load_cert_chain(ca_path)?;
+        let certs = load_cert_chain(ca_path, "backend CA bundle")?;
         let (added, ignored) = root_store.add_parsable_certificates(certs);
         if added == 0 {
             return Err(TlsError::Rustls(format!(
@@ -71,74 +79,49 @@ pub struct BackendTlsConfigBuilder<'a> {
 
 impl<'a> BackendTlsConfigBuilder<'a> {
     pub fn build_rustls(&self) -> Result<ClientConfig, TlsError> {
-        let builder = backend_client_config_builder(self.policy)
-            .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
-        let client_auth = self.load_client_auth()?;
-        let verifier = self.build_server_verifier()?;
-        let builder = builder.with_webpki_verifier(verifier);
-        let mut client_config = match client_auth {
-            Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
-                TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
-            }),
-            None => Ok(builder.with_no_client_auth()),
-        }?;
-
-        if self.skip_verification() {
-            client_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifier));
-        }
-
-        Ok(client_config)
+        self.build_rustls_with_skip_verify_warning(
+            "Backend TLS certificate verification DISABLED (testing mode)",
+        )
     }
 
+    /// Keep the HTTP/3 backend path on a distinct entry point so the call site
+    /// makes the QUIC-specific intent obvious in logs and future refactors.
     pub fn build_rustls_quic(&self) -> Result<ClientConfig, TlsError> {
+        self.build_rustls_with_skip_verify_warning(
+            "Backend TLS certificate verification DISABLED for HTTP/3 backend",
+        )
+    }
+
+    fn build_rustls_with_skip_verify_warning(
+        &self,
+        skip_verify_warning: &'static str,
+    ) -> Result<ClientConfig, TlsError> {
         let builder = backend_client_config_builder(self.policy)
             .map_err(|e| TlsError::Rustls(format!("Failed to apply backend TLS policy: {}", e)))?;
         let client_auth = self.load_client_auth()?;
-        let skip_verification = self.skip_verification();
-        let ca_path = self.custom_ca_path();
-        let mut root_store = if ca_path.is_some() {
-            RootCertStore::empty()
-        } else {
-            RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-        };
 
-        if !skip_verification && let Some(ca_path) = ca_path {
-            let certs = load_cert_chain(ca_path)?;
-            let (added, ignored) = root_store.add_parsable_certificates(certs);
-            if added == 0 {
-                return Err(TlsError::Rustls(format!(
-                    "No valid CA certificates found in {}",
-                    ca_path.display()
-                )));
-            }
-            if ignored > 0 {
-                tracing::warn!(
-                    "Ignored {} invalid CA certificate(s) while loading {}",
-                    ignored,
-                    ca_path.display()
-                );
-            }
+        if self.skip_verification() {
+            tracing::warn!("{}", skip_verify_warning);
+            let dangerous = builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier));
+            return match client_auth {
+                Some((certs, key)) => dangerous.with_client_auth_cert(certs, key).map_err(|e| {
+                    TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
+                }),
+                None => Ok(dangerous.with_no_client_auth()),
+            };
         }
 
-        let verifier = build_server_verifier_with_crls(root_store, self.crls)
-            .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))?;
+        let verifier = self.build_server_verifier()?;
         let builder = builder.with_webpki_verifier(verifier);
-        let mut client_config = match client_auth {
+
+        match client_auth {
             Some((certs, key)) => builder.with_client_auth_cert(certs, key).map_err(|e| {
                 TlsError::Rustls(format!("Invalid client certificate/key pair: {}", e))
             }),
             None => Ok(builder.with_no_client_auth()),
-        }?;
-
-        if skip_verification {
-            client_config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifier));
         }
-
-        Ok(client_config)
     }
 
     pub fn build_reqwest(&self) -> Result<ClientBuilder, TlsError> {
@@ -153,7 +136,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     }
 
     fn build_server_verifier(&self) -> Result<Arc<WebPkiServerVerifier>, TlsError> {
-        let root_store = build_root_cert_store(self.custom_ca_path(), self.global_ca, self.crls)?;
+        let root_store = build_root_cert_store(self.custom_ca_path(), self.global_ca)?;
         build_server_verifier_with_crls(root_store, self.crls)
             .map_err(|e| TlsError::Rustls(format!("Failed to build server verifier: {}", e)))
     }
@@ -190,57 +173,71 @@ impl<'a> BackendTlsConfigBuilder<'a> {
             .or(self.global_client_key);
 
         match (cert_path, key_path) {
-            (Some(_), None) => Err(TlsError::Pem(
-                "backend TLS client certificate is set but the private key is missing".to_string(),
-            )),
-            (None, Some(_)) => Err(TlsError::Pem(
-                "backend TLS client private key is set but the certificate is missing".to_string(),
-            )),
+            (Some(cert_path), None) => Err(TlsError::Pem {
+                kind: "backend TLS client certificate",
+                path: cert_path.to_path_buf(),
+                details: "the private key is missing".to_string(),
+            }),
+            (None, Some(key_path)) => Err(TlsError::Pem {
+                kind: "backend TLS client private key",
+                path: key_path.to_path_buf(),
+                details: "the certificate is missing".to_string(),
+            }),
             (None, None) => Ok(None),
             (Some(cert_path), Some(key_path)) => {
-                let certs = load_cert_chain(cert_path)?;
-                let key = load_private_key(key_path)?;
+                let certs = load_cert_chain(cert_path, "backend TLS client certificate")?;
+                let key = load_private_key(key_path, "backend TLS client private key")?;
                 Ok(Some((certs, key)))
             }
         }
     }
 }
 
-fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let pem = fs::read(path)
-        .map_err(|e| TlsError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
+fn load_cert_chain(
+    path: &Path,
+    kind: &'static str,
+) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let pem = fs::read(path).map_err(|source| TlsError::Io {
+        kind,
+        path: path.to_path_buf(),
+        source,
+    })?;
     let certs = rustls_pemfile::certs(&mut Cursor::new(pem))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            TlsError::Pem(format!(
-                "Failed to parse PEM certificates from {}: {}",
-                path.display(),
-                e
-            ))
+        .map_err(|e| TlsError::Pem {
+            kind,
+            path: path.to_path_buf(),
+            details: format!("PEM certificates: {}", e),
         })?;
 
     if certs.is_empty() {
-        return Err(TlsError::Pem(format!(
-            "No PEM certificates found in {}",
-            path.display()
-        )));
+        return Err(TlsError::Pem {
+            kind,
+            path: path.to_path_buf(),
+            details: "no PEM certificates found".to_string(),
+        });
     }
 
     Ok(certs)
 }
 
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let pem = fs::read(path)
-        .map_err(|e| TlsError::Io(format!("Failed to read {}: {}", path.display(), e)))?;
+fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'static>, TlsError> {
+    let pem = fs::read(path).map_err(|source| TlsError::Io {
+        kind,
+        path: path.to_path_buf(),
+        source,
+    })?;
     rustls_pemfile::private_key(&mut Cursor::new(pem))
-        .map_err(|e| {
-            TlsError::Pem(format!(
-                "Failed to parse PEM private key from {}: {}",
-                path.display(),
-                e
-            ))
+        .map_err(|e| TlsError::Pem {
+            kind,
+            path: path.to_path_buf(),
+            details: format!("PEM private key: {}", e),
         })?
-        .ok_or_else(|| TlsError::Pem(format!("No private key found in {}", path.display())))
+        .ok_or_else(|| TlsError::Pem {
+            kind,
+            path: path.to_path_buf(),
+            details: "no private key found".to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -450,7 +447,7 @@ mod tests {
         );
 
         let store =
-            build_root_cert_store(Some(&proxy_path), Some(&global_path), &[]).expect("root store");
+            build_root_cert_store(Some(&proxy_path), Some(&global_path)).expect("root store");
 
         assert_eq!(store.roots.len(), 1);
     }
@@ -466,14 +463,14 @@ mod tests {
             &(global_ca_a.cert_pem.clone() + &global_ca_b.cert_pem),
         );
 
-        let store = build_root_cert_store(None, Some(&global_path), &[]).expect("root store");
+        let store = build_root_cert_store(None, Some(&global_path)).expect("root store");
 
         assert_eq!(store.roots.len(), 2);
     }
 
     #[test]
     fn build_root_cert_store_falls_back_to_webpki_roots() {
-        let store = build_root_cert_store(None, None, &[]).expect("root store");
+        let store = build_root_cert_store(None, None).expect("root store");
         assert_eq!(store.roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
     }
 
@@ -491,7 +488,7 @@ mod tests {
         let err = builder_for(&proxy, None, false, None, None, &[])
             .build_rustls()
             .unwrap_err();
-        assert!(matches!(err, TlsError::Pem(_)));
+        assert!(matches!(err, TlsError::Pem { .. }));
 
         proxy.resolved_tls.client_cert_path = None;
         proxy.resolved_tls.client_key_path = Some(key_path.display().to_string());
@@ -499,7 +496,7 @@ mod tests {
         let err = builder_for(&proxy, None, false, None, None, &[])
             .build_rustls()
             .unwrap_err();
-        assert!(matches!(err, TlsError::Pem(_)));
+        assert!(matches!(err, TlsError::Pem { .. }));
     }
 
     #[test]
@@ -523,6 +520,18 @@ mod tests {
         builder_for(&proxy, None, true, None, None, &[])
             .build_rustls()
             .expect("global no-verify should bypass CA loading");
+    }
+
+    #[test]
+    fn build_rustls_quic_skips_ca_loading_when_verification_is_disabled() {
+        ensure_crypto_provider();
+        let mut proxy = test_proxy();
+        proxy.resolved_tls.server_ca_cert_path = Some("/does/not/exist.pem".to_string());
+        proxy.resolved_tls.verify_server_cert = false;
+
+        builder_for(&proxy, None, false, None, None, &[])
+            .build_rustls_quic()
+            .expect("HTTP/3 skip-verify should bypass CA loading");
     }
 
     #[test]
@@ -599,7 +608,7 @@ mod tests {
         let err = builder_for(&proxy, None, false, None, None, &[])
             .build_rustls()
             .unwrap_err();
-        assert!(matches!(err, TlsError::Io(_)));
+        assert!(matches!(err, TlsError::Io { .. }));
     }
 
     #[test]

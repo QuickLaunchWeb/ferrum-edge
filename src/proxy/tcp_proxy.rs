@@ -329,8 +329,6 @@ impl CachedBackendTlsConfig {
         proxy: &Proxy,
         tls_no_verify: bool,
         global_tls_ca_bundle_path: Option<&str>,
-        global_client_cert_path: Option<&str>,
-        global_client_key_path: Option<&str>,
         tls_policy: Option<&TlsPolicy>,
         crls: &crate::tls::CrlList,
     ) -> Result<Self, anyhow::Error> {
@@ -339,8 +337,8 @@ impl CachedBackendTlsConfig {
             policy: tls_policy,
             global_ca: global_tls_ca_bundle_path.map(Path::new),
             global_no_verify: tls_no_verify,
-            global_client_cert: global_client_cert_path.map(Path::new),
-            global_client_key: global_client_key_path.map(Path::new),
+            global_client_cert: None,
+            global_client_key: None,
             crls,
         }
         .build_rustls()
@@ -379,10 +377,6 @@ pub struct TcpListenerConfig {
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
     pub tls_ca_bundle_path: Option<String>,
-    /// Global client certificate path for outbound backend mTLS fallback.
-    pub backend_tls_client_cert_path: Option<String>,
-    /// Global client key path for outbound backend mTLS fallback.
-    pub backend_tls_client_key_path: Option<String>,
     pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
@@ -436,8 +430,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         metrics,
         tls_no_verify,
         tls_ca_bundle_path,
-        backend_tls_client_cert_path,
-        backend_tls_client_key_path,
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
@@ -495,8 +487,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     proxy,
                     tls_no_verify,
                     tls_ca_bundle_path.as_deref(),
-                    backend_tls_client_cert_path.as_deref(),
-                    backend_tls_client_key_path.as_deref(),
                     tls_policy.as_deref(),
                     &crls,
                 )

@@ -492,9 +492,18 @@ impl Http2ConnectionPool {
             crls: &self.crls,
         }
         .build_rustls()
-        .map_err(|e| Http2PoolError::Internal {
-            message: format!("Failed to build backend TLS config: {}", e),
-            source: Some(InternalSource::Message(e.to_string())),
+        .map_err(|e| {
+            let message = format!("Failed to build backend TLS config: {}", e);
+            let source = match e {
+                crate::tls::backend::TlsError::Io { source, .. } => {
+                    Some(InternalSource::Io(source))
+                }
+                crate::tls::backend::TlsError::Pem { .. }
+                | crate::tls::backend::TlsError::Rustls(_) => {
+                    Some(InternalSource::Message(message.clone()))
+                }
+            };
+            Http2PoolError::Internal { message, source }
         })?;
 
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
@@ -891,12 +900,8 @@ impl std::fmt::Display for BackendUnavailableSource {
 /// Typed source for `Http2PoolError::Internal`.
 #[derive(Debug)]
 pub enum InternalSource {
-    #[allow(dead_code)]
     /// Filesystem read / PEM parse failure.
     Io(std::io::Error),
-    #[allow(dead_code)]
-    /// rustls configuration error (invalid cert chain, bad key, etc.).
-    Rustls(rustls::Error),
     /// A string-only error from an upstream helper that doesn't expose a
     /// typed chain. Kept last-resort so we don't pretend we have more
     /// information than we actually do.
@@ -907,7 +912,6 @@ impl std::error::Error for InternalSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Rustls(e) => Some(e),
             Self::Message(_) => None,
         }
     }
@@ -917,7 +921,6 @@ impl std::fmt::Display for InternalSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "{}", e),
-            Self::Rustls(e) => write!(f, "{}", e),
             Self::Message(m) => write!(f, "{}", m),
         }
     }
