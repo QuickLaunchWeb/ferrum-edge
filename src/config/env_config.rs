@@ -1984,7 +1984,7 @@ impl EnvConfig {
         }
 
         if self.mode == OperatingMode::ControlPlane {
-            debug_assert!(
+            assert!(
                 self.cp_grpc_listen_addr.is_some(),
                 "cp_grpc_listen_addr is populated during from_env_with_conf()"
             );

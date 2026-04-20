@@ -159,6 +159,8 @@ macro_rules! env_config {
 
     (@parse $conf:expr, $mode:expr;) => {};
 
+    // `[section]` markers are documentation-only and exist purely to keep
+    // large env_config! blocks readable while expanding to the same code.
     (@parse $conf:expr, $mode:expr; [$section:ident] $($rest:tt)*) => {
         env_config!(@parse $conf, $mode; $($rest)*);
     };
@@ -190,7 +192,8 @@ macro_rules! env_config {
     };
 
     (@parse $conf:expr, $mode:expr;
-        $field:ident : $ty:ty = $env:literal => $default:expr, $rule:ident($($args:tt)*);
+        $field:ident : $ty:ty = $env:literal => $default:expr,
+        $first_rule:ident($($first_args:tt)*) $(, $rule:ident($($args:tt)*))*;
         $($rest:tt)*
     ) => {
         let mut $field: $ty =
@@ -199,7 +202,10 @@ macro_rules! env_config {
                 $env,
                 || $default,
             )?;
-        env_config!(@apply_rule $field; $rule($($args)*));
+        // Post-parse rules run left-to-right so call sites can intentionally
+        // chain transformations like `max(...)` then `clamp(...)`.
+        env_config!(@apply_rule $field; $first_rule($($first_args)*));
+        $(env_config!(@apply_rule $field; $rule($($args)*));)*
         env_config!(@parse $conf, $mode; $($rest)*);
     };
 
@@ -231,7 +237,9 @@ macro_rules! env_config {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ConfFile, OperatingMode};
+    use super::super::{AutoBool, BackendAllowIps, ConfFile, OperatingMode};
+    use super::EnvValue;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -344,5 +352,61 @@ mod tests {
             assert!(err.contains("FERRUM_SAMPLE_SECRET"));
             assert!(err.contains("at least 32 characters"));
         });
+    }
+
+    #[test]
+    fn macro_post_parse_rules_apply_left_to_right() {
+        with_env_vars(
+            &[
+                ("FERRUM_SAMPLE_LIMIT", "0"),
+                ("FERRUM_SAMPLE_ACTION", "STATUS"),
+            ],
+            || {
+                let conf = ConfFile::default();
+                let _mode = OperatingMode::Migrate;
+
+                let result: Result<(usize, String), String> = (|| {
+                    env_config! {
+                        conf = &conf, mode = &_mode;
+                        sample_limit: usize = "FERRUM_SAMPLE_LIMIT" => 10usize, max(1usize), clamp(1usize, 8usize);
+                        sample_action: String = "FERRUM_SAMPLE_ACTION" => "UP".to_string(), lowercase();
+                    }
+                    Ok((sample_limit, sample_action))
+                })();
+
+                assert_eq!(result.unwrap(), (1, "status".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn vec_string_parser_trims_and_filters_empty_entries() {
+        let parsed =
+            <Vec<String> as EnvValue>::parse_env(" alpha, ,beta ,, gamma ", "FERRUM_LIST").unwrap();
+        assert_eq!(parsed, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn hashmap_parser_accepts_json_objects() {
+        let parsed = <HashMap<String, String> as EnvValue>::parse_env(
+            r#"{"alpha":"one","beta":"two"}"#,
+            "FERRUM_MAP",
+        )
+        .unwrap();
+        assert_eq!(parsed.get("alpha"), Some(&"one".to_string()));
+        assert_eq!(parsed.get("beta"), Some(&"two".to_string()));
+    }
+
+    #[test]
+    fn auto_bool_parser_is_case_insensitive() {
+        let parsed = <AutoBool as EnvValue>::parse_env("AUTO", "FERRUM_AUTO_BOOL").unwrap();
+        assert_eq!(parsed, AutoBool::Auto);
+    }
+
+    #[test]
+    fn backend_allow_ips_parser_is_case_insensitive() {
+        let parsed =
+            <BackendAllowIps as EnvValue>::parse_env("PuBlIc", "FERRUM_BACKEND_ALLOW_IPS").unwrap();
+        assert_eq!(parsed, BackendAllowIps::Public);
     }
 }
