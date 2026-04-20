@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Error type for streaming response bodies.
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
@@ -989,6 +989,208 @@ impl FrameSource for H3FrameSource {
     }
 }
 
+pub(crate) struct Coalescing<S: FrameSource> {
+    inner: S,
+    target_bytes: usize,
+    buffer: BytesMut,
+    stashed_trailer: Option<Frame<Bytes>>,
+    stashed_error: Option<BoxError>,
+    done: bool,
+    content_length: Option<u64>,
+    flush_after: Option<Duration>,
+    flush_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    flush_timer_armed: bool,
+}
+
+impl<S: FrameSource> Coalescing<S> {
+    fn new(inner: S, target_bytes: usize, content_length: Option<u64>) -> Self {
+        Self::with_flush_after(inner, target_bytes, content_length, None)
+    }
+
+    fn with_flush_after(
+        inner: S,
+        target_bytes: usize,
+        content_length: Option<u64>,
+        flush_after: Option<Duration>,
+    ) -> Self {
+        Self {
+            inner,
+            target_bytes,
+            buffer: BytesMut::with_capacity(target_bytes.min(COALESCE_TARGET)),
+            stashed_trailer: None,
+            stashed_error: None,
+            done: false,
+            content_length,
+            flush_after,
+            flush_timer: None,
+            flush_timer_armed: false,
+        }
+    }
+
+    fn arm_flush_timer(&mut self) {
+        let Some(flush_after) = self.flush_after else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + flush_after;
+        if let Some(timer) = self.flush_timer.as_mut() {
+            timer.as_mut().reset(deadline);
+        } else {
+            self.flush_timer = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        }
+        self.flush_timer_armed = true;
+    }
+
+    fn poll_flush_timer(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if !self.flush_timer_armed {
+            return Poll::Pending;
+        }
+
+        match self.flush_timer.as_mut() {
+            Some(timer) => match std::future::Future::poll(timer.as_mut(), cx) {
+                Poll::Ready(()) => {
+                    self.flush_timer_armed = false;
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            },
+            None => Poll::Pending,
+        }
+    }
+
+    fn flush_buffer(&mut self) -> Option<Frame<Bytes>> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        self.flush_timer_armed = false;
+        Some(Frame::data(self.buffer.split().freeze()))
+    }
+
+    fn buffer_data(&mut self, data: &Bytes) {
+        let buffer_was_empty = self.buffer.is_empty();
+        self.buffer.extend_from_slice(data);
+        if buffer_was_empty {
+            self.arm_flush_timer();
+        }
+    }
+}
+
+impl<S: FrameSource + Unpin> http_body::Body for Coalescing<S> {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+
+        if let Some(trailer) = this.stashed_trailer.take() {
+            this.done = true;
+            return Poll::Ready(Some(Ok(trailer)));
+        }
+
+        if this.done {
+            if let Some(frame) = this.flush_buffer() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if let Some(err) = this.stashed_error.take() {
+                return Poll::Ready(Some(Err(err)));
+            }
+            return Poll::Ready(None);
+        }
+
+        if !this.buffer.is_empty()
+            && matches!(this.poll_flush_timer(cx), Poll::Ready(()))
+            && let Some(frame) = this.flush_buffer()
+        {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+
+        loop {
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        if this.buffer.is_empty() && data.len() >= this.target_bytes {
+                            return Poll::Ready(Some(Ok(frame)));
+                        }
+
+                        this.buffer_data(data);
+                        if this.buffer.len() >= this.target_bytes
+                            && let Some(flushed) = this.flush_buffer()
+                        {
+                            return Poll::Ready(Some(Ok(flushed)));
+                        }
+                        continue;
+                    }
+
+                    if !this.buffer.is_empty() {
+                        this.stashed_trailer = Some(frame);
+                        if let Some(flushed) = this.flush_buffer() {
+                            return Poll::Ready(Some(Ok(flushed)));
+                        }
+                        return Poll::Pending;
+                    }
+
+                    this.done = true;
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    this.done = true;
+                    if !this.buffer.is_empty() {
+                        this.stashed_error = Some(err);
+                        if let Some(flushed) = this.flush_buffer() {
+                            return Poll::Ready(Some(Ok(flushed)));
+                        }
+                        return Poll::Pending;
+                    }
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(None) => {
+                    this.done = true;
+                    if let Some(flushed) = this.flush_buffer() {
+                        return Poll::Ready(Some(Ok(flushed)));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    if this.buffer.is_empty() {
+                        return Poll::Pending;
+                    }
+                    if this.flush_after.is_some() {
+                        if matches!(this.poll_flush_timer(cx), Poll::Ready(()))
+                            && let Some(flushed) = this.flush_buffer()
+                        {
+                            return Poll::Ready(Some(Ok(flushed)));
+                        }
+                        return Poll::Pending;
+                    }
+                    if let Some(flushed) = this.flush_buffer() {
+                        return Poll::Ready(Some(Ok(flushed)));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+            && self.buffer.is_empty()
+            && self.stashed_trailer.is_none()
+            && self.stashed_error.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        content_length_hint(self.content_length)
+    }
+}
+
+#[rustfmt::skip]
+fn content_length_hint(content_length: Option<u64>) -> http_body::SizeHint {
+    content_length.map(http_body::SizeHint::with_exact).unwrap_or_default()
+}
+
 // -- CoalescingBody -----------------------------------------------------------
 
 /// Minimum chunk size (bytes) before yielding a frame to hyper's H1 encoder.
@@ -1596,6 +1798,7 @@ mod tests {
     use super::*;
     use futures_util::Stream;
     use futures_util::task::noop_waker;
+    use http_body::Body;
     use std::collections::VecDeque;
 
     #[rustfmt::skip]
@@ -1637,7 +1840,20 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    fn poll_source<S: FrameSource + Unpin>(source: &mut S) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+    fn poll_all<B: http_body::Body<Data = Bytes, Error = BoxError> + Unpin>(body: &mut B) -> Vec<Result<Frame<Bytes>, BoxError>> {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut frames = Vec::new();
+        while let Poll::Ready(Some(frame)) = Pin::new(&mut *body).poll_frame(&mut cx) {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    #[rustfmt::skip]
+    fn poll_source<S: FrameSource + Unpin>(
+        source: &mut S,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         Pin::new(source).poll_frame(&mut cx)
@@ -1672,5 +1888,116 @@ mod tests {
         }
 
         assert!(matches!(poll_source(&mut source), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn coalescing_buffer_fills_to_threshold() {
+        let mut body = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![1u8; 4])))),
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![2u8; 4])))),
+                MockStep::Frame(Ok(Frame::data(Bytes::from(vec![3u8; 4])))),
+                MockStep::End,
+            ]),
+            10,
+            None,
+        );
+
+        let frames = poll_all(&mut body);
+        assert_eq!(frames.len(), 1);
+        let first = frames[0].as_ref().unwrap().data_ref().unwrap().len();
+        assert_eq!(first, 12);
+        assert!(first >= 10);
+    }
+
+    #[test]
+    fn coalescing_trailer_with_buffered_data_flushes_data_first() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+
+        let mut body = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from("hello")))),
+                MockStep::Frame(Ok(Frame::trailers(trailers))),
+                MockStep::End,
+            ]),
+            100,
+            None,
+        );
+
+        let frames = poll_all(&mut body);
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].as_ref().unwrap().data_ref().is_some());
+        let trailer_map = frames[1]
+            .as_ref()
+            .unwrap()
+            .trailers_ref()
+            .expect("expected trailer frame");
+        assert_eq!(trailer_map.get("grpc-status").unwrap(), "0");
+    }
+
+    #[test]
+    fn coalescing_trailer_with_empty_buffer_emits_immediately() {
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+
+        let mut body = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::trailers(trailers))),
+                MockStep::End,
+            ]),
+            100,
+            None,
+        );
+
+        let frames = poll_all(&mut body);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].as_ref().unwrap().trailers_ref().is_some());
+    }
+
+    #[test]
+    fn coalescing_end_of_stream_flushes_partial_buffer() {
+        let mut body = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from("partial")))),
+                MockStep::End,
+            ]),
+            1_000,
+            None,
+        );
+
+        let frames = poll_all(&mut body);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].as_ref().unwrap().data_ref().unwrap().as_ref(),
+            b"partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn coalescing_flush_after_waits_for_timer() {
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from("tail")))),
+                MockStep::Pending,
+            ]),
+            1_000,
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"tail");
+            }
+            other => panic!("expected timer-driven flush, got {other:?}"),
+        }
     }
 }
