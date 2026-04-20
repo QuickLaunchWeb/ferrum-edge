@@ -993,8 +993,8 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         let window_idx = RedisRateLimitClient::window_index(self.window_seconds);
         let ttl = self.window_seconds + 1;
 
-        let count = match self.datagrams_per_window {
-            Some(_) if self.bytes_per_window.is_some() => {
+        match self.datagrams_per_window {
+            Some(max_datagrams) if self.bytes_per_window.is_some() => {
                 let datagram_key = redis.make_key(&[key, "datagrams", &window_idx.to_string()]);
                 let bytes_key = redis.make_key(&[key, "bytes", &window_idx.to_string()]);
                 let (count, bytes) = redis
@@ -1005,6 +1005,13 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
                         ttl,
                     )
                     .await?;
+                if count as u64 > max_datagrams {
+                    return Ok(RateLimitOutcome::deny()
+                        .with_limit(max_datagrams)
+                        .with_window(self.window_seconds)
+                        .with_usage(count as u64)
+                        .with_metric("count"));
+                }
                 if let Some(max_bytes) = self.bytes_per_window
                     && bytes as u64 > max_bytes
                 {
@@ -1014,7 +1021,6 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
                         .with_usage(bytes as u64)
                         .with_metric("bytes"));
                 }
-                count
             }
             Some(max_datagrams) => {
                 let datagram_key = redis.make_key(&[key, "datagrams", &window_idx.to_string()]);
@@ -1026,33 +1032,22 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
                         .with_usage(count as u64)
                         .with_metric("count"));
                 }
-                count
             }
-            None => 0,
-        };
-
-        if self.datagrams_per_window.is_none()
-            && let Some(max_bytes) = self.bytes_per_window
-        {
-            let bytes_key = redis.make_key(&[key, "bytes", &window_idx.to_string()]);
-            let bytes = redis
-                .incrby_with_expire(&bytes_key, op.datagram_size as i64, ttl)
-                .await?;
-            if bytes as u64 > max_bytes {
-                return Ok(RateLimitOutcome::deny()
-                    .with_limit(max_bytes)
-                    .with_window(self.window_seconds)
-                    .with_usage(bytes as u64)
-                    .with_metric("bytes"));
+            None => {
+                if let Some(max_bytes) = self.bytes_per_window {
+                    let bytes_key = redis.make_key(&[key, "bytes", &window_idx.to_string()]);
+                    let bytes = redis
+                        .incrby_with_expire(&bytes_key, op.datagram_size as i64, ttl)
+                        .await?;
+                    if bytes as u64 > max_bytes {
+                        return Ok(RateLimitOutcome::deny()
+                            .with_limit(max_bytes)
+                            .with_window(self.window_seconds)
+                            .with_usage(bytes as u64)
+                            .with_metric("bytes"));
+                    }
+                }
             }
-        } else if let Some(max_datagrams) = self.datagrams_per_window
-            && count as u64 > max_datagrams
-        {
-            return Ok(RateLimitOutcome::deny()
-                .with_limit(max_datagrams)
-                .with_window(self.window_seconds)
-                .with_usage(count as u64)
-                .with_metric("count"));
         }
 
         Ok(RateLimitOutcome::allow())

@@ -25,11 +25,6 @@ pub struct UdpRateLimiting {
 }
 
 impl UdpRateLimiting {
-    #[allow(dead_code)]
-    pub fn new(config: &Value) -> Result<Self, String> {
-        Self::new_with_http_client(config, PluginHttpClient::default())
-    }
-
     pub fn new_with_http_client(
         config: &Value,
         http_client: PluginHttpClient,
