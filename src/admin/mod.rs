@@ -30,6 +30,7 @@ use crate::config::db_backend::DatabaseBackend;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
 };
+use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::grpc::cp_server::DpNodeRegistry;
 use crate::grpc::dp_client::DpCpConnectionState;
 use crate::plugins;
@@ -1546,7 +1547,7 @@ async fn handle_batch_create(
     // Cross-resource validations require a GatewayConfig view over the batch.
     // Individual items are already normalized and field-validated above, so skip
     // normalize_fields() and validate_all_fields() to avoid redundant work.
-    let batch_config = GatewayConfig {
+    let mut batch_config = GatewayConfig {
         version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: batch.proxies.clone(),
         consumers: batch.consumers.clone(),
@@ -1556,32 +1557,20 @@ async fn handle_batch_create(
         known_namespaces: Vec::new(),
     };
 
-    if let Err(errs) = batch_config.validate_unique_resource_ids() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_unique_consumer_identities() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_unique_consumer_credentials() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_unique_upstream_names() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_unique_proxy_names() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_hosts() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_regex_listen_paths() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_unique_listen_paths() {
-        validation_errors.extend(errs);
-    }
-    if let Err(errs) = batch_config.validate_stream_proxies() {
-        validation_errors.extend(errs);
+    match ValidationPipeline::new(&mut batch_config)
+        .validate_unique_resource_ids(ValidationAction::Collect)
+        .validate_unique_consumer_identities(ValidationAction::Collect)
+        .validate_unique_consumer_credentials(ValidationAction::Collect)
+        .validate_unique_upstream_names(ValidationAction::Collect)
+        .validate_unique_proxy_names(ValidationAction::Collect)
+        .validate_hosts(ValidationAction::Collect)
+        .validate_regex_listen_paths(ValidationAction::Collect)
+        .validate_unique_listen_paths(ValidationAction::Collect)
+        .validate_stream_proxies(ValidationAction::Collect)
+        .run()
+    {
+        Ok(errs) => validation_errors.extend(errs),
+        Err(err) => validation_errors.push(err.to_string()),
     }
 
     let batch_proxy_ids: HashSet<&str> = batch
@@ -1932,35 +1921,21 @@ async fn handle_restore(
             .as_ref()
             .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
             .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
-        if let Err(errs) = temp_config.validate_all_fields(cert_expiry_days) {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_unique_resource_ids() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_unique_consumer_identities() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_unique_consumer_credentials() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_hosts() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_regex_listen_paths() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_unique_listen_paths() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_stream_proxies() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_upstream_references() {
-            validation_errors.extend(errs);
-        }
-        if let Err(errs) = temp_config.validate_plugin_references() {
-            validation_errors.extend(errs);
+        match ValidationPipeline::new(&mut temp_config)
+            .validate_all_fields(cert_expiry_days, ValidationAction::Collect)
+            .validate_unique_resource_ids(ValidationAction::Collect)
+            .validate_unique_consumer_identities(ValidationAction::Collect)
+            .validate_unique_consumer_credentials(ValidationAction::Collect)
+            .validate_hosts(ValidationAction::Collect)
+            .validate_regex_listen_paths(ValidationAction::Collect)
+            .validate_unique_listen_paths(ValidationAction::Collect)
+            .validate_stream_proxies(ValidationAction::Collect)
+            .validate_upstream_references(ValidationAction::Collect)
+            .validate_plugin_references(ValidationAction::Collect)
+            .run()
+        {
+            Ok(errs) => validation_errors.extend(errs),
+            Err(err) => validation_errors.push(err.to_string()),
         }
         if !validation_errors.is_empty() {
             return Ok(json_response(

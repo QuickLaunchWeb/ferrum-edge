@@ -13,8 +13,9 @@
 
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
+use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use std::path::Path;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Load configuration from a YAML or JSON file.
 ///
@@ -104,64 +105,29 @@ pub fn load_config_from_file(
         serde_json::from_value(value)?
     };
 
-    // Validate resource ID format
-    if let Err(errors) = config.validate_resource_ids() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+    ValidationPipeline::new(&mut config)
+        .validate_resource_ids(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid resource ID(s) found",
-            errors.len()
-        );
-    }
-
-    // Validate all field-level constraints (lengths, ranges, nested configs)
-    if let Err(errors) =
-        config.validate_all_fields_with_ip_policy(cert_expiry_warning_days, backend_allow_ips)
-    {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
-            "Configuration validation failed: {} invalid field(s) found",
-            errors.len()
-        );
-    }
-
-    // Validate resource ID uniqueness
-    if let Err(dupes) = config.validate_unique_resource_ids() {
-        for msg in &dupes {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_all_fields_with_ip_policy(
+            cert_expiry_warning_days,
+            backend_allow_ips,
+            ValidationAction::FatalCount(
+                "Configuration validation failed: {} invalid field(s) found",
+            ),
+        )
+        .validate_unique_resource_ids(ValidationAction::FatalCount(
             "Configuration validation failed: {} duplicate resource ID(s) found",
-            dupes.len()
-        );
-    }
-
-    // Normalize canonical in-memory fields before cross-resource validation.
-    config.normalize_fields();
-    config.resolve_upstream_tls();
-    if let Err(errors) = config.validate_hosts() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .normalize_fields()
+        .resolve_upstream_tls()
+        .validate_hosts(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid host(s) found",
-            errors.len()
-        );
-    }
-
-    // Validate regex listen_paths compile correctly
-    if let Err(errors) = config.validate_regex_listen_paths() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_regex_listen_paths(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid regex listen_path(s) found",
-            errors.len()
-        );
-    }
+        ))
+        .run()?;
 
     // Capture all distinct namespaces before filtering so `GET /namespaces`
     // can return the full set even though only one namespace's resources are kept.
@@ -223,137 +189,38 @@ pub fn load_config_from_file(
         );
     }
 
-    // Validate host+listen_path uniqueness
-    if let Err(dupes) = config.validate_unique_listen_paths() {
-        for msg in &dupes {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+    ValidationPipeline::new(&mut config)
+        .validate_unique_listen_paths(ValidationAction::FatalCount(
             "Configuration validation failed: {} duplicate listen_path(s) found",
-            dupes.len()
-        );
-    }
-
-    // Validate consumer username/custom_id uniqueness
-    if let Err(dupes) = config.validate_unique_consumer_identities() {
-        for msg in &dupes {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
-            "Configuration validation failed: {} duplicate consumer identity(ies) found. \
-             Each consumer must have a unique username and unique custom_id.",
-            dupes.len()
-        );
-    }
-
-    // Validate consumer credential (keyauth API key) uniqueness
-    if let Err(dupes) = config.validate_unique_consumer_credentials() {
-        for msg in &dupes {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
-            "Configuration validation failed: {} duplicate consumer credential(s) found. \
-             Each consumer must have a unique keyauth API key.",
-            dupes.len()
-        );
-    }
-
-    // Validate upstream name uniqueness
-    if let Err(dupes) = config.validate_unique_upstream_names() {
-        for msg in &dupes {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_unique_consumer_identities(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate consumer identity(ies) found. Each consumer must have a unique username and unique custom_id.",
+        ))
+        .validate_unique_consumer_credentials(ValidationAction::FatalCount(
+            "Configuration validation failed: {} duplicate consumer credential(s) found. Each consumer must have a unique keyauth API key.",
+        ))
+        .validate_unique_upstream_names(ValidationAction::FatalCount(
             "Configuration validation failed: {} duplicate upstream name(s) found",
-            dupes.len()
-        );
-    }
-
-    // Validate proxy name uniqueness
-    if let Err(dupes) = config.validate_unique_proxy_names() {
-        for msg in &dupes {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_unique_proxy_names(ValidationAction::FatalCount(
             "Configuration validation failed: {} duplicate proxy name(s) found",
-            dupes.len()
-        );
-    }
-
-    // Validate upstream references exist
-    if let Err(errors) = config.validate_upstream_references() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_upstream_references(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid upstream reference(s) found",
-            errors.len()
-        );
-    }
-
-    // Validate plugin config targets and proxy/plugin association integrity.
-    if let Err(errors) = config.validate_plugin_references() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_plugin_references(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid plugin reference(s) found",
-            errors.len()
-        );
-    }
-
-    // Validate each plugin config by instantiating the plugin.
-    // This catches invalid config values (missing required fields, bad types, etc.)
-    // at startup rather than at request time.
-    {
-        let mut plugin_errors = Vec::new();
-        for pc in &config.plugin_configs {
-            if !pc.enabled {
-                continue;
-            }
-            if let Err(err) = crate::plugins::validate_plugin_config(&pc.plugin_name, &pc.config) {
-                plugin_errors.push(format!(
-                    "Plugin '{}' (id={}): {}",
-                    pc.plugin_name, pc.id, err
-                ));
-            }
-        }
-        if !plugin_errors.is_empty() {
-            for msg in &plugin_errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!(
-                "Configuration validation failed: {} plugin config error(s) found",
-                plugin_errors.len()
-            );
-        }
-    }
-
-    // Validate plugin file dependencies (e.g., geo_restriction .mmdb files).
-    // Fatal in file mode — the gateway should not start with missing files.
-    {
-        let file_dep_errors = config.validate_plugin_file_dependencies();
-        if !file_dep_errors.is_empty() {
-            for msg in &file_dep_errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!(
-                "Configuration validation failed: {} plugin file dependency error(s) found",
-                file_dep_errors.len()
-            );
-        }
-    }
-
-    // Validate stream proxy (TCP/UDP) configuration
-    if let Err(errors) = config.validate_stream_proxies() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
+        ))
+        .validate_plugin_configs(ValidationAction::FatalCount(
+            "Configuration validation failed: {} plugin config error(s) found",
+        ))
+        .validate_plugin_file_dependencies(ValidationAction::FatalCount(
+            "Configuration validation failed: {} plugin file dependency error(s) found",
+        ))
+        .validate_stream_proxies(ValidationAction::FatalCount(
             "Configuration validation failed: {} stream proxy error(s) found",
-            errors.len()
-        );
-    }
+        ))
+        .run()?;
 
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
