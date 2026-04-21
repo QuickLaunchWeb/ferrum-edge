@@ -108,6 +108,8 @@ pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
 }
 
 pub fn detect_sse_provider(json: &Value) -> Option<AiProvider> {
+    // Check streaming-specific provider shapes before the buffered-response
+    // fallback below; Anthropic's `message_*` events are the most load-bearing.
     if json
         .get("type")
         .and_then(|value| value.as_str())
@@ -141,8 +143,8 @@ pub fn extract_response_usage(json: &Value, provider: AiProvider) -> AiTokenUsag
     }
 }
 
-#[allow(dead_code)]
-pub fn extract_response_texts<'a>(json: &'a Value) -> Vec<&'a str> {
+#[cfg(test)]
+fn extract_response_texts<'a>(json: &'a Value) -> Vec<&'a str> {
     let mut texts = Vec::new();
 
     if let Some(choices) = json.get("choices").and_then(|value| value.as_array()) {
@@ -218,13 +220,8 @@ pub fn extract_response_texts<'a>(json: &'a Value) -> Vec<&'a str> {
     texts
 }
 
-#[allow(dead_code)]
-pub fn first_response_text<'a>(json: &'a Value) -> Option<&'a str> {
-    extract_response_texts(json).into_iter().next()
-}
-
-#[allow(dead_code)]
-pub fn for_each_response_text_mut(json: &mut Value, mut apply: impl FnMut(&mut String)) {
+#[cfg(test)]
+fn for_each_response_text_mut(json: &mut Value, mut apply: impl FnMut(&mut String)) {
     if let Some(choices) = json
         .get_mut("choices")
         .and_then(|value| value.as_array_mut())
@@ -315,26 +312,20 @@ pub fn for_each_response_text_mut(json: &mut Value, mut apply: impl FnMut(&mut S
 
 fn extract_openai_usage(json: &Value, provider: AiProvider) -> AiTokenUsage {
     let usage = json.get("usage");
+    let prompt = usage
+        .and_then(|value| value.get("prompt_tokens"))
+        .and_then(|value| value.as_u64());
+    let completion = usage
+        .and_then(|value| value.get("completion_tokens"))
+        .and_then(|value| value.as_u64());
+
     AiTokenUsage {
-        prompt_tokens: usage
-            .and_then(|value| value.get("prompt_tokens"))
-            .and_then(|value| value.as_u64()),
-        completion_tokens: usage
-            .and_then(|value| value.get("completion_tokens"))
-            .and_then(|value| value.as_u64()),
+        prompt_tokens: prompt,
+        completion_tokens: completion,
         total_tokens: usage
             .and_then(|value| value.get("total_tokens"))
             .and_then(|value| value.as_u64())
-            .or_else(|| {
-                sum_pair(
-                    usage
-                        .and_then(|value| value.get("prompt_tokens"))
-                        .and_then(|value| value.as_u64()),
-                    usage
-                        .and_then(|value| value.get("completion_tokens"))
-                        .and_then(|value| value.as_u64()),
-                )
-            }),
+            .or_else(|| sum_pair(prompt, completion)),
         model: json
             .get("model")
             .and_then(|value| value.as_str())
