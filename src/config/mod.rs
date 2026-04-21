@@ -21,6 +21,7 @@ pub mod migrations;
 pub mod mongo_store;
 pub mod pool_config;
 pub mod types;
+pub(crate) mod validation_pipeline;
 
 #[allow(unused_imports)] // AutoBool is used by unit tests but not directly by the binary
 pub use env_config::AutoBool;

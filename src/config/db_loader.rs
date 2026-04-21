@@ -22,6 +22,7 @@ use crate::config::types::{
     LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
     RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
+use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -548,99 +549,35 @@ impl DatabaseStore {
             known_namespaces: Vec::new(),
         };
 
-        // Normalize canonical in-memory fields before validation.
-        config.normalize_fields();
-        config.resolve_upstream_tls();
-
-        // Validate all field-level constraints (lengths, ranges, nested configs).
-        // Warn-only since data already exists in the database.
-        if let Err(errors) = config.validate_all_fields_with_ip_policy(
-            self.cert_expiry_warning_days,
-            &self.backend_allow_ips,
-        ) {
-            for msg in &errors {
-                warn!("{}", msg);
-            }
-        }
-
-        // Validate host entry format
-        if let Err(errors) = config.validate_hosts() {
-            for msg in &errors {
-                warn!("{}", msg);
-            }
-        }
-
-        // Validate regex listen_paths compile correctly
-        if let Err(errors) = config.validate_regex_listen_paths() {
-            for msg in &errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!("Database has invalid regex listen_path(s)");
-        }
-
-        if let Err(dupes) = config.validate_unique_listen_paths() {
-            for msg in &dupes {
-                error!("{}", msg);
-            }
-            anyhow::bail!("Database has conflicting host+listen_path combinations");
-        }
-
-        // Validate stream proxy (TCP/UDP) configuration
-        if let Err(errors) = config.validate_stream_proxies() {
-            for msg in &errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!(
+        ValidationPipeline::new(&mut config)
+            .normalize_fields()
+            .resolve_upstream_tls()
+            .validate_all_fields_with_ip_policy(
+                self.cert_expiry_warning_days,
+                &self.backend_allow_ips,
+                ValidationAction::Warn,
+            )
+            .validate_hosts(ValidationAction::Warn)
+            .validate_regex_listen_paths(ValidationAction::FatalStatic(
+                "Database has invalid regex listen_path(s)",
+            ))
+            .validate_unique_listen_paths(ValidationAction::FatalStatic(
+                "Database has conflicting host+listen_path combinations",
+            ))
+            .validate_stream_proxies(ValidationAction::FatalCount(
                 "Database configuration validation failed: {} stream proxy error(s) found",
-                errors.len()
-            );
-        }
-
-        // Defense-in-depth: validate consumer identity and credential uniqueness.
-        // The database schema has UNIQUE constraints, but if data was imported or
-        // the schema was modified, duplicates could exist. Log warnings instead of
-        // failing startup so the gateway can still serve with the DB's data.
-        if let Err(errors) = config.validate_unique_consumer_identities() {
-            for msg in &errors {
-                warn!("{}", msg);
-            }
-        }
-        if let Err(errors) = config.validate_unique_consumer_credentials() {
-            for msg in &errors {
-                warn!("{}", msg);
-            }
-        }
-
-        if let Err(errors) = config.validate_upstream_references() {
-            for msg in &errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!("Database has invalid upstream reference(s)");
-        }
-
-        if let Err(errors) = config.validate_plugin_references() {
-            for msg in &errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!("Database has invalid plugin reference(s)");
-        }
-
-        // Validate each plugin config by instantiating the plugin.
-        // Warn-only since data already exists in the database.
-        for pc in &config.plugin_configs {
-            if !pc.enabled {
-                continue;
-            }
-            if let Err(err) = crate::plugins::validate_plugin_config(&pc.plugin_name, &pc.config) {
-                warn!("Plugin '{}' (id={}): {}", pc.plugin_name, pc.id, err);
-            }
-        }
-
-        // Warn on missing plugin file dependencies (e.g., geo_restriction .mmdb).
-        // Warn-only since data already exists in the database.
-        for msg in config.validate_plugin_file_dependencies() {
-            warn!("{}", msg);
-        }
+            ))
+            .validate_unique_consumer_identities(ValidationAction::Warn)
+            .validate_unique_consumer_credentials(ValidationAction::Warn)
+            .validate_upstream_references(ValidationAction::FatalStatic(
+                "Database has invalid upstream reference(s)",
+            ))
+            .validate_plugin_references(ValidationAction::FatalStatic(
+                "Database has invalid plugin reference(s)",
+            ))
+            .validate_plugin_configs(ValidationAction::Warn)
+            .validate_plugin_file_dependencies(ValidationAction::Warn)
+            .run()?;
 
         self.check_slow_query("load_full_config", start);
         Ok(config)
