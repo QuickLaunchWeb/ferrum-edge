@@ -200,6 +200,49 @@ fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
     )
 }
 
+#[cfg(any(
+    feature = "secrets-vault",
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
+async fn resolve_many_concurrent<C, F>(
+    secrets: &[PendingSecret],
+    timeout: Duration,
+    backend_name: &'static str,
+    client: &C,
+    fetch: F,
+) -> Result<Vec<ResolvedPendingSecret>, String>
+where
+    C: Sync,
+    F: for<'a> Fn(
+        &'a C,
+        &'a str,
+        &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, String>>,
+{
+    let futs: Vec<_> = secrets
+        .iter()
+        .map(|secret| async {
+            let value =
+                tokio::time::timeout(timeout, fetch(client, &secret.reference, &secret.base_key))
+                    .await
+                    .map_err(|_| timeout_error(&secret.base_key, backend_name, timeout))??;
+            Ok::<_, String>(ResolvedPendingSecret {
+                base_key: secret.base_key.clone(),
+                value,
+                suffixed_key: secret.suffixed_key.clone(),
+            })
+        })
+        .collect();
+
+    let mut resolved = Vec::with_capacity(secrets.len());
+    for item in futures_util::future::join_all(futs).await {
+        resolved.push(item?);
+    }
+    Ok(resolved)
+}
+
 fn match_suffix(raw_key: &str) -> Option<(&'static dyn SecretBackend, &str)> {
     for backend in suffix_backends() {
         if let Some(base) = backend.matches_suffix(raw_key) {
@@ -432,28 +475,14 @@ impl SecretBackend for VaultBackend {
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
         let client = vault::VaultClientWrapper::new()?;
-        let futs: Vec<_> = secrets
-            .iter()
-            .map(|secret| async {
-                let value = tokio::time::timeout(
-                    timeout,
-                    client.fetch_secret(&secret.reference, &secret.base_key),
-                )
-                .await
-                .map_err(|_| timeout_error(&secret.base_key, self.display_name(), timeout))??;
-                Ok::<_, String>(ResolvedPendingSecret {
-                    base_key: secret.base_key.clone(),
-                    value,
-                    suffixed_key: secret.suffixed_key.clone(),
-                })
-            })
-            .collect();
-
-        let mut resolved = Vec::with_capacity(secrets.len());
-        for item in futures_util::future::join_all(futs).await {
-            resolved.push(item?);
-        }
-        Ok(resolved)
+        resolve_many_concurrent(
+            secrets,
+            timeout,
+            self.display_name(),
+            &client,
+            |client, reference, key| Box::pin(client.fetch_secret(reference, key)),
+        )
+        .await
     }
 }
 
@@ -490,28 +519,14 @@ impl SecretBackend for AwsBackend {
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
         let client = aws::AwsClientWrapper::new().await;
-        let futs: Vec<_> = secrets
-            .iter()
-            .map(|secret| async {
-                let value = tokio::time::timeout(
-                    timeout,
-                    client.fetch_secret(&secret.reference, &secret.base_key),
-                )
-                .await
-                .map_err(|_| timeout_error(&secret.base_key, self.display_name(), timeout))??;
-                Ok::<_, String>(ResolvedPendingSecret {
-                    base_key: secret.base_key.clone(),
-                    value,
-                    suffixed_key: secret.suffixed_key.clone(),
-                })
-            })
-            .collect();
-
-        let mut resolved = Vec::with_capacity(secrets.len());
-        for item in futures_util::future::join_all(futs).await {
-            resolved.push(item?);
-        }
-        Ok(resolved)
+        resolve_many_concurrent(
+            secrets,
+            timeout,
+            self.display_name(),
+            &client,
+            |client, reference, key| Box::pin(client.fetch_secret(reference, key)),
+        )
+        .await
     }
 }
 
@@ -548,28 +563,14 @@ impl SecretBackend for GcpBackend {
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
         let client = gcp::GcpClientWrapper::new().await?;
-        let futs: Vec<_> = secrets
-            .iter()
-            .map(|secret| async {
-                let value = tokio::time::timeout(
-                    timeout,
-                    client.fetch_secret(&secret.reference, &secret.base_key),
-                )
-                .await
-                .map_err(|_| timeout_error(&secret.base_key, self.display_name(), timeout))??;
-                Ok::<_, String>(ResolvedPendingSecret {
-                    base_key: secret.base_key.clone(),
-                    value,
-                    suffixed_key: secret.suffixed_key.clone(),
-                })
-            })
-            .collect();
-
-        let mut resolved = Vec::with_capacity(secrets.len());
-        for item in futures_util::future::join_all(futs).await {
-            resolved.push(item?);
-        }
-        Ok(resolved)
+        resolve_many_concurrent(
+            secrets,
+            timeout,
+            self.display_name(),
+            &client,
+            |client, reference, key| Box::pin(client.fetch_secret(reference, key)),
+        )
+        .await
     }
 }
 
@@ -606,28 +607,14 @@ impl SecretBackend for AzureBackend {
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
         let creds = azure::AzureCredentials::new()?;
-        let futs: Vec<_> = secrets
-            .iter()
-            .map(|secret| async {
-                let value = tokio::time::timeout(
-                    timeout,
-                    creds.fetch_secret(&secret.reference, &secret.base_key),
-                )
-                .await
-                .map_err(|_| timeout_error(&secret.base_key, self.display_name(), timeout))??;
-                Ok::<_, String>(ResolvedPendingSecret {
-                    base_key: secret.base_key.clone(),
-                    value,
-                    suffixed_key: secret.suffixed_key.clone(),
-                })
-            })
-            .collect();
-
-        let mut resolved = Vec::with_capacity(secrets.len());
-        for item in futures_util::future::join_all(futs).await {
-            resolved.push(item?);
-        }
-        Ok(resolved)
+        resolve_many_concurrent(
+            secrets,
+            timeout,
+            self.display_name(),
+            &creds,
+            |creds, reference, key| Box::pin(creds.fetch_secret(reference, key)),
+        )
+        .await
     }
 }
 
