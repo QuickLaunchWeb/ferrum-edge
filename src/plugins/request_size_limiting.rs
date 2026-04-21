@@ -22,6 +22,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
 
+use super::utils::size_limit::{
+    SizeLimiter, content_length_over_limit, reject_with_limit, required_positive_u64,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct RequestSizeLimiting {
@@ -30,16 +33,19 @@ pub struct RequestSizeLimiting {
 
 impl RequestSizeLimiting {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let max_bytes = config["max_bytes"].as_u64().unwrap_or(0);
-
-        if max_bytes == 0 {
-            return Err(
-                "request_size_limiting: 'max_bytes' is required and must be greater than zero"
-                    .to_string(),
-            );
-        }
+        let max_bytes = required_positive_u64(config, "max_bytes", "request_size_limiting")?;
 
         Ok(Self { max_bytes })
+    }
+}
+
+impl SizeLimiter for RequestSizeLimiting {
+    fn plugin_name(&self) -> &'static str {
+        "request_size_limiting"
+    }
+
+    fn max_size_bytes(&self) -> u128 {
+        self.max_bytes as u128
     }
 }
 
@@ -58,29 +64,19 @@ impl Plugin for RequestSizeLimiting {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.max_bytes == 0 {
+        if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
         // Fast path: check Content-Length header without reading the body
-        if let Some(cl) = ctx.headers.get("content-length")
-            && let Ok(len) = cl.parse::<u64>()
-            && len > self.max_bytes
-        {
+        if let Some(len) = content_length_over_limit(&ctx.headers, self.max_size_bytes()) {
             debug!(
-                plugin = "request_size_limiting",
+                plugin = self.plugin_name(),
                 content_length = len,
-                max_bytes = self.max_bytes,
+                max_bytes = self.max_size_bytes(),
                 "Request rejected: Content-Length exceeds limit"
             );
-            return PluginResult::Reject {
-                status_code: 413,
-                body: format!(
-                    r#"{{"error":"Request body too large","limit":{}}}"#,
-                    self.max_bytes
-                ),
-                headers: HashMap::new(),
-            };
+            return reject_with_limit(413, "Request body too large", self.max_size_bytes());
         }
 
         PluginResult::Continue
@@ -91,28 +87,21 @@ impl Plugin for RequestSizeLimiting {
         ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if self.max_bytes == 0 {
+        if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
         // If another plugin caused the body to be buffered, check actual size
         if let Some(body) = ctx.metadata.get("request_body") {
             let len = body.len() as u64;
-            if len > self.max_bytes {
+            if self.exceeds_limit(len as u128) {
                 debug!(
-                    plugin = "request_size_limiting",
+                    plugin = self.plugin_name(),
                     body_len = len,
-                    max_bytes = self.max_bytes,
+                    max_bytes = self.max_size_bytes(),
                     "Request rejected: buffered body exceeds limit"
                 );
-                return PluginResult::Reject {
-                    status_code: 413,
-                    body: format!(
-                        r#"{{"error":"Request body too large","limit":{}}}"#,
-                        self.max_bytes
-                    ),
-                    headers: HashMap::new(),
-                };
+                return reject_with_limit(413, "Request body too large", self.max_size_bytes());
             }
         }
 
@@ -124,26 +113,19 @@ impl Plugin for RequestSizeLimiting {
         _headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if self.max_bytes == 0 {
+        if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
         let len = body.len() as u64;
-        if len > self.max_bytes {
+        if self.exceeds_limit(len as u128) {
             debug!(
-                plugin = "request_size_limiting",
+                plugin = self.plugin_name(),
                 body_len = len,
-                max_bytes = self.max_bytes,
+                max_bytes = self.max_size_bytes(),
                 "Request rejected: final request body exceeds limit"
             );
-            return PluginResult::Reject {
-                status_code: 413,
-                body: format!(
-                    r#"{{"error":"Request body too large","limit":{}}}"#,
-                    self.max_bytes
-                ),
-                headers: HashMap::new(),
-            };
+            return reject_with_limit(413, "Request body too large", self.max_size_bytes());
         }
 
         PluginResult::Continue

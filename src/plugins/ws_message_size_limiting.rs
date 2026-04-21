@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::warn;
 
+use super::utils::size_limit::{SizeLimiter, required_positive_usize};
 use super::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 
 pub struct WsMessageSizeLimiting {
@@ -34,21 +35,15 @@ impl WsMessageSizeLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
     pub fn new(config: &Value) -> Result<Self, String> {
-        let max_frame_bytes = config["max_frame_bytes"].as_u64().unwrap_or(0) as usize;
-
-        if max_frame_bytes == 0 {
-            return Err(
-                "ws_message_size_limiting: 'max_frame_bytes' is required and must be greater than zero"
-                    .to_string(),
-            );
-        }
+        let max_frame_bytes =
+            required_positive_usize(config, "max_frame_bytes", "ws_message_size_limiting")?;
 
         let mut close_reason = config["close_reason"]
             .as_str()
             .unwrap_or("Message too large")
             .to_string();
         if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
-            tracing::warn!(
+            warn!(
                 max_bytes = Self::MAX_CLOSE_REASON_BYTES,
                 "ws_message_size_limiting: 'close_reason' exceeds WebSocket limit — truncating"
             );
@@ -83,6 +78,16 @@ impl WsMessageSizeLimiting {
     }
 }
 
+impl SizeLimiter for WsMessageSizeLimiting {
+    fn plugin_name(&self) -> &'static str {
+        "ws_message_size_limiting"
+    }
+
+    fn max_size_bytes(&self) -> u128 {
+        self.max_frame_bytes as u128
+    }
+}
+
 #[async_trait]
 impl Plugin for WsMessageSizeLimiting {
     fn name(&self) -> &str {
@@ -108,22 +113,22 @@ impl Plugin for WsMessageSizeLimiting {
         direction: WebSocketFrameDirection,
         message: &Message,
     ) -> Option<Message> {
-        if self.max_frame_bytes == 0 {
+        if !self.is_enabled() {
             return None;
         }
 
         let size = Self::frame_size(message);
-        if size > self.max_frame_bytes {
+        if self.exceeds_limit(size as u128) {
             let dir_label = match direction {
                 WebSocketFrameDirection::ClientToBackend => "client->backend",
                 WebSocketFrameDirection::BackendToClient => "backend->client",
             };
             warn!(
-                plugin = "ws_message_size_limiting",
+                plugin = self.plugin_name(),
                 proxy_id = %proxy_id,
                 direction = dir_label,
                 frame_size = size,
-                max_frame_bytes = self.max_frame_bytes,
+                max_frame_bytes = self.max_size_bytes(),
                 "WebSocket frame exceeds size limit, closing connection"
             );
             return Some(Message::Close(Some(CloseFrame {
