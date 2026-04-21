@@ -21,6 +21,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
 
+use super::utils::size_limit::{
+    SizeLimiter, content_length_over_limit, reject_with_limit, required_positive_u64,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct ResponseSizeLimiting {
@@ -30,20 +33,23 @@ pub struct ResponseSizeLimiting {
 
 impl ResponseSizeLimiting {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let max_bytes = config["max_bytes"].as_u64().unwrap_or(0);
+        let max_bytes = required_positive_u64(config, "max_bytes", "response_size_limiting")?;
         let require_buffered_check = config["require_buffered_check"].as_bool().unwrap_or(false);
-
-        if max_bytes == 0 {
-            return Err(
-                "response_size_limiting: 'max_bytes' is required and must be greater than zero"
-                    .to_string(),
-            );
-        }
 
         Ok(Self {
             max_bytes,
             require_buffered_check,
         })
+    }
+}
+
+impl SizeLimiter for ResponseSizeLimiting {
+    fn plugin_name(&self) -> &'static str {
+        "response_size_limiting"
+    }
+
+    fn max_size_bytes(&self) -> u128 {
+        self.max_bytes as u128
     }
 }
 
@@ -62,7 +68,7 @@ impl Plugin for ResponseSizeLimiting {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.require_buffered_check && self.max_bytes > 0
+        self.require_buffered_check && self.is_enabled()
     }
 
     async fn after_proxy(
@@ -71,29 +77,19 @@ impl Plugin for ResponseSizeLimiting {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if self.max_bytes == 0 {
+        if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
         // Fast path: check Content-Length response header
-        if let Some(cl) = response_headers.get("content-length")
-            && let Ok(len) = cl.parse::<u64>()
-            && len > self.max_bytes
-        {
+        if let Some(len) = content_length_over_limit(response_headers, self.max_size_bytes()) {
             debug!(
-                plugin = "response_size_limiting",
+                plugin = self.plugin_name(),
                 content_length = len,
-                max_bytes = self.max_bytes,
+                max_bytes = self.max_size_bytes(),
                 "Response rejected: Content-Length exceeds limit"
             );
-            return PluginResult::Reject {
-                status_code: 502,
-                body: format!(
-                    r#"{{"error":"Response body too large","limit":{}}}"#,
-                    self.max_bytes
-                ),
-                headers: HashMap::new(),
-            };
+            return reject_with_limit(502, "Response body too large", self.max_size_bytes());
         }
 
         PluginResult::Continue
@@ -106,26 +102,19 @@ impl Plugin for ResponseSizeLimiting {
         _response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if self.max_bytes == 0 {
+        if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
         let len = body.len() as u64;
-        if len > self.max_bytes {
+        if self.exceeds_limit(len as u128) {
             debug!(
-                plugin = "response_size_limiting",
+                plugin = self.plugin_name(),
                 body_len = len,
-                max_bytes = self.max_bytes,
+                max_bytes = self.max_size_bytes(),
                 "Response rejected: buffered body exceeds limit"
             );
-            return PluginResult::Reject {
-                status_code: 502,
-                body: format!(
-                    r#"{{"error":"Response body too large","limit":{}}}"#,
-                    self.max_bytes
-                ),
-                headers: HashMap::new(),
-            };
+            return reject_with_limit(502, "Response body too large", self.max_size_bytes());
         }
 
         PluginResult::Continue

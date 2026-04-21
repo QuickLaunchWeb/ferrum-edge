@@ -14,6 +14,7 @@ pub mod jwks_store;
 pub mod log_helpers;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
+pub mod size_limit;
 pub mod udp_endpoint;
 
 pub use batching_logger::{BatchConfig, BatchingLogger, RetryPolicy};
