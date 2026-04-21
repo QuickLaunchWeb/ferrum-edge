@@ -1,3 +1,16 @@
+//! Dialect-specific SQL text for the V001 initial schema migration.
+//!
+//! MySQL intentionally diverges from the SQLite/Postgres-style schema in a few
+//! places:
+//! - strict mode forbids defaults on `TEXT`/`BLOB`, so MySQL uses bounded
+//!   `VARCHAR(N)` columns for primary keys and other fields that need defaults
+//! - timestamp columns stay as `VARCHAR(50)` because sqlx's `Any` driver does
+//!   not round-trip MySQL `DATETIME` values into the string-based config layer
+//!
+//! The proxy schema also intentionally omits a unique index on
+//! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
+//! namespace/name and namespace/listen_port constraints belong in V001.
+
 use sqlx::AnyPool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,12 +25,12 @@ enum SqlDialect {
 /// The helper keeps the migration logic conservative: it only encapsulates the
 /// SQL text and the MySQL duplicate-index tolerance that already existed in the
 /// migration, without trying to normalize the schema across databases.
-pub(crate) struct V001SqlBuilder {
+pub(super) struct V001SqlBuilder {
     dialect: SqlDialect,
 }
 
 impl V001SqlBuilder {
-    pub(crate) fn new(db_type: &str) -> Self {
+    pub(super) fn new(db_type: &str) -> Self {
         let dialect = match db_type {
             "mysql" => SqlDialect::MySql,
             "sqlite" => SqlDialect::Sqlite,
@@ -27,7 +40,7 @@ impl V001SqlBuilder {
         Self { dialect }
     }
 
-    pub(crate) async fn apply(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
+    pub(super) async fn apply(&self, pool: &AnyPool) -> Result<(), anyhow::Error> {
         self.enable_sqlite_foreign_keys(pool).await?;
         self.create_tables(pool).await?;
         self.create_indexes(pool).await?;
