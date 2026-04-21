@@ -1733,38 +1733,31 @@ async fn connect_backend_tls_cached(
 /// finishes (cleanly or with an error). Matches the splice-path grace window.
 const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
-/// Copy bytes from `reader` into `writer` until EOF, updating `bytes` and
-/// optionally `last_activity` on each read. Returns `Ok(())` on EOF or
-/// `Err((side, err))` on the first read/write failure — the `side`
-/// distinguishes whether the error came from reading the source or writing
-/// to the destination, which the caller uses to attribute the failure to
-/// the correct socket (frontend vs backend).
+/// Copy bytes from `reader` into `writer` until EOF, updating shared
+/// counters on each read/write cycle.
 ///
 /// **Idle-timer refresh pattern (two-phase):**
 /// `last_activity` is stored **before** the write (post-read, pre-write)
-/// AND **after** the write (post-write). The pre-write refresh is
-/// critical — without it, a successful read followed by a backpressured
-/// write could park inside the write longer than `idle_timeout`, and
-/// the `bidirectional_copy` watchdog (which polls `last_activity` once per
-/// second) would see the stale timestamp and falsely fire an idle timeout
-/// even though bytes were just read from the source. The post-write
-/// refresh additionally credits the direction for write progress.
+/// AND **after** the write (post-write). The pre-write refresh prevents
+/// a backpressured write from masquerading as inactivity.
 ///
 /// `read_watermark` / `write_watermark` are per-direction inactivity
-/// timestamps checked by the Phase 1 watchdog for `backend_read_timeout` /
-/// `backend_write_timeout`. Each successful read refreshes `read_watermark`;
-/// each write that makes partial progress refreshes `write_watermark`.
-/// The watermarks are NOT enforced here — they are polled by the
-/// `bidirectional_copy` watchdog tick, which fires the appropriate
-/// timeout when staleness exceeds the configured threshold.
-async fn copy_one_direction<R, W>(
+/// timestamps polled by the `bidirectional_copy` watchdog. Shared via
+/// bare references to parent-scoped `AtomicU64`s — no `Arc` indirection
+/// on the hot path.
+///
+/// When `write_watermark` is `None`, the write path uses `write_all` for
+/// maximum throughput (tokio's internal vectored-write optimisations).
+/// When `Some`, a chunked `write()` loop refreshes the watermark on each
+/// partial progress so slow-but-progressing backends are not misclassified.
+async fn copy_one_direction<'a, R, W>(
     mut reader: R,
     mut writer: W,
     buf_size: usize,
-    bytes: Arc<AtomicU64>,
-    last_activity: Option<Arc<AtomicU64>>,
-    read_watermark: Option<Arc<AtomicU64>>,
-    write_watermark: Option<Arc<AtomicU64>>,
+    bytes: &'a AtomicU64,
+    last_activity: Option<&'a AtomicU64>,
+    read_watermark: Option<&'a AtomicU64>,
+    write_watermark: Option<&'a AtomicU64>,
 ) -> Result<(), (StreamIoSide, std::io::Error)>
 where
     R: AsyncRead + Unpin,
@@ -1780,39 +1773,44 @@ where
             let _ = writer.shutdown().await;
             return Ok(());
         }
-        if let Some(ref wm) = read_watermark {
-            wm.store(coarse_now_ms(), Ordering::Relaxed);
+        // Single clock read for both watermark + idle refresh.
+        let now = coarse_now_ms();
+        if let Some(wm) = read_watermark {
+            wm.store(now, Ordering::Relaxed);
         }
-        // Refresh the idle timestamp before the (potentially blocking) write so
-        // that a backpressured destination does not masquerade as inactivity.
-        if let Some(ref la) = last_activity {
-            la.store(coarse_now_ms(), Ordering::Relaxed);
+        if let Some(la) = last_activity {
+            la.store(now, Ordering::Relaxed);
         }
-        // Chunked write loop: each partial write refreshes the write watermark
-        // so a slow-but-progressing backend keeps the inactivity watchdog happy.
-        let mut written = 0;
-        while written < n {
-            match writer.write(&buf[written..n]).await {
-                Ok(0) => {
-                    return Err((
-                        StreamIoSide::Write,
-                        std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "write returned 0 bytes",
-                        ),
-                    ));
-                }
-                Ok(nw) => {
-                    written += nw;
-                    if let Some(ref wm) = write_watermark {
+        if let Some(wm) = write_watermark {
+            // Chunked write: refresh watermark on each partial progress.
+            let mut written = 0;
+            while written < n {
+                match writer.write(&buf[written..n]).await {
+                    Ok(0) => {
+                        return Err((
+                            StreamIoSide::Write,
+                            std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "write returned 0 bytes",
+                            ),
+                        ));
+                    }
+                    Ok(nw) => {
+                        written += nw;
                         wm.store(coarse_now_ms(), Ordering::Relaxed);
                     }
+                    Err(e) => return Err((StreamIoSide::Write, e)),
                 }
-                Err(e) => return Err((StreamIoSide::Write, e)),
+            }
+        } else {
+            // Fast path: no write watermark — use write_all which lets tokio
+            // use vectored writes and avoids per-chunk branch overhead.
+            if let Err(e) = writer.write_all(&buf[..n]).await {
+                return Err((StreamIoSide::Write, e));
             }
         }
         bytes.fetch_add(n as u64, Ordering::Relaxed);
-        if let Some(ref la) = last_activity {
+        if let Some(la) = last_activity {
             la.store(coarse_now_ms(), Ordering::Relaxed);
         }
     }
@@ -1905,32 +1903,39 @@ where
         };
     }
 
-    let c2b_bytes = Arc::new(AtomicU64::new(0));
-    let b2c_bytes = Arc::new(AtomicU64::new(0));
+    // Stack-allocated counters and watermarks — no Arc indirection on the
+    // hot path. The pinned futures borrow these directly via references.
+    let c2b_bytes = AtomicU64::new(0);
+    let b2c_bytes = AtomicU64::new(0);
 
     let now = coarse_now_ms();
-    let last_activity = match idle_timeout {
-        Some(t) if !t.is_zero() => Some(Arc::new(AtomicU64::new(now))),
-        _ => None,
+    let last_activity_storage = AtomicU64::new(now);
+    let idle_timeout_active = idle_timeout.is_some_and(|t| !t.is_zero());
+    let last_activity: Option<&AtomicU64> = if idle_timeout_active {
+        Some(&last_activity_storage)
+    } else {
+        None
     };
 
-    // Per-direction inactivity watermarks for backend_read_timeout /
-    // backend_write_timeout. Initialized to session start so a freshly
-    // established connection is not immediately stale.
-    let b2c_read_watermark = backend_read_timeout
-        .filter(|d| !d.is_zero())
-        .map(|_| Arc::new(AtomicU64::new(now)));
-    let c2b_write_watermark = backend_write_timeout
-        .filter(|d| !d.is_zero())
-        .map(|_| Arc::new(AtomicU64::new(now)));
+    // Per-direction inactivity watermarks. Stored on the stack alongside the
+    // futures they protect — zero heap allocation, zero pointer chase.
+    let b2c_read_wm_storage = AtomicU64::new(now);
+    let c2b_write_wm_storage = AtomicU64::new(now);
+    let read_wm_active = backend_read_timeout.is_some_and(|d| !d.is_zero());
+    let write_wm_active = backend_write_timeout.is_some_and(|d| !d.is_zero());
+    let b2c_read_watermark: Option<&AtomicU64> = if read_wm_active {
+        Some(&b2c_read_wm_storage)
+    } else {
+        None
+    };
+    let c2b_write_watermark: Option<&AtomicU64> = if write_wm_active {
+        Some(&c2b_write_wm_storage)
+    } else {
+        None
+    };
 
     let (client_read, client_write) = tokio::io::split(client);
     let (backend_read, backend_write) = tokio::io::split(backend);
-
-    let c2b_bytes_task = c2b_bytes.clone();
-    let b2c_bytes_task = b2c_bytes.clone();
-    let la_c2b = last_activity.clone();
-    let la_b2c = last_activity.clone();
 
     // Per-direction layout:
     // * c2b reads from CLIENT and writes to BACKEND — the write watermark
@@ -1941,24 +1946,23 @@ where
         client_read,
         backend_write,
         buf_size,
-        c2b_bytes_task,
-        la_c2b,
+        &c2b_bytes,
+        last_activity,
         None,
-        c2b_write_watermark.clone(),
+        c2b_write_watermark,
     );
     let b2c_fut = copy_one_direction(
         backend_read,
         client_write,
         buf_size,
-        b2c_bytes_task,
-        la_b2c,
-        b2c_read_watermark.clone(),
+        &b2c_bytes,
+        last_activity,
+        b2c_read_watermark,
         None,
     );
     tokio::pin!(c2b_fut);
     tokio::pin!(b2c_fut);
 
-    let idle_timeout_active = last_activity.is_some();
     let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
     let backend_read_timeout_ms = backend_read_timeout
         .map(|d| d.as_millis() as u64)
@@ -1966,8 +1970,7 @@ where
     let backend_write_timeout_ms = backend_write_timeout
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let any_watchdog_active =
-        idle_timeout_active || b2c_read_watermark.is_some() || c2b_write_watermark.is_some();
+    let any_watchdog_active = idle_timeout_active || read_wm_active || write_wm_active;
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
@@ -2027,7 +2030,7 @@ where
                 // backend_write_timeout). Checked before the bidirectional
                 // idle timeout so a stale single direction is caught even
                 // when the other direction is still active.
-                if let Some(ref wm) = b2c_read_watermark
+                if let Some(wm) = b2c_read_watermark
                     && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_read_timeout_ms
                 {
                     first_failure = Some((
@@ -2038,7 +2041,7 @@ where
                     ));
                     break;
                 }
-                if let Some(ref wm) = c2b_write_watermark
+                if let Some(wm) = c2b_write_watermark
                     && now.saturating_sub(wm.load(Ordering::Relaxed)) >= backend_write_timeout_ms
                 {
                     first_failure = Some((
@@ -2049,7 +2052,7 @@ where
                     ));
                     break;
                 }
-                if let Some(ref la) = last_activity
+                if let Some(la) = last_activity
                     && now.saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
                 {
                     first_failure = Some((
@@ -2090,7 +2093,7 @@ where
         if clean_eof {
             first_failure = drain_half_close_copy(
                 &mut c2b_fut,
-                &last_activity,
+                last_activity,
                 idle_timeout_active,
                 timeout_ms,
                 half_close_cap,
@@ -2126,7 +2129,7 @@ where
         if clean_eof {
             first_failure = drain_half_close_copy(
                 &mut b2c_fut,
-                &last_activity,
+                last_activity,
                 idle_timeout_active,
                 timeout_ms,
                 half_close_cap,
@@ -2183,7 +2186,7 @@ where
 /// semantically timeouts from the caller's perspective.
 async fn drain_half_close_copy<F>(
     drain_fut: &mut F,
-    last_activity: &Option<Arc<AtomicU64>>,
+    last_activity: Option<&AtomicU64>,
     idle_timeout_active: bool,
     timeout_ms: u64,
     half_close_cap: Option<Duration>,
@@ -2213,16 +2216,15 @@ where
                 return None;
             }
             _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                if let Some(la) = last_activity.as_ref() {
-                    let last = la.load(Ordering::Relaxed);
-                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                        return Some((
-                            Direction::Unknown,
-                            ErrorClass::ReadWriteTimeout,
-                            None,
-                            "idle timeout".to_string(),
-                        ));
-                    }
+                if let Some(la) = last_activity
+                    && coarse_now_ms().saturating_sub(la.load(Ordering::Relaxed)) >= timeout_ms
+                {
+                    return Some((
+                        Direction::Unknown,
+                        ErrorClass::ReadWriteTimeout,
+                        None,
+                        "idle timeout".to_string(),
+                    ));
                 }
                 if let Some(cap) = half_close_cap
                     && phase2_start.elapsed() >= cap
