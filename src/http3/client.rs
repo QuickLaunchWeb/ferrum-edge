@@ -17,13 +17,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use bytes::Buf;
-use dashmap::DashMap;
 use http::Request;
 use quinn::crypto::rustls::QuicClientConfig;
 use tracing::debug;
 
+use crate::config::PoolConfig;
 use crate::config::types::Proxy;
+use crate::pool::{GenericPool, PoolManager};
 
 /// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
 ///
@@ -143,19 +146,6 @@ pub struct H3StreamingResponse {
     pub recv_stream: H3RequestStream,
 }
 
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// Cached HTTP/3 connection entry.
-struct H3PoolEntry {
-    send_request: H3SendRequest,
-    last_used_epoch_ms: Arc<AtomicU64>,
-}
-
 /// HTTP/3 connection pool for proxying requests to HTTP/3 backends.
 ///
 /// Caches QUIC connections and h3 session handles per backend `host:port`,
@@ -163,7 +153,7 @@ struct H3PoolEntry {
 /// and h3 session for every request. Each cached connection supports full
 /// HTTP/3 multiplexing (concurrent streams).
 pub struct Http3ConnectionPool {
-    entries: Arc<DashMap<String, H3PoolEntry>>,
+    pool: Arc<GenericPool<Http3PoolManager>>,
     env_config: Arc<crate::config::EnvConfig>,
     /// Shared DNS cache for backend hostname resolution.
     dns_cache: crate::dns::DnsCache,
@@ -180,20 +170,54 @@ pub struct Http3ConnectionPool {
     ipv6_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
 }
 
+#[derive(Clone, Default)]
+struct Http3PoolManager;
+
+#[async_trait]
+impl PoolManager for Http3PoolManager {
+    type Connection = H3SendRequest;
+
+    fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
+        Http3ConnectionPool::write_pool_key_with_host(buf, host, port, proxy, shard);
+    }
+
+    // HTTP/3 request paths establish new connections through
+    // `GenericPool::create_or_get_existing_owned()` because QUIC setup needs
+    // per-call TLS and H3 config objects that are not part of the manager.
+    async fn create(&self, _key: &str, _proxy: &Proxy) -> Result<Self::Connection> {
+        Err(anyhow::anyhow!(
+            "Http3ConnectionPool uses GenericPool::create_or_get_existing_owned for creation"
+        ))
+    }
+
+    fn is_healthy(&self, _conn: &Self::Connection) -> bool {
+        true
+    }
+
+    fn destroy(&self, conn: Self::Connection) {
+        drop(conn);
+    }
+}
+
 impl Http3ConnectionPool {
     pub fn new(env_config: Arc<crate::config::EnvConfig>, dns_cache: crate::dns::DnsCache) -> Self {
         let connections_per_backend = env_config.http3_connections_per_backend;
-        let pool = Self {
-            entries: Arc::new(DashMap::new()),
+        let cleanup_interval = Duration::from_secs(env_config.pool_cleanup_interval_seconds.max(1));
+        let pool_cfg = PoolConfig {
+            idle_timeout_seconds: env_config.http3_pool_idle_timeout_seconds,
+            max_idle_per_host: connections_per_backend.max(1),
+            ..PoolConfig::default()
+        };
+
+        Self {
+            pool: GenericPool::new(Arc::new(Http3PoolManager), pool_cfg, cleanup_interval),
             env_config,
             dns_cache,
             conn_counter: AtomicU64::new(0),
             connections_per_backend,
             ipv4_endpoint: tokio::sync::OnceCell::new(),
             ipv6_endpoint: tokio::sync::OnceCell::new(),
-        };
-        pool.start_cleanup_task();
-        pool
+        }
     }
 
     /// Get or lazily create the shared QUIC endpoint for the given address family.
@@ -214,7 +238,7 @@ impl Http3ConnectionPool {
 
     /// Number of connections in the pool (for metrics).
     pub fn pool_size(&self) -> usize {
-        self.entries.len()
+        self.pool.pool_size()
     }
 
     /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
@@ -229,13 +253,23 @@ impl Http3ConnectionPool {
     /// `format!()` allocations. Called from both the allocating `pool_key()`
     /// (cold path) and the thread-local buffer lookup (hot path).
     fn write_pool_key(buf: &mut String, proxy: &Proxy, index: usize) {
+        Self::write_pool_key_with_host(buf, &proxy.backend_host, proxy.backend_port, proxy, index);
+    }
+
+    fn write_pool_key_with_host(
+        buf: &mut String,
+        host: &str,
+        port: u16,
+        proxy: &Proxy,
+        index: usize,
+    ) {
         use std::fmt::Write;
         buf.clear();
         let _ = write!(
             buf,
             "{}|{}|{}|{}|{}|{}",
-            proxy.backend_host,
-            proxy.backend_port,
+            host,
+            port,
             index,
             proxy
                 .resolved_tls
@@ -263,6 +297,47 @@ impl Http3ConnectionPool {
         key
     }
 
+    async fn create_or_get_proxy_sender(
+        &self,
+        key: String,
+        proxy: &Proxy,
+        tls_config: Arc<rustls::ClientConfig>,
+        h3_config: super::config::Http3ServerConfig,
+    ) -> Result<H3SendRequest, anyhow::Error> {
+        // H3 is the one pool that needs extra creation context beyond the
+        // `Proxy`, so it uses the shared shell's explicit creation closure.
+        self.pool
+            .create_or_get_existing_owned(key, |_| {
+                let tls_config = tls_config.clone();
+                let h3_config = h3_config.clone();
+                async move {
+                    self.create_connection(proxy, &tls_config, Some(&h3_config))
+                        .await
+                }
+            })
+            .await
+    }
+
+    async fn create_or_get_target_sender(
+        &self,
+        key: String,
+        host: &str,
+        port: u16,
+        tls_config: Arc<rustls::ClientConfig>,
+        h3_config: super::config::Http3ServerConfig,
+    ) -> Result<H3SendRequest, anyhow::Error> {
+        self.pool
+            .create_or_get_existing_owned(key, |_| {
+                let tls_config = tls_config.clone();
+                let h3_config = h3_config.clone();
+                async move {
+                    self.create_connection_to_target(host, port, &tls_config, Some(&h3_config))
+                        .await
+                }
+            })
+            .await
+    }
+
     /// Pre-establish a QUIC connection and cache it in the pool (shard 0 only).
     ///
     /// Used at startup to warm the connection pool so the first request to each
@@ -273,20 +348,13 @@ impl Http3ConnectionPool {
         tls_config: &Arc<rustls::ClientConfig>,
     ) -> Result<(), anyhow::Error> {
         let key = Self::pool_key(proxy, 0);
-        if self.entries.contains_key(&key) {
+        if self.pool.cached(&key).is_some() {
             return Ok(());
         }
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
-            .create_connection(proxy, tls_config, Some(&h3_config))
+        let _ = self
+            .create_or_get_proxy_sender(key, proxy, tls_config.clone(), h3_config)
             .await?;
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
         Ok(())
     }
 
@@ -301,20 +369,13 @@ impl Http3ConnectionPool {
         tls_config: &Arc<rustls::ClientConfig>,
     ) -> Result<(), anyhow::Error> {
         let key = Self::pool_key_for_target(host, port, 0);
-        if self.entries.contains_key(&key) {
+        if self.pool.cached(&key).is_some() {
             return Ok(());
         }
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
-            .create_connection_to_target(host, port, tls_config, Some(&h3_config))
+        let _ = self
+            .create_or_get_target_sender(key, host, port, tls_config.clone(), h3_config)
             .await?;
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
         Ok(())
     }
 
@@ -343,25 +404,9 @@ impl Http3ConnectionPool {
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
-        // Fast path: use a thread-local buffer for pool key lookup to avoid
-        // allocating a String on every request. On cache hit + successful
-        // request, we return without any String allocation.
-        thread_local! {
-            static KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
-        }
-        let cached = KEY_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            Self::write_pool_key(&mut buf, proxy, start);
-            if let Some(entry) = self.entries.get(&*buf) {
-                entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
-                let sr = entry.send_request.clone();
-                drop(entry);
-                return Some(sr);
-            }
-            None
-        });
+        let cached = self
+            .pool
+            .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
         if let Some(mut sr) = cached {
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
@@ -378,30 +423,19 @@ impl Http3ConnectionPool {
         let key = Self::pool_key(proxy, start);
 
         // Try cached connection on the selected index first
-        if let Some(entry) = self.entries.get(&key) {
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            let mut sr = entry.send_request.clone();
-            drop(entry); // Release DashMap lock before async work
-
+        if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
-                    self.entries.remove(&key);
+                    self.pool.invalidate(&key);
 
                     // Try other cached indices before creating a new connection
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key = Self::pool_key(proxy, fallback_index);
-                        if let Some(entry) = self.entries.get(&fallback_key) {
-                            entry
-                                .last_used_epoch_ms
-                                .store(now_epoch_ms(), Ordering::Relaxed);
-                            let mut fallback_sr = entry.send_request.clone();
-                            drop(entry);
+                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
                             match Self::do_request(
                                 &mut fallback_sr,
                                 proxy,
@@ -414,7 +448,7 @@ impl Http3ConnectionPool {
                             {
                                 Ok(result) => return Ok(result),
                                 Err(_) => {
-                                    self.entries.remove(&fallback_key);
+                                    self.pool.invalidate(&fallback_key);
                                 }
                             }
                         }
@@ -427,17 +461,9 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_connection(proxy, &tls_config, Some(&h3_config))
+            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await?;
         let mut sr_for_request = sr.clone();
-
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
 
         Self::do_request(
             &mut sr_for_request,
@@ -476,13 +502,7 @@ impl Http3ConnectionPool {
         let key = Self::pool_key_for_target(target_host, target_port, start);
 
         // Try cached connection on the selected index first
-        if let Some(entry) = self.entries.get(&key) {
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            let mut sr = entry.send_request.clone();
-            drop(entry);
-
+        if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
@@ -491,19 +511,14 @@ impl Http3ConnectionPool {
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
                         target_host, target_port, e
                     );
-                    self.entries.remove(&key);
+                    self.pool.invalidate(&key);
 
                     // Try other cached indices before creating a new connection
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key =
                             Self::pool_key_for_target(target_host, target_port, fallback_index);
-                        if let Some(entry) = self.entries.get(&fallback_key) {
-                            entry
-                                .last_used_epoch_ms
-                                .store(now_epoch_ms(), Ordering::Relaxed);
-                            let mut fallback_sr = entry.send_request.clone();
-                            drop(entry);
+                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
                             match Self::do_request(
                                 &mut fallback_sr,
                                 proxy,
@@ -516,7 +531,7 @@ impl Http3ConnectionPool {
                             {
                                 Ok(result) => return Ok(result),
                                 Err(_) => {
-                                    self.entries.remove(&fallback_key);
+                                    self.pool.invalidate(&fallback_key);
                                 }
                             }
                         }
@@ -529,17 +544,9 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_connection_to_target(target_host, target_port, &tls_config, Some(&h3_config))
+            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
             .await?;
         let mut sr_for_request = sr.clone();
-
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
 
         Self::do_request(
             &mut sr_for_request,
@@ -925,13 +932,7 @@ impl Http3ConnectionPool {
         // if the first attempt fails mid-body. Go straight to the slow path.
         let key = Self::pool_key(proxy, start);
 
-        if let Some(entry) = self.entries.get(&key) {
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            let mut sr = entry.send_request.clone();
-            drop(entry);
-
+        if let Some(mut sr) = self.pool.cached(&key) {
             // Single attempt — body is consumed, no retry possible.
             // On error, evict the stale connection so subsequent requests
             // don't repeatedly fail on the same dead QUIC handle.
@@ -952,7 +953,7 @@ impl Http3ConnectionPool {
                         "HTTP/3 streaming body: cached connection failed, evicting: {}",
                         e
                     );
-                    self.entries.remove(&key);
+                    self.pool.invalidate(&key);
                     return Err(e);
                 }
             }
@@ -962,17 +963,9 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_connection(proxy, &tls_config, Some(&h3_config))
+            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await?;
         let mut sr_for_request = sr.clone();
-
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
 
         Self::do_request_streaming_body(
             &mut sr_for_request,
@@ -1011,13 +1004,7 @@ impl Http3ConnectionPool {
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = Self::pool_key_for_target(target_host, target_port, start);
 
-        if let Some(entry) = self.entries.get(&key) {
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            let mut sr = entry.send_request.clone();
-            drop(entry);
-
+        if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request_streaming_body(
                 &mut sr,
                 proxy,
@@ -1035,7 +1022,7 @@ impl Http3ConnectionPool {
                         "HTTP/3 streaming body: cached connection to {}:{} failed, evicting: {}",
                         target_host, target_port, e
                     );
-                    self.entries.remove(&key);
+                    self.pool.invalidate(&key);
                     return Err(e);
                 }
             }
@@ -1044,17 +1031,9 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_connection_to_target(target_host, target_port, &tls_config, Some(&h3_config))
+            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
             .await?;
         let mut sr_for_request = sr.clone();
-
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
 
         Self::do_request_streaming_body(
             &mut sr_for_request,
@@ -1085,23 +1064,9 @@ impl Http3ConnectionPool {
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
-        // Fast path: thread-local buffer lookup (zero allocation on cache hit)
-        thread_local! {
-            static KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
-        }
-        let cached = KEY_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            Self::write_pool_key(&mut buf, proxy, start);
-            if let Some(entry) = self.entries.get(&*buf) {
-                entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
-                let sr = entry.send_request.clone();
-                drop(entry);
-                return Some(sr);
-            }
-            None
-        });
+        let cached = self
+            .pool
+            .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
         if let Some(mut sr) = cached
             && let Ok(result) = Self::do_request_streaming(
                 &mut sr,
@@ -1119,13 +1084,7 @@ impl Http3ConnectionPool {
         // Slow path: allocate pool key String
         let key = Self::pool_key(proxy, start);
 
-        if let Some(entry) = self.entries.get(&key) {
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            let mut sr = entry.send_request.clone();
-            drop(entry);
-
+        if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request_streaming(
                 &mut sr,
                 proxy,
@@ -1139,17 +1098,12 @@ impl Http3ConnectionPool {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
-                    self.entries.remove(&key);
+                    self.pool.invalidate(&key);
 
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key = Self::pool_key(proxy, fallback_index);
-                        if let Some(entry) = self.entries.get(&fallback_key) {
-                            entry
-                                .last_used_epoch_ms
-                                .store(now_epoch_ms(), Ordering::Relaxed);
-                            let mut fallback_sr = entry.send_request.clone();
-                            drop(entry);
+                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
                             match Self::do_request_streaming(
                                 &mut fallback_sr,
                                 proxy,
@@ -1162,7 +1116,7 @@ impl Http3ConnectionPool {
                             {
                                 Ok(result) => return Ok(result),
                                 Err(_) => {
-                                    self.entries.remove(&fallback_key);
+                                    self.pool.invalidate(&fallback_key);
                                 }
                             }
                         }
@@ -1174,17 +1128,9 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_connection(proxy, &tls_config, Some(&h3_config))
+            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await?;
         let mut sr_for_request = sr.clone();
-
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
 
         Self::do_request_streaming(
             &mut sr_for_request,
@@ -1218,13 +1164,7 @@ impl Http3ConnectionPool {
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = Self::pool_key_for_target(target_host, target_port, start);
 
-        if let Some(entry) = self.entries.get(&key) {
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            let mut sr = entry.send_request.clone();
-            drop(entry);
-
+        if let Some(mut sr) = self.pool.cached(&key) {
             match Self::do_request_streaming(
                 &mut sr,
                 proxy,
@@ -1241,18 +1181,13 @@ impl Http3ConnectionPool {
                         "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
                         target_host, target_port, e
                     );
-                    self.entries.remove(&key);
+                    self.pool.invalidate(&key);
 
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key =
                             Self::pool_key_for_target(target_host, target_port, fallback_index);
-                        if let Some(entry) = self.entries.get(&fallback_key) {
-                            entry
-                                .last_used_epoch_ms
-                                .store(now_epoch_ms(), Ordering::Relaxed);
-                            let mut fallback_sr = entry.send_request.clone();
-                            drop(entry);
+                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
                             match Self::do_request_streaming(
                                 &mut fallback_sr,
                                 proxy,
@@ -1265,7 +1200,7 @@ impl Http3ConnectionPool {
                             {
                                 Ok(result) => return Ok(result),
                                 Err(_) => {
-                                    self.entries.remove(&fallback_key);
+                                    self.pool.invalidate(&fallback_key);
                                 }
                             }
                         }
@@ -1277,17 +1212,9 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
-            .create_connection_to_target(target_host, target_port, &tls_config, Some(&h3_config))
+            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
             .await?;
         let mut sr_for_request = sr.clone();
-
-        self.entries.insert(
-            key,
-            H3PoolEntry {
-                send_request: sr,
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
 
         Self::do_request_streaming(
             &mut sr_for_request,
@@ -1298,40 +1225,6 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-    }
-
-    /// Background cleanup task that evicts idle connections.
-    fn start_cleanup_task(&self) {
-        let entries = self.entries.clone();
-        let cleanup_secs = self.env_config.pool_cleanup_interval_seconds.max(1);
-        let idle_timeout_ms = self
-            .env_config
-            .http3_pool_idle_timeout_seconds
-            .saturating_mul(1000);
-        tokio::spawn(async move {
-            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(cleanup_secs));
-            loop {
-                cleanup_timer.tick().await;
-                let now = now_epoch_ms();
-                let mut keys_to_remove = Vec::new();
-                for entry in entries.iter() {
-                    let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
-                    let idle_ms = now.saturating_sub(last_used);
-                    if idle_ms > idle_timeout_ms {
-                        keys_to_remove.push(entry.key().clone());
-                    }
-                }
-                if !keys_to_remove.is_empty() {
-                    debug!(
-                        "HTTP/3 pool cleanup: evicting {} idle connections",
-                        keys_to_remove.len()
-                    );
-                    for key in keys_to_remove {
-                        entries.remove(&key);
-                    }
-                }
-            }
-        });
     }
 }
 

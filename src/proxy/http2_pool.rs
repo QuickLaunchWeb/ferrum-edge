@@ -2,338 +2,95 @@
 //!
 //! Provides proper HTTP/2 stream multiplexing over a single persistent TLS
 //! connection, avoiding the connection-per-request churn that reqwest exhibits
-//! under concurrent load. Modeled on the `GrpcConnectionPool` pattern.
-//!
-//! Used when a proxy has `backend_protocol: https` and `pool_enable_http2: true`.
+//! under concurrent load. The shared `GenericPool` owns the DashMap, key reuse,
+//! and cleanup sweep; this wrapper keeps the readiness and shard-selection logic.
 
+use anyhow::Result;
+use async_trait::async_trait;
 use dashmap::DashMap;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
-use crate::dns::DnsCache;
+use crate::dns::{DnsCache, DnsConfig};
+use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn write_http2_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
+    use std::fmt::Write;
+    buf.clear();
+    let _ = write!(buf, "{}|{}|", host, port);
+    buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+    buf.push('|');
+    buf.push_str(
+        proxy
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    buf.push('|');
+    buf.push_str(
+        proxy
+            .resolved_tls
+            .client_cert_path
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    buf.push('|');
+    buf.push(if proxy.resolved_tls.verify_server_cert {
+        '1'
+    } else {
+        '0'
+    });
 }
 
-/// Pool entry tracking a sender handle and its last-used timestamp.
-struct Http2PoolEntry {
-    sender: http2::SendRequest<Incoming>,
-    last_used_epoch_ms: Arc<AtomicU64>,
+fn pool_key_owned(proxy: &Proxy) -> String {
+    let mut buf = String::with_capacity(128);
+    write_http2_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+    buf
 }
 
-/// HTTP/2 connection pool for HTTPS backends.
-///
-/// Manages reusable HTTP/2 connections with proper stream multiplexing.
-/// Unlike the reqwest-based `ConnectionPool`, this uses hyper's HTTP/2 client
-/// directly to multiplex concurrent requests over a single TLS connection,
-/// eliminating the TLS handshake overhead that reqwest incurs under load.
-///
-/// Honors the same configuration as the HTTP pool:
-/// - Global `PoolConfig` from environment variables
-/// - Per-proxy overrides (`pool_*` fields on `Proxy`)
-/// - Global mTLS and CA bundle settings from `EnvConfig`
-/// - Background idle connection cleanup
-pub struct Http2ConnectionPool {
-    /// Cached sender handles keyed by `host:port#shard`
-    entries: Arc<DashMap<String, Http2PoolEntry>>,
-    /// Round-robin counters keyed by base backend host:port.
-    rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
-    /// Global pool configuration (idle timeout, keepalive, etc.)
+fn write_http2_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+    buf.truncate(base_len);
+    buf.push('#');
+    if shard < 10 {
+        buf.push((b'0' + shard as u8) as char);
+    } else {
+        use std::fmt::Write;
+        let _ = write!(buf, "{shard}");
+    }
+}
+
+#[derive(Clone)]
+struct Http2PoolManager {
     global_pool_config: PoolConfig,
-    /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
-    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    dns_cache: DnsCache,
     tls_policy: Option<Arc<TlsPolicy>>,
-    /// Certificate Revocation Lists for backend TLS verification.
     crls: crate::tls::CrlList,
-    /// Shared H2 backend TLS configs so new pooled connections reuse rustls'
-    /// session resumption state instead of rebuilding from scratch.
     tls_configs: BackendTlsConfigCache,
 }
 
-impl Default for Http2ConnectionPool {
-    fn default() -> Self {
-        Self::new(
-            PoolConfig::default(),
-            crate::config::EnvConfig::default(),
-            None,
-            Arc::new(Vec::new()),
-        )
-    }
-}
-
-impl Http2ConnectionPool {
-    pub fn new(
-        global_pool_config: PoolConfig,
-        global_env_config: crate::config::EnvConfig,
-        tls_policy: Option<Arc<TlsPolicy>>,
-        crls: crate::tls::CrlList,
-    ) -> Self {
-        let pool = Self {
-            entries: Arc::new(DashMap::new()),
-            rr_counters: Arc::new(DashMap::new()),
-            global_pool_config,
-            global_env_config,
-            tls_policy,
-            crls,
-            tls_configs: BackendTlsConfigCache::new(),
-        };
-
-        pool.start_cleanup_task();
-        pool
-    }
-
-    /// Number of connections in the pool (for metrics).
-    pub fn pool_size(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Pool key — includes all fields that affect connection identity.
-    /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
-    /// Writes into `buf` to allow thread-local reuse on the hot path.
-    fn write_pool_key(buf: &mut String, proxy: &Proxy) {
-        use std::fmt::Write;
-        buf.clear();
-        let _ = write!(buf, "{}|{}|", proxy.backend_host, proxy.backend_port);
-        buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .server_ca_cert_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .client_cert_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push(if proxy.resolved_tls.verify_server_cert {
-            '1'
-        } else {
-            '0'
-        });
-    }
-
-    /// Allocating version of the pool key — only used for warmup deduplication
-    /// where the key must outlive the thread-local buffer.
-    fn pool_key_owned(proxy: &Proxy) -> String {
-        let mut buf = String::with_capacity(128);
-        Self::write_pool_key(&mut buf, proxy);
-        buf
-    }
-
-    /// Expose the base pool key for warmup deduplication (without shard suffix).
-    pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
-        Self::pool_key_owned(proxy)
-    }
-
-    /// Build a shard key by appending the shard index to a pre-allocated buffer.
-    /// Reuses the same buffer across calls to minimize allocations.
-    /// Internally superseded by `write_shard_key_inplace`; kept public for
-    /// external test verification of the shard key format.
-    #[allow(dead_code)]
-    pub fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
-        buf.clear();
-        buf.push_str(base_key);
-        buf.push('#');
-        if shard < 10 {
-            buf.push((b'0' + shard as u8) as char);
-        } else {
-            use std::fmt::Write;
-            let _ = write!(buf, "{shard}");
-        }
-    }
-
-    /// Append a shard suffix in-place by truncating to `base_len` first.
-    /// Avoids clearing and rewriting the base key on every shard iteration.
-    fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
-        buf.truncate(base_len);
-        buf.push('#');
-        if shard < 10 {
-            buf.push((b'0' + shard as u8) as char);
-        } else {
-            use std::fmt::Write;
-            let _ = write!(buf, "{shard}");
-        }
-    }
-
-    /// Get or create an HTTP/2 connection to the HTTPS backend.
-    ///
-    /// Returns a sender that has been `ready()`-checked, meaning the H2
-    /// connection has capacity for at least one more stream. This is critical
-    /// for scaling under high concurrency: without the readiness check, all
-    /// concurrent requests pile onto one sender and exceed
-    /// `MAX_CONCURRENT_STREAMS`, causing stream resets and errors.
-    ///
-    /// When the selected shard's sender is not ready (back-pressure), we
-    /// try other shards round-robin before blocking, spreading load across
-    /// all pooled connections.
-    pub async fn get_sender(
-        &self,
-        proxy: &Proxy,
-        dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
-        let pool_config = self.global_pool_config.for_proxy(proxy);
-        let shard_count = pool_config.http2_connections_per_host.max(1);
-
-        // Build the base pool key and resolve the round-robin start shard.
-        // The rr_counters lookup uses get() first (read-only, no allocation).
-        // Only on the first request for a given base key does entry() allocate.
-        let mut key_buf = String::with_capacity(128);
-        Self::write_pool_key(&mut key_buf, proxy);
-        let base_len = key_buf.len();
-
-        let rr = match self.rr_counters.get(&key_buf) {
-            Some(existing) => existing.value().clone(),
-            None => self
-                .rr_counters
-                .entry(key_buf[..base_len].to_owned())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-                .clone(),
-        };
-        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
-
-        // Two-phase readiness check:
-        //
-        // Phase 1 (zero-cost): poll each shard's sender once without blocking.
-        //   At low concurrency, the sender is almost always immediately ready,
-        //   so this returns in nanoseconds with no timeout overhead.
-        //
-        // Phase 2 (back-pressure): if no shard was instantly ready, re-scan
-        //   with a short timeout per shard, giving each H2 connection a chance
-        //   to free a stream slot before we fall through to creating a new connection.
-        let mut first_live_key: Option<String> = None;
-        for offset in 0..shard_count {
-            let shard = (start + offset) % shard_count;
-            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
-
-            if let Some(entry) = self.entries.get(&key_buf) {
-                if entry.sender.is_closed() {
-                    drop(entry);
-                    self.entries.remove(&key_buf);
-                    continue;
-                }
-                let mut sender = entry.sender.clone();
-                entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
-                drop(entry);
-
-                // Instant poll — no timer, no allocation, just check if ready now
-                match futures_util::FutureExt::now_or_never(sender.ready()) {
-                    Some(Ok(())) => return Ok(sender),
-                    Some(Err(_)) => {
-                        // Connection error — evict and try next shard
-                        self.entries.remove(&key_buf);
-                        continue;
-                    }
-                    None => {
-                        // Not ready yet — remember this shard for phase 2
-                        if first_live_key.is_none() {
-                            first_live_key = Some(key_buf.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 2: no shard was instantly ready (high concurrency / back-pressure).
-        // Wait briefly on the first live shard for a stream slot to free up.
-        if let Some(key) = first_live_key
-            && let Some(entry) = self.entries.get(&key)
-        {
-            let mut sender = entry.sender.clone();
-            drop(entry);
-            match tokio::time::timeout(Duration::from_millis(5), sender.ready()).await {
-                Ok(Ok(())) => return Ok(sender),
-                Ok(Err(_)) => {
-                    self.entries.remove(&key);
-                }
-                Err(_) => {
-                    // Still not ready after 5ms — fall through to create new connection
-                }
-            }
-        }
-
-        // No existing shard was ready — create a new connection on the
-        // originally selected shard.
-        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
-        let sender = match self.create_connection(proxy, dns_cache).await {
-            Ok(sender) => sender,
-            Err(err) => {
-                // Connection failed — try to find any live shard as fallback
-                for offset in 1..shard_count {
-                    let shard = (start + offset) % shard_count;
-                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
-                    if let Some(entry) = self.entries.get(&key_buf) {
-                        if !entry.sender.is_closed() {
-                            entry
-                                .last_used_epoch_ms
-                                .store(now_epoch_ms(), Ordering::Relaxed);
-                            return Ok(entry.sender.clone());
-                        }
-                        drop(entry);
-                        self.entries.remove(&key_buf);
-                    }
-                }
-                return Err(err);
-            }
-        };
-        let sender = match self.entries.entry(key_buf) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                if occupied.get().sender.is_closed() {
-                    occupied.insert(Http2PoolEntry {
-                        sender: sender.clone(),
-                        last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-                    });
-                    sender
-                } else {
-                    occupied.get().sender.clone()
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(Http2PoolEntry {
-                    sender: sender.clone(),
-                    last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-                });
-                sender
-            }
-        };
-        Ok(sender)
-    }
-
+impl Http2PoolManager {
     async fn create_connection(
         &self,
         proxy: &Proxy,
-        dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        // Resolve backend hostname via the shared DNS cache. Errors propagate
-        // — no silent fallback to raw hostname that would bypass the cache.
-        let resolved_ip = dns_cache
+        let resolved_ip = self
+            .dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
@@ -345,63 +102,44 @@ impl Http2ConnectionPool {
                 source: Some(BackendUnavailableSource::Dns),
             })?;
 
-        // Construct SocketAddr from the resolved IpAddr + port directly.
-        // This handles both IPv4 and IPv6 correctly without string formatting
-        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
-        // which breaks "ip:port" string parsing).
         let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
         let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
-        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
-        // before connect() so the kernel can co-select ephemeral ports.
         let tcp = tokio::time::timeout(
             connect_timeout,
             crate::socket_opts::connect_with_socket_opts(sock_addr),
         )
         .await
-        .map_err(|_| {
-            warn!(
-                "http2_pool: connect timeout ({}ms) to backend {}",
+        .map_err(|_| Http2PoolError::BackendTimeout {
+            message: format!(
+                "Connect timeout after {}ms to {}",
                 proxy.backend_connect_timeout_ms, addr
-            );
-            // Synthesize an io::Error so downstream classification can walk
-            // the typed chain instead of string-matching "timeout".
-            Http2PoolError::BackendTimeout {
-                message: format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ),
-                source: Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "backend connect timed out",
-                )),
-            }
+            ),
+            source: Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend connect timed out",
+            )),
         })?
         .map_err(|e| {
             if crate::retry::is_port_exhaustion(&e) {
                 tracing::error!(
                     "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
-                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                     reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
                     addr,
                     e
                 );
             } else {
                 warn!("http2_pool: failed to connect to backend {}: {}", addr, e);
             }
-            // Preserve the typed io::Error so classify_http2_pool_error() can
-            // walk the source chain (ErrorKind::ConnectionRefused, raw_os_error
-            // for EADDRNOTAVAIL, etc.) regardless of Display wording.
             Http2PoolError::BackendUnavailable {
                 message: format!("Connection refused: {}", e),
                 source: Some(BackendUnavailableSource::Io(e)),
             }
         })?;
 
-        // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
 
-        // Apply TCP keepalive using per-proxy pool config
         let pool_config = self.global_pool_config.for_proxy(proxy);
         if pool_config.enable_http_keep_alive {
             Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
@@ -411,11 +149,8 @@ impl Http2ConnectionPool {
             .await
     }
 
-    /// Build an HTTP/2 client builder with keepalive and flow-control settings.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
-
-        // Timer is required for keep_alive_interval and keep_alive_timeout to work
         builder.timer(TokioTimer::new());
 
         if pool_config.enable_http2 {
@@ -429,8 +164,6 @@ impl Http2ConnectionPool {
                 .max_concurrent_reset_streams(4096);
         }
 
-        // Flow-control tuning — larger windows dramatically improve throughput
-        // by allowing more data in flight before waiting for WINDOW_UPDATEs.
         builder
             .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
             .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
@@ -444,7 +177,6 @@ impl Http2ConnectionPool {
         builder
     }
 
-    /// Set TCP keepalive on a stream to detect dead backend connections.
     fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
         #[cfg(unix)]
         use std::os::fd::AsFd;
@@ -465,7 +197,7 @@ impl Http2ConnectionPool {
 
     fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, Http2PoolError> {
         self.tls_configs
-            .get_or_try_build(Self::pool_key_owned(proxy), || {
+            .get_or_try_build(pool_key_owned(proxy), || {
                 let mut tls_config = BackendTlsConfigBuilder {
                     proxy,
                     policy: self.tls_policy.as_deref(),
@@ -503,11 +235,10 @@ impl Http2ConnectionPool {
                 })?;
 
                 tls_config.alpn_protocols = vec![b"h2".to_vec()];
-                Ok(tls_config)
+                Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
             })
     }
 
-    /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
     async fn create_tls_connection(
         &self,
         tcp: TcpStream,
@@ -521,8 +252,6 @@ impl Http2ConnectionPool {
         let tls_config = self.get_tls_config(proxy)?;
         let connector = TlsConnector::from(tls_config);
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-            // Invalid SNI server name is a configuration/DNS problem, not a
-            // transient backend issue — classify as DNS lookup.
             Http2PoolError::BackendUnavailable {
                 message: format!("Invalid server name: {}", e),
                 source: Some(BackendUnavailableSource::InvalidDnsName),
@@ -548,7 +277,6 @@ impl Http2ConnectionPool {
                     source: Some(BackendUnavailableSource::Hyper(e)),
                 })?;
 
-        // Spawn the connection driver
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("http2_pool: TLS connection closed: {}", e);
@@ -557,46 +285,174 @@ impl Http2ConnectionPool {
 
         Ok(sender)
     }
+}
 
-    /// Start background cleanup task that evicts idle connections.
-    fn start_cleanup_task(&self) {
-        let entries = self.entries.clone();
-        let idle_timeout_ms = self
-            .global_pool_config
-            .idle_timeout_seconds
-            .saturating_mul(1000);
-        let cleanup_secs = self.global_env_config.pool_cleanup_interval_seconds.max(1);
+#[async_trait]
+impl PoolManager for Http2PoolManager {
+    type Connection = http2::SendRequest<Incoming>;
 
-        tokio::spawn(async move {
-            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(cleanup_secs));
+    fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
+        write_http2_pool_key(buf, host, port, proxy);
+        let base_len = buf.len();
+        write_http2_shard_key_inplace(buf, base_len, shard);
+    }
 
-            loop {
-                cleanup_timer.tick().await;
+    async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<Incoming>> {
+        self.create_connection(proxy)
+            .await
+            .map_err(anyhow::Error::from)
+    }
 
-                let now = now_epoch_ms();
-                let mut keys_to_remove = Vec::new();
+    fn is_healthy(&self, conn: &Self::Connection) -> bool {
+        !conn.is_closed()
+    }
 
-                for entry in entries.iter() {
-                    let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
-                    let idle_ms = now.saturating_sub(last_used);
+    fn destroy(&self, conn: Self::Connection) {
+        drop(conn);
+    }
+}
 
-                    // Evict if idle too long or if the connection is already closed
-                    if idle_ms > idle_timeout_ms || entry.sender.is_closed() {
-                        keys_to_remove.push(entry.key().clone());
+/// HTTP/2 connection pool for HTTPS backends.
+pub struct Http2ConnectionPool {
+    pool: Arc<GenericPool<Http2PoolManager>>,
+    rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
+}
+
+impl Default for Http2ConnectionPool {
+    fn default() -> Self {
+        Self::new(
+            PoolConfig::default(),
+            crate::config::EnvConfig::default(),
+            DnsCache::new(DnsConfig::default()),
+            None,
+            Arc::new(Vec::new()),
+        )
+    }
+}
+
+impl Http2ConnectionPool {
+    pub fn new(
+        global_pool_config: PoolConfig,
+        global_env_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
+    ) -> Self {
+        let cleanup_interval =
+            Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
+        let manager = Arc::new(Http2PoolManager {
+            global_pool_config: global_pool_config.clone(),
+            global_env_config,
+            dns_cache,
+            tls_policy,
+            crls,
+            tls_configs: BackendTlsConfigCache::new(),
+        });
+
+        Self {
+            pool: GenericPool::new(manager, global_pool_config, cleanup_interval),
+            rr_counters: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.pool.pool_size()
+    }
+
+    pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
+        pool_key_owned(proxy)
+    }
+
+    #[allow(dead_code)]
+    pub fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
+        buf.clear();
+        buf.push_str(base_key);
+        buf.push('#');
+        if shard < 10 {
+            buf.push((b'0' + shard as u8) as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(buf, "{shard}");
+        }
+    }
+
+    fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+        write_http2_shard_key_inplace(buf, base_len, shard);
+    }
+
+    pub async fn get_sender(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
+        let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
+
+        let mut key_buf = String::with_capacity(128);
+        write_http2_pool_key(&mut key_buf, &proxy.backend_host, proxy.backend_port, proxy);
+        let base_len = key_buf.len();
+
+        let rr = match self.rr_counters.get(&key_buf) {
+            Some(existing) => existing.value().clone(),
+            None => self
+                .rr_counters
+                .entry(key_buf[..base_len].to_owned())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone(),
+        };
+        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+
+        let mut first_live: Option<(String, http2::SendRequest<Incoming>)> = None;
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
+
+            if let Some(mut sender) = self.pool.cached(&key_buf) {
+                match futures_util::FutureExt::now_or_never(sender.ready()) {
+                    Some(Ok(())) => return Ok(sender),
+                    Some(Err(_)) => {
+                        self.pool.invalidate(&key_buf);
                     }
-                }
-
-                if !keys_to_remove.is_empty() {
-                    debug!(
-                        "http2_pool cleanup: evicting {} idle/closed connections",
-                        keys_to_remove.len()
-                    );
-                    for key in keys_to_remove {
-                        entries.remove(&key);
+                    None => {
+                        if first_live.is_none() {
+                            first_live = Some((key_buf.clone(), sender));
+                        }
                     }
                 }
             }
-        });
+        }
+
+        if let Some((key, mut sender)) = first_live {
+            match tokio::time::timeout(Duration::from_millis(5), sender.ready()).await {
+                Ok(Ok(())) => return Ok(sender),
+                Ok(Err(_)) => self.pool.invalidate(&key),
+                Err(_) => {}
+            }
+        }
+
+        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
+        let selected_key = key_buf.clone();
+        let manager = Arc::clone(self.pool.manager());
+        let sender = match self
+            .pool
+            .create_or_get_existing_owned(selected_key, |key| async move {
+                let _ = key;
+                manager.create_connection(proxy).await
+            })
+            .await
+        {
+            Ok(sender) => sender,
+            Err(err) => {
+                for offset in 1..shard_count {
+                    let shard = (start + offset) % shard_count;
+                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
+                    if let Some(sender) = self.pool.cached(&key_buf) {
+                        return Ok(sender);
+                    }
+                }
+                return Err(err);
+            }
+        };
+        Ok(sender)
     }
 }
 

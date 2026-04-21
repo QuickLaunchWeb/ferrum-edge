@@ -30,6 +30,7 @@ mod modes;
 mod overload;
 mod plugin_cache;
 mod plugins;
+mod pool;
 mod proxy;
 mod retry;
 mod router_cache;

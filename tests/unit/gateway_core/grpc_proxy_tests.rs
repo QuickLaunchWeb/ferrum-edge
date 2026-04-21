@@ -417,8 +417,7 @@ async fn test_grpc_connection_pool_creation() {
     let mut proxy = test_proxy();
     proxy.backend_host = "127.0.0.1".to_string();
     proxy.backend_port = 1; // intentionally unreachable port
-    let dns = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
-    let result = pool.get_sender(&proxy, &dns).await;
+    let result = pool.get_sender(&proxy).await;
     // Connection should fail (unreachable port), but not panic
     assert!(
         result.is_err(),

@@ -18,6 +18,8 @@
 //!
 //! gRPC metadata maps to HTTP/2 headers, so existing auth plugins work unchanged.
 
+use anyhow::Result;
+use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http_body::Frame;
@@ -30,7 +32,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -38,7 +40,8 @@ use tracing::{debug, error, warn};
 
 use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
-use crate::dns::DnsCache;
+use crate::dns::{DnsCache, DnsConfig};
+use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
 
@@ -121,17 +124,51 @@ impl http_body::Body for GrpcBody {
     }
 }
 
-/// Pool entry tracking a sender handle and its last-used timestamp.
-struct GrpcPoolEntry {
-    sender: http2::SendRequest<GrpcBody>,
-    last_used_epoch_ms: Arc<AtomicU64>,
+fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
+    use std::fmt::Write;
+    buf.clear();
+    let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs) as u8;
+    let _ = write!(buf, "{}|{}|{}|", host, port, tls);
+    buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+    buf.push('|');
+    buf.push_str(
+        proxy
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    buf.push('|');
+    buf.push_str(
+        proxy
+            .resolved_tls
+            .client_cert_path
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    buf.push('|');
+    buf.push(if proxy.resolved_tls.verify_server_cert {
+        '1'
+    } else {
+        '0'
+    });
 }
 
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+fn grpc_pool_key_owned(proxy: &Proxy) -> String {
+    let mut buf = String::with_capacity(128);
+    write_grpc_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+    buf
+}
+
+fn write_grpc_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+    buf.truncate(base_len);
+    buf.push('#');
+    if shard < 10 {
+        buf.push((b'0' + shard as u8) as char);
+    } else {
+        use std::fmt::Write;
+        let _ = write!(buf, "{shard}");
+    }
 }
 
 /// gRPC-specific HTTP/2 connection pool.
@@ -146,23 +183,17 @@ fn now_epoch_ms() -> u64 {
 /// - Global mTLS and CA bundle settings from `EnvConfig`
 /// - Background idle connection cleanup
 pub struct GrpcConnectionPool {
-    /// Cached sender handles keyed by `host:port:tls#shard`
-    entries: Arc<DashMap<String, GrpcPoolEntry>>,
-    /// Round-robin counters keyed by the base backend host:port:tls tuple.
+    pool: Arc<GenericPool<GrpcPoolManager>>,
     rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
-    /// Global pool configuration (idle timeout, keepalive, etc.)
+}
+
+#[derive(Clone)]
+struct GrpcPoolManager {
     global_pool_config: PoolConfig,
-    /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
-    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    dns_cache: DnsCache,
     tls_policy: Option<Arc<TlsPolicy>>,
-    /// Certificate Revocation Lists for backend TLS verification.
     crls: crate::tls::CrlList,
-    /// How long to wait for stream capacity on a live sender before opening a
-    /// new backend connection shard.
-    sender_ready_wait: Duration,
-    /// Shared H2 TLS configs so GRPCS reconnects reuse rustls' session
-    /// resumption state instead of starting from a fresh config each time.
     tls_configs: BackendTlsConfigCache,
 }
 
@@ -171,6 +202,7 @@ impl Default for GrpcConnectionPool {
         Self::new(
             PoolConfig::default(),
             crate::config::EnvConfig::default(),
+            DnsCache::new(DnsConfig::default()),
             None,
             Arc::new(Vec::new()),
         )
@@ -181,28 +213,30 @@ impl GrpcConnectionPool {
     pub fn new(
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
         tls_policy: Option<Arc<TlsPolicy>>,
         crls: crate::tls::CrlList,
     ) -> Self {
-        let sender_ready_wait = Duration::from_millis(global_env_config.grpc_pool_ready_wait_ms);
-        let pool = Self {
-            entries: Arc::new(DashMap::new()),
-            rr_counters: Arc::new(DashMap::new()),
-            global_pool_config,
+        let cleanup_interval =
+            Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
+        let manager = Arc::new(GrpcPoolManager {
+            global_pool_config: global_pool_config.clone(),
             global_env_config,
+            dns_cache,
             tls_policy,
             crls,
-            sender_ready_wait,
             tls_configs: BackendTlsConfigCache::new(),
-        };
+        });
 
-        pool.start_cleanup_task();
-        pool
+        Self {
+            pool: GenericPool::new(manager, global_pool_config, cleanup_interval),
+            rr_counters: Arc::new(DashMap::new()),
+        }
     }
 
     /// Number of connections in the pool (for metrics).
     pub fn pool_size(&self) -> usize {
-        self.entries.len()
+        self.pool.pool_size()
     }
 
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
@@ -216,45 +250,13 @@ impl GrpcConnectionPool {
     /// Writes the base key (without shard suffix) into `buf`. For shard keys,
     /// `write_shard_key_inplace()` appends `#N` by truncating to the base length.
     fn write_pool_key(buf: &mut String, proxy: &Proxy) {
-        use std::fmt::Write;
-        buf.clear();
-        let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs) as u8;
-        let _ = write!(
-            buf,
-            "{}|{}|{}|",
-            proxy.backend_host, proxy.backend_port, tls
-        );
-        buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .server_ca_cert_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push_str(
-            proxy
-                .resolved_tls
-                .client_cert_path
-                .as_deref()
-                .unwrap_or_default(),
-        );
-        buf.push('|');
-        buf.push(if proxy.resolved_tls.verify_server_cert {
-            '1'
-        } else {
-            '0'
-        });
+        write_grpc_pool_key(buf, &proxy.backend_host, proxy.backend_port, proxy);
     }
 
     /// Allocating version of the pool key — only used for warmup deduplication
     /// where the key must outlive the thread-local buffer.
     fn pool_key_owned(proxy: &Proxy) -> String {
-        let mut buf = String::with_capacity(128);
-        Self::write_pool_key(&mut buf, proxy);
-        buf
+        grpc_pool_key_owned(proxy)
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
@@ -265,19 +267,89 @@ impl GrpcConnectionPool {
     /// Append a shard suffix in-place by truncating to `base_len` first.
     /// Avoids clearing and rewriting the base key on every shard iteration.
     fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
-        buf.truncate(base_len);
-        buf.push('#');
-        if shard < 10 {
-            buf.push((b'0' + shard as u8) as char);
-        } else {
-            use std::fmt::Write;
-            let _ = write!(buf, "{shard}");
-        }
+        write_grpc_shard_key_inplace(buf, base_len, shard);
     }
 
+    pub async fn get_sender(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
+        let manager = self.pool.manager();
+        let pool_config = manager.global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
+
+        let mut key_buf = String::with_capacity(128);
+        Self::write_pool_key(&mut key_buf, proxy);
+        let base_len = key_buf.len();
+
+        let rr = match self.rr_counters.get(&key_buf) {
+            Some(existing) => existing.value().clone(),
+            None => self
+                .rr_counters
+                .entry(key_buf[..base_len].to_owned())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone(),
+        };
+        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+        let sender_ready_wait =
+            Duration::from_millis(manager.global_env_config.grpc_pool_ready_wait_ms);
+
+        let mut first_live: Option<(String, http2::SendRequest<GrpcBody>)> = None;
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
+
+            if let Some(mut sender) = self.pool.cached(&key_buf) {
+                match futures_util::FutureExt::now_or_never(sender.ready()) {
+                    Some(Ok(())) => return Ok(sender),
+                    Some(Err(_)) => self.pool.invalidate(&key_buf),
+                    None => {
+                        if first_live.is_none() {
+                            first_live = Some((key_buf.clone(), sender));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((key, mut sender)) = first_live {
+            match tokio::time::timeout(sender_ready_wait, sender.ready()).await {
+                Ok(Ok(())) => return Ok(sender),
+                Ok(Err(_)) => self.pool.invalidate(&key),
+                Err(_) => {}
+            }
+        }
+
+        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
+        let selected_key = key_buf.clone();
+        let manager = Arc::clone(self.pool.manager());
+        match self
+            .pool
+            .create_or_get_existing_owned(selected_key, |key| async move {
+                let _ = key;
+                manager.create_connection(proxy).await
+            })
+            .await
+        {
+            Ok(sender) => Ok(sender),
+            Err(err) => {
+                for offset in 1..shard_count {
+                    let shard = (start + offset) % shard_count;
+                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
+                    if let Some(sender) = self.pool.cached(&key_buf) {
+                        return Ok(sender);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+impl GrpcPoolManager {
     fn get_tls_config(&self, proxy: &Proxy) -> Result<Arc<rustls::ClientConfig>, GrpcProxyError> {
         self.tls_configs
-            .get_or_try_build(Self::pool_key_owned(proxy), || {
+            .get_or_try_build(grpc_pool_key_owned(proxy), || {
                 let mut tls_config = BackendTlsConfigBuilder {
                     proxy,
                     policy: self.tls_policy.as_deref(),
@@ -309,148 +381,17 @@ impl GrpcConnectionPool {
             })
     }
 
-    /// Get or create an HTTP/2 connection to the gRPC backend.
-    ///
-    /// Returns a sender that has been `ready()`-checked, meaning the H2
-    /// connection has capacity for at least one more stream. Uses the same
-    /// two-phase readiness strategy as `Http2ConnectionPool::get_sender`.
-    pub async fn get_sender(
-        &self,
-        proxy: &Proxy,
-        dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        let pool_config = self.global_pool_config.for_proxy(proxy);
-        let shard_count = pool_config.http2_connections_per_host.max(1);
-
-        // Build the base pool key and resolve the round-robin start shard.
-        // The rr_counters lookup uses get() first (read-only, no allocation).
-        // Only on the first request for a given base key does entry() allocate.
-        let mut key_buf = String::with_capacity(128);
-        Self::write_pool_key(&mut key_buf, proxy);
-        let base_len = key_buf.len();
-
-        let rr = match self.rr_counters.get(&key_buf) {
-            Some(existing) => existing.value().clone(),
-            None => self
-                .rr_counters
-                .entry(key_buf[..base_len].to_owned())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-                .clone(),
-        };
-        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
-
-        // Two-phase readiness check (see Http2ConnectionPool::get_sender for rationale):
-        // Phase 1: instant poll each shard without blocking.
-        // Phase 2: if none ready, wait briefly on first live shard.
-        let mut first_live_key: Option<String> = None;
-        for offset in 0..shard_count {
-            let shard = (start + offset) % shard_count;
-            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
-
-            if let Some(entry) = self.entries.get(&key_buf) {
-                if entry.sender.is_closed() {
-                    drop(entry);
-                    self.entries.remove(&key_buf);
-                    continue;
-                }
-                let mut sender = entry.sender.clone();
-                entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
-                drop(entry);
-
-                match futures_util::FutureExt::now_or_never(sender.ready()) {
-                    Some(Ok(())) => return Ok(sender),
-                    Some(Err(_)) => {
-                        self.entries.remove(&key_buf);
-                        continue;
-                    }
-                    None => {
-                        if first_live_key.is_none() {
-                            first_live_key = Some(key_buf.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 2: wait briefly on first live shard for a stream slot to free up.
-        // Keep this shorter than a typical successful unary gRPC round trip so
-        // backpressure doesn't turn into queueing latency under load.
-        if let Some(key) = first_live_key
-            && let Some(entry) = self.entries.get(&key)
-        {
-            let mut sender = entry.sender.clone();
-            drop(entry);
-            match tokio::time::timeout(self.sender_ready_wait, sender.ready()).await {
-                Ok(Ok(())) => return Ok(sender),
-                Ok(Err(_)) => {
-                    self.entries.remove(&key);
-                }
-                Err(_) => {
-                    // Still not ready after the configured wait — fall through
-                    // to create a new connection.
-                }
-            }
-        }
-
-        // No existing shard was ready — create a new connection.
-        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
-        let sender = match self.create_connection(proxy, dns_cache).await {
-            Ok(sender) => sender,
-            Err(err) => {
-                for offset in 1..shard_count {
-                    let shard = (start + offset) % shard_count;
-                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
-                    if let Some(entry) = self.entries.get(&key_buf) {
-                        if !entry.sender.is_closed() {
-                            entry
-                                .last_used_epoch_ms
-                                .store(now_epoch_ms(), Ordering::Relaxed);
-                            return Ok(entry.sender.clone());
-                        }
-                        drop(entry);
-                        self.entries.remove(&key_buf);
-                    }
-                }
-                return Err(err);
-            }
-        };
-        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
-        let sender = match self.entries.entry(key_buf) {
-            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
-                if occupied.get().sender.is_closed() {
-                    occupied.insert(GrpcPoolEntry {
-                        sender: sender.clone(),
-                        last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-                    });
-                    sender
-                } else {
-                    occupied.get().sender.clone()
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(GrpcPoolEntry {
-                    sender: sender.clone(),
-                    last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-                });
-                sender
-            }
-        };
-        Ok(sender)
-    }
-
     async fn create_connection(
         &self,
         proxy: &Proxy,
-        dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
         // Resolve backend hostname via the shared DNS cache. Errors propagate
         // — no silent fallback to raw hostname that would bypass the cache.
-        let resolved_ip = dns_cache
+        let resolved_ip = self
+            .dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
@@ -634,46 +575,30 @@ impl GrpcConnectionPool {
 
         Ok(sender)
     }
+}
 
-    /// Start background cleanup task that evicts idle connections.
-    fn start_cleanup_task(&self) {
-        let entries = self.entries.clone();
-        let idle_timeout_ms = self
-            .global_pool_config
-            .idle_timeout_seconds
-            .saturating_mul(1000);
-        let cleanup_secs = self.global_env_config.pool_cleanup_interval_seconds.max(1);
+#[async_trait]
+impl PoolManager for GrpcPoolManager {
+    type Connection = http2::SendRequest<GrpcBody>;
 
-        tokio::spawn(async move {
-            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(cleanup_secs));
+    fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
+        write_grpc_pool_key(buf, host, port, proxy);
+        let base_len = buf.len();
+        write_grpc_shard_key_inplace(buf, base_len, shard);
+    }
 
-            loop {
-                cleanup_timer.tick().await;
+    async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<GrpcBody>> {
+        self.create_connection(proxy)
+            .await
+            .map_err(anyhow::Error::from)
+    }
 
-                let now = now_epoch_ms();
-                let mut keys_to_remove = Vec::new();
+    fn is_healthy(&self, conn: &Self::Connection) -> bool {
+        !conn.is_closed()
+    }
 
-                for entry in entries.iter() {
-                    let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
-                    let idle_ms = now.saturating_sub(last_used);
-
-                    // Evict if idle too long or if the connection is already closed
-                    if idle_ms > idle_timeout_ms || entry.sender.is_closed() {
-                        keys_to_remove.push(entry.key().clone());
-                    }
-                }
-
-                if !keys_to_remove.is_empty() {
-                    debug!(
-                        "gRPC pool cleanup: evicting {} idle/closed connections",
-                        keys_to_remove.len()
-                    );
-                    for key in keys_to_remove {
-                        entries.remove(&key);
-                    }
-                }
-            }
-        });
+    fn destroy(&self, conn: Self::Connection) {
+        drop(conn);
     }
 }
 
@@ -685,6 +610,19 @@ pub enum GrpcProxyError {
     ResourceExhausted(String),
     Internal(String),
 }
+
+impl std::fmt::Display for GrpcProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendUnavailable(msg)
+            | Self::BackendTimeout(msg)
+            | Self::ResourceExhausted(msg)
+            | Self::Internal(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl std::error::Error for GrpcProxyError {}
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
@@ -891,7 +829,7 @@ pub async fn proxy_grpc_request_streaming(
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
-    dns_cache: &DnsCache,
+    _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     max_grpc_recv_size_bytes: usize,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
@@ -944,7 +882,7 @@ pub async fn proxy_grpc_request_streaming(
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
 
-    let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
+    let mut sender = grpc_pool.get_sender(proxy).await?;
     let read_timeout = Duration::from_millis(effective_timeout_ms);
     let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
         .await
@@ -1056,12 +994,12 @@ pub(crate) async fn proxy_grpc_request_core(
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
-    dns_cache: &DnsCache,
+    _dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Get or create HTTP/2 connection to backend (round-robins across pool)
-    let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
+    let mut sender = grpc_pool.get_sender(proxy).await?;
     // Parse the backend URL to extract path and authority
     let uri: hyper::Uri = backend_url
         .parse()
