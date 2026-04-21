@@ -6,6 +6,9 @@ use crate::plugins::PluginResult;
 pub trait SizeLimiter {
     fn plugin_name(&self) -> &'static str;
 
+    /// Use `u128` so HTTP plugins backed by `u64` limits and WebSocket frame
+    /// checks backed by `usize` can share one comparison path without lossy
+    /// casts in the trait API.
     fn max_size_bytes(&self) -> u128;
 
     fn is_enabled(&self) -> bool {
