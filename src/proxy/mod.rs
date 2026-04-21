@@ -607,12 +607,14 @@ impl ProxyState {
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
+            dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
         ));
         let http2_pool = Arc::new(Http2ConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
+            dns_cache.clone(),
             tls_policy_arc.clone(),
             crls.clone(),
         ));
@@ -1159,13 +1161,12 @@ impl ProxyState {
                     let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(&target_proxy);
                     if seen.insert(key) {
                         let pool = self.grpc_pool.clone();
-                        let dns = self.dns_cache.clone();
                         tasks.push(Box::pin(async move {
                             let desc = format!(
                                 "gRPC {}:{}",
                                 target_proxy.backend_host, target_proxy.backend_port
                             );
-                            pool.get_sender(&target_proxy, &dns)
+                            pool.get_sender(&target_proxy)
                                 .await
                                 .map(|_| desc.clone())
                                 .map_err(|e| format!("{}: {:?}", desc, e))
@@ -1177,11 +1178,10 @@ impl ProxyState {
             let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(proxy);
             if seen.insert(key) {
                 let pool = self.grpc_pool.clone();
-                let dns = self.dns_cache.clone();
                 let proxy = proxy.clone();
                 tasks.push(Box::pin(async move {
                     let desc = format!("gRPC {}:{}", proxy.backend_host, proxy.backend_port);
-                    pool.get_sender(&proxy, &dns)
+                    pool.get_sender(&proxy)
                         .await
                         .map(|_| desc.clone())
                         .map_err(|e| format!("{}: {:?}", desc, e))
@@ -1207,13 +1207,12 @@ impl ProxyState {
                     let key = Http2ConnectionPool::pool_key_for_warmup(&target_proxy);
                     if seen.insert(key) {
                         let pool = self.http2_pool.clone();
-                        let dns = self.dns_cache.clone();
                         tasks.push(Box::pin(async move {
                             let desc = format!(
                                 "H2 {}:{}",
                                 target_proxy.backend_host, target_proxy.backend_port
                             );
-                            pool.get_sender(&target_proxy, &dns)
+                            pool.get_sender(&target_proxy)
                                 .await
                                 .map(|_| desc.clone())
                                 .map_err(|e| format!("{}: {:?}", desc, e))
@@ -1225,11 +1224,10 @@ impl ProxyState {
             let key = Http2ConnectionPool::pool_key_for_warmup(proxy);
             if seen.insert(key) {
                 let pool = self.http2_pool.clone();
-                let dns = self.dns_cache.clone();
                 let proxy = proxy.clone();
                 tasks.push(Box::pin(async move {
                     let desc = format!("H2 {}:{}", proxy.backend_host, proxy.backend_port);
-                    pool.get_sender(&proxy, &dns)
+                    pool.get_sender(&proxy)
                         .await
                         .map(|_| desc.clone())
                         .map_err(|e| format!("{}: {:?}", desc, e))
@@ -8007,7 +8005,7 @@ async fn proxy_to_backend_http2(
     // Get or create HTTP/2 connection to backend.
     // The pool returns a ready() sender with stream capacity, evicting closed
     // connections and spreading load across shards automatically.
-    let mut sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
+    let mut sender = match state.http2_pool.get_sender(proxy).await {
         Ok(s) => s,
         Err(e) => {
             let msg = e.message().to_string();

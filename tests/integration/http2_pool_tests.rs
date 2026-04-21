@@ -155,6 +155,7 @@ async fn test_http2_pool_new_starts_empty() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
@@ -168,7 +169,6 @@ async fn test_http2_pool_new_starts_empty() {
 #[tokio::test]
 async fn test_http2_pool_backend_unavailable() {
     let pool = create_default_pool();
-    let dns_cache = create_dns_cache();
 
     let mut proxy = create_test_proxy();
     // Point to a port that should refuse connections
@@ -176,7 +176,7 @@ async fn test_http2_pool_backend_unavailable() {
     proxy.backend_port = 1; // Privileged port, should refuse
     proxy.backend_tls_verify_server_cert = false;
 
-    let result = pool.get_sender(&proxy, &dns_cache).await;
+    let result = pool.get_sender(&proxy).await;
     assert!(
         result.is_err(),
         "Expected error connecting to unavailable backend"
@@ -210,7 +210,6 @@ async fn test_http2_pool_backend_unavailable() {
 #[tokio::test]
 async fn test_http2_pool_backend_timeout() {
     let pool = create_default_pool();
-    let dns_cache = create_dns_cache();
 
     let mut proxy = create_test_proxy();
     // Use a non-routable address to trigger connect timeout
@@ -219,7 +218,7 @@ async fn test_http2_pool_backend_timeout() {
     proxy.backend_connect_timeout_ms = 100; // Very short timeout
     proxy.backend_tls_verify_server_cert = false;
 
-    let result = pool.get_sender(&proxy, &dns_cache).await;
+    let result = pool.get_sender(&proxy).await;
     assert!(result.is_err(), "Expected timeout error");
     match result.unwrap_err() {
         Http2PoolError::BackendTimeout { message: msg, .. } => {
@@ -242,7 +241,6 @@ async fn test_http2_pool_backend_timeout() {
 #[tokio::test]
 async fn test_http2_pool_invalid_server_name() {
     let pool = create_default_pool();
-    let dns_cache = create_dns_cache();
 
     let mut proxy = create_test_proxy();
     // Empty hostname is invalid for TLS server name
@@ -250,7 +248,7 @@ async fn test_http2_pool_invalid_server_name() {
     proxy.backend_port = 9999;
     proxy.backend_tls_verify_server_cert = false;
 
-    let result = pool.get_sender(&proxy, &dns_cache).await;
+    let result = pool.get_sender(&proxy).await;
     // Should fail at DNS resolution or TLS server name construction
     assert!(result.is_err());
 }
@@ -268,17 +266,17 @@ async fn test_http2_pool_get_sender_connects() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy = create_test_proxy();
     proxy.backend_host = "localhost".to_string();
     proxy.backend_port = port;
     proxy.backend_tls_verify_server_cert = false; // Self-signed cert
 
-    let sender = pool.get_sender(&proxy, &dns_cache).await;
+    let sender = pool.get_sender(&proxy).await;
     assert!(
         sender.is_ok(),
         "get_sender should succeed: {:?}",
@@ -299,10 +297,10 @@ async fn test_http2_pool_reuses_connection() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy = create_test_proxy();
     proxy.backend_host = "localhost".to_string();
@@ -311,13 +309,13 @@ async fn test_http2_pool_reuses_connection() {
 
     // Get sender twice for the same proxy
     let _sender1 = pool
-        .get_sender(&proxy, &dns_cache)
+        .get_sender(&proxy)
         .await
         .expect("First get_sender failed");
     let size_after_first = pool.pool_size();
 
     let _sender2 = pool
-        .get_sender(&proxy, &dns_cache)
+        .get_sender(&proxy)
         .await
         .expect("Second get_sender failed");
     let size_after_second = pool.pool_size();
@@ -341,10 +339,10 @@ async fn test_http2_pool_different_backends_get_separate_entries() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy1 = create_test_proxy();
     proxy1.backend_host = "localhost".to_string();
@@ -357,16 +355,10 @@ async fn test_http2_pool_different_backends_get_separate_entries() {
     proxy2.backend_port = port2;
     proxy2.backend_tls_verify_server_cert = false;
 
-    let _sender1 = pool
-        .get_sender(&proxy1, &dns_cache)
-        .await
-        .expect("Backend 1 failed");
+    let _sender1 = pool.get_sender(&proxy1).await.expect("Backend 1 failed");
     let size_after_first = pool.pool_size();
 
-    let _sender2 = pool
-        .get_sender(&proxy2, &dns_cache)
-        .await
-        .expect("Backend 2 failed");
+    let _sender2 = pool.get_sender(&proxy2).await.expect("Backend 2 failed");
     let size_after_second = pool.pool_size();
 
     assert!(
@@ -386,10 +378,10 @@ async fn test_http2_pool_different_tls_verify_gets_separate_entries() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy_no_verify = create_test_proxy();
     proxy_no_verify.backend_host = "localhost".to_string();
@@ -398,7 +390,7 @@ async fn test_http2_pool_different_tls_verify_gets_separate_entries() {
     proxy_no_verify.resolved_tls.verify_server_cert = false;
 
     let _sender1 = pool
-        .get_sender(&proxy_no_verify, &dns_cache)
+        .get_sender(&proxy_no_verify)
         .await
         .expect("no-verify get_sender failed");
     let size_after_no_verify = pool.pool_size();
@@ -411,7 +403,7 @@ async fn test_http2_pool_different_tls_verify_gets_separate_entries() {
     proxy_verify.backend_tls_verify_server_cert = true;
     proxy_verify.resolved_tls.verify_server_cert = true;
 
-    let result = pool.get_sender(&proxy_verify, &dns_cache).await;
+    let result = pool.get_sender(&proxy_verify).await;
     // The verify=true connection should fail (self-signed cert, no CA)
     // but the important thing is it didn't reuse the verify=false connection
     if result.is_ok() {
@@ -433,10 +425,10 @@ async fn test_http2_pool_dns_override_affects_pool_key() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy1 = create_test_proxy();
     proxy1.backend_host = "localhost".to_string();
@@ -444,10 +436,7 @@ async fn test_http2_pool_dns_override_affects_pool_key() {
     proxy1.backend_tls_verify_server_cert = false;
     proxy1.dns_override = None;
 
-    let _sender1 = pool
-        .get_sender(&proxy1, &dns_cache)
-        .await
-        .expect("get_sender 1 failed");
+    let _sender1 = pool.get_sender(&proxy1).await.expect("get_sender 1 failed");
     let size1 = pool.pool_size();
 
     let mut proxy2 = create_test_proxy();
@@ -456,10 +445,7 @@ async fn test_http2_pool_dns_override_affects_pool_key() {
     proxy2.backend_tls_verify_server_cert = false;
     proxy2.dns_override = Some("127.0.0.1".to_string());
 
-    let _sender2 = pool
-        .get_sender(&proxy2, &dns_cache)
-        .await
-        .expect("get_sender 2 failed");
+    let _sender2 = pool.get_sender(&proxy2).await.expect("get_sender 2 failed");
     let size2 = pool.pool_size();
 
     assert!(
@@ -479,10 +465,10 @@ async fn test_http2_pool_ca_cert_path_affects_pool_key() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy1 = create_test_proxy();
     proxy1.backend_host = "localhost".to_string();
@@ -490,10 +476,7 @@ async fn test_http2_pool_ca_cert_path_affects_pool_key() {
     proxy1.backend_tls_verify_server_cert = false;
     proxy1.backend_tls_server_ca_cert_path = None;
 
-    let _sender1 = pool
-        .get_sender(&proxy1, &dns_cache)
-        .await
-        .expect("get_sender 1 failed");
+    let _sender1 = pool.get_sender(&proxy1).await.expect("get_sender 1 failed");
     let size1 = pool.pool_size();
 
     let mut proxy2 = create_test_proxy();
@@ -503,7 +486,7 @@ async fn test_http2_pool_ca_cert_path_affects_pool_key() {
     proxy2.backend_tls_server_ca_cert_path = Some("tests/certs/ca.crt".to_string());
 
     // This may fail (the CA cert may not match) but the key differentiation is what we test
-    let _ = pool.get_sender(&proxy2, &dns_cache).await;
+    let _ = pool.get_sender(&proxy2).await;
     let size2 = pool.pool_size();
 
     // If proxy2 succeeded, we should have 2 entries; if it failed, size stays at 1
@@ -526,20 +509,17 @@ async fn test_http2_pool_sender_is_not_closed() {
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
         None,
         Arc::new(Vec::new()),
     );
-    let dns_cache = create_dns_cache();
 
     let mut proxy = create_test_proxy();
     proxy.backend_host = "localhost".to_string();
     proxy.backend_port = port;
     proxy.backend_tls_verify_server_cert = false;
 
-    let sender = pool
-        .get_sender(&proxy, &dns_cache)
-        .await
-        .expect("get_sender failed");
+    let sender = pool.get_sender(&proxy).await.expect("get_sender failed");
 
     // The sender should be live (H2 connection is open)
     assert!(

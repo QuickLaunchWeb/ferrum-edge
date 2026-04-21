@@ -31,6 +31,7 @@ pub mod modes;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;
+pub mod pool;
 pub mod proxy;
 pub mod retry;
 pub mod router_cache;
