@@ -95,6 +95,8 @@ pub(crate) trait SecretBackend: Sync + Send {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
+        // Apply the same timeout envelope to every backend, including file
+        // reads, so startup cannot hang indefinitely on a blocked mount/FIFO.
         let mut resolved = Vec::with_capacity(secrets.len());
         for secret in secrets {
             let value = tokio::time::timeout(
@@ -270,7 +272,12 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
     for backend in startup_backends() {
         let backend_pending: Vec<PendingSecret> = pending
             .iter()
-            .filter(|s| s.backend.name() == backend.name())
+            .filter(|s| {
+                std::ptr::addr_eq(
+                    s.backend as *const dyn SecretBackend,
+                    backend as *const dyn SecretBackend,
+                )
+            })
             .cloned()
             .collect();
         if backend_pending.is_empty() {
@@ -293,6 +300,10 @@ pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Resolve a single secret key across all configured backends.
+///
+/// Startup uses `resolve_all_env_secrets()` for bulk env injection; this helper
+/// remains for the existing single-key tests and ad-hoc secret lookups.
 pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String> {
     let mut sources: Vec<(&'static dyn SecretBackend, String)> = Vec::new();
 
