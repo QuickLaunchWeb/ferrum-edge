@@ -7782,11 +7782,14 @@ fn record_request(state: &ProxyState, status: u16) {
 /// **except** `Set-Cookie` (RFC 6265) which must be emitted as separate header
 /// lines. We store multiple Set-Cookie values separated by `\n` so they can be
 /// split back into individual headers when building the downstream response.
-fn collect_response_headers(
-    source: &reqwest::header::HeaderMap,
+fn collect_response_headers_generic<'a, I>(
+    source_keys_len: usize,
+    source: I,
     target: &mut HashMap<String, String>,
-) {
-    target.reserve(source.keys_len());
+) where
+    I: IntoIterator<Item = (&'a http::header::HeaderName, &'a http::header::HeaderValue)>,
+{
+    target.reserve(source_keys_len);
     for (k, v) in source {
         // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
         // Uses match (compiler-optimized) instead of linear array scan.
@@ -7814,33 +7817,20 @@ fn collect_response_headers(
     }
 }
 
+fn collect_response_headers(
+    source: &reqwest::header::HeaderMap,
+    target: &mut HashMap<String, String>,
+) {
+    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+}
+
 /// Collect hyper response headers into a HashMap.
 ///
 /// Same semantics as `collect_response_headers` (Set-Cookie newline separation,
 /// comma folding for other headers) but for `hyper::HeaderMap` instead of
 /// `reqwest::header::HeaderMap`. Used by the HTTP/2 multiplexing pool path.
 fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
-    target.reserve(source.keys_len());
-    for (k, v) in source {
-        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
-        match k.as_str() {
-            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
-            | "trailer" | "transfer-encoding" | "upgrade" => continue,
-            _ => {}
-        }
-        if let Ok(vs) = v.to_str() {
-            let sep = if k == "set-cookie" { "\n" } else { ", " };
-            match target.get_mut(k.as_str()) {
-                Some(existing) => {
-                    existing.push_str(sep);
-                    existing.push_str(vs);
-                }
-                None => {
-                    target.insert(k.as_str().to_owned(), vs.to_owned());
-                }
-            }
-        }
-    }
+    collect_response_headers_generic(source.keys_len(), source.iter(), target);
 }
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
@@ -8812,5 +8802,61 @@ async fn proxy_to_backend_http3_retry(
                 error_class: Some(error_class),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::header::HeaderValue;
+
+    #[test]
+    fn collect_response_headers_preserves_backend_forwarding_rules() {
+        let mut source = reqwest::header::HeaderMap::new();
+        source.append("x-test", HeaderValue::from_static("one"));
+        source.append("x-test", HeaderValue::from_static("two"));
+        source.append("set-cookie", HeaderValue::from_static("session=a"));
+        source.append("set-cookie", HeaderValue::from_static("theme=dark"));
+        source.insert("connection", HeaderValue::from_static("keep-alive"));
+        source.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        source.insert(
+            "x-non-utf8",
+            HeaderValue::from_bytes(&[0x80, 0x81]).expect("valid raw header value"),
+        );
+
+        let mut target = HashMap::new();
+        collect_response_headers(&source, &mut target);
+
+        assert_eq!(target.get("x-test").map(String::as_str), Some("one, two"));
+        assert_eq!(
+            target.get("set-cookie").map(String::as_str),
+            Some("session=a\ntheme=dark")
+        );
+        assert!(!target.contains_key("connection"));
+        assert!(!target.contains_key("transfer-encoding"));
+        assert!(!target.contains_key("x-non-utf8"));
+    }
+
+    #[test]
+    fn collect_hyper_response_headers_matches_reqwest_behavior() {
+        let mut source = hyper::HeaderMap::new();
+        source.append("x-test", HeaderValue::from_static("alpha"));
+        source.append("x-test", HeaderValue::from_static("beta"));
+        source.append("set-cookie", HeaderValue::from_static("a=1"));
+        source.append("set-cookie", HeaderValue::from_static("b=2"));
+        source.insert("upgrade", HeaderValue::from_static("h2c"));
+
+        let mut target = HashMap::new();
+        collect_hyper_response_headers(&source, &mut target);
+
+        assert_eq!(
+            target.get("x-test").map(String::as_str),
+            Some("alpha, beta")
+        );
+        assert_eq!(
+            target.get("set-cookie").map(String::as_str),
+            Some("a=1\nb=2")
+        );
+        assert!(!target.contains_key("upgrade"));
     }
 }
