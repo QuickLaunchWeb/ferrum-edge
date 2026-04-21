@@ -144,7 +144,7 @@ pub fn extract_response_usage(json: &Value, provider: AiProvider) -> AiTokenUsag
 }
 
 #[cfg(test)]
-fn extract_response_texts<'a>(json: &'a Value) -> Vec<&'a str> {
+fn extract_response_texts(json: &Value) -> Vec<&str> {
     let mut texts = Vec::new();
 
     if let Some(choices) = json.get("choices").and_then(|value| value.as_array()) {
