@@ -71,10 +71,14 @@ impl ReqwestPoolManager {
         .pool_max_idle_per_host(config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
 
-        if proxy.backend_read_timeout_ms > 0 {
-            client_builder =
-                client_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
-        }
+        // NOTE: `backend_read_timeout_ms` is deliberately NOT applied here.
+        // The `reqwest::Client` is shared across all proxies whose pool key
+        // resolves to the same identity (same backend, TLS, DNS override).
+        // Baking a timeout into the shared client means the first proxy to
+        // create the client would dictate the timeout for every other proxy
+        // reusing it — cross-route policy leakage. Per-request timeouts are
+        // applied on the dispatch side via `RequestBuilder::timeout()` which
+        // takes precedence over any client-level timeout.
 
         if config.enable_http_keep_alive {
             client_builder =

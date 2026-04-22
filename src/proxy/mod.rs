@@ -6829,6 +6829,17 @@ async fn proxy_to_backend_retry(
 
     let mut req_builder = client.request(req_method, backend_url);
 
+    // Per-request timeout override. The shared `reqwest::Client` intentionally
+    // has no client-level timeout (see `connection_pool::create_client`) so
+    // two proxies with different timeouts sharing the same pool entry do not
+    // leak policy across routes. `0` means "disabled" — skip the override so
+    // reqwest's default (no timeout) applies.
+    if proxy.backend_read_timeout_ms > 0 {
+        req_builder = req_builder.timeout(std::time::Duration::from_millis(
+            proxy.backend_read_timeout_ms,
+        ));
+    }
+
     // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
     for (k, v) in headers {
         match k.as_str() {
@@ -7196,6 +7207,17 @@ async fn proxy_to_backend(
     };
 
     let mut req_builder = client.request(req_method, backend_url);
+
+    // Per-request timeout override. The shared `reqwest::Client` intentionally
+    // has no client-level timeout (see `connection_pool::create_client`) so
+    // two proxies with different timeouts sharing the same pool entry do not
+    // leak policy across routes. `0` means "disabled" — skip the override so
+    // reqwest's default (no timeout) applies.
+    if proxy.backend_read_timeout_ms > 0 {
+        req_builder = req_builder.timeout(std::time::Duration::from_millis(
+            proxy.backend_read_timeout_ms,
+        ));
+    }
 
     // Forward headers, stripping hop-by-hop headers per RFC 7230 Section 6.1
     for (k, v) in headers {
