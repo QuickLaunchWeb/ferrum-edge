@@ -621,15 +621,24 @@ where
     // `src/proxy/mod.rs::proxy_grpc_request_core` so gRPC backends behind
     // an H3 frontend see the same forwarding metadata (X-Forwarded-For,
     // -Proto, -Host, Via, Forwarded) as they would over H1/H2.
+    //
+    // Hot-path note: the HOST and X-FORWARDED-FOR lookups use the hyper
+    // pre-interned HeaderName constants when we know the key — but here
+    // the source is a `HashMap<String, String>` so we use `.get()` on the
+    // lowercase literal (single string compare, no alloc). Forwarding
+    // header *insertion* below uses the pre-interned constants to skip
+    // the name-parse on the hot path.
     let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
     let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
-    let mut hmap = HeaderMap::new();
+    // Pre-size the HeaderMap — each source entry produces at most one output
+    // and we add up to 5 forwarding headers; `HeaderMap::with_capacity`
+    // clamps to the power-of-two bucket count so extra slack is cheap.
+    let mut hmap = HeaderMap::with_capacity(proxy_headers.len() + 5);
     for (k, v) in proxy_headers {
-        let k_lower = k.as_str();
         // Skip the forwarding headers we re-synthesize below so a
         // client-sent value cannot override the gateway's canonical view.
         if matches!(
-            k_lower,
+            k.as_str(),
             "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "via" | "forwarded"
         ) {
             continue;
@@ -645,9 +654,9 @@ where
     if let Ok(val) = HeaderValue::from_str(&xff_val) {
         hmap.insert("x-forwarded-for", val);
     }
-    if let Ok(val) = HeaderValue::from_str("https") {
-        hmap.insert("x-forwarded-proto", val);
-    }
+    // `x-forwarded-proto=https` is identical across H3 requests (H3 is
+    // always TLS) — use `from_static` to skip the header-value parse.
+    hmap.insert("x-forwarded-proto", HeaderValue::from_static("https"));
     if let Some(host) = original_host_header
         && let Ok(val) = HeaderValue::from_str(host)
     {
@@ -656,12 +665,12 @@ where
     if let Some(ref via) = state.via_header_http3
         && let Ok(val) = HeaderValue::from_str(via)
     {
-        hmap.insert("via", val);
+        hmap.insert(hyper::header::VIA, val);
     }
     if state.add_forwarded_header {
         let fwd = crate::proxy::build_forwarded_value(client_ip, "https", original_host_header);
         if let Ok(val) = HeaderValue::from_str(&fwd) {
-            hmap.insert("forwarded", val);
+            hmap.insert(hyper::header::FORWARDED, val);
         }
     }
 
@@ -1105,13 +1114,18 @@ fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<Str
             continue;
         }
         if let Ok(val) = v.to_str() {
-            headers
-                .entry(name.to_string())
-                .and_modify(|existing| {
+            // `get_mut(name)` borrows the key as &str — no String alloc on
+            // the multi-value case. Only the insert branch allocates the
+            // owned key. Matches the H1/H2 path's pattern (see CLAUDE.md).
+            match headers.get_mut(name) {
+                Some(existing) => {
                     existing.push_str(if name == "set-cookie" { "\n" } else { ", " });
                     existing.push_str(val);
-                })
-                .or_insert_with(|| val.to_string());
+                }
+                None => {
+                    headers.insert(name.to_string(), val.to_string());
+                }
+            }
         }
     }
     headers
@@ -1170,11 +1184,18 @@ where
             // `collect_reqwest_response_headers` to avoid RFC-violating
             // comma folding. Newlines are invalid inside a single
             // HeaderValue, so split and emit each cookie as its own header
-            // line — mirrors the H1/H2 path in `src/proxy/mod.rs`.
-            if let Ok(name) = HeaderName::from_bytes(k.as_bytes()) {
+            // line — mirrors the H1/H2 path in `src/proxy/mod.rs`. Fast
+            // path: most responses have a single Set-Cookie, so skip the
+            // split when there's no embedded newline.
+            if !v.contains('\n') {
+                if let Ok(val) = HeaderValue::from_str(v) {
+                    // Pre-interned constant — zero parse, zero alloc.
+                    resp_builder = resp_builder.header(hyper::header::SET_COOKIE, val);
+                }
+            } else {
                 for cookie_val in v.split('\n') {
                     if let Ok(val) = HeaderValue::from_str(cookie_val) {
-                        resp_builder = resp_builder.header(name.clone(), val);
+                        resp_builder = resp_builder.header(hyper::header::SET_COOKIE, val);
                     }
                 }
             }

@@ -799,8 +799,6 @@ async fn handle_h3_request(
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"Method Not Allowed"}"#.as_bytes(),
             &headers,
-            crate::proxy::grpc_proxy::grpc_status::UNIMPLEMENTED,
-            "Method Not Allowed",
         )
         .await?;
         return Ok(());
@@ -851,8 +849,6 @@ async fn handle_h3_request(
                     http_status,
                     &reject.body,
                     &headers,
-                    h3_http_status_to_grpc_status(http_status),
-                    &reject_body_as_grpc_message(&reject.body, http_status),
                 )
                 .await?;
                 return Ok(());
@@ -885,16 +881,7 @@ async fn handle_h3_request(
         record_request(&state, status_code);
         apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers).await;
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED);
-        send_h3_reject_flavor_aware(
-            &mut stream,
-            http_flavor,
-            http_status,
-            &body,
-            &headers,
-            h3_http_status_to_grpc_status(http_status),
-            &reject_body_as_grpc_message(&body, http_status),
-        )
-        .await?;
+        send_h3_reject_flavor_aware(&mut stream, http_flavor, http_status, &body, &headers).await?;
         return Ok(());
     }
     plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
@@ -927,8 +914,6 @@ async fn handle_h3_request(
                             http_status,
                             &reject.body,
                             &headers,
-                            h3_http_status_to_grpc_status(http_status),
-                            &reject_body_as_grpc_message(&reject.body, http_status),
                         )
                         .await?;
                         return Ok(());
@@ -1019,8 +1004,6 @@ async fn handle_h3_request(
                         http_status,
                         &reject.body,
                         &headers,
-                        h3_http_status_to_grpc_status(http_status),
-                        &reject_body_as_grpc_message(&reject.body, http_status),
                     )
                     .await?;
                     return Ok(());
@@ -1059,8 +1042,6 @@ async fn handle_h3_request(
                         http_status,
                         &reject.body,
                         &headers,
-                        h3_http_status_to_grpc_status(http_status),
-                        &reject_body_as_grpc_message(&reject.body, http_status),
                     )
                     .await?;
                     return Ok(());
@@ -1144,8 +1125,6 @@ async fn handle_h3_request(
                 StatusCode::SERVICE_UNAVAILABLE,
                 br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
                 &rej_headers,
-                crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
-                "Service temporarily unavailable (circuit breaker open)",
             )
             .await?;
             return Ok(());
@@ -2838,28 +2817,40 @@ async fn send_h3_error_flavor_aware(
 /// plugin/auth/CB reject paths). For gRPC requests, headers supplied by the
 /// plugin are converted alongside the mandatory `grpc-status` /
 /// `grpc-message` signalling. Plain/WebSocket uses the standard JSON body.
+///
+/// gRPC status + message are derived INSIDE this helper (not at every call
+/// site) so Plain-flavor rejects — the overwhelming majority on an H3
+/// listener — never pay for the JSON body parse or the message String
+/// allocation. `reject_body_as_grpc_message` only runs when flavor is
+/// actually Grpc.
 async fn send_h3_reject_flavor_aware(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
     http_status: StatusCode,
     http_body: &[u8],
     headers: &HashMap<String, String>,
-    grpc_status: u32,
-    grpc_message: &str,
 ) -> Result<(), anyhow::Error> {
     if !matches!(flavor, HttpFlavor::Grpc) {
         return send_h3_reject_response(stream, http_status, http_body, headers).await;
     }
+
+    // gRPC flavor only — derive signalling now.
+    let grpc_status = h3_http_status_to_grpc_status(http_status);
+    let grpc_message = reject_body_as_grpc_message(http_body, http_status);
 
     // Build a trailers-only gRPC error that preserves any custom headers
     // the plugin attached (e.g., rate-limit metadata), while forcing the
     // gRPC signalling headers to match.
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "application/grpc");
+        .header(hyper::header::CONTENT_TYPE, "application/grpc");
     for (k, v) in headers {
-        let lower = k.to_ascii_lowercase();
-        if lower == "content-type" || lower == "grpc-status" || lower == "grpc-message" {
+        // `eq_ignore_ascii_case` avoids the `to_ascii_lowercase` String
+        // allocation that was previously executed per header.
+        if k.eq_ignore_ascii_case("content-type")
+            || k.eq_ignore_ascii_case("grpc-status")
+            || k.eq_ignore_ascii_case("grpc-message")
+        {
             continue;
         }
         if let (Ok(name), Ok(val)) = (
@@ -2871,7 +2862,7 @@ async fn send_h3_reject_flavor_aware(
     }
     let resp = builder
         .header("grpc-status", grpc_status.to_string())
-        .header("grpc-message", grpc_message)
+        .header("grpc-message", grpc_message.as_ref())
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
@@ -2881,40 +2872,54 @@ async fn send_h3_reject_flavor_aware(
 
 /// Extract a grpc-message string from a plugin/auth reject body, which is
 /// typically JSON (`{"error":"..."}`). Falls back to a status-derived
-/// default when the body isn't parseable JSON. `\r` / `\n` characters are
-/// stripped since they are illegal inside a single HeaderValue.
-fn reject_body_as_grpc_message(body: &[u8], status: StatusCode) -> String {
-    // Try the common shapes first: {"error":"..."}, {"message":"..."}, then
-    // fall back to body-as-utf8 (if reasonable), then the canonical status
-    // reason. Mirrors `proxy/mod.rs::extract_grpc_reject_message` behavior
-    // at a high level but is intentionally inlined — the H3 listener is
-    // latency-sensitive and this is a rejection path.
+/// default when the body isn't parseable JSON.
+///
+/// Returns `Cow<str>` so the common case (canonical status reason, or body
+/// already free of `\r`/`\n`) avoids the String allocation entirely. Only
+/// bodies that contain control characters pay for the sanitized copy.
+/// Mirrors `proxy/mod.rs::extract_grpc_reject_message` behavior at a high
+/// level but is intentionally inlined — the H3 listener is latency-sensitive.
+fn reject_body_as_grpc_message(body: &[u8], status: StatusCode) -> std::borrow::Cow<'static, str> {
+    // Try common JSON shapes first.
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
         for key in ["grpc_message", "message", "error", "details"] {
             if let Some(msg) = value.get(key).and_then(|v| v.as_str()) {
                 let sanitized = sanitize_grpc_message(msg);
                 if !sanitized.is_empty() {
-                    return sanitized;
+                    return std::borrow::Cow::Owned(sanitized);
                 }
             }
         }
     }
+    // Fall back to raw body-as-utf8.
     if let Ok(text) = std::str::from_utf8(body)
         && !text.trim().is_empty()
     {
         let sanitized = sanitize_grpc_message(text);
         if !sanitized.is_empty() {
-            return sanitized;
+            return std::borrow::Cow::Owned(sanitized);
         }
     }
-    status
-        .canonical_reason()
-        .unwrap_or("Gateway rejected request")
-        .to_string()
+    // Final fallback — static canonical reason, zero alloc.
+    std::borrow::Cow::Borrowed(
+        status
+            .canonical_reason()
+            .unwrap_or("Gateway rejected request"),
+    )
 }
 
+/// Replace `\r` / `\n` with space (illegal inside a single HeaderValue) and
+/// trim. Returns an empty String when the input is empty-after-trim; the
+/// caller checks for that and falls back to the canonical reason.
+///
+/// Fast path: if the input has no control characters, returns a trimmed
+/// clone in a single pass instead of re-collecting char-by-char.
 fn sanitize_grpc_message(message: &str) -> String {
-    message
+    let trimmed = message.trim();
+    if !trimmed.contains(['\r', '\n']) {
+        return trimmed.to_string();
+    }
+    trimmed
         .chars()
         .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
         .collect::<String>()
