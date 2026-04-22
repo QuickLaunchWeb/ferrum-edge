@@ -518,13 +518,16 @@ pub struct EnvConfig {
     /// poll" footguns. Legal range: [50, 100_000].
     pub http3_flush_interval_micros: u64,
     /// Bounded mpsc channel capacity for the H3→HTTP/HTTPS cross-protocol
-    /// request-body bridge (default: 8). The bridge pushes H3 `recv_data`
+    /// request-body bridge (default: 32). The bridge pushes H3 `recv_data`
     /// chunks into the channel; `reqwest::Body::wrap_stream` drains the
     /// receiver and feeds the backend TCP socket. This bounds in-flight
     /// request body memory to approximately `capacity × average_chunk_size`
-    /// during a streaming cross-protocol upload. Increase for bursty
-    /// uploads where the backend drains faster than the client produces;
-    /// decrease to reduce per-request memory overhead. Legal range: [1, 1024].
+    /// during a streaming cross-protocol upload (default ~32 × 16 KiB ≈
+    /// 512 KiB per upload — enough pipeline depth to absorb backend jitter
+    /// without starving throughput, while keeping 1 K concurrent uploads
+    /// under ~500 MiB). Increase for high-bandwidth uploads where the
+    /// client produces faster than the backend drains; decrease on
+    /// memory-constrained hosts. Legal range: [1, 1024].
     pub http3_request_body_channel_capacity: usize,
     /// Initial QUIC path MTU in bytes used to build `TransportConfig`
     /// (default: 1500). quinn's baseline of 1200 forces ~9 packets for a
@@ -1024,7 +1027,7 @@ impl Default for EnvConfig {
             http3_coalesce_min_bytes: 32_768,
             http3_coalesce_max_bytes: 32_768,
             http3_flush_interval_micros: 200,
-            http3_request_body_channel_capacity: 8,
+            http3_request_body_channel_capacity: 32,
             http3_initial_mtu: 1500,
             grpc_pool_ready_wait_ms: 1,
             pool_warmup_enabled: true,
@@ -1276,7 +1279,7 @@ impl EnvConfig {
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
             http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
-            http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 8usize, clamp(1usize, 1024usize);
+            http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 32usize, clamp(1usize, 1024usize);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
