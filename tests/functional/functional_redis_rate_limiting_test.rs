@@ -413,7 +413,7 @@ async fn setup_proxy_with_plugins(
     proxy_id: &str,
     listen_path: &str,
     backend_port: u16,
-    backend_protocol: &str,
+    backend_scheme: &str,
     plugins: Vec<serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     harness
@@ -422,7 +422,7 @@ async fn setup_proxy_with_plugins(
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": backend_protocol,
+                "backend_scheme": backend_scheme,
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,
@@ -443,7 +443,7 @@ async fn setup_proxy_with_plugins(
             &json!({
                 "id": proxy_id,
                 "listen_path": listen_path,
-                "backend_protocol": backend_protocol,
+                "backend_scheme": backend_scheme,
                 "backend_host": "localhost",
                 "backend_port": backend_port,
                 "strip_listen_path": true,

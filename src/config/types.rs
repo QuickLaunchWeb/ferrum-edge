@@ -2188,6 +2188,12 @@ fn validate_status_codes(field_name: &str, codes: &[u16]) -> Result<(), String> 
 
 impl Proxy {
     /// Normalize proxy fields to their canonical in-memory form.
+    ///
+    /// Also populates `dispatch_kind` from `backend_scheme` +
+    /// `backend_prefer_h3` so per-proxy call sites (admin CRUD validation,
+    /// incremental config apply, single-row DB reads) get a correct
+    /// dispatch classification without depending on the
+    /// `GatewayConfig::resolve_dispatch_kind` batch pass.
     pub fn normalize_fields(&mut self) {
         for host in &mut self.hosts {
             *host = host.to_lowercase();
@@ -2196,6 +2202,21 @@ impl Proxy {
         // downstream consumers (DNS cache, connection pool keys) never create
         // duplicate entries for mixed-case variants of the same hostname.
         self.backend_host = self.backend_host.to_ascii_lowercase();
+
+        // Populate the pre-computed dispatch classification. One Copy enum
+        // + one bool in → one Copy enum out; no allocation. `effective_scheme`
+        // applies the HTTP-family default so an HTTP proxy POSTed without
+        // an explicit `backend_scheme` still validates against an Https
+        // dispatch kind (secure default).
+        let scheme = self.effective_scheme();
+        self.dispatch_kind = DispatchKind::from((scheme, self.backend_prefer_h3));
+        // Canonicalize the stored field for HTTP-family proxies so logging,
+        // pool keys, and incremental serialization read a concrete scheme.
+        // Stream proxies without an explicit scheme are deliberately left
+        // as `None` so validation can emit a clear "missing scheme" error.
+        if self.backend_scheme.is_none() && !self.dispatch_kind.is_stream() {
+            self.backend_scheme = Some(scheme);
+        }
     }
 
     /// Human-readable scheme for error messages. Returns `"<unset>"` before

@@ -59,7 +59,7 @@ fn test_websocket_auth_configuration() {
     proxies:
       - id: "secure-websocket"
         listen_path: "/ws"
-        backend_protocol: "wss"  # Secure WebSocket
+        backend_scheme: "https"  # TLS — WebSocket is detected per-request via Upgrade header
         backend_host: "secure-backend.example.com"
         backend_port: 443
         auth_mode: "single"  # Require authentication
@@ -89,12 +89,15 @@ fn test_websocket_auth_configuration() {
     assert!(expected_config.contains("access_control"));
     assert!(expected_config.contains("ip_restriction"));
     assert!(expected_config.contains("rate_limiting"));
-    assert!(expected_config.contains("wss")); // Secure WebSocket
+    // Post-refactor, WebSocket is detected per-request via Upgrade header; the
+    // secure variant is driven by `backend_scheme: https` + an incoming
+    // `wss://` URL, not a separate scheme value.
+    assert!(expected_config.contains("https")); // TLS-secured transport
 
     println!("✅ WebSocket security configuration validated:");
     println!("   - Authentication required (key_auth)");
     println!("   - Authorization enforced (access_control)");
     println!("   - Client IP restriction enforced (ip_restriction)");
     println!("   - Rate limiting applied");
-    println!("   - Secure WebSocket protocol (wss)");
+    println!("   - TLS transport (https backend_scheme)");
 }
