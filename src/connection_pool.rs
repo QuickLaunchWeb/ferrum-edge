@@ -66,6 +66,19 @@ impl ReqwestPoolManager {
         .build_reqwest()
         .map_err(|e| anyhow::anyhow!("Failed to build reqwest backend TLS config: {}", e))?
         .dns_resolver(dns_resolver)
+        // KNOWN LIMITATION: `connect_timeout` is a client-level setting in
+        // reqwest with no per-request override. When two proxies share a
+        // pool entry (same backend + TLS + DNS override), the first proxy
+        // to populate the client dictates the connect timeout for every
+        // proxy reusing it. Fragmenting the pool by connect timeout would
+        // violate the "policy fields must not fragment the pool key" rule
+        // (see `docs/connection_pool.md` / CLAUDE.md) and doubles client
+        // count in heterogeneous configs. Operators who need per-proxy
+        // connect timeouts should make the pool key unique (e.g., set a
+        // distinct `dns_override`). Upstream fix would be the per-request
+        // connect timeout API being discussed in seanmonstar/reqwest#3017
+        // — once that lands we can move this to dispatch time like we do
+        // for the request timeout below.
         .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
         .tcp_nodelay(true)
         .pool_max_idle_per_host(config.max_idle_per_host)

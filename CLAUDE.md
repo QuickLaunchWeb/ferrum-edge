@@ -839,6 +839,8 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 - **Empty/default values are free** — most proxies won't set per-proxy mTLS or dns_override, so these fields are empty strings and all proxies sharing a backend still share one pool entry.
 - **Keep the `|` delimiter** — do not switch to `:` or any character that can appear in hostnames, IPv6 addresses, or file paths.
 
+**Policy fields and cross-proxy sharing:** Because the pool key excludes policy fields, two proxies resolving to the same pool entry share policy values baked into the underlying client — whichever proxy populates the entry first wins. For `backend_read_timeout_ms` this is not observable because the timeout is applied per-request via `RequestBuilder::timeout()` (see `connection_pool::create_client` — the client-level `.timeout()` is intentionally omitted). For `backend_connect_timeout_ms`, reqwest does not expose a per-request override, so the first-wins behaviour is observable: the connect timeout of the first proxy to populate the entry applies to every sibling proxy reusing it. Impact is bounded to new-connection paths (initial fill, pool eviction, scaling). Operators who need per-proxy connect timeouts should make the pool key unique — e.g., set a distinct `dns_override` — which forces a separate client. Upstream fix is tracked in [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017); once that lands we can move connect timeout to dispatch time too.
+
 ### Health Check Architecture
 
 Health checking uses a **two-layer design** to prevent cross-proxy contamination while keeping shared state where appropriate:
