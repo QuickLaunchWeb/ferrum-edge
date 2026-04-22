@@ -21,6 +21,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Buf;
 use http::Request;
+use http_body_util::BodyExt as _;
+use hyper::body::Incoming;
 use quinn::crypto::rustls::QuicClientConfig;
 use tracing::debug;
 
@@ -901,6 +903,91 @@ impl Http3ConnectionPool {
         })
     }
 
+    /// Execute an HTTP/3 request, streaming the request body from a hyper
+    /// `Incoming` body directly to the backend without collecting into `Vec<u8>`.
+    ///
+    /// Used by the H1/H2 frontend -> H3 backend path when no request-body
+    /// plugins need buffering and no retries can replay the body.
+    #[allow(clippy::too_many_arguments)]
+    async fn do_request_streaming_incoming_body(
+        send_request: &mut H3SendRequest,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        mut frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let uri: http::Uri = backend_url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+
+        let _host = uri.host().unwrap_or(&proxy.backend_host);
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        let req_method: http::Method = method
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+
+        let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
+        for (name, value) in headers {
+            match name.as_str() {
+                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                _ => {
+                    req_builder = req_builder.header(name, value);
+                }
+            }
+        }
+
+        let req = req_builder.body(())?;
+        let mut backend_stream = send_request.send_request(req).await?;
+
+        let mut total_sent: usize = 0;
+        while let Some(frame_result) = frontend_body.frame().await {
+            let frame = frame_result.map_err(|e| {
+                anyhow::anyhow!("Client disconnected while sending request body: {}", e)
+            })?;
+            let Ok(mut chunk) = frame.into_data() else {
+                continue;
+            };
+            let len = chunk.remaining();
+            if max_request_body_size > 0 {
+                total_sent += len;
+                if total_sent > max_request_body_size {
+                    return Err(anyhow::anyhow!("Request body exceeds maximum size"));
+                }
+            }
+            if len == 0 {
+                continue;
+            }
+            bytes_seen.fetch_add(len as u64, Ordering::Release);
+            backend_stream.send_data(chunk.copy_to_bytes(len)).await?;
+        }
+        backend_stream.finish().await?;
+
+        let response = backend_stream.recv_response().await?;
+        let status = response.status().as_u16();
+
+        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        for (name, value) in response.headers() {
+            match name.as_str() {
+                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+                | "trailer" | "transfer-encoding" | "upgrade" => continue,
+                _ => {}
+            }
+            if let Ok(value_str) = value.to_str() {
+                response_headers.insert(name.as_str().to_string(), value_str.to_string());
+            }
+        }
+
+        Ok(H3StreamingResponse {
+            status,
+            headers: response_headers,
+            recv_stream: backend_stream,
+        })
+    }
+
     /// Send an HTTP/3 request with a streaming request body from the frontend,
     /// returning headers and a stream handle for the response body.
     ///
@@ -979,6 +1066,76 @@ impl Http3ConnectionPool {
         .await
     }
 
+    /// Send an HTTP/3 request with a streaming request body sourced from a
+    /// hyper `Incoming` body, returning headers and a stream handle for the
+    /// response body.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_streaming_incoming_body(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key(proxy, start);
+        let mut frontend_body = Some(frontend_body);
+
+        if let Some(mut sr) = self.pool.cached(&key) {
+            match Self::do_request_streaming_incoming_body(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                frontend_body
+                    .take()
+                    .expect("frontend body should be available before first send"),
+                max_request_body_size,
+                Arc::clone(&bytes_seen),
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 streaming body from Incoming: cached connection failed, evicting: {}",
+                        e
+                    );
+                    self.pool.invalidate(&key);
+                    return Err(e);
+                }
+            }
+        }
+
+        let tls_config = tls_config_fn()?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let sr = self
+            .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
+            .await?;
+        let mut sr_for_request = sr.clone();
+
+        Self::do_request_streaming_incoming_body(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            frontend_body.expect("frontend body should not be consumed on cache miss"),
+            max_request_body_size,
+            bytes_seen,
+        )
+        .await
+    }
+
     /// Send an HTTP/3 request with a streaming request body to an explicit
     /// host/port target.
     #[allow(clippy::too_many_arguments)]
@@ -1043,6 +1200,77 @@ impl Http3ConnectionPool {
             headers,
             frontend_stream,
             max_request_body_size,
+        )
+        .await
+    }
+
+    /// Send an HTTP/3 request with a streaming `Incoming` request body to an
+    /// explicit host/port target.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_with_target_streaming_incoming_body(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_body: Incoming,
+        max_request_body_size: usize,
+        bytes_seen: Arc<AtomicU64>,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key_for_target(target_host, target_port, start);
+        let mut frontend_body = Some(frontend_body);
+
+        if let Some(mut sr) = self.pool.cached(&key) {
+            match Self::do_request_streaming_incoming_body(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                frontend_body
+                    .take()
+                    .expect("frontend body should be available before first send"),
+                max_request_body_size,
+                Arc::clone(&bytes_seen),
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 streaming body from Incoming: cached connection to {}:{} failed, evicting: {}",
+                        target_host, target_port, e
+                    );
+                    self.pool.invalidate(&key);
+                    return Err(e);
+                }
+            }
+        }
+
+        let tls_config = tls_config_fn()?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let sr = self
+            .create_or_get_target_sender(key, target_host, target_port, tls_config, h3_config)
+            .await?;
+        let mut sr_for_request = sr.clone();
+
+        Self::do_request_streaming_incoming_body(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            frontend_body.expect("frontend body should not be consumed on cache miss"),
+            max_request_body_size,
+            bytes_seen,
         )
         .await
     }

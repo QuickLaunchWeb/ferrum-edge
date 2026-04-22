@@ -11,12 +11,17 @@ use dashmap::DashMap;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
+
+thread_local! {
+    static HTTP2_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
+}
 
 // ALPN negotiation learning cache states. A single `AtomicU8` per pool key
 // records what the backend actually spoke after the first TLS handshake.
@@ -79,6 +84,13 @@ impl AlpnEntry {
     }
 }
 
+fn upsert_alpn_entry(cache: &DashMap<String, AlpnEntry>, pool_key: &str, decision: u8) {
+    cache
+        .entry(pool_key.to_owned())
+        .and_modify(|entry| entry.record(decision))
+        .or_insert_with(|| AlpnEntry::new(decision));
+}
+
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsConfig};
@@ -119,6 +131,15 @@ fn pool_key_owned(proxy: &Proxy) -> String {
     let mut buf = String::with_capacity(128);
     write_http2_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
     buf
+}
+
+fn with_http2_pool_key<R>(proxy: &Proxy, f: impl FnOnce(&str) -> R) -> R {
+    HTTP2_POOL_KEY_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        write_http2_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+        f(buf.as_str())
+    })
 }
 
 fn write_http2_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
@@ -179,9 +200,7 @@ impl Http2PoolManager {
             entry.record(decision);
             return;
         }
-        self.alpn_cache
-            .entry(pool_key.to_owned())
-            .or_insert_with(|| AlpnEntry::new(decision));
+        upsert_alpn_entry(&self.alpn_cache, pool_key, decision);
     }
 
     async fn create_connection(
@@ -494,13 +513,14 @@ impl Http2ConnectionPool {
     /// doesn't have to pay the "learn the hard way" cost for an h1.1-only
     /// backend.
     pub fn is_known_http1_backend(&self, proxy: &Proxy) -> bool {
-        let key = pool_key_owned(proxy);
         let manager = self.pool.manager();
         let ttl = manager.global_env_config.http2_alpn_negative_cache_ttl_secs;
-        manager
-            .alpn_cache
-            .get(&key)
-            .is_some_and(|entry| entry.effective_decision(ttl) == ALPN_IS_HTTP1)
+        with_http2_pool_key(proxy, |key| {
+            manager
+                .alpn_cache
+                .get(key)
+                .is_some_and(|entry| entry.effective_decision(ttl) == ALPN_IS_HTTP1)
+        })
     }
 
     pub fn pool_size(&self) -> usize {
@@ -1004,5 +1024,21 @@ impl Http2PoolError {
             // variant rather than surfacing the message to clients.
             Self::BackendSelectedHttp1 { .. } => "backend does not support http/2",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_alpn_entry_updates_existing_decision_on_slow_path() {
+        let cache = DashMap::new();
+        cache.insert("backend|443".to_string(), AlpnEntry::new(ALPN_IS_HTTP1));
+
+        upsert_alpn_entry(&cache, "backend|443", ALPN_IS_HTTP2);
+
+        let entry = cache.get("backend|443").expect("entry should exist");
+        assert_eq!(entry.effective_decision(u64::MAX), ALPN_IS_HTTP2);
     }
 }

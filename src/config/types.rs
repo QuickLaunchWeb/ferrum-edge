@@ -686,11 +686,10 @@ fn default_retry_on_connect_failure() -> bool {
 ///   by `listen_port`.
 ///
 /// `Tcps` follows the `http`/`https`, `ws`/`wss`, pattern (serde name `"tcps"`).
-/// Backward-compatibility aliases for the old 11-variant `BackendProtocol`
-/// enum are accepted on the serde boundary via `#[serde(alias = "...")]`
-/// for operators carrying over YAML/JSON files — values deserialize into the
-/// canonical 6-variant form at load time. Admin API payloads should use the
-/// canonical names.
+/// Only the canonical six scheme names are accepted on the serde boundary.
+/// Legacy `BackendProtocol` field names and variant spellings are not
+/// supported for file-mode compatibility; operators should migrate configs
+/// to `backend_scheme` before loading them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendScheme {

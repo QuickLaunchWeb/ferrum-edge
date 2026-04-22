@@ -86,7 +86,7 @@ Mirrors the H1/H2 proxy path's plugin-driven decision (see `ClientRequestBody::{
 
 - One task (inlined via `tokio::join!`) reads `RequestStream::recv_data()` and pushes `Bytes` chunks into the `Sender`.
 - The `Receiver` is wrapped via `stream::unfold` and handed to `Body::wrap_stream`; the Receiver owns its own state and satisfies the `'static` bound.
-- Channel capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 8). Memory is bounded by `capacity × average_h3_chunk_size`.
+- Channel capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). Memory is bounded by `capacity × average_h3_chunk_size`.
 - `max_request_body_size_bytes` is enforced inline — if exceeded, the reader pushes an `io::Error` onto the channel so reqwest aborts with a reset stream rather than forwarding a truncated body.
 - When the receiver is dropped (backend canceled or body fully read), the next `tx.send()` errors and the reader exits cleanly; no dangling task.
 
@@ -166,5 +166,5 @@ These are enforced separately from hyper's built-in validation because the H3 li
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target |
 | `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32,768` | Response coalesce buffer capacity |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval |
-| `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `8` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
+| `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |

@@ -24,7 +24,7 @@
 //!   `stream::unfold` and handed to `Body::wrap_stream` (the Receiver
 //!   owns its own state and is `'static`). Backpressure is provided by
 //!   the bounded channel (capacity sized to
-//!   `FERRUM_H3_REQUEST_BODY_CHANNEL_CAPACITY`, default 8). When the H3
+//!   `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY`, default 32). When the H3
 //!   recv half is drained OR the backend cancels, both sides unwind
 //!   cleanly without a dangling task. If the caller pre-buffered the
 //!   body (plugin phase already collected it), the buffered bytes are
@@ -114,6 +114,8 @@ pub struct CrossProtocolOutcome {
     pub response_status: u16,
     pub bytes_streamed: u64,
     pub request_bytes: u64,
+    pub backend_target_url: Option<String>,
+    pub backend_resolved_ip: Option<String>,
     pub body_completed: bool,
     pub client_disconnected: bool,
     pub connection_error: bool,
@@ -142,6 +144,108 @@ impl CoalesceConfig {
     }
 }
 
+fn record_cross_protocol_connection_start(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) {
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
+        state
+            .load_balancer_cache
+            .record_connection_start(upstream_id, target);
+    }
+}
+
+fn record_cross_protocol_retry_failure(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+) {
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
+        state
+            .load_balancer_cache
+            .record_connection_end(upstream_id, target);
+    }
+
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state
+            .circuit_breaker_cache
+            .get_or_create(&proxy.id, cb_target_key, cb_config);
+        cb.record_failure(response_status, connection_error);
+    }
+}
+
+fn select_next_cross_protocol_retry_target(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_hash_key: Option<&str>,
+    current_target: Option<&Arc<UpstreamTarget>>,
+    path: &str,
+    query_string: &str,
+) -> Option<(Arc<UpstreamTarget>, String, String)> {
+    let (Some(upstream_id), Some(prev_target), Some(hash_key)) =
+        (&proxy.upstream_id, current_target, lb_hash_key)
+    else {
+        return None;
+    };
+
+    let health_ctx = crate::load_balancer::HealthContext {
+        active_unhealthy: &state.health_checker.active_unhealthy_targets,
+        proxy_passive: state
+            .health_checker
+            .passive_health
+            .get(&proxy.id)
+            .map(|r| r.value().clone()),
+    };
+
+    let next = state.load_balancer_cache.select_next_target(
+        upstream_id,
+        hash_key,
+        prev_target,
+        Some(&health_ctx),
+    )?;
+
+    let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
+    let next_url = crate::proxy::build_backend_url_with_target(
+        proxy,
+        path,
+        query_string,
+        &next.host,
+        next.port,
+        strip_len,
+        next.path.as_deref(),
+    );
+    let next_cb_target_key = crate::circuit_breaker::target_key(&next.host, next.port);
+    Some((next, next_cb_target_key, next_url))
+}
+
+async fn resolve_cross_protocol_backend_ip(
+    state: &ProxyState,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Option<String> {
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str());
+    state
+        .dns_cache
+        .resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+fn strip_query_from_backend_url(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).to_string()
+}
+
 /// Entry point — routes the cross-protocol dispatch by flavor. Called from
 /// the H3 server when `proxy.dispatch_kind` is not `HttpsH3Preferred` OR
 /// the flavor is not Plain.
@@ -151,10 +255,11 @@ impl CoalesceConfig {
 /// `apply_request_body_plugins` + `on_final_request_body` on the
 /// prebuffered request body (transform + validate), `after_proxy` on the
 /// backend response headers (modify / reject), `inject_sticky_cookie`
-/// (sticky LB cookie), and `on_response_body` + `on_final_response_body`
-/// on the buffered gRPC response body. Without these, H3 clients on
-/// non-H3 backends would silently skip body validators, response
-/// transformers, sticky sessions, etc.
+/// (sticky LB cookie), and buffered-response hooks
+/// (`on_response_body` / `transform_response_body` /
+/// `on_final_response_body`) on plain and gRPC responses when buffering is
+/// active. Without these, H3 clients on non-H3 backends would silently skip
+/// body validators, response transformers, sticky sessions, etc.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<S>(
     state: &ProxyState,
@@ -162,7 +267,10 @@ pub async fn run<S>(
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
     proxy_headers: &HashMap<String, String>,
+    path: &str,
+    query_string: &str,
     backend_url: &str,
+    lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
     flavor: HttpFlavor,
@@ -176,6 +284,10 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     let backend_start = Instant::now();
+    let raw_prebuffered_body_bytes = prebuffered_body
+        .as_ref()
+        .map(|body| body.len() as u64)
+        .unwrap_or(0);
 
     // If an earlier plugin phase pre-buffered the request body, run the
     // post-before_proxy body-transform + body-validation hooks on it
@@ -200,7 +312,7 @@ where
                         flavor,
                         reject,
                         backend_start,
-                        transformed.len() as u64,
+                        raw_prebuffered_body_bytes,
                     )
                     .await;
                 }
@@ -217,10 +329,14 @@ where
                 stream,
                 method,
                 proxy_headers,
+                path,
+                query_string,
                 backend_url,
+                lb_hash_key,
                 upstream_target,
                 cb_target_key,
                 prebuffered_body,
+                raw_prebuffered_body_bytes,
                 client_ip,
                 backend_start,
                 ctx,
@@ -236,10 +352,14 @@ where
                 stream,
                 method,
                 proxy_headers,
+                path,
+                query_string,
                 backend_url,
+                lb_hash_key,
                 upstream_target,
                 cb_target_key,
                 prebuffered_body,
+                raw_prebuffered_body_bytes,
                 client_ip,
                 backend_start,
                 ctx,
@@ -270,16 +390,130 @@ where
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+fn build_plain_request_builder(
+    client: &reqwest::Client,
+    state: &ProxyState,
+    proxy: &Proxy,
+    req_method: reqwest::Method,
+    proxy_headers: &HashMap<String, String>,
+    backend_url: &str,
+    effective_host: &str,
+    client_ip: &str,
+) -> reqwest::RequestBuilder {
+    let mut req_builder = client.request(req_method, backend_url);
+
+    if proxy.backend_read_timeout_ms > 0 {
+        req_builder = req_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
+    }
+
+    let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
+    let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
+    for (k, v) in proxy_headers {
+        match k.as_str() {
+            "host" => {
+                if proxy.preserve_host_header {
+                    req_builder = req_builder.header("Host", v.as_str());
+                } else {
+                    req_builder = req_builder.header("Host", effective_host);
+                }
+            }
+            _ if should_skip_cross_protocol_backend_header(k.as_str()) => {}
+            _ => {
+                req_builder = req_builder.header(k, v);
+            }
+        }
+    }
+
+    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip);
+    req_builder = req_builder.header("X-Forwarded-For", xff_val);
+    req_builder = req_builder.header("X-Forwarded-Proto", "https");
+    if let Some(host) = original_host_header {
+        req_builder = req_builder.header("X-Forwarded-Host", host);
+    }
+    if let Some(ref via) = state.via_header_http3 {
+        req_builder = req_builder.header("Via", via.as_str());
+    }
+    if state.add_forwarded_header {
+        req_builder = req_builder.header(
+            "Forwarded",
+            crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
+        );
+    }
+
+    req_builder
+}
+
+fn reqwest_error_response_for_cross_protocol(
+    state: &ProxyState,
+    e: &reqwest::Error,
+    backend_resolved_ip: Option<String>,
+) -> crate::retry::BackendResponse {
+    let error_class = crate::retry::classify_reqwest_error(e);
+    if error_class == crate::retry::ErrorClass::PortExhaustion {
+        state.overload.record_port_exhaustion();
+    }
+    let error_body = if error_class == crate::retry::ErrorClass::DnsLookupError {
+        r#"{"error":"DNS resolution for backend failed"}"#
+    } else {
+        r#"{"error":"Backend unavailable"}"#
+    };
+    crate::retry::BackendResponse {
+        status_code: 502,
+        body: crate::retry::ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: e.is_connect() || e.is_timeout(),
+        backend_resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
+async fn collect_reqwest_response_body_with_limit(
+    mut response: reqwest::Response,
+    max_response_body_size_bytes: usize,
+) -> Result<Vec<u8>, (Vec<u8>, Option<ErrorClass>)> {
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if max_response_body_size_bytes > 0
+                    && body.len() + chunk.len() > max_response_body_size_bytes
+                {
+                    return Err((
+                        r#"{"error":"Backend response body exceeds maximum size"}"#
+                            .as_bytes()
+                            .to_vec(),
+                        Some(ErrorClass::ResponseBodyTooLarge),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(error) => {
+                warn!("cross-protocol H3→HTTP: failed to read buffered response body: {error}");
+                return Err((
+                    r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
+                    Some(crate::retry::classify_reqwest_error(&error)),
+                ));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_plain<S>(
     state: &ProxyState,
     proxy: &Proxy,
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
     proxy_headers: &HashMap<String, String>,
+    path: &str,
+    query_string: &str,
     backend_url: &str,
+    lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
     prebuffered_body: Option<Vec<u8>>,
+    raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     backend_start: Instant,
     ctx: &mut RequestContext,
@@ -305,14 +539,16 @@ where
                 true,
                 backend_start.elapsed(),
             );
-            return write_error(
+            let mut outcome = write_error(
                 stream,
                 StatusCode::BAD_GATEWAY,
                 r#"{"error":"Bad Gateway"}"#,
                 backend_start,
                 0,
             )
-            .await;
+            .await?;
+            outcome.connection_error = true;
+            return Ok(outcome);
         }
     };
 
@@ -330,107 +566,221 @@ where
         }
     };
 
-    let effective_host = upstream_target
-        .map(|t| t.host.as_str())
-        .unwrap_or(proxy.backend_host.as_str());
-
-    let mut req_builder = client.request(req_method, backend_url);
-
-    // Honor `backend_read_timeout_ms` so the H3 cross-protocol bridge
-    // obeys the same per-proxy timeout policy as the main H1/H2 path
-    // (src/proxy/mod.rs::proxy_to_backend_retry). `0` means "disabled" —
-    // skip the override so reqwest's default (no timeout) applies.
-    if proxy.backend_read_timeout_ms > 0 {
-        req_builder = req_builder.timeout(Duration::from_millis(proxy.backend_read_timeout_ms));
-    }
-
-    // Forward headers. Host is rewritten to the effective backend unless
-    // `preserve_host_header` is set — matches `proxy_to_backend_retry`'s
-    // policy. Hop-by-hop headers per RFC 9110 §7.6.1 are stripped. The
-    // standard forwarding headers (X-Forwarded-*, Via, Forwarded) are
-    // emitted after this loop so we can honor any existing XFF value
-    // the client sent while guaranteeing the gateway appends its own
-    // resolved client IP — identical to the H1/H2 path.
-    let original_host_header = proxy_headers.get("host").map(|s| s.as_str());
-    let original_xff = proxy_headers.get("x-forwarded-for").map(|s| s.as_str());
-    for (k, v) in proxy_headers {
-        match k.as_str() {
-            "host" => {
-                if proxy.preserve_host_header {
-                    req_builder = req_builder.header("Host", v.as_str());
-                } else {
-                    req_builder = req_builder.header("Host", effective_host);
-                }
-            }
-            // Skipped: hop-by-hop (RFC 9110 §7.6.1) and the forwarding
-            // headers we re-synthesize below so a client-sent value cannot
-            // override the gateway's canonical view.
-            "connection"
-            | "content-length"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "upgrade"
-            | "x-forwarded-for"
-            | "x-forwarded-proto"
-            | "x-forwarded-host"
-            | "via"
-            | "forwarded" => {}
-            _ => {
-                req_builder = req_builder.header(k, v);
-            }
-        }
-    }
-
-    // Standard forwarding header set — mirrors `proxy_to_backend_retry` in
-    // `src/proxy/mod.rs` so backends see identical forwarding metadata
-    // regardless of whether the client arrived via H1/H2 or H3. H3 clients
-    // always arrive over TLS so proto is always "https".
-    let xff_val = crate::proxy::build_xff_value(original_xff, client_ip);
-    req_builder = req_builder.header("X-Forwarded-For", xff_val);
-    req_builder = req_builder.header("X-Forwarded-Proto", "https");
-    if let Some(host) = original_host_header {
-        req_builder = req_builder.header("X-Forwarded-Host", host);
-    }
-    if let Some(ref via) = state.via_header_http3 {
-        req_builder = req_builder.header("Via", via.as_str());
-    }
-    if state.add_forwarded_header {
-        req_builder = req_builder.header(
-            "Forwarded",
-            crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
+    let mut current_target = upstream_target.cloned().map(Arc::new);
+    let mut current_cb_target_key = cb_target_key.map(str::to_owned);
+    let mut current_url = backend_url.to_string();
+    let retry_config = if crate::retry::has_effective_http_retries(proxy.retry.as_ref(), method) {
+        proxy.retry.as_ref()
+    } else {
+        None
+    };
+    let should_buffer_response = retry_config.is_some()
+        || !crate::proxy::should_stream_response_body(
+            proxy,
+            plugins,
+            ctx,
+            state
+                .plugin_cache
+                .requires_response_body_buffering(&proxy.id),
         );
-    }
 
-    // Request body dispatch — streams by default, buffers only when the
-    // caller pre-buffered (plugin phase already collected the body). This
-    // mirrors `ClientRequestBody::{Streaming, Buffered}` in the H1/H2 path
-    // (src/proxy/mod.rs:231).
-    let max_req_bytes = state.max_request_body_size_bytes;
-    let (send_result, request_bytes) = match prebuffered_body {
-        Some(buffered) => {
-            // Fast path — body is already in memory. One allocation passed
-            // to reqwest; no mpsc, no bridge.
-            let n = buffered.len() as u64;
-            let send_future = req_builder.body(buffered).send();
-            (send_future.await, n)
+    let (response, request_bytes) = match prebuffered_body {
+        Some(buffered_body) => {
+            let request_bytes = raw_prebuffered_body_bytes;
+            let mut attempt = 0u32;
+
+            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+
+            let response = loop {
+                let effective_host = current_target
+                    .as_deref()
+                    .map(|t| t.host.as_str())
+                    .unwrap_or(proxy.backend_host.as_str());
+                let send_result = build_plain_request_builder(
+                    &client,
+                    state,
+                    proxy,
+                    req_method.clone(),
+                    proxy_headers,
+                    &current_url,
+                    effective_host,
+                    client_ip,
+                )
+                .body(buffered_body.clone())
+                .send()
+                .await;
+
+                match send_result {
+                    Ok(response) => {
+                        let attempt_result = crate::retry::BackendResponse {
+                            status_code: response.status().as_u16(),
+                            body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: None,
+                            error_class: None,
+                        };
+                        if let Some(retry_config) = retry_config
+                            && crate::retry::should_retry(
+                                retry_config,
+                                method,
+                                &attempt_result,
+                                attempt,
+                            )
+                        {
+                            record_cross_protocol_retry_failure(
+                                state,
+                                proxy,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                attempt_result.status_code,
+                                false,
+                            );
+                            let delay = crate::retry::retry_delay(retry_config, attempt);
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            if let Some((next_target, next_cb_target_key, next_url)) =
+                                select_next_cross_protocol_retry_target(
+                                    state,
+                                    proxy,
+                                    lb_hash_key,
+                                    current_target.as_ref(),
+                                    path,
+                                    query_string,
+                                )
+                            {
+                                current_target = Some(next_target);
+                                current_cb_target_key = Some(next_cb_target_key);
+                                current_url = next_url;
+                            }
+                            warn!(
+                                proxy_id = %proxy.id,
+                                attempt = attempt,
+                                max_retries = retry_config.max_retries,
+                                connection_error = false,
+                                "Retrying cross-protocol H3→HTTP backend request"
+                            );
+                            record_cross_protocol_connection_start(
+                                state,
+                                proxy,
+                                current_target.as_deref(),
+                            );
+                            continue;
+                        }
+                        break response;
+                    }
+                    Err(e) => {
+                        let attempt_result =
+                            reqwest_error_response_for_cross_protocol(state, &e, None);
+                        warn!(
+                            proxy_id = %proxy.id,
+                            error = %e,
+                            class = ?attempt_result.error_class,
+                            "cross-protocol H3→HTTP: backend request failed"
+                        );
+                        if let Some(retry_config) = retry_config
+                            && crate::retry::should_retry(
+                                retry_config,
+                                method,
+                                &attempt_result,
+                                attempt,
+                            )
+                        {
+                            record_cross_protocol_retry_failure(
+                                state,
+                                proxy,
+                                current_target.as_deref(),
+                                current_cb_target_key.as_deref(),
+                                attempt_result.status_code,
+                                attempt_result.connection_error,
+                            );
+                            let delay = crate::retry::retry_delay(retry_config, attempt);
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            if let Some((next_target, next_cb_target_key, next_url)) =
+                                select_next_cross_protocol_retry_target(
+                                    state,
+                                    proxy,
+                                    lb_hash_key,
+                                    current_target.as_ref(),
+                                    path,
+                                    query_string,
+                                )
+                            {
+                                current_target = Some(next_target);
+                                current_cb_target_key = Some(next_cb_target_key);
+                                current_url = next_url;
+                            }
+                            warn!(
+                                proxy_id = %proxy.id,
+                                attempt = attempt,
+                                max_retries = retry_config.max_retries,
+                                connection_error = attempt_result.connection_error,
+                                "Retrying cross-protocol H3→HTTP backend request"
+                            );
+                            record_cross_protocol_connection_start(
+                                state,
+                                proxy,
+                                current_target.as_deref(),
+                            );
+                            continue;
+                        }
+
+                        let final_backend_resolved_ip = resolve_cross_protocol_backend_ip(
+                            state,
+                            proxy,
+                            current_target.as_deref(),
+                        )
+                        .await;
+                        record_backend_outcome(
+                            state,
+                            proxy,
+                            current_target.as_deref(),
+                            current_cb_target_key.as_deref(),
+                            attempt_result.status_code,
+                            attempt_result.connection_error,
+                            backend_start.elapsed(),
+                        );
+                        let mut outcome = write_error(
+                            stream,
+                            StatusCode::BAD_GATEWAY,
+                            r#"{"error":"Bad Gateway"}"#,
+                            backend_start,
+                            request_bytes,
+                        )
+                        .await?;
+                        outcome.backend_target_url =
+                            Some(strip_query_from_backend_url(&current_url));
+                        outcome.connection_error = attempt_result.connection_error;
+                        outcome.error_class = attempt_result.error_class;
+                        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                        return Ok(outcome);
+                    }
+                }
+            };
+            (response, request_bytes)
         }
         None => {
-            // Streaming path — wire the H3 recv half to reqwest via a
-            // bounded mpsc channel. Reader + send() are driven concurrently
-            // via `tokio::select!` (biased toward `send_future`) so the
-            // body flows end-to-end without any intermediate Vec<u8>, AND
-            // a backend that produces an early response (413, 401, etc.)
-            // short-circuits the reader instead of stranding it in
-            // `recv_data()` waiting for upload bytes the backend no longer
-            // wants. See module doc comment for design rationale.
+            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+
+            let effective_host = current_target
+                .as_deref()
+                .map(|t| t.host.as_str())
+                .unwrap_or(proxy.backend_host.as_str());
+            let req_builder = build_plain_request_builder(
+                &client,
+                state,
+                proxy,
+                req_method,
+                proxy_headers,
+                &current_url,
+                effective_host,
+                client_ip,
+            );
+
+            let max_req_bytes = state.max_request_body_size_bytes;
             let capacity = state.env_config.http3_request_body_channel_capacity;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(capacity);
-            // Receiver is 'static (owns its own state) — satisfies the
-            // `Body::wrap_stream` bound without capturing the &mut borrow.
             let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
                 rx.recv().await.map(|item| (item, rx))
             });
@@ -439,10 +789,6 @@ where
 
             let bytes_read = Arc::new(AtomicU64::new(0));
             let reader_bytes = Arc::clone(&bytes_read);
-            // Signals that the reader detected an oversized request body and
-            // aborted the bridge. Used after the select loop to emit 413
-            // rather than the generic 502 that a reqwest stream error
-            // would produce.
             let oversized = Arc::new(AtomicBool::new(false));
             let reader_oversized = Arc::clone(&oversized);
             let reader_future = async {
@@ -463,17 +809,11 @@ where
                             }
                             total += data.len();
                             reader_bytes.store(total as u64, Ordering::Relaxed);
-                            // Bytes::copy_from_slice is unavoidable here —
-                            // h3's `chunk.chunk()` returns &[u8] borrowed
-                            // from the Bytes holder it won't release to us.
                             if tx.send(Ok(Bytes::copy_from_slice(data))).await.is_err() {
-                                // Receiver dropped (backend closed body
-                                // stream early or send_future finished) —
-                                // stop reading.
                                 return;
                             }
                         }
-                        Ok(None) => return, // clean EOF; tx drops on exit
+                        Ok(None) => return,
                         Err(e) => {
                             let _ = tx
                                 .send(Err(std::io::Error::other(format!(
@@ -487,20 +827,6 @@ where
                 }
             };
 
-            // `select!` with `biased` polls `send_future` first on every
-            // wakeup. If the backend returns a final response before the
-            // client has finished uploading (e.g., auth reject, early
-            // validation 413), we break out of the loop and drop
-            // `reader_future` — its `tx` is dropped, which drops the mpsc
-            // receiver, which signals reqwest's body stream to end, which
-            // cleanly completes the request. No stranded task on
-            // `recv_data()`. If the reader completes first (normal
-            // upload), we continue polling `send_future` with the reader
-            // disabled via the `!reader_done` guard.
-            //
-            // The select loop is scoped in a block so both pinned futures
-            // (which borrow `stream`) are dropped before the oversized
-            // branch below needs `&mut stream` again for `write_error`.
             let send_result = {
                 tokio::pin!(send_future);
                 tokio::pin!(reader_future);
@@ -514,15 +840,12 @@ where
                 }
             };
             let request_bytes = bytes_read.load(Ordering::Relaxed);
-            // Oversized request body: emit 413 directly, skipping the
-            // generic backend-error branch below (which would surface the
-            // reqwest stream error as 502).
             if oversized.load(Ordering::Relaxed) {
                 record_backend_outcome(
                     state,
                     proxy,
-                    upstream_target,
-                    cb_target_key,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
                     413,
                     false,
                     backend_start.elapsed(),
@@ -536,45 +859,55 @@ where
                 )
                 .await;
             }
-            (send_result, request_bytes)
-        }
-    };
 
-    let response = match send_result {
-        Ok(r) => r,
-        Err(e) => {
-            let error_class = crate::retry::classify_reqwest_error(&e);
-            warn!(
-                proxy_id = %proxy.id,
-                error = %e,
-                class = ?error_class,
-                "cross-protocol H3→HTTP: backend request failed"
-            );
-            record_backend_outcome(
-                state,
-                proxy,
-                upstream_target,
-                cb_target_key,
-                502,
-                true,
-                backend_start.elapsed(),
-            );
-            let mut outcome = write_error(
-                stream,
-                StatusCode::BAD_GATEWAY,
-                r#"{"error":"Bad Gateway"}"#,
-                backend_start,
-                request_bytes,
-            )
-            .await?;
-            outcome.connection_error = true;
-            outcome.error_class = Some(error_class);
-            return Ok(outcome);
+            match send_result {
+                Ok(response) => (response, request_bytes),
+                Err(e) => {
+                    let final_backend_resolved_ip =
+                        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref())
+                            .await;
+                    let attempt_result = reqwest_error_response_for_cross_protocol(
+                        state,
+                        &e,
+                        final_backend_resolved_ip.clone(),
+                    );
+                    warn!(
+                        proxy_id = %proxy.id,
+                        error = %e,
+                        class = ?attempt_result.error_class,
+                        "cross-protocol H3→HTTP: backend request failed"
+                    );
+                    record_backend_outcome(
+                        state,
+                        proxy,
+                        current_target.as_deref(),
+                        current_cb_target_key.as_deref(),
+                        attempt_result.status_code,
+                        attempt_result.connection_error,
+                        backend_start.elapsed(),
+                    );
+                    let mut outcome = write_error(
+                        stream,
+                        StatusCode::BAD_GATEWAY,
+                        r#"{"error":"Bad Gateway"}"#,
+                        backend_start,
+                        request_bytes,
+                    )
+                    .await?;
+                    outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                    outcome.connection_error = attempt_result.connection_error;
+                    outcome.error_class = attempt_result.error_class;
+                    outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                    return Ok(outcome);
+                }
+            }
         }
     };
 
     let status = response.status().as_u16();
     let mut response_headers = collect_reqwest_response_headers(&response);
+    let final_backend_resolved_ip =
+        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
 
     // Content-Length fast-path limit (mirrors the H3 pool path).
     if state.max_response_body_size_bytes > 0
@@ -586,26 +919,29 @@ where
         record_backend_outcome(
             state,
             proxy,
-            upstream_target,
-            cb_target_key,
+            current_target.as_deref(),
+            current_cb_target_key.as_deref(),
             502,
             false,
             backend_start.elapsed(),
         );
-        return write_error(
+        let mut outcome = write_error(
             stream,
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Backend response body exceeds maximum size"}"#,
             backend_start,
             request_bytes,
         )
-        .await;
+        .await?;
+        outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        return Ok(outcome);
     }
 
     // Run `after_proxy` hooks so response-transformer, CORS, compression-
     // advertise, and other hooks that modify response headers see the
     // cross-protocol path. A rejection here cancels the backend response
-    // and writes the reject body instead — matches
+    // before we buffer or stream the body — matches
     // `run_after_proxy_hooks` semantics in `proxy/mod.rs`.
     if !plugins.is_empty()
         && let Some(reject) =
@@ -614,13 +950,13 @@ where
         record_backend_outcome(
             state,
             proxy,
-            upstream_target,
-            cb_target_key,
+            current_target.as_deref(),
+            current_cb_target_key.as_deref(),
             reject.status_code,
             false,
             backend_start.elapsed(),
         );
-        return write_reject_with_headers(
+        let mut outcome = write_reject_with_headers(
             stream,
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             &reject.body,
@@ -628,7 +964,10 @@ where
             backend_start,
             request_bytes,
         )
-        .await;
+        .await?;
+        outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+        outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        return Ok(outcome);
     }
 
     // Sticky session cookie injection — only runs if the LB selected a
@@ -636,10 +975,155 @@ where
     crate::http3::server::inject_sticky_cookie(
         state,
         proxy,
-        upstream_target,
+        current_target.as_deref(),
         sticky_cookie_needed,
         &mut response_headers,
     );
+
+    if should_buffer_response {
+        let mut response_status = status;
+        let mut response_body = match collect_reqwest_response_body_with_limit(
+            response,
+            state.max_response_body_size_bytes,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err((error_body, error_class)) => {
+                record_backend_outcome(
+                    state,
+                    proxy,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
+                    502,
+                    false,
+                    backend_start.elapsed(),
+                );
+                let empty_headers = HashMap::new();
+                let mut outcome = write_reject_with_headers(
+                    stream,
+                    StatusCode::BAD_GATEWAY,
+                    &error_body,
+                    &empty_headers,
+                    backend_start,
+                    request_bytes,
+                )
+                .await?;
+                outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                outcome.error_class = error_class;
+                return Ok(outcome);
+            }
+        };
+
+        if !plugins.is_empty() {
+            for plugin in plugins {
+                let result = plugin
+                    .on_response_body(ctx, response_status, &response_headers, &response_body)
+                    .await;
+                match result {
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let reject = crate::proxy::plugin_result_into_reject_parts(reject)
+                            .expect("reject result should convert to rejection parts");
+                        response_status = reject.status_code;
+                        response_headers.clear();
+                        response_headers
+                            .insert("content-type".to_string(), "application/json".to_string());
+                        for (k, v) in reject.headers {
+                            response_headers.insert(k, v);
+                        }
+                        response_body = reject.body;
+                        break;
+                    }
+                }
+            }
+
+            for plugin in plugins {
+                if let Some(transformed) = plugin
+                    .transform_response_body(
+                        &response_body,
+                        content_type_of(&response_headers),
+                        &response_headers,
+                    )
+                    .await
+                {
+                    response_headers
+                        .insert("content-length".to_string(), transformed.len().to_string());
+                    response_body = transformed;
+                }
+            }
+
+            for plugin in plugins {
+                let result = plugin
+                    .on_final_response_body(ctx, response_status, &response_headers, &response_body)
+                    .await;
+                match result {
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let reject = crate::proxy::plugin_result_into_reject_parts(reject)
+                            .expect("reject result should convert to rejection parts");
+                        response_status = reject.status_code;
+                        response_headers.clear();
+                        response_headers
+                            .insert("content-type".to_string(), "application/json".to_string());
+                        for (k, v) in reject.headers {
+                            response_headers.insert(k, v);
+                        }
+                        response_body = reject.body;
+                        break;
+                    }
+                }
+            }
+        }
+
+        send_response_headers(stream, response_status, &response_headers).await?;
+        let bytes_streamed = response_body.len() as u64;
+        let mut body_completed = true;
+        let mut client_disconnected = false;
+        if !response_body.is_empty()
+            && let Err(error) = stream.send_data(Bytes::from(response_body)).await
+        {
+            debug!("cross-protocol H3 buffered body send_data failed: {error}");
+            client_disconnected = true;
+            body_completed = false;
+        }
+        if body_completed && let Err(error) = stream.finish().await {
+            debug!("cross-protocol H3 buffered finish failed: {error}");
+            client_disconnected = true;
+            body_completed = false;
+        }
+
+        record_backend_outcome(
+            state,
+            proxy,
+            current_target.as_deref(),
+            current_cb_target_key.as_deref(),
+            response_status,
+            false,
+            backend_start.elapsed(),
+        );
+
+        return Ok(CrossProtocolOutcome {
+            response_status,
+            bytes_streamed,
+            request_bytes,
+            backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+            backend_resolved_ip: final_backend_resolved_ip.clone(),
+            body_completed,
+            client_disconnected,
+            connection_error: false,
+            error_class: None,
+            body_error_class: if body_completed {
+                None
+            } else {
+                Some(ErrorClass::ClientDisconnect)
+            },
+            backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
 
     // Send response headers, then stream the body with coalescing.
     send_response_headers(stream, status, &response_headers).await?;
@@ -652,8 +1136,8 @@ where
     record_backend_outcome(
         state,
         proxy,
-        upstream_target,
-        cb_target_key,
+        current_target.as_deref(),
+        current_cb_target_key.as_deref(),
         status,
         false,
         backend_start.elapsed(),
@@ -663,6 +1147,8 @@ where
         response_status: status,
         bytes_streamed,
         request_bytes,
+        backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+        backend_resolved_ip: final_backend_resolved_ip.clone(),
         body_completed,
         client_disconnected,
         connection_error: false,
@@ -683,10 +1169,14 @@ async fn dispatch_grpc<S>(
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
     proxy_headers: &HashMap<String, String>,
+    path: &str,
+    query_string: &str,
     backend_url: &str,
+    lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
     prebuffered_body: Option<Vec<u8>>,
+    raw_prebuffered_body_bytes: u64,
     client_ip: &str,
     backend_start: Instant,
     ctx: &mut RequestContext,
@@ -709,6 +1199,9 @@ where
             .await;
         }
     };
+    let mut current_target = upstream_target.cloned().map(Arc::new);
+    let mut current_cb_target_key = cb_target_key.map(str::to_owned);
+    let mut current_url = backend_url.to_string();
 
     // gRPC request body: the pool API takes `Bytes` for retry-safe framing
     // and trailer handling. Buffer the H3 recv half here (unary gRPC bodies
@@ -717,6 +1210,7 @@ where
     // future optimization). Size ceiling uses `max_grpc_recv_size_bytes`
     // (not `max_request_body_size_bytes`) so H3 gRPC matches the H1/H2 gRPC
     // limit — an `https` proxy serves any client HTTP version uniformly.
+    let body_was_prebuffered = prebuffered_body.is_some();
     let body = if let Some(buffered) = prebuffered_body {
         buffered
     } else {
@@ -749,12 +1243,18 @@ where
             }
         }
     };
-    let request_bytes = body.len() as u64;
+    let request_bytes = if body_was_prebuffered {
+        raw_prebuffered_body_bytes
+    } else {
+        body.len() as u64
+    };
 
     // Build the backend-facing header map. Mirrors the H1/H2 gRPC path in
     // `src/proxy/mod.rs::proxy_grpc_request_core` so gRPC backends behind
     // an H3 frontend see the same forwarding metadata (X-Forwarded-For,
-    // -Proto, -Host, Via, Forwarded) as they would over H1/H2.
+    // -Proto, -Host, Via, Forwarded) as they would over H1/H2. Hop-by-hop
+    // headers (RFC 9110 §7.6.1) plus client-supplied forwarding headers
+    // are stripped before we re-synthesize the canonical forwarding set.
     //
     // Hot-path note: the HOST and X-FORWARDED-FOR lookups use the hyper
     // pre-interned HeaderName constants when we know the key — but here
@@ -769,12 +1269,7 @@ where
     // clamps to the power-of-two bucket count so extra slack is cheap.
     let mut hmap = HeaderMap::with_capacity(proxy_headers.len() + 5);
     for (k, v) in proxy_headers {
-        // Skip the forwarding headers we re-synthesize below so a
-        // client-sent value cannot override the gateway's canonical view.
-        if matches!(
-            k.as_str(),
-            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "via" | "forwarded"
-        ) {
+        if should_skip_cross_protocol_backend_header(k.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(val)) = (
@@ -808,29 +1303,108 @@ where
         }
     }
 
-    // Stream the response when no retry is configured and no plugin needs
-    // the response body buffered. Retries force buffering because the retry
-    // layer must inspect status/body to decide; buffering plugins force
-    // buffering because they need the full body for validation/transform.
-    // Without this, server-streaming / bidi gRPC responses would accumulate
-    // fully in memory before the first byte flows to the H3 client.
-    let stream_grpc_response = proxy.retry.is_none()
-        && !state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id);
+    // Stream the response when the current request has no effective gRPC
+    // retries and no plugin (or explicit response_body_mode) needs the
+    // body buffered. Without this, server-streaming / bidi gRPC responses
+    // would accumulate fully in memory before the first byte flows to the
+    // H3 client.
+    let grpc_has_retry = crate::retry::can_retry_connection_failures(proxy.retry.as_ref());
+    let stream_grpc_response = !grpc_has_retry
+        && crate::proxy::should_stream_response_body(
+            proxy,
+            plugins,
+            ctx,
+            state
+                .plugin_cache
+                .requires_response_body_buffering(&proxy.id),
+        );
     let body_bytes = Bytes::from(body);
-    let result = proxy_grpc_request_from_bytes(
-        hyper_method,
-        hmap,
-        body_bytes,
+    record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+    let mut result = proxy_grpc_request_from_bytes(
+        hyper_method.clone(),
+        hmap.clone(),
+        body_bytes.clone(),
         proxy,
-        backend_url,
+        &current_url,
         &state.grpc_pool,
         &state.dns_cache,
         proxy_headers,
         stream_grpc_response,
     )
     .await;
+
+    if grpc_has_retry && let Some(retry_config) = &proxy.retry {
+        let mut attempt = 0u32;
+        loop {
+            let is_connection_error = match &result {
+                Err(grpc_proxy::GrpcProxyError::BackendUnavailable(_)) => true,
+                Err(grpc_proxy::GrpcProxyError::BackendTimeout(message))
+                    if message.contains("Connect timeout") =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if !is_connection_error
+                || !retry_config.retry_on_connect_failure
+                || attempt >= retry_config.max_retries
+            {
+                break;
+            }
+
+            record_cross_protocol_retry_failure(
+                state,
+                proxy,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                502,
+                true,
+            );
+
+            let delay = crate::retry::retry_delay(retry_config, attempt);
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+
+            if let Some((next_target, next_cb_target_key, next_url)) =
+                select_next_cross_protocol_retry_target(
+                    state,
+                    proxy,
+                    lb_hash_key,
+                    current_target.as_ref(),
+                    path,
+                    query_string,
+                )
+            {
+                current_target = Some(next_target);
+                current_cb_target_key = Some(next_cb_target_key);
+                current_url = next_url;
+            }
+
+            warn!(
+                proxy_id = %proxy.id,
+                attempt = attempt,
+                max_retries = retry_config.max_retries,
+                "Retrying cross-protocol H3→gRPC backend request"
+            );
+            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+
+            result = proxy_grpc_request_from_bytes(
+                hyper_method.clone(),
+                hmap.clone(),
+                body_bytes.clone(),
+                proxy,
+                &current_url,
+                &state.grpc_pool,
+                &state.dns_cache,
+                proxy_headers,
+                false,
+            )
+            .await;
+        }
+    }
+
+    let final_backend_resolved_ip =
+        resolve_cross_protocol_backend_ip(state, proxy, current_target.as_deref()).await;
 
     match result {
         Ok(GrpcResponseKind::Buffered(mut resp)) => {
@@ -851,13 +1425,13 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
-                    upstream_target,
-                    cb_target_key,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
                     reject.status_code,
                     false,
                     backend_start.elapsed(),
                 );
-                return write_reject_with_headers(
+                let mut outcome = write_reject_with_headers(
                     stream,
                     StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -866,12 +1440,15 @@ where
                     backend_start,
                     request_bytes,
                 )
-                .await;
+                .await?;
+                outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                return Ok(outcome);
             }
             crate::http3::server::inject_sticky_cookie(
                 state,
                 proxy,
-                upstream_target,
+                current_target.as_deref(),
                 sticky_cookie_needed,
                 &mut resp.headers,
             );
@@ -923,8 +1500,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                upstream_target,
-                cb_target_key,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
                 resp.status,
                 false,
                 backend_start.elapsed(),
@@ -933,6 +1510,8 @@ where
                 response_status: resp.status,
                 bytes_streamed: bytes_total,
                 request_bytes,
+                backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+                backend_resolved_ip: final_backend_resolved_ip.clone(),
                 body_completed,
                 client_disconnected,
                 connection_error: false,
@@ -964,13 +1543,13 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
-                    upstream_target,
-                    cb_target_key,
+                    current_target.as_deref(),
+                    current_cb_target_key.as_deref(),
                     reject.status_code,
                     false,
                     backend_start.elapsed(),
                 );
-                return write_reject_with_headers(
+                let mut outcome = write_reject_with_headers(
                     stream,
                     StatusCode::from_u16(reject.status_code)
                         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -979,12 +1558,15 @@ where
                     backend_start,
                     request_bytes,
                 )
-                .await;
+                .await?;
+                outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
+                outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                return Ok(outcome);
             }
             crate::http3::server::inject_sticky_cookie(
                 state,
                 proxy,
-                upstream_target,
+                current_target.as_deref(),
                 sticky_cookie_needed,
                 &mut streaming.headers,
             );
@@ -1010,8 +1592,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                upstream_target,
-                cb_target_key,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
                 streaming.status,
                 false,
                 backend_start.elapsed(),
@@ -1020,6 +1602,8 @@ where
                 response_status: streaming.status,
                 bytes_streamed,
                 request_bytes,
+                backend_target_url: Some(strip_query_from_backend_url(&current_url)),
+                backend_resolved_ip: final_backend_resolved_ip.clone(),
                 body_completed: final_body_completed,
                 client_disconnected: final_client_disconnected,
                 connection_error: false,
@@ -1062,8 +1646,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
-                upstream_target,
-                cb_target_key,
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
                 502,
                 true,
                 backend_start.elapsed(),
@@ -1076,8 +1660,10 @@ where
                 request_bytes,
             )
             .await?;
+            outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
             outcome.connection_error = true;
             outcome.error_class = Some(error_class);
+            outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
             Ok(outcome)
         }
     }
@@ -1312,8 +1898,10 @@ where
                 bytes_streamed += out_len;
             }
             // When trailers are present, the caller finishes the stream
-            // via `send_trailers`. When absent, finish here.
-            if trailers.is_none()
+            // via `send_trailers`. Empty trailers are equivalent to absent
+            // here: no trailers frame is needed, but the QUIC stream still
+            // must be closed with FIN.
+            if should_finish_h3_stream_without_trailers(trailers.as_ref())
                 && let Err(_e) = stream.finish().await
             {
                 client_disconnected = true;
@@ -1331,6 +1919,13 @@ where
         body_error_class,
         trailers,
     )
+}
+
+fn should_finish_h3_stream_without_trailers(trailers: Option<&HeaderMap>) -> bool {
+    match trailers {
+        None => true,
+        Some(trailers) => trailers.is_empty(),
+    }
 }
 
 fn classify_hyper_error(e: &hyper::Error) -> ErrorClass {
@@ -1493,6 +2088,8 @@ where
         response_status: status.as_u16(),
         bytes_streamed: len,
         request_bytes,
+        backend_target_url: None,
+        backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
         connection_error: false,
@@ -1546,6 +2143,8 @@ where
         response_status: status.as_u16(),
         bytes_streamed: len,
         request_bytes,
+        backend_target_url: None,
+        backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
         connection_error: false,
@@ -1576,14 +2175,11 @@ where
         // Map the HTTP status the plugin chose to a gRPC status. Reuse the
         // H3 listener's mapper for consistency.
         let grpc_status = crate::http3::server::h3_http_status_to_grpc_status(http_status);
-        let grpc_message = std::str::from_utf8(&parts.body)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| http_status.canonical_reason().unwrap_or("Request rejected"));
+        let grpc_message = reject_body_as_h3_grpc_message(&parts.body, http_status);
         write_grpc_error(
             stream,
             grpc_status,
-            grpc_message,
+            &grpc_message,
             backend_start,
             request_bytes,
         )
@@ -1607,6 +2203,40 @@ fn content_type_of(headers: &HashMap<String, String>) -> Option<&str> {
     headers.get("content-type").map(|s| s.as_str())
 }
 
+/// Extract a plugin reject body into a gRPC-safe header value for the H3
+/// error path. Reuses the shared H1/H2 JSON/body extraction logic, then
+/// strips bytes `HeaderValue::from_str` rejects on this response path.
+fn reject_body_as_h3_grpc_message(body: &[u8], status: StatusCode) -> String {
+    crate::proxy::extract_grpc_reject_message(body)
+        .map(|message| sanitize_h3_grpc_message_for_header(&message))
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| {
+            sanitize_h3_grpc_message_for_header(
+                status.canonical_reason().unwrap_or("Request rejected"),
+            )
+        })
+}
+
+/// Keep H3 `grpc-message` header values builder-safe by normalizing CR/LF
+/// to spaces and dropping NUL bytes before trim. `HeaderValue::from_str`
+/// accepts UTF-8 here, so we do not strip non-ASCII.
+fn sanitize_h3_grpc_message_for_header(message: &str) -> String {
+    let trimmed = message.trim();
+    if !trimmed.contains(['\0', '\r', '\n']) {
+        return trimmed.to_string();
+    }
+    trimmed
+        .chars()
+        .filter_map(|c| match c {
+            '\r' | '\n' => Some(' '),
+            '\0' => None,
+            _ => Some(c),
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Write a trailers-only gRPC error response (HTTP 200 + grpc-status +
 /// grpc-message as response headers, empty body). Used for
 /// gRPC-flavor bridge failures so the client receives a valid gRPC error
@@ -1621,11 +2251,15 @@ async fn write_grpc_error<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let resp = Response::builder()
+    let grpc_message = sanitize_h3_grpc_message_for_header(grpc_message);
+    let mut resp_builder = Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/grpc")
-        .header("grpc-status", grpc_status.to_string())
-        .header("grpc-message", grpc_message)
+        .header("grpc-status", grpc_status.to_string());
+    if !grpc_message.is_empty() {
+        resp_builder = resp_builder.header("grpc-message", grpc_message.as_str());
+    }
+    let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
     stream.send_response(resp).await?;
@@ -1634,6 +2268,8 @@ where
         response_status: 200,
         bytes_streamed: 0,
         request_bytes,
+        backend_target_url: None,
+        backend_resolved_ip: None,
         body_completed: true,
         client_disconnected: false,
         connection_error: false,
@@ -1657,5 +2293,102 @@ fn parse_reqwest_method(method: &str) -> Option<reqwest::Method> {
         "HEAD" => Some(reqwest::Method::HEAD),
         "OPTIONS" => Some(reqwest::Method::OPTIONS),
         other => reqwest::Method::from_bytes(other.as_bytes()).ok(),
+    }
+}
+
+/// Headers the H3 cross-protocol bridge must never forward to non-H3
+/// backends. This is the shared filter for both the plain and gRPC
+/// bridge paths so the two cannot drift.
+fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade"
+            | "x-forwarded-for"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+            | "via"
+            | "forwarded"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
+        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
+    };
+    use hyper::{HeaderMap, StatusCode};
+
+    #[test]
+    fn cross_protocol_backend_header_filter_strips_hop_by_hop_and_forwarding_headers() {
+        for name in [
+            "connection",
+            "content-length",
+            "transfer-encoding",
+            "keep-alive",
+            "te",
+            "trailer",
+            "proxy-authorization",
+            "proxy-connection",
+            "upgrade",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "via",
+            "forwarded",
+        ] {
+            assert!(
+                should_skip_cross_protocol_backend_header(name),
+                "{name} should be stripped"
+            );
+        }
+
+        for name in [
+            "content-type",
+            "grpc-timeout",
+            "grpc-encoding",
+            "user-agent",
+        ] {
+            assert!(
+                !should_skip_cross_protocol_backend_header(name),
+                "{name} should be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn h3_grpc_message_sanitizer_strips_invalid_header_bytes() {
+        assert_eq!(
+            sanitize_h3_grpc_message_for_header("  bad\r\n\0message  "),
+            "bad  message"
+        );
+    }
+
+    #[test]
+    fn h3_grpc_reject_body_message_is_header_safe() {
+        let body = br#"{"message":"bad\r\n\u0000message"}"#;
+        assert_eq!(
+            reject_body_as_h3_grpc_message(body, StatusCode::BAD_REQUEST),
+            "bad  message"
+        );
+    }
+
+    #[test]
+    fn empty_h3_trailers_finish_stream_like_absent_trailers() {
+        let empty = HeaderMap::new();
+        let mut non_empty = HeaderMap::new();
+        non_empty.insert("grpc-status", "0".parse().unwrap());
+
+        assert!(should_finish_h3_stream_without_trailers(None));
+        assert!(should_finish_h3_stream_without_trailers(Some(&empty)));
+        assert!(!should_finish_h3_stream_without_trailers(Some(&non_empty)));
     }
 }

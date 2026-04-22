@@ -169,7 +169,7 @@ These TLS policy settings apply uniformly to both inbound (frontend) and outboun
 | `FERRUM_HTTP3_COALESCE_MIN_BYTES` | No | `32768` | Response coalesce flush target (native H3 + cross-protocol bridge) |
 | `FERRUM_HTTP3_COALESCE_MAX_BYTES` | No | `32768` | Response coalesce buffer capacity and `min_bytes` clamp |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | No | `200` | Response coalesce time-based flush interval (µs) |
-| `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | No | `8` | Bounded mpsc capacity for the H3→non-H3 cross-protocol request-body bridge. Bounds in-flight request memory to approximately `capacity × average_h3_chunk_size` during streaming uploads. Range: 1–1024. |
+| `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | No | `32` | Bounded mpsc capacity for the H3→non-H3 cross-protocol request-body bridge. Bounds in-flight request memory to approximately `capacity × average_h3_chunk_size` during streaming uploads. Range: 1–1024. |
 | `FERRUM_HTTP3_INITIAL_MTU` | No | `1500` | Initial QUIC path MTU (clamped 1200–65527) |
 
 See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol bridge behavior, and WebSocket-over-H3 rationale.

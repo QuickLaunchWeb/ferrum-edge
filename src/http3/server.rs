@@ -1089,15 +1089,26 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Determine streaming vs buffered mode — same logic as HTTP/1.1 and gRPC paths.
-    // Stream by default; buffer only when plugins need to inspect/modify the body
-    // or when retries are configured (need to replay the request body).
-    let has_retry = proxy.retry.is_some();
-    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
-    let needs_response_buffering = has_retry
-        || state
+    // Determine streaming vs buffered mode — same logic as the H1/H2 paths.
+    // Stream by default; buffer when plugins / response_body_mode need body
+    // access or when the current request has effective retries (needs replay).
+    let has_retry = match http_flavor {
+        HttpFlavor::Plain => {
+            crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+        }
+        HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
+        HttpFlavor::WebSocket => false,
+    };
+    let should_stream_response = crate::proxy::should_stream_response_body(
+        &proxy,
+        &plugins,
+        &ctx,
+        state
             .plugin_cache
-            .requires_response_body_buffering(&proxy.id);
+            .requires_response_body_buffering(&proxy.id),
+    );
+    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
+    let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
@@ -1193,14 +1204,34 @@ async fn handle_h3_request(
     let use_native_h3_pool =
         proxy.dispatch_kind == DispatchKind::HttpsH3Preferred && http_flavor == HttpFlavor::Plain;
     if !use_native_h3_pool {
-        // Track connection for least-connections LB before dispatching.
-        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-            state
-                .load_balancer_cache
-                .record_connection_start(upstream_id, target);
-        }
-
-        let prebuffered = prebuffered_body_data.take();
+        let prebuffered = if needs_request_buffering {
+            let body_was_prebuffered = prebuffered_body_data.is_some();
+            let mut body_data = prebuffered_body_data.take().unwrap_or_default();
+            if !body_was_prebuffered {
+                while let Some(chunk) = stream.recv_data().await? {
+                    let bytes = chunk.chunk();
+                    if content_length_limit > 0
+                        && body_data.len() + bytes.len() > content_length_limit
+                    {
+                        record_request(&state, 413);
+                        send_h3_error_flavor_aware(
+                            &mut stream,
+                            http_flavor,
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                            crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                            "Request body exceeds maximum size",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    body_data.extend_from_slice(bytes);
+                }
+            }
+            Some(body_data)
+        } else {
+            prebuffered_body_data.take()
+        };
         // Pass the pre-resolved plugin list + mutable context so the
         // bridge can run the same after_proxy / on_final_request_body /
         // on_response_body / on_final_response_body / sticky-cookie
@@ -1214,7 +1245,10 @@ async fn handle_h3_request(
             &mut stream,
             &method,
             &proxy_headers,
+            &path,
+            &query_string,
             &backend_url,
+            lb_hash_key.as_deref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             http_flavor,
@@ -1249,8 +1283,14 @@ async fn handle_h3_request(
             request_path: path.clone(),
             matched_proxy_id: Some(proxy.id.clone()),
             matched_proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-            backend_resolved_ip: backend_resolved_ip.clone(),
+            backend_target_url: outcome
+                .backend_target_url
+                .clone()
+                .or_else(|| Some(strip_query_params(&backend_url).to_string())),
+            backend_resolved_ip: outcome
+                .backend_resolved_ip
+                .clone()
+                .or_else(|| backend_resolved_ip.clone()),
             response_status_code: outcome.response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
@@ -1273,12 +1313,6 @@ async fn handle_h3_request(
         };
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
-        // End connection tracking for least-connections LB.
-        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-            state
-                .load_balancer_cache
-                .record_connection_end(upstream_id, target);
-        }
         return Ok(());
     }
 

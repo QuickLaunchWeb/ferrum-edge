@@ -498,6 +498,34 @@ pub fn should_retry(
         .contains(&response.status_code)
 }
 
+/// Returns `true` when the retry config can replay connection-level failures.
+///
+/// A present but inert config (for example `max_retries = 0` or
+/// `retry_on_connect_failure = false`) should not force request buffering or
+/// disable streaming fast paths.
+pub fn can_retry_connection_failures(config: Option<&RetryConfig>) -> bool {
+    config.is_some_and(|config| config.max_retries > 0 && config.retry_on_connect_failure)
+}
+
+/// Returns `true` when the retry config can replay HTTP status-code failures
+/// for the current method.
+pub fn can_retry_http_statuses(config: Option<&RetryConfig>, method: &str) -> bool {
+    config.is_some_and(|config| {
+        config.max_retries > 0
+            && !config.retryable_status_codes.is_empty()
+            && config
+                .retryable_methods
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(method))
+    })
+}
+
+/// Returns `true` when the retry config can actually trigger retries for a
+/// plain HTTP-family request.
+pub fn has_effective_http_retries(config: Option<&RetryConfig>, method: &str) -> bool {
+    can_retry_connection_failures(config) || can_retry_http_statuses(config, method)
+}
+
 /// Calculate the delay before the next retry attempt.
 ///
 /// Exponential backoff includes decorrelated jitter to prevent thundering
@@ -529,5 +557,69 @@ pub fn retry_delay(config: &RetryConfig, attempt: u32) -> Duration {
             let jittered = (capped / 2).saturating_add(jitter_offset);
             Duration::from_millis(jittered.min(*max_ms))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        can_retry_connection_failures, can_retry_http_statuses, has_effective_http_retries,
+    };
+    use crate::config::types::RetryConfig;
+
+    #[test]
+    fn no_op_retry_config_does_not_enable_connection_retries() {
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+
+        assert!(!can_retry_connection_failures(Some(&retry)));
+
+        let retry = RetryConfig {
+            max_retries: 3,
+            retry_on_connect_failure: false,
+            ..RetryConfig::default()
+        };
+        assert!(!can_retry_connection_failures(Some(&retry)));
+    }
+
+    #[test]
+    fn http_status_retries_require_method_and_status_codes() {
+        let mut retry = RetryConfig {
+            max_retries: 3,
+            retry_on_connect_failure: false,
+            retryable_status_codes: vec![502, 503],
+            ..RetryConfig::default()
+        };
+
+        assert!(can_retry_http_statuses(Some(&retry), "GET"));
+        assert!(!can_retry_http_statuses(Some(&retry), "POST"));
+
+        retry.retryable_methods.push("POST".to_string());
+        assert!(can_retry_http_statuses(Some(&retry), "POST"));
+
+        retry.retryable_status_codes.clear();
+        assert!(!can_retry_http_statuses(Some(&retry), "GET"));
+    }
+
+    #[test]
+    fn effective_http_retries_ignore_inert_configs() {
+        let mut retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        assert!(!has_effective_http_retries(Some(&retry), "GET"));
+
+        retry = RetryConfig {
+            max_retries: 3,
+            retry_on_connect_failure: false,
+            retryable_status_codes: vec![],
+            ..RetryConfig::default()
+        };
+        assert!(!has_effective_http_retries(Some(&retry), "GET"));
+
+        retry.retryable_status_codes = vec![503];
+        assert!(has_effective_http_retries(Some(&retry), "GET"));
     }
 }
