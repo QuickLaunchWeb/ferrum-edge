@@ -1782,6 +1782,16 @@ where
             la.store(now, Ordering::Relaxed);
         }
         if let Some(wm) = write_watermark {
+            // Prime the watermark before entering the write loop — captures
+            // "we have `n` bytes ready to write as of `now`". Without this,
+            // the u64::MAX sentinel installed at session start would keep
+            // the watchdog comparison (`now - watermark`) saturating at 0
+            // forever when the first write is immediately stuck (stuck
+            // backend send buffer), and `backend_write_timeout` would never
+            // fire. Push-only safety is preserved because we only reach
+            // this point after a read actually succeeded — a silent c2b
+            // reader never primes the watermark.
+            wm.store(now, Ordering::Relaxed);
             // Chunked write: refresh watermark on each partial progress.
             let mut written = 0;
             while written < n {
@@ -1920,10 +1930,12 @@ where
     // Per-direction inactivity watermarks. Stored on the stack alongside the
     // futures they protect — zero heap allocation, zero pointer chase.
     // Read watermark starts at `now` — a silent backend is immediately stale.
-    // Write watermark starts at u64::MAX (sentinel) so the check is inert
-    // until the first write actually progresses. Without the sentinel, push-
-    // only traffic (backend→client, client silent) would falsely fire the
-    // write timeout because no c2b write ever refreshes the watermark.
+    // Write watermark starts at u64::MAX (sentinel) so the check stays inert
+    // while c2b has no data queued to send. `copy_one_direction` primes it
+    // with `now` the moment a read succeeds (before the write loop), so a
+    // stuck backend send buffer still fires the timeout. Without the sentinel,
+    // push-only traffic (backend→client, client silent) would falsely fire the
+    // write timeout because no c2b read/write ever refreshes the watermark.
     let b2c_read_wm_storage = AtomicU64::new(now);
     let c2b_write_wm_storage = AtomicU64::new(u64::MAX);
     let read_wm_active = backend_read_timeout.is_some_and(|d| !d.is_zero());
