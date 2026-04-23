@@ -310,6 +310,7 @@ where
                     return write_final_body_reject(
                         stream,
                         flavor,
+                        ctx,
                         reject,
                         backend_start,
                         raw_prebuffered_body_bytes,
@@ -935,6 +936,7 @@ where
         .await?;
         outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+        outcome.body_error_class = Some(ErrorClass::ResponseBodyTooLarge);
         return Ok(outcome);
     }
 
@@ -1422,25 +1424,28 @@ where
                 )
                 .await
             {
+                let mut outcome = write_final_body_reject(
+                    stream,
+                    HttpFlavor::Grpc,
+                    ctx,
+                    PluginResult::RejectBinary {
+                        status_code: reject.status_code,
+                        body: Bytes::from(reject.body),
+                        headers: reject.headers,
+                    },
+                    backend_start,
+                    request_bytes,
+                )
+                .await?;
                 record_backend_outcome(
                     state,
                     proxy,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    reject.status_code,
+                    outcome.response_status,
                     false,
                     backend_start.elapsed(),
                 );
-                let mut outcome = write_reject_with_headers(
-                    stream,
-                    StatusCode::from_u16(reject.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &reject.body,
-                    &reject.headers,
-                    backend_start,
-                    request_bytes,
-                )
-                .await?;
                 outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 return Ok(outcome);
@@ -1452,41 +1457,89 @@ where
                 sticky_cookie_needed,
                 &mut resp.headers,
             );
-            // Run on_response_body / on_final_response_body on the
-            // collected body (gRPC buffered responses are small — unary
-            // RPCs). Plugins can transform the body here (e.g., gRPC-Web
-            // framing, response_transformer).
-            let mut body = resp.body;
+            // Run the buffered response-body hook pipeline in the same
+            // order as the main gRPC proxy path so reject/transform
+            // semantics stay transport-independent.
+            let mut response_status = resp.status;
+            let mut response_headers = resp.headers;
+            let mut response_body = resp.body;
+            let mut response_trailers = resp.trailers;
             for plugin in plugins.iter() {
-                plugin
-                    .on_response_body(ctx, resp.status, &resp.headers, &body)
+                let result = plugin
+                    .on_response_body(ctx, response_status, &response_headers, &response_body)
                     .await;
-                if let Some(transformed) = plugin
-                    .transform_response_body(&body, content_type_of(&resp.headers), &resp.headers)
-                    .await
-                {
-                    body = transformed;
+                match result {
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        debug!(
+                            plugin = plugin.name(),
+                            "Plugin rejected buffered H3 gRPC response body"
+                        );
+                        apply_buffered_grpc_plugin_reject(
+                            ctx,
+                            reject,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                            &mut response_trailers,
+                        );
+                        break;
+                    }
                 }
             }
             for plugin in plugins.iter() {
-                plugin
-                    .on_final_response_body(ctx, resp.status, &resp.headers, &body)
+                if let Some(transformed) = plugin
+                    .transform_response_body(
+                        &response_body,
+                        content_type_of(&response_headers),
+                        &response_headers,
+                    )
+                    .await
+                {
+                    response_headers
+                        .insert("content-length".to_string(), transformed.len().to_string());
+                    response_body = transformed;
+                }
+            }
+            for plugin in plugins.iter() {
+                let result = plugin
+                    .on_final_response_body(ctx, response_status, &response_headers, &response_body)
                     .await;
+                match result {
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        debug!(
+                            plugin = plugin.name(),
+                            "Plugin rejected finalized buffered H3 gRPC response body"
+                        );
+                        apply_buffered_grpc_plugin_reject(
+                            ctx,
+                            reject,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                            &mut response_trailers,
+                        );
+                        break;
+                    }
+                }
             }
 
-            send_response_headers(stream, resp.status, &resp.headers).await?;
-            let bytes_total = body.len() as u64;
+            send_response_headers(stream, response_status, &response_headers).await?;
+            let bytes_total = response_body.len() as u64;
             let mut body_completed = true;
             let mut client_disconnected = false;
-            if !body.is_empty()
-                && let Err(e) = stream.send_data(Bytes::from(body)).await
+            if !response_body.is_empty()
+                && let Err(e) = stream.send_data(Bytes::from(response_body)).await
             {
                 debug!("cross-protocol H3 gRPC body send_data failed: {}", e);
                 client_disconnected = true;
                 body_completed = false;
             }
-            if body_completed && !resp.trailers.is_empty() {
-                let trailer_map = headers_to_header_map(&resp.trailers);
+            if body_completed && !response_trailers.is_empty() {
+                let trailer_map = headers_to_header_map(&response_trailers);
                 if let Err(e) = stream.send_trailers(trailer_map).await {
                     warn!("H3 gRPC send_trailers failed: {}", e);
                     client_disconnected = true;
@@ -1502,12 +1555,12 @@ where
                 proxy,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
-                resp.status,
+                response_status,
                 false,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
-                response_status: resp.status,
+                response_status,
                 bytes_streamed: bytes_total,
                 request_bytes,
                 backend_target_url: Some(strip_query_from_backend_url(&current_url)),
@@ -1540,25 +1593,28 @@ where
                 )
                 .await
             {
+                let mut outcome = write_final_body_reject(
+                    stream,
+                    HttpFlavor::Grpc,
+                    ctx,
+                    PluginResult::RejectBinary {
+                        status_code: reject.status_code,
+                        body: Bytes::from(reject.body),
+                        headers: reject.headers,
+                    },
+                    backend_start,
+                    request_bytes,
+                )
+                .await?;
                 record_backend_outcome(
                     state,
                     proxy,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    reject.status_code,
+                    outcome.response_status,
                     false,
                     backend_start.elapsed(),
                 );
-                let mut outcome = write_reject_with_headers(
-                    stream,
-                    StatusCode::from_u16(reject.status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &reject.body,
-                    &reject.headers,
-                    backend_start,
-                    request_bytes,
-                )
-                .await?;
                 outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
                 outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
                 return Ok(outcome);
@@ -1667,6 +1723,28 @@ where
             Ok(outcome)
         }
     }
+}
+
+fn apply_buffered_grpc_plugin_reject(
+    ctx: &mut RequestContext,
+    reject: PluginResult,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+    response_trailers: &mut HashMap<String, String>,
+) {
+    let reject = crate::proxy::plugin_result_into_reject_parts(reject)
+        .expect("reject result should convert to rejection parts");
+    let normalized = normalize_h3_grpc_reject(
+        StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+        &reject.body,
+        &reject.headers,
+    );
+    apply_h3_grpc_reject_metadata(ctx, &normalized);
+    *response_status = normalized.http_status.as_u16();
+    *response_headers = normalized.headers;
+    *response_body = normalized.body;
+    response_trailers.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -2161,6 +2239,7 @@ where
 async fn write_final_body_reject<S>(
     stream: &mut RequestStream<S, Bytes>,
     flavor: HttpFlavor,
+    ctx: &mut RequestContext,
     reject: PluginResult,
     backend_start: Instant,
     request_bytes: u64,
@@ -2172,18 +2251,9 @@ where
         .expect("reject result should convert to rejection parts");
     let http_status = StatusCode::from_u16(parts.status_code).unwrap_or(StatusCode::BAD_REQUEST);
     if matches!(flavor, HttpFlavor::Grpc) {
-        // Map the HTTP status the plugin chose to a gRPC status. Reuse the
-        // H3 listener's mapper for consistency.
-        let grpc_status = crate::http3::server::h3_http_status_to_grpc_status(http_status);
-        let grpc_message = reject_body_as_h3_grpc_message(&parts.body, http_status);
-        write_grpc_error(
-            stream,
-            grpc_status,
-            &grpc_message,
-            backend_start,
-            request_bytes,
-        )
-        .await
+        let normalized = normalize_h3_grpc_reject(http_status, &parts.body, &parts.headers);
+        apply_h3_grpc_reject_metadata(ctx, &normalized);
+        write_normalized_grpc_reject(stream, &normalized, backend_start, request_bytes).await
     } else {
         write_reject_with_headers(
             stream,
@@ -2197,6 +2267,79 @@ where
     }
 }
 
+fn normalize_h3_grpc_reject(
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> crate::proxy::NormalizedRejectResponse {
+    crate::proxy::normalize_reject_response(status, body, headers, true)
+}
+
+fn apply_h3_grpc_reject_metadata(
+    ctx: &mut RequestContext,
+    reject: &crate::proxy::NormalizedRejectResponse,
+) {
+    if let Some(grpc_status) = reject.grpc_status {
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            grpc_status,
+            reject.grpc_message.as_deref().unwrap_or(""),
+        );
+    }
+}
+
+async fn write_normalized_grpc_reject<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    reject: &crate::proxy::NormalizedRejectResponse,
+    backend_start: Instant,
+    request_bytes: u64,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
+    debug_assert!(
+        reject.body.is_empty(),
+        "normalized gRPC rejects should be trailers-only"
+    );
+    let mut resp_builder = Response::builder().status(reject.http_status);
+    for (key, value) in &reject.headers {
+        let sanitized_grpc_message;
+        let header_value = if key.eq_ignore_ascii_case("grpc-message") {
+            sanitized_grpc_message = sanitize_h3_grpc_message_for_header(value);
+            if sanitized_grpc_message.is_empty() {
+                continue;
+            }
+            sanitized_grpc_message.as_str()
+        } else {
+            value.as_str()
+        };
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(header_value),
+        ) {
+            resp_builder = resp_builder.header(name, val);
+        }
+    }
+    let resp = resp_builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
+    stream.send_response(resp).await?;
+    let _ = stream.finish().await;
+    Ok(CrossProtocolOutcome {
+        response_status: reject.http_status.as_u16(),
+        bytes_streamed: 0,
+        request_bytes,
+        backend_target_url: None,
+        backend_resolved_ip: None,
+        body_completed: true,
+        client_disconnected: false,
+        connection_error: false,
+        error_class: None,
+        body_error_class: None,
+        backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
 /// Borrow the `content-type` value for body-transform plugin dispatch
 /// without re-allocating.
 fn content_type_of(headers: &HashMap<String, String>) -> Option<&str> {
@@ -2204,8 +2347,9 @@ fn content_type_of(headers: &HashMap<String, String>) -> Option<&str> {
 }
 
 /// Extract a plugin reject body into a gRPC-safe header value for the H3
-/// error path. Reuses the shared H1/H2 JSON/body extraction logic, then
+/// test path. Reuses the shared H1/H2 JSON/body extraction logic, then
 /// strips bytes `HeaderValue::from_str` rejects on this response path.
+#[cfg(test)]
 fn reject_body_as_h3_grpc_message(body: &[u8], status: StatusCode) -> String {
     crate::proxy::extract_grpc_reject_message(body)
         .map(|message| sanitize_h3_grpc_message_for_header(&message))
@@ -2321,10 +2465,14 @@ fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
+        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata, normalize_h3_grpc_reject,
         reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
         should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
     };
+    use crate::plugins::{PluginResult, RequestContext};
     use hyper::{HeaderMap, StatusCode};
 
     #[test]
@@ -2390,5 +2538,123 @@ mod tests {
         assert!(should_finish_h3_stream_without_trailers(None));
         assert!(should_finish_h3_stream_without_trailers(Some(&empty)));
         assert!(!should_finish_h3_stream_without_trailers(Some(&non_empty)));
+    }
+
+    #[test]
+    fn buffered_grpc_plugin_reject_normalizes_and_clears_backend_trailers() {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/grpc.Service/Method".to_string(),
+        );
+        let mut response_status = 200;
+        let mut response_headers =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+        let mut response_body = b"backend-body".to_vec();
+        let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
+
+        apply_buffered_grpc_plugin_reject(
+            &mut ctx,
+            PluginResult::Reject {
+                status_code: 429,
+                body: r#"{"error":"Rate limit exceeded"}"#.to_string(),
+                headers: HashMap::from([("x-ratelimit-limit".to_string(), "5".to_string())]),
+            },
+            &mut response_status,
+            &mut response_headers,
+            &mut response_body,
+            &mut response_trailers,
+        );
+
+        assert_eq!(response_status, 200);
+        assert!(response_body.is_empty());
+        assert!(response_trailers.is_empty());
+        assert_eq!(
+            response_headers
+                .get("content-type")
+                .map(|value| value.as_str()),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            response_headers
+                .get("grpc-status")
+                .map(|value| value.as_str()),
+            Some("8")
+        );
+        assert_eq!(
+            response_headers
+                .get("grpc-message")
+                .map(|value| value.as_str()),
+            Some("Rate limit exceeded")
+        );
+        assert_eq!(
+            response_headers
+                .get("x-ratelimit-limit")
+                .map(|value| value.as_str()),
+            Some("5")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(|value| value.as_str()),
+            Some("8")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_message").map(|value| value.as_str()),
+            Some("Rate limit exceeded")
+        );
+    }
+
+    #[test]
+    fn h3_grpc_reject_normalization_preserves_custom_headers_and_metadata() {
+        let normalized = normalize_h3_grpc_reject(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":"Rate limit exceeded"}"#,
+            &HashMap::from([("x-ratelimit-limit".to_string(), "5".to_string())]),
+        );
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/grpc.Service/Method".to_string(),
+        );
+
+        apply_h3_grpc_reject_metadata(&mut ctx, &normalized);
+
+        assert_eq!(normalized.http_status, StatusCode::OK);
+        assert!(normalized.body.is_empty());
+        assert_eq!(
+            normalized
+                .headers
+                .get("content-type")
+                .map(|value| value.as_str()),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("grpc-status")
+                .map(|value| value.as_str()),
+            Some("8")
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("grpc-message")
+                .map(|value| value.as_str()),
+            Some("Rate limit exceeded")
+        );
+        assert_eq!(
+            normalized
+                .headers
+                .get("x-ratelimit-limit")
+                .map(|value| value.as_str()),
+            Some("5")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_status").map(|value| value.as_str()),
+            Some("8")
+        );
+        assert_eq!(
+            ctx.metadata.get("grpc_message").map(|value| value.as_str()),
+            Some("Rate limit exceeded")
+        );
     }
 }

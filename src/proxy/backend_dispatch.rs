@@ -24,7 +24,8 @@ use crate::proxy::ProxyState;
 /// Detect the HTTP flavor of an incoming request.
 ///
 /// Called from the hot path for every HTTP-family request. Cost:
-/// - Fast-fails on the WebSocket upgrade headers (4 header lookups, short-circuit).
+/// - Fast-fails on the WebSocket upgrade / Extended CONNECT signals
+///   (4 header lookups, short-circuit).
 /// - Falls through to a single content-type lookup + 16-byte ASCII prefix match.
 /// - Total: ~80–100ns on a non-WebSocket, non-gRPC POST; well below noise.
 ///
@@ -36,10 +37,10 @@ use crate::proxy::ProxyState;
 /// `Incoming` body, the H3 request shell, and unit tests that pass `()`.
 #[inline]
 pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
-    // Cheap WebSocket check runs first — an H2 Extended CONNECT with
+    // Cheap WebSocket check runs first — an Extended CONNECT with
     // `:protocol=websocket` carries no content-type, so the gRPC arm would
     // miss it.
-    if is_http2_websocket_connect(req) || is_http1_websocket_upgrade(req) {
+    if is_extended_connect_websocket(req) || is_http1_websocket_upgrade(req) {
         return HttpFlavor::WebSocket;
     }
 
@@ -53,13 +54,17 @@ pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
     HttpFlavor::Plain
 }
 
-/// HTTP/2 Extended CONNECT check (RFC 8441). Mirrors `is_h2_websocket_connect`
-/// in `proxy/mod.rs` but lives here so it can be called from both the H1/H2
-/// server loop and the H3 frontend.
+/// Extended CONNECT WebSocket check for HTTP/2 (RFC 8441) and HTTP/3
+/// (RFC 9220). Mirrors `is_h2_websocket_connect` in `proxy/mod.rs` but lives
+/// here so it can be called from both the H1/H2 server loop and the H3
+/// frontend.
 #[inline]
-fn is_http2_websocket_connect<B>(req: &Request<B>) -> bool {
+fn is_extended_connect_websocket<B>(req: &Request<B>) -> bool {
     req.method() == hyper::Method::CONNECT
-        && req.version() == hyper::Version::HTTP_2
+        && matches!(
+            req.version(),
+            hyper::Version::HTTP_2 | hyper::Version::HTTP_3
+        )
         && req
             .extensions()
             .get::<hyper::ext::Protocol>()

@@ -7187,13 +7187,22 @@ async fn proxy_to_backend(
         DispatchKind::HttpsPool | DispatchKind::HttpsH3Preferred
     ) {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
+        // Mirror the warmup path: the direct H2 pool must key and dial on the
+        // load-balanced target, not the proxy's template backend_host/port.
+        let direct_h2_target_proxy = upstream_target.map(|target| {
+            let mut target_proxy = proxy.clone();
+            target_proxy.backend_host = target.host.clone();
+            target_proxy.backend_port = target.port;
+            target_proxy
+        });
+        let direct_h2_proxy = direct_h2_target_proxy.as_ref().unwrap_or(proxy);
         if can_use_direct_http2_pool(
             pool_config.enable_http2,
             retain_request_body,
             requires_request_body_buffering,
-        ) && !state.http2_pool.is_known_http1_backend(proxy)
+        ) && !state.http2_pool.is_known_http1_backend(direct_h2_proxy)
         {
-            let direct_h2_sender = match state.http2_pool.get_sender(proxy).await {
+            let direct_h2_sender = match state.http2_pool.get_sender(direct_h2_proxy).await {
                 Ok(sender) => Some(sender),
                 Err(e) => {
                     if should_fallback_to_reqwest_after_http2_pool_error(&e) {
@@ -7239,7 +7248,7 @@ async fn proxy_to_backend(
                 return (
                     proxy_to_backend_http2(
                         state,
-                        proxy,
+                        direct_h2_proxy,
                         sender,
                         backend_url,
                         method,

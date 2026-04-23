@@ -119,7 +119,7 @@ Either way, `grpc-status` reaches the H3 client intact.
 
 ## WebSocket over HTTP/3 — not supported
 
-Requests that the H3 listener classifies as `WebSocket` (HTTP/1.1 `Upgrade: websocket` or HTTP/2 Extended CONNECT with `:protocol=websocket`) receive an explicit **501 Not Implemented** with a JSON body advising the operator to send the upgrade over HTTP/1.1 or HTTP/2.
+Requests that arrive on the H3 listener as RFC 9220 Extended CONNECT WebSocket handshakes (`CONNECT` with `:protocol=websocket`) receive an explicit **501 Not Implemented** with a JSON body advising the operator to send the upgrade over HTTP/1.1 or HTTP/2.
 
 ### Why
 

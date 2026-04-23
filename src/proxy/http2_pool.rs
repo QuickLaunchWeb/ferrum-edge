@@ -182,14 +182,17 @@ impl Http2PoolManager {
     /// backend that was upgraded to HTTP/2 gets re-probed at most once
     /// per TTL window per pool key.
     fn alpn_shortcut(&self, proxy: &Proxy) -> Result<(), Http2PoolError> {
-        let key = pool_key_owned(proxy);
         let ttl = self.global_env_config.http2_alpn_negative_cache_ttl_secs;
-        if let Some(entry) = self.alpn_cache.get(&key)
-            && entry.effective_decision(ttl) == ALPN_IS_HTTP1
-        {
-            return Err(Http2PoolError::BackendSelectedHttp1 { pool_key: key });
-        }
-        Ok(())
+        with_http2_pool_key(proxy, |key| {
+            if let Some(entry) = self.alpn_cache.get(key)
+                && entry.effective_decision(ttl) == ALPN_IS_HTTP1
+            {
+                return Err(Http2PoolError::BackendSelectedHttp1 {
+                    pool_key: key.to_owned(),
+                });
+            }
+            Ok(())
+        })
     }
 
     /// Record the ALPN decision observed on a completed handshake. Writes

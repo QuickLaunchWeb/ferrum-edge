@@ -599,13 +599,14 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Block CONNECT method — HTTP/3 has no CONNECT-based upgrade mechanism.
-    // Unlike HTTP/2 Extended CONNECT (RFC 8441) which allows WebSocket upgrades,
-    // HTTP/3 uses CONNECT-UDP (RFC 9298) and WebTransport (RFC 9220) which are
-    // separate protocols not supported by this proxy. Allowing CONNECT would
-    // enable TCP tunnel establishment that bypasses proxy routing controls.
-    if method == "CONNECT" {
-        warn!("Rejected HTTP/3 CONNECT request");
+    // Block non-WebSocket CONNECT requests. HTTP/3 Extended CONNECT for
+    // WebSocket (RFC 9220) is classified above as `HttpFlavor::WebSocket`
+    // and falls through to the shared unsupported-WebSocket path, which
+    // returns the documented 501 response. Other CONNECT-style protocols
+    // (for example CONNECT-UDP) are not supported by this proxy and must be
+    // rejected to prevent tunnel establishment that bypasses proxy routing.
+    if method == "CONNECT" && http_flavor != HttpFlavor::WebSocket {
+        warn!("Rejected non-WebSocket HTTP/3 CONNECT request");
         record_request(&state, 405);
         send_h3_error_flavor_aware(
             &mut stream,
