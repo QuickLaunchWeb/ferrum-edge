@@ -164,6 +164,15 @@ These TLS policy settings apply uniformly to both inbound (frontend) and outboun
 | `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `8388608` | HTTP/3 per-stream receive window in bytes (default: 8 MiB) |
 | `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `33554432` | HTTP/3 connection-level receive window in bytes (default: 32 MiB) |
 | `FERRUM_HTTP3_SEND_WINDOW` | No | `8388608` | HTTP/3 per-connection send window in bytes (default: 8 MiB) |
+| `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | No | `4` | QUIC connections per H3 backend (pool sharding) |
+| `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | No | `120` | H3 backend connection idle eviction in seconds |
+| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | No | `32768` | Response coalesce flush target (native H3 + cross-protocol bridge) |
+| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | No | `32768` | Response coalesce buffer capacity and `min_bytes` clamp |
+| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | No | `200` | Response coalesce time-based flush interval (µs) |
+| `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | No | `32` | Bounded mpsc capacity for the H3→non-H3 cross-protocol request-body bridge. Bounds in-flight request memory to approximately `capacity × average_h3_chunk_size` during streaming uploads. Range: 1–1024. |
+| `FERRUM_HTTP3_INITIAL_MTU` | No | `1500` | Initial QUIC path MTU (clamped 1200–65527) |
+
+See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol bridge behavior, and WebSocket-over-H3 rationale.
 
 ### Stream Proxy (TCP/UDP/DTLS)
 
@@ -279,7 +288,7 @@ proxies:
   - id: "my-api"
     name: "My Backend API"
     listen_path: "/api/v1"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "backend-service"
     backend_port: 3000
     strip_listen_path: true
@@ -325,14 +334,14 @@ proxies:
   # TCP proxy with TLS origination to backend
   - id: "postgres-proxy"
     listen_port: 5432
-    backend_protocol: tcp_tls
+    backend_scheme: tcps
     backend_host: "db.internal"
     backend_port: 5432
 
   # UDP proxy with DTLS encryption to backend
   - id: "iot-proxy"
     listen_port: 5684
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "iot-backend.internal"
     backend_port: 5684
     backend_tls_verify_server_cert: false
@@ -341,7 +350,7 @@ proxies:
   # Full DTLS e2e: DTLS client → gateway → DTLS backend
   - id: "secure-iot"
     listen_port: 5685
-    backend_protocol: dtls
+    backend_scheme: dtls
     backend_host: "secure-iot.internal"
     backend_port: 5684
     frontend_tls: true

@@ -133,6 +133,10 @@ Regex listen_paths (`~` prefix) auto-anchored full-path (`^...$`). For prefix-st
 
 Host-only HTTP proxy matches all paths under its hosts; `strip_listen_path: true` is a no-op there. `hosts: []` + `listen_path: None` is rejected. Uniqueness: two HTTP proxies conflict iff same `listen_path` + overlapping `hosts` (empty hosts = catch-all, overlaps all). Host-only and path-carrying on same host coexist (different match tiers). See `DatabaseBackend::check_listen_path_unique()` in `src/config/db_backend.rs`.
 
+**`backend_scheme` + runtime flavor**: HTTP-family proxies accept `http`/`https` and `backend_scheme` is optional (defaults to `https`). Stream-family (`tcp`/`tcps`/`udp`/`dtls`) requires an explicit scheme. gRPC and WebSocket are NOT schemes — they are runtime flavors classified per-request via `backend_dispatch::detect_http_flavor()` (one header lookup, zero allocation). A single `https` proxy serves Plain/gRPC/WebSocket traffic uniformly. `backend_prefer_h3: true` (only valid when effective scheme resolves to `https`) opts the proxy into the H3 backend pool with ALPN fallback to h2/h1.1.
+
+**HTTP/3 is decoupled from the backend.** An H3 client can hit any `https` backend; the gateway dispatches Plain/gRPC via reqwest / H2 pool just like H1/H2 clients do and only uses the H3 backend pool when `backend_prefer_h3: true`. WebSocket over H3 returns 501 (RFC 9220 not broadly supported). See [docs/http3.md](docs/http3.md) for the cross-protocol bridge, buffering policy, and rationale.
+
 ### Protocol-Level Request Validation
 
 `check_protocol_headers()` in `src/proxy/mod.rs` runs on every inbound request. Rejects (400 unless noted): HTTP/1.0+TE, **CL+TE conflict** (RFC 9112 §6.1 smuggling), multiple CL/mismatched, multiple Host, HTTP/2 TE not `"trailers"`, non-numeric Content-Length, TRACE (405 XST defense), non-WS CONNECT (405). Host trailing dot stripped pre-routing. gRPC non-POST → gRPC error trailers. Invalid Sec-WebSocket-Key falls through as non-WS. WS Origin rejected 403 when `allowed_ws_origins` set.
@@ -273,9 +277,12 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 - **TCP**: `TcpListener` → `TcpStream::connect`; 1:1. `splice(2)` on Linux (plain + kTLS) else `copy_bidirectional`.
 - **UDP**: `UdpSocket` → per-session socket, session-keyed. GSO-batched send on Linux.
 
-Dispatch in `src/proxy/mod.rs`: gRPC via `is_grpc_request()`; H3 via `matches!(proxy.backend_protocol, BackendProtocol::H3)`; H2 via `BackendProtocol::H2`. Streaming vs buffered: two-tier check + `proxy.retry.is_some()`.
+Dispatch in `src/proxy/mod.rs`: `detect_http_flavor(&req) -> HttpFlavor::{Plain, Grpc, WebSocket}` classifies the request once (shared with the H3 frontend). Backend selection uses `Proxy.dispatch_kind: DispatchKind` (pre-computed at config load via `GatewayConfig::resolve_dispatch_kind()` — variants: `HttpPool`, `HttpsPool`, `HttpsH3Preferred`, `TcpRaw`, `TcpTls`, `UdpRaw`, `UdpDtls`). H2 direct pool: `matches!(dispatch_kind, HttpsPool | HttpsH3Preferred) && !is_known_http1_backend(proxy)` (ALPN learning cache short-circuits known-h1 backends). Streaming vs buffered: two-tier check + `proxy.retry.is_some()`.
 
-**H3 frontend dispatches only to H3 backends** — no fallback; `proxy.backend_protocol` NOT consulted on H3 path. H1/H2 frontend → H3 backend IS supported via `Http3ConnectionPool`.
+**H3 frontend architecture** (`http3/server.rs`, standalone QUIC server). Backend dispatch branches on `(dispatch_kind, http_flavor)`:
+- `HttpsH3Preferred + Plain` — native H3 fast path via `Http3ConnectionPool` (quinn/h3), fully streamed.
+- Everything else — cross-protocol bridge `http3::cross_protocol::run` reuses `state.connection_pool` (reqwest) / `state.grpc_pool`, so one `https` proxy serves H1/H2/H3 clients uniformly. WebSocket-over-H3 returns 501.
+- Cross-protocol buffering: request body buffered (`&mut RequestStream` can't be captured by reqwest's `'static` body), response streamed with the same coalesce window as the native H3 writer. gRPC trailers forwarded via `send_trailers` on both buffered and streaming responses.
 
 **QUIC connection migration**: `http3/server.rs` compares `remote_address()` per request (zero-alloc integer compare). `Arc<str>` re-created only on actual change. Fixes a security issue where migrated clients bypassed per-IP rate limits — do NOT revert to once-per-connection cache.
 
@@ -286,7 +293,7 @@ Dispatch in `src/proxy/mod.rs`: gRPC via `is_grpc_request()`; H3 via `matches!(p
 Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include every field affecting connection identity (destination, TLS trust, client credentials, DNS routing). Missing field = pool poisoning; extra = fragmentation. `|` delimiter (IPv6 colons would be ambiguous).
 
 - **HTTP** (`connection_pool.rs`): `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}` — `dest` is `u={upstream_id}` or `d={host}:{port}`
-- **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N`
+- **gRPC** (`proxy/grpc_proxy.rs`): `{host}|{port}|{tls}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` — `tls` from `matches!(backend_scheme, Some(BackendScheme::Https))`; gRPC pool entered at runtime by content-type, not by scheme
 - **HTTP/2** (`proxy/http2_pool.rs`): `{host}|{port}|{dns_override}|{ca}|{mtls_cert}|{verify}` + shard `#N` (always TLS)
 - **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{ca}|{mtls_cert}|{verify}`
 
@@ -406,6 +413,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (0 = auto `max(10K, proxies × 3)`)
 - `FERRUM_POOL_WARMUP_ENABLED` (`true`); `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` (8 MiB), `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` (32 MiB) — gRPC tuning
 - `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (65536; eager buffer when CL ≤ this; `0` always stream)
+- `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (32; bounded mpsc for H3→non-H3 cross-protocol request-body bridge; ~512 KiB pipeline depth per upload)
 - `FERRUM_KTLS_ENABLED`/`IO_URING_SPLICE_ENABLED`/`UDP_GSO_ENABLED`/`UDP_PKTINFO_ENABLED`/`UDP_GRO_ENABLED`/`TCP_FASTOPEN_ENABLED` (all `auto` on Linux)
 - `FERRUM_DNS_MIN_TTL_SECONDS` (5); `FERRUM_DNS_TTL_OVERRIDE_SECONDS` (0)
 - `FERRUM_ADD_VIA_HEADER`/`VIA_PSEUDONYM` (`true`/`ferrum-edge`)

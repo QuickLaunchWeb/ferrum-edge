@@ -2,18 +2,109 @@
 //! path (`proxy/mod.rs`) and the HTTP/3 frontend (`http3/server.rs`).
 //!
 //! These functions encapsulate upstream target selection, circuit breaker checks,
-//! and post-request outcome recording (CB, passive health, latency). Extracting
-//! them prevents logic drift between the two frontend paths.
+//! post-request outcome recording (CB, passive health, latency), and runtime
+//! HTTP-flavor detection. Extracting them prevents logic drift between the
+//! two frontend paths.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyper::Request;
 use tracing::{debug, warn};
 
-use crate::config::types::{Proxy, UpstreamTarget};
+use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::load_balancer::{HashOnStrategy, HealthContext, LoadBalancerCache};
 use crate::proxy::ProxyState;
+use crate::proxy::is_valid_websocket_key;
+
+// ---------------------------------------------------------------------------
+// Runtime HTTP flavor detection
+// ---------------------------------------------------------------------------
+
+/// Detect the HTTP flavor of an incoming request.
+///
+/// Called from the hot path for every HTTP-family request. Cost:
+/// - Fast-fails on the WebSocket upgrade / Extended CONNECT signals
+///   (4 header lookups, short-circuit).
+/// - Falls through to a single content-type lookup + 16-byte ASCII prefix match.
+/// - Total: ~80–100ns on a non-WebSocket, non-gRPC POST; well below noise.
+///
+/// **Do not cache the result per-proxy.** Flavors are per-request: a single
+/// `Https` proxy can serve regular REST, gRPC, and WebSocket traffic mixed on
+/// the same backend. A `DashMap` lookup would cost more than this function.
+///
+/// The body type `B` is generic so the same helper works for hyper's
+/// `Incoming` body, the H3 request shell, and unit tests that pass `()`.
+#[inline]
+pub fn detect_http_flavor<B>(req: &Request<B>) -> HttpFlavor {
+    // Cheap WebSocket check runs first — an Extended CONNECT with
+    // `:protocol=websocket` carries no content-type, so the gRPC arm would
+    // miss it.
+    if is_extended_connect_websocket(req) || is_http1_websocket_upgrade(req) {
+        return HttpFlavor::WebSocket;
+    }
+
+    if let Some(ct) = req.headers().get(hyper::header::CONTENT_TYPE)
+        && let Some(prefix) = ct.as_bytes().get(..16)
+        && prefix.eq_ignore_ascii_case(b"application/grpc")
+    {
+        return HttpFlavor::Grpc;
+    }
+
+    HttpFlavor::Plain
+}
+
+/// Extended CONNECT WebSocket check for HTTP/2 (RFC 8441) and HTTP/3
+/// (RFC 9220). Mirrors `is_h2_websocket_connect` in `proxy/mod.rs` but lives
+/// here so it can be called from both the H1/H2 server loop and the H3
+/// frontend.
+#[inline]
+fn is_extended_connect_websocket<B>(req: &Request<B>) -> bool {
+    req.method() == hyper::Method::CONNECT
+        && matches!(
+            req.version(),
+            hyper::Version::HTTP_2 | hyper::Version::HTTP_3
+        )
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_ref().eq_ignore_ascii_case(b"websocket"))
+}
+
+/// HTTP/1.1 WebSocket upgrade check. Accepts only well-formed RFC 6455
+/// handshakes: `Connection: Upgrade`, `Upgrade: websocket`, a base64-encoded
+/// 16-byte `Sec-WebSocket-Key`, and `Sec-WebSocket-Version: 13`.
+#[inline]
+fn is_http1_websocket_upgrade<B>(req: &Request<B>) -> bool {
+    let headers = req.headers();
+    let Some(connection) = headers.get("connection").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    // `Connection` is a list header; any token == "upgrade" (case-insensitive).
+    let has_upgrade_token = connection
+        .split(',')
+        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+    if !has_upgrade_token {
+        return false;
+    }
+    let is_websocket = headers
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+    if !is_websocket {
+        return false;
+    }
+    let key_ok = headers
+        .get("sec-websocket-key")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_valid_websocket_key);
+    let version_ok = headers
+        .get("sec-websocket-version")
+        .and_then(|v| v.to_str().ok())
+        == Some("13");
+    key_ok && version_ok
+}
 
 /// Result of upstream target selection.
 pub(crate) struct UpstreamSelection {

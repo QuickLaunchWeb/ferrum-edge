@@ -517,6 +517,18 @@ pub struct EnvConfig {
     /// microseconds (default: 200). Floor: 50 µs to prevent "flush every
     /// poll" footguns. Legal range: [50, 100_000].
     pub http3_flush_interval_micros: u64,
+    /// Bounded mpsc channel capacity for the H3→HTTP/HTTPS cross-protocol
+    /// request-body bridge (default: 32). The bridge pushes H3 `recv_data`
+    /// chunks into the channel; `reqwest::Body::wrap_stream` drains the
+    /// receiver and feeds the backend TCP socket. This bounds in-flight
+    /// request body memory to approximately `capacity × average_chunk_size`
+    /// during a streaming cross-protocol upload (default ~32 × 16 KiB ≈
+    /// 512 KiB per upload — enough pipeline depth to absorb backend jitter
+    /// without starving throughput, while keeping 1 K concurrent uploads
+    /// under ~500 MiB). Increase for high-bandwidth uploads where the
+    /// client produces faster than the backend drains; decrease on
+    /// memory-constrained hosts. Legal range: [1, 1024].
+    pub http3_request_body_channel_capacity: usize,
     /// Initial QUIC path MTU in bytes used to build `TransportConfig`
     /// (default: 1500). quinn's baseline of 1200 forces ~9 packets for a
     /// 10 KiB payload; 1500 is safe on modern networks and quinn backs off
@@ -541,6 +553,19 @@ pub struct EnvConfig {
     /// Interval in seconds between connection pool cleanup sweeps (default: 30).
     /// Applies to HTTP, gRPC, HTTP/2, and HTTP/3 connection pools.
     pub pool_cleanup_interval_seconds: u64,
+
+    /// TTL (seconds) for negative observations in the direct HTTP/2 pool's
+    /// ALPN learning cache (default: 14400 = 4 hours). When the pool sees
+    /// a backend negotiate `http/1.1`, subsequent requests short-circuit
+    /// to reqwest to avoid a repeat handshake+failure. After this TTL
+    /// expires, the next request re-probes HTTP/2 — so a backend that has
+    /// been upgraded from h1.1 to HTTP/2 will be picked up at most one
+    /// TTL window later. Default of 4 h means at most one wasted h2
+    /// handshake per pool key every 4 h on an h1.1-only backend — near-
+    /// zero cost at scale while still surfacing backend upgrades within a
+    /// reasonable window. Set to 0 to disable expiry (backend observations
+    /// pinned until gateway restart — restores pre-TTL behavior).
+    pub http2_alpn_negative_cache_ttl_secs: u64,
 
     // Router cache
     /// Maximum entries in the router prefix/negative lookup cache (default: 0 = auto).
@@ -1015,11 +1040,13 @@ impl Default for EnvConfig {
             http3_coalesce_min_bytes: 32_768,
             http3_coalesce_max_bytes: 32_768,
             http3_flush_interval_micros: 200,
+            http3_request_body_channel_capacity: 32,
             http3_initial_mtu: 1500,
             grpc_pool_ready_wait_ms: 1,
             pool_warmup_enabled: true,
             pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
+            http2_alpn_negative_cache_ttl_secs: 14_400,
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
             tcp_half_close_max_wait_seconds: 300,
@@ -1266,11 +1293,13 @@ impl EnvConfig {
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
             http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
+            http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 32usize, clamp(1usize, 1024usize);
             http3_initial_mtu: u16 = "FERRUM_HTTP3_INITIAL_MTU" => 1500u16;
             grpc_pool_ready_wait_ms: u64 = "FERRUM_GRPC_POOL_READY_WAIT_MS" => 1u64;
             pool_warmup_enabled: bool = "FERRUM_POOL_WARMUP_ENABLED" => true;
             pool_warmup_concurrency: usize = "FERRUM_POOL_WARMUP_CONCURRENCY" => 500usize, max(1usize);
             pool_cleanup_interval_seconds: u64 = "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS" => 30u64;
+            http2_alpn_negative_cache_ttl_secs: u64 = "FERRUM_HTTP2_ALPN_NEGATIVE_CACHE_TTL_SECS" => 14_400u64;
             router_cache_max_entries: usize = "FERRUM_ROUTER_CACHE_MAX_ENTRIES" => 0usize;
             tcp_idle_timeout_seconds: u64 = "FERRUM_TCP_IDLE_TIMEOUT_SECONDS" => 300u64;
             tcp_half_close_max_wait_seconds: u64 = "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS" => 300u64;
@@ -1580,11 +1609,13 @@ impl EnvConfig {
             http3_coalesce_min_bytes,
             http3_coalesce_max_bytes,
             http3_flush_interval_micros,
+            http3_request_body_channel_capacity,
             http3_initial_mtu,
             grpc_pool_ready_wait_ms,
             pool_warmup_enabled,
             pool_warmup_concurrency,
             pool_cleanup_interval_seconds,
+            http2_alpn_negative_cache_ttl_secs,
             router_cache_max_entries,
             tcp_idle_timeout_seconds,
             tcp_half_close_max_wait_seconds,

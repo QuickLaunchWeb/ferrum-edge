@@ -136,7 +136,17 @@ impl PoolManager for ReqwestPoolManager {
         } else {
             let _ = write!(buf, "d={}:{}|", host, port);
         }
-        let _ = write!(buf, "{}|", proxy.backend_protocol as u8);
+        // Pool keys partition by scheme discriminant so two proxies with different
+        // wire schemes (http vs https, tcp vs tcps, etc.) don't share a client.
+        // `u8::MAX` is a stable sentinel for the rare "scheme not yet resolved"
+        // case — `normalize_fields()` populates `backend_scheme` before any
+        // request hits the pool, so this arm is defensive.
+        debug_assert!(
+            proxy.backend_scheme.is_some(),
+            "backend_scheme should be resolved before HTTP pool key generation"
+        );
+        let scheme_disc = proxy.backend_scheme.map(|s| s as u8).unwrap_or(u8::MAX);
+        let _ = write!(buf, "{}|", scheme_disc);
         buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
         buf.push('|');
         buf.push_str(

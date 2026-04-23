@@ -39,7 +39,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
 use crate::config::PoolConfig;
-use crate::config::types::{BackendProtocol, Proxy};
+use crate::config::types::{BackendScheme, Proxy};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
 use crate::tls::TlsPolicy;
@@ -127,7 +127,10 @@ impl http_body::Body for GrpcBody {
 fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
     use std::fmt::Write;
     buf.clear();
-    let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs) as u8;
+    // TLS intent comes from the backend scheme; flavor (gRPC vs plain HTTP)
+    // is detected at request time and doesn't affect pool identity — an
+    // Https pool entry serves both gRPC and Plain requests.
+    let tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https)) as u8;
     let _ = write!(buf, "{}|{}|{}|", host, port, tls);
     buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
     buf.push('|');
@@ -254,12 +257,16 @@ impl GrpcConnectionPool {
     }
 
     /// Allocating version of the pool key — only used for warmup deduplication
-    /// where the key must outlive the thread-local buffer.
+    /// where the key must outlive the thread-local buffer. Currently unused
+    /// post-refactor (gRPC pool warms lazily); retained for future re-enablement.
+    #[allow(dead_code)]
     fn pool_key_owned(proxy: &Proxy) -> String {
         grpc_pool_key_owned(proxy)
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
+    /// Currently unused post-refactor; see `pool_key_owned`.
+    #[allow(dead_code)]
     pub(crate) fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key_owned(proxy)
     }
@@ -453,7 +460,7 @@ impl GrpcPoolManager {
             Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
         }
 
-        let use_tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
+        let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
         if use_tls {
             self.create_tls_connection(tcp, host, proxy, &pool_config)
@@ -785,8 +792,19 @@ pub async fn proxy_grpc_request(
 
 /// Proxy a gRPC request using pre-collected body bytes.
 ///
-/// Used for retry attempts where the request body has already been buffered.
-/// Always uses buffered mode — retries must be able to inspect the response.
+/// Used for retry attempts where the request body has already been buffered,
+/// and by the HTTP/3 cross-protocol bridge where the body was drained from
+/// an H3 recv stream before dispatching. When `stream_response` is `true`,
+/// the response `Incoming` body is returned live (frame-by-frame streaming,
+/// trailers arrive as a terminal frame); otherwise the response is fully
+/// buffered and trailers are extracted up-front.
+///
+/// Retries MUST pass `stream_response = false` — the response must be
+/// fully collected so the retry layer can inspect status/body before
+/// deciding whether to retry. The cross-protocol bridge passes `true` when
+/// no retries are configured and no plugin requires response-body
+/// buffering, so server-streaming/bidi gRPC responses flow to the client
+/// without accumulating in memory.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_from_bytes(
     method: hyper::Method,
@@ -797,8 +815,8 @@ pub async fn proxy_grpc_request_from_bytes(
     grpc_pool: &GrpcConnectionPool,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
+    stream_response: bool,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
-    // Retries always use buffered mode so the response can be inspected
     proxy_grpc_request_core(
         method,
         headers,
@@ -808,7 +826,7 @@ pub async fn proxy_grpc_request_from_bytes(
         grpc_pool,
         dns_cache,
         proxy_headers,
-        false,
+        stream_response,
     )
     .await
 }

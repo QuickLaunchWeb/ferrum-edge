@@ -32,7 +32,7 @@ Streaming is the default because it provides better latency and memory character
 proxies:
   - id: "my-api"
     listen_path: "/api"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "backend-service"
     backend_port: 3000
     response_body_mode: stream  # "stream" (default) or "buffer"
@@ -46,7 +46,7 @@ The field is optional. When omitted, it defaults to `stream`.
 {
   "id": "my-api",
   "listen_path": "/api",
-  "backend_protocol": "http",
+  "backend_scheme": "http",
   "backend_host": "backend-service",
   "backend_port": 3000,
   "response_body_mode": "buffer"
@@ -210,11 +210,16 @@ Both protocols support streaming. By default, streaming responses use `ProxyBody
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 responses support **streaming** across two distinct paths:
+HTTP/3 responses support **streaming** across three distinct paths. See [docs/http3.md](http3.md) for the full dispatch model.
 
-**H3 frontend → H3 backend** (in `http3/server.rs`): The H3 server's dedicated proxy path uses `Http3ConnectionPool::request_streaming()` to return a live `RequestStream`, then forwards response chunks directly to the QUIC client via `send_data()` with backpressure-aware adaptive coalescing (8–32 KiB accumulation, 2ms time-based flushing).
+**H3 frontend → H3 backend** (in `http3/server.rs`, requires `backend_prefer_h3: true`): The H3 server's dedicated proxy path uses `Http3ConnectionPool::request_streaming()` to return a live `RequestStream`, then forwards response chunks directly to the QUIC client via `send_data()` with backpressure-aware adaptive coalescing (8–32 KiB accumulation, 2ms time-based flushing).
 
 **H1/H2 frontend → H3 backend** (in `proxy/mod.rs`): When `stream_response=true`, the dispatch path uses `Http3ConnectionPool::request_streaming()` and returns `ResponseBody::StreamingH3`. The response body builder wraps the h3 `RequestStream` in `CoalescingH3Body` (configurable coalesce target) or `DirectH3Body` (zero-overhead passthrough), bridging h3's `recv_data()` async API to `http_body::Body` for hyper to forward to the HTTP/1.1 or H2 client. This eliminates the previous full-body buffering that occurred on this cross-protocol path.
+
+**H3 frontend → non-H3 backend** (in `http3/cross_protocol.rs`, any proxy where `dispatch_kind != HttpsH3Preferred` or flavor != `Plain`): The H3 listener drives the same reqwest / HTTP/2 / gRPC backends as the H1/H2 proxy path:
+
+- **Request body** — streamed via a bounded `tokio::sync::mpsc` bridge into `reqwest::Body::wrap_stream` for `Plain` flavor. Mirrors the H1/H2 plugin-driven policy: stream by default, buffer only when a plugin pre-collected the body. Bridge capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). `Grpc` flavor buffers the request body because the gRPC pool's retry-safe framing expects `Bytes`; unary gRPC bodies are small so this is acceptable.
+- **Response body** — streamed frame-by-frame with the same `http3_coalesce_*` window as the native H3 writer, so QUIC frame cadence is identical across dispatch kinds. `Plain` polls `reqwest::Response::chunk()`; `Grpc` polls hyper `Incoming::frame()` so trailer frames split off for `RequestStream::send_trailers()`.
 
 When plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, HTTP/3 responses fall back to **buffered** mode via `Http3ConnectionPool::request()` with full `on_response_body` and `transform_response_body` plugin hook support.
 
@@ -282,7 +287,7 @@ Use `response_body_mode: stream` (default) when:
 proxies:
   - id: "file-download"
     listen_path: "/files"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "storage-service"
     backend_port: 8080
     response_body_mode: stream  # default, shown for clarity
@@ -294,7 +299,7 @@ proxies:
 proxies:
   - id: "data-api"
     listen_path: "/data"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "data-service"
     backend_port: 3000
     response_body_mode: buffer  # required for body inspection plugins
@@ -309,7 +314,7 @@ proxies:
   # High-throughput proxy — stream for performance
   - id: "public-api"
     listen_path: "/api"
-    backend_protocol: https
+    backend_scheme: https
     backend_host: "api.example.com"
     backend_port: 443
     # response_body_mode defaults to stream
@@ -317,7 +322,7 @@ proxies:
   # Auth-protected proxy — buffer for response validation
   - id: "internal-api"
     listen_path: "/internal"
-    backend_protocol: http
+    backend_scheme: http
     backend_host: "internal-service"
     backend_port: 3000
     response_body_mode: buffer
