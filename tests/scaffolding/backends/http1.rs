@@ -28,10 +28,11 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone)]
 pub enum HttpStep {
     /// Accept a request and (optionally) match it against a matcher. The
-    /// matcher runs against the full raw request bytes (method line +
-    /// headers, excluding body). If the matcher returns false, the request
-    /// is still recorded in `received_requests` but the rest of the script
-    /// still fires.
+    /// matcher runs against the parsed request line + headers (not body).
+    /// When the matcher returns false, the request is still recorded in
+    /// `received_requests` and the rest of the script still fires, but the
+    /// mismatch is counted — see
+    /// [`ScriptedHttp1Backend::matcher_mismatches`] for the observable.
     ExpectRequest(RequestMatcher),
     /// Send `HTTP/1.1 <status> <reason>\r\n`.
     RespondStatus { status: u16, reason: String },
@@ -222,6 +223,11 @@ impl ScriptedHttp1BackendBuilder {
 #[derive(Default)]
 struct Http1State {
     accepted: AtomicU32,
+    /// Count of `ExpectRequest` matchers that returned `false`. Exposed via
+    /// [`ScriptedHttp1Backend::matcher_mismatches`] so tests can assert the
+    /// gateway forwarded what they expected without silently ignoring a
+    /// mismatch.
+    matcher_mismatches: AtomicU32,
     requests: Mutex<Vec<Request>>,
 }
 
@@ -240,6 +246,35 @@ impl ScriptedHttp1Backend {
 
     pub fn accepted_connections(&self) -> u32 {
         self.state.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Number of `ExpectRequest` matchers that returned `false` so far.
+    /// Tests that supply a non-trivial matcher should assert this is zero;
+    /// the matcher is otherwise informational and won't fail the script on
+    /// its own.
+    pub fn matcher_mismatches(&self) -> u32 {
+        self.state.matcher_mismatches.load(Ordering::SeqCst)
+    }
+
+    /// Panic if any `ExpectRequest` matcher returned `false`. Call at the
+    /// end of a test that uses a non-trivial matcher (e.g.,
+    /// `RequestMatcher::method_path`) — without this, a gateway that
+    /// forwarded the wrong method/path would not fail the test, defeating
+    /// the purpose of the matcher.
+    pub async fn assert_no_matcher_mismatches(&self) {
+        let count = self.matcher_mismatches();
+        if count == 0 {
+            return;
+        }
+        let reqs = self.received_requests().await;
+        let summary: Vec<String> = reqs
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        panic!(
+            "{} ExpectRequest matcher(s) returned false; received requests: {:?}",
+            count, summary
+        );
     }
 
     /// Clone of every parsed request observed so far.
@@ -269,7 +304,13 @@ impl Drop for ScriptedHttp1Backend {
 }
 
 /// Parse a request's prelude (up to `\r\n\r\n`) from a stream.
-async fn read_http_prelude(stream: &mut TcpStream) -> io::Result<Option<Request>> {
+///
+/// A single `read()` can return the prelude plus some body bytes in the
+/// same buffer. The second return value is any bytes that arrived after
+/// the `\r\n\r\n` separator; [`drain_body`] must consume them first before
+/// reading more from the socket, otherwise it will wait for Content-Length
+/// bytes that the peer already sent and POST-body tests hang.
+async fn read_http_prelude(stream: &mut TcpStream) -> io::Result<Option<(Request, Vec<u8>)>> {
     let mut acc: Vec<u8> = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
     loop {
@@ -285,11 +326,16 @@ async fn read_http_prelude(stream: &mut TcpStream) -> io::Result<Option<Request>
             Err(e) => return Err(e),
         }
     }
-    let prelude_end = acc
+    let sep_pos = acc
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .unwrap_or(acc.len());
-    let prelude = &acc[..prelude_end];
+    let prelude = &acc[..sep_pos];
+    // Bytes past the `\r\n\r\n` separator are the start of the request body
+    // (or pipelined next request). Hand them back so drain_body doesn't
+    // double-read them from the socket.
+    let body_start = sep_pos.saturating_add(4).min(acc.len());
+    let leftover = acc[body_start..].to_vec();
     let text = std::str::from_utf8(prelude).map_err(io::Error::other)?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
@@ -306,33 +352,43 @@ async fn read_http_prelude(stream: &mut TcpStream) -> io::Result<Option<Request>
             headers.push((n.trim().to_string(), v.trim().to_string()));
         }
     }
-    Ok(Some(Request {
-        method,
-        path,
-        version,
-        headers,
-        raw_prelude: prelude.to_vec(),
-    }))
+    Ok(Some((
+        Request {
+            method,
+            path,
+            version,
+            headers,
+            raw_prelude: prelude.to_vec(),
+        },
+        leftover,
+    )))
 }
 
 /// Consume any body the client still has in the socket, as advertised by
-/// Content-Length. Transfer-Encoding: chunked is not fully parsed — just
-/// drained opportunistically so we don't stall.
-async fn drain_body(stream: &mut TcpStream, req: &Request) -> io::Result<()> {
-    if let Some(cl) = req.header("content-length")
-        && let Ok(n) = cl.parse::<usize>()
-    {
-        if n == 0 {
-            return Ok(());
-        }
-        let mut buf = vec![0u8; n];
-        let mut read = 0;
-        while read < n {
-            match stream.read(&mut buf[read..]).await {
-                Ok(0) => break,
-                Ok(m) => read += m,
-                Err(_) => break,
-            }
+/// Content-Length. `leftover` is body bytes already read during prelude
+/// parsing — they count toward the Content-Length quota, so we only read
+/// the remainder from the socket.
+///
+/// Transfer-Encoding: chunked is not parsed; if the caller needs to drain a
+/// chunked body they must do so themselves.
+async fn drain_body(stream: &mut TcpStream, req: &Request, leftover: Vec<u8>) -> io::Result<()> {
+    let Some(cl) = req.header("content-length") else {
+        return Ok(());
+    };
+    let Ok(n) = cl.parse::<usize>() else {
+        return Ok(());
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    let mut already = leftover.len().min(n);
+    while already < n {
+        let mut buf = [0u8; 4096];
+        let want = (n - already).min(buf.len());
+        match stream.read(&mut buf[..want]).await {
+            Ok(0) => break,
+            Ok(m) => already += m,
+            Err(_) => break,
         }
     }
     Ok(())
@@ -355,12 +411,16 @@ async fn run_http_script(
     for step in script {
         match step {
             HttpStep::ExpectRequest(matcher) => {
-                let req_opt = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some(req) = req_opt {
-                    drain_body(&mut stream, &req).await.ok();
-                    // Matcher result is informational; we record the request
-                    // either way so tests can assert on what was sent.
-                    let _ = (matcher.0)(&req);
+                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                if let Some((req, leftover)) = parsed {
+                    drain_body(&mut stream, &req, leftover).await.ok();
+                    // Matcher is informational — the script continues either
+                    // way — but we surface mismatches via a counter so tests
+                    // can observe the result instead of it being silently
+                    // discarded.
+                    if !(matcher.0)(&req) {
+                        state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                    }
                     state.requests.lock().await.push(req);
                 }
             }
@@ -401,9 +461,9 @@ async fn run_http_script(
             } => {
                 // Consume a request so the client can reach the
                 // "awaiting response" state.
-                let req = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some(r) = req {
-                    drain_body(&mut stream, &r).await.ok();
+                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                if let Some((r, leftover)) = parsed {
+                    drain_body(&mut stream, &r, leftover).await.ok();
                     state.requests.lock().await.push(r);
                 }
                 stream
@@ -423,9 +483,9 @@ async fn run_http_script(
                 body_prefix,
                 reset,
             } => {
-                let req = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some(r) = req {
-                    drain_body(&mut stream, &r).await.ok();
+                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                if let Some((r, leftover)) = parsed {
+                    drain_body(&mut stream, &r, leftover).await.ok();
                     state.requests.lock().await.push(r);
                 }
                 stream
@@ -454,9 +514,9 @@ async fn run_http_script(
                 pause,
                 count,
             } => {
-                let req = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some(r) = req {
-                    drain_body(&mut stream, &r).await.ok();
+                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                if let Some((r, leftover)) = parsed {
+                    drain_body(&mut stream, &r, leftover).await.ok();
                     state.requests.lock().await.push(r);
                 }
                 stream
@@ -604,5 +664,57 @@ mod tests {
         s.read_to_end(&mut resp).await.expect("read");
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("xyxy"));
+    }
+
+    /// Regression test: sending the prelude and body in a single `write_all`
+    /// must not hang the backend. Previously `read_http_prelude` dropped
+    /// any body bytes that arrived in the same read as the `\r\n\r\n`
+    /// separator, then `drain_body` waited on the socket for
+    /// Content-Length bytes that the peer had already sent, and the
+    /// subsequent response never fired until the socket was closed.
+    #[tokio::test]
+    async fn post_with_body_coalesced_with_prelude_does_not_hang() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "POST", "/echo",
+            )))
+            .step(HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: "2".into(),
+            })
+            .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // Headers and body in a single write. The backend must not wait on
+        // the socket for body bytes already delivered here.
+        s.write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")
+            .await
+            .expect("write");
+
+        let fut = async {
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            resp
+        };
+        let resp = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("backend responded within timeout");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains("HTTP/1.1 200 OK") && text.ends_with("ok"),
+            "expected response, got {text:?}"
+        );
+        backend.assert_no_matcher_mismatches().await;
     }
 }

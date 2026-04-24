@@ -42,9 +42,6 @@ pub struct TlsConfig {
     /// handshake. Useful for timeout tests where the gateway must give up
     /// before the TLS handshake completes.
     pub handshake_delay: Duration,
-    /// If `true`, the server requests (but does not require) a client
-    /// certificate. We default to no client auth for simplicity.
-    pub request_client_cert: bool,
 }
 
 impl TlsConfig {
@@ -56,7 +53,6 @@ impl TlsConfig {
             key_pem: key_pem.into(),
             alpn: Vec::new(),
             handshake_delay: Duration::ZERO,
-            request_client_cert: false,
         }
     }
 
@@ -193,11 +189,13 @@ impl ScriptedTlsBackendBuilder {
                                             Err(_e) => return,
                                         };
                                         state_conn.handshakes.fetch_add(1, Ordering::SeqCst);
-                                        if let Some(alpn) = tls_stream.get_ref().1.alpn_protocol() {
-                                            *state_conn.last_alpn.lock().await = Some(alpn.to_vec());
-                                        } else {
-                                            *state_conn.last_alpn.lock().await = None;
-                                        }
+                                        let alpn = tls_stream
+                                            .get_ref()
+                                            .1
+                                            .alpn_protocol()
+                                            .map(|a| a.to_vec());
+                                        *state_conn.last_alpn.lock().await = alpn.clone();
+                                        state_conn.all_alpn.lock().await.push(alpn);
                                         let _ = run_tls_script(tls_stream, script, state_conn).await;
                                     });
                                 } else {

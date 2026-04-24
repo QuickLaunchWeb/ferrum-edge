@@ -58,6 +58,12 @@ pub enum TcpStep {
     Drop,
     /// Send a TCP RST by setting `SO_LINGER=0` and dropping. Triggers
     /// `ECONNRESET` on the peer's next read/write.
+    ///
+    /// **TLS caveat**: in a [`super::tls::ScriptedTlsBackend`] this step
+    /// falls back to a plain `drop(stream)` (FIN) because we can't take
+    /// `SO_LINGER` out of the wrapped rustls stream without consuming it.
+    /// Clients see EOF instead of RST — close enough for "connection
+    /// abruptly ended" tests, but not a true RST-class error.
     Reset,
     /// Accept the next connection and drop it immediately **without** reading
     /// any bytes. The peer's first write will observe RST (or the accept

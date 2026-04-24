@@ -19,17 +19,18 @@
 //! [`HarnessMode::InProcess`] variant is reserved; the plan calls for an
 //! in-process `ProxyState` spin-up but the existing integration-test code
 //! constructs `ProxyState` field-by-field, which is too narrow to drive a
-//! full request lifecycle in 50 LOC. Rather than skip the acceptance tests
-//! or ship a broken in-process path, we default to binary mode (Stdio::null
-//! + retry loop) and annotate the in-process branch as Phase 2 work.
+//! full request lifecycle in 50 LOC.
 //!
-//! The builder API intentionally matches the plan's signature so the
-//! in-process path can land without breaking existing tests.
+//! Selecting [`HarnessMode::InProcess`] via
+//! [`GatewayHarnessBuilder::mode_in_process`] is a hard error in Phase 1 —
+//! the variant exists to pin the API shape for Phase 2. Tests that want
+//! in-process behaviour will fail loudly rather than silently get binary
+//! mode, which would have masked the missing implementation.
 
 use crate::common::gateway_harness::{DbType, TestGateway, TestGatewayBuilder};
 use crate::scaffolding::clients::Http1Client;
 use reqwest::StatusCode;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -73,9 +74,9 @@ impl GatewayHarnessBuilder {
         self
     }
 
-    /// Reserved — currently falls back to binary mode (see module docs).
-    /// Kept in the public API so future Phase-2 work can flip the behaviour
-    /// without changing call sites.
+    /// Reserved for Phase 2. Selecting this mode causes [`Self::spawn`] to
+    /// return an error — the variant exists to pin the API shape so Phase 2
+    /// can land without changing call sites.
     pub fn mode_in_process(mut self) -> Self {
         self.mode = HarnessMode::InProcess;
         self
@@ -130,11 +131,14 @@ impl GatewayHarnessBuilder {
 
     /// Finalize the builder and spawn the harness.
     pub async fn spawn(self) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
-        // In-process mode is a Phase-2 deliverable — see module docs.
+        // In-process mode is a Phase-2 deliverable — see module docs. Error
+        // rather than silently falling back to binary mode so test authors
+        // know they're hitting the unimplemented path.
         if matches!(self.mode, HarnessMode::InProcess) {
-            eprintln!(
-                "GatewayHarness: mode_in_process is reserved for Phase 2; \
-                 falling back to binary mode for this spawn"
+            return Err(
+                "GatewayHarness: HarnessMode::InProcess is reserved for Phase 2 \
+                 and not yet implemented — use mode_binary() instead"
+                    .into(),
             );
         }
         let gw = self.inner.spawn().await?;
@@ -350,9 +354,4 @@ impl GatewayHarness {
 /// common/config_builder).
 pub fn yaml(value: &Value) -> String {
     serde_yaml::to_string(value).unwrap_or_else(|_| "<yaml serialize error>".to_string())
-}
-
-#[allow(dead_code)]
-fn _ensure_json_referenced() -> Value {
-    json!({})
 }

@@ -43,7 +43,7 @@ async fn scripted_tcp_backend_end_to_end() {
 async fn scripted_http1_backend_via_reqwest() {
     let reservation = reserve_port().await.expect("port");
     let port = reservation.port;
-    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
         .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
             "GET", "/ping",
         )))
@@ -65,6 +65,9 @@ async fn scripted_http1_backend_via_reqwest() {
     let resp = client.get(&url).await.expect("get");
     assert_eq!(resp.status, reqwest::StatusCode::OK);
     assert_eq!(resp.body_text(), "pong");
+    // The matcher is only informational unless we assert — otherwise a test
+    // expecting "GET /ping" would pass for any method/path the client sent.
+    backend.assert_no_matcher_mismatches().await;
 }
 
 #[tokio::test]

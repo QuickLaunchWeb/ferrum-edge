@@ -11,8 +11,10 @@
 
 #![allow(clippy::bool_assert_comparison)]
 
-use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedTcpBackend, TcpStep};
-use crate::scaffolding::backends::{ScriptedHttp1Backend, ScriptedTlsBackend, TlsConfig};
+use crate::scaffolding::backends::{
+    HttpStep, RequestMatcher, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend,
+    TcpStep, TlsConfig,
+};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
@@ -20,6 +22,21 @@ use crate::scaffolding::{file_mode_yaml_for_backend, file_mode_yaml_for_backend_
 use reqwest::StatusCode;
 use serde_json::json;
 use std::time::{Duration, Instant};
+
+/// Fetch captured gateway logs and fail the test if they are empty — the
+/// harness silently returns an empty string when `capture_output()` was not
+/// called on the builder, and downstream `logs.contains(..)` asserts would
+/// then pass for the wrong reason.
+fn require_logs(harness: &GatewayHarness) -> String {
+    let logs = harness
+        .captured_combined()
+        .expect("read captured gateway logs");
+    assert!(
+        !logs.trim().is_empty(),
+        "gateway logs were empty — did you forget .capture_output() on the builder?"
+    );
+    logs
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Test 1 — backend refuses the TCP connection → 502 + ConnectionRefused class.
@@ -61,7 +78,7 @@ async fn backend_refuses_connect_maps_to_502_with_connection_refused() {
         resp.body_text()
     );
 
-    let logs = harness.captured_combined().unwrap_or_default();
+    let logs = require_logs(&harness);
     // The gateway's upstream error classifier tags connection-reset/refused
     // cases with "connection" in the class name (ConnectionError, ConnectionRefused).
     let has_connection_error = logs.contains("connection") || logs.contains("ConnectionError");
@@ -99,7 +116,7 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
         .await
         .expect("response");
     assert_eq!(resp.status, StatusCode::BAD_GATEWAY);
-    let logs = harness.captured_combined().unwrap_or_default();
+    let logs = require_logs(&harness);
     // Gateway should have logged a backend request error. The platform-
     // specific string can be "reset", "connection closed", "request_error"
     // (reqwest's generic classifier), or "Backend request failed". Any of
@@ -232,7 +249,7 @@ async fn backend_close_mid_body_populates_body_error_class() {
         }
     }
 
-    let logs = harness.captured_combined().unwrap_or_default();
+    let logs = require_logs(&harness);
     // The gateway logs body-read errors as either a structured
     // `body_error_class` (via stdout_logging) or a proxy-level
     // "Failed to read backend response body" / "error decoding response
@@ -307,13 +324,18 @@ async fn tls_expired_cert_produces_tls_error_not_generic_502() {
         .expect("response");
     assert_eq!(resp.status, StatusCode::BAD_GATEWAY, "expected 502");
 
-    let logs = harness.captured_combined().unwrap_or_default();
+    let logs = require_logs(&harness);
+    // Look for cert/TLS-specific tokens. We deliberately avoid a bare `"tls"`
+    // substring match — crate and module paths contain "tls" nearly
+    // everywhere, which would turn this assertion into a no-op.
     let has_tls_signal = logs.contains("TlsError")
-        || logs.contains("tls")
-        || logs.contains("TLS")
         || logs.contains("expired")
         || logs.contains("notAfter")
-        || logs.contains("certificate");
+        || logs.contains("NotValidYet")
+        || logs.contains("certificate")
+        || logs.contains("CertificateError")
+        || logs.contains("InvalidCertificate")
+        || logs.contains("handshake");
     assert!(
         has_tls_signal,
         "expected TLS/cert error signal in logs, got:\n{logs}"
@@ -420,7 +442,12 @@ async fn h2_alpn_fallback_downgrades_capability() {
     // diagnostic signal that `mark_h2_tls_unsupported` fired and populated
     // `is_known_http1_backend` — this is the regression test CLAUDE.md
     // called out in the phase-1 plan.
-    let logs = harness.captured_combined().unwrap_or_default();
+    //
+    // NOTE: this couples the test to the exact `BackendSelectedHttp1` error
+    // string in `Http2PoolError`. If that variant is renamed, update here.
+    // No stable test-visible counter exists yet — adding one is a reasonable
+    // Phase 2 improvement.
+    let logs = require_logs(&harness);
     assert!(
         logs.contains("BackendSelectedHttp1"),
         "expected gateway log to mention BackendSelectedHttp1; logs:\n{logs}"
