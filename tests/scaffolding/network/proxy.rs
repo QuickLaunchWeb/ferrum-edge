@@ -244,19 +244,31 @@ async fn relay_with_profile(
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut br, mut bw) = tokio::io::split(backend);
 
-    // Bidirectional relay. Use `copy` rather than `copy_bidirectional`
-    // so we don't leak memory on half-close (one direction ending
-    // normally while the other blocks on the latency timer).
+    // Bidirectional relay with correct half-close semantics: when one
+    // direction reaches EOF we half-close its peer's write side (so
+    // the peer observes EOF on its read side), but we keep pumping the
+    // other direction until it also drains.
+    //
+    // A prior `tokio::select!` over the two copies dropped whichever
+    // future lost the race, which can eat response bytes: a client
+    // that sends a full request and then half-closes causes `c_to_b`
+    // to complete while the backend is still producing the response
+    // on `b_to_c` — `select!` would cancel the second task and lose
+    // the remaining bytes.
+    use tokio::io::AsyncWriteExt;
     let c_to_b = async move {
         let _ = tokio::io::copy(&mut cr, &mut bw).await;
+        let _ = bw.shutdown().await;
     };
     let b_to_c = async move {
         let _ = tokio::io::copy(&mut br, &mut cw).await;
+        let _ = cw.shutdown().await;
     };
-    tokio::select! {
-        _ = c_to_b => {},
-        _ = b_to_c => {},
-    }
+    // Both directions must drain. `NetworkSimProxy::shutdown()` holds
+    // an `AbortHandle` for this task, so a test that drops the proxy
+    // unblocks us even if one side would otherwise wait forever (e.g.
+    // the injected latency timer is still pending).
+    let _ = tokio::join!(c_to_b, b_to_c);
 }
 
 /// Wrap `inner` in whatever `profile` wants. The order is
@@ -376,6 +388,67 @@ mod tests {
             started.elapsed() >= Duration::from_millis(250),
             "elapsed was {:?}, expected ≥ 250ms",
             started.elapsed()
+        );
+    }
+
+    /// Regression: when the client half-closes its write side after
+    /// sending a request, the relay must keep pumping backend→client
+    /// bytes rather than cancelling that direction along with the
+    /// c→b copy. A prior `tokio::select!` over the two copies lost
+    /// response bytes for exactly this pattern (common in HTTP/1.0
+    /// clients and any explicit `shutdown(SHUT_WR)` flow).
+    #[tokio::test]
+    async fn relay_preserves_response_after_client_half_close() {
+        // Custom backend: read full request, wait briefly, reply, close.
+        let backend_res = reserve_port().await.expect("backend port");
+        let backend_port = backend_res.port;
+        let backend_listener = backend_res.into_listener();
+        tokio::spawn(async move {
+            let Ok((mut s, _)) = backend_listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 256];
+            // Read until client half-close (EOF). The client sends
+            // "req" then shutdowns write; the backend sees the read
+            // return 0 once all bytes + EOF have arrived.
+            let mut total = 0;
+            loop {
+                match s.read(&mut buf[total..]).await {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => return,
+                }
+                if total == buf.len() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = s.write_all(b"RESPONSE_AFTER_HALF_CLOSE").await;
+            let _ = s.shutdown().await;
+        });
+
+        let proxy_res = reserve_port().await.expect("proxy port");
+        let proxy_port = proxy_res.port;
+        let _proxy = NetworkSimProxy::builder(proxy_res.into_listener())
+            .forward_to(("127.0.0.1", backend_port))
+            .spawn()
+            .expect("spawn proxy");
+
+        let mut c = TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .expect("connect");
+        c.write_all(b"req").await.unwrap();
+        // Client signals "done sending" before the backend has
+        // started producing the response. The pre-fix relay treated
+        // the resulting c→b EOF as a "whole relay done" signal and
+        // dropped the b→c task — eating the response.
+        c.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        c.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            &response, b"RESPONSE_AFTER_HALF_CLOSE",
+            "response must survive the client's write-side half-close"
         );
     }
 }

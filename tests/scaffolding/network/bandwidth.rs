@@ -120,14 +120,14 @@ where
     ) -> Poll<std::io::Result<()>> {
         let this = self.project();
 
-        // Only gate based on how many bytes the caller is willing to
-        // receive — `buf.remaining()`. In practice most buf sizes are
-        // 8k/64k; the bucket caps them.
-        let want = buf.remaining().max(1) as u64;
-        let allowed = want.min(this.read_bucket.rate_bps);
-
+        // Charge only bytes that actually move. We don't reserve tokens
+        // upfront — instead we wait until at least one token is
+        // available, poll the inner stream, and then decrement the
+        // bucket by whatever bytes came back. A `Pending` or error
+        // result therefore never drains the bucket, so a backend that's
+        // simply slow to respond doesn't add artificial sleeps on top
+        // of its own latency.
         loop {
-            // If we have a timer armed and it hasn't fired, bail.
             if this.read_sleep.is_some() {
                 if let Some(sleep) = this.read_sleep.as_mut() {
                     match sleep.as_mut().poll(cx) {
@@ -137,30 +137,35 @@ where
                 }
                 *this.read_sleep = None;
             }
-            match this.read_bucket.try_consume(allowed) {
-                Ok(()) => break,
-                Err(wait) => {
-                    *this.read_sleep = Some(Box::pin(tokio::time::sleep(wait)));
-                    // Loop back to poll the sleep we just armed.
-                    continue;
-                }
+            this.read_bucket.refill();
+            if this.read_bucket.tokens >= 1.0 {
+                break;
             }
+            // Bucket fully drained. Wait for one token to accrue so we
+            // can deliver at least one byte — this bounds the spin at
+            // the configured rate without requiring a per-byte poll.
+            let wait = Duration::from_secs_f64(1.0 / this.read_bucket.rate_bps as f64);
+            *this.read_sleep = Some(Box::pin(tokio::time::sleep(wait)));
         }
 
-        // Temporarily shrink the read buf so the inner stream doesn't
-        // read more than `allowed` tokens authorised. `ReadBuf::take`
-        // produces a sub-buf bounded to `allowed` bytes; then we commit
-        // whatever got filled back to the caller's buf.
-        let mut limit = [0u8; 65535];
-        let slice_len = (allowed as usize).min(buf.remaining()).min(limit.len());
-        let mut sub = ReadBuf::new(&mut limit[..slice_len]);
+        // Cap the inner read to what the bucket can afford right now,
+        // plus the caller's buffer. A caller asking for 8 KiB on a
+        // 1 KiB/s bucket will see at most ~1 KiB back per call.
+        let available = this.read_bucket.tokens as u64;
+        let mut scratch = [0u8; 65535];
+        let slice_len = (available as usize)
+            .max(1)
+            .min(buf.remaining())
+            .min(scratch.len());
+        let mut sub = ReadBuf::new(&mut scratch[..slice_len]);
         let res = this.inner.poll_read(cx, &mut sub);
-        if let Poll::Ready(Ok(())) = res {
+        if let Poll::Ready(Ok(())) = &res {
             let filled = sub.filled();
             buf.put_slice(filled);
-            // Refund any unused tokens (we paid `allowed`, used `filled.len()`).
-            let refund = allowed.saturating_sub(filled.len() as u64);
-            this.read_bucket.tokens += refund as f64;
+            this.read_bucket.tokens -= filled.len() as f64;
+            if this.read_bucket.tokens < 0.0 {
+                this.read_bucket.tokens = 0.0;
+            }
         }
         res
     }
@@ -176,12 +181,14 @@ where
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.project();
-        let want = buf.len() as u64;
-        if want == 0 {
+        if buf.is_empty() {
             return this.inner.poll_write(cx, buf);
         }
-        let allowed = want.min(this.write_bucket.rate_bps);
 
+        // Same "charge only bytes actually moved" discipline as the
+        // read path — see the comment in `poll_read`. A `Pending` write
+        // to a backed-up peer never drains the bucket, so the limiter
+        // tracks real throughput rather than poll scheduling.
         loop {
             if this.write_sleep.is_some() {
                 if let Some(sleep) = this.write_sleep.as_mut() {
@@ -192,20 +199,23 @@ where
                 }
                 *this.write_sleep = None;
             }
-            match this.write_bucket.try_consume(allowed) {
-                Ok(()) => break,
-                Err(wait) => {
-                    *this.write_sleep = Some(Box::pin(tokio::time::sleep(wait)));
-                    continue;
-                }
+            this.write_bucket.refill();
+            if this.write_bucket.tokens >= 1.0 {
+                break;
             }
+            let wait = Duration::from_secs_f64(1.0 / this.write_bucket.rate_bps as f64);
+            *this.write_sleep = Some(Box::pin(tokio::time::sleep(wait)));
         }
 
-        let slice = &buf[..(allowed as usize).min(buf.len())];
+        // Slice the caller's buffer to what the bucket can afford.
+        let available = this.write_bucket.tokens as usize;
+        let slice = &buf[..available.max(1).min(buf.len())];
         let res = this.inner.poll_write(cx, slice);
-        if let Poll::Ready(Ok(n)) = res {
-            let refund = allowed.saturating_sub(n as u64);
-            this.write_bucket.tokens += refund as f64;
+        if let Poll::Ready(Ok(n)) = &res {
+            this.write_bucket.tokens -= *n as f64;
+            if this.write_bucket.tokens < 0.0 {
+                this.write_bucket.tokens = 0.0;
+            }
         }
         res
     }
@@ -261,6 +271,45 @@ mod tests {
             started.elapsed() >= Duration::from_millis(700),
             "elapsed was {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Regression: `Pending` polls must not drain the token bucket.
+    /// A backend that's simply slow to respond should not eat into the
+    /// caller's rate budget; only bytes that actually move should
+    /// charge the bucket. The "charge only bytes actually moved"
+    /// discipline in `poll_read` guarantees this.
+    ///
+    /// Setup: 64 B/s rate (1 s burst ⇒ bucket starts at 64 tokens).
+    /// Poll a read while the peer has nothing on the wire, cancel that
+    /// read, then write a single byte. If `Pending` had drained the
+    /// bucket, the follow-up read would stall ~1 s waiting for tokens
+    /// to refill. Under the correct discipline it serves the byte
+    /// immediately out of the untouched burst.
+    #[tokio::test]
+    async fn pending_poll_does_not_drain_tokens() {
+        let (mut peer, receiver) = tokio::io::duplex(4096);
+        let mut stream = BandwidthLimitedStream::new(receiver, 64);
+
+        let mut buf = [0u8; 1024];
+        tokio::select! {
+            r = AsyncReadExt::read(&mut stream, &mut buf) => {
+                panic!("unexpected early read result: {:?}", r);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+
+        peer.write_all(&[7u8]).await.unwrap();
+
+        let started = Instant::now();
+        let n = AsyncReadExt::read(&mut stream, &mut buf).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 7);
+        // If `Pending` had drained the bucket, this would block ~1 s.
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "expected instant read (Pending must not drain the bucket), got {elapsed:?}"
         );
     }
 }

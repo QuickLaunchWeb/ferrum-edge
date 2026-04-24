@@ -107,13 +107,39 @@ where
             return Poll::Ready(Ok(())); // EOF
         }
 
-        let pre_len = buf.filled().len();
-        let res = this.inner.poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = res {
-            let delta = buf.filled().len() - pre_len;
-            this.counter.fetch_add(delta, Ordering::SeqCst);
+        // Cap the read buffer to the remaining byte budget so a single
+        // `poll_read` can't deliver well past `after_bytes`. Without
+        // this cap, mid-stream truncation tests can miss the exact
+        // cutoff — the counter crosses the threshold mid-call and only
+        // the NEXT poll triggers the close, meanwhile an additional
+        // chunk of inner data has already been handed up. Mirrors the
+        // write-side slicing below.
+        let remaining = remaining_budget(*this.after_bytes, this.counter.load(Ordering::SeqCst));
+        if this.after_bytes.is_some() && remaining < buf.remaining() {
+            // Sub ReadBuf backed by a scratch buffer so we can slice
+            // the read to `remaining` bytes. `ReadBuf::take` shares
+            // memory with the outer but doesn't propagate `filled()`
+            // back, so we use the same scratch pattern the bandwidth
+            // limiter uses.
+            let mut scratch = [0u8; 65535];
+            let slice_len = remaining.min(scratch.len());
+            let mut sub = ReadBuf::new(&mut scratch[..slice_len]);
+            let res = this.inner.poll_read(cx, &mut sub);
+            if let Poll::Ready(Ok(())) = &res {
+                let filled = sub.filled();
+                buf.put_slice(filled);
+                this.counter.fetch_add(filled.len(), Ordering::SeqCst);
+            }
+            res
+        } else {
+            let pre_len = buf.filled().len();
+            let res = this.inner.poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = res {
+                let delta = buf.filled().len() - pre_len;
+                this.counter.fetch_add(delta, Ordering::SeqCst);
+            }
+            res
         }
-        res
     }
 }
 
@@ -230,5 +256,26 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = b.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"abcd");
+    }
+
+    /// Regression: `poll_read` must cap the read at the remaining
+    /// budget so a single poll cannot deliver more than `after_bytes`
+    /// even when the inner stream has plenty of data queued up. Pre-fix
+    /// this test would return all 100 queued bytes in one call.
+    #[tokio::test]
+    async fn truncate_caps_read_at_remaining_budget_even_when_buf_is_bigger() {
+        let (mut a, b) = tokio::io::duplex(4096);
+        a.write_all(&[0u8; 100]).await.unwrap();
+        drop(a); // EOF — inner has 100 bytes readable, then EOF.
+
+        let mut t = TruncatedStream::new(b, 10);
+        let mut buf = [0u8; 64]; // caller buffer is larger than the budget
+        let n = t.read(&mut buf).await.unwrap();
+        assert_eq!(n, 10, "single poll_read must not exceed after_bytes");
+        assert_eq!(t.byte_count(), 10);
+
+        // Next read hits the threshold and returns EOF.
+        let n = t.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
     }
 }
