@@ -62,7 +62,10 @@ pub use backends::{
 pub use certs::TestCa;
 pub use clients::{ClientResponse, DtlsClient, Http1Client, UdpClient};
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
-pub use network::{BandwidthLimitedStream, DelayedStream, TruncatedStream};
+pub use network::{
+    BandwidthLimitedStream, DelayedStream, NetworkProfile, NetworkSimProxy, NetworkSimProxyBuilder,
+    TruncatedStream,
+};
 pub use ports::{
     PortReservation, UdpPortReservation, reserve_port, reserve_port_pair, reserve_udp_port,
     unbound_port, unbound_udp_port,
