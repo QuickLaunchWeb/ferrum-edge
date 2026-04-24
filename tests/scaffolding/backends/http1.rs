@@ -205,7 +205,10 @@ impl ScriptedHttp1BackendBuilder {
                         let state_conn = state_task.clone();
                         let script = steps.clone();
                         tokio::spawn(async move {
-                            let _ = run_http_script(stream, script, state_conn).await;
+                            let state_err = state_conn.clone();
+                            if let Err(e) = run_http_script(stream, script, state_conn).await {
+                                state_err.step_errors.lock().await.push(e.to_string());
+                            }
                         });
                     }
                 }
@@ -229,6 +232,10 @@ struct Http1State {
     /// mismatch.
     matcher_mismatches: AtomicU32,
     requests: Mutex<Vec<Request>>,
+    /// I/O errors returned by `run_http_script`. Without this, write
+    /// failures (client hung up before response, etc.) would be silently
+    /// dropped — see [`ScriptedHttp1Backend::step_errors`].
+    step_errors: Mutex<Vec<String>>,
 }
 
 /// A running scripted HTTP/1.1 backend. Drop shuts it down.
@@ -285,6 +292,21 @@ impl ScriptedHttp1Backend {
     /// Shorthand: returns the Nth parsed request (0-indexed).
     pub async fn request(&self, n: usize) -> Option<Request> {
         self.state.requests.lock().await.get(n).cloned()
+    }
+
+    /// I/O errors captured from each connection's script run. Empty on
+    /// the happy path; see
+    /// [`super::tcp::ScriptedTcpBackend::step_errors`] for rationale.
+    pub async fn step_errors(&self) -> Vec<String> {
+        self.state.step_errors.lock().await.clone()
+    }
+
+    /// Panic if any connection's script returned an I/O error.
+    pub async fn assert_no_step_errors(&self) {
+        let errs = self.step_errors().await;
+        if !errs.is_empty() {
+            panic!("{} script step error(s): {:?}", errs.len(), errs);
+        }
     }
 
     pub fn shutdown(&mut self) {
@@ -404,6 +426,12 @@ async fn run_http_script(
     // Track whether the status line has been sent. Used only by the error
     // descriptions; not otherwise observable.
     let mut _status_sent = false;
+    // Track whether a prior step has already parsed the request prelude on
+    // this connection. Steps that implicitly consume a request
+    // (`CloseAfterHeaders`, `CloseMidBody`, `TrickleBody`, `CloseBeforeStatus`)
+    // must not re-read after an explicit `ExpectRequest`, or they'd wait on
+    // a second request that never arrives and the test would hang.
+    let mut request_consumed = false;
 
     // Always read one request first unless the very first step is
     // `CloseBeforeStatus` (in which case the client may not even get to
@@ -422,6 +450,7 @@ async fn run_http_script(
                         state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
                     }
                     state.requests.lock().await.push(req);
+                    request_consumed = true;
                 }
             }
             HttpStep::RespondStatus { status, reason } => {
@@ -449,8 +478,11 @@ async fn run_http_script(
             }
             HttpStep::CloseBeforeStatus => {
                 // Try to consume whatever request the client sent, but close
-                // without ever writing a status line.
-                let _ = read_http_prelude(&mut stream).await;
+                // without ever writing a status line. Skip the read if a
+                // prior `ExpectRequest` already consumed it.
+                if !request_consumed {
+                    let _ = read_http_prelude(&mut stream).await;
+                }
                 let _ = stream.shutdown().await;
                 return Ok(());
             }
@@ -460,11 +492,15 @@ async fn run_http_script(
                 headers,
             } => {
                 // Consume a request so the client can reach the
-                // "awaiting response" state.
-                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some((r, leftover)) = parsed {
-                    drain_body(&mut stream, &r, leftover).await.ok();
-                    state.requests.lock().await.push(r);
+                // "awaiting response" state — unless a prior `ExpectRequest`
+                // already did. (The step returns right after writing the
+                // response, so we don't bother flipping `request_consumed`.)
+                if !request_consumed {
+                    let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                    if let Some((r, leftover)) = parsed {
+                        drain_body(&mut stream, &r, leftover).await.ok();
+                        state.requests.lock().await.push(r);
+                    }
                 }
                 stream
                     .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -483,10 +519,12 @@ async fn run_http_script(
                 body_prefix,
                 reset,
             } => {
-                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some((r, leftover)) = parsed {
-                    drain_body(&mut stream, &r, leftover).await.ok();
-                    state.requests.lock().await.push(r);
+                if !request_consumed {
+                    let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                    if let Some((r, leftover)) = parsed {
+                        drain_body(&mut stream, &r, leftover).await.ok();
+                        state.requests.lock().await.push(r);
+                    }
                 }
                 stream
                     .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -514,10 +552,12 @@ async fn run_http_script(
                 pause,
                 count,
             } => {
-                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some((r, leftover)) = parsed {
-                    drain_body(&mut stream, &r, leftover).await.ok();
-                    state.requests.lock().await.push(r);
+                if !request_consumed {
+                    let parsed = read_http_prelude(&mut stream).await.ok().flatten();
+                    if let Some((r, leftover)) = parsed {
+                        drain_body(&mut stream, &r, leftover).await.ok();
+                        state.requests.lock().await.push(r);
+                    }
                 }
                 stream
                     .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -716,5 +756,105 @@ mod tests {
             "expected response, got {text:?}"
         );
         backend.assert_no_matcher_mismatches().await;
+    }
+
+    /// Regression test: chaining `ExpectRequest → CloseMidBody` must not
+    /// hang. Previously `CloseMidBody` unconditionally called
+    /// `read_http_prelude` a second time and waited for a request that
+    /// would never arrive, so a perfectly natural "assert the request,
+    /// then simulate a mid-body close" script deadlocked until the
+    /// client timed out.
+    #[tokio::test]
+    async fn expect_request_then_close_mid_body_does_not_hang() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "GET", "/pipe",
+            )))
+            .step(HttpStep::CloseMidBody {
+                status: 200,
+                reason: "OK".into(),
+                headers: vec![("Content-Length".into(), "10".into())],
+                body_prefix: b"ab".to_vec(),
+                reset: false,
+            })
+            .spawn()
+            .expect("spawn");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(b"GET /pipe HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .expect("write");
+
+        let fut = async {
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            resp
+        };
+        let resp = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("backend responded within timeout");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("HTTP/1.1 200 OK"), "got {text:?}");
+        assert!(text.contains("Content-Length: 10"), "got {text:?}");
+        assert!(text.ends_with("ab"), "got {text:?}");
+
+        // Only the one request should have been recorded — if the bug
+        // returned, we would observe zero requests (CloseMidBody would
+        // hang in read_http_prelude) or two.
+        let reqs = backend.received_requests().await;
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/pipe");
+        backend.assert_no_matcher_mismatches().await;
+    }
+
+    /// Short-reads on `ReadExact`-equivalents (here: a `Content-Length`
+    /// body the client never completes) must surface in `step_errors`
+    /// instead of being silently dropped. The backend closes when the
+    /// client hangs up; `drain_body`'s loop bails with no visible
+    /// error, but any _script-level_ error (an I/O write failure, a
+    /// step that couldn't complete) shows up through the new helper.
+    #[tokio::test]
+    async fn step_errors_exposes_io_failures_to_callers() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .step(HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: "1000".into(),
+            })
+            .step(HttpStep::RespondBodyChunk(vec![b'x'; 1_000_000]))
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        // Connect, send a request, then drop without reading the response
+        // so the server's write hits `BrokenPipe`.
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .expect("write");
+            // Drop immediately — kernel sends FIN while server is still
+            // writing the megabyte payload.
+        }
+
+        // Give the server task time to hit the write error.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let errs = backend.step_errors().await;
+        assert!(
+            !errs.is_empty(),
+            "expected write failure to be captured in step_errors"
+        );
     }
 }

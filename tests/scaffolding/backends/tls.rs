@@ -175,7 +175,12 @@ impl ScriptedTlsBackendBuilder {
                                         .map(|a| a.to_vec());
                                     *state_conn.last_alpn.lock().await = alpn.clone();
                                     state_conn.all_alpn.lock().await.push(alpn);
-                                    let _ = run_tls_script(tls_stream, script, state_conn).await;
+                                    let state_err = state_conn.clone();
+                                    if let Err(e) =
+                                        run_tls_script(tls_stream, script, state_conn).await
+                                    {
+                                        state_err.step_errors.lock().await.push(e.to_string());
+                                    }
                                 });
                             }
                             ExecutionMode::Once => {
@@ -196,7 +201,16 @@ impl ScriptedTlsBackendBuilder {
                                             .map(|a| a.to_vec());
                                         *state_conn.last_alpn.lock().await = alpn.clone();
                                         state_conn.all_alpn.lock().await.push(alpn);
-                                        let _ = run_tls_script(tls_stream, script, state_conn).await;
+                                        let state_err = state_conn.clone();
+                                        if let Err(e) =
+                                            run_tls_script(tls_stream, script, state_conn).await
+                                        {
+                                            state_err
+                                                .step_errors
+                                                .lock()
+                                                .await
+                                                .push(e.to_string());
+                                        }
                                     });
                                 } else {
                                     drop(tcp);
@@ -226,6 +240,9 @@ struct TlsBackendState {
     /// Every ALPN protocol negotiated so far, in chronological order. A
     /// handshake that didn't negotiate ALPN contributes `None`.
     all_alpn: Mutex<Vec<Option<Vec<u8>>>>,
+    /// Errors returned by `run_tls_script`. See
+    /// [`ScriptedTlsBackend::step_errors`] for rationale.
+    step_errors: Mutex<Vec<String>>,
 }
 
 /// A running scripted TLS backend. Drop shuts it down.
@@ -275,6 +292,22 @@ impl ScriptedTlsBackend {
     pub async fn received_contains(&self, needle: &[u8]) -> bool {
         let buf = self.received_bytes().await;
         buf.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Errors captured from every script execution so far. Empty on the
+    /// happy path; see [`ScriptedTcpBackend::step_errors`] for rationale.
+    pub async fn step_errors(&self) -> Vec<String> {
+        self.state.step_errors.lock().await.clone()
+    }
+
+    /// Panic if any script execution failed. Call this before test-side
+    /// asserts when a short-read or I/O failure should fail the test
+    /// rather than be silently discarded.
+    pub async fn assert_no_step_errors(&self) {
+        let errs = self.step_errors().await;
+        if !errs.is_empty() {
+            panic!("{} script step error(s): {:?}", errs.len(), errs);
+        }
     }
 
     pub fn shutdown(&mut self) {

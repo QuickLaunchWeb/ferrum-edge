@@ -192,7 +192,16 @@ impl ScriptedTcpBackendBuilder {
                         match mode {
                             ExecutionMode::RepeatEachConnection => {
                                 tokio::spawn(async move {
-                                    let _ = run_script(stream, script, state_conn).await;
+                                    let state_err = state_conn.clone();
+                                    if let Err(e) =
+                                        run_script(stream, script, state_conn).await
+                                    {
+                                        state_err
+                                            .step_errors
+                                            .lock()
+                                            .await
+                                            .push(e.to_string());
+                                    }
                                 });
                             }
                             ExecutionMode::Once => {
@@ -200,8 +209,16 @@ impl ScriptedTcpBackendBuilder {
                                 // connections accept-and-drop.
                                 if conn_index == 0 {
                                     tokio::spawn(async move {
-                                        let _ =
-                                            run_script(stream, script, state_conn).await;
+                                        let state_err = state_conn.clone();
+                                        if let Err(e) =
+                                            run_script(stream, script, state_conn).await
+                                        {
+                                            state_err
+                                                .step_errors
+                                                .lock()
+                                                .await
+                                                .push(e.to_string());
+                                        }
                                     });
                                 } else {
                                     drop(stream);
@@ -226,6 +243,12 @@ impl ScriptedTcpBackendBuilder {
 struct BackendState {
     accepted: AtomicU32,
     received_bytes: Mutex<Vec<u8>>,
+    /// Errors returned by `run_script`. Without this the step errors
+    /// would be silently dropped and a script that e.g. short-reads its
+    /// `ReadExact` would leave tests green — see
+    /// [`ScriptedTcpBackend::step_errors`] /
+    /// [`ScriptedTcpBackend::assert_no_step_errors`].
+    step_errors: Mutex<Vec<String>>,
 }
 
 /// A running scripted TCP backend. Dropping the handle shuts it down.
@@ -261,6 +284,24 @@ impl ScriptedTcpBackend {
     pub async fn received_contains(&self, needle: &[u8]) -> bool {
         let buf = self.received_bytes().await;
         buf.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Errors captured from every script execution so far. Empty on the
+    /// happy path. Useful when tests need to assert no step failed
+    /// (which would otherwise go unnoticed).
+    pub async fn step_errors(&self) -> Vec<String> {
+        self.state.step_errors.lock().await.clone()
+    }
+
+    /// Panic with the captured errors if any script execution failed.
+    /// Tests should call this before their own asserts — otherwise a
+    /// short-read or I/O failure in the script would leave the test
+    /// green despite the backend never running the intended flow.
+    pub async fn assert_no_step_errors(&self) {
+        let errs = self.step_errors().await;
+        if !errs.is_empty() {
+            panic!("{} script step error(s): {:?}", errs.len(), errs);
+        }
     }
 
     /// Signal shutdown; the accept loop exits on its next iteration. Safe
@@ -503,6 +544,35 @@ mod tests {
         // The backend drops the socket right after accept; client sees EOF.
         let n = client.read(&mut buf).await.expect("read");
         assert_eq!(n, 0, "expected EOF after drop, got {n} bytes");
+    }
+
+    /// `run_script` short-reads (peer closed before `ReadExact` filled)
+    /// must surface in `step_errors` — otherwise a scripted backend can
+    /// fail to execute its intended steps while the test still passes.
+    #[tokio::test]
+    async fn step_errors_captures_short_read() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::ReadExact(10))
+            .spawn()
+            .expect("spawn");
+
+        // Client connects, sends 3 bytes, closes. The script wants 10.
+        {
+            let mut client = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            client.write_all(b"abc").await.expect("write");
+        }
+
+        // Give the server task time to observe the short read.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let errs = backend.step_errors().await;
+        assert!(
+            errs.iter().any(|e| e.contains("short read")),
+            "expected short-read error in {errs:?}"
+        );
     }
 
     /// Regression test: a peer that packs the `ReadUntil` delimiter and
