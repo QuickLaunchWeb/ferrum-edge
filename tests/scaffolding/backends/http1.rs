@@ -347,38 +347,41 @@ impl Drop for ScriptedHttp1Backend {
 
 /// Parse a request's prelude (up to `\r\n\r\n`) from a stream.
 ///
-/// A single `read()` can return the prelude plus some body bytes in the
-/// same buffer. The second return value is any bytes that arrived after
-/// the `\r\n\r\n` separator; [`drain_body`] must consume them first before
-/// reading more from the socket, otherwise it will wait for Content-Length
-/// bytes that the peer already sent and POST-body tests hang.
-async fn read_http_prelude(stream: &mut TcpStream) -> io::Result<Option<(Request, Vec<u8>)>> {
-    let mut acc: Vec<u8> = Vec::with_capacity(1024);
+/// `carryover` is bytes already read in a previous step (pipelined body
+/// tail, a second request coalesced into the previous `read`, etc.). The
+/// function drains the prelude out of it and leaves any post-`\r\n\r\n`
+/// bytes in place — those may be body bytes for this request or the start
+/// of the *next* pipelined request. [`drain_body`] consumes them next and
+/// leaves any further tail behind.
+///
+/// Returns `Ok(None)` on clean EOF before a full prelude arrives. Parse
+/// failures (non-UTF8 bytes in the prelude, oversized prelude) surface as
+/// `Err` so callers can record them in `step_errors`.
+async fn read_http_prelude(
+    stream: &mut TcpStream,
+    carryover: &mut Vec<u8>,
+) -> io::Result<Option<Request>> {
     let mut buf = [0u8; 1024];
-    loop {
-        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if acc.len() > 32 * 1024 {
+    while !carryover.windows(4).any(|w| w == b"\r\n\r\n") {
+        if carryover.len() > 32 * 1024 {
             return Err(io::Error::other("prelude too large"));
         }
         match stream.read(&mut buf).await {
             Ok(0) => return Ok(None),
-            Ok(n) => acc.extend_from_slice(&buf[..n]),
+            Ok(n) => carryover.extend_from_slice(&buf[..n]),
             Err(e) => return Err(e),
         }
     }
-    let sep_pos = acc
+    let sep_pos = carryover
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(acc.len());
-    let prelude = &acc[..sep_pos];
-    // Bytes past the `\r\n\r\n` separator are the start of the request body
-    // (or pipelined next request). Hand them back so drain_body doesn't
-    // double-read them from the socket.
-    let body_start = sep_pos.saturating_add(4).min(acc.len());
-    let leftover = acc[body_start..].to_vec();
-    let text = std::str::from_utf8(prelude).map_err(io::Error::other)?;
+        .unwrap_or(carryover.len());
+    // Take the prelude out of carryover; everything past the `\r\n\r\n`
+    // separator stays in carryover for drain_body / the next step.
+    let body_start = sep_pos.saturating_add(4).min(carryover.len());
+    let prelude: Vec<u8> = carryover.drain(..body_start).collect();
+    let prelude_slice = &prelude[..sep_pos.min(prelude.len())];
+    let text = std::str::from_utf8(prelude_slice).map_err(io::Error::other)?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -394,26 +397,30 @@ async fn read_http_prelude(stream: &mut TcpStream) -> io::Result<Option<(Request
             headers.push((n.trim().to_string(), v.trim().to_string()));
         }
     }
-    Ok(Some((
-        Request {
-            method,
-            path,
-            version,
-            headers,
-            raw_prelude: prelude.to_vec(),
-        },
-        leftover,
-    )))
+    Ok(Some(Request {
+        method,
+        path,
+        version,
+        headers,
+        raw_prelude: prelude_slice.to_vec(),
+    }))
 }
 
-/// Consume any body the client still has in the socket, as advertised by
-/// Content-Length. `leftover` is body bytes already read during prelude
-/// parsing — they count toward the Content-Length quota, so we only read
-/// the remainder from the socket.
+/// Consume `Content-Length` body bytes for `req`. `carryover` is the
+/// pre-read buffer (bytes that arrived in the same `read()` as the prelude
+/// or a previous step). The function drains `Content-Length` bytes from
+/// the front of `carryover`, then from the socket for any remainder —
+/// **bytes past Content-Length stay in `carryover`** so a subsequent
+/// `ExpectRequest` can parse a pipelined next request without losing the
+/// bytes the peer already sent.
 ///
-/// Transfer-Encoding: chunked is not parsed; if the caller needs to drain a
-/// chunked body they must do so themselves.
-async fn drain_body(stream: &mut TcpStream, req: &Request, leftover: Vec<u8>) -> io::Result<()> {
+/// Transfer-Encoding: chunked is not parsed; if the caller needs to drain
+/// a chunked body they must do so themselves.
+async fn drain_body(
+    stream: &mut TcpStream,
+    req: &Request,
+    carryover: &mut Vec<u8>,
+) -> io::Result<()> {
     let Some(cl) = req.header("content-length") else {
         return Ok(());
     };
@@ -423,13 +430,17 @@ async fn drain_body(stream: &mut TcpStream, req: &Request, leftover: Vec<u8>) ->
     if n == 0 {
         return Ok(());
     }
-    let mut already = leftover.len().min(n);
-    while already < n {
+    // Drain up to N body bytes from the front of carryover, leaving the
+    // tail (pipelined next request) behind.
+    let from_carry = carryover.len().min(n);
+    carryover.drain(..from_carry);
+    let mut remaining = n - from_carry;
+    while remaining > 0 {
         let mut buf = [0u8; 4096];
-        let want = (n - already).min(buf.len());
+        let want = remaining.min(buf.len());
         match stream.read(&mut buf[..want]).await {
             Ok(0) => break,
-            Ok(m) => already += m,
+            Ok(m) => remaining -= m,
             Err(_) => break,
         }
     }
@@ -452,6 +463,9 @@ async fn run_http_script(
     // must not re-read after an explicit `ExpectRequest`, or they'd wait on
     // a second request that never arrives and the test would hang.
     let mut request_consumed = false;
+    // Persistent pre-read buffer carried across steps: body tail past a
+    // previous request's `Content-Length`, pipelined next request, etc.
+    let mut carryover: Vec<u8> = Vec::new();
 
     // Always read one request first unless the very first step is
     // `CloseBeforeStatus` (in which case the client may not even get to
@@ -459,18 +473,31 @@ async fn run_http_script(
     for step in script {
         match step {
             HttpStep::ExpectRequest(matcher) => {
-                let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                if let Some((req, leftover)) = parsed {
-                    drain_body(&mut stream, &req, leftover).await.ok();
-                    // Matcher is informational — the script continues either
-                    // way — but we surface mismatches via a counter so tests
-                    // can observe the result instead of it being silently
-                    // discarded.
-                    if !(matcher.0)(&req) {
-                        state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                match read_http_prelude(&mut stream, &mut carryover).await {
+                    Ok(Some(req)) => {
+                        drain_body(&mut stream, &req, &mut carryover).await.ok();
+                        // Matcher is informational — the script continues either
+                        // way — but we surface mismatches via a counter so tests
+                        // can observe the result instead of it being silently
+                        // discarded.
+                        if !(matcher.0)(&req) {
+                            state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                        }
+                        state.requests.lock().await.push(req);
+                        request_consumed = true;
                     }
-                    state.requests.lock().await.push(req);
-                    request_consumed = true;
+                    Ok(None) => {
+                        state.step_errors.lock().await.push(
+                            "ExpectRequest: peer closed before sending a full request".into(),
+                        );
+                    }
+                    Err(e) => {
+                        state
+                            .step_errors
+                            .lock()
+                            .await
+                            .push(format!("ExpectRequest: failed to parse request: {e}"));
+                    }
                 }
             }
             HttpStep::RespondStatus { status, reason } => {
@@ -501,7 +528,7 @@ async fn run_http_script(
                 // without ever writing a status line. Skip the read if a
                 // prior `ExpectRequest` already consumed it.
                 if !request_consumed {
-                    let _ = read_http_prelude(&mut stream).await;
+                    let _ = read_http_prelude(&mut stream, &mut carryover).await;
                 }
                 let _ = stream.shutdown().await;
                 return Ok(());
@@ -515,12 +542,11 @@ async fn run_http_script(
                 // "awaiting response" state — unless a prior `ExpectRequest`
                 // already did. (The step returns right after writing the
                 // response, so we don't bother flipping `request_consumed`.)
-                if !request_consumed {
-                    let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                    if let Some((r, leftover)) = parsed {
-                        drain_body(&mut stream, &r, leftover).await.ok();
-                        state.requests.lock().await.push(r);
-                    }
+                if !request_consumed
+                    && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
+                {
+                    drain_body(&mut stream, &r, &mut carryover).await.ok();
+                    state.requests.lock().await.push(r);
                 }
                 stream
                     .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -539,12 +565,11 @@ async fn run_http_script(
                 body_prefix,
                 reset,
             } => {
-                if !request_consumed {
-                    let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                    if let Some((r, leftover)) = parsed {
-                        drain_body(&mut stream, &r, leftover).await.ok();
-                        state.requests.lock().await.push(r);
-                    }
+                if !request_consumed
+                    && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
+                {
+                    drain_body(&mut stream, &r, &mut carryover).await.ok();
+                    state.requests.lock().await.push(r);
                 }
                 stream
                     .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -572,12 +597,11 @@ async fn run_http_script(
                 pause,
                 count,
             } => {
-                if !request_consumed {
-                    let parsed = read_http_prelude(&mut stream).await.ok().flatten();
-                    if let Some((r, leftover)) = parsed {
-                        drain_body(&mut stream, &r, leftover).await.ok();
-                        state.requests.lock().await.push(r);
-                    }
+                if !request_consumed
+                    && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
+                {
+                    drain_body(&mut stream, &r, &mut carryover).await.ok();
+                    state.requests.lock().await.push(r);
                 }
                 stream
                     .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -829,6 +853,123 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].path, "/pipe");
         backend.assert_no_matcher_mismatches().await;
+    }
+
+    /// Regression test: a peer that pipelines two requests on one TCP
+    /// connection (request A + Content-Length body + request B) must
+    /// have both surface as `ExpectRequest` hits. Before the fix,
+    /// `drain_body` consumed body bytes up to Content-Length and
+    /// discarded the tail (request B's prelude) that arrived in the
+    /// same `read()`, so the next `ExpectRequest` would block forever.
+    #[tokio::test]
+    async fn pipelined_requests_in_one_tcp_read_are_both_parsed() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "POST", "/first",
+            )))
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "GET", "/second",
+            )))
+            .step(HttpStep::RespondStatus {
+                status: 200,
+                reason: "OK".into(),
+            })
+            .step(HttpStep::RespondHeader {
+                name: "Content-Length".into(),
+                value: "4".into(),
+            })
+            .step(HttpStep::RespondBodyChunk(b"done".to_vec()))
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // Both requests + the first request's body in a single `write_all`.
+        s.write_all(
+            b"POST /first HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n\
+              abc\
+              GET /second HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await
+        .expect("write");
+
+        let fut = async {
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.expect("read");
+            resp
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("second request parsed and response fired within timeout");
+
+        let reqs = backend.received_requests().await;
+        assert_eq!(reqs.len(), 2, "expected both requests: {reqs:?}");
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/first");
+        assert_eq!(reqs[1].method, "GET");
+        assert_eq!(reqs[1].path, "/second");
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
+    }
+
+    /// Regression test: if the peer closes before a full request prelude
+    /// arrives, `ExpectRequest` must surface the failure via
+    /// `step_errors` instead of silently treating it as a matched
+    /// request. A naive `assert_no_matcher_mismatches()`-only test would
+    /// otherwise pass against a zero-request connection.
+    #[tokio::test]
+    async fn expect_request_surfaces_eof_and_parse_failures() {
+        // Case 1: EOF before prelude terminator.
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .spawn()
+            .expect("spawn");
+
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            // Partial prelude, then close.
+            s.write_all(b"GET /never-finished HTTP/1.1\r\n")
+                .await
+                .expect("write");
+            // Drop: FIN before \r\n\r\n.
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let errs = backend.step_errors().await;
+        assert!(
+            errs.iter().any(|e| e.contains("ExpectRequest")),
+            "expected ExpectRequest error for EOF-before-prelude; got {errs:?}"
+        );
+
+        // Case 2: non-UTF-8 bytes in the prelude.
+        let reservation2 = reserve_port().await.expect("port");
+        let port2 = reservation2.port;
+        let backend2 = ScriptedHttp1Backend::builder(reservation2.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .spawn()
+            .expect("spawn");
+
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port2))
+                .await
+                .expect("connect");
+            s.write_all(&[0xFF, 0xFE, b'\r', b'\n', b'\r', b'\n'])
+                .await
+                .expect("write");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let errs2 = backend2.step_errors().await;
+        assert!(
+            errs2.iter().any(|e| e.contains("ExpectRequest")),
+            "expected ExpectRequest error for invalid UTF-8; got {errs2:?}"
+        );
     }
 
     /// Short-reads on `ReadExact`-equivalents (here: a `Content-Length`
