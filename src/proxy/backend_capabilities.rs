@@ -254,15 +254,17 @@ pub type SharedBackendCapabilityRegistry = Arc<BackendCapabilityRegistry>;
 ///
 /// Callers flip `pending` to request a refresh. The first caller also flips
 /// `running` and spawns the refresh task; subsequent callers leave `running`
-/// alone and exit — the running task will re-check `pending` at the end of
-/// each refresh and loop until no more work is outstanding, so their request
-/// is never lost. Two guarantees:
+/// alone and exit — the running task drains `pending` in a loop and then
+/// uses a handoff-safe `try_finish()` that atomically re-checks `pending`
+/// before releasing the runner role, so work queued mid-finish cannot be
+/// orphaned. Invariants:
 ///
-/// - At most one refresh task in flight.
-/// - If a caller sets `pending` after the running task's last `pending.swap`
-///   but before `running.store(false)`, the *next* caller that arrives will
-///   observe `running == false`, become the runner, and drain `pending` —
-///   no silent work loss in the steady state.
+/// - At most one refresh task in flight at any moment.
+/// - If a caller sets `pending` after the running task's last
+///   `take_pending()` but before the runner releases `running`, the
+///   runner observes the new pending flag in `try_finish()` and either
+///   re-acquires the runner role itself or hands off to a freshly-spawned
+///   task — no silent work loss.
 #[derive(Debug, Default)]
 pub struct RefreshCoalescer {
     running: AtomicBool,
@@ -275,23 +277,47 @@ impl RefreshCoalescer {
     }
 
     /// Mark refresh work as needed. Returns `true` if the caller just
-    /// transitioned to the "runner" role and must drive `drain()` in a
-    /// spawned task; `false` means an existing runner will absorb this
-    /// request.
+    /// transitioned to the "runner" role and must drive the refresh loop
+    /// in a spawned task; `false` means an existing runner will absorb
+    /// this request.
     pub fn request(&self) -> bool {
         self.pending.store(true, Ordering::Release);
         !self.running.swap(true, Ordering::AcqRel)
     }
 
     /// Consume one pending flag. Returns `true` when a refresh should run,
-    /// `false` when the runner should release the `running` bit and exit.
+    /// `false` when the inner drain loop has caught up.
     pub fn take_pending(&self) -> bool {
         self.pending.swap(false, Ordering::AcqRel)
     }
 
-    /// Release the runner role. Call after `take_pending()` returns `false`.
-    pub fn finish(&self) {
+    /// Attempt to release the runner role. Returns `true` if the caller is
+    /// truly done and should exit; `false` if a concurrent `request()`
+    /// queued work during the finish window and the caller has re-acquired
+    /// the runner role (must loop back to `take_pending()`).
+    ///
+    /// Guarantees no orphaned `pending` flag: every path leaves either
+    /// `running=false, pending=false` (truly idle), or `running=true` with
+    /// *some* task (this one or a freshly-spawned one) responsible for
+    /// draining.
+    pub fn try_finish(&self) -> bool {
+        // Release the runner role. Any concurrent `request()` from here
+        // onward sees `running=false` and spawns a fresh runner, so the
+        // only race is with a caller that already passed its
+        // `running.swap` *before* this store (i.e. coalesced while we
+        // were still running).
         self.running.store(false, Ordering::Release);
+        if !self.pending.load(Ordering::Acquire) {
+            return true;
+        }
+        // Pending is set and we just cleared `running`. Try to re-acquire
+        // the runner role. `swap` returns the old value:
+        // - old was `false` (we set it true): WE re-acquired → return
+        //   `false` so the caller loops back and drains.
+        // - old was `true` (a fresh `request()` already became the new
+        //   runner): they own the drain → return `true` so the caller
+        //   exits cleanly.
+        self.running.swap(true, Ordering::AcqRel)
     }
 }
 
@@ -469,9 +495,141 @@ mod tests {
         );
         // No more pending now.
         assert!(!coalescer.take_pending());
-        coalescer.finish();
+        assert!(coalescer.try_finish(), "idle runner finishes cleanly");
 
         // After finish, a new request becomes a fresh runner.
         assert!(coalescer.request());
+    }
+
+    #[test]
+    fn refresh_coalescer_try_finish_detects_coalesced_mid_finish_request() {
+        // Regression test for the handoff race: a caller that coalesced
+        // between the runner's last `take_pending()` and its release of
+        // the runner role must not be stranded.
+        let coalescer = RefreshCoalescer::new();
+        assert!(coalescer.request(), "initial runner");
+        assert!(coalescer.take_pending(), "drain initial work");
+        assert!(!coalescer.take_pending(), "no more work");
+
+        // Simulate a caller that races the runner's finish: they set
+        // `pending` and swap `running`, observing running=true (still set
+        // by the current runner) and so coalesce.
+        assert!(
+            !coalescer.request(),
+            "caller mid-finish coalesces with the running runner"
+        );
+
+        // Now the runner calls try_finish. It must observe the
+        // just-coalesced pending flag and re-acquire the runner role
+        // rather than leaving it stranded.
+        assert!(
+            !coalescer.try_finish(),
+            "try_finish must not release when pending is set; it re-acquires the runner role"
+        );
+        assert!(
+            coalescer.take_pending(),
+            "re-acquired runner drains the coalesced pending flag"
+        );
+        assert!(!coalescer.take_pending(), "no further work");
+        assert!(coalescer.try_finish(), "final try_finish releases cleanly");
+    }
+
+    #[test]
+    fn refresh_coalescer_try_finish_idle_case_exits_cleanly() {
+        // Straight happy-path: no one queued work during the finish window,
+        // so try_finish must release the runner role and return `true`.
+        let coalescer = RefreshCoalescer::new();
+        assert!(coalescer.request());
+        assert!(coalescer.take_pending());
+        assert!(!coalescer.take_pending());
+        assert!(coalescer.try_finish(), "idle try_finish exits cleanly");
+        // A fresh request is now a new runner (running is released).
+        assert!(
+            coalescer.request(),
+            "after try_finish, next request is runner"
+        );
+    }
+
+    /// Stress test: race many `request()` calls against runner loops using
+    /// `try_finish`. For every `request()` issued, at least one refresh
+    /// must end up being counted — no pending flag may be orphaned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_coalescer_no_orphaned_pending_under_contention() {
+        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering as AO;
+
+        let coalescer = Arc::new(RefreshCoalescer::new());
+        let refreshes = Arc::new(AtomicU64::new(0));
+        let requests = Arc::new(AtomicU64::new(0));
+
+        // Runner loop mimics `spawn_backend_capability_refresh`'s spawn
+        // closure, with a lightweight "refresh" (just a counter bump).
+        fn spawn_runner(
+            coalescer: Arc<RefreshCoalescer>,
+            refreshes: Arc<AtomicU64>,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                loop {
+                    while coalescer.take_pending() {
+                        refreshes.fetch_add(1, AO::Relaxed);
+                        // Yield to give other tasks a chance to race.
+                        tokio::task::yield_now().await;
+                    }
+                    if coalescer.try_finish() {
+                        break;
+                    }
+                }
+            })
+        }
+
+        let mut handles = Vec::new();
+        // Many concurrent requesters.
+        for _ in 0..64 {
+            let coalescer = coalescer.clone();
+            let requests = requests.clone();
+            let refreshes = refreshes.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..50 {
+                    requests.fetch_add(1, AO::Relaxed);
+                    if coalescer.request() {
+                        // We became the runner — spawn the drain loop.
+                        spawn_runner(coalescer.clone(), refreshes.clone());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Let any in-flight runners drain.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // After quiescence:
+        // 1. No pending flag may remain set.
+        // 2. No runner role may remain held (otherwise a late caller would
+        //    coalesce forever).
+        assert!(
+            !coalescer.pending.load(AO::Acquire),
+            "pending flag leaked after quiescence"
+        );
+        assert!(
+            !coalescer.running.load(AO::Acquire),
+            "running flag leaked after quiescence"
+        );
+        // And: at least one refresh must have happened per requester
+        // burst (coalescing allowed, but total loss of a flag is not).
+        let r = refreshes.load(AO::Relaxed);
+        let q = requests.load(AO::Relaxed);
+        assert!(r >= 1, "no refreshes ran despite {q} requests");
+        assert!(
+            r <= q,
+            "impossibly many refreshes ({r}) for {q} requests — sanity check"
+        );
     }
 }

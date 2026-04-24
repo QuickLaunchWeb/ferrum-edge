@@ -1368,27 +1368,55 @@ impl ProxyState {
 
     /// Request a capability refresh in the background, coalescing overlapping
     /// requests. Callers are fire-and-forget: if a refresh is already running,
-    /// this returns immediately and the in-flight task will re-run the refresh
+    /// this returns immediately and the in-flight task re-drains `pending`
     /// after it completes, so config changes that arrived mid-refresh are
-    /// still picked up without spawning N duplicate tasks.
-    fn spawn_backend_capability_refresh(&self) {
+    /// still picked up without spawning N duplicate tasks or orphaning the
+    /// queued request.
+    pub(crate) fn spawn_backend_capability_refresh(&self) {
         if !self.backend_capabilities_refresh.request() {
             debug!("Backend capability refresh coalesced into in-flight task");
             return;
         }
         let state = self.clone();
         tokio::spawn(async move {
-            while state.backend_capabilities_refresh.take_pending() {
-                state.refresh_backend_capabilities().await;
+            loop {
+                while state.backend_capabilities_refresh.take_pending() {
+                    state.refresh_backend_capabilities().await;
+                }
+                // Handoff-safe finish: if a caller set `pending` between
+                // our last `take_pending()` and `try_finish()`, we either
+                // re-acquire the runner role (return `false`, loop back to
+                // drain again) or observe that someone else has become the
+                // runner in the meantime (return `true`, exit).
+                if state.backend_capabilities_refresh.try_finish() {
+                    break;
+                }
             }
-            state.backend_capabilities_refresh.finish();
         });
     }
 
+    /// Start the periodic background refresh task.
+    ///
+    /// `run_initial_refresh` controls whether this method kicks off an
+    /// immediate refresh before the first interval tick:
+    /// - Callers that already populated the registry via
+    ///   `warmup_connection_pools().await` should pass `false` (the skip
+    ///   avoids a duplicate probe at startup).
+    /// - Callers that did NOT run warmup (DP mode always, or file/db mode
+    ///   when `FERRUM_POOL_WARMUP_ENABLED=false`) must pass `true` —
+    ///   otherwise the registry stays empty until the first periodic tick
+    ///   (default 24 h), which means `supports_native_http3_backend` /
+    ///   `supports_direct_http2_backend` return `false` for every
+    ///   HTTPS request during that window and H3-only backends see
+    ///   persistent cross-protocol-bridge failures.
     pub fn start_backend_capability_refresh_task(
         &self,
+        run_initial_refresh: bool,
         shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
+        if run_initial_refresh {
+            self.spawn_backend_capability_refresh();
+        }
         let state = self.clone();
         let interval_secs = self
             .env_config
@@ -1397,8 +1425,11 @@ impl ProxyState {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            // Skip the immediate first tick — startup warmup already ran a
-            // refresh. We only want the periodic one from here on.
+            // Skip the first immediate tick: either warmup or the explicit
+            // `run_initial_refresh` call above has already kicked off a
+            // probe, or the operator genuinely has no HTTP-family backends
+            // and a no-op tick is harmless. From here on, only the
+            // periodic cadence matters.
             interval.tick().await;
 
             match shutdown {
