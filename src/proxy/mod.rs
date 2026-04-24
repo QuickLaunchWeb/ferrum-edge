@@ -310,27 +310,43 @@ pub(crate) fn supports_native_http3_backend(
             .is_some_and(|record| record.plain_http.h3.is_supported())
 }
 
+/// True when an `ErrorClass` represents an H3 / QUIC transport-level
+/// failure that should downgrade the cached H3 capability to
+/// `Unsupported`. Excludes application-layer / client-side errors
+/// (`ClientDisconnect`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`,
+/// `RequestError`) which do not reflect backend QUIC health.
+pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
+    matches!(
+        class,
+        retry::ErrorClass::ConnectionRefused
+            | retry::ErrorClass::ConnectionTimeout
+            | retry::ErrorClass::ConnectionReset
+            | retry::ErrorClass::ConnectionClosed
+            | retry::ErrorClass::TlsError
+            | retry::ErrorClass::ProtocolError
+            | retry::ErrorClass::DnsLookupError
+            | retry::ErrorClass::PortExhaustion
+            | retry::ErrorClass::ConnectionPoolError
+            | retry::ErrorClass::ReadWriteTimeout
+    )
+}
+
 /// Is this H3 backend response the kind that should downgrade the cached
 /// H3 capability to `Unsupported`? Only connection / protocol-level
 /// failures — not 4xx/5xx application responses, not client disconnects,
 /// not payload-size errors.
+/// Classifies an H3 backend response as a transport-level failure based
+/// on `error_class` ALONE — intentionally ignoring `connection_error`.
+///
+/// Rationale: `classify_h3_error` marks GOAWAY / stream reset / other
+/// protocol errors and non-connect read timeouts with
+/// `connection_error=false`, yet they are still H3 transport failures.
+/// Routing the next request through the same native H3 pool would just
+/// repeat them. Only application-layer outcomes (`ClientDisconnect`,
+/// body-size errors, plain `RequestError`) leave the capability
+/// untouched — those reflect the request, not the backend.
 fn is_h3_transport_failure(resp: &retry::BackendResponse) -> bool {
-    if !resp.connection_error {
-        return false;
-    }
-    matches!(
-        resp.error_class,
-        Some(retry::ErrorClass::ConnectionRefused)
-            | Some(retry::ErrorClass::ConnectionTimeout)
-            | Some(retry::ErrorClass::ConnectionReset)
-            | Some(retry::ErrorClass::ConnectionClosed)
-            | Some(retry::ErrorClass::TlsError)
-            | Some(retry::ErrorClass::ProtocolError)
-            | Some(retry::ErrorClass::DnsLookupError)
-            | Some(retry::ErrorClass::PortExhaustion)
-            | Some(retry::ErrorClass::ConnectionPoolError)
-            | Some(retry::ErrorClass::ReadWriteTimeout)
-    )
+    resp.error_class.is_some_and(is_h3_transport_error_class)
 }
 
 fn supports_direct_http2_backend(
@@ -7375,30 +7391,24 @@ async fn proxy_to_backend(
     // supports H3. gRPC and WebSocket dispatch earlier in the handler and
     // never reach this block, so only Plain-flavor requests can enter.
     //
-    // `client_request_body` becomes `mut` here so that if the H3 attempt
-    // fails with a transport / protocol error AND the body is replayable
-    // (already buffered in memory), we can downgrade the cached H3
-    // capability and fall through to reqwest on this same request instead
-    // of returning 502 while the cache still says "Supported". Streaming
-    // bodies aren't replayable, so we only rescue this request when it
-    // was already buffered upstream.
-    let mut client_request_body = client_request_body;
+    // On H3 transport failure we downgrade the cached capability so
+    // subsequent requests skip the native pool immediately — but we do NOT
+    // replay the body via reqwest on the same request. The failed H3
+    // attempt may already have flushed headers / body to the backend
+    // before the reset, timeout, or protocol error surfaced, so replaying
+    // the same body would bypass the operator's retry policy and could
+    // duplicate non-idempotent requests. The outer retry loop (when
+    // `proxy.retry` is configured) is the only place that decides whether
+    // replay is safe per method + `retry_on_methods`. Without retry, the
+    // 502 propagates to the client and the next request uses reqwest.
     if supports_native_http3_backend(state, proxy, upstream_target) {
-        let replayable_body: Option<Vec<u8>> = match &client_request_body {
-            ClientRequestBody::Buffered(body) => Some(body.clone()),
-            ClientRequestBody::Streaming(_) => None,
-        };
-        let body_for_h3 = std::mem::replace(
-            &mut client_request_body,
-            ClientRequestBody::Buffered(Vec::new()),
-        );
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
             backend_url,
             method,
             headers,
-            body_for_h3,
+            client_request_body,
             plugins,
             upstream_target,
             client_ip,
@@ -7421,34 +7431,16 @@ async fn proxy_to_backend(
         };
 
         if is_h3_transport_failure(&resp) {
-            // Downgrade the cached H3 classification so subsequent requests
-            // skip the H3 pool immediately instead of repeatedly 502-ing
-            // until the 24 h periodic refresh re-probes. The next periodic
-            // refresh restores `Supported` if the backend recovers.
+            debug!(
+                proxy_id = %proxy.id,
+                error_class = ?resp.error_class,
+                "H3 backend transport failed; downgrading cached capability so subsequent requests route via reqwest"
+            );
             state
                 .backend_capabilities
                 .mark_h3_unsupported(proxy, upstream_target);
-
-            if let Some(body) = replayable_body {
-                warn!(
-                    proxy_id = %proxy.id,
-                    error_class = ?resp.error_class,
-                    "H3 backend transport failed; downgraded cached capability and falling back to reqwest for this request"
-                );
-                // Restore the body and fall through to the reqwest / H2
-                // path below.
-                client_request_body = ClientRequestBody::Buffered(body);
-            } else {
-                debug!(
-                    proxy_id = %proxy.id,
-                    error_class = ?resp.error_class,
-                    "H3 backend transport failed; downgraded cached capability, cannot replay streaming body"
-                );
-                return (resp, body_bytes);
-            }
-        } else {
-            return (resp, body_bytes);
         }
+        return (resp, body_bytes);
     }
 
     // Use the direct HTTP/2 pool only when the capability registry has already
@@ -7478,8 +7470,17 @@ async fn proxy_to_backend(
                         debug!(
                             proxy_id = %proxy.id,
                             error = %e,
-                            "HTTP/2 pool negotiated HTTP/1.1 backend — falling back to reqwest"
+                            "HTTP/2 pool negotiated HTTP/1.1 backend — downgrading cached capability and falling back to reqwest"
                         );
+                        // The per-pool-key ALPN learning cache was removed
+                        // when the capability registry took over classification,
+                        // so without this the next request would repeat the
+                        // direct-H2 handshake + ALPN-fallback cost until the
+                        // 24 h refresh re-probes. Downgrade here so subsequent
+                        // requests go straight to reqwest.
+                        state
+                            .backend_capabilities
+                            .mark_h2_tls_unsupported(proxy, upstream_target);
                         None
                     } else {
                         return (
@@ -9598,5 +9599,95 @@ mod tests {
             &ctx,
             false,
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // H3 transport-failure classifier tests (gates the capability downgrade)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn is_h3_transport_error_class_covers_connection_failures() {
+        for class in [
+            retry::ErrorClass::ConnectionRefused,
+            retry::ErrorClass::ConnectionTimeout,
+            retry::ErrorClass::ConnectionReset,
+            retry::ErrorClass::ConnectionClosed,
+            retry::ErrorClass::TlsError,
+            retry::ErrorClass::ProtocolError,
+            retry::ErrorClass::DnsLookupError,
+            retry::ErrorClass::PortExhaustion,
+            retry::ErrorClass::ConnectionPoolError,
+            retry::ErrorClass::ReadWriteTimeout,
+        ] {
+            assert!(
+                is_h3_transport_error_class(class),
+                "expected {class:?} to be a transport-class failure"
+            );
+        }
+    }
+
+    #[test]
+    fn is_h3_transport_error_class_excludes_application_errors() {
+        // Application-layer errors must NOT downgrade the H3 capability — the
+        // backend is fine, the request itself is bad. Downgrading here would
+        // route subsequent requests via reqwest for no operational reason.
+        for class in [
+            retry::ErrorClass::ClientDisconnect,
+            retry::ErrorClass::RequestBodyTooLarge,
+            retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::RequestError,
+        ] {
+            assert!(
+                !is_h3_transport_error_class(class),
+                "{class:?} must not trigger an H3 downgrade"
+            );
+        }
+    }
+
+    #[test]
+    fn is_h3_transport_failure_ignores_connection_error_flag() {
+        // `classify_h3_error` marks GOAWAY / stream reset / ReadWriteTimeout
+        // with `connection_error=false`, so the downgrade predicate must
+        // NOT require that flag. The decision hinges on `error_class`
+        // alone — any transport-level class downgrades, any application-
+        // layer class does not.
+        let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
+            retry::BackendResponse {
+                status_code: 502,
+                body: retry::ResponseBody::Buffered(Vec::new()),
+                headers: HashMap::new(),
+                connection_error,
+                backend_resolved_ip: None,
+                error_class,
+            }
+        };
+
+        // Connect-class failure with connection_error=true: transport failure.
+        assert!(is_h3_transport_failure(&mk(
+            true,
+            Some(retry::ErrorClass::ConnectionTimeout)
+        )));
+        // ProtocolError (GOAWAY / stream reset) with connection_error=false
+        // MUST still downgrade — this is the P2 bug the review called out.
+        assert!(is_h3_transport_failure(&mk(
+            false,
+            Some(retry::ErrorClass::ProtocolError)
+        )));
+        // ReadWriteTimeout with connection_error=false also downgrades.
+        assert!(is_h3_transport_failure(&mk(
+            false,
+            Some(retry::ErrorClass::ReadWriteTimeout)
+        )));
+        // Missing error_class → not classifiable as transport.
+        assert!(!is_h3_transport_failure(&mk(true, None)));
+        // Application-layer error class: NOT a transport failure.
+        assert!(!is_h3_transport_failure(&mk(
+            true,
+            Some(retry::ErrorClass::ClientDisconnect)
+        )));
+        assert!(!is_h3_transport_failure(&mk(
+            false,
+            Some(retry::ErrorClass::RequestBodyTooLarge)
+        )));
     }
 }

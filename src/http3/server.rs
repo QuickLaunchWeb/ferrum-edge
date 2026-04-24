@@ -1382,6 +1382,16 @@ async fn handle_h3_request(
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
                 let h3_error_class = classify_h3_error(&e);
+                // H3 frontend → H3 backend path: QUIC failure here means the
+                // cached H3 capability lied (backend probably lost UDP), so
+                // downgrade the classification. The next H3 request is free
+                // to retry — by then `supports_native_http3_backend` returns
+                // false and the cross-protocol bridge handles it.
+                if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                    state
+                        .backend_capabilities
+                        .mark_h3_unsupported(&proxy, upstream_target.as_deref());
+                }
                 let h3_error_body = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
                     r#"{"error":"DNS resolution for backend failed"}"#
                 } else {
@@ -2455,6 +2465,11 @@ async fn proxy_to_backend_h3_streaming(
         Err(e) => {
             error!("Backend request failed (HTTP/3 streaming): {}", e);
             let h3_error_class = classify_h3_error(&e);
+            if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(proxy, upstream_target);
+            }
             let h3_error_body = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#
             } else {
@@ -2759,6 +2774,11 @@ async fn proxy_to_backend_h3(
                 e
             );
             let h3_error_class = classify_h3_error(&e);
+            if crate::proxy::is_h3_transport_error_class(h3_error_class) {
+                state
+                    .backend_capabilities
+                    .mark_h3_unsupported(proxy, upstream_target);
+            }
             let error_body: &[u8] = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
                 br#"{"error":"DNS resolution for backend failed"}"#
             } else {

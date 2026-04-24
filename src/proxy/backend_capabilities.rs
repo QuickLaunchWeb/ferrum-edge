@@ -183,6 +183,41 @@ impl BackendCapabilityRegistry {
         }
     }
 
+    /// Downgrade the cached H2/TLS classification for a backend target to
+    /// `Unsupported` after observing an ALPN-driven HTTP/1.1 fallback
+    /// (`Http2PoolError::BackendSelectedHttp1`). No-op when the target has
+    /// no cached record.
+    ///
+    /// The direct H2 pool's per-key ALPN learning cache was removed in
+    /// favor of this registry, so without this downgrade every subsequent
+    /// request would re-attempt the direct H2 handshake, re-negotiate
+    /// HTTP/1.1, and re-pay the fallback cost until the next 24 h refresh.
+    /// Marking the backend Unsupported here makes
+    /// `supports_direct_http2_backend` return false for subsequent
+    /// requests so they go straight to reqwest. The gRPC h2 transport
+    /// bucket is downgraded in lockstep since the same ALPN observation
+    /// is the signal for both.
+    pub fn mark_h2_tls_unsupported(&self, proxy: &Proxy, target: Option<&UpstreamTarget>) {
+        let key = capability_key_for_proxy_target(proxy, target);
+        if let Some(mut entry) = self.entries.get_mut(&key)
+            && (!matches!(entry.plain_http.h2_tls, ProtocolSupport::Unsupported)
+                || !matches!(entry.grpc_transport.h2_tls, ProtocolSupport::Unsupported))
+        {
+            let mut new_record = (**entry).clone();
+            new_record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+            new_record.grpc_transport.h2_tls = ProtocolSupport::Unsupported;
+            // Backend still speaks HTTPS over HTTP/1.1 — record that
+            // explicitly so operators can see "h1 only" when eyeballing
+            // the registry.
+            new_record.plain_http.h1 = ProtocolSupport::Supported;
+            new_record.last_probe_at_unix_secs = now_unix_secs();
+            new_record.last_probe_error = Some(
+                "H2/TLS downgraded after ALPN-negotiated HTTP/1.1 on request path".to_string(),
+            );
+            *entry = Arc::new(new_record);
+        }
+    }
+
     pub fn retain_keys(&self, active_keys: &std::collections::HashSet<String>) {
         self.entries.retain(|key, _| active_keys.contains(key));
     }
@@ -513,6 +548,41 @@ mod tests {
         registry.mark_h3_unsupported(&proxy, None);
         let fetched = registry.get(&proxy, None).unwrap();
         assert_eq!(fetched.plain_http.h3, ProtocolSupport::Unsupported);
+    }
+
+    #[test]
+    fn registry_mark_h2_tls_unsupported_downgrades_both_h2_buckets() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        let key = capability_key(&proxy);
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h2_tls = ProtocolSupport::Supported;
+        record.plain_http.h3 = ProtocolSupport::Supported;
+        record.grpc_transport.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(key, record);
+
+        registry.mark_h2_tls_unsupported(&proxy, None);
+
+        let fetched = registry.get(&proxy, None).unwrap();
+        assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Unsupported);
+        assert_eq!(fetched.grpc_transport.h2_tls, ProtocolSupport::Unsupported);
+        assert_eq!(
+            fetched.plain_http.h1,
+            ProtocolSupport::Supported,
+            "HTTPS still works, just over h1"
+        );
+        // H3 classification must NOT be affected — ALPN fallback is an
+        // H2 observation, not an H3 observation.
+        assert_eq!(fetched.plain_http.h3, ProtocolSupport::Supported);
+        assert!(fetched.last_probe_error.is_some());
+    }
+
+    #[test]
+    fn registry_mark_h2_tls_unsupported_is_noop_when_no_cached_entry() {
+        let registry = BackendCapabilityRegistry::new();
+        let proxy = minimal_proxy();
+        registry.mark_h2_tls_unsupported(&proxy, None);
+        assert!(registry.get(&proxy, None).is_none());
     }
 
     #[test]

@@ -301,6 +301,35 @@ Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default
 
 **Policy cross-proxy sharing**: Because pool keys exclude policy fields, proxies resolving to the same entry share policy baked into the client (first-wins). `backend_read_timeout_ms` not observable (applied per-request via `RequestBuilder::timeout()`). `backend_connect_timeout_ms` IS observable (reqwest has no per-request override). Force separation via distinct `dns_override`. Upstream fix tracked: seanmonstar/reqwest#3017.
 
+### Backend Capability Registry (`src/proxy/backend_capabilities.rs`)
+
+Out-of-band protocol classifier that decides whether a plain HTTPS request uses native H3, the direct H2 pool, or reqwest — keyed by deduplicated backend target identity (scheme + host + port + `dns_override` + CA + mTLS cert + mTLS key + verify). The key format matches `Http3ConnectionPool::pool_key` so the classification and QUIC reuse stay aligned.
+
+**Lifecycle**:
+- `warmup_connection_pools()` (file/db with `FERRUM_POOL_WARMUP_ENABLED=true`) awaits a full probe pass before traffic.
+- `start_backend_capability_refresh_task(run_initial_refresh, shutdown)`: spawns the periodic probe every `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` (default 86400 = 24h). Callers pass `true` when warmup was skipped (warmup-off or DP with non-empty initial config) so the registry populates before the first periodic tick — otherwise HTTPS dispatch falls back to reqwest until the 24h mark. DP passes `false` because its startup config is empty; first CP config push triggers `spawn_backend_capability_refresh` via `apply_incremental`/`update_config`.
+- Config reload (`apply_incremental` / `update_config`) calls `spawn_backend_capability_refresh` — the `RefreshCoalescer` guarantees at most one in-flight task plus one queued re-run via a `try_finish` handoff that re-checks `pending` after releasing the runner role, so late config changes are never orphaned.
+
+**Probe parallelism**:
+- Cross-target: `for_each_concurrent(pool_warmup_concurrency)` (default 500), matching the DNS warmup pattern.
+- Intra-target (HTTPS only): `tokio::join!` runs the H2 probe (`probe_h2_tls` borrows `&mut record`) and the H3 probe (`probe_h3` returns `H3ProbeOutcome` to avoid aliasing the mutable record borrow) in parallel, halving worst-case per-target wall-clock.
+- Probe timeouts clamp to `BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP` (5 s) so slow QUIC discovery never holds startup readiness.
+
+**Hot-path lookup**:
+- `BackendCapabilityRegistry::get(proxy, target)` builds the key in a thread-local `RefCell<String>` buffer — zero per-request allocation on repeat calls (mirrors `HTTP2_POOL_KEY_BUF`).
+- `supports_native_http3_backend(state, proxy, target)` and `supports_direct_http2_backend` are two boolean checks on the returned record. `Unknown` / `Unsupported` both route via reqwest, so an empty registry degrades gracefully.
+
+**Stale-cache invalidation**: `mark_h3_unsupported(proxy, target)` and `mark_h2_tls_unsupported(proxy, target)` Arc-swap the cached record to downgrade the relevant bucket with an operator-visible `last_probe_error`.
+
+- H3 downgrade gated by `is_h3_transport_error_class` (ConnectionRefused/Timeout/Reset/Closed/TlsError/ProtocolError/DnsLookupError/PortExhaustion/ConnectionPoolError/ReadWriteTimeout — NOT ClientDisconnect or payload-size errors) via `is_h3_transport_failure`, which inspects `error_class` ONLY. `classify_h3_error` flags GOAWAY / stream reset / non-connect read timeouts with `connection_error=false`; they are still transport failures and must downgrade. Hit sites: `proxy_to_backend`, `proxy_to_backend_http3_retry` (H1/H2 frontend → H3 backend), plus `http3/server.rs` streaming-body / streaming-response / buffered paths (H3 frontend → H3 backend).
+- H2/TLS downgrade fires on `Http2PoolError::BackendSelectedHttp1` in the direct-H2 dispatch branch — the old per-pool-key ALPN learning cache was removed when the capability registry took over, so without this downgrade every subsequent request would repeat the failed H2 handshake + ALPN fallback until the 24 h refresh. The gRPC `h2_tls` bucket is downgraded in lockstep because the same ALPN observation applies. `plain_http.h1` is set to `Supported` to record that the backend still speaks HTTPS — just over HTTP/1.1.
+
+The next periodic refresh re-probes and restores `Supported` if the backend recovers.
+
+**No same-request reqwest fallback after H3 failure**: when an H3 attempt fails transport-class, the capability is downgraded and the 502 propagates. The gateway does NOT replay the body on the same request — the failed H3 attempt may already have flushed headers / body before the reset / protocol error surfaced, so replaying would bypass `proxy.retry.retry_on_methods` and duplicate non-idempotent requests. When retry is configured, the outer retry loop handles replay after re-checking `supports_native_http3_backend` (now false) on the next iteration; that's where method / connection-error policy is enforced.
+
+**Probe outcomes for expected-unsupported cases** (h2c on plaintext HTTP, H3 on most HTTPS backends): classified as `Unsupported` with a `debug!` log — not appended to `last_probe_error`. Only genuine connection/TLS-config failures on HTTPS backends populate the error string so operators don't chase phantom errors every refresh cycle.
+
 ### Health Check Architecture (two-layer)
 
 - **Active probes** (periodic): shared per-upstream in `HealthChecker.active_unhealthy_targets: DashMap<"upstream_id::host:port", u64>`. Failure marks unhealthy for ALL proxies using that upstream (target is genuinely down).
@@ -412,6 +441,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_TRUSTED_PROXIES` (XFF CIDRs); `FERRUM_BACKEND_ALLOW_IPS` (`both`/`private`/`public`)
 - `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (0 = auto `max(10K, proxies × 3)`)
 - `FERRUM_POOL_WARMUP_ENABLED` (`true`); `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` (8 MiB), `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` (32 MiB) — gRPC tuning
+- `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` (86400 = 24h) — background re-classification interval for the backend capability registry (H1/H2/H3 + h2c). Tune down during backend protocol rollouts so H3-upgrade / rollback detection latency shrinks; startup + H3 failure downgrade are the main triggers the rest of the time.
 - `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (65536; eager buffer when CL ≤ this; `0` always stream)
 - `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (32; bounded mpsc for H3→non-H3 cross-protocol request-body bridge; ~512 KiB pipeline depth per upload)
 - `FERRUM_KTLS_ENABLED`/`IO_URING_SPLICE_ENABLED`/`UDP_GSO_ENABLED`/`UDP_PKTINFO_ENABLED`/`UDP_GRO_ENABLED`/`TCP_FASTOPEN_ENABLED` (all `auto` on Linux)
