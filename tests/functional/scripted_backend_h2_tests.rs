@@ -144,6 +144,35 @@ fn grpc_file_config(port: u16, overrides: Value) -> String {
     serde_yaml::to_string(&config).expect("serialize yaml")
 }
 
+/// Spawn a gateway harness with the Phase-2 test defaults.
+///
+/// All tests in this module need the same harness setup:
+///   * `.log_level("info")` so the `stdout_logging` access log at INFO
+///     is emitted,
+///   * `.env("RUST_LOG", "info,access_log=info")` so a reviewer or CI
+///     machine with `RUST_LOG=error` (or similar) in their shell
+///     doesn't silently suppress the access log — `EnvFilter` reads
+///     `RUST_LOG` first and only falls back to `FERRUM_LOG_LEVEL` when
+///     it's unset. Matches the pattern in
+///     `tests/functional/functional_logging_test.rs`.
+///   * `.capture_output()` so `captured_combined()` can read back the
+///     subprocess's stdout/stderr files.
+///
+/// Centralizing these avoids drift — Phase-1 shipped with bare
+/// `.log_level("info")` on each builder call, and a reviewer's
+/// inherited `RUST_LOG` caused the access-log assertions in the
+/// GOAWAY/RST tests to regress until this helper was introduced.
+async fn spawn_grpc_harness(yaml: String) -> GatewayHarness {
+    GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info,access_log=info")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway")
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Test 1 — backend GOAWAY mid-request → 502 + ProtocolError class.
 // ────────────────────────────────────────────────────────────────────────────
@@ -175,13 +204,7 @@ async fn h2_goaway_mid_request_handled_gracefully() {
         .expect("spawn backend");
 
     let yaml = grpc_file_config(backend_port, Value::Null);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
         .proxy_base_url()
@@ -280,13 +303,7 @@ async fn h2_stream_reset_classified_as_protocol_error() {
         .expect("spawn backend");
 
     let yaml = grpc_file_config(backend_port, Value::Null);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
         .proxy_base_url()
@@ -370,13 +387,7 @@ async fn grpc_trailers_missing_produces_internal_status() {
         .expect("spawn backend");
 
     let yaml = grpc_file_config(backend_port, Value::Null);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
         .proxy_base_url()
@@ -449,12 +460,7 @@ async fn grpc_deadline_exceeded_propagates_as_deadline_exceeded_not_unavailable(
         .expect("spawn backend");
 
     let yaml = grpc_file_config(backend_port, Value::Null);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
         .proxy_base_url()
@@ -549,13 +555,7 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
         "backend_read_timeout_ms": read_timeout_ms,
     });
     let yaml = grpc_file_config(backend_port, overrides);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
         .proxy_base_url()
@@ -640,13 +640,7 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
         .expect("spawn backend");
 
     let yaml = grpc_file_config(backend_port, Value::Null);
-    let harness = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .spawn()
-        .await
-        .expect("spawn gateway");
+    let harness = spawn_grpc_harness(yaml).await;
 
     let gw_port = harness
         .proxy_base_url()
