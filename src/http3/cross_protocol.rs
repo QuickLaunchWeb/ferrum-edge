@@ -818,51 +818,102 @@ where
             let reader_bytes = Arc::clone(&bytes_read);
             let oversized = Arc::new(AtomicBool::new(false));
             let reader_oversized = Arc::clone(&oversized);
+            // When the backend resolves first, the outer `select!`
+            // notifies the reader, which halts the recv half
+            // (STOP_SENDING + H3_NO_ERROR) and exits. Without this,
+            // dropping `reader_future` would close the mpsc sender
+            // mid-stream — reqwest surfaces it as a connection error
+            // AND the H3 recv half is left dangling, which the peer
+            // observes as RESET_STREAM(0x0).
+            let halt_notify = Arc::new(tokio::sync::Notify::new());
+            let reader_halt = Arc::clone(&halt_notify);
             let reader_future = async {
                 let mut total: usize = 0;
                 loop {
-                    match stream.recv_data().await {
-                        Ok(Some(chunk)) => {
-                            let data = chunk.chunk();
-                            if max_req_bytes > 0 && total + data.len() > max_req_bytes {
-                                reader_oversized.store(true, Ordering::Relaxed);
-                                let _ = tx
-                                    .send(Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "request body exceeds max_request_body_size_bytes",
-                                    )))
-                                    .await;
-                                return;
-                            }
-                            total += data.len();
-                            reader_bytes.store(total as u64, Ordering::Relaxed);
-                            if tx.send(Ok(Bytes::copy_from_slice(data))).await.is_err() {
-                                return;
-                            }
-                        }
-                        Ok(None) => return,
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(std::io::Error::other(format!(
-                                    "H3 recv_data failed: {}",
-                                    e
-                                ))))
-                                .await;
+                    tokio::select! {
+                        biased;
+                        _ = reader_halt.notified() => {
+                            crate::http3::stream_util::halt_request_body(stream);
                             return;
+                        }
+                        chunk = stream.recv_data() => {
+                            match chunk {
+                                Ok(Some(chunk)) => {
+                                    let data = chunk.chunk();
+                                    if max_req_bytes > 0 && total + data.len() > max_req_bytes {
+                                        reader_oversized.store(true, Ordering::Relaxed);
+                                        crate::http3::stream_util::halt_request_body(stream);
+                                        let _ = tx
+                                            .send(Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "request body exceeds max_request_body_size_bytes",
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    total += data.len();
+                                    reader_bytes.store(total as u64, Ordering::Relaxed);
+                                    if tx.send(Ok(Bytes::copy_from_slice(data))).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => return,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(Err(std::io::Error::other(format!(
+                                            "H3 recv_data failed: {}",
+                                            e
+                                        ))))
+                                        .await;
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
             };
 
+            // Race resolution: the reader_future MUST stay polled until
+            // it exits cleanly, otherwise dropping it closes the mpsc
+            // sender mid-stream and reqwest surfaces the aborted body as
+            // a connection error — AND the H3 recv half is left
+            // dangling, which the peer observes as RESET_STREAM(0x0).
+            // When the backend resolves first (common for early errors
+            // and small 2xx responses while the client is still
+            // uploading) we notify the reader so it halts the recv
+            // half itself and exits naturally. A short grace deadline
+            // caps the time we wait for the reader after the backend
+            // has already answered.
+            let drain_ms = state.env_config.h3_request_body_drain_ms;
             let send_result = {
                 tokio::pin!(send_future);
                 tokio::pin!(reader_future);
                 let mut reader_done = false;
                 loop {
                     tokio::select! {
-                        biased;
-                        result = &mut send_future => break result,
-                        _ = &mut reader_future, if !reader_done => { reader_done = true; }
+                        result = &mut send_future => {
+                            if !reader_done {
+                                if drain_ms > 0 {
+                                    let drain_deadline = Duration::from_millis(drain_ms);
+                                    if let Ok(()) =
+                                        tokio::time::timeout(drain_deadline, &mut reader_future)
+                                            .await
+                                    {
+                                        reader_done = true;
+                                    }
+                                }
+                                if !reader_done {
+                                    halt_notify.notify_one();
+                                    let halt_deadline = Duration::from_millis(100);
+                                    let _ = tokio::time::timeout(halt_deadline, &mut reader_future)
+                                        .await;
+                                }
+                            }
+                            break result;
+                        }
+                        _ = &mut reader_future, if !reader_done => {
+                            reader_done = true;
+                        }
                     }
                 }
             };
@@ -2199,6 +2250,7 @@ where
     let len = bytes.len() as u64;
     let _ = stream.send_data(bytes).await;
     let _ = stream.finish().await;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
         bytes_streamed: len,
@@ -2254,6 +2306,7 @@ where
         let _ = stream.send_data(Bytes::copy_from_slice(body)).await;
     }
     let _ = stream.finish().await;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
         bytes_streamed: len,
@@ -2382,6 +2435,7 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: reject.http_status.as_u16(),
         bytes_streamed: 0,
@@ -2465,6 +2519,7 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
+    crate::http3::stream_util::halt_request_body(stream);
     Ok(CrossProtocolOutcome {
         response_status: 200,
         bytes_streamed: 0,
@@ -2657,6 +2712,85 @@ mod tests {
         assert_eq!(
             ctx.metadata.get("grpc_message").map(|value| value.as_str()),
             Some("Rate limit exceeded")
+        );
+    }
+
+    /// Regression test for the cross-protocol `select!` race: when the
+    /// backend resolves before the request-body reader finishes, the
+    /// reader must be notified (not dropped mid-stream). This mirrors
+    /// the `halt_notify` + drain + timeout loop in `dispatch_plain`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backend_early_response_notifies_reader_instead_of_dropping_it() {
+        use std::pin::pin;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let halt_notify = Arc::new(Notify::new());
+        let reader_halted = Arc::new(AtomicBool::new(false));
+
+        let reader_halt = Arc::clone(&halt_notify);
+        let reader_flag = Arc::clone(&reader_halted);
+        let reader_future = async move {
+            tokio::select! {
+                biased;
+                _ = reader_halt.notified() => {
+                    reader_flag.store(true, Ordering::Release);
+                }
+                () = std::future::pending::<()>() => {}
+            }
+        };
+
+        // Simulates `send_future` completing first (backend responded
+        // while the client was still uploading). Kept at 1 ms so the
+        // reader_future loses the race deterministically on the same
+        // runtime without needing `tokio::test(start_paused)`.
+        let send_future = async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            "ok"
+        };
+
+        let drain_ms = 5_u64;
+        let result: &str = {
+            let mut send_future = pin!(send_future);
+            let mut reader_future = pin!(reader_future);
+            let mut reader_done = false;
+            loop {
+                tokio::select! {
+                    result = &mut send_future => {
+                        if !reader_done {
+                            if drain_ms > 0 {
+                                let drain_deadline = Duration::from_millis(drain_ms);
+                                if let Ok(()) = tokio::time::timeout(
+                                    drain_deadline,
+                                    &mut reader_future,
+                                ).await {
+                                    reader_done = true;
+                                }
+                            }
+                            if !reader_done {
+                                halt_notify.notify_one();
+                                let halt_deadline = Duration::from_millis(100);
+                                let _ = tokio::time::timeout(
+                                    halt_deadline,
+                                    &mut reader_future,
+                                ).await;
+                            }
+                        }
+                        break result;
+                    }
+                    _ = &mut reader_future, if !reader_done => {
+                        reader_done = true;
+                    }
+                }
+            }
+        };
+
+        assert_eq!(result, "ok");
+        assert!(
+            reader_halted.load(Ordering::Acquire),
+            "reader must be notified and halted when backend wins the race"
         );
     }
 
