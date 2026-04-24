@@ -287,6 +287,12 @@ async fn run_script(
     script: Vec<TcpStep>,
     state: Arc<BackendState>,
 ) -> Result<(), StepError> {
+    // Bytes already read past the boundary of a previous `ReadUntil` step.
+    // `ReadExact` and `ReadUntil` consume from here before touching the
+    // socket again, so a script like
+    //   ReadUntil(b"\r\n\r\n") → ReadExact(body_len)
+    // works when the peer packs headers+body into a single TCP segment.
+    let mut leftover: Vec<u8> = Vec::new();
     for step in script {
         match step {
             TcpStep::Accept => {
@@ -296,6 +302,12 @@ async fn run_script(
             TcpStep::ReadExact(n) => {
                 let mut buf = vec![0u8; n];
                 let mut read = 0;
+                if !leftover.is_empty() {
+                    let take = leftover.len().min(n);
+                    buf[..take].copy_from_slice(&leftover[..take]);
+                    leftover.drain(..take);
+                    read = take;
+                }
                 while read < n {
                     match stream.read(&mut buf[read..]).await {
                         Ok(0) => {
@@ -320,12 +332,10 @@ async fn run_script(
                     .extend_from_slice(&buf[..read]);
             }
             TcpStep::ReadUntil(needle) => {
-                let mut acc = Vec::new();
+                let mut acc = std::mem::take(&mut leftover);
+                let mut boundary = find_subsequence(&acc, &needle).map(|p| p + needle.len());
                 let mut buf = [0u8; 4096];
-                loop {
-                    if find_subsequence(&acc, &needle).is_some() {
-                        break;
-                    }
+                while boundary.is_none() {
                     match stream.read(&mut buf).await {
                         Ok(0) => {
                             state.received_bytes.lock().await.extend_from_slice(&acc);
@@ -334,14 +344,25 @@ async fn run_script(
                                 actual: acc.len(),
                             });
                         }
-                        Ok(m) => acc.extend_from_slice(&buf[..m]),
+                        Ok(m) => {
+                            acc.extend_from_slice(&buf[..m]);
+                            boundary = find_subsequence(&acc, &needle).map(|p| p + needle.len());
+                        }
                         Err(e) => {
                             state.received_bytes.lock().await.extend_from_slice(&acc);
                             return Err(StepError::Io(e));
                         }
                     }
                 }
-                state.received_bytes.lock().await.extend_from_slice(&acc);
+                let end = boundary.expect("boundary set by loop exit");
+                // Record only up to (and including) the needle, stash the
+                // rest for the next step so nothing is silently consumed.
+                state
+                    .received_bytes
+                    .lock()
+                    .await
+                    .extend_from_slice(&acc[..end]);
+                leftover = acc[end..].to_vec();
             }
             TcpStep::Write(bytes) => stream.write_all(&bytes).await?,
             TcpStep::Sleep(d) => tokio::time::sleep(d).await,
@@ -482,6 +503,50 @@ mod tests {
         // The backend drops the socket right after accept; client sees EOF.
         let n = client.read(&mut buf).await.expect("read");
         assert_eq!(n, 0, "expected EOF after drop, got {n} bytes");
+    }
+
+    /// Regression test: a peer that packs the `ReadUntil` delimiter and
+    /// subsequent body bytes into a single TCP segment must not lose the
+    /// body bytes. A prior implementation consumed everything into `acc`
+    /// and discarded the tail, so a follow-up `ReadExact` would hang
+    /// waiting for bytes the peer had already sent.
+    #[tokio::test]
+    async fn read_until_preserves_bytes_past_needle_for_next_step() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+            .step(TcpStep::ReadExact(5))
+            .step(TcpStep::Write(b"ack\n".to_vec()))
+            .step(TcpStep::Drop)
+            .spawn()
+            .expect("spawn");
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        // Headers + body in a single write — the backend must not lose the
+        // 5 bytes of body that arrive with the \r\n\r\n terminator.
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nhello")
+            .await
+            .expect("write");
+
+        let fut = async {
+            let mut resp = Vec::new();
+            client.read_to_end(&mut resp).await.expect("read");
+            resp
+        };
+        let resp = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("second step completed within timeout");
+        assert_eq!(resp, b"ack\n");
+
+        let received = backend.received_bytes().await;
+        assert!(
+            received.ends_with(b"hello"),
+            "expected body bytes recorded after needle, got {received:?}"
+        );
     }
 
     #[tokio::test]

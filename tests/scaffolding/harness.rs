@@ -313,20 +313,6 @@ impl GatewayHarness {
         self.gateway.temp_dir.path()
     }
 
-    /// JSON builder helper: POST `{proxies, consumers, upstreams, plugins}`
-    /// to the admin reload endpoint. Currently sends `POST /reload` which
-    /// is the endpoint file-mode tests use when `FERRUM_FILE_CONFIG_PATH`
-    /// has been rewritten; for database/CP mode the same payload should be
-    /// driven through `/proxies` / `/consumers` batch endpoints.
-    ///
-    /// Returns the reload response body (may be empty on success).
-    pub async fn reload(
-        &self,
-        config: &Value,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        self.post_admin_json("/reload", config).await
-    }
-
     /// A convenience for typical "send a GET through the proxy" assertions.
     pub async fn proxy_get(
         &self,

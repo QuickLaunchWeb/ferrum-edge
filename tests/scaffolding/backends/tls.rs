@@ -299,12 +299,21 @@ async fn run_tls_script(
     script: Vec<TcpStep>,
     state: Arc<TlsBackendState>,
 ) -> Result<(), StepError> {
+    // See the matching comment in `tcp.rs::run_script` — preserves bytes
+    // read past a `ReadUntil` needle for the next step.
+    let mut leftover: Vec<u8> = Vec::new();
     for step in script {
         match step {
             TcpStep::Accept => {}
             TcpStep::ReadExact(n) => {
                 let mut buf = vec![0u8; n];
                 let mut read = 0;
+                if !leftover.is_empty() {
+                    let take = leftover.len().min(n);
+                    buf[..take].copy_from_slice(&leftover[..take]);
+                    leftover.drain(..take);
+                    read = take;
+                }
                 while read < n {
                     match stream.read(&mut buf[read..]).await {
                         Ok(0) => {
@@ -329,12 +338,15 @@ async fn run_tls_script(
                     .extend_from_slice(&buf[..read]);
             }
             TcpStep::ReadUntil(needle) => {
-                let mut acc = Vec::new();
+                let mut acc = std::mem::take(&mut leftover);
+                let find = |bytes: &[u8]| -> Option<usize> {
+                    bytes
+                        .windows(needle.len())
+                        .position(|w| w == needle.as_slice())
+                };
+                let mut boundary = find(&acc).map(|p| p + needle.len());
                 let mut buf = [0u8; 4096];
-                loop {
-                    if acc.windows(needle.len()).any(|w| w == needle.as_slice()) {
-                        break;
-                    }
+                while boundary.is_none() {
                     match stream.read(&mut buf).await {
                         Ok(0) => {
                             state.received_bytes.lock().await.extend_from_slice(&acc);
@@ -343,11 +355,23 @@ async fn run_tls_script(
                                 actual: acc.len(),
                             });
                         }
-                        Ok(m) => acc.extend_from_slice(&buf[..m]),
-                        Err(e) => return Err(StepError::Io(e)),
+                        Ok(m) => {
+                            acc.extend_from_slice(&buf[..m]);
+                            boundary = find(&acc).map(|p| p + needle.len());
+                        }
+                        Err(e) => {
+                            state.received_bytes.lock().await.extend_from_slice(&acc);
+                            return Err(StepError::Io(e));
+                        }
                     }
                 }
-                state.received_bytes.lock().await.extend_from_slice(&acc);
+                let end = boundary.expect("boundary set by loop exit");
+                state
+                    .received_bytes
+                    .lock()
+                    .await
+                    .extend_from_slice(&acc[..end]);
+                leftover = acc[end..].to_vec();
             }
             TcpStep::Write(bytes) => stream.write_all(&bytes).await?,
             TcpStep::Sleep(d) => tokio::time::sleep(d).await,
