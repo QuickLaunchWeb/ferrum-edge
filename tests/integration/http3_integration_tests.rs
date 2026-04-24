@@ -463,6 +463,9 @@ async fn test_http3_proxy_state_creation() {
         backend_capabilities: Arc::new(
             ferrum_edge::proxy::backend_capabilities::BackendCapabilityRegistry::new(),
         ),
+        backend_capabilities_refresh: Arc::new(
+            ferrum_edge::proxy::backend_capabilities::RefreshCoalescer::new(),
+        ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
@@ -694,6 +697,9 @@ async fn test_http3_full_integration() {
         )),
         backend_capabilities: Arc::new(
             ferrum_edge::proxy::backend_capabilities::BackendCapabilityRegistry::new(),
+        ),
+        backend_capabilities_refresh: Arc::new(
+            ferrum_edge::proxy::backend_capabilities::RefreshCoalescer::new(),
         ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),

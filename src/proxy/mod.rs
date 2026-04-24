@@ -89,7 +89,7 @@ use crate::tls::{NoVerifier, TlsPolicy};
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
-    ProtocolSupport, SharedBackendCapabilityRegistry,
+    ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
@@ -104,6 +104,44 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
 /// Capability probes run during startup and background refresh, so they should
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
+
+/// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
+/// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
+/// parallel via `tokio::join!` so it can't simultaneously alias that borrow.
+/// Instead it returns this struct; `apply()` merges the result into the
+/// shared record + error list when the join completes.
+struct H3ProbeOutcome {
+    h3: ProtocolSupport,
+    error: Option<String>,
+}
+
+impl H3ProbeOutcome {
+    fn apply(self, record: &mut BackendCapabilityRecord, errors: &mut Vec<String>) {
+        if !matches!(self.h3, ProtocolSupport::Unknown) {
+            record.plain_http.h3 = self.h3;
+        }
+        if let Some(err) = self.error {
+            errors.push(err);
+        }
+    }
+}
+
+/// Append a probe-error message into `record.last_probe_error` without
+/// stomping an existing error. Used by `probe_h2_tls` which borrows the
+/// record mutably (can't also borrow the outer `errors` vec) — the outer
+/// caller recombines any `last_probe_error` set here with its own `errors`
+/// list.
+fn append_probe_error(record: &mut BackendCapabilityRecord, msg: String) {
+    match record.last_probe_error.as_mut() {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&msg);
+        }
+        None => {
+            record.last_probe_error = Some(msg);
+        }
+    }
+}
 
 /// Boxed future type for pool warmup tasks.
 /// Returns `Ok(description)` on success or `Err(message)` on failure.
@@ -568,6 +606,11 @@ pub struct ProxyState {
     pub h3_pool: Arc<Http3ConnectionPool>,
     /// Startup-classified backend protocol capabilities keyed by real backend target identity.
     pub backend_capabilities: SharedBackendCapabilityRegistry,
+    /// Single-flight guard for the capability refresh task. Coalesces bursts
+    /// of config-reload triggers into at most one in-flight refresh plus one
+    /// queued re-run so rapid `apply_incremental` calls do not spawn N
+    /// duplicate background probes.
+    pub backend_capabilities_refresh: SharedRefreshCoalescer,
     /// Load balancer cache for upstream target selection.
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
@@ -715,6 +758,7 @@ impl ProxyState {
             dns_cache.clone(),
         ));
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::new());
+        let backend_capabilities_refresh = Arc::new(RefreshCoalescer::new());
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
             env_config,
@@ -938,6 +982,7 @@ impl ProxyState {
             http2_pool,
             h3_pool,
             backend_capabilities,
+            backend_capabilities_refresh,
             alt_svc_header,
             via_header_http11,
             via_header_http2,
@@ -1072,108 +1117,204 @@ impl ProxyState {
         target: &BackendCapabilityProbeTarget,
     ) -> BackendCapabilityRecord {
         let scheme = target.scheme();
-        let mut record = BackendCapabilityRecord::for_scheme(scheme);
+        let mut record = BackendCapabilityRecord::default();
+        // Accumulates *unexpected* probe failures only — connection errors on
+        // TLS backends and TLS-config setup errors. Expected "backend doesn't
+        // speak protocol X" outcomes (e.g., h2c not deployed on a plaintext
+        // backend, QUIC not deployed on a TLS backend) drop to debug and
+        // record a definitive `Unsupported`, which keeps operators from
+        // chasing phantom errors on every refresh cycle.
         let mut errors = Vec::new();
         let probe_proxy = Self::build_backend_capability_probe_proxy(&target.proxy);
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
+        let host = target.host();
+        let port = target.port();
 
         match scheme {
             BackendScheme::Http => {
                 record.plain_http.h1 = ProtocolSupport::Supported;
-                match tokio::time::timeout(probe_timeout, self.grpc_pool.get_sender(&probe_proxy))
-                    .await
-                {
-                    Ok(Ok(_)) => {
-                        record.grpc_transport.h2c = ProtocolSupport::Supported;
-                    }
-                    Ok(Err(err)) => {
-                        errors.push(format!(
-                            "h2c probe failed for {}:{}: {}",
-                            target.host, target.port, err
-                        ));
-                    }
-                    Err(_) => {
-                        errors.push(format!(
-                            "h2c probe timed out for {}:{} after {}ms",
-                            target.host, target.port, probe_proxy.backend_connect_timeout_ms
-                        ));
-                    }
-                }
+                self.probe_h2c(&probe_proxy, probe_timeout, host, port, &mut record)
+                    .await;
             }
             BackendScheme::Https => {
-                match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(&probe_proxy))
-                    .await
-                {
-                    Ok(Ok(_)) => {
-                        record.plain_http.h2_tls = ProtocolSupport::Supported;
-                        record.grpc_transport.h2_tls = ProtocolSupport::Supported;
-                    }
-                    Ok(Err(http2_pool::Http2PoolError::BackendSelectedHttp1 { .. })) => {
-                        record.plain_http.h1 = ProtocolSupport::Supported;
-                        record.plain_http.h2_tls = ProtocolSupport::Unsupported;
-                        record.grpc_transport.h2_tls = ProtocolSupport::Unsupported;
-                    }
-                    Ok(Err(err)) => {
-                        errors.push(format!(
-                            "HTTP/2 probe failed for {}:{}: {}",
-                            target.host, target.port, err
-                        ));
-                    }
-                    Err(_) => {
-                        errors.push(format!(
-                            "HTTP/2 probe timed out for {}:{} after {}ms",
-                            target.host, target.port, probe_proxy.backend_connect_timeout_ms
-                        ));
-                    }
-                }
-
-                match self
+                // Run the H2 and H3 probes concurrently against the same
+                // backend target. They hit independent transports (TCP+TLS
+                // vs. UDP+QUIC), independent pools, and independent rustls
+                // configs, so there's no shared state to serialize on.
+                // Without this, a backend with slow TLS + slow QUIC would
+                // double the per-target wall-clock; `for_each_concurrent`
+                // only parallelizes *across* targets, not within one.
+                let tls_config_result = self
                     .connection_pool
-                    .get_tls_config_for_backend(&probe_proxy)
-                {
-                    Ok(tls_config) => {
-                        match tokio::time::timeout(
-                            probe_timeout,
-                            self.h3_pool.warmup_connection(&probe_proxy, &tls_config),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                record.plain_http.h3 = ProtocolSupport::Supported;
-                            }
-                            Ok(Err(err)) => {
-                                errors.push(format!(
-                                    "HTTP/3 probe failed for {}:{}: {}",
-                                    target.host, target.port, err
-                                ));
-                            }
-                            Err(_) => {
-                                errors.push(format!(
-                                    "HTTP/3 probe timed out for {}:{} after {}ms",
-                                    target.host,
-                                    target.port,
-                                    probe_proxy.backend_connect_timeout_ms
-                                ));
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        errors.push(format!(
-                            "HTTP/3 TLS config failed for {}:{}: {}",
-                            target.host, target.port, err
-                        ));
-                    }
-                }
+                    .get_tls_config_for_backend(&probe_proxy);
+                let h2_fut =
+                    self.probe_h2_tls(&probe_proxy, probe_timeout, host, port, &mut record);
+                let h3_fut = Self::probe_h3(
+                    &self.h3_pool,
+                    &probe_proxy,
+                    probe_timeout,
+                    tls_config_result,
+                    host,
+                    port,
+                );
+                let (_, h3_outcome) = tokio::join!(h2_fut, h3_fut);
+                h3_outcome.apply(&mut record, &mut errors);
             }
             BackendScheme::Tcp | BackendScheme::Tcps | BackendScheme::Udp | BackendScheme::Dtls => {
             }
         }
 
         record.last_probe_at_unix_secs = backend_capabilities::now_unix_secs();
+        // `probe_h2_tls` writes its own errors into `record.last_probe_error`
+        // directly (it owns `&mut record` alongside the join!-running H3
+        // future). `probe_h3`'s errors come back via the outcome struct in
+        // `errors`. Merge both sources here.
         if !errors.is_empty() {
-            record.last_probe_error = Some(errors.join("; "));
+            let joined = errors.join("; ");
+            match record.last_probe_error.as_mut() {
+                Some(existing) => {
+                    existing.push_str("; ");
+                    existing.push_str(&joined);
+                }
+                None => record.last_probe_error = Some(joined),
+            }
         }
         record
+    }
+
+    /// h2c prior-knowledge probe for a plaintext HTTP backend. Borrows
+    /// `record` so the outcome is written directly; genuine errors (none
+    /// expected for h2c — "backend doesn't speak h2c" is the normal case)
+    /// drop to `debug!` and classify as `Unsupported`.
+    async fn probe_h2c(
+        &self,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        host: &str,
+        port: u16,
+        record: &mut BackendCapabilityRecord,
+    ) {
+        match tokio::time::timeout(probe_timeout, self.grpc_pool.get_sender(probe_proxy)).await {
+            Ok(Ok(_)) => {
+                record.grpc_transport.h2c = ProtocolSupport::Supported;
+            }
+            Ok(Err(err)) => {
+                record.grpc_transport.h2c = ProtocolSupport::Unsupported;
+                debug!(
+                    "h2c probe for {}:{} classified unsupported: {}",
+                    host, port, err
+                );
+            }
+            Err(_) => {
+                debug!(
+                    "h2c probe for {}:{} timed out after {}ms; leaving unknown",
+                    host, port, probe_proxy.backend_connect_timeout_ms
+                );
+            }
+        }
+    }
+
+    /// H2/TLS probe. Borrows `record` so the H2 + H1-fallback outcome is
+    /// written directly; unexpected connection failures are surfaced to the
+    /// caller via `errors` (this is the genuine "can't reach an HTTPS
+    /// backend" signal the operator should see).
+    async fn probe_h2_tls(
+        &self,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        host: &str,
+        port: u16,
+        record: &mut BackendCapabilityRecord,
+    ) {
+        match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(probe_proxy)).await {
+            Ok(Ok(_)) => {
+                record.plain_http.h2_tls = ProtocolSupport::Supported;
+                record.grpc_transport.h2_tls = ProtocolSupport::Supported;
+            }
+            Ok(Err(http2_pool::Http2PoolError::BackendSelectedHttp1 { .. })) => {
+                record.plain_http.h1 = ProtocolSupport::Supported;
+                record.plain_http.h2_tls = ProtocolSupport::Unsupported;
+                record.grpc_transport.h2_tls = ProtocolSupport::Unsupported;
+            }
+            Ok(Err(err)) => {
+                // We need to collect this error for `last_probe_error`, but
+                // the outer function writes `errors` and we can't borrow it
+                // through the join! Thread the message via
+                // `record.last_probe_error` directly instead — the outer
+                // function merges this into the combined error string.
+                append_probe_error(
+                    record,
+                    format!("HTTP/2 probe failed for {host}:{port}: {err}"),
+                );
+            }
+            Err(_) => {
+                append_probe_error(
+                    record,
+                    format!(
+                        "HTTP/2 probe timed out for {}:{} after {}ms",
+                        host, port, probe_proxy.backend_connect_timeout_ms
+                    ),
+                );
+            }
+        }
+    }
+
+    /// H3 / QUIC probe. Returns an outcome the caller merges into `record` +
+    /// the outer `errors` vec. Takes `&Arc<Http3ConnectionPool>` plus a
+    /// pre-computed `tls_config_result` so the synchronous TLS-config build
+    /// (a real error case) is folded in without duplicating the timeout
+    /// handling. Written as an associated fn so it can be polled via
+    /// `tokio::join!` alongside `probe_h2_tls` (which borrows `&mut record`)
+    /// without aliasing `self`.
+    async fn probe_h3(
+        h3_pool: &Arc<Http3ConnectionPool>,
+        probe_proxy: &Proxy,
+        probe_timeout: Duration,
+        tls_config_result: Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+        host: &str,
+        port: u16,
+    ) -> H3ProbeOutcome {
+        let tls_config = match tls_config_result {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                return H3ProbeOutcome {
+                    h3: ProtocolSupport::Unknown,
+                    error: Some(format!("HTTP/3 TLS config failed for {host}:{port}: {err}")),
+                };
+            }
+        };
+
+        match tokio::time::timeout(
+            probe_timeout,
+            h3_pool.warmup_connection(probe_proxy, &tls_config),
+        )
+        .await
+        {
+            Ok(Ok(())) => H3ProbeOutcome {
+                h3: ProtocolSupport::Supported,
+                error: None,
+            },
+            Ok(Err(err)) => {
+                debug!(
+                    "HTTP/3 probe for {}:{} classified unsupported: {}",
+                    host, port, err
+                );
+                H3ProbeOutcome {
+                    h3: ProtocolSupport::Unsupported,
+                    error: None,
+                }
+            }
+            Err(_) => {
+                debug!(
+                    "HTTP/3 probe for {}:{} timed out after {}ms; leaving unknown",
+                    host, port, probe_proxy.backend_connect_timeout_ms
+                );
+                H3ProbeOutcome {
+                    h3: ProtocolSupport::Unknown,
+                    error: None,
+                }
+            }
+        }
     }
 
     pub async fn refresh_backend_capabilities(&self) {
@@ -1225,10 +1366,22 @@ impl ProxyState {
         );
     }
 
+    /// Request a capability refresh in the background, coalescing overlapping
+    /// requests. Callers are fire-and-forget: if a refresh is already running,
+    /// this returns immediately and the in-flight task will re-run the refresh
+    /// after it completes, so config changes that arrived mid-refresh are
+    /// still picked up without spawning N duplicate tasks.
     fn spawn_backend_capability_refresh(&self) {
+        if !self.backend_capabilities_refresh.request() {
+            debug!("Backend capability refresh coalesced into in-flight task");
+            return;
+        }
         let state = self.clone();
         tokio::spawn(async move {
-            state.refresh_backend_capabilities().await;
+            while state.backend_capabilities_refresh.take_pending() {
+                state.refresh_backend_capabilities().await;
+            }
+            state.backend_capabilities_refresh.finish();
         });
     }
 
@@ -1244,20 +1397,22 @@ impl ProxyState {
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            // Skip the immediate first tick — startup warmup already ran a
+            // refresh. We only want the periodic one from here on.
             interval.tick().await;
 
             match shutdown {
                 Some(mut shutdown_rx) => loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            state.refresh_backend_capabilities().await;
+                            state.spawn_backend_capability_refresh();
                         }
                         _ = shutdown_rx.changed() => break,
                     }
                 },
                 None => loop {
                     interval.tick().await;
-                    state.refresh_backend_capabilities().await;
+                    state.spawn_backend_capability_refresh();
                 },
             }
         });

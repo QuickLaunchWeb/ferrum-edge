@@ -987,3 +987,94 @@ fn backend_capability_key_includes_tls_identity_fields() {
         "capability key must distinguish different TLS identities"
     );
 }
+
+#[test]
+fn backend_capability_key_separates_distinct_dns_overrides() {
+    // Two otherwise-identical proxies pointed at the same logical backend
+    // must NOT share a capability entry when they pin different resolved
+    // IPs via `dns_override`: the probe result for one resolution target
+    // is not a valid proxy for the other.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.dns_override = Some("10.0.0.1".to_string());
+
+    let mut p2 = p1.clone();
+    p2.dns_override = Some("10.0.0.2".to_string());
+
+    assert_ne!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "dns_override must segregate capability entries"
+    );
+}
+
+#[test]
+fn backend_capability_key_separates_verify_server_cert_toggles() {
+    // Whether the backend cert is actually validated is part of the
+    // trust chain; probes with and without verification are not
+    // interchangeable observations.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.verify_server_cert = true;
+
+    let mut p2 = p1.clone();
+    p2.resolved_tls.verify_server_cert = false;
+
+    assert_ne!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "verify_server_cert must segregate capability entries"
+    );
+}
+
+#[test]
+fn backend_capability_key_reuses_entry_across_equivalent_proxies() {
+    // Two proxies with the same resolved identity (scheme, host, port,
+    // dns_override, TLS fields) must hash to the exact same key so they
+    // share one probe result in the registry.
+    let mut p1 = minimal_proxy();
+    p1.backend_scheme = Some(BackendScheme::Https);
+    p1.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    p1.resolved_tls.server_ca_cert_path = Some("/ca/shared.pem".to_string());
+    p1.resolved_tls.verify_server_cert = true;
+
+    let mut p2 = p1.clone();
+    p2.id = "different-proxy-id".to_string();
+    p2.listen_path = Some("/other".to_string());
+    p2.strip_listen_path = !p1.strip_listen_path;
+
+    assert_eq!(
+        capability_key(&p1),
+        capability_key(&p2),
+        "proxy identity / path fields must not leak into the capability key"
+    );
+}
+
+#[test]
+fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
+    // When an upstream target is supplied, it completely replaces the
+    // proxy's template host/port in the key. Probes are keyed by the
+    // real connection endpoint, not the proxy's fallback values.
+    let proxy = minimal_proxy();
+    let target = UpstreamTarget {
+        host: "lb-member.internal".to_string(),
+        port: 7443,
+        weight: 1,
+        tags: Default::default(),
+        path: None,
+    };
+
+    let key_with_target = capability_key_for_proxy_target(&proxy, Some(&target));
+    let key_without_target = capability_key_for_proxy_target(&proxy, None);
+
+    assert!(
+        key_with_target.starts_with("http|lb-member.internal|7443|"),
+        "upstream target host/port should appear first: {key_with_target}"
+    );
+    assert!(
+        key_without_target.starts_with("http|backend.example.com|8080|"),
+        "proxy backend host/port should appear when no target is supplied: {key_without_target}"
+    );
+}
