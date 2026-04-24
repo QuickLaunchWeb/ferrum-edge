@@ -3216,8 +3216,9 @@ async fn connect_websocket_backend(
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
+    // Without this, 70 KB WS messages hit Nagle + delayed-ACK (~40 ms/msg).
     let connect_future =
-        connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
+        connect_async_tls_with_config(ws_request, Some(ws_config), true, connector);
 
     let (backend_ws_stream, backend_response) =
         match tokio::time::timeout(connect_timeout, connect_future).await {
@@ -9700,5 +9701,54 @@ mod tests {
             false,
             Some(retry::ErrorClass::RequestBodyTooLarge)
         )));
+    }
+
+    // Regression guard for the 70 KB WSS Nagle cliff: without TCP_NODELAY on
+    // the backend WS socket, messages that span a 64 KiB segment + a short
+    // trailing segment hit Nagle waiting on a delayed ACK (~40 ms/msg).
+    // Verifies that `connect_websocket_backend` produces a TcpStream with
+    // nodelay enabled.
+    #[tokio::test]
+    async fn connect_websocket_backend_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = tokio_tungstenite::accept_async(stream).await;
+            }
+        });
+
+        let proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": addr.ip().to_string(),
+            "backend_port": addr.port(),
+            "backend_scheme": "http",
+            "backend_connect_timeout_ms": 2000u64,
+        }))
+        .expect("proxy deserialize");
+
+        let env_config = crate::config::EnvConfig::default();
+        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        let url = format!("ws://{}/", addr);
+
+        let ws_stream =
+            connect_websocket_backend(&url, &proxy, &env_config, &[], None, &crls, 65536, 4096)
+                .await
+                .expect("backend connect succeeds");
+
+        match ws_stream.get_ref() {
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp) => {
+                assert!(
+                    tcp.nodelay().expect("nodelay getsockopt"),
+                    "backend WS TcpStream must have TCP_NODELAY set"
+                );
+            }
+            _ => panic!("expected plain TCP backend"),
+        }
+
+        drop(ws_stream);
+        let _ = server.await;
     }
 }
