@@ -23,7 +23,7 @@ use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -165,7 +165,20 @@ impl ScriptedTlsBackendBuilder {
                                     }
                                     let tls_stream = match acceptor.accept(tcp).await {
                                         Ok(s) => s,
-                                        Err(_e) => return,
+                                        Err(e) => {
+                                            // Persist the handshake failure so
+                                            // `assert_no_step_errors()` catches
+                                            // broken TLS fixtures (bad cert,
+                                            // untrusted root, wrong SAN, etc.)
+                                            // instead of the task silently
+                                            // returning with no trace.
+                                            state_conn
+                                                .step_errors
+                                                .lock()
+                                                .await
+                                                .push(format!("TLS handshake failed: {e}"));
+                                            return;
+                                        }
                                     };
                                     state_conn.handshakes.fetch_add(1, Ordering::SeqCst);
                                     // Record the negotiated ALPN for the most recent handshake
@@ -195,7 +208,14 @@ impl ScriptedTlsBackendBuilder {
                                         }
                                         let tls_stream = match acceptor.accept(tcp).await {
                                             Ok(s) => s,
-                                            Err(_e) => return,
+                                            Err(e) => {
+                                                state_conn
+                                                    .step_errors
+                                                    .lock()
+                                                    .await
+                                                    .push(format!("TLS handshake failed: {e}"));
+                                                return;
+                                            }
                                         };
                                         state_conn.handshakes.fetch_add(1, Ordering::SeqCst);
                                         let alpn = tls_stream
@@ -251,6 +271,8 @@ struct TlsBackendState {
     /// AbortHandles for in-flight per-connection tasks (see
     /// `BackendState::connection_aborts` in `tcp.rs` for rationale).
     connection_aborts: StdMutex<Vec<AbortHandle>>,
+    /// One-shot latch mirroring `BackendState::refuse_next_fired`.
+    refuse_next_fired: AtomicBool,
 }
 
 impl TlsBackendState {
@@ -456,8 +478,16 @@ async fn run_tls_script(
                 return Ok(());
             }
             TcpStep::RefuseNextConnect => {
-                drop(stream);
-                return Ok(());
+                // One-shot, mirroring `run_script` in tcp.rs. Only the
+                // first accept through this step refuses.
+                if state
+                    .refuse_next_fired
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    drop(stream);
+                    return Ok(());
+                }
             }
         }
     }
@@ -561,6 +591,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let alpn = backend.last_alpn().await;
         assert_eq!(alpn.as_deref(), Some(&b"http/1.1"[..]));
+    }
+
+    /// Regression test: TLS handshake failures (cert mismatch, wrong
+    /// SAN, plain-TCP client against a TLS server, etc.) must be
+    /// recorded in `step_errors`. Previously the task silently returned
+    /// on handshake failure, so `assert_no_step_errors()` passed even
+    /// when the fixture never completed a handshake.
+    #[tokio::test]
+    async fn handshake_failure_lands_in_step_errors() {
+        let ca = TestCa::new("tls-handshake-fail").expect("ca");
+        let (cert_pem, key_pem) = ca.valid().expect("leaf");
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedTlsBackend::builder(
+            reservation.into_listener(),
+            TlsConfig::new(cert_pem, key_pem),
+        )
+        .step(TcpStep::Drop)
+        .spawn()
+        .expect("spawn tls");
+
+        // Plain-TCP client against a TLS server: handshake fails.
+        {
+            let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            c.write_all(b"not a TLS client hello\r\n\r\n")
+                .await
+                .expect("write");
+        }
+
+        // Give the handshake time to fail.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let errs = backend.step_errors().await;
+        assert!(
+            errs.iter().any(|e| e.contains("TLS handshake failed")),
+            "expected TLS handshake failure in step_errors; got {errs:?}"
+        );
+        // No handshake completed, so no scripted step ran.
+        assert_eq!(backend.handshakes_completed(), 0);
     }
 
     /// Regression test: mirror of the TCP variant. `received_contains(b"")`

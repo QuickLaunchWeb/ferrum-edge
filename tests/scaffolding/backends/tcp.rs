@@ -11,9 +11,11 @@
 //!
 //! - The script is copied into each accepted connection (`repeat_each_connection`
 //!   mode) or consumed once (`once` mode). No `rand`.
-//! - `RefuseNextConnect` does **not** close the listener — it accepts and then
-//!   immediately drops, so the TCP SYN/ACK completes and the client sees RST
-//!   on first write.
+//! - `RefuseNextConnect` is one-shot: the first accepted connection is
+//!   dropped without any reads, subsequent connections fall through to
+//!   the remaining script. The TCP SYN/ACK completes before the drop,
+//!   so the client sees an immediate RST/EOF rather than a kernel-level
+//!   `ECONNREFUSED` (use `ports::unbound_port()` for that).
 //!
 //! ## Observability
 //!
@@ -27,7 +29,7 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -66,15 +68,19 @@ pub enum TcpStep {
     /// Clients see EOF instead of RST — close enough for "connection
     /// abruptly ended" tests, but not a true RST-class error.
     Reset,
-    /// Accept the next connection and drop it immediately **without** reading
-    /// any bytes. The peer's first write will observe RST (or the accept
-    /// succeeding and the connection closing straight away). This is the
-    /// "refuse-at-TCP" fixture for the 502+ConnectionRefused acceptance test.
+    /// Accept the **next** connection and drop it immediately without
+    /// reading any bytes. One-shot: after it fires once, subsequent
+    /// connections treat the step as a no-op and run the remainder of
+    /// the script normally. That matches the "next" in the name and lets
+    /// callers model "refuse once, then serve" without a script rewrite.
     ///
-    /// **Behavior note**: Because the OS has already completed the three-way
-    /// handshake before `accept` returns, clients see this as "connected, then
-    /// immediately reset" rather than a TCP-level connection refused. That is
-    /// the closest deterministic approximation available above the kernel.
+    /// **Behavior note**: Because the OS has already completed the
+    /// three-way handshake before `accept` returns, clients see this as
+    /// "connected, then immediately reset" rather than a TCP-level
+    /// connection refused. That is the closest deterministic
+    /// approximation available above the kernel. For a real
+    /// `ECONNREFUSED`, see
+    /// [`super::super::ports::unbound_port`].
     RefuseNextConnect,
 }
 
@@ -268,6 +274,11 @@ struct BackendState {
     /// `TcpStep::Sleep(30s)` still running when the backend is dropped)
     /// don't leak into later tests.
     connection_aborts: StdMutex<Vec<AbortHandle>>,
+    /// One-shot latch for `TcpStep::RefuseNextConnect`. Set on the first
+    /// accept that reaches the step; subsequent connections see it true
+    /// and fall through so callers can model "refuse one, then serve
+    /// normally" without renaming the step.
+    refuse_next_fired: AtomicBool,
 }
 
 impl BackendState {
@@ -473,10 +484,17 @@ async fn run_script(
                 return Ok(());
             }
             TcpStep::RefuseNextConnect => {
-                // Drop the current socket immediately. The runner accepts the
-                // next connection on the listener in the outer loop.
-                drop(stream);
-                return Ok(());
+                // One-shot: if we're the first accept that reached this
+                // step, actually refuse. Later connections fall through
+                // so their scripts run the remaining steps normally.
+                if state
+                    .refuse_next_fired
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    drop(stream);
+                    return Ok(());
+                }
             }
         }
     }
@@ -648,6 +666,39 @@ mod tests {
         // The backend drops the socket right after accept; client sees EOF.
         let n = client.read(&mut buf).await.expect("read");
         assert_eq!(n, 0, "expected EOF after drop, got {n} bytes");
+    }
+
+    /// Regression test: `RefuseNextConnect` fires once, then subsequent
+    /// connections run the rest of the script normally. Without the
+    /// one-shot latch the step dropped every accepted connection under
+    /// `RepeatEachConnection`, contradicting the "next" in the name.
+    #[tokio::test]
+    async fn refuse_next_connect_is_one_shot_only() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let _backend = ScriptedTcpBackend::builder(reservation.into_listener())
+            .step(TcpStep::RefuseNextConnect)
+            .step(TcpStep::Write(b"served".to_vec()))
+            .step(TcpStep::Drop)
+            .spawn()
+            .expect("spawn");
+
+        // Connection 1: refused. Client sees EOF on read.
+        {
+            let mut c1 = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect 1");
+            let mut buf = [0u8; 16];
+            assert_eq!(c1.read(&mut buf).await.expect("read 1"), 0);
+        }
+
+        // Connection 2: no refuse, full script runs, server writes "served".
+        let mut c2 = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect 2");
+        let mut resp = Vec::new();
+        c2.read_to_end(&mut resp).await.expect("read 2");
+        assert_eq!(resp, b"served");
     }
 
     /// Regression test: dropping the backend aborts in-flight connection
