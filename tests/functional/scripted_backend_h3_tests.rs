@@ -1137,3 +1137,172 @@ async fn h3_client_explicit_host_matches_authority_preserved() {
          prelude:\n{prelude}"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Codex P1 regression — Use SELECTED upstream-target host on synthesis path.
+//
+// PR #492's first synthesis fix populated `Host` from `:authority` for H3
+// clients that didn't send an explicit Host. But on the H3 NATIVE pool path,
+// `build_h3_backend_headers` then rewrote Host with `proxy.backend_host` when
+// `preserve_host_header=false` — while `request_with_target*` still routed
+// to `upstream_target.host`. For upstream-backed proxies where those
+// differ (the common case: `backend_host` is a template fallback,
+// load-balanced targets are the real backends), the H3 connection went to
+// `upstream_target.host` while the synthesized Host pointed at
+// `proxy.backend_host`. Strict virtual-host routing on the upstream
+// rejected those requests; common clients (curl, Chromium, reqwest) all
+// sent only `:authority`, so the bug applied to the realistic majority.
+//
+// This test pins the fix: the synthesized Host MUST equal the
+// SELECTED target's host on an upstream-backed H3 native-pool dispatch.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_host() {
+    let ca = TestCa::new("phase-host-codex-p1").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    // Colocated TCP+UDP so the capability probe reaches both transports
+    // and classifies h3 = Supported (gateway then takes the native H3 pool).
+    let (tcp_listener, udp_socket, backend_port) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+
+    // TCP+TLS sidecar for the capability probe (advertises h2+http/1.1).
+    // It's never actually hit by the test request — that lands on H3.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_listener,
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // Real H3 backend that records the inbound `:authority` + headers.
+    // Accept stream, send 200 + 2-byte body.
+    let h3_backend = ScriptedH3Backend::builder(udp_socket, H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "2".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(b"ok")))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    // Upstream-backed proxy. `backend_host` is a TEMPLATE fallback that's
+    // syntactically valid and resolvable but DIFFERS from the upstream
+    // target's host. Without the Codex P1 fix, the synthesized Host would
+    // end up as "localhost" while the H3 connection lands at "127.0.0.1".
+    // With the fix, the synthesized Host = upstream target host = "127.0.0.1".
+    let config = json!({
+        "proxies": [{
+            "id": "h3-codex-p1",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "upstream_id": "lb",
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+        }],
+        "upstreams": [{
+            "id": "lb",
+            "name": "lb",
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": backend_port,
+                "weight": 1,
+            }],
+            "algorithm": "round_robin",
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("yaml");
+
+    let reservation = reserve_port().await.expect("reserve https port");
+    let https_port = reservation.port;
+    drop(reservation);
+
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-codex-p1");
+    Box::leak(Box::new(scratch));
+
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Wait for capability classification — gateway must see h3=supported
+    // before it'll route via the native H3 pool.
+    let _ = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("registry populated");
+
+    // H3 client sends only `:authority` (no explicit Host). Mimics curl,
+    // Chromium, Firefox, reqwest defaults.
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/x");
+    let resp = client
+        .get_with_options(
+            &url,
+            crate::scaffolding::clients::GetOptions {
+                host_header: crate::scaffolding::clients::HostHeader::Auto,
+            },
+        )
+        .await
+        .expect("h3 response");
+    if resp.status.as_u16() != 200 {
+        let logs = harness.captured_combined().unwrap_or_default();
+        let entry = fetch_capability_entry(&harness).await.ok().flatten();
+        panic!(
+            "expected 200 from H3 native pool; got {} \n--- registry: {:?}\n--- logs: ---\n{}",
+            resp.status, entry, logs
+        );
+    }
+
+    // The H3 backend recorded the request — assert the Host the gateway
+    // forwarded equals the SELECTED upstream-target host.
+    let received = h3_backend.received_requests().await;
+    let req = received
+        .iter()
+        .find(|r| r.method == "GET")
+        .expect("backend must have received a GET");
+    let host = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.as_str())
+        .expect("backend must have received a Host header");
+    assert_eq!(
+        host, "127.0.0.1",
+        "preserve_host_header=false on upstream-backed H3 native-pool dispatch: \
+         synthesized Host MUST equal SELECTED upstream-target host (127.0.0.1), \
+         NOT the proxy's template `backend_host` (\"localhost\"). \
+         Without the Codex P1 fix on PR #492, this assertion fails — the H3 \
+         connection lands at 127.0.0.1 while the Host header points at the \
+         template, breaking virtual-host routing on the backend. \
+         Recorded request: method={} authority={:?} host_header={host}",
+        req.method, req.authority,
+    );
+}
