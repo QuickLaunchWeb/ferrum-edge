@@ -222,6 +222,20 @@ impl BackendCapabilityRegistry {
         self.entries.retain(|key, _| active_keys.contains(key));
     }
 
+    /// Snapshot of every registry entry as `(key, record)` pairs.
+    ///
+    /// Consumed by the JWT-authenticated admin endpoint
+    /// `GET /backend-capabilities` (see `src/admin/mod.rs` +
+    /// `docs/admin_api.md`) and by test-side introspection. Not called
+    /// on the hot path — allocates one `Vec` + clones every `Arc` — so
+    /// request latency is unaffected.
+    pub fn snapshot(&self) -> Vec<(String, Arc<BackendCapabilityRecord>)> {
+        self.entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
