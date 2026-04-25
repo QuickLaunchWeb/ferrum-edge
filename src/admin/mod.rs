@@ -701,6 +701,24 @@ pub async fn handle_admin_request(
         // Cluster status (CP/DP connection info)
         (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
+        // Backend capability registry introspection + refresh.
+        //
+        // JWT-authenticated (falls through the admin auth gate above).
+        // The registry stores only protocol classifications (h1 / h2_tls
+        // / h3 / h2c) per deduplicated backend target identity — no
+        // secrets, credentials, or payload data — so it's safe to
+        // expose permanently in dev, staging, and production. Operators
+        // use `GET /backend-capabilities` for routing-decision debugging
+        // (why did this H3-capable backend fall back to reqwest?) and
+        // `POST /backend-capabilities/refresh` to force an out-of-band
+        // reclassification after a deliberate backend change. The
+        // scripted-backend test framework also asserts on these
+        // endpoints in its H3 acceptance tests.
+        (Method::GET, ["backend-capabilities"]) => handle_backend_capabilities_get(&state).await,
+        (Method::POST, ["backend-capabilities", "refresh"]) => {
+            handle_backend_capabilities_refresh(&state).await
+        }
+
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Not Found"}),
@@ -2199,5 +2217,85 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                 "message": "Cluster status is only available in cp or dp modes",
             }),
         )),
+    }
+}
+
+// ---- Backend Capability Registry ----
+//
+// JWT-authenticated handlers exposing the per-backend-target protocol
+// classification cache documented in `src/proxy/backend_capabilities.rs`.
+// See `docs/admin_api.md` for operator-facing semantics and
+// `openapi.yaml` for the request / response schemas.
+
+async fn handle_backend_capabilities_get(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let proxy_state = match &state.proxy_state {
+        Some(ps) => ps,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "proxy_state unavailable in this mode"}),
+            ));
+        }
+    };
+    let snapshot = proxy_state.backend_capabilities.snapshot();
+    let entries: Vec<serde_json::Value> = snapshot
+        .into_iter()
+        .map(|(key, record)| {
+            json!({
+                "key": key,
+                "plain_http": {
+                    "h1": protocol_support_label(record.plain_http.h1),
+                    "h2_tls": protocol_support_label(record.plain_http.h2_tls),
+                    "h3": protocol_support_label(record.plain_http.h3),
+                },
+                "grpc_transport": {
+                    "h2_tls": protocol_support_label(record.grpc_transport.h2_tls),
+                    "h2c": protocol_support_label(record.grpc_transport.h2c),
+                },
+                "last_probe_at_unix_secs": record.last_probe_at_unix_secs,
+                "last_probe_error": record.last_probe_error.clone(),
+            })
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "entries": entries,
+        }),
+    ))
+}
+
+async fn handle_backend_capabilities_refresh(
+    state: &AdminState,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let proxy_state = match &state.proxy_state {
+        Some(ps) => ps,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "proxy_state unavailable in this mode"}),
+            ));
+        }
+    };
+    // Run synchronously so the caller can assert on the post-refresh
+    // snapshot immediately. The request handler is already on a tokio
+    // worker task so .await is fine.
+    proxy_state.refresh_backend_capabilities().await;
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({"status": "refreshed"}),
+    ))
+}
+
+fn protocol_support_label(
+    support: crate::proxy::backend_capabilities::ProtocolSupport,
+) -> &'static str {
+    use crate::proxy::backend_capabilities::ProtocolSupport;
+    match support {
+        ProtocolSupport::Unknown => "unknown",
+        ProtocolSupport::Supported => "supported",
+        ProtocolSupport::Unsupported => "unsupported",
     }
 }

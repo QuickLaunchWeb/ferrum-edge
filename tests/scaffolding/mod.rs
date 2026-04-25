@@ -55,12 +55,14 @@ pub mod ports;
 
 // Curated re-exports so a test's imports fit on one line.
 pub use backends::{
-    DatagramMatcher, DtlsConfig, ExecutionMode, Http1Request, HttpStep, RecordedDatagram,
-    RequestMatcher, ScriptedDtlsBackend, ScriptedHttp1Backend, ScriptedTcpBackend,
-    ScriptedTlsBackend, ScriptedUdpBackend, TcpStep, TlsConfig, UdpStep,
+    DatagramMatcher, DtlsConfig, ExecutionMode, H3RecordedRequest, H3Step, H3TlsConfig,
+    Http1Request, HttpStep, QuicRefuser, RecordedDatagram, RequestMatcher, ScriptedDtlsBackend,
+    ScriptedH3Backend, ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend,
+    ScriptedUdpBackend, TcpStep, TlsConfig, UdpSocketReservation, UdpStep,
+    tls_backend_without_quic, tls_backend_without_quic_with_ok_response,
 };
 pub use certs::TestCa;
-pub use clients::{ClientResponse, DtlsClient, Http1Client, UdpClient};
+pub use clients::{ClientResponse, DtlsClient, Http1Client, Http3Client, Http3Response, UdpClient};
 pub use harness::{GatewayHarness, GatewayHarnessBuilder, HarnessMode};
 pub use network::{
     BandwidthLimitedStream, DelayedStream, NetworkProfile, NetworkSimProxy, NetworkSimProxyBuilder,
