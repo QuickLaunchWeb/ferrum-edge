@@ -80,6 +80,8 @@ fn require_logs(harness: &GatewayHarness) -> String {
 //
 // Expected: request returns 200, total elapsed ≥ 400 ms (proving the
 // latency was actually injected and not no-op'd away).
+// Migrated to `HarnessMode::InProcess` — asserts only on status + body +
+// timing, so it benefits from the ~10× faster in-process startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn slow_backend_within_read_timeout_completes() {
@@ -119,6 +121,7 @@ async fn slow_backend_within_read_timeout_completes() {
     let yaml =
         file_mode_yaml_for_backend_with(middleman_port, json!({ "backend_read_timeout_ms": 2000 }));
     let harness = GatewayHarness::builder()
+        .mode_in_process()
         .file_config(yaml)
         .log_level("info")
         .spawn()

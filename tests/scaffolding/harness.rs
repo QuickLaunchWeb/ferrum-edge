@@ -46,18 +46,20 @@
 //!
 //! ## Caveats specific to in-process mode
 //!
-//! - `FERRUM_POOL_WARMUP_ENABLED` defaults to `true` (matching the
-//!   binary's default). Override with
-//!   [`GatewayHarnessBuilder::pool_warmup_enabled`] if your test needs
-//!   the gateway to sit on cold pools.
-//! - The file-mode YAML loader's strict-loading rules (every top-level
-//!   collection must be present) **do not apply in in-process mode**:
-//!   the harness writes the YAML to a temp file and feeds it through the
-//!   same `load_config_from_file` path, so the same `consumers: []` /
-//!   `upstreams: []` / `plugin_configs: []` boilerplate is still
-//!   required.  Use the helpers in `tests/scaffolding/mod.rs`
+//! - **`FERRUM_POOL_WARMUP_ENABLED` defaults to `false`** in both
+//!   harness modes — most tests want cold pools so their per-request
+//!   connection-count assertions aren't inflated by the warmup probe.
+//!   Tests that depend on the capability registry's first probe
+//!   (e.g. `h2_alpn_fallback_downgrades_capability`) explicitly opt
+//!   in via [`GatewayHarnessBuilder::pool_warmup_enabled(true)`].
+//! - The file-mode YAML loader's strict-loading rules apply identically
+//!   in in-process mode — every top-level collection (`consumers`,
+//!   `upstreams`, `plugin_configs`) still has to be present in the
+//!   YAML, even if empty. The harness writes the YAML to a temp file
+//!   and feeds it through the same `load_config_from_file` path.
+//!   The helpers in `tests/scaffolding/mod.rs`
 //!   ([`crate::scaffolding::file_mode_yaml_for_backend`] and friends)
-//!   to avoid the footgun.
+//!   already include the empty-collection boilerplate.
 //! - Logs go to whatever `tracing` subscriber the test process has
 //!   installed. `captured_combined()` returns `Err` in in-process mode —
 //!   tests that depend on log assertions must stay on binary mode.
@@ -118,10 +120,14 @@ impl Default for GatewayHarnessBuilder {
             log_level: "info".to_string(),
             jwt_secret: "ferrum-edge-shared-harness-secret-00000".to_string(),
             jwt_issuer: "ferrum-edge-shared-harness".to_string(),
-            // Match the production binary's default — tests that exercise
-            // capability registry classification need warmup on so the
-            // first probe runs at startup, not 24 h later.
-            pool_warmup_enabled: true,
+            // Match `TestGateway`'s default — tests that exercise the
+            // capability registry's classification path (e.g.
+            // `h2_alpn_fallback_downgrades_capability`) explicitly opt
+            // in via `pool_warmup_enabled(true)`. Defaulting `true` here
+            // would silently double-count the first probe as a backend
+            // connection in tests like
+            // `h2_direct_pool_reuses_connection_across_requests`.
+            pool_warmup_enabled: false,
             extra_env: Vec::new(),
         }
     }
@@ -204,15 +210,20 @@ impl GatewayHarnessBuilder {
         self
     }
 
-    /// Override the connection pool warmup behaviour.  Tests depending on
-    /// the capability registry's first-probe should keep the default
-    /// (`true`).  Tests that want cold pools (latency-tracking) should
-    /// pass `false`.
+    /// Override the connection pool warmup behaviour.
+    ///
+    /// Defaults to **disabled** in both modes — most tests want cold pools
+    /// because their assertion counts backend connections per RPC and the
+    /// warmup probe would inflate that count by one. Tests that depend on
+    /// the capability registry's first-probe (e.g.
+    /// `h2_alpn_fallback_downgrades_capability`) opt in via
+    /// `pool_warmup_enabled(true)`.
     pub fn pool_warmup_enabled(mut self, enabled: bool) -> Self {
         self.pool_warmup_enabled = enabled;
-        if !enabled {
-            self.inner = self.inner.env("FERRUM_POOL_WARMUP_ENABLED", "false");
-        }
+        // Explicit env override on every call so binary mode picks up the
+        // setting regardless of TestGateway's defaults.
+        let v = if enabled { "true" } else { "false" };
+        self.inner = self.inner.env("FERRUM_POOL_WARMUP_ENABLED", v);
         self
     }
 
@@ -224,7 +235,9 @@ impl GatewayHarnessBuilder {
         }
     }
 
-    async fn spawn_binary(self) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
+    async fn spawn_binary(
+        self,
+    ) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
         let gw = self.inner.spawn().await?;
         Ok(GatewayHarness {
             mode: HarnessMode::Binary,
@@ -239,14 +252,13 @@ impl GatewayHarnessBuilder {
     ) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
         // Today the in-process path only supports file mode — anything that
         // wants DB/CP/DP must go through the binary path.
-        let yaml = self
-            .file_yaml
-            .as_deref()
-            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        let yaml = self.file_yaml.as_deref().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
                 "GatewayHarness::mode_in_process requires file_config(yaml) — \
                  in-process DB/CP/DP support is a follow-up"
                     .into()
-            })?;
+            },
+        )?;
 
         // Up to MAX_ATTEMPTS retries on bind race (matches the binary
         // path's port-allocation rules — see CLAUDE.md "bind-drop-rebind").

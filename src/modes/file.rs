@@ -532,10 +532,9 @@ pub async fn serve(
                     let sh = shutdown_tx.subscribe();
                     let cfg = Some(admin_tls_config);
                     let h = tokio::spawn(async move {
-                        if let Err(e) = admin::start_admin_listener_with_bound_listener(
-                            listener, st, sh, cfg,
-                        )
-                        .await
+                        if let Err(e) =
+                            admin::start_admin_listener_with_bound_listener(listener, st, sh, cfg)
+                                .await
                         {
                             error!("Admin HTTPS listener error: {}", e);
                         }

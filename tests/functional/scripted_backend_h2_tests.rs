@@ -669,6 +669,12 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
 // and holds it; when this test was authored the pool was sharded but
 // reuse-on-hit. If the sharding policy changes, this test may need
 // tuning (e.g. pin to shard 0 via a request header).
+//
+// Migrated to `HarnessMode::InProcess` — the assertion is on
+// `backend.accepted_connections()` and `backend.received_streams()`,
+// neither of which depend on captured gateway logs. Inline the harness
+// construction (rather than reuse `spawn_grpc_harness`) so we can opt out
+// of `capture_output()`, which is binary-only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h2_direct_pool_reuses_connection_across_requests() {
@@ -695,7 +701,14 @@ async fn h2_direct_pool_reuses_connection_across_requests() {
         .expect("spawn backend");
 
     let yaml = grpc_file_config(backend_port, Value::Null);
-    let harness = spawn_grpc_harness(yaml).await;
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info,access_log=info")
+        .spawn()
+        .await
+        .expect("spawn gateway");
 
     let gw_port = harness
         .proxy_base_url()

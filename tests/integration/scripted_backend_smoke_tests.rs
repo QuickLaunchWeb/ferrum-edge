@@ -13,6 +13,8 @@ use crate::scaffolding::backends::{
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http1Client;
+use crate::scaffolding::file_mode_yaml_for_backend;
+use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,4 +122,59 @@ async fn scripted_tls_backend_alpn_negotiation() {
         "server picked http/1.1 from h2 → http/1.1 client ALPN offer"
     );
     assert_eq!(backend.handshakes_completed(), 1);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// In-process harness end-to-end. Confirms `HarnessMode::InProcess` boots the
+// gateway as a tokio task, routes a real HTTP request through `ProxyState`,
+// and reaches a scripted backend on `127.0.0.1:<port>` — all in well under a
+// second. This test pins the in-process path so it can't silently regress to
+// the binary path without the test failing fast.
+//
+// Lives in `tests/integration/` (not `tests/functional/`) precisely because
+// it does NOT need the binary — that's the whole point of in-process mode.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_harness_routes_request_to_scripted_backend() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "GET", "/ping",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: "4".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"pong".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend(backend_port);
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn in-process gateway");
+
+    // Health endpoint should respond before the first proxy request — if it
+    // doesn't we know the in-process serve() returned without binding.
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("gateway healthy");
+
+    let client = harness.http_client().expect("client");
+    let resp = client
+        .get(&harness.proxy_url("/api/ping"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status, reqwest::StatusCode::OK);
+    assert_eq!(resp.body_text(), "pong");
 }
