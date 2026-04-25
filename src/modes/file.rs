@@ -42,19 +42,25 @@ use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
-/// Pre-bound TCP listeners that callers of [`serve`] can hand to the gateway
-/// instead of letting it bind ports itself.
+/// Pre-bound TCP listeners + admin overrides that callers of [`serve`] can
+/// hand to the gateway instead of letting it bind ports / read env itself.
 ///
-/// Each field is independent: leave a slot `None` to disable that listener,
-/// pass `Some` to use the caller's socket.  When a slot is `Some`, the
-/// corresponding port in [`EnvConfig`] is ignored — the listener is adopted
-/// as-is and its already-bound address is what clients connect to.
+/// Each listener field is independent: leave a slot `None` to disable that
+/// listener, pass `Some` to use the caller's socket. When a slot is `Some`,
+/// the corresponding port in [`EnvConfig`] is ignored — the listener is
+/// adopted as-is and its already-bound address is what clients connect to.
 ///
 /// In-process tests reserve ports via `tests/scaffolding/ports.rs` and pass
 /// the live listeners in here so the gateway adopts the same FD without
 /// re-binding (which would be racy under parallel test load).
+///
+/// `admin_jwt_manager`, when provided, bypasses
+/// [`crate::admin::jwt_auth::create_jwt_manager_from_env`] entirely. Tests
+/// running in the same process can't share the global `FERRUM_ADMIN_JWT_*`
+/// env vars without serialising — passing a manager directly avoids the
+/// dance.
 #[derive(Default)]
-pub struct PreboundListeners {
+pub struct ServeOptions {
     /// Plaintext proxy port. `None` disables the plaintext proxy listener.
     pub proxy_http: Option<TcpListener>,
     /// TLS proxy port. `None` disables the HTTPS proxy listener even when
@@ -65,6 +71,10 @@ pub struct PreboundListeners {
     /// TLS admin port. `None` disables the HTTPS admin listener even when
     /// admin TLS material is configured.
     pub admin_https: Option<TcpListener>,
+    /// Pre-built admin JWT manager. When `None`, `serve` reads the JWT
+    /// secret/issuer/ttl from environment variables (same as the binary
+    /// path does via `create_jwt_manager_from_env`).
+    pub admin_jwt_manager: Option<crate::admin::jwt_auth::JwtManager>,
 }
 
 /// Handles returned by [`serve`].
@@ -80,7 +90,9 @@ pub struct ServeHandles {
     /// Shared proxy state. Tests can read metrics, swap config, etc.
     pub proxy_state: ProxyState,
     /// Local addresses each listener is bound to (resolved from the pre-bound
-    /// listener, **not** read from `EnvConfig`).
+    /// listener, **not** read from `EnvConfig`). Tests use this to build
+    /// canonical proxy/admin URLs.
+    #[allow(dead_code)] // The binary path drops this immediately; tests read it.
     pub bound: BoundAddresses,
     /// Background task handles. Drop the struct to abandon them, or
     /// [`Self::join`] to wait for graceful drain.
@@ -163,7 +175,7 @@ pub async fn run(
     let handles = serve(
         env_config.clone(),
         config,
-        PreboundListeners::default(),
+        ServeOptions::default(),
         shutdown_tx.clone(),
     )
     .await?;
@@ -249,7 +261,7 @@ pub async fn run(
 pub async fn serve(
     env_config: EnvConfig,
     config: GatewayConfig,
-    mut prebound: PreboundListeners,
+    mut prebound: ServeOptions,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<ServeHandles, anyhow::Error> {
     info!(
@@ -426,18 +438,25 @@ pub async fn serve(
 
     // Listen for SIGHUP — only meaningful for run(); skipped here.
     let startup_ready = Arc::new(AtomicBool::new(false));
-    let jwt_manager = match create_jwt_manager_from_env() {
-        Ok(jm) => jm,
-        Err(e) => {
-            warn!(
-                "Admin JWT not configured ({}), admin endpoints will reject requests",
-                e
-            );
-            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                secret: random_secret,
-                ..Default::default()
-            })
+    let jwt_manager = if let Some(jm) = prebound.admin_jwt_manager.take() {
+        // Caller (in-process harness) supplied its own — bypass env reads
+        // entirely so parallel tests don't have to serialise on
+        // `FERRUM_ADMIN_JWT_*` globals.
+        jm
+    } else {
+        match create_jwt_manager_from_env() {
+            Ok(jm) => jm,
+            Err(e) => {
+                warn!(
+                    "Admin JWT not configured ({}), admin endpoints will reject requests",
+                    e
+                );
+                let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+                crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
+                    secret: random_secret,
+                    ..Default::default()
+                })
+            }
         }
     };
     let admin_state = AdminState {
