@@ -221,6 +221,38 @@ impl FrontendKind {
                 );
             }
             (FrontendKind::Grpc, MatrixResponse::Grpc(r)) => {
+                // `effective_grpc_status` collapses two distinct outcomes
+                // into UNAVAILABLE(14): a real Trailers-Only error from the
+                // gateway (HTTP 200 + grpc-status=14) AND a transport-level
+                // failure where no HTTP response ever arrived (synthesised
+                // `http_status == 0`). Without the shape checks below, a
+                // gateway regression that drops the RPC entirely would still
+                // pass `assert_status(502)` because both paths map to 14.
+                // Require the actual response shape: no stream-level error,
+                // an HTTP response was received, and an explicit grpc-status
+                // is present (in trailers OR Trailers-Only initial headers).
+                assert!(
+                    r.stream_error.is_none(),
+                    "[grpc] expected well-formed response but stream errored: \
+                     {err:?} (http_status={http})",
+                    err = r.stream_error,
+                    http = r.http_status
+                );
+                assert_ne!(
+                    r.http_status, 0,
+                    "[grpc] expected gateway to return an HTTP response but the \
+                     client got no headers (synthesised http_status==0 means a \
+                     transport-level failure, not a gateway-formatted gRPC error)"
+                );
+                assert!(
+                    r.grpc_status().is_some(),
+                    "[grpc] expected explicit grpc-status (in trailers OR \
+                     Trailers-Only initial headers) but neither carried one — \
+                     http_status={http}, headers={headers:?}, trailers={trailers:?}",
+                    http = r.http_status,
+                    headers = r.headers,
+                    trailers = r.trailers
+                );
                 let expected_grpc = http_to_grpc_status(expected_http);
                 let actual = r.effective_grpc_status();
                 assert_eq!(
@@ -292,10 +324,19 @@ impl BackendKind {
         )
     }
 
-    /// Spawn a backend of this kind that refuses every accepted
-    /// connection (one-shot per accept — `RefuseNextConnect`-class
-    /// behavior). Returns the running backend handle wrapped so the
-    /// caller doesn't need to know the concrete type.
+    /// Spawn a backend of this kind that closes every accepted
+    /// connection without reading or writing. Returns the running
+    /// backend handle wrapped so the caller doesn't need to know the
+    /// concrete type.
+    ///
+    /// Implementation note: we deliberately use [`TcpStep::Drop`]
+    /// (repeatable, fires on every connection) rather than
+    /// [`TcpStep::RefuseNextConnect`] — the latter is one-shot per
+    /// backend lifetime, so any pool warmup probe, capability probe,
+    /// or retry attempt could consume the single refusal and leave
+    /// later connections falling through to the (empty) remainder of
+    /// the script. `Drop` gives stable refusal semantics regardless of
+    /// how many times the gateway connects.
     ///
     /// Panics for reserved variants.
     pub async fn spawn_refuse_connect(
@@ -310,7 +351,7 @@ impl BackendKind {
                 let reservation = reserve_port().await?;
                 let port = reservation.port;
                 let backend = ScriptedTcpBackend::builder(reservation.into_listener())
-                    .step(TcpStep::RefuseNextConnect)
+                    .step(TcpStep::Drop)
                     .spawn()?;
                 Ok(MatrixBackend::new_tcp(port, backend))
             }

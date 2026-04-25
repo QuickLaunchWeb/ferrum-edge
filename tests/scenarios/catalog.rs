@@ -43,10 +43,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::scaffolding::backends::dtls::DtlsConfig;
 use crate::scaffolding::backends::{
     GrpcStep, H2Step, H3Step, H3TlsConfig, HttpStep, MatchHeaders, MatchRpc, QuicRefuser,
-    RequestMatcher, ScriptedDtlsBackend, ScriptedGrpcBackend, ScriptedH2Backend, ScriptedH3Backend,
+    RequestMatcher, ScriptedGrpcBackend, ScriptedH2Backend, ScriptedH3Backend,
     ScriptedHttp1Backend, ScriptedTcpBackend, ScriptedTlsBackend, ScriptedUdpBackend, TcpStep,
     TlsConfig, UdpSocketReservation, UdpStep,
 };
@@ -251,34 +250,58 @@ pub fn respond_but_close_before_trailer(body: Bytes) -> Vec<GrpcStep> {
 // TLS / cert
 // ────────────────────────────────────────────────────────────────────────────
 
-/// TLS config with a leaf cert whose `notAfter` is in the past. The
-/// gateway should reject the handshake unless `FERRUM_TLS_NO_VERIFY=true`.
-pub fn cert_expired() -> TlsConfig {
-    let ca = TestCa::new("scenario-expired").expect("ca");
+// ## Trust-anchor contract for cert presets
+//
+// Each cert preset takes a caller-provided `&TestCa`. Earlier
+// iterations minted a fresh `TestCa` internally and returned only the
+// `TlsConfig`; that left the test with no way to plumb the CA into
+// the gateway's trust anchor configuration
+// (`backend_tls_server_ca_cert_path` or `FERRUM_TLS_CA_BUNDLE_PATH`),
+// so the gateway rejected the leaf as `unknown issuer` *before* the
+// named validation path (expired / SAN mismatch / not-yet-valid) ever
+// ran. With verification disabled the path was skipped entirely, so
+// the preset name was misleading either way.
+//
+// The caller now owns the CA: pass it in to a preset to mint a leaf
+// chained to it, plumb `ca.cert_pem` into the gateway as the trust
+// anchor, and the gateway exercises the validation path the preset
+// is named for. `cert_self_signed` is the exception — its leaf is
+// not chained to the CA at all; the CA receiver is kept for API
+// symmetry with the other presets.
+
+/// TLS config with a leaf cert whose `notAfter` is in the past, signed
+/// by `ca`. The gateway should reject the handshake unless
+/// `FERRUM_TLS_NO_VERIFY=true`. Plumb `ca.cert_pem` into the gateway's
+/// trust anchor so the rejection comes from the expired `notAfter`,
+/// not from `unknown issuer`.
+pub fn cert_expired(ca: &TestCa) -> TlsConfig {
     let (cert_pem, key_pem) = ca.expired().expect("expired leaf");
     TlsConfig::new(cert_pem, key_pem)
 }
 
-/// TLS config with a leaf cert SAN that does NOT match `localhost` —
-/// the gateway should fail hostname verification.
-pub fn cert_san_mismatch() -> TlsConfig {
-    let ca = TestCa::new("scenario-san-mismatch").expect("ca");
+/// TLS config with a leaf cert SAN that does NOT match `localhost`,
+/// signed by `ca`. The gateway should fail hostname verification when
+/// it trusts `ca.cert_pem`.
+pub fn cert_san_mismatch(ca: &TestCa) -> TlsConfig {
     let (cert_pem, key_pem) = ca.wrong_san().expect("wrong-san leaf");
     TlsConfig::new(cert_pem, key_pem)
 }
 
-/// TLS config whose leaf is signed by itself (no CA), so a verifying
-/// gateway must reject it as untrusted.
-pub fn cert_self_signed() -> TlsConfig {
-    let ca = TestCa::new("scenario-self-signed").expect("ca");
-    let (cert_pem, key_pem) = ca.self_signed().expect("self-signed leaf");
+/// TLS config whose leaf is signed by itself, NOT by `ca`. A verifying
+/// gateway must reject it as untrusted. The `ca` parameter is kept for
+/// API symmetry with the other cert presets (callers don't need to plumb
+/// any specific trust anchor for this case).
+pub fn cert_self_signed(_ca: &TestCa) -> TlsConfig {
+    let throwaway = TestCa::new("scenario-self-signed").expect("ca");
+    let (cert_pem, key_pem) = throwaway.self_signed().expect("self-signed leaf");
     TlsConfig::new(cert_pem, key_pem)
 }
 
-/// TLS config with a leaf whose `notBefore` is in the future. Some TLS
-/// stacks reject upfront, others surface the failure at handshake.
-pub fn cert_not_yet_valid() -> TlsConfig {
-    let ca = TestCa::new("scenario-not-yet-valid").expect("ca");
+/// TLS config with a leaf whose `notBefore` is in the future, signed by
+/// `ca`. Some TLS stacks reject upfront, others surface the failure at
+/// handshake. Plumb `ca.cert_pem` into the gateway's trust anchor so the
+/// rejection isolates the not-yet-valid case rather than `unknown issuer`.
+pub fn cert_not_yet_valid(ca: &TestCa) -> TlsConfig {
     let (cert_pem, key_pem) = ca.not_yet_valid().expect("not-yet-valid leaf");
     TlsConfig::new(cert_pem, key_pem)
 }
@@ -409,26 +432,32 @@ pub fn udp_amplification_attempt(reply_count: usize) -> Vec<UdpStep> {
     ]
 }
 
-/// DTLS handshake-timeout fixture: the server absorbs datagrams
-/// silently for `delay` and then drops the connection without ever
-/// completing the handshake. The gateway must give up at
-/// `backend_connect_timeout_ms`.
+/// True DTLS handshake-timeout fixture: a UDP socket that silently
+/// absorbs every incoming datagram for `delay` without ever speaking
+/// DTLS. The gateway's `ClientHello` packets disappear into the
+/// blackhole, so its `backend_connect_timeout_ms` is what drives the
+/// failure path.
 ///
-/// `dimpl` doesn't expose a pre-handshake stall hook, so we
-/// approximate by parking on `Silence(delay)` — the dimpl-side
-/// handshake state machine still runs, but no application data is
-/// ever exchanged, and tests can pair this with a tight gateway
-/// `backend_connect_timeout_ms` to observe the give-up path.
-pub async fn dtls_handshake_timeout(
+/// Implementation note: an earlier iteration of this helper used
+/// [`ScriptedDtlsBackend`], but [`ScriptedDtlsBackend::spawn`] only
+/// runs its script *after* `DtlsServer::accept()` completes the
+/// handshake — so a `Silence` step modelled an application-data /
+/// read stall, not a handshake stall. Using [`ScriptedUdpBackend`]
+/// removes the DTLS listener entirely and gives a deterministic
+/// pre-handshake blackhole on the same UDP socket.
+///
+/// Tests that want a *post*-handshake stall (DTLS handshake completes,
+/// but the application never reads/writes) should compose
+/// `ScriptedDtlsBackend::builder(...).step(UdpStep::Silence(d))`
+/// directly — that's still useful, just for a different failure
+/// class than this helper models.
+pub fn dtls_handshake_blackhole(
     socket: UdpSocket,
     delay: Duration,
-) -> Result<ScriptedDtlsBackend, Box<dyn std::error::Error + Send + Sync>> {
-    let config = DtlsConfig::self_signed()?;
-    ScriptedDtlsBackend::builder(socket, config)
-        .step(UdpStep::Silence(delay))
-        .step(UdpStep::DropSocket)
+) -> Result<ScriptedUdpBackend, std::io::Error> {
+    ScriptedUdpBackend::builder(socket)
+        .steps(vec![UdpStep::Silence(delay), UdpStep::DropSocket])
         .spawn()
-        .await
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -461,14 +490,20 @@ pub fn bandwidth_limited(listener: TcpListener, kbps: u64) -> NetworkSimProxyBui
 // Tests that DO need composition should use the script-returning
 // variants above and call `.spawn()` themselves.
 
-/// Spawn a [`ScriptedTcpBackend`] that refuses every accepted
-/// connection (one-shot per `RefuseNextConnect`) — fits matrix tests
-/// asserting "any frontend → 502 against a refusing backend".
+/// Spawn a [`ScriptedTcpBackend`] that closes every accepted
+/// connection without reading or writing — fits matrix tests asserting
+/// "any frontend → 502 against a refusing backend".
+///
+/// Uses [`TcpStep::Drop`] (repeatable, fires on every connection)
+/// rather than [`TcpStep::RefuseNextConnect`], which is one-shot per
+/// backend lifetime — pool warmup probes, capability probes, or
+/// retries can consume the single refusal and leave subsequent
+/// connections falling through to the (empty) remainder of the script.
 pub fn spawn_refusing_tcp_backend(
     reservation: PortReservation,
 ) -> Result<ScriptedTcpBackend, std::io::Error> {
     ScriptedTcpBackend::builder(reservation.into_listener())
-        .step(TcpStep::RefuseNextConnect)
+        .step(TcpStep::Drop)
         .spawn()
 }
 
@@ -537,10 +572,11 @@ mod tests {
         // Constructing the TlsConfig is enough — building the
         // server config exercises the rustls path which is unit-tested
         // separately under `tls.rs`.
-        let _expired = cert_expired();
-        let _san = cert_san_mismatch();
-        let _self_signed = cert_self_signed();
-        let _not_yet = cert_not_yet_valid();
+        let ca = TestCa::new("scenario-cert-presets").expect("ca");
+        let _expired = cert_expired(&ca);
+        let _san = cert_san_mismatch(&ca);
+        let _self_signed = cert_self_signed(&ca);
+        let _not_yet = cert_not_yet_valid(&ca);
     }
 
     #[test]
