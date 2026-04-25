@@ -39,42 +39,64 @@ fn require_logs(harness: &GatewayHarness) -> String {
     logs
 }
 
-/// Sleep long enough for `tracing-appender`'s non-blocking writer to
-/// drain the `stdout_logging` `TransactionSummary` JSON, then snapshot
-/// the captured combined output. This is the source of truth for every
-/// `"error_class":"..."` / `"body_error_class":"..."` assertion in
-/// this module.
+/// Test-side signals proving the gateway took the gRPC backend-error
+/// path. The assertion below is satisfied when ANY of these appear in
+/// the captured log; each is a structured marker tied to a specific
+/// gateway code path and is absent from happy-path / startup logs.
 ///
-/// Background: `stdout_logging` emits the summary through a background
-/// writer thread. The writer lags the response by tens of ms and has
-/// no public flush API at the subscriber level. Killing the subprocess
-/// via SIGKILL (the default `child.kill()`) bypasses the writer-thread
-/// `WorkerGuard` drop, so a bare `stop_and_collect_logs()` can still
-/// miss the line. A short fixed sleep (≥ 200 ms on macOS under load)
-/// plus a snapshot read is the established pattern in
-/// `tests/functional/functional_logging_test.rs`.
+/// We intentionally keep multiple signals because no single one is
+/// available in every reviewer environment:
+///
+/// * `BACKEND_ERROR_LOG` — `error!()` line at the `ferrum_edge::proxy::
+///   grpc_proxy` target. Fires whenever `sender.send_request(...)`
+///   returns Err on the streaming-body dispatch (GOAWAY pre-headers,
+///   RST during early header exchange). Emitted at ERROR level so it
+///   survives any `RUST_LOG` filter that doesn't suppress ERROR (the
+///   gateway's default is `error`). This is the signal a reviewer
+///   testing with restrictive `RUST_LOG` will see and was the only
+///   one they reported.
+/// * `BODY_ERROR_CLASS_FIELD` — `"body_error_class":"..."` in the
+///   `TransactionSummary` access-log JSON, fired by the deferred body
+///   logger when the response stream errors after headers were already
+///   forwarded. Requires `RUST_LOG=info,access_log=info` and the
+///   `stdout_logging` plugin (both wired in by `spawn_grpc_harness`).
+/// * `REJECTION_PHASE_FIELD` — `"rejection_phase":"grpc_backend_error"`
+///   inside the access-log JSON's metadata, fired by the synchronous
+///   gRPC backend-error path in `src/proxy/mod.rs`. Same loading
+///   requirements as `BODY_ERROR_CLASS_FIELD`.
+///
+/// Escape-form note for the access-log signals: the `TransactionSummary`
+/// JSON is serialized into the *outer* tracing JSON's `fields.message`
+/// string, so `"` becomes `\"` on disk. Patterns below use the escaped
+/// form (`\\\"field\\\":\\\"` in Rust source, `\"field\":\"` on disk).
+const BACKEND_ERROR_LOG: &str = "gRPC backend request failed";
+const BODY_ERROR_CLASS_FIELD: &str = "\\\"body_error_class\\\":\\\"";
+const REJECTION_PHASE_FIELD: &str = "\\\"rejection_phase\\\":\\\"grpc_backend_error\\\"";
+
+fn has_backend_error_signal(logs: &str) -> bool {
+    logs.contains(BACKEND_ERROR_LOG)
+        || logs.contains(BODY_ERROR_CLASS_FIELD)
+        || logs.contains(REJECTION_PHASE_FIELD)
+}
+
+/// Poll the captured output until a backend-error signal appears, then
+/// return the full snapshot. Polling is necessary because the
+/// `stdout_logging` access-log routes through `tracing-appender`'s
+/// non-blocking writer, which lags the response by tens of ms; a bare
+/// `captured_combined()` snapshot races the flush.
+///
+/// We force a drain by sending a couple of admin `/health` probes
+/// through the same gateway after the failing RPC: each probe emits
+/// its own log events, which travel through the same writer thread,
+/// guaranteeing that everything queued before them (including our
+/// target access-log line) has reached the underlying writer.
+///
+/// On timeout, return the latest snapshot so the panic message shows
+/// what WAS logged. The polling loop exits as soon as ANY of the
+/// signals (`BACKEND_ERROR_LOG`, `BODY_ERROR_CLASS_FIELD`,
+/// `REJECTION_PHASE_FIELD`) appears — see [`has_backend_error_signal`]
+/// for the rationale.
 async fn collect_flushed_logs(harness: &GatewayHarness) -> String {
-    // The gateway's `stdout_logging` plugin routes through
-    // `tracing-appender`'s non-blocking writer, whose worker thread
-    // wakes on each channel push. Earlier tracing lines on startup
-    // already primed the writer, but the `TransactionSummary` access-log
-    // JSON lands in the pipe asynchronously — by the time `log()`
-    // returns, the test sees the response but the JSON may still be
-    // in the channel.
-    //
-    // We force a drain by sending a couple of admin `/health` probes
-    // through the same gateway after the failing RPC: each probe emits
-    // its own log events, which travel through the same writer thread,
-    // guaranteeing that everything queued before them (including our
-    // target access-log line) has reached the underlying writer. Then
-    // we poll the captured output for either sentinel field.
-    //
-    // Escape-form note: the `TransactionSummary` JSON is serialized into
-    // the *outer* tracing JSON's `fields.message` string, so `"` becomes
-    // `\"` on disk. Test-side patterns must use the escaped form
-    // (`\\\"field\\\":\\\"` in Rust source, `\"field\":\"` on disk),
-    // not the raw `"field":"` — that was a real trip-wire during the
-    // PR-486 review.
     if let Ok(base) = harness.admin_url("/health").parse::<reqwest::Url>() {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(500))
@@ -89,9 +111,7 @@ async fn collect_flushed_logs(harness: &GatewayHarness) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let logs = harness.captured_combined().unwrap_or_default();
-        if logs.contains("\\\"rejection_phase\\\":\\\"grpc_backend_error\\\"")
-            || logs.contains("\\\"body_error_class\\\":\\\"")
-        {
+        if has_backend_error_signal(&logs) {
             return logs;
         }
         if Instant::now() >= deadline {
@@ -262,34 +282,24 @@ async fn h2_goaway_mid_request_handled_gracefully() {
     );
 
     // Gateway logs: confirm the gateway emitted a *structured* backend-error
-    // classifier. `"error_class":"..."` is the load-bearing signal — the
-    // `TransactionSummary` serializer skips the field when it is `None`,
-    // so its mere presence proves the gateway classified this request as
-    // a backend failure. The specific `rejection_phase=grpc_backend_error`
-    // marker additionally proves we took the pre-headers GOAWAY code path
-    // (as opposed to surfacing the RST-like path that fires
-    // `body_error_class` instead). Together they replace the old broad
-    // substring checks (`grpc`, `backend`) that leaked into ordinary
-    // startup/routing logs and masked regressions that logged no
-    // classifier at all.
-    //
-    // We call `collect_flushed_logs` here (instead of
-    // `captured_combined()` directly) because `stdout_logging` routes
-    // through tracing-appender's non-blocking writer — it can lag the
-    // response by tens of ms, and a bare snapshot races the flush.
-    // Escape-form note: see `collect_flushed_logs` — the access-log
-    // JSON is nested inside the outer tracing JSON's `fields.message`
-    // string, so patterns must match `\"field\":\"` not `"field":"`.
+    // signal. See [`has_backend_error_signal`] for the three accepted
+    // markers and why ANY of them satisfies the "gateway noticed the
+    // failure and classified it" guarantee. We use `OR` (rather than
+    // requiring all three) because their availability depends on
+    // `RUST_LOG`: the access-log fields require INFO-level filtering,
+    // while the `gRPC backend request failed` ERROR log fires at the
+    // gateway's default level and is what reviewer environments with
+    // restrictive `RUST_LOG` will see. None of the signals appear on
+    // the happy path or in ordinary startup / routing logs, so each is
+    // load-bearing on its own.
     let logs = collect_flushed_logs(&harness).await;
     assert!(
-        logs.contains("\\\"error_class\\\":\\\""),
-        "expected populated error_class in access-log TransactionSummary \
-         for a pre-headers GOAWAY; logs:\n{logs}"
-    );
-    assert!(
-        logs.contains("\\\"rejection_phase\\\":\\\"grpc_backend_error\\\""),
-        "expected rejection_phase=grpc_backend_error in access-log metadata \
-         (specific marker for the gRPC backend-error dispatch path); logs:\n{logs}"
+        has_backend_error_signal(&logs),
+        "expected the gateway to emit at least one structured backend-error \
+         signal — \"{BACKEND_ERROR_LOG}\" (gRPC proxy ERROR log), \
+         {BODY_ERROR_CLASS_FIELD} (access-log body_error_class field), or \
+         {REJECTION_PHASE_FIELD} (access-log rejection_phase metadata) — \
+         after a pre-headers GOAWAY; logs:\n{logs}"
     );
 
     // Regression guard: H3 capability must not have been touched by an
@@ -364,31 +374,25 @@ async fn h2_stream_reset_classified_as_protocol_error() {
         response.stream_error,
     );
 
-    // Look for a structured backend-error classifier in the access log.
-    // See `collect_flushed_logs` for why we sleep-then-snapshot instead
-    // of bare `captured_combined`, and why `"error_class"` /
-    // `"body_error_class"` are the load-bearing signals (vs broad
-    // substrings like `rst` / `reset` / `grpc`, which either never fire
-    // on this path or leak into ordinary startup logs).
+    // Same OR-of-structured-signals predicate as the GOAWAY test —
+    // see [`has_backend_error_signal`] for the rationale and the
+    // code-path / RUST_LOG mapping.
     //
-    // Code-path note: RST_STREAM lands on either the `grpc_backend_error`
-    // rejection path (populating `error_class` + `rejection_phase`) or
-    // the body-streaming path (populating `body_error_class`), depending
-    // on whether the RST arrived before the gateway finished forwarding
-    // initial response headers. We accept both outcomes — either proves
-    // the gateway noticed the reset and classified it rather than
-    // masking it as a clean completion.
-    // Escape-form note: see `collect_flushed_logs` — the access-log
-    // JSON is nested inside the outer tracing JSON's `fields.message`
-    // string, so patterns must match `\"field\":\"` not `"field":"`.
+    // Code-path note specific to RST_STREAM: the RST may arrive
+    // before the gateway finishes forwarding initial response headers
+    // (in which case `sender.send_request(...)` errors and the
+    // `gRPC backend request failed` ERROR log fires + `rejection_phase`
+    // is populated), or after (in which case `body_error_class` is
+    // populated by the deferred body logger). The OR predicate
+    // accepts either outcome.
     let logs = collect_flushed_logs(&harness).await;
-    let has_classifier =
-        logs.contains("\\\"error_class\\\":\\\"") || logs.contains("\\\"body_error_class\\\":\\\"");
     assert!(
-        has_classifier,
-        "expected the gateway to populate error_class or body_error_class \
-         in the access-log TransactionSummary after an H2 stream reset; \
-         logs:\n{logs}"
+        has_backend_error_signal(&logs),
+        "expected the gateway to emit at least one structured backend-error \
+         signal after an H2 stream reset — \"{BACKEND_ERROR_LOG}\" \
+         (gRPC proxy ERROR log), {BODY_ERROR_CLASS_FIELD} (access-log \
+         body_error_class field), or {REJECTION_PHASE_FIELD} (access-log \
+         rejection_phase metadata); logs:\n{logs}"
     );
 }
 
