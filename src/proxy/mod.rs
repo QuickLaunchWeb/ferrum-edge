@@ -4953,6 +4953,33 @@ async fn handle_proxy_request_inner(
             // Requests that fail routing (404) skip this entirely, saving ~20-60
             // String allocations.
             ctx.materialize_headers();
+
+            // Synthesize a `Host` entry from the HTTP/2 `:authority`
+            // pseudo-header when the client sent only `:authority`. RFC 9113
+            // §8.3.1 treats `:authority` as the Host equivalent for
+            // forwarding, but hyper-server places it on `req.uri()` and
+            // does not insert it into `req.headers()`. Without this
+            // backfill, every downstream codepath that reads
+            // `headers.get("host")` (backend Host emission with
+            // `preserve_host_header=true`, X-Forwarded-Host, RFC 7239
+            // `Forwarded`, plugins keyed on inbound host) sees `None`.
+            // HTTP/1.1 mandates an explicit Host so this is effectively
+            // an HTTP/2-only no-op for compliant H1 clients; we apply the
+            // backfill unconditionally because the cost is one
+            // `contains_key` + one optional insert and the rule is the
+            // same across versions.
+            //
+            // When `preserve_host_header == false`, the per-route Host
+            // override fires later in the dispatch path and replaces this
+            // synthetic value with the upstream target's host — the
+            // existing semantics for non-preserve mode are preserved.
+            if !ctx.headers.contains_key("host")
+                && let Some(authority) = req.uri().authority()
+            {
+                ctx.headers
+                    .insert("host".to_string(), authority.as_str().to_string());
+            }
+
             // Inject regex path parameters into context metadata and headers
             for (name, value) in &rm.path_params {
                 ctx.metadata

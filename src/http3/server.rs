@@ -761,6 +761,36 @@ async fn handle_h3_request(
             // Materialize headers now — path param injection writes to ctx.headers,
             // and all subsequent code (plugins, backend dispatch) needs the HashMap.
             ctx.materialize_headers();
+
+            // Synthesize a `Host` entry from the H3 `:authority` pseudo-header
+            // when the client did not send an explicit `Host` header. Real H3
+            // clients (curl, Chromium, Firefox) typically send only
+            // `:authority`, which the h3 crate parks in `req.uri().authority()`
+            // and explicitly does NOT add to `req.headers()`. Without this
+            // backfill, every downstream codepath that reads
+            // `headers.get("host")` — `build_h3_backend_headers`,
+            // `build_plain_request_builder`, the gRPC cross-protocol header
+            // map, X-Forwarded-Host, RFC 7239 `Forwarded`, and any plugin
+            // that gates on the inbound host — sees `None` and either
+            // forwards no Host to the backend or omits the forwarding
+            // header entirely. RFC 9114 §4.3.1 and RFC 9113 §8.3.1 both
+            // treat the H2/H3 `:authority` pseudo-header as the Host
+            // equivalent for forwarding purposes, so this is the canonical
+            // back-translation. Routing already runs above against
+            // `req.uri().authority()` directly, so it is unaffected.
+            //
+            // When `preserve_host_header == false`, the per-route Host
+            // override fires later in `build_h3_backend_headers` /
+            // `build_plain_request_builder` and replaces this synthetic
+            // value with the upstream target's host — the existing
+            // semantics for non-preserve mode are preserved.
+            if !ctx.headers.contains_key("host")
+                && let Some(authority) = req.uri().authority()
+            {
+                ctx.headers
+                    .insert("host".to_string(), authority.as_str().to_string());
+            }
+
             // Inject regex path parameters into context metadata and headers
             for (name, value) in &rm.path_params {
                 ctx.metadata
