@@ -4970,9 +4970,14 @@ async fn handle_proxy_request_inner(
             // same across versions.
             //
             // When `preserve_host_header == false`, the per-route Host
-            // override fires later in the dispatch path and replaces this
-            // synthetic value with the upstream target's host — the
-            // existing semantics for non-preserve mode are preserved.
+            // override fires later in the dispatch path
+            // (`proxy_to_backend` for plain HTTP, `proxy_to_backend_http2`
+            // for the direct H2 pool, `proxy_grpc_request_core` /
+            // `proxy_grpc_request_streaming` for gRPC,
+            // `build_http3_backend_headers` for the H1/H2 → H3-native
+            // backend dispatch) and replaces this synthetic value with the
+            // upstream target's host — the existing semantics for
+            // non-preserve mode are preserved.
             if !ctx.headers.contains_key("host")
                 && let Some(authority) = req.uri().authority()
             {
@@ -8661,8 +8666,10 @@ async fn proxy_to_backend_http2(
 
 fn build_http3_backend_headers(
     state: &ProxyState,
+    proxy: &Proxy,
     headers: &HashMap<String, String>,
     client_ip: &str,
+    effective_host: &str,
     content_length: Option<&str>,
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
@@ -8678,6 +8685,25 @@ fn build_http3_backend_headers(
             | "proxy-connection"
             | "upgrade"
             | "x-ferrum-original-content-encoding" => continue,
+            "host" => {
+                // Apply per-route `preserve_host_header` override on the
+                // first-attempt H3-native backend path. Mirrors
+                // `proxy_to_backend_http3_retry`, the plain HTTP / direct
+                // H2 / gRPC dispatch paths, and `build_h3_backend_headers`
+                // (H3 frontend → H3 backend). Without this, an H2 frontend
+                // that synthesized `host` from `:authority` (see the
+                // `handle_proxy_request_inner` synthesis above) would
+                // forward the client's external authority to an H3-native
+                // backend even when `preserve_host_header == false`.
+                let host_value = if proxy.preserve_host_header {
+                    value.as_str()
+                } else {
+                    effective_host
+                };
+                if let Ok(hv) = host_value.parse::<hyper::header::HeaderValue>() {
+                    http3_headers.push((hyper::header::HOST, hv));
+                }
+            }
             _ => {
                 if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
                     http3_headers.push((header_name, header_value));
@@ -8798,8 +8824,10 @@ async fn proxy_to_backend_http3(
                 let (_parts, body) = (*original_req).into_parts();
                 let http3_headers = build_http3_backend_headers(
                     state,
+                    proxy,
                     headers,
                     client_ip,
+                    effective_host,
                     headers.get("content-length").map(String::as_str),
                 );
 
@@ -9096,8 +9124,14 @@ async fn proxy_to_backend_http3(
     } else {
         None
     };
-    let http3_headers =
-        build_http3_backend_headers(state, headers, client_ip, request_content_length.as_deref());
+    let http3_headers = build_http3_backend_headers(
+        state,
+        proxy,
+        headers,
+        client_ip,
+        effective_host,
+        request_content_length.as_deref(),
+    );
 
     let body_bytes: bytes::Bytes = request_body.into();
 

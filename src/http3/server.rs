@@ -780,10 +780,14 @@ async fn handle_h3_request(
             // `req.uri().authority()` directly, so it is unaffected.
             //
             // When `preserve_host_header == false`, the per-route Host
-            // override fires later in `build_h3_backend_headers` /
-            // `build_plain_request_builder` and replaces this synthetic
-            // value with the upstream target's host — the existing
-            // semantics for non-preserve mode are preserved.
+            // override fires later in `build_plain_request_builder` (plain
+            // HTTP cross-protocol bridge) and `proxy_grpc_request_core` /
+            // `proxy_grpc_request_streaming` (gRPC dispatch — covers both
+            // the H1/H2 frontend gRPC path and the H3 cross-protocol gRPC
+            // map, since the cross-protocol path delegates to those
+            // functions) and replaces this synthetic value with the upstream
+            // target's host. The existing semantics for non-preserve mode
+            // are preserved.
             if !ctx.headers.contains_key("host")
                 && let Some(authority) = req.uri().authority()
             {
