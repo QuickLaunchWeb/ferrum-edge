@@ -241,9 +241,11 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 ### TLS Architecture
 
-**Backend CA trust chain**: proxy `backend_tls_server_ca_cert_path` → global `FERRUM_TLS_CA_BUNDLE_PATH` → webpki/system roots. Opt-out via `backend_tls_verify_server_cert: false` or `FERRUM_TLS_NO_VERIFY=true`.
+**Backend CA trust chain**: proxy `backend_tls_server_ca_cert_path` → global `FERRUM_TLS_CA_BUNDLE_PATH` → webpki/system roots. Opt-out via `backend_tls_verify_server_cert: false` or `FERRUM_TLS_NO_VERIFY=true`. The proxy backend path always passes a fully-built `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`, so the trust store is constructed in-house from `RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS)` regardless of platform.
 
-**CA exclusivity**: custom CA = sole trust anchor (no webpki mixing). When adding new paths with custom CA: reqwest → `.tls_built_in_root_certs(false)`; rustls → `RootCertStore::empty()`.
+**CA exclusivity**: custom CA = sole trust anchor (no webpki mixing). When adding new paths with custom CA: reqwest → `.tls_certs_only([cert])` (replaces the trust store wholesale; sole API since reqwest 0.13 — older `.tls_built_in_root_certs(false) + .add_root_certificate(cert)` was removed); rustls → `RootCertStore::empty()`.
+
+**reqwest "rustls" feature trust roots (no-custom-CA paths only)**: since reqwest 0.13 the bundled `rustls` feature ships `rustls-platform-verifier` instead of `webpki-roots`. Verifier resolution: macOS keychain → Windows cert store → webpki bundled fallback on Linux. This affects only the *helper* clients that don't preconfigure TLS — `health_check.rs`, `plugins/utils/http_client.rs`, `plugins/spec_expose.rs` — and only when no `FERRUM_TLS_CA_BUNDLE_PATH` / per-plugin CA is configured. Production deploys (Linux containers) see no behaviour change. macOS/Windows operators running the gateway locally will pick up roots from their OS keychain on those paths.
 
 **Startup validation**: per-proxy TLS paths validated by `validate_all_fields_with_ip_policy()` at config load. File = refuse to start; DB = warn; DP = reject update, keep cached. No silent fallback.
 

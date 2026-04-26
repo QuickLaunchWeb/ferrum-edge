@@ -46,10 +46,16 @@ The gateway resolves backend CA trust in the following order:
 
 1. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
 2. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
-3. **Neither set** — verify with **webpki/system roots** (secure default). The gateway does **not** skip verification when no CA is configured.
+3. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
 4. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
+
+> **Trust roots — backend proxy path.**
+> The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / per-proxy CA paths can change which roots the gateway trusts for backend traffic.
+
+> **Trust roots — internal helper clients.**
+> A few internal-helper reqwest clients (active health-check probes, plugin outbound HTTP via `PluginHttpClient`, the `spec_expose` plugin) do not preconfigure TLS. As of reqwest 0.13 those clients use `rustls-platform-verifier`, which resolves trust roots from the **OS keychain on macOS/Windows** and falls through to bundled webpki on Linux. For containerised production deploys (the supported target) behaviour is identical to pre-0.13. Operators running the gateway locally on macOS/Windows will see helper-client TLS verified against their OS keychain unless a `FERRUM_TLS_CA_BUNDLE_PATH` / per-plugin CA is configured (in which case the custom CA replaces the trust store wholesale, per the exclusivity rule above).
 
 Backends using certificates from public CAs work out of the box with no CA configuration. Backends using internal or self-signed certificates require either a proxy-specific or global CA bundle.
 
