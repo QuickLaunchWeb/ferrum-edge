@@ -176,7 +176,7 @@ pub(crate) async fn drain_h3_response_body(
     method: &str,
     status: u16,
     content_length: Option<u64>,
-) -> Result<Vec<u8>, anyhow::Error> {
+) -> Result<Vec<u8>, h3::error::StreamError> {
     let mut body = match content_length {
         Some(cl) => Vec::with_capacity(cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize),
         None => Vec::new(),
@@ -195,7 +195,7 @@ pub(crate) async fn drain_h3_response_body(
                     );
                     break;
                 }
-                return Err(anyhow::Error::from(e));
+                return Err(e);
             }
         }
     }

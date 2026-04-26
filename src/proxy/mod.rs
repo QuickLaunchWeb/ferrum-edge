@@ -9063,9 +9063,8 @@ async fn proxy_to_backend_http3(
                             {
                                 Ok(body) => body,
                                 Err(e) => {
-                                    let error_str = e.to_string();
                                     let (error_kind, is_conn_error, error_class) =
-                                        classify_h3_error(&error_str);
+                                        classify_h3_error(&e);
                                     error!(
                                         proxy_id = %proxy.id,
                                         backend_url = %backend_url,
@@ -9153,7 +9152,7 @@ async fn proxy_to_backend_http3(
                             )
                         } else {
                             let (error_kind, is_conn_error, error_class) =
-                                classify_h3_error(&error_str);
+                                classify_h3_error(e.as_ref());
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -9352,8 +9351,7 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
-                let error_str = e.to_string();
-                let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+                let (error_kind, is_conn_error, error_class) = classify_h3_error(e.as_ref());
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9427,8 +9425,7 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
-                let error_str = e.to_string();
-                let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+                let (error_kind, is_conn_error, error_class) = classify_h3_error(e.as_ref());
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9454,50 +9451,47 @@ async fn proxy_to_backend_http3(
     }
 }
 
-/// Classify an HTTP/3/QUIC error string into (error_kind, is_connection_error, ErrorClass).
+/// Classify an HTTP/3/QUIC error into `(error_kind, is_connection_error, ErrorClass)`.
+///
+/// Delegates the typed source-chain walk to `http3::client::classify_http3_error`
+/// (the canonical H3 classifier — handles `quinn::ConnectionError`,
+/// `quinn::ConnectError`, `io::Error`, and string fallbacks for `h3::Error` /
+/// anyhow chains in one place). This wrapper only adds the two ancillary fields
+/// the BackendResponse path needs:
+///
+/// - `error_kind` — short, stable label used in the `error_kind=...` log field.
+/// - `is_connection_error` — feeds `BackendResponse.connection_error`, which
+///   gates retry-on-connect-failure. Per `is_h3_transport_failure` semantics,
+///   this flag is independent of whether the failure is "transport-level" for
+///   capability-downgrade purposes (`is_h3_transport_error_class` looks at
+///   `error_class` only). `connection_error` is reserved for retries that
+///   require a fresh connection — protocol errors and read timeouts can be
+///   retried on the same QUIC session, so they stay `false`.
 ///
 /// Called only on the error path — not hot path.
-fn classify_h3_error(error_str: &str) -> (&'static str, bool, retry::ErrorClass) {
-    let lower = error_str.to_lowercase();
-    if lower.contains("dns") || lower.contains("resolve") || lower.contains("no record found") {
-        ("dns_failure", true, retry::ErrorClass::DnsLookupError)
-    } else if lower.contains("tls")
-        || lower.contains("certificate")
-        || lower.contains("ssl")
-        || lower.contains("handshake")
-        || lower.contains("invalid server name")
-    {
-        ("tls_error", true, retry::ErrorClass::TlsError)
-    } else if lower.contains("timeout") || lower.contains("timed out") {
-        if lower.contains("connect") {
-            (
-                "connect_timeout",
-                true,
-                retry::ErrorClass::ConnectionTimeout,
-            )
-        } else {
-            ("read_timeout", false, retry::ErrorClass::ReadWriteTimeout)
-        }
-    } else if lower.contains("refused") {
-        (
-            "connect_failure",
-            true,
-            retry::ErrorClass::ConnectionRefused,
-        )
-    } else if lower.contains("quic connection failed")
-        || lower.contains("connection reset")
-        || lower.contains("reset")
-    {
-        ("connect_failure", true, retry::ErrorClass::ConnectionReset)
-    } else if lower.contains("protocol")
-        || lower.contains("goaway")
-        || lower.contains("h3")
-        || lower.contains("stream")
-    {
-        ("protocol_error", false, retry::ErrorClass::ProtocolError)
-    } else {
-        ("request_error", false, retry::ErrorClass::RequestError)
-    }
+pub(crate) fn classify_h3_error(
+    err: &(dyn std::error::Error + 'static),
+) -> (&'static str, bool, retry::ErrorClass) {
+    let class = crate::http3::client::classify_http3_error(err);
+    let (kind, is_conn_error) = match class {
+        retry::ErrorClass::DnsLookupError => ("dns_failure", true),
+        retry::ErrorClass::TlsError => ("tls_error", true),
+        retry::ErrorClass::ConnectionTimeout => ("connect_timeout", true),
+        retry::ErrorClass::ReadWriteTimeout => ("read_timeout", false),
+        retry::ErrorClass::ConnectionRefused => ("connect_failure", true),
+        retry::ErrorClass::ConnectionReset => ("connect_failure", true),
+        retry::ErrorClass::ConnectionClosed => ("connect_failure", true),
+        retry::ErrorClass::ConnectionPoolError => ("pool_error", true),
+        retry::ErrorClass::PortExhaustion => ("port_exhaustion", true),
+        retry::ErrorClass::ProtocolError => ("protocol_error", false),
+        retry::ErrorClass::RequestError => ("request_error", false),
+        // Variants the H3 classifier never returns — kept exhaustive so adding
+        // a new ErrorClass forces a deliberate decision here.
+        retry::ErrorClass::ResponseBodyTooLarge
+        | retry::ErrorClass::RequestBodyTooLarge
+        | retry::ErrorClass::ClientDisconnect => ("request_error", false),
+    };
+    (kind, is_conn_error, class)
 }
 
 /// Replay a saved HTTP/3 request to an explicit target (used during retries).
@@ -9646,8 +9640,7 @@ async fn proxy_to_backend_http3_retry(
             }
         }
         Err(e) => {
-            let error_str = e.to_string();
-            let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+            let (error_kind, is_conn_error, error_class) = classify_h3_error(e.as_ref());
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -9923,6 +9916,111 @@ mod tests {
             false,
             Some(retry::ErrorClass::RequestBodyTooLarge)
         )));
+    }
+
+    // ---------------------------------------------------------------------
+    // classify_h3_error: typed wrapper over http3::client::classify_http3_error
+    //
+    // Verifies that (a) typed quinn / io errors flow through the source-chain
+    // walker into a stable (kind, is_conn_error, class) triple, (b) the
+    // is_conn_error flag matches the retry-on-connect contract, and (c) the
+    // bare-substring "stream" bug from the prior string classifier is gone —
+    // an `upstream`-shaped error message must not be misclassified as a
+    // protocol error.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn classify_h3_error_quinn_timeout_is_connect_timeout() {
+        let err = quinn::ConnectionError::TimedOut;
+        let (kind, is_conn, class) = classify_h3_error(&err);
+        assert_eq!(class, retry::ErrorClass::ConnectionTimeout);
+        assert_eq!(kind, "connect_timeout");
+        assert!(is_conn);
+    }
+
+    #[test]
+    fn classify_h3_error_quinn_reset_is_connect_failure() {
+        let err = quinn::ConnectionError::Reset;
+        let (kind, is_conn, class) = classify_h3_error(&err);
+        assert_eq!(class, retry::ErrorClass::ConnectionReset);
+        assert_eq!(kind, "connect_failure");
+        assert!(is_conn);
+    }
+
+    #[test]
+    fn classify_h3_error_quinn_locally_closed_is_connect_failure() {
+        let err = quinn::ConnectionError::LocallyClosed;
+        let (kind, is_conn, class) = classify_h3_error(&err);
+        assert_eq!(class, retry::ErrorClass::ConnectionClosed);
+        assert_eq!(kind, "connect_failure");
+        assert!(is_conn);
+    }
+
+    #[test]
+    fn classify_h3_error_quinn_version_mismatch_is_protocol_error() {
+        let err = quinn::ConnectionError::VersionMismatch;
+        let (kind, is_conn, class) = classify_h3_error(&err);
+        assert_eq!(class, retry::ErrorClass::ProtocolError);
+        assert_eq!(kind, "protocol_error");
+        // Protocol-level: same QUIC session can't recover, but it's not a
+        // connection-establishment failure, so retry-on-connect is `false`.
+        assert!(!is_conn);
+    }
+
+    #[test]
+    fn classify_h3_error_quinn_cids_exhausted_is_pool_error() {
+        let err = quinn::ConnectionError::CidsExhausted;
+        let (kind, is_conn, class) = classify_h3_error(&err);
+        assert_eq!(class, retry::ErrorClass::ConnectionPoolError);
+        assert_eq!(kind, "pool_error");
+        assert!(is_conn);
+    }
+
+    #[test]
+    fn classify_h3_error_string_fallback_goaway_is_protocol_error() {
+        // GOAWAY surfaces as a stringly-typed h3 error in the wild — verify
+        // the fallback path still tags it ProtocolError so the capability
+        // downgrade fires.
+        let err: Box<dyn std::error::Error + Send + Sync + 'static> =
+            "h3 error: GOAWAY received".into();
+        let (kind, is_conn, class) = classify_h3_error(err.as_ref());
+        assert_eq!(class, retry::ErrorClass::ProtocolError);
+        assert_eq!(kind, "protocol_error");
+        assert!(!is_conn);
+    }
+
+    #[test]
+    fn classify_h3_error_does_not_misclassify_upstream_as_protocol_error() {
+        // The previous string classifier matched a bare `"stream"` substring,
+        // which also matched `"upstream target"` / `"upstream id"` — labeling
+        // load-balancer or backend-selection failures as protocol errors and
+        // (worse) downgrading the H3 capability. The typed walker delegates
+        // to `http3::client::classify_http3_error`, which keeps stream tokens
+        // anchored (`stream reset`, `reset_stream`, `stream_id`, etc.).
+        let err: Box<dyn std::error::Error + Send + Sync + 'static> =
+            "no healthy upstream target available".into();
+        let (_, _, class) = classify_h3_error(err.as_ref());
+        assert_ne!(
+            class,
+            retry::ErrorClass::ProtocolError,
+            "upstream-shaped messages must not be classified as ProtocolError"
+        );
+    }
+
+    #[test]
+    fn classify_h3_error_typed_h3_stream_error_propagates() {
+        // The buffered `drain_h3_response_body` returns
+        // `h3::error::StreamError` directly — verify the typed classifier
+        // accepts it via &dyn Error coercion.
+        // `RemoteClosing` (GOAWAY) is `non_exhaustive` and unconstructible
+        // from outside h3, so synthesize a `Display`-only error that mimics
+        // the wire shape (h3 0.0.8 emits messages that include the literal
+        // "h3" token, which the string fallback maps to ProtocolError).
+        let err: Box<dyn std::error::Error + Send + Sync + 'static> =
+            "h3 stream finished without response headers".into();
+        let (kind, _, class) = classify_h3_error(err.as_ref());
+        assert_eq!(class, retry::ErrorClass::ProtocolError);
+        assert_eq!(kind, "protocol_error");
     }
 
     // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────
