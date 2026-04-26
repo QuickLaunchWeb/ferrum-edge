@@ -152,6 +152,12 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
     }
 }
 
+/// Cap on Content-Length-driven `Vec` pre-allocation for buffered H3 response
+/// bodies. Bounds the worst case when a malicious or misconfigured backend
+/// sends a huge `content-length` header — the actual body can still grow past
+/// this via `extend_from_slice`, but the initial reservation is capped.
+pub(crate) const H3_BODY_PREALLOC_CAP_BYTES: u64 = 1024 * 1024;
+
 /// Drain an H3 response stream into a `Vec<u8>`, tolerating a post-body
 /// graceful close signal. Two variants are recovered:
 ///
@@ -171,9 +177,8 @@ pub(crate) async fn drain_h3_response_body(
     status: u16,
     content_length: Option<u64>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    const PREALLOC_CAP: u64 = 1024 * 1024;
     let mut body = match content_length {
-        Some(cl) => Vec::with_capacity(cl.min(PREALLOC_CAP) as usize),
+        Some(cl) => Vec::with_capacity(cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize),
         None => Vec::new(),
     };
     loop {
@@ -182,7 +187,7 @@ pub(crate) async fn drain_h3_response_body(
             Ok(None) => break,
             Err(e) => {
                 if is_h3_graceful_close(&e)
-                    && is_response_body_complete(&body, method, status, content_length)
+                    && is_response_body_complete(body.len() as u64, method, status, content_length)
                 {
                     debug!(
                         bytes_received = body.len(),
@@ -197,23 +202,18 @@ pub(crate) async fn drain_h3_response_body(
     Ok(body)
 }
 
-pub(crate) fn is_h3_graceful_close_public(e: &h3::error::StreamError) -> bool {
-    is_h3_graceful_close(e)
-}
-
-fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
-    // h3's RemoteClosing variant (GOAWAY) is #[non_exhaustive] and not
-    // matchable from outside the crate; fall back to Display string.
+/// Whether `e` is a connection-level graceful-close signal that may legally
+/// follow a complete response body: `CONNECTION_CLOSE(H3_NO_ERROR)` or
+/// `GOAWAY` (RFC 9114 §5.1, §5.2). Stream-level resets (`RemoteTerminate`)
+/// are intentionally NOT considered graceful — the server aborted the stream.
+///
+/// The `RemoteClosing` (GOAWAY) variant is `#[non_exhaustive]` and h3 marks
+/// the unit variant itself unconstructible from outside the crate, so it
+/// cannot be matched by name. We fall back to its `Display` string (stable
+/// in h3 0.0.8); any future wording change is caught by
+/// `h3_goaway_after_complete_body_is_treated_as_graceful`.
+pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
     e.is_h3_no_error() || e.to_string() == "Remote is closing the connection"
-}
-
-pub(crate) fn is_response_body_complete_public(
-    body_len: u64,
-    method: &str,
-    status: u16,
-    content_length: Option<u64>,
-) -> bool {
-    is_response_body_complete_inner(body_len, method, status, content_length)
 }
 
 /// Whether the received body is semantically complete for this response.
@@ -224,16 +224,7 @@ pub(crate) fn is_response_body_complete_public(
 /// (RFC 9110 §6.4.1, §15.3.5, §15.4.5) and are complete when empty.
 /// Returns `false` when Content-Length is absent and the response normally
 /// carries a body, since completeness cannot be determined without the FIN.
-fn is_response_body_complete(
-    body: &[u8],
-    method: &str,
-    status: u16,
-    content_length: Option<u64>,
-) -> bool {
-    is_response_body_complete_inner(body.len() as u64, method, status, content_length)
-}
-
-fn is_response_body_complete_inner(
+pub(crate) fn is_response_body_complete(
     body_len: u64,
     method: &str,
     status: u16,

@@ -1586,17 +1586,21 @@ async fn handle_h3_request(
                     match chunk_result {
                         Ok(Some(chunk)) => {
                             let chunk_bytes = chunk.chunk();
-                            if state.max_response_body_size_bytes > 0 {
-                                total_streamed += chunk_bytes.len();
-                                if total_streamed > state.max_response_body_size_bytes {
-                                    warn!(
-                                        "Backend response exceeded {} byte limit during streaming",
-                                        state.max_response_body_size_bytes
-                                    );
-                                    let _ = stream.finish().await;
-                                    body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
-                                    break 'outer;
-                                }
+                            // Always count received bytes — the graceful-close
+                            // recovery below uses this to decide if the body is
+                            // semantically complete, even when the body-size
+                            // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
+                            total_streamed += chunk_bytes.len();
+                            if state.max_response_body_size_bytes > 0
+                                && total_streamed > state.max_response_body_size_bytes
+                            {
+                                warn!(
+                                    "Backend response exceeded {} byte limit during streaming",
+                                    state.max_response_body_size_bytes
+                                );
+                                let _ = stream.finish().await;
+                                body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                                break 'outer;
                             }
                             coalesce_buf.extend_from_slice(chunk_bytes);
                             if coalesce_buf.len() >= coalesce_min_bytes {
@@ -1616,9 +1620,9 @@ async fn handle_h3_request(
                             let cl: Option<u64> = response_headers
                                 .get("content-length")
                                 .and_then(|v| v.parse().ok());
-                            let received = total_streamed as u64 + coalesce_buf.len() as u64;
-                            if crate::http3::client::is_h3_graceful_close_public(&e)
-                                && crate::http3::client::is_response_body_complete_public(
+                            let received = total_streamed as u64;
+                            if crate::http3::client::is_h3_graceful_close(&e)
+                                && crate::http3::client::is_response_body_complete(
                                     received, &method, response_status, cl,
                                 )
                             {
@@ -2676,18 +2680,22 @@ async fn proxy_to_backend_h3_streaming(
                 match chunk_result {
                     Ok(Some(chunk)) => {
                         let chunk_bytes = chunk.chunk();
-                        if state.max_response_body_size_bytes > 0 {
-                            total_streamed += chunk_bytes.len();
-                            if total_streamed > state.max_response_body_size_bytes {
-                                warn!(
-                                    "Backend response exceeded {} byte limit during streaming",
-                                    state.max_response_body_size_bytes
-                                );
-                                let _ = h3_stream.finish().await;
-                                terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
-                                body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
-                                break 'outer;
-                            }
+                        // Always count received bytes — the graceful-close
+                        // recovery below uses this to decide if the body is
+                        // semantically complete, even when the body-size
+                        // limit is disabled (FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0).
+                        total_streamed += chunk_bytes.len();
+                        if state.max_response_body_size_bytes > 0
+                            && total_streamed > state.max_response_body_size_bytes
+                        {
+                            warn!(
+                                "Backend response exceeded {} byte limit during streaming",
+                                state.max_response_body_size_bytes
+                            );
+                            let _ = h3_stream.finish().await;
+                            terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                            body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                            break 'outer;
                         }
 
                         coalesce_buf.extend_from_slice(chunk_bytes);
@@ -2711,9 +2719,9 @@ async fn proxy_to_backend_h3_streaming(
                         let cl: Option<u64> = response_headers
                             .get("content-length")
                             .and_then(|v| v.parse().ok());
-                        let received = total_streamed as u64 + coalesce_buf.len() as u64;
-                        if crate::http3::client::is_h3_graceful_close_public(&e)
-                            && crate::http3::client::is_response_body_complete_public(
+                        let received = total_streamed as u64;
+                        if crate::http3::client::is_h3_graceful_close(&e)
+                            && crate::http3::client::is_response_body_complete(
                                 received, method, response_status, cl,
                             )
                         {
