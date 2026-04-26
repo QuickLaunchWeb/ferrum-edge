@@ -82,7 +82,13 @@ thiserror = "2"
 anyhow = "1"
 async-trait = "0.1"
 pin-project-lite = "0.2"
-reqwest = { version = "0.13", features = ["json", "rustls", "stream"] }
+# `default-features = false` drops `system-proxy` from the default set —
+# we are a server-side gateway making outbound backend calls, so honouring
+# `HTTP_PROXY` / `HTTPS_PROXY` env vars from the operator's shell is almost
+# never the intent (and a misconfigured env var would silently route
+# backend traffic through an unintended hop). Everything else from the
+# pre-0.13 default set is re-enabled explicitly.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "http2", "charset"] }
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }
 base64 = "0.22"
 url = "2"

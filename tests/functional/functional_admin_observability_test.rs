@@ -501,14 +501,33 @@ async fn test_restore_body_size_limit() {
             // Confirm this is the gateway-closed-mid-body class of error,
             // not e.g. a connect failure that would mean the gateway never
             // saw the request in the first place.
-            let chain = format!("{err:?}");
+            //
+            // Walk the source chain looking for an `io::Error` and inspect
+            // its `ErrorKind` — that's a stable surface across reqwest /
+            // hyper-util patch releases. Stringifying `Debug` would silently
+            // bypass real bugs the moment those crates reword their errors.
+            let mut io_kind: Option<std::io::ErrorKind> = None;
+            let mut cur: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(e) = cur {
+                if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                    io_kind = Some(io.kind());
+                    break;
+                }
+                cur = e.source();
+            }
             assert!(
-                chain.contains("BodyWrite")
-                    || chain.contains("ConnectionReset")
-                    || chain.contains("connection closed")
-                    || chain.contains("broken pipe"),
-                "expected ConnectionReset / BodyWrite when gateway closes \
-                 mid-upload after enforcing the size cap, got: {chain}"
+                matches!(
+                    io_kind,
+                    Some(
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+                ),
+                "expected gateway-closed-mid-body io::Error \
+                 (ConnectionReset / BrokenPipe / ConnectionAborted / UnexpectedEof) \
+                 after enforcing the size cap, got: {err:?}"
             );
         }
     }
