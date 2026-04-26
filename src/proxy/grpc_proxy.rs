@@ -818,12 +818,15 @@ pub async fn proxy_grpc_request(
 /// trailers arrive as a terminal frame); otherwise the response is fully
 /// buffered and trailers are extracted up-front.
 ///
-/// Retries MUST pass `stream_response = false` — the response must be
-/// fully collected so the retry layer can inspect status/body before
-/// deciding whether to retry. The cross-protocol bridge passes `true` when
-/// no retries are configured and no plugin requires response-body
-/// buffering, so server-streaming/bidi gRPC responses flow to the client
-/// without accumulating in memory.
+/// Retry attempts can safely pass `stream_response = true`: the gateway's
+/// gRPC retry loop only re-fires on CONNECTION errors that surface BEFORE
+/// any response headers (`BackendUnavailable` / `BackendTimeout::Connect`),
+/// so once a streaming response begins flowing the loop breaks out and
+/// never has to inspect the body. Buffering the retry response would
+/// silently downgrade a server-streaming RPC into "wait for the whole
+/// body" the moment a transient TCP RST hits the very first attempt — the
+/// exact trailer-stall this path is meant to avoid. The cross-protocol
+/// bridge passes the same streaming decision through for the same reason.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_from_bytes(
     method: hyper::Method,

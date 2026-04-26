@@ -5611,7 +5611,18 @@ async fn handle_proxy_request_inner(
                 }
             }
 
-            // Dispatch to backend with pre-collected body bytes
+            // Dispatch to backend with pre-collected body bytes.
+            //
+            // The collected request body must be returned to the caller
+            // regardless of `grpc_should_stream` — retries fire on
+            // CONNECTION errors that occur BEFORE response headers, so the
+            // streaming-or-not choice for the response has no bearing on
+            // whether the request body needs to be replayable. Returning
+            // `Bytes::new()` here on the streaming branch silently fed the
+            // retry loop an empty body whenever a body-hook proxy also had
+            // `retry_on_connect_failure` enabled. Mirrors the same
+            // single-return contract documented in
+            // `proxy_grpc_request`.
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
                 grpc_headers,
@@ -5624,11 +5635,7 @@ async fn handle_proxy_request_inner(
                 grpc_should_stream,
             )
             .await;
-            if grpc_should_stream {
-                (result, Bytes::new())
-            } else {
-                (result, grpc_req_body)
-            }
+            (result, grpc_req_body)
         } else {
             // Fast path: no plugin body hooks needed
             let request = match client_request_body {
@@ -5768,6 +5775,16 @@ async fn handle_proxy_request_inner(
                     "Retrying gRPC backend request"
                 );
 
+                // Stream the retry response under the same conditions as
+                // the initial attempt. The retry loop only fires on
+                // CONNECTION errors that surface BEFORE response headers
+                // (`BackendUnavailable` / `BackendTimeout::Connect`) — once
+                // a response begins, this loop breaks out and never touches
+                // the body, so passing `grpc_should_stream=true` here is
+                // safe and necessary to keep the trailer-stall fix that
+                // motivates this PR working when the very first connect
+                // hiccups (otherwise a transient TCP RST silently downgrades
+                // a streaming RPC to fully buffered).
                 grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
@@ -5777,7 +5794,7 @@ async fn handle_proxy_request_inner(
                     &state.grpc_pool,
                     &state.dns_cache,
                     proxy_headers,
-                    false, // retries always buffer so the response can be inspected
+                    grpc_should_stream,
                 )
                 .await;
             }
@@ -9874,5 +9891,127 @@ mod tests {
             Some(1024 * 1024),
             1024 * 1024,
         ));
+    }
+
+    /// Regression guard: the gRPC request-body-hook branch must always
+    /// return the collected request bytes alongside the dispatch result,
+    /// even when the response is being streamed.
+    ///
+    /// Background: the response-streaming decision (`grpc_should_stream`)
+    /// is orthogonal to whether the REQUEST body must be replayable on a
+    /// connection-level retry. The retry loop fires on connection errors
+    /// observed BEFORE response headers, so streaming-vs-buffering the
+    /// response has no bearing on whether the request needs to be
+    /// replayable. The OLD pattern collapsed both into a single decision:
+    ///
+    /// ```ignore
+    /// if grpc_should_stream { (result, Bytes::new()) }
+    /// else                  { (result, grpc_req_body) }
+    /// ```
+    ///
+    /// which silently fed the retry loop an empty request body whenever a
+    /// body-hook proxy ALSO had `retry_on_connect_failure` enabled and the
+    /// streaming-response gate was open. This test fingerprints the fixed
+    /// shape so a future cleanup cannot accidentally re-introduce the
+    /// branching.
+    #[test]
+    fn grpc_hook_path_returns_collected_request_body_unconditionally() {
+        let src = include_str!("mod.rs");
+        let marker = "// Dispatch to backend with pre-collected body bytes";
+        let block_start = src
+            .find(marker)
+            .expect("hook-path dispatch block marker not found");
+        // The block ends at the `} else {` that opens the `grpc_needs_request_body_hooks=false` arm.
+        let tail = &src[block_start..];
+        let block_end = tail
+            .find("} else {\n            // Fast path: no plugin body hooks needed")
+            .expect("end of grpc hook-path branch not found");
+        let block = &tail[..block_end];
+
+        for (i, line) in block.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("if grpc_should_stream"),
+                "regression at relative line {} of grpc hook-path branch: \
+                 found `if grpc_should_stream` split on the success path. \
+                 Always return the collected request body so a connect-level \
+                 retry can replay it. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+            assert!(
+                !trimmed.contains("Bytes::new()"),
+                "regression at relative line {} of grpc hook-path branch: \
+                 the success path must return `grpc_req_body`, not \
+                 `Bytes::new()`. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+        }
+    }
+
+    /// Regression guard: the gRPC retry loop must propagate the original
+    /// streaming-response decision into each retry attempt.
+    ///
+    /// Background: the loop only retries CONNECTION errors that surface
+    /// BEFORE response headers (`BackendUnavailable` /
+    /// `BackendTimeout::Connect`). Once any retry attempt produces a
+    /// response, the loop's match falls through and the response is
+    /// handed off to the downstream client untouched. Buffering the retry
+    /// response therefore has no benefit but reintroduces the
+    /// trailer-stall the rest of this PR is fixing — a single transient
+    /// connect failure on a server-streaming RPC would silently downgrade
+    /// the entire response to "wait for the whole body".
+    #[test]
+    fn grpc_retry_loop_passes_streaming_decision_through() {
+        let src = include_str!("mod.rs");
+        let loop_start = src
+            .find("// gRPC retry loop — retries on connection failures")
+            .expect("gRPC retry loop marker not found");
+        let tail = &src[loop_start..];
+        let loop_end = tail
+            .find("\n        }\n\n        let backend_total_ms = backend_start.elapsed()")
+            .expect("end of gRPC retry loop not found");
+        let loop_body = &tail[..loop_end];
+
+        let call_marker = "grpc_proxy::proxy_grpc_request_from_bytes(";
+        let call_idx = loop_body
+            .find(call_marker)
+            .expect("retry-loop call to proxy_grpc_request_from_bytes not found");
+        let call_tail = &loop_body[call_idx..];
+        let call_end = call_tail
+            .find(")\n                .await")
+            .expect("end of retry-loop call not found");
+        let call_args = &call_tail[..call_end];
+
+        // The OLD pattern hard-coded the streaming flag to `false` on the
+        // retry path. Either explicit `false,` or any phrasing that
+        // disables streaming irrespective of the initial decision is a
+        // regression.
+        for (i, line) in call_args.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            assert!(
+                trimmed != "false," && trimmed != "false",
+                "regression at relative line {} of gRPC retry call: \
+                 `proxy_grpc_request_from_bytes` is invoked with a hard-\
+                 coded `false` streaming flag. Pass `grpc_should_stream` \
+                 instead so successful retries keep the trailer-stall fix \
+                 active. Offending line:\n  {}",
+                i + 1,
+                line
+            );
+        }
+        assert!(
+            call_args.contains("grpc_should_stream"),
+            "expected `grpc_should_stream` to be threaded into the retry \
+             call to proxy_grpc_request_from_bytes; argument list was:\n{}",
+            call_args
+        );
     }
 }
