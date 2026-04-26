@@ -7,27 +7,362 @@
 //! The admin API is always read-only in this mode (no database to write to).
 //! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
 //! any externally-crafted JWT will be rejected since nobody knows the secret.
+//!
+//! ## Public entry points
+//!
+//! - [`run`] — the binary entry point. Loads the YAML/JSON config from
+//!   `FERRUM_FILE_CONFIG_PATH`, registers a SIGHUP reload handler, and runs
+//!   forever until shutdown is signalled. This is what `ferrum-edge run`
+//!   ultimately calls into.
+//! - [`serve`] — an in-process entry point that takes an already-built
+//!   `GatewayConfig`, optional pre-bound TCP listeners for the proxy and
+//!   admin ports, and a shutdown receiver. Returns a [`ServeHandles`]
+//!   struct that holds the `ProxyState` and JoinHandles for every spawned
+//!   task. Used by the in-process variant of `tests/scaffolding/harness.rs`
+//!   to spin up a real gateway in ~100ms without invoking a subprocess.
+//!
+//! `serve()` deliberately omits the SIGHUP handler — caller-driven config
+//! updates go through `proxy_state.update_config()` directly.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::file_loader;
+use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
+/// Pre-bound TCP listeners + admin overrides that callers of [`serve`] can
+/// hand to the gateway instead of letting it bind ports / read env itself.
+///
+/// Each listener field is independent: leave a slot `None` to disable that
+/// listener, pass `Some` to use the caller's socket. When a slot is `Some`,
+/// the corresponding port in [`EnvConfig`] is ignored — the listener is
+/// adopted as-is and its already-bound address is what clients connect to.
+///
+/// In-process tests reserve ports via `tests/scaffolding/ports.rs` and pass
+/// the live listeners in here so the gateway adopts the same FD without
+/// re-binding (which would be racy under parallel test load).
+///
+/// `admin_jwt_manager`, when provided, bypasses
+/// [`crate::admin::jwt_auth::create_jwt_manager_from_env`] entirely. Tests
+/// running in the same process can't share the global `FERRUM_ADMIN_JWT_*`
+/// env vars without serialising — passing a manager directly avoids the
+/// dance.
+#[derive(Default)]
+pub struct ServeOptions {
+    /// Plaintext proxy port. `None` disables the plaintext proxy listener.
+    pub proxy_http: Option<TcpListener>,
+    /// TLS proxy port. `None` disables the HTTPS proxy listener even when
+    /// TLS material is configured.
+    pub proxy_https: Option<TcpListener>,
+    /// Plaintext admin port. `None` disables the plaintext admin listener.
+    pub admin_http: Option<TcpListener>,
+    /// TLS admin port. `None` disables the HTTPS admin listener even when
+    /// admin TLS material is configured.
+    pub admin_https: Option<TcpListener>,
+    /// Pre-built admin JWT manager. When `None`, `serve` reads the JWT
+    /// secret/issuer/ttl from environment variables (same as the binary
+    /// path does via `create_jwt_manager_from_env`).
+    pub admin_jwt_manager: Option<crate::admin::jwt_auth::JwtManager>,
+    /// When `true`, `serve` does not trigger the immediate
+    /// backend-capability probe pass on startup; only the periodic refresh
+    /// loop is started.
+    ///
+    /// The binary leaves this `false`: when warmup is also off, an
+    /// immediate probe is the only thing that populates the registry
+    /// before the first periodic tick (default 24 h), without which
+    /// HTTPS dispatch falls back to reqwest for the entire window.
+    ///
+    /// In-process tests set this `true` to keep the harness "cold". The
+    /// h2c probe that runs against HTTP backends opens a real connection
+    /// to the (often scripted) backend, which would consume the first
+    /// `ExpectRequest` step or perturb per-test connection counts.
+    /// Tests that explicitly need the probe behaviour opt in via
+    /// `pool_warmup_enabled(true)` instead — that path runs warmup first
+    /// (which itself populates the registry) and is awaited before
+    /// `serve()` returns, so the test gets a deterministic snapshot
+    /// rather than racing the background refresh.
+    pub skip_initial_capability_refresh: bool,
+}
+
+/// Handles returned by [`serve`].
+///
+/// The caller can:
+/// 1. Drive requests through the gateway via the bound listeners' addresses.
+/// 2. Read state out of [`ServeHandles::proxy_state`] (e.g. metrics,
+///    capability registry, dispatch kind).
+/// 3. Trigger shutdown by `send`-ing `true` on the [`tokio::sync::watch`]
+///    channel passed to `serve()`.
+/// 4. Await graceful drain by `await`ing [`ServeHandles::join`].
+pub struct ServeHandles {
+    /// Shared proxy state. Tests can read metrics, swap config, etc.
+    pub proxy_state: ProxyState,
+    /// Local addresses each listener is bound to (resolved from the pre-bound
+    /// listener, **not** read from `EnvConfig`). Tests use this to build
+    /// canonical proxy/admin URLs.
+    #[allow(dead_code)] // The binary path drops this immediately; tests read it.
+    pub bound: BoundAddresses,
+    /// Listener task handles (proxy HTTP/HTTPS/H3 + admin HTTP/HTTPS).
+    /// These exit cleanly when the shutdown signal fires, so [`Self::join`]
+    /// awaits them unbounded.
+    listener_handles: Vec<JoinHandle<()>>,
+    /// Background task handles (DNS refresh, overload monitor, metrics).
+    /// [`Self::join`] caps the wait on these at [`BACKGROUND_DRAIN_TIMEOUT`]
+    /// so a stuck task can never wedge graceful shutdown indefinitely
+    /// — the binary's pre-refactor `run()` had the same 5 s cap, and
+    /// rolling-restart / test-teardown ergonomics rely on it.
+    background_handles: Vec<JoinHandle<()>>,
+    /// Shutdown sender. [`Self::join`] uses it for two things:
+    ///
+    /// 1. **Subscribe** to wait for shutdown when `listener_handles` is
+    ///    empty (stream-only deployment — TCP/UDP only via
+    ///    `stream_listener_manager` whose tasks are not tracked here).
+    ///    Without this, `join()` would return after the background-drain
+    ///    timeout and `run()` would exit ~5 s after startup even though
+    ///    stream proxies were still serving.
+    /// 2. **Send `true`** when one listener task panics, so the remaining
+    ///    listeners observe shutdown via their own subscribers and exit
+    ///    promptly. Without this, an in-flight `handle.await` for a
+    ///    still-serving listener blocks forever — the panic never bubbles
+    ///    up and the binary stays alive with one dead listener.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` snapshot — bound on the in-flight
+    /// request drain that runs between listener exit and background-task
+    /// drain.
+    drain_seconds: u64,
+}
+
+/// Hard cap on background-task drain (DNS refresh, overload monitor,
+/// metrics) during shutdown. Mirrors the pre-refactor `run()`'s 5 s
+/// timeout — without it, a stuck background task wedges the whole
+/// shutdown.
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolved listener addresses returned by [`serve`].
+#[derive(Default, Clone, Debug)]
+pub struct BoundAddresses {
+    pub proxy_http: Option<SocketAddr>,
+    pub proxy_https: Option<SocketAddr>,
+    pub admin_http: Option<SocketAddr>,
+    pub admin_https: Option<SocketAddr>,
+}
+
+impl ServeHandles {
+    /// Wait for every spawned listener / background task to finish.
+    ///
+    /// Callers must trigger shutdown on the [`tokio::sync::watch::Sender`]
+    /// they passed into [`serve`] before awaiting this future, otherwise
+    /// `join()` will hang waiting for accept loops that never exit.
+    ///
+    /// Three phases — match the pre-refactor `run()`:
+    ///
+    /// 1. Listener handles awaited unbounded. These exit on the shutdown
+    ///    watch channel; once all are gone no new connections arrive. If
+    ///    `listener_handles` is empty (stream-only deployment — TCP/UDP
+    ///    only, plaintext proxy + admin disabled), wait directly on the
+    ///    shutdown channel instead so the function stays alive while
+    ///    `stream_listener_manager`'s tasks (which are not tracked here)
+    ///    keep serving traffic.
+    /// 2. In-flight request drain bounded by `FERRUM_SHUTDOWN_DRAIN_SECONDS`.
+    ///    Existing connections see `Connection: close` and finish their
+    ///    current request-response cycle.
+    /// 3. Background tasks (DNS refresh, overload monitor, metrics)
+    ///    awaited with [`BACKGROUND_DRAIN_TIMEOUT`]. A stuck task logs a
+    ///    warning instead of wedging shutdown — without this cap a
+    ///    rolling restart could hang on a single misbehaving task.
+    ///
+    /// Returns the first listener-task `JoinError` if any listener panicked.
+    /// Every listener is still awaited (so `JoinError`s on later handles get
+    /// logged) and the drain phases still run, but the returned `Err`
+    /// propagates up to `run()` so the binary surfaces a panicked listener
+    /// instead of silently exiting with one listener missing — matching
+    /// the pre-refactor `handle.await?` semantics.
+    pub async fn join(self) -> Result<(), tokio::task::JoinError> {
+        let listener_result = if self.listener_handles.is_empty() {
+            // Stream-only deployment: there are no JoinHandles to await,
+            // so block on the shutdown watch channel until somebody fires
+            // it. Mirrors the pre-refactor `run()` which had the same
+            // `wait_shutdown.changed().await` loop.
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            while !*shutdown_rx.borrow() {
+                if shutdown_rx.changed().await.is_err() {
+                    // Sender dropped without sending `true` — treat as
+                    // shutdown.
+                    break;
+                }
+            }
+            Ok(())
+        } else {
+            // Pass a closure that fires shutdown on first panic so
+            // remaining listeners observe it and exit promptly. Without
+            // this, a panicked listener would leave the others stuck on
+            // their accept loops forever and `join()` would never return.
+            let shutdown_tx = self.shutdown_tx.clone();
+            await_listener_handles(self.listener_handles, move || {
+                let _ = shutdown_tx.send(true);
+            })
+            .await
+        };
+        if self.drain_seconds > 0 {
+            crate::overload::wait_for_drain(
+                &self.proxy_state.overload,
+                Duration::from_secs(self.drain_seconds),
+            )
+            .await;
+        }
+        join_background_handles(self.background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+        listener_result
+    }
+
+    /// Signal shutdown then drain inner listener / background handles.
+    ///
+    /// Intended for `serve()`'s own use when an early-startup `?` fires
+    /// after some tasks have already been spawned: without this the
+    /// spawned `JoinHandle`s drop unawaited and the underlying listener
+    /// loops orphan, holding sockets across the in-process retry path
+    /// and poisoning subsequent attempts in the same process. Discards
+    /// any listener `JoinError` because the original startup error is
+    /// the more useful one to surface.
+    pub async fn shutdown_and_join(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.join().await;
+    }
+}
+
+/// Await every listener handle. Logs each `JoinError` and returns the
+/// first one so a panicked listener bubbles up to `run()` (instead of
+/// silently leaving the binary running with one fewer accept loop).
+///
+/// Awaits handles **concurrently** via `FuturesUnordered` rather than
+/// sequentially so that:
+///
+/// 1. The first panic is observed even if it happens on a handle later
+///    in the iteration order than a still-serving listener.
+/// 2. On the first panic, `shutdown_on_panic` fires so the still-serving
+///    listeners observe the shutdown watch channel via their own
+///    subscribers and exit promptly. With sequential `for handle in
+///    handles { handle.await }` plus no shutdown trigger, a panicked
+///    listener would leave the remaining ones stuck on their accept
+///    loops forever and the helper would never return.
+///
+/// Pulled out of [`ServeHandles::join`] so the panic-propagation
+/// behaviour is unit-testable without constructing a `ProxyState`.
+async fn await_listener_handles(
+    handles: Vec<JoinHandle<()>>,
+    shutdown_on_panic: impl FnOnce(),
+) -> Result<(), tokio::task::JoinError> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut futures: FuturesUnordered<_> = handles.into_iter().collect();
+    let mut first_error: Option<tokio::task::JoinError> = None;
+    let mut shutdown_on_panic = Some(shutdown_on_panic);
+    while let Some(result) = futures.next().await {
+        if let Err(err) = result {
+            error!("Gateway listener task failed: {}", err);
+            if first_error.is_none() {
+                first_error = Some(err);
+                if let Some(trigger) = shutdown_on_panic.take() {
+                    trigger();
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Await every handle in `handles`, capped at `timeout`. On timeout we log
+/// a single warning and return — a stuck task is not allowed to wedge
+/// graceful shutdown. Pulled out of [`ServeHandles::join`] so the timeout
+/// behaviour is unit-testable without constructing a `ProxyState`.
+async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    let drain = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            "Background tasks did not drain within {}s, proceeding with shutdown",
+            timeout.as_secs()
+        );
+    }
+}
+
+/// Build the reserved-port set [`serve`] uses for stream-proxy conflict
+/// validation and for `AdminState::reserved_ports`.
+///
+/// Per-listener priority: a `Some(TcpListener)` in `prebound` wins over
+/// the matching `env_config.*_port` because the live port can differ
+/// when callers adopt FDs (in-process harness, future production
+/// integrations). Falls back to the env-config port when no listener
+/// is pre-bound. Port `0` is "disabled" — never reserved. CP gRPC
+/// isn't pre-bindable via `ServeOptions` so it always comes from env.
+fn effective_reserved_ports(
+    env_config: &EnvConfig,
+    prebound: &ServeOptions,
+) -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    let resolve = |listener: &Option<TcpListener>, env_port: u16| -> Option<u16> {
+        if let Some(l) = listener {
+            l.local_addr().ok().map(|a| a.port())
+        } else if env_port != 0 {
+            Some(env_port)
+        } else {
+            None
+        }
+    };
+    for port in [
+        resolve(&prebound.proxy_http, env_config.proxy_http_port),
+        resolve(&prebound.proxy_https, env_config.proxy_https_port),
+        resolve(&prebound.admin_http, env_config.admin_http_port),
+        resolve(&prebound.admin_https, env_config.admin_https_port),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ports.insert(port);
+    }
+    if let Some(ref addr) = env_config.cp_grpc_listen_addr
+        && let Some(port_str) = addr.rsplit(':').next()
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        ports.insert(port);
+    }
+    ports
+}
+
+/// Resolve the address H3 should bind its UDP socket to. Reuses the
+/// HTTPS listener's resolved address when available so the QUIC port
+/// matches the TLS-over-TCP port even if `env_config.proxy_https_port`
+/// is stale (e.g. ephemeral `0` resolved at bind time, or holding the
+/// production default while a caller adopted an FD on a different
+/// port). Falls back to the env-config port when no HTTPS listener
+/// is bound.
+fn resolve_http3_bind_addr(env_config: &EnvConfig, bound_https: Option<SocketAddr>) -> SocketAddr {
+    bound_https.unwrap_or_else(|| env_config.proxy_socket_addr(env_config.proxy_https_port))
+}
+
+/// The binary entry point. Loads the YAML/JSON config from
+/// `FERRUM_FILE_CONFIG_PATH`, then dispatches into [`serve`] with a
+/// SIGHUP reload handler installed on top.
 pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
-    // Log configuration details
     info!(
         "Starting in file mode with log level: {}",
         env_config.log_level
@@ -58,256 +393,59 @@ pub async fn run(
         &env_config.backend_allow_ips,
         &env_config.namespace,
     )?;
-    info!(
-        "File mode: loaded {} proxies, {} consumers",
-        config.proxies.len(),
-        config.consumers.len()
-    );
 
-    // Validate stream proxy ports don't conflict with gateway reserved ports
-    let reserved_ports = env_config.reserved_gateway_ports();
-    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        return Err(anyhow::anyhow!(
-            "Stream proxy port conflicts with gateway reserved ports"
-        ));
-    }
+    // Install the SIGHUP handler BEFORE serve() so a HUP arriving during
+    // startup (DNS warmup, pool warmup, listener bind) doesn't take the
+    // default termination action and kill the process. Once the
+    // `Signal` stream is created, tokio overrides the default handler
+    // and queues incoming signals; the reload loop below `recv()`s them
+    // after `serve()` returns. Startup HUPs become "reload after we're
+    // ready" instead of "process gone".
+    #[cfg(unix)]
+    let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|e| anyhow::anyhow!("Failed to register SIGHUP handler: {e}"))?;
 
-    let dns_cache = DnsCache::new(DnsConfig {
-        global_overrides: env_config.dns_overrides.clone(),
-        resolver_addresses: env_config.dns_resolver_address.clone(),
-        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
-        dns_order: env_config.dns_order.clone(),
-        ttl_override_seconds: env_config.dns_ttl_override,
-        min_ttl_seconds: env_config.dns_min_ttl,
-        stale_ttl_seconds: env_config.dns_stale_ttl,
-        error_ttl_seconds: env_config.dns_error_ttl,
-        max_cache_size: env_config.dns_cache_max_size,
-        warmup_concurrency: env_config.dns_warmup_concurrency,
-        slow_threshold_ms: env_config.dns_slow_threshold_ms,
-        refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
-        failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
-        try_tcp_on_error: env_config.dns_try_tcp_on_error,
-        num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
-        max_active_requests: env_config.dns_max_active_requests,
-        backend_allow_ips: env_config.backend_allow_ips.clone(),
-    });
-
-    // DNS warmup — resolve all hostnames (proxy backends, upstream targets,
-    // and plugin endpoints) before accepting requests. Hostnames are
-    // deduplicated inside DnsCache::warmup() so shared hostnames across
-    // proxies/plugins only trigger one DNS lookup.
-    let mut hostnames: Vec<_> = config
-        .proxies
-        .iter()
-        .map(|p| {
-            (
-                p.backend_host.clone(),
-                p.dns_override.clone(),
-                p.dns_cache_ttl_seconds,
-            )
-        })
-        .collect();
-
-    // Add upstream target hostnames for load-balanced proxies
-    for upstream in &config.upstreams {
-        for target in &upstream.targets {
-            hostnames.push((target.host.clone(), None, None));
-        }
-    }
-
-    // Build TLS hardening policy from environment (needed for both frontend
-    // and backend TLS — cipher suites, protocol versions, key exchange groups).
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
-    );
-
-    // Build ProxyState first so the plugin cache exists with the shared DNS
-    // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(
-        config,
-        dns_cache.clone(),
+    // Hand off to serve(). It builds ProxyState, spawns listeners, and waits
+    // until shutdown — exactly what run() used to do inline. The only extra
+    // bit is the SIGHUP handler, registered alongside.
+    let handles = serve(
         env_config.clone(),
-        Some(tls_policy.clone()),
-    )?;
+        config,
+        ServeOptions::default(),
+        shutdown_tx.clone(),
+    )
+    .await?;
 
-    // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
-    let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
-    for host in plugin_hosts {
-        hostnames.push((host, None, None));
-    }
-
-    dns_cache.warmup(hostnames).await;
-
-    // Connection pool warmup — pre-establish backend connections for HTTP-family
-    // proxies so the first request to each backend avoids TCP/TLS/QUIC handshake
-    // latency. Must run after DNS warmup (needs resolved IPs).
-    if env_config.pool_warmup_enabled {
-        proxy_state.warmup_connection_pools().await;
-    }
-    // Kick off an initial capability probe when warmup is off — otherwise
-    // the registry stays empty and HTTPS H2/H3 dispatch falls back to
-    // reqwest until the first periodic tick (up to 24 h).
-    proxy_state.start_backend_capability_refresh_task(
-        !env_config.pool_warmup_enabled,
-        Some(shutdown_tx.subscribe()),
-    );
-
-    // Start per-IP request counter cleanup (removes stale zero-count entries)
-    proxy_state.start_per_ip_cleanup_task();
-
-    // Start background TTL refresh to keep cache warm (with shutdown)
-    let dns_handle =
-        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
-
-    // Start background task to retry failed DNS lookups
-    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
-
-    // Start service discovery background tasks
-    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
-
-    // Start overload monitor background task
-    let overload_handle = crate::overload::start_monitor(
-        proxy_state.overload.clone(),
-        env_config.overload_config(),
-        env_config.max_connections,
-        env_config.max_requests,
-        shutdown_tx.subscribe(),
-    );
-
-    // Start windowed metrics monitor background task
-    let metrics_handle = crate::metrics::start_metrics_monitor(
-        proxy_state.request_count.clone(),
-        proxy_state.status_counts.clone(),
-        proxy_state.windowed_metrics.clone(),
-        env_config.status_metrics_window_seconds,
-        shutdown_tx.subscribe(),
-    );
-
-    // Validate TLS configuration if provided
-    let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.frontend_tls_cert_path,
-        &env_config.frontend_tls_key_path,
-    ) {
-        info!("Loading TLS configuration with client certificate verification...");
-        let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(
-            cert_path,
-            key_path,
-            client_ca_bundle_path,
-            env_config.tls_no_verify,
-            &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            &crls,
-        ) {
-            Ok(mut config) => {
-                // Enable 0-RTT on the proxy frontend only (not admin).
-                tls::enable_early_data(&mut config, &tls_policy);
-                // Enable kTLS session-secret extraction on the proxy frontend
-                // only (not admin) when kTLS could be used. Rustls gates
-                // `dangerous_extract_secrets()` behind this flag; without it,
-                // the kTLS splice fallback path in tcp_proxy.rs would never
-                // be able to retrieve the session keys.
-                if env_config.ktls_enabled.could_be_enabled() {
-                    tls::enable_secret_extraction_for_ktls(&mut config);
-                }
-                if client_ca_bundle_path.is_some() {
-                    info!(
-                        "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                    );
-                } else {
-                    info!(
-                        "TLS configuration loaded without client certificate verification (HTTPS available)"
-                    );
-                }
-                Some(config)
-            }
-            Err(e) => {
-                error!("TLS configuration validation failed: {}", e);
-                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
-            }
-        }
-    } else {
-        info!("No TLS configuration provided (HTTP only)");
-        None
-    };
-
-    // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
-    // The TLS config is loaded after ProxyState::new(), so we update it here and
-    // re-reconcile to start any deferred frontend_tls listeners.
-    if let Some(ref tls_cfg) = tls_config {
-        proxy_state
-            .stream_listener_manager
-            .set_frontend_tls_config(Some(tls_cfg.clone()));
-    }
-
-    // Set DTLS cert/key for UDP proxies with frontend_tls (DTLS termination).
-    if let (Some(cert_path), Some(key_path)) =
-        (&env_config.dtls_cert_path, &env_config.dtls_key_path)
-    {
-        tls::check_cert_expiry(
-            cert_path,
-            "DTLS frontend cert",
-            env_config.tls_cert_expiry_warning_days,
-        )?;
-        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
-            tls::check_cert_expiry(
-                ca_path,
-                "DTLS client CA cert",
-                env_config.tls_cert_expiry_warning_days,
-            )?;
-        }
-        proxy_state
-            .stream_listener_manager
-            .set_frontend_dtls_cert_key(
-                cert_path.clone(),
-                key_path.clone(),
-                env_config.dtls_client_ca_cert_path.clone(),
-            );
-    }
-
-    // Log size limits if non-default
-    if env_config.max_header_size_bytes != 32_768 {
-        info!(
-            "Custom max header size: {} bytes",
-            env_config.max_header_size_bytes
-        );
-    }
-    if env_config.max_request_body_size_bytes != 10_485_760 {
-        info!(
-            "Custom max request body size: {} bytes",
-            env_config.max_request_body_size_bytes
-        );
-    }
-
-    // Listen for SIGHUP to reload config (with shutdown)
-    #[cfg(unix)]
-    let proxy_state_reload = proxy_state.clone();
-    #[cfg(unix)]
+    // SIGHUP-driven config reload (Unix only). On non-Unix this future just
+    // waits on shutdown so the join order is unchanged.
+    let proxy_state_reload = handles.proxy_state.clone();
     let config_path_owned = config_path.to_string();
-    #[cfg(unix)]
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
-    #[cfg(unix)]
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
-    #[cfg(unix)]
     let reload_namespace = env_config.namespace.clone();
     let mut sighup_shutdown = shutdown_tx.subscribe();
     let sighup_handle = tokio::spawn(async move {
+        // Shutdown can already be `true` by the time this task starts —
+        // the SIGHUP handler is registered AFTER `serve()` returns, so
+        // anything that fires shutdown during startup (SIGTERM,
+        // serve-internal failure cleanup) lands the watch at `true`
+        // before we get here. `changed()` only completes on a *new*
+        // update, so without this short-circuit the task would block on
+        // `recv()` / `changed()` until something else moved the
+        // channel — and `run()`'s `tokio::time::timeout(5s, sighup_handle)`
+        // would always burn the full timeout on shutdown-during-startup
+        // paths.
+        if *sighup_shutdown.borrow() {
+            info!("SIGHUP listener: shutdown already signalled at startup, exiting");
+            return;
+        }
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sighup = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to register SIGHUP handler: {}", e);
-                    return;
-                }
-            };
+            // Use the pre-installed signal stream from above so any HUPs
+            // that arrived during `serve()` startup get processed here
+            // (`tokio::signal::unix::Signal` queues notifications until
+            // `recv()` is awaited).
+            let mut sighup = sighup;
             loop {
                 tokio::select! {
                     _ = sighup.recv() => {
@@ -341,24 +479,251 @@ pub async fn run(
         }
     });
 
-    // Start Admin API (read-only in file mode)
-    let jwt_manager = match create_jwt_manager_from_env() {
-        Ok(jm) => jm,
-        Err(e) => {
-            warn!(
-                "Admin JWT not configured ({}), admin endpoints will reject requests",
-                e
+    // Wait for serve()'s tasks to drain (proxy listeners + background
+    // tasks). Surface any listener-task panic so the binary exits non-zero
+    // and the operator's process supervisor can restart — silently
+    // continuing with one listener missing was the pre-fix behaviour.
+    let listener_result = handles.join().await;
+
+    // SIGHUP listener exits via shutdown_rx — wait for it too with a timeout.
+    let _ = tokio::time::timeout(Duration::from_secs(5), sighup_handle).await;
+
+    listener_result.map_err(|e| anyhow::anyhow!("Gateway listener task panicked: {e}"))
+}
+
+/// In-process entry point.
+///
+/// Builds a [`ProxyState`] from `config`, spawns proxy and admin listeners
+/// (using `prebound` listeners where provided, otherwise binding the ports
+/// from `env_config`), and returns a [`ServeHandles`] without blocking.
+///
+/// Unlike [`run`], this function:
+///
+/// - Skips SIGHUP reload (caller drives reloads via
+///   `handles.proxy_state.update_config(...)`).
+/// - Skips the shutdown-signal handler — the caller already owns the
+///   `shutdown_tx`.
+/// - Returns once every listener has bound (or adopted its pre-bound socket)
+///   — the gateway is ready to take traffic before this function returns.
+///
+/// Stream proxy bind failures are still fatal here: this matches `run()`'s
+/// invariants and keeps tests honest about config typos.
+pub async fn serve(
+    env_config: EnvConfig,
+    config: GatewayConfig,
+    mut prebound: ServeOptions,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<ServeHandles, anyhow::Error> {
+    info!(
+        "file::serve: starting in-process gateway with {} proxies, {} consumers",
+        config.proxies.len(),
+        config.consumers.len()
+    );
+
+    // Compute reserved ports from the listeners we'll actually bind, NOT
+    // from env_config alone. With pre-bound listeners (in-process harness,
+    // and any other `serve()` caller that adopts FDs) the live port can
+    // differ from `env_config.proxy_http_port` etc. — using env-config
+    // ports here would both:
+    //   - Reject valid configs (e.g., default 8000 marked reserved when
+    //     the actual proxy listener was adopted on an ephemeral port).
+    //   - Miss real clashes with the pre-bound socket and defer them to
+    //     bind time, where they bypass the up-front validation contract.
+    // CP gRPC isn't pre-bindable via `ServeOptions` so it still comes
+    // from env_config.
+    let reserved_ports = effective_reserved_ports(&env_config, &prebound);
+    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        return Err(anyhow::anyhow!(
+            "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+
+    let dns_cache = DnsCache::new(DnsConfig {
+        global_overrides: env_config.dns_overrides.clone(),
+        resolver_addresses: env_config.dns_resolver_address.clone(),
+        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
+        dns_order: env_config.dns_order.clone(),
+        ttl_override_seconds: env_config.dns_ttl_override,
+        min_ttl_seconds: env_config.dns_min_ttl,
+        stale_ttl_seconds: env_config.dns_stale_ttl,
+        error_ttl_seconds: env_config.dns_error_ttl,
+        max_cache_size: env_config.dns_cache_max_size,
+        warmup_concurrency: env_config.dns_warmup_concurrency,
+        slow_threshold_ms: env_config.dns_slow_threshold_ms,
+        refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
+        failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
+        try_tcp_on_error: env_config.dns_try_tcp_on_error,
+        num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
+        max_active_requests: env_config.dns_max_active_requests,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
+    });
+
+    // DNS warmup — collect every hostname referenced in the config (proxy
+    // backends, upstream targets, plugin endpoints) so the first request
+    // doesn't pay the resolver round-trip.
+    let mut hostnames: Vec<_> = config
+        .proxies
+        .iter()
+        .map(|p| {
+            (
+                p.backend_host.clone(),
+                p.dns_override.clone(),
+                p.dns_cache_ttl_seconds,
+            )
+        })
+        .collect();
+    for upstream in &config.upstreams {
+        for target in &upstream.targets {
+            hostnames.push((target.host.clone(), None, None));
+        }
+    }
+
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
+
+    let proxy_state = ProxyState::new(
+        config,
+        dns_cache.clone(),
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
+
+    let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
+    for host in plugin_hosts {
+        hostnames.push((host, None, None));
+    }
+
+    dns_cache.warmup(hostnames).await;
+
+    if env_config.pool_warmup_enabled {
+        proxy_state.warmup_connection_pools().await;
+    }
+    // Without warmup, the registry is otherwise empty until the first
+    // periodic tick (24 h default) — pass `true` so `start_backend_*`
+    // kicks off an immediate probe pass. In-process tests that want a
+    // truly cold gateway set `skip_initial_capability_refresh` to opt
+    // out of that probe (see `ServeOptions` docs).
+    let run_initial_refresh =
+        !env_config.pool_warmup_enabled && !prebound.skip_initial_capability_refresh;
+    proxy_state
+        .start_backend_capability_refresh_task(run_initial_refresh, Some(shutdown_tx.subscribe()));
+
+    proxy_state.start_per_ip_cleanup_task();
+
+    let dns_handle =
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+
+    proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
+
+    let overload_handle = crate::overload::start_monitor(
+        proxy_state.overload.clone(),
+        env_config.overload_config(),
+        env_config.max_connections,
+        env_config.max_requests,
+        shutdown_tx.subscribe(),
+    );
+
+    let metrics_handle = crate::metrics::start_metrics_monitor(
+        proxy_state.request_count.clone(),
+        proxy_state.status_counts.clone(),
+        proxy_state.windowed_metrics.clone(),
+        env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+
+    // Validate frontend TLS config if provided (paths, expiry, key match).
+    let tls_config = if let (Some(cert_path), Some(key_path)) = (
+        &env_config.frontend_tls_cert_path,
+        &env_config.frontend_tls_key_path,
+    ) {
+        info!("Loading TLS configuration with client certificate verification...");
+        let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
+        match tls::load_tls_config_with_client_auth(
+            cert_path,
+            key_path,
+            client_ca_bundle_path,
+            env_config.tls_no_verify,
+            &tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            &crls,
+        ) {
+            Ok(mut config) => {
+                tls::enable_early_data(&mut config, &tls_policy);
+                if env_config.ktls_enabled.could_be_enabled() {
+                    tls::enable_secret_extraction_for_ktls(&mut config);
+                }
+                Some(config)
+            }
+            Err(e) => {
+                error!("TLS configuration validation failed: {}", e);
+                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref tls_cfg) = tls_config {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_tls_config(Some(tls_cfg.clone()));
+    }
+
+    if let (Some(cert_path), Some(key_path)) =
+        (&env_config.dtls_cert_path, &env_config.dtls_key_path)
+    {
+        tls::check_cert_expiry(
+            cert_path,
+            "DTLS frontend cert",
+            env_config.tls_cert_expiry_warning_days,
+        )?;
+        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
+            tls::check_cert_expiry(
+                ca_path,
+                "DTLS client CA cert",
+                env_config.tls_cert_expiry_warning_days,
+            )?;
+        }
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_dtls_cert_key(
+                cert_path.clone(),
+                key_path.clone(),
+                env_config.dtls_client_ca_cert_path.clone(),
             );
-            // Create a JWT manager with a random secret so externally-crafted
-            // tokens are rejected — no one can predict the secret.
-            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-            crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                secret: random_secret,
-                ..Default::default()
-            })
+    }
+
+    // Listen for SIGHUP — only meaningful for run(); skipped here.
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let jwt_manager = if let Some(jm) = prebound.admin_jwt_manager.take() {
+        // Caller (in-process harness) supplied its own — bypass env reads
+        // entirely so parallel tests don't have to serialise on
+        // `FERRUM_ADMIN_JWT_*` globals.
+        jm
+    } else {
+        match create_jwt_manager_from_env() {
+            Ok(jm) => jm,
+            Err(e) => {
+                warn!(
+                    "Admin JWT not configured ({}), admin endpoints will reject requests",
+                    e
+                );
+                let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+                crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
+                    secret: random_secret,
+                    ..Default::default()
+                })
+            }
         }
     };
-    let startup_ready = Arc::new(AtomicBool::new(false));
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -377,28 +742,39 @@ pub async fn run(
         cp_connection_state: None,
     };
 
-    let mut handles = Vec::new();
+    // Listener handles (proxy/admin HTTP/HTTPS/H3) — `join()` waits on
+    // these unbounded; they exit promptly on the shutdown watch channel.
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let mut bound = BoundAddresses::default();
 
-    // Admin HTTP listener (disabled when port is 0)
-    if env_config.admin_http_port != 0 {
-        let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
-        let admin_http_state = admin_state.clone();
-        let admin_http_shutdown = shutdown_tx.subscribe();
-        let admin_http_handle = tokio::spawn(async move {
-            info!("Starting admin HTTP listener on {}", admin_http_addr);
-            if let Err(e) =
-                admin::start_admin_listener(admin_http_addr, admin_http_state, admin_http_shutdown)
-                    .await
-            {
+    // ── Admin HTTP listener ──────────────────────────────────────────────
+    if let Some(listener) = prebound.admin_http.take() {
+        bound.admin_http = listener.local_addr().ok();
+        let st = admin_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
+            if let Err(e) = admin::serve_admin_on_listener(listener, st, sh, None).await {
                 error!("Admin HTTP listener error: {}", e);
             }
         });
-        handles.push(admin_http_handle);
+        handles.push(h);
+    } else if env_config.admin_http_port != 0 {
+        let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
+        bound.admin_http = Some(admin_http_addr);
+        let st = admin_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
+            info!("Starting admin HTTP listener on {}", admin_http_addr);
+            if let Err(e) = admin::start_admin_listener(admin_http_addr, st, sh).await {
+                error!("Admin HTTP listener error: {}", e);
+            }
+        });
+        handles.push(h);
     } else {
         info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
     }
 
-    // Admin HTTPS listener (if TLS is configured for admin)
+    // ── Admin HTTPS listener ─────────────────────────────────────────────
     if let (Some(admin_cert), Some(admin_key)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
@@ -415,24 +791,36 @@ pub async fn run(
             &crls,
         ) {
             Ok(admin_tls_config) => {
-                let admin_https_addr: SocketAddr =
-                    env_config.admin_socket_addr(env_config.admin_https_port);
-                let admin_https_state = admin_state.clone();
-                let admin_https_shutdown = shutdown_tx.subscribe();
-                let admin_https_handle = tokio::spawn(async move {
-                    info!("Starting admin HTTPS listener on {}", admin_https_addr);
-                    if let Err(e) = admin::start_admin_listener_with_tls(
-                        admin_https_addr,
-                        admin_https_state,
-                        admin_https_shutdown,
-                        Some(admin_tls_config),
-                    )
-                    .await
-                    {
-                        error!("Admin HTTPS listener error: {}", e);
-                    }
-                });
-                handles.push(admin_https_handle);
+                if let Some(listener) = prebound.admin_https.take() {
+                    bound.admin_https = listener.local_addr().ok();
+                    let st = admin_state.clone();
+                    let sh = shutdown_tx.subscribe();
+                    let cfg = Some(admin_tls_config);
+                    let h = tokio::spawn(async move {
+                        if let Err(e) = admin::serve_admin_on_listener(listener, st, sh, cfg).await
+                        {
+                            error!("Admin HTTPS listener error: {}", e);
+                        }
+                    });
+                    handles.push(h);
+                } else {
+                    let admin_https_addr: SocketAddr =
+                        env_config.admin_socket_addr(env_config.admin_https_port);
+                    bound.admin_https = Some(admin_https_addr);
+                    let st = admin_state.clone();
+                    let sh = shutdown_tx.subscribe();
+                    let cfg = Some(admin_tls_config);
+                    let h = tokio::spawn(async move {
+                        info!("Starting admin HTTPS listener on {}", admin_https_addr);
+                        if let Err(e) =
+                            admin::start_admin_listener_with_tls(admin_https_addr, st, sh, cfg)
+                                .await
+                        {
+                            error!("Admin HTTPS listener error: {}", e);
+                        }
+                    });
+                    handles.push(h);
+                }
             }
             Err(e) => {
                 warn!(
@@ -442,89 +830,130 @@ pub async fn run(
             }
         }
     }
-    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+    if env_config.admin_http_port == 0
+        && env_config.admin_tls_cert_path.is_none()
+        && bound.admin_http.is_none()
+        && bound.admin_https.is_none()
+    {
         warn!(
             "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
         );
     }
 
-    // Start separate listeners for HTTP and HTTPS proxy
+    // ── Proxy HTTP listener ──────────────────────────────────────────────
     let mut startup_signals = Vec::new();
 
-    // HTTP listener (disabled when port is 0)
-    if env_config.proxy_http_port != 0 {
+    if let Some(listener) = prebound.proxy_http.take() {
+        bound.proxy_http = listener.local_addr().ok();
+        let st = proxy_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let h = tokio::spawn(async move {
+            if let Err(e) =
+                proxy::start_proxy_listener_with_bound_listener(listener, st, sh, None).await
+            {
+                error!("HTTP proxy listener error: {}", e);
+            }
+        });
+        handles.push(h);
+        // Pre-bound listener is already accepting — no startup signal needed.
+    } else if env_config.proxy_http_port != 0 {
         let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
-        let http_state = proxy_state.clone();
-        let http_shutdown = shutdown_tx.subscribe();
-        let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
-        let http_handle = tokio::spawn(async move {
+        bound.proxy_http = Some(http_addr);
+        let st = proxy_state.clone();
+        let sh = shutdown_tx.subscribe();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let h = tokio::spawn(async move {
             info!("Starting HTTP proxy listener on {}", http_addr);
             if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 http_addr,
-                http_state,
-                http_shutdown,
+                st,
+                sh,
                 None,
-                Some(http_started_tx),
+                Some(started_tx),
             )
             .await
             {
                 error!("HTTP proxy listener error: {}", e);
             }
         });
-        handles.push(http_handle);
-        startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
+        handles.push(h);
+        startup_signals.push(("HTTP proxy listener".to_string(), started_rx));
     } else {
         info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
     }
 
-    // HTTPS listener (only if TLS is configured)
-    if let Some(tls_config) = tls_config.clone() {
-        let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
-        let https_state = proxy_state.clone();
-        let https_shutdown = shutdown_tx.subscribe();
-        let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
-        let https_handle = tokio::spawn(async move {
-            info!("Starting HTTPS proxy listener on {}", https_addr);
-            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
-                https_addr,
-                https_state,
-                https_shutdown,
-                Some(tls_config),
-                Some(https_started_tx),
-            )
-            .await
-            {
-                error!("HTTPS proxy listener error: {}", e);
-            }
-        });
-        handles.push(https_handle);
-        startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
+    // ── Proxy HTTPS listener (TLS) ───────────────────────────────────────
+    if let Some(tls_cfg_arc) = tls_config.clone() {
+        if let Some(listener) = prebound.proxy_https.take() {
+            bound.proxy_https = listener.local_addr().ok();
+            let st = proxy_state.clone();
+            let sh = shutdown_tx.subscribe();
+            let cfg = Some(tls_cfg_arc.clone());
+            let h = tokio::spawn(async move {
+                if let Err(e) =
+                    proxy::start_proxy_listener_with_bound_listener(listener, st, sh, cfg).await
+                {
+                    error!("HTTPS proxy listener error: {}", e);
+                }
+            });
+            handles.push(h);
+        } else {
+            let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
+            bound.proxy_https = Some(https_addr);
+            let st = proxy_state.clone();
+            let sh = shutdown_tx.subscribe();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let cfg = Some(tls_cfg_arc.clone());
+            let h = tokio::spawn(async move {
+                info!("Starting HTTPS proxy listener on {}", https_addr);
+                if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+                    https_addr,
+                    st,
+                    sh,
+                    cfg,
+                    Some(started_tx),
+                )
+                .await
+                {
+                    error!("HTTPS proxy listener error: {}", e);
+                }
+            });
+            handles.push(h);
+            startup_signals.push(("HTTPS proxy listener".to_string(), started_rx));
+        }
     } else {
         info!("TLS not configured - HTTPS listener disabled");
     }
 
-    // HTTP/3 (QUIC) listener (only if enabled and TLS is configured)
+    // ── HTTP/3 (QUIC) listener ───────────────────────────────────────────
+    // H3 always binds its own UDP socket — no pre-bound variant. Reuse
+    // the HTTPS listener's resolved address so the QUIC port matches the
+    // TLS-over-TCP port even when callers adopted an FD on a port that
+    // doesn't match `env_config.proxy_https_port` (e.g. ephemeral 0
+    // resolved by the kernel, or env config holding a stale default).
+    // Without this, H1/H2 reach the adopted socket but H3 binds
+    // somewhere else and clients see the protocols diverge.
     if env_config.enable_http3 {
-        if let Some(tls_config) = tls_config.clone() {
-            let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
-            let h3_state = proxy_state.clone();
-            let h3_shutdown = shutdown_tx.subscribe();
+        if let Some(tls_cfg_arc) = tls_config.clone() {
+            let h3_addr = resolve_http3_bind_addr(&env_config, bound.proxy_https);
+            let st = proxy_state.clone();
+            let sh = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
-            let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
-            let h3_handle = tokio::spawn(async move {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let h = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,
-                    h3_state,
-                    h3_shutdown,
-                    tls_config,
+                    st,
+                    sh,
+                    tls_cfg_arc,
                     h3_config,
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
-                        started_tx: Some(h3_started_tx),
+                        started_tx: Some(started_tx),
                     },
                 )
                 .await
@@ -532,69 +961,322 @@ pub async fn run(
                     error!("HTTP/3 proxy listener error: {}", e);
                 }
             });
-            handles.push(h3_handle);
-            startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
+            handles.push(h);
+            startup_signals.push(("HTTP/3 proxy listener".to_string(), started_rx));
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
     }
 
-    if env_config.proxy_http_port == 0 && tls_config.is_none() {
+    // Background-task handles tracked separately so `ServeHandles::join`
+    // can apply a hard `BACKGROUND_DRAIN_TIMEOUT` cap to them. The
+    // pre-refactor `run()` did the same with an explicit
+    // `tokio::time::timeout(Duration::from_secs(5), bg_drain)` block —
+    // mixing them in with listener handles loses that bound and lets a
+    // stuck DNS / metrics task wedge shutdown indefinitely.
+    let background_handles: Vec<JoinHandle<()>> = vec![dns_handle, overload_handle, metrics_handle];
+
+    // Build `ServeHandles` BEFORE the late-startup `?` calls so that
+    // failure to bind stream listeners / receive listener-started
+    // signals / wait for the stream listener manager doesn't leave
+    // the proxy / admin / DNS / overload / metrics tasks orphaned.
+    // `shutdown_and_join` below signals shutdown via the watch channel
+    // and drains the spawned handles before propagating the error —
+    // critical for the in-process retry path in
+    // `GatewayHarnessBuilder::spawn_in_process`, which would otherwise
+    // accumulate orphan listeners holding sockets across attempts.
+    let serve_handles = ServeHandles {
+        proxy_state: proxy_state.clone(),
+        bound,
+        listener_handles: handles,
+        background_handles,
+        shutdown_tx,
+        drain_seconds: env_config.shutdown_drain_seconds,
+    };
+
+    // Stream proxy listeners (TCP/UDP) — fatal if any binds fail in file mode.
+    let startup_result: Result<(), anyhow::Error> = async {
+        proxy_state.initial_reconcile_stream_listeners().await?;
+        wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(10))
+            .await?;
+        startup_ready.store(true, Ordering::Relaxed);
+        info!("Gateway startup complete; /health now reports ready");
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = startup_result {
         warn!(
-            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
+            "Gateway startup failed after spawning listener / background tasks: {}; \
+             draining spawned tasks before returning",
+            e
+        );
+        serve_handles.shutdown_and_join().await;
+        return Err(e);
+    }
+
+    Ok(serve_handles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::time::Instant;
+
+    // Regression: a stuck background task must not wedge graceful shutdown.
+    // The pre-refactor `run()` capped the background drain at 5 s; the
+    // codex review flagged that lifting this into `ServeHandles::join` lost
+    // the bound. The helper takes the timeout as a parameter, so this test
+    // uses a 100 ms cap to assert the semantics without burning real
+    // seconds (`tokio::time::pause` would need the `test-util` feature
+    // which isn't enabled here).
+    #[tokio::test]
+    async fn join_background_handles_caps_at_timeout_when_a_handle_hangs() {
+        let well_behaved = tokio::spawn(async {});
+        let stuck = tokio::spawn(async {
+            pending::<()>().await;
+        });
+
+        let started = Instant::now();
+        join_background_handles(vec![well_behaved, stuck], Duration::from_millis(100)).await;
+        let elapsed = started.elapsed();
+
+        // Must complete within ~timeout + slop — never wedge forever.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "join must wait for the timeout, not return early; got {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "join must not exceed the timeout substantially; got {elapsed:?}",
         );
     }
 
-    // Start stream proxy listeners (TCP/UDP) — bind failures are fatal in file mode.
-    proxy_state.initial_reconcile_stream_listeners().await?;
-    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
-    proxy_state
-        .stream_listener_manager
-        .wait_until_started(Duration::from_secs(10))
-        .await?;
-    startup_ready.store(true, Ordering::Relaxed);
-    info!("Gateway startup complete; /health now reports ready");
+    // Sanity: when every background handle resolves promptly, the helper
+    // returns immediately instead of blocking until the timeout.
+    #[tokio::test]
+    async fn join_background_handles_returns_promptly_when_all_complete() {
+        let h1 = tokio::spawn(async {});
+        let h2 = tokio::spawn(async {});
 
-    // Wait for all listeners to complete (these exit when the shutdown signal fires).
-    // If no listener handles were spawned (e.g., all plaintext ports disabled and no
-    // TLS configured), block on the shutdown signal so stream proxies keep running.
-    if handles.is_empty() {
-        let mut wait_shutdown = shutdown_tx.subscribe();
-        while !*wait_shutdown.borrow() {
-            if wait_shutdown.changed().await.is_err() {
-                break;
-            }
-        }
-    } else {
-        for handle in handles {
-            handle.await?;
-        }
+        let started = Instant::now();
+        join_background_handles(vec![h1, h2], Duration::from_secs(5)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "well-behaved background handles should drain promptly; took {elapsed:?}",
+        );
     }
 
-    // Graceful connection drain: wait for in-flight requests to complete.
-    // Accept loops have stopped, so no new connections arrive. Existing
-    // connections see Connection: close (via the draining flag) and complete
-    // their current request-response cycle before disconnecting.
-    let drain_seconds = env_config.shutdown_drain_seconds;
-    if drain_seconds > 0 {
-        crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
-            .await;
+    // Regression: `ServeHandles::join` previously did `let _ = handle.await`
+    // for every listener handle, silently swallowing JoinErrors. The
+    // pre-refactor `run()` used `handle.await?`, so a panicked listener
+    // task would terminate the binary. Codex flagged the silent drop —
+    // verify `await_listener_handles` surfaces panics as `Err` so `run()`
+    // can exit non-zero and the operator's supervisor restarts.
+    #[tokio::test]
+    async fn await_listener_handles_returns_err_when_a_listener_panics() {
+        let healthy = tokio::spawn(async {});
+        let panicker = tokio::spawn(async {
+            panic!("simulated listener crash");
+        });
+        let healthy_late = tokio::spawn(async {});
+
+        let result = await_listener_handles(vec![healthy, panicker, healthy_late], || {}).await;
+        let err = result.expect_err("a listener panicked, await_listener_handles must return Err");
+        assert!(
+            err.is_panic(),
+            "JoinError should report `is_panic()` for a panicked listener; got {err:?}",
+        );
     }
 
-    // Wait for background tasks to drain cleanly, with a timeout to prevent
-    // hanging if a task is stuck.
-    let bg_drain = async {
-        let _ = dns_handle.await;
-        let _ = sighup_handle.await;
-        let _ = overload_handle.await;
-        let _ = metrics_handle.await;
-    };
-    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
+    // Sanity: when no listener panics, the helper returns Ok and never
+    // synthesises a phantom error. Also asserts the shutdown trigger is
+    // NOT fired in the happy path — firing on every join would cause
+    // graceful shutdown to also signal itself, which is wasteful.
+    #[tokio::test]
+    async fn await_listener_handles_returns_ok_and_does_not_signal_when_all_complete() {
+        let h1 = tokio::spawn(async {});
+        let h2 = tokio::spawn(async {});
+        let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggered_clone = triggered.clone();
+
+        await_listener_handles(vec![h1, h2], move || {
+            triggered_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
         .await
-        .is_err()
-    {
-        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
+        .expect("no listener panicked; helper must return Ok");
+        assert!(
+            !triggered.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown trigger must NOT fire when no listener panicked",
+        );
     }
 
-    Ok(())
+    // Regression P1: previously the helper awaited handles sequentially,
+    // so a panicked listener earlier in the list would surface only AFTER
+    // every later listener exited on its own. If any later listener was
+    // still serving, `handle.await` blocked forever and the panic was
+    // never reported. The fix uses `FuturesUnordered` + a shutdown
+    // trigger: the first panic fires `shutdown_on_panic`, which the
+    // remaining listeners observe via the watch channel and exit
+    // promptly. This test models that with two listeners that wait on a
+    // shutdown channel and a third that panics.
+    #[tokio::test]
+    async fn await_listener_handles_signals_shutdown_so_remaining_listeners_can_exit() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut listener_a_rx = shutdown_tx.subscribe();
+        let listener_a = tokio::spawn(async move {
+            // Block until the helper triggers shutdown.
+            let _ = listener_a_rx.changed().await;
+        });
+
+        let panicker = tokio::spawn(async {
+            panic!("listener crash");
+        });
+
+        let mut listener_b_rx = shutdown_tx.subscribe();
+        let listener_b = tokio::spawn(async move {
+            let _ = listener_b_rx.changed().await;
+        });
+
+        let trigger_tx = shutdown_tx.clone();
+        let started = Instant::now();
+        let result = await_listener_handles(vec![listener_a, panicker, listener_b], move || {
+            let _ = trigger_tx.send(true);
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("panicker should produce an Err");
+        assert!(err.is_panic());
+        // 2 s is generous compared to the actual cost (one watch-channel
+        // notification + two `changed()` wakeups). Without the shutdown
+        // trigger this would block forever.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "helper should drain remaining listeners via shutdown trigger; took {elapsed:?}",
+        );
+    }
+
+    // Regression: pre-bound listener ports must take precedence over
+    // `env_config.*_port` when computing reserved ports. Codex flagged
+    // that using env-config ports alone both rejects valid configs (a
+    // stream proxy on the env-config default port that's never actually
+    // bound) and misses real conflicts with the pre-bound socket
+    // (deferred to bind-time errors).
+    #[tokio::test]
+    async fn effective_reserved_ports_uses_prebound_port_over_env_config() {
+        // Bind two ephemeral ports up front so we can hand them to
+        // ServeOptions and compare with env-config defaults.
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin");
+        let prebound_proxy_port = proxy_listener.local_addr().unwrap().port();
+        let prebound_admin_port = admin_listener.local_addr().unwrap().port();
+
+        // env_config carries production defaults (8000 / 9000) that don't
+        // match the actually-bound ports.
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 8000,
+            proxy_https_port: 0,
+            admin_http_port: 9000,
+            admin_https_port: 0,
+            ..EnvConfig::default()
+        };
+
+        let prebound = ServeOptions {
+            proxy_http: Some(proxy_listener),
+            admin_http: Some(admin_listener),
+            ..ServeOptions::default()
+        };
+
+        let reserved = effective_reserved_ports(&env_config, &prebound);
+
+        assert!(
+            reserved.contains(&prebound_proxy_port),
+            "prebound proxy port {prebound_proxy_port} must be reserved; got {reserved:?}",
+        );
+        assert!(
+            reserved.contains(&prebound_admin_port),
+            "prebound admin port {prebound_admin_port} must be reserved; got {reserved:?}",
+        );
+        assert!(
+            !reserved.contains(&8000),
+            "env-config proxy_http_port 8000 must NOT be reserved when a prebound \
+             listener is on a different port; got {reserved:?}",
+        );
+        assert!(
+            !reserved.contains(&9000),
+            "env-config admin_http_port 9000 must NOT be reserved when a prebound \
+             listener is on a different port; got {reserved:?}",
+        );
+    }
+
+    // Regression P1: H3's UDP socket must bind to the same port the
+    // adopted HTTPS TCP listener is on, not to whatever
+    // `env_config.proxy_https_port` happens to hold. Without this fix,
+    // H1/H2 traffic reaches the adopted FD on (say) ephemeral port
+    // 50000 but H3 tries to bind 8443 — clients pointed at 50000 fall
+    // off the cross-protocol path silently.
+    #[test]
+    fn resolve_http3_bind_addr_uses_bound_https_when_available() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            // Deliberately unrelated to the bound port.
+            proxy_https_port: 8443,
+            ..EnvConfig::default()
+        };
+        let bound_https: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let addr = resolve_http3_bind_addr(&env_config, Some(bound_https));
+        assert_eq!(
+            addr, bound_https,
+            "H3 must bind to the adopted HTTPS listener's address; got {addr}",
+        );
+    }
+
+    // Sanity: when no HTTPS listener is bound (binary path with no
+    // pre-bound FDs), fall back to the env-config port — current
+    // production behaviour, must not regress.
+    #[test]
+    fn resolve_http3_bind_addr_falls_back_to_env_when_no_bound_https() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_https_port: 8443,
+            ..EnvConfig::default()
+        };
+        let addr = resolve_http3_bind_addr(&env_config, None);
+        assert_eq!(addr.port(), 8443);
+    }
+
+    // Sanity: with no pre-bound listeners, fall back to env-config ports
+    // (the binary path) and skip port `0` which means "disabled."
+    #[test]
+    fn effective_reserved_ports_falls_back_to_env_when_no_prebound() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 8000,
+            proxy_https_port: 8443,
+            admin_http_port: 9000,
+            admin_https_port: 0, // disabled
+            ..EnvConfig::default()
+        };
+        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default());
+        assert!(reserved.contains(&8000));
+        assert!(reserved.contains(&8443));
+        assert!(reserved.contains(&9000));
+        assert!(
+            !reserved.contains(&0),
+            "port 0 means disabled and must not be reserved; got {reserved:?}",
+        );
+    }
 }

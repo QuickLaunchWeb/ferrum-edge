@@ -160,6 +160,10 @@ async fn backend_accepts_then_resets_maps_to_connection_reset() {
 // Tolerance: ~500ms. Loaded CI machines may jitter a bit but the watchdog
 // granularity is 1s per CLAUDE.md §TCP timeout docs — we're measuring
 // HTTP-level timeouts here, which are tighter. See `docs/error_classification`.
+//
+// Migrated to `HarnessMode::InProcess` — the test asserts on response
+// status + timing only, no log capture, so it benefits from the ~10× faster
+// in-process startup without losing coverage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn backend_read_timeout_fires_after_backend_read_timeout_ms() {
@@ -177,6 +181,7 @@ async fn backend_read_timeout_fires_after_backend_read_timeout_ms() {
     let yaml = file_mode_yaml_for_backend_with(backend_port, overrides);
 
     let harness = GatewayHarness::builder()
+        .mode_in_process()
         .file_config(yaml)
         .log_level("info")
         .spawn()

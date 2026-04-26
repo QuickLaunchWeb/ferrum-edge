@@ -140,6 +140,11 @@ pub async fn start_admin_listener_with_tls(
 /// can steal the port between releasing it and the listener task re-binding.
 /// Production callers go through [`start_admin_listener`] /
 /// [`start_admin_listener_with_tls`], which bind internally.
+///
+/// `file::serve` (the in-process gateway entry point) also calls this
+/// directly when a `ServeOptions::admin_http` / `admin_https` listener is
+/// supplied, so the in-process harness shares one accept loop with the
+/// binary path.
 pub async fn serve_admin_on_listener(
     listener: TcpListener,
     state: AdminState,
