@@ -131,11 +131,37 @@ pub enum HarnessMode {
     InProcess,
 }
 
+/// Which gateway flavour the most recent mode-selecting builder call
+/// asked for. Tracks the *last* method call's intent so chained orderings
+/// like `.file_config(yaml).db_sqlite()` correctly resolve to "the
+/// caller wants DB" rather than letting an earlier `file_config` call
+/// silently win because it left a stale `file_yaml` field set.
+///
+/// `spawn_in_process` keys on this to reject DB / CP / DP requests
+/// without dropping them on the floor (the in-process path only
+/// supports file mode today; silently running file mode against a
+/// `.db_sqlite()` builder chain would let tests appear to exercise
+/// behaviour they're not).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuilderModeKind {
+    /// `TestGatewayBuilder` defaults to `Database(Sqlite)`, so before
+    /// any explicit mode-selecting call the harness inherits that.
+    Database,
+    /// `file_config(yaml)` was the most recent mode-selecting call.
+    File,
+}
+
 /// Fluent builder for [`GatewayHarness`].
 pub struct GatewayHarnessBuilder {
     mode: HarnessMode,
     inner: TestGatewayBuilder,
     file_yaml: Option<String>,
+    /// Latest mode-selecting builder call (file vs DB). The
+    /// `spawn_in_process` path requires `File`; chaining
+    /// `.file_config(...)` then `.db_sqlite()` flips this to `Database`
+    /// even though `file_yaml` is still `Some`, so spawn errors out
+    /// instead of silently running file mode.
+    mode_kind: BuilderModeKind,
     log_level: String,
     jwt_secret: String,
     jwt_issuer: String,
@@ -149,6 +175,10 @@ impl Default for GatewayHarnessBuilder {
             mode: HarnessMode::Binary,
             inner: TestGateway::builder(),
             file_yaml: None,
+            // Default matches `TestGateway::builder()`'s `mode_database_sqlite()`
+            // default — flipped to `File` by `file_config(...)` and back
+            // to `Database` by `db_sqlite()` / `db(...)`.
+            mode_kind: BuilderModeKind::Database,
             log_level: "info".to_string(),
             jwt_secret: "ferrum-edge-shared-harness-secret-00000".to_string(),
             jwt_issuer: "ferrum-edge-shared-harness".to_string(),
@@ -185,6 +215,7 @@ impl GatewayHarnessBuilder {
         let yaml = yaml.into();
         self.inner = self.inner.mode_file(yaml.clone());
         self.file_yaml = Some(yaml);
+        self.mode_kind = BuilderModeKind::File;
         self
     }
 
@@ -196,6 +227,7 @@ impl GatewayHarnessBuilder {
     /// `spawn()`. SQLite-in-process can be a follow-up if there's demand.
     pub fn db_sqlite(mut self) -> Self {
         self.inner = self.inner.mode_database_sqlite();
+        self.mode_kind = BuilderModeKind::Database;
         self
     }
 
@@ -231,6 +263,7 @@ impl GatewayHarnessBuilder {
     /// later phases; in-process mode only supports file mode for now.
     pub fn db(mut self, db: DbType) -> Self {
         self.inner = self.inner.mode_database(db);
+        self.mode_kind = BuilderModeKind::Database;
         self
     }
 
@@ -283,7 +316,22 @@ impl GatewayHarnessBuilder {
         self,
     ) -> Result<GatewayHarness, Box<dyn std::error::Error + Send + Sync>> {
         // Today the in-process path only supports file mode — anything that
-        // wants DB/CP/DP must go through the binary path.
+        // wants DB/CP/DP must go through the binary path. Two checks:
+        //
+        // 1. `mode_kind` must be `File`. If a caller chained
+        //    `.file_config(yaml).db_sqlite().mode_in_process()`, the
+        //    `db_sqlite()` call wins and `mode_kind` is `Database` —
+        //    silently running file mode would let the test appear to
+        //    exercise the DB path while not doing so. Hard error.
+        // 2. `file_yaml` must be `Some` (set by `file_config`). Catches
+        //    the bare `.mode_in_process()` (no `file_config()`) call.
+        if self.mode_kind != BuilderModeKind::File {
+            return Err("GatewayHarness::mode_in_process supports file mode only — \
+                       a `db_sqlite()` / `db(...)` call after `file_config(...)` \
+                       (or instead of it) is unsupported and would silently fall \
+                       back to file. Drop the DB call or switch to mode_binary()."
+                .into());
+        }
         let yaml = self.file_yaml.as_deref().ok_or_else(
             || -> Box<dyn std::error::Error + Send + Sync> {
                 "GatewayHarness::mode_in_process requires file_config(yaml) — \

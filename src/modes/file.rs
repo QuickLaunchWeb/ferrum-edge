@@ -331,6 +331,17 @@ fn effective_reserved_ports(
     ports
 }
 
+/// Resolve the address H3 should bind its UDP socket to. Reuses the
+/// HTTPS listener's resolved address when available so the QUIC port
+/// matches the TLS-over-TCP port even if `env_config.proxy_https_port`
+/// is stale (e.g. ephemeral `0` resolved at bind time, or holding the
+/// production default while a caller adopted an FD on a different
+/// port). Falls back to the env-config port when no HTTPS listener
+/// is bound.
+fn resolve_http3_bind_addr(env_config: &EnvConfig, bound_https: Option<SocketAddr>) -> SocketAddr {
+    bound_https.unwrap_or_else(|| env_config.proxy_socket_addr(env_config.proxy_https_port))
+}
+
 /// The binary entry point. Loads the YAML/JSON config from
 /// `FERRUM_FILE_CONFIG_PATH`, then dispatches into [`serve`] with a
 /// SIGHUP reload handler installed on top.
@@ -887,10 +898,16 @@ pub async fn serve(
     }
 
     // ── HTTP/3 (QUIC) listener ───────────────────────────────────────────
-    // H3 always binds its own UDP socket — no pre-bound variant.
+    // H3 always binds its own UDP socket — no pre-bound variant. Reuse
+    // the HTTPS listener's resolved address so the QUIC port matches the
+    // TLS-over-TCP port even when callers adopted an FD on a port that
+    // doesn't match `env_config.proxy_https_port` (e.g. ephemeral 0
+    // resolved by the kernel, or env config holding a stale default).
+    // Without this, H1/H2 reach the adopted socket but H3 binds
+    // somewhere else and clients see the protocols diverge.
     if env_config.enable_http3 {
         if let Some(tls_cfg_arc) = tls_config.clone() {
-            let h3_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
+            let h3_addr = resolve_http3_bind_addr(&env_config, bound.proxy_https);
             let st = proxy_state.clone();
             let sh = shutdown_tx.subscribe();
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
@@ -1150,6 +1167,42 @@ mod tests {
             "env-config admin_http_port 9000 must NOT be reserved when a prebound \
              listener is on a different port; got {reserved:?}",
         );
+    }
+
+    // Regression P1: H3's UDP socket must bind to the same port the
+    // adopted HTTPS TCP listener is on, not to whatever
+    // `env_config.proxy_https_port` happens to hold. Without this fix,
+    // H1/H2 traffic reaches the adopted FD on (say) ephemeral port
+    // 50000 but H3 tries to bind 8443 — clients pointed at 50000 fall
+    // off the cross-protocol path silently.
+    #[test]
+    fn resolve_http3_bind_addr_uses_bound_https_when_available() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            // Deliberately unrelated to the bound port.
+            proxy_https_port: 8443,
+            ..EnvConfig::default()
+        };
+        let bound_https: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let addr = resolve_http3_bind_addr(&env_config, Some(bound_https));
+        assert_eq!(
+            addr, bound_https,
+            "H3 must bind to the adopted HTTPS listener's address; got {addr}",
+        );
+    }
+
+    // Sanity: when no HTTPS listener is bound (binary path with no
+    // pre-bound FDs), fall back to the env-config port — current
+    // production behaviour, must not regress.
+    #[test]
+    fn resolve_http3_bind_addr_falls_back_to_env_when_no_bound_https() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_https_port: 8443,
+            ..EnvConfig::default()
+        };
+        let addr = resolve_http3_bind_addr(&env_config, None);
+        assert_eq!(addr.port(), 8443);
     }
 
     // Sanity: with no pre-bound listeners, fall back to env-config ports

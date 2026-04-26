@@ -539,3 +539,39 @@ async fn in_process_stop_and_collect_logs_returns_empty_without_aborting_join() 
     // None.
     drop(harness);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: chaining `.file_config(yaml).db_sqlite().mode_in_process()`
+// must error at spawn rather than silently running file mode against a
+// `db_sqlite()` request. Pre-fix the harness only checked for `file_yaml`,
+// so the DB-mode intent (set by the later `.db_sqlite()`) was dropped on
+// the floor — tests would appear to exercise DB mode while actually using
+// file mode, hiding real differences in behaviour.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn in_process_harness_rejects_db_mode_after_file_config() {
+    let backend_port = reserve_port().await.expect("port").port;
+    let yaml = file_mode_yaml_for_backend(backend_port);
+    let result = GatewayHarness::builder()
+        .file_config(yaml)
+        // The DB call after file_config flips mode_kind to Database;
+        // mode_in_process must reject this rather than silently running
+        // file mode.
+        .db_sqlite()
+        .mode_in_process()
+        .spawn()
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!(
+            "harness must reject .file_config().db_sqlite().mode_in_process() — \
+             not silently fall back to file mode",
+        ),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("file mode only") || msg.contains("file_config"),
+        "error must explain that in-process supports file mode only; got {msg:?}",
+    );
+}
