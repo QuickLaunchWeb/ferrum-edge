@@ -161,13 +161,22 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
 /// and stream-error-frame codes are. This is intentional: a stream reset means
 /// the server aborted this particular stream, whereas the connection close
 /// we're recovering from affects all streams after the body was fully sent.
+///
+// TODO: `StreamError::RemoteClosing` (GOAWAY) has the same race shape per
+// RFC 9114 §5.2 — if FIN+GOAWAY coalesce, recv_data can return RemoteClosing
+// instead of Ok(None). Rare in practice (servers send GOAWAY before the final
+// response, not after) but worth extending the recovery predicate if observed.
 pub(crate) async fn drain_h3_response_body(
     stream: &mut H3RequestStream,
     method: &str,
     status: u16,
     content_length: Option<u64>,
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let mut body = Vec::new();
+    const PREALLOC_CAP: u64 = 1024 * 1024;
+    let mut body = match content_length {
+        Some(cl) => Vec::with_capacity(cl.min(PREALLOC_CAP) as usize),
+        None => Vec::new(),
+    };
     loop {
         match stream.recv_data().await {
             Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
@@ -189,6 +198,14 @@ pub(crate) async fn drain_h3_response_body(
     Ok(body)
 }
 
+/// Whether the received body is semantically complete for this response.
+///
+/// Uses exact equality for Content-Length-delimited bodies — an overlong body
+/// (more bytes than declared) is malformed and must not be accepted as
+/// "complete". HEAD, 204, and 304 responses have no body by definition
+/// (RFC 9110 §6.4.1, §15.3.5, §15.4.5) and are complete when empty.
+/// Returns `false` when Content-Length is absent and the response normally
+/// carries a body, since completeness cannot be determined without the FIN.
 fn is_response_body_complete(
     body: &[u8],
     method: &str,
