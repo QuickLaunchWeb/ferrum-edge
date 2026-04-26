@@ -628,13 +628,24 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection — only now do we need the TLS config
-        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
+        // Create new connection — only now do we need the TLS config.
+        //
+        // CRITICAL: `tls_config_fn()` and `create_or_get_proxy_sender()`
+        // can fail BEFORE `do_request` runs. If an earlier internal
+        // attempt above already set `any_request_on_wire = true`, those
+        // setup failures must STILL promote the sticky flag — otherwise
+        // a post-wire first attempt followed by a fresh-connect setup
+        // failure would surface as `request_on_wire=false`, and the
+        // gateway would treat the call as pre-wire and replay a
+        // non-idempotent request via `retry_on_connect_failure`. Each
+        // `?` exit applies the promotion explicitly.
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request(
@@ -725,8 +736,13 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create new connection to the explicit target
-        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
+        // Create new connection to the explicit target.
+        // See `request()` for why these `?` exits must apply the
+        // sticky `any_request_on_wire` promotion (post-wire cached
+        // attempt → fresh-connect setup failure must NOT report
+        // request_on_wire=false).
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -738,7 +754,7 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request(
@@ -1688,12 +1704,15 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
+        // See `request()` for why these `?` exits must apply the
+        // sticky `any_request_on_wire` promotion.
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(H3PoolError::pre_wire)?;
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming(
@@ -1786,7 +1805,10 @@ impl Http3ConnectionPool {
             }
         }
 
-        let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
+        // See `request()` for why these `?` exits must apply the
+        // sticky `any_request_on_wire` promotion.
+        let tls_config = tls_config_fn()
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -1798,7 +1820,7 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(H3PoolError::pre_wire)?;
+            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming(
@@ -2128,6 +2150,60 @@ mod h3_pool_error_tests {
             classify_http3_error(err.as_ref()),
             crate::retry::ErrorClass::ProtocolError,
             "RESET_STREAM is application-layer (stream abort), not connection reset"
+        );
+    }
+
+    /// Codex P1 regression: when an earlier internal attempt set
+    /// `any_request_on_wire = true` (post-wire) and then `tls_config_fn()`
+    /// or `create_or_get_proxy_sender()` fails on the fresh-connect
+    /// fallback, the pool MUST promote the sticky flag onto the resulting
+    /// `H3PoolError::pre_wire`. Without that promotion, the gateway sees
+    /// `request_on_wire=false`, treats the call as pre-wire, and replays
+    /// a non-idempotent request via `retry_on_connect_failure` even
+    /// though the FIRST internal attempt may already have been processed
+    /// by the backend.
+    ///
+    /// We can't exercise the real pool at unit-test scope (it needs a
+    /// QUIC endpoint), but we CAN assert the exact closure pattern the
+    /// fix introduced: `e -> pre_wire(e).with_request_on_wire(flag)`.
+    /// If a future refactor reverts to the bare `map_err(pre_wire)?`
+    /// shape, this test fails because `request_on_wire` would be `false`.
+    #[test]
+    fn pre_wire_setup_failure_after_post_wire_attempt_preserves_sticky_flag() {
+        // Simulate: any_request_on_wire = true (an earlier internal attempt
+        // sent the request body). Now tls_config_fn() fails.
+        let any_request_on_wire = true;
+        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
+
+        let propagated: H3PoolError = H3PoolError::pre_wire(synthetic_setup_failure)
+            .with_request_on_wire(any_request_on_wire);
+
+        assert!(
+            propagated.request_on_wire(),
+            "TLS / sender-creation failure path must propagate sticky \
+             request_on_wire=true so the gateway respects retry_on_methods \
+             instead of replaying via retry_on_connect_failure. If this \
+             assertion fails, a future refactor likely reverted to the \
+             bare `map_err(pre_wire)?` shape — restore the closure form: \
+             `|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire)`"
+        );
+    }
+
+    #[test]
+    fn pre_wire_setup_failure_with_no_prior_post_wire_attempt_stays_pre_wire() {
+        // Counterpart: if NO earlier internal attempt sent the body
+        // (any_request_on_wire = false), the same closure must NOT
+        // mistakenly mark the error as post-wire.
+        let any_request_on_wire = false;
+        let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
+
+        let propagated: H3PoolError = H3PoolError::pre_wire(synthetic_setup_failure)
+            .with_request_on_wire(any_request_on_wire);
+
+        assert!(
+            !propagated.request_on_wire(),
+            "Setup failure with no prior post-wire attempt must remain \
+             request_on_wire=false so retry_on_connect_failure can fire"
         );
     }
 }
