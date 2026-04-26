@@ -11,9 +11,30 @@
 //! * 503 rejection when new-request critical threshold trips (request count)
 //! * Recovery back to `normal` after in-flight work drains
 //!
+//! Phase-8 additions (these complement the original tests already in this
+//! file):
+//!
+//! * `fd_pressure_disables_keepalive` — uses `FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD`
+//!   to drive the file-descriptor pressure path (independent from connection
+//!   count). Linux-only — the macOS getrlimit(RLIMIT_NOFILE) returning
+//!   `RLIM_INFINITY` makes the percentage-based threshold untrippable, so
+//!   the test skips with an explicit message there.
+//! * `request_count_above_threshold_returns_503` — drives `MAX_REQUESTS`
+//!   below pending in-flight work and asserts 503 + the
+//!   `actions.reject_new_requests=true` flag rather than the older 502 /
+//!   timeout fallback.
+//! * `grpc_overload_returns_grpc_status_unavailable_not_http_503` — same
+//!   request-count saturation but on a gRPC frontend; verifies the gateway
+//!   returns a gRPC trailer-only `UNAVAILABLE` instead of a HTTP 503.
+//! * `overload_state_transitions_logged_with_warn_then_info` — asserts the
+//!   gateway logs the `enter overload` event at WARN and `recover from
+//!   overload` event at INFO. Captures both stdout and stderr to a single
+//!   file because the gateway's `SeverityWriter` routes INFO to stdout
+//!   and WARN to stderr.
+//!
 //! Run with:
 //!   cargo build --bin ferrum-edge
-//!   cargo test --test functional_tests -- --ignored functional_overload --nocapture
+//!   cargo test --test functional_tests -- --ignored --nocapture functional_overload
 
 use std::io::Write;
 use std::sync::Arc;
@@ -92,14 +113,21 @@ struct OverloadEnv {
     conn_critical: Option<f64>,
     req_pressure: Option<f64>,
     req_critical: Option<f64>,
+    fd_pressure: Option<f64>,
+    fd_critical: Option<f64>,
     shutdown_drain_seconds: Option<u32>,
 }
 
+/// Start the gateway. When `capture_log_path` is `Some`, BOTH stdout and
+/// stderr are redirected to that file. The gateway routes INFO logs to
+/// stdout and WARN/ERROR to stderr (`SeverityWriter` in `main.rs`), so
+/// any test that wants to assert on log-line presence needs both streams.
 fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
     env: &OverloadEnv,
+    capture_log_path: Option<&std::path::Path>,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
 
@@ -108,7 +136,7 @@ fn start_gateway(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "warn")
+        .env("FERRUM_LOG_LEVEL", "info")
         // Make sure perf features don't destabilize the small functional test harness.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false");
 
@@ -133,13 +161,33 @@ fn start_gateway(
     if let Some(v) = env.req_critical {
         cmd.env("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD", v.to_string());
     }
+    if let Some(v) = env.fd_pressure {
+        cmd.env("FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD", v.to_string());
+    }
+    if let Some(v) = env.fd_critical {
+        cmd.env("FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD", v.to_string());
+    }
     if let Some(v) = env.shutdown_drain_seconds {
         cmd.env("FERRUM_SHUTDOWN_DRAIN_SECONDS", v.to_string());
     }
 
+    let (stdout, stderr) = match capture_log_path {
+        Some(path) => {
+            // Open the file once for stderr, then dup the file descriptor for
+            // stdout so both streams append into the same file. Each Stdio
+            // wraps an independent File handle but shares the underlying
+            // fd at the kernel level after dup, which gives us interleaved
+            // writes (race-prone but acceptable for functional log assertions).
+            let f1 = std::fs::File::create(path).expect("create log file");
+            let f2 = f1.try_clone().expect("clone log file fd");
+            (std::process::Stdio::from(f1), std::process::Stdio::from(f2))
+        }
+        None => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
+
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()
         .expect("Failed to start gateway binary")
 }
@@ -171,7 +219,37 @@ async fn start_gateway_with_retry(
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-        let mut child = start_gateway(config_path, proxy_port, admin_port, env);
+        let mut child = start_gateway(config_path, proxy_port, admin_port, env, None);
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+        eprintln!(
+            "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+             (proxy_port={proxy_port}, admin_port={admin_port})"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");
+}
+
+/// Variant that captures stdout AND stderr to a single file; returns the
+/// file path along with the usual `(child, proxy_port, admin_port)` tuple.
+/// Used by tests that need to assert on INFO-level log lines, since the
+/// gateway routes INFO to stdout (see `SeverityWriter` in `main.rs`).
+async fn start_gateway_with_retry_capture_logs(
+    config_path: &str,
+    env: &OverloadEnv,
+    log_path: &std::path::Path,
+) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let proxy_port = ephemeral_port().await;
+        let admin_port = ephemeral_port().await;
+        let mut child = start_gateway(config_path, proxy_port, admin_port, env, Some(log_path));
         if wait_for_gateway(admin_port).await {
             return (child, proxy_port, admin_port);
         }
@@ -209,6 +287,35 @@ plugin_configs: []
     config_file
         .write_all(config_content.as_bytes())
         .expect("write config");
+    drop(config_file);
+    config_path
+}
+
+/// Write a config that exposes a gRPC proxy on `/grpc.svc/` pointing at
+/// the same slow backend. The backend doesn't have to actually speak gRPC
+/// — once the gateway flips into critical state, requests are rejected
+/// before they reach the backend, and we assert on the gateway-generated
+/// response shape (gRPC trailers vs. HTTP status).
+fn write_grpc_config(temp_dir: &TempDir, backend_port: u16) -> std::path::PathBuf {
+    let config_path = temp_dir.path().join("grpc_config.yaml");
+    let config_content = format!(
+        r#"
+proxies:
+  - id: "grpc-proxy"
+    listen_path: "/grpc.svc"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: false
+
+consumers: []
+plugin_configs: []
+"#
+    );
+    let mut config_file = std::fs::File::create(&config_path).expect("create grpc config");
+    config_file
+        .write_all(config_content.as_bytes())
+        .expect("write grpc config");
     drop(config_file);
     config_path
 }
@@ -830,4 +937,447 @@ async fn test_overload_endpoint_returns_503_under_critical() {
     }
 
     teardown(gw, stop).await;
+}
+
+// ============================================================================
+// Phase-8 additions
+// ============================================================================
+
+/// Phase-8 Test 7: FD pressure disables keepalive.
+///
+/// On macOS the FD soft limit returned by `getrlimit(RLIMIT_NOFILE)` is
+/// `RLIM_INFINITY` (`u64::MAX`) and `count_open_fds()` is unimplemented
+/// (returns 0), so `fd_ratio = current / max ≡ 0` regardless of actual
+/// FD usage. A percentage-based FD threshold is therefore impossible to
+/// trip on macOS, and we skip with an explicit message rather than
+/// silently passing.
+///
+/// On Linux the gateway counts open FDs from `/proc/self/fd` and reads
+/// the soft limit from `getrlimit`. The challenge is that
+/// `RLIMIT_NOFILE` varies wildly across Linux environments (1024 on
+/// many laptops, 1,048,576+ in containers). A hard-coded threshold like
+/// `0.0001` requires ≥104 FDs on a 1M-limit container, which is above
+/// typical baseline (~30 FDs). Hence we configure the threshold at
+/// `THRESHOLD = 1e-9` — below any reasonable FD-ratio floor on every
+/// supported Linux environment (worst case is 1 FD / 10M-limit = 1e-7,
+/// still 100× the threshold) — and assert that:
+///   * the OBSERVED `fd_ratio` exceeds the configured threshold (so the
+///     mechanism really fired, not a no-op), and
+///   * `disable_keepalive` is `true` while connection pressure is
+///     inert (so we know FD pressure was the trigger).
+/// This avoids the env-sensitivity flagged in PR #493 review without
+/// needing to muck with `setrlimit` on the spawned child.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fd_pressure_disables_keepalive() {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "skipping fd_pressure_disables_keepalive: FD pressure relies on \
+             /proc/self/fd + finite RLIMIT_NOFILE, which is Linux-only"
+        );
+        return;
+    }
+
+    let temp_dir = TempDir::new().expect("tempdir");
+    let (backend_port, stop, _backend) = spawn_slow_backend(2000).await;
+    let config_path = write_config(&temp_dir, backend_port);
+
+    // Threshold is set well below any plausible Linux baseline FD ratio:
+    //   * RLIMIT_NOFILE caps at fs.nr_open (kernel default ~1M-10M).
+    //   * A live gateway always holds well over 1 open FD (stdio,
+    //     listeners, log handles, etc.).
+    //   * Worst-case ratio: 1 FD / 10M limit = 1e-7 ≫ 1e-9.
+    // So the threshold is reliably crossed across environments — but is
+    // still a real, non-trivial f64 value rather than 0.0, so the
+    // gateway's `>=` comparison is exercising real arithmetic.
+    const THRESHOLD: f64 = 1e-9;
+
+    let env = OverloadEnv {
+        // Conn pressure stays inert so FD pressure is the only path that
+        // can flip `disable_keepalive`.
+        max_connections: Some(10000),
+        conn_pressure: Some(0.99),
+        conn_critical: Some(0.999),
+        check_interval_ms: Some(200),
+        fd_pressure: Some(THRESHOLD),
+        fd_critical: Some(0.999),
+        shutdown_drain_seconds: Some(0),
+        ..Default::default()
+    };
+
+    let (gw, _proxy_port, admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), &env).await;
+
+    // Allow the monitor at least one full interval to pick up the FD count.
+    let mut disabled = false;
+    let mut observed_fd_ratio: f64 = 0.0;
+    let mut last_body = serde_json::Value::Null;
+    for _ in 0..20 {
+        sleep(Duration::from_millis(200)).await;
+        let (_, body) = get_overload(admin_port).await;
+        last_body = body.clone();
+        let fd_ratio = body
+            .get("pressure")
+            .and_then(|p| p.get("file_descriptors"))
+            .and_then(|f| f.get("ratio"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        observed_fd_ratio = observed_fd_ratio.max(fd_ratio);
+        let dk = body
+            .get("actions")
+            .and_then(|a| a.get("disable_keepalive"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let conn_ratio = body
+            .get("pressure")
+            .and_then(|p| p.get("connections"))
+            .and_then(|c| c.get("ratio"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        // Make sure connection pressure isn't the actual trigger — we
+        // configured max_connections=10000 specifically to keep
+        // conn_ratio near zero. The fd_ratio must exceed the configured
+        // threshold (gateway uses `fd_ratio >= threshold`).
+        if dk && fd_ratio >= THRESHOLD && conn_ratio < 0.99 {
+            disabled = true;
+            break;
+        }
+    }
+    assert!(
+        disabled,
+        "expected disable_keepalive=true triggered by FD pressure \
+         (configured threshold={THRESHOLD:e}, max observed FD ratio={observed_fd_ratio:e}); \
+         /overload={last_body}"
+    );
+    // Sanity: observed ratio should exceed the threshold by a comfortable
+    // margin on any sane Linux env. If this fires, the gateway is reading
+    // a near-zero FD count (Linux only — see top-of-test cfg gate) and
+    // the test setup needs revisiting.
+    assert!(
+        observed_fd_ratio >= THRESHOLD,
+        "observed FD ratio {observed_fd_ratio:e} did not exceed threshold {THRESHOLD:e}; \
+         gateway may be reporting fd_ratio=0 (count_open_fds() unimplemented or RLIMIT_NOFILE \
+         is RLIM_INFINITY). /overload={last_body}"
+    );
+
+    teardown(gw, stop).await;
+}
+
+/// Phase-8 Test 8: When MAX_REQUESTS is saturated, fresh requests get
+/// 503 with `actions.reject_new_requests=true`.
+///
+/// This is functionally similar to Test 4 but specifically asserts the
+/// HTTP-frontend response shape (HTTP 503 + `reject_new_requests=true`)
+/// rather than just the elapsed-time / status invariant.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_count_above_threshold_returns_503() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let (backend_port, stop, _backend) = spawn_slow_backend(3000).await;
+    let config_path = write_config(&temp_dir, backend_port);
+
+    let env = OverloadEnv {
+        max_requests: Some(3),
+        check_interval_ms: Some(200),
+        req_pressure: Some(0.3),
+        req_critical: Some(0.5),
+        shutdown_drain_seconds: Some(0),
+        ..Default::default()
+    };
+
+    let (gw, proxy_port, admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), &env).await;
+
+    let slow_url = format!("http://127.0.0.1:{proxy_port}/slow");
+
+    // Saturate the request budget: spawn N >= max_requests slow requests.
+    let mut inflight = Vec::new();
+    for _ in 0..3 {
+        let url = slow_url.clone();
+        inflight.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .pool_max_idle_per_host(0)
+                .http1_only()
+                .build()
+                .unwrap();
+            client.get(&url).send().await
+        }));
+    }
+
+    sleep(Duration::from_millis(1000)).await;
+
+    // Probe must come back as 503.
+    let probe_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+
+    let mut probe_status: Option<u16> = None;
+    for _ in 0..8 {
+        let probe = probe_client.get(&slow_url).send().await;
+        if let Ok(r) = probe {
+            probe_status = Some(r.status().as_u16());
+            if r.status().as_u16() == 503 {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        probe_status,
+        Some(503),
+        "fresh request must get 503 once req_critical fires; \
+         got {probe_status:?}"
+    );
+
+    // /overload must agree.
+    let (_, body) = get_overload(admin_port).await;
+    let reject = body
+        .get("actions")
+        .and_then(|a| a.get("reject_new_requests"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(
+        reject,
+        "expected actions.reject_new_requests=true; /overload={body}"
+    );
+
+    for f in inflight {
+        let _ = f.await;
+    }
+
+    teardown(gw, stop).await;
+}
+
+/// Phase-8 Test 9: gRPC overload rejection returns gRPC `UNAVAILABLE`
+/// (status 14), not a bare HTTP 503.
+///
+/// We send a request with `Content-Type: application/grpc` to the gateway's
+/// gRPC proxy. Once the gateway is in critical request-count pressure, the
+/// overload-rejection path calls `build_grpc_error_response(UNAVAILABLE,
+/// "Service overloaded")` (`src/proxy/grpc_proxy.rs`), which emits:
+///
+///   * HTTP status 200
+///   * `content-type: application/grpc`
+///   * `grpc-status: 14` HEADER (HTTP/1.1 can't carry trailers reliably,
+///     so the gateway emits gRPC status as a regular header)
+///   * `grpc-message: Service overloaded`
+///
+/// The gateway short-circuits via `is_grpc_request()` (content-type check)
+/// before the regular HTTP 503 path runs. The pass criterion below requires
+/// the actual gRPC signal (`grpc-status: 14` header) — accepting bare HTTP
+/// 503 would mask a regression where the gateway forgets to special-case
+/// gRPC content-types in the overload reject path.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grpc_overload_returns_grpc_status_unavailable_not_http_503() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let (backend_port, stop, _backend) = spawn_slow_backend(3000).await;
+    let config_path = write_grpc_config(&temp_dir, backend_port);
+
+    let env = OverloadEnv {
+        max_requests: Some(3),
+        check_interval_ms: Some(200),
+        req_pressure: Some(0.3),
+        req_critical: Some(0.5),
+        shutdown_drain_seconds: Some(0),
+        ..Default::default()
+    };
+
+    let (gw, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), &env).await;
+
+    // Saturate with normal HTTP requests (those count toward max_requests).
+    let saturate_url = format!("http://127.0.0.1:{proxy_port}/grpc.svc/anything");
+    let mut inflight = Vec::new();
+    for _ in 0..3 {
+        let url = saturate_url.clone();
+        inflight.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(8))
+                .pool_max_idle_per_host(0)
+                .http1_only()
+                .build()
+                .unwrap();
+            client.get(&url).send().await
+        }));
+    }
+    sleep(Duration::from_millis(1000)).await;
+
+    // Probe: send an HTTP/1.1 request with gRPC content-type. The gateway's
+    // overload reject path detects `application/grpc` and emits HTTP 200
+    // with `grpc-status: 14` and `grpc-message` as headers (HTTP/1.1 can't
+    // carry trailers on a hyper-built response, so the gateway emits the
+    // gRPC status as a header, which is what gRPC clients fall back to
+    // checking when no trailers arrive).
+    //
+    // PASS CRITERION (mandatory): `grpc-status: 14` header MUST be present.
+    // We do NOT accept a bare HTTP 503 — that would mean the gateway took
+    // the generic HTTP reject path and forgot to short-circuit on the gRPC
+    // content-type, which is exactly the regression this test is meant to
+    // catch.
+    let probe_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .pool_max_idle_per_host(0)
+        .http1_only()
+        .build()
+        .unwrap();
+
+    let mut got_grpc_overload = false;
+    let mut last_summary = String::new();
+    for _ in 0..8 {
+        let resp = probe_client
+            .post(&saturate_url)
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .header("grpc-encoding", "identity")
+            .body(vec![0u8, 0, 0, 0, 0]) // gRPC zero-length frame
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            let status = r.status().as_u16();
+            // Capture the headers BEFORE consuming the response so the
+            // `grpc-status` / `grpc-message` checks survive `text()`.
+            let grpc_status_hdr = r
+                .headers()
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let grpc_message_hdr = r
+                .headers()
+                .get("grpc-message")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let content_type_hdr = r
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let body = r.text().await.unwrap_or_default();
+            last_summary = format!(
+                "status={status} content_type={content_type_hdr:?} \
+                 grpc_status={grpc_status_hdr:?} grpc_message={grpc_message_hdr:?} \
+                 body_excerpt={body:.80}"
+            );
+            // The ONLY acceptable success signal is the gRPC marker. A
+            // bare 503 with no grpc-status header is treated as failure.
+            if grpc_status_hdr.as_deref() == Some("14") {
+                got_grpc_overload = true;
+                break;
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        got_grpc_overload,
+        "gRPC overload must produce a `grpc-status: 14` header on the response \
+         (HTTP/1.1 can't carry trailers, so the gateway emits gRPC status as \
+         a regular header). Bare HTTP 503 without gRPC markers is NOT acceptable \
+         — it indicates the overload reject path forgot to short-circuit on the \
+         gRPC content-type. Last response: {last_summary}"
+    );
+
+    for f in inflight {
+        let _ = f.await;
+    }
+
+    teardown(gw, stop).await;
+}
+
+/// Phase-8 Test 10: enter overload at WARN, recover at INFO.
+///
+/// Captures stderr to a temp file and greps for the specific log lines
+/// the gateway emits when transitioning into and out of overload. We
+/// don't pin the exact wording (it can change), but we DO assert that:
+///
+///   * At least one WARN-level line mentioning "overload" appeared
+///     during the burst.
+///   * At least one INFO-level line mentioning "recover" or "normal"
+///     appeared after the burst drained.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overload_state_transitions_logged_with_warn_then_info() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let (backend_port, stop, _backend) = spawn_slow_backend(800).await;
+    let config_path = write_config(&temp_dir, backend_port);
+
+    let env = OverloadEnv {
+        max_connections: Some(8),
+        check_interval_ms: Some(200),
+        conn_pressure: Some(0.3),
+        conn_critical: Some(0.5),
+        shutdown_drain_seconds: Some(0),
+        ..Default::default()
+    };
+
+    let log_path = temp_dir.path().join("gateway.log");
+    let (gw, proxy_port, _admin_port) =
+        start_gateway_with_retry_capture_logs(config_path.to_str().unwrap(), &env, &log_path).await;
+
+    let slow_url = format!("http://127.0.0.1:{proxy_port}/slow");
+    // Drive 10 concurrent slow requests; this saturates max_connections=8.
+    let mut futures = Vec::new();
+    for _ in 0..10 {
+        let url = slow_url.clone();
+        futures.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap();
+            client.get(&url).send().await
+        }));
+    }
+
+    // Wait for the burst to wind down.
+    sleep(Duration::from_millis(1500)).await;
+    for f in futures {
+        let _ = f.await;
+    }
+
+    // Allow the monitor to flip back to normal after drain. We wait
+    // generously here because the recovery transition fires on the next
+    // monitor tick AFTER active_connections drops below the critical
+    // threshold, and we also need the OS to flush the gateway's stderr
+    // buffer to the captured file.
+    sleep(Duration::from_millis(3000)).await;
+
+    // Tear down the gateway BEFORE reading stderr so any buffered writes
+    // are flushed by the kernel as the process exits. Reading the file
+    // while the child still owns the stderr fd can miss log lines that
+    // the child has written but not yet flushed (rare on Linux, common
+    // on macOS where stderr can be block-buffered).
+    teardown(gw, stop).await;
+
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    // Look for any "overload"-mentioning line at WARN level and a
+    // recovery line at INFO level. The gateway emits structured JSON
+    // logs (via tracing-subscriber) which carry `"level":"WARN"` /
+    // `"level":"INFO"`, so a substring match is reliable. INFO is on
+    // stdout per `SeverityWriter`, hence we capture both streams above.
+    let warned = log_contents.lines().any(|ln| {
+        ln.contains("WARN")
+            && (ln.to_ascii_lowercase().contains("overload")
+                || ln.to_ascii_lowercase().contains("pressure"))
+    });
+    let recovered = log_contents.lines().any(|ln| {
+        ln.contains("INFO")
+            && (ln.to_ascii_lowercase().contains("recover")
+                || ln.to_ascii_lowercase().contains("normal"))
+    });
+
+    assert!(
+        warned,
+        "expected at least one WARN line mentioning overload/pressure during the burst; \
+         log={log_contents}"
+    );
+    assert!(
+        recovered,
+        "expected at least one INFO line mentioning recover/normal after the burst drained; \
+         log={log_contents}"
+    );
 }
