@@ -468,19 +468,114 @@ async fn test_restore_body_size_limit() {
     let body = format!(r#"{{"proxies":[],"pad":"{padding}"}}"#);
     assert!(body.len() > 1024 * 1024, "test body must exceed 1 MiB");
 
-    let resp = client
+    // Gateway enforces the size cap by returning 413 PAYLOAD_TOO_LARGE and
+    // closing the connection. Two outcomes are observable from the client:
+    //
+    //   1. The gateway reads + buffers up to 1 MiB, sends 413, then closes.
+    //      If the client managed to flush the rest of the 2 MiB body into
+    //      the socket before the close lands, it sees the 413 cleanly.
+    //
+    //   2. The client is still writing the body when the connection is
+    //      closed. macOS surfaces this as ECONNRESET in `BodyWrite`. Newer
+    //      reqwest / hyper-util raise that as a `Request` error rather than
+    //      silently completing. This is a race against TCP send/receive
+    //      buffer pressure (~128 KiB on macOS by default), so under
+    //      parallel test load the connection-reset path is the common one.
+    //
+    // Both outcomes prove the gateway enforced the cap — accept either.
+    match client
         .post(format!("{}/restore?confirm=true", harness.admin_base_url))
         .header("Authorization", harness.auth_header())
         .header("Content-Type", "application/json")
         .body(body)
         .send()
         .await
-        .expect("POST /restore failed");
-    assert_eq!(
-        resp.status().as_u16(),
-        413,
-        "2 MiB body under 1 MiB limit should return 413 PAYLOAD_TOO_LARGE"
-    );
+    {
+        Ok(resp) => assert_eq!(
+            resp.status().as_u16(),
+            413,
+            "2 MiB body under 1 MiB limit should return 413 PAYLOAD_TOO_LARGE \
+             when the response races back before the connection close"
+        ),
+        Err(err) => {
+            // First, confirm this is the gateway-closed-mid-body class of
+            // error (not e.g. a connect failure that would mean the gateway
+            // never saw the request in the first place). Walk the source
+            // chain to find an `io::Error` and match on `ErrorKind` —
+            // that's a stable surface across reqwest / hyper-util patch
+            // releases; stringifying `Debug` would silently bypass real
+            // bugs the moment those crates reword their errors.
+            let mut io_kind: Option<std::io::ErrorKind> = None;
+            let mut cur: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(e) = cur {
+                if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                    io_kind = Some(io.kind());
+                    break;
+                }
+                cur = e.source();
+            }
+            assert!(
+                matches!(
+                    io_kind,
+                    Some(
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                    )
+                ),
+                "expected gateway-closed-mid-body io::Error \
+                 (ConnectionReset / BrokenPipe / ConnectionAborted / UnexpectedEof) \
+                 after enforcing the size cap, got: {err:?}"
+            );
+
+            // Second, prove the gateway is still alive and serving — a
+            // listener crash / panic mid-test would surface the same
+            // ECONNRESET above without ever exercising the size cap. By
+            // following up with `/health` (unauthenticated, no body) we
+            // distinguish "gateway closed our oversize upload" (passing,
+            // /health responds 200) from "gateway died" (failing, /health
+            // returns a transport error of its own).
+            let health_resp = client
+                .get(format!("{}/health", harness.admin_base_url))
+                .send()
+                .await
+                .expect(
+                    "/health request after oversize POST failed — \
+                         this means the earlier ECONNRESET was not the \
+                         size-cap path: the gateway is no longer serving",
+                );
+            assert_eq!(
+                health_resp.status().as_u16(),
+                200,
+                "gateway must remain healthy after rejecting the \
+                 oversized restore body — got {} from /health",
+                health_resp.status()
+            );
+
+            // Third, prove the cap is `/restore`-specific (not a generic
+            // listener problem) by sending a small valid restore body and
+            // requiring the response to be anything *other* than 413
+            // PAYLOAD_TOO_LARGE. If the gateway is misconfigured and the
+            // size cap is firing on every body, this catches it.
+            let small_body = r#"{"proxies":[],"consumers":[],"plugins":[]}"#;
+            let small_resp = client
+                .post(format!("{}/restore?confirm=true", harness.admin_base_url))
+                .header("Authorization", harness.auth_header())
+                .header("Content-Type", "application/json")
+                .body(small_body)
+                .send()
+                .await
+                .expect("small /restore POST after oversize failure errored");
+            assert_ne!(
+                small_resp.status().as_u16(),
+                413,
+                "small (<1 MiB) body must not hit the size cap — \
+                 got 413 from /restore for a {}-byte body",
+                small_body.len()
+            );
+        }
+    }
 }
 
 /// Test 8: `/restore` with malformed JSON → 400 with parse error in body.
