@@ -5,12 +5,14 @@
 //!
 //! * `retry_on_methods` enforcement (POST must NOT replay even on
 //!   connection-level failures when only GET is in the retry list).
-//! * Retry-loop interaction with the H3 capability registry — first
-//!   attempt over native H3 fails, second attempt routes via the
-//!   cross-protocol bridge (reqwest path).
+//! * H3 capability-registry interaction with the single-protocol-per-
+//!   request contract: within a single request, every retry attempt
+//!   stays on the protocol the request started with; only the NEXT
+//!   request observes the downgrade and routes via the cross-protocol
+//!   bridge (reqwest path).
 //! * Streaming-body requests are NOT replayed by the retry loop (the
-//!   recent Codex P1 fix; previously a same-request fallback could
-//!   double-fire the body).
+//!   Codex P1 fix; previously a same-request fallback could double-
+//!   fire the body).
 //! * `max_retries: 0` disables retries even with `retry_on_connect_failure`
 //!   enabled.
 //!

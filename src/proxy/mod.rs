@@ -6498,21 +6498,29 @@ async fn handle_proxy_request_inner(
     // Perform the backend request with retry logic.
     // Returns the response and the final CB target key (may differ from the
     // initial target when retries switch to a different upstream target).
+    //
+    // Capture the dispatch protocol once at the start of the request and
+    // thread it into both the initial attempt and every retry. Retries
+    // within a single request stay on the protocol the request started with
+    // — capability downgrade affects the NEXT request, never this one.
+    // Cross-protocol fallback within a request would bypass
+    // `proxy.retry.retry_on_methods` and risk duplicating non-idempotent
+    // requests, since the failed transport attempt may have flushed
+    // headers/body to the backend before the error surfaced.
+    //
+    // It is critical that the `request_was_h3` snapshot is taken HERE and
+    // passed into `proxy_to_backend` as `dispatch_h3` rather than re-read
+    // inside it: a concurrent `mark_h3_unsupported` / capability refresh
+    // between this read and the async DNS resolve inside `proxy_to_backend`
+    // would otherwise let the first attempt and the retry loop disagree
+    // about the transport — the exact mid-request switching this contract
+    // forbids.
+    let request_was_h3 = supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
     let (backend_resp, final_cb_target_key) = if let Some(retry_config) = retry_config {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
-        // Capture the dispatch protocol once at the start of the request so
-        // every retry iteration uses the same transport. Retries within a
-        // single request stay on the protocol the request started with —
-        // capability downgrade affects the NEXT request, never this one.
-        // Cross-protocol fallback within a request would bypass
-        // `proxy.retry.retry_on_methods` and risk duplicating non-idempotent
-        // requests, since the failed transport attempt may have flushed
-        // headers/body to the backend before the error surfaced.
-        let request_was_h3 =
-            supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
         let (mut result, retained_body) = proxy_to_backend(
             &state,
             &proxy,
@@ -6528,6 +6536,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            request_was_h3,
             &ctx.request_bytes_observed,
         )
         .await;
@@ -6651,6 +6660,7 @@ async fn handle_proxy_request_inner(
             false, // no retry — don't retain body
             &request_client_ip,
             is_tls,
+            request_was_h3,
             &ctx.request_bytes_observed,
         )
         .await
@@ -7548,6 +7558,14 @@ pub(crate) async fn proxy_to_backend_retry(
 }
 
 /// Proxy the request to the backend.
+///
+/// `dispatch_h3` is captured by the caller and forced through here so the
+/// dispatch decision is made exactly once per request — see the
+/// `request_was_h3` capture in `proxy_to_backend_inner` for the rationale.
+/// Without it, a concurrent capability refresh / `mark_h3_unsupported` between
+/// the outer capture and the async DNS resolve below could flip the inner
+/// re-check, splitting the first attempt and the retries across H3 / reqwest
+/// — the exact cross-protocol-mid-request behavior this contract forbids.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -7564,6 +7582,7 @@ async fn proxy_to_backend(
     retain_request_body: bool,
     client_ip: &str,
     is_tls: bool,
+    dispatch_h3: bool,
     // Shared counter for request body bytes observed on the wire. Populated
     // by the body handling block below via either `fetch_max` (buffered paths)
     // or frame-by-frame `fetch_add` (streaming paths via SizeLimitedIncoming /
@@ -7604,17 +7623,24 @@ async fn proxy_to_backend(
     // supports H3. gRPC and WebSocket dispatch earlier in the handler and
     // never reach this block, so only Plain-flavor requests can enter.
     //
+    // `dispatch_h3` is the caller-captured snapshot of
+    // `supports_native_http3_backend` taken once at the start of the request.
+    // Re-reading the registry here would race a concurrent
+    // `mark_h3_unsupported` / refresh between the outer capture and the
+    // async DNS resolve above, letting the first attempt and the retry loop
+    // pick different transports.
+    //
     // On H3 transport failure we downgrade the cached capability so
     // subsequent requests skip the native pool immediately — but we do NOT
-    // replay the body via reqwest on the same request. The failed H3
-    // attempt may already have flushed headers / body to the backend
-    // before the reset, timeout, or protocol error surfaced, so replaying
-    // the same body would bypass the operator's retry policy and could
-    // duplicate non-idempotent requests. The outer retry loop (when
-    // `proxy.retry` is configured) is the only place that decides whether
-    // replay is safe per method + `retry_on_methods`. Without retry, the
-    // 502 propagates to the client and the next request uses reqwest.
-    if supports_native_http3_backend(state, proxy, upstream_target) {
+    // cross protocols on the same request. The failed H3 attempt may
+    // already have flushed headers / body to the backend before the reset,
+    // timeout, or protocol error surfaced, so cross-protocol replay would
+    // bypass the operator's `retry_on_methods` policy and could duplicate
+    // non-idempotent requests. Same-protocol H3 retries do replay the
+    // retained body — the outer retry loop's job — but only against the
+    // H3 pool. Without retry, the 502 propagates to the client and the
+    // NEXT request uses reqwest.
+    if dispatch_h3 {
         let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
