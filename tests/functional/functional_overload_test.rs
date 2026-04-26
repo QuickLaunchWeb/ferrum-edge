@@ -953,12 +953,20 @@ async fn test_overload_endpoint_returns_503_under_critical() {
 /// silently passing.
 ///
 /// On Linux the gateway counts open FDs from `/proc/self/fd` and reads
-/// the soft limit from `getrlimit`. We set
-/// `FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD=0.0001` so the gateway's
-/// baseline FD usage is enough to trip the threshold, set the
-/// connection-pressure threshold high so it cannot mask the FD
-/// observation, and assert that the FD ratio reported by `/overload`
-/// actually exceeds the threshold and that `disable_keepalive=true`.
+/// the soft limit from `getrlimit`. The challenge is that
+/// `RLIMIT_NOFILE` varies wildly across Linux environments (1024 on
+/// many laptops, 1,048,576+ in containers). A hard-coded threshold like
+/// `0.0001` requires ≥104 FDs on a 1M-limit container, which is above
+/// typical baseline (~30 FDs). Hence we configure the threshold at
+/// `THRESHOLD = 1e-9` — below any reasonable FD-ratio floor on every
+/// supported Linux environment (worst case is 1 FD / 10M-limit = 1e-7,
+/// still 100× the threshold) — and assert that:
+///   * the OBSERVED `fd_ratio` exceeds the configured threshold (so the
+///     mechanism really fired, not a no-op), and
+///   * `disable_keepalive` is `true` while connection pressure is
+///     inert (so we know FD pressure was the trigger).
+/// This avoids the env-sensitivity flagged in PR #493 review without
+/// needing to muck with `setrlimit` on the spawned child.
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fd_pressure_disables_keepalive() {
@@ -974,6 +982,16 @@ async fn fd_pressure_disables_keepalive() {
     let (backend_port, stop, _backend) = spawn_slow_backend(2000).await;
     let config_path = write_config(&temp_dir, backend_port);
 
+    // Threshold is set well below any plausible Linux baseline FD ratio:
+    //   * RLIMIT_NOFILE caps at fs.nr_open (kernel default ~1M-10M).
+    //   * A live gateway always holds well over 1 open FD (stdio,
+    //     listeners, log handles, etc.).
+    //   * Worst-case ratio: 1 FD / 10M limit = 1e-7 ≫ 1e-9.
+    // So the threshold is reliably crossed across environments — but is
+    // still a real, non-trivial f64 value rather than 0.0, so the
+    // gateway's `>=` comparison is exercising real arithmetic.
+    const THRESHOLD: f64 = 1e-9;
+
     let env = OverloadEnv {
         // Conn pressure stays inert so FD pressure is the only path that
         // can flip `disable_keepalive`.
@@ -981,11 +999,7 @@ async fn fd_pressure_disables_keepalive() {
         conn_pressure: Some(0.99),
         conn_critical: Some(0.999),
         check_interval_ms: Some(200),
-        // Trip the FD threshold on baseline FD usage. Even a fresh
-        // gateway opens dozens of FDs (listeners, pipes, log handles,
-        // pool warmup probes), so 0.0001 is comfortably below the
-        // observed ratio in any reasonable Linux environment.
-        fd_pressure: Some(0.0001),
+        fd_pressure: Some(THRESHOLD),
         fd_critical: Some(0.999),
         shutdown_drain_seconds: Some(0),
         ..Default::default()
@@ -1022,8 +1036,9 @@ async fn fd_pressure_disables_keepalive() {
             .unwrap_or(0.0);
         // Make sure connection pressure isn't the actual trigger — we
         // configured max_connections=10000 specifically to keep
-        // conn_ratio near zero.
-        if dk && fd_ratio >= 0.0001 && conn_ratio < 0.99 {
+        // conn_ratio near zero. The fd_ratio must exceed the configured
+        // threshold (gateway uses `fd_ratio >= threshold`).
+        if dk && fd_ratio >= THRESHOLD && conn_ratio < 0.99 {
             disabled = true;
             break;
         }
@@ -1031,7 +1046,18 @@ async fn fd_pressure_disables_keepalive() {
     assert!(
         disabled,
         "expected disable_keepalive=true triggered by FD pressure \
-         (max observed FD ratio={observed_fd_ratio}); /overload={last_body}"
+         (configured threshold={THRESHOLD:e}, max observed FD ratio={observed_fd_ratio:e}); \
+         /overload={last_body}"
+    );
+    // Sanity: observed ratio should exceed the threshold by a comfortable
+    // margin on any sane Linux env. If this fires, the gateway is reading
+    // a near-zero FD count (Linux only — see top-of-test cfg gate) and
+    // the test setup needs revisiting.
+    assert!(
+        observed_fd_ratio >= THRESHOLD,
+        "observed FD ratio {observed_fd_ratio:e} did not exceed threshold {THRESHOLD:e}; \
+         gateway may be reporting fd_ratio=0 (count_open_fds() unimplemented or RLIMIT_NOFILE \
+         is RLIM_INFINITY). /overload={last_body}"
     );
 
     teardown(gw, stop).await;

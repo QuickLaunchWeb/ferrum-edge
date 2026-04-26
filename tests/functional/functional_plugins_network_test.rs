@@ -132,16 +132,50 @@ async fn rate_limiting_survives_slow_backend() {
         }));
     }
 
+    // Collect EVERY task outcome — a dropped task error would let a
+    // partial-failure run satisfy the >=1/<=5 status checks below
+    // without actually exercising the rate-limiter contract. Failures
+    // and panics are surfaced explicitly.
     let mut statuses: Vec<u16> = Vec::with_capacity(10);
-    for t in tasks {
-        if let Ok(Ok(s)) = t.await {
-            statuses.push(s);
+    let mut request_errors: Vec<String> = Vec::new();
+    for (i, t) in tasks.into_iter().enumerate() {
+        match t.await {
+            Ok(Ok(s)) => statuses.push(s),
+            Ok(Err(e)) => request_errors.push(format!("task {i}: reqwest error: {e}")),
+            Err(e) => request_errors.push(format!("task {i}: join error: {e}")),
         }
     }
+    assert!(
+        request_errors.is_empty(),
+        "rate-limit test expects every concurrent request to complete with an HTTP \
+         status (200 or 429); got {} task error(s) which would let a partial-failure \
+         run pass the count assertions vacuously: {:?}",
+        request_errors.len(),
+        request_errors
+    );
+    assert_eq!(
+        statuses.len(),
+        10,
+        "expected all 10 concurrent requests to produce a status; got {}: statuses={statuses:?}",
+        statuses.len()
+    );
     let oks = statuses.iter().filter(|s| **s == 200).count();
     let rate_limited = statuses.iter().filter(|s| **s == 429).count();
     eprintln!(
         "rate_limiting_survives_slow_backend: statuses={statuses:?} oks={oks} rl={rate_limited}"
+    );
+    // Every status must be either 200 (passed rate limit + reached
+    // backend) or 429 (rejected by rate limit). Anything else (e.g.,
+    // 502 from a flaky backend) means the test isn't measuring what
+    // it claims to measure.
+    let unexpected: Vec<u16> = statuses
+        .iter()
+        .copied()
+        .filter(|s| *s != 200 && *s != 429)
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "expected only 200 / 429 statuses; got unexpected: {unexpected:?}; statuses={statuses:?}"
     );
     // Both halves of the rate-limiter contract must hold — without the
     // 200 floor, a broken plugin that rejects every request would also

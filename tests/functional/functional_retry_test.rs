@@ -473,15 +473,20 @@ async fn retry_does_not_replay_streaming_request_body() {
 
     let total = backend.accepted_connections();
     let attempts = total - baseline;
-    // The Codex P1 invariant: streaming bodies cannot be replayed, so
-    // the gateway must NOT have driven multiple attempts for this
-    // request. Allow exactly 1 attempt — anything more means the
-    // gateway re-attempted the request with a stale (or empty) body,
-    // which is the bug.
-    assert!(
-        attempts <= 1,
-        "streaming POST body must NOT be replayed by the retry loop; \
-         backend saw {attempts} attempts (baseline={baseline}, total={total})"
+    // The Codex P1 invariant has TWO halves:
+    //   * `attempts >= 1` — the gateway DID reach the backend at least
+    //     once. Without this floor, a routing/startup regression that
+    //     never forwards the request would silently pass `<= 1`.
+    //   * `attempts <= 1` — the gateway did NOT replay a streaming
+    //     body. Replaying a streaming POST body is the actual bug
+    //     this test was added to catch (Codex P1).
+    // Together they mean: exactly one attempt, no replay.
+    assert_eq!(
+        attempts, 1,
+        "streaming POST must reach the backend exactly once — no replay AND no \
+         missing attempt. Got {attempts} attempts (baseline={baseline}, total={total}). \
+         attempts==0 would mean the request never reached the backend; attempts>1 \
+         means the gateway replayed a streaming body."
     );
 }
 
