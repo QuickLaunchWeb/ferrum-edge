@@ -3186,7 +3186,7 @@ fn build_websocket_tls_connector(
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream, or an error if the backend is unreachable.
 #[allow(clippy::too_many_arguments)]
-async fn connect_websocket_backend(
+pub(crate) async fn connect_websocket_backend(
     backend_url: &str,
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
@@ -3216,8 +3216,9 @@ async fn connect_websocket_backend(
 
     let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
+    // Without this, 70 KB WS messages hit Nagle + delayed-ACK (~40 ms/msg).
     let connect_future =
-        connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
+        connect_async_tls_with_config(ws_request, Some(ws_config), true, connector);
 
     let (backend_ws_stream, backend_response) =
         match tokio::time::timeout(connect_timeout, connect_future).await {
