@@ -163,6 +163,8 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
 /// we're recovering from affects all streams after the body was fully sent.
 pub(crate) async fn drain_h3_response_body(
     stream: &mut H3RequestStream,
+    method: &str,
+    status: u16,
     content_length: Option<u64>,
 ) -> Result<Vec<u8>, anyhow::Error> {
     let mut body = Vec::new();
@@ -171,7 +173,9 @@ pub(crate) async fn drain_h3_response_body(
             Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
             Ok(None) => break,
             Err(e) => {
-                if e.is_h3_no_error() && is_response_body_complete(&body, content_length) {
+                if e.is_h3_no_error()
+                    && is_response_body_complete(&body, method, status, content_length)
+                {
                     debug!(
                         bytes_received = body.len(),
                         "H3 recv_data hit graceful CONNECTION_CLOSE after complete body; treating as success"
@@ -185,9 +189,17 @@ pub(crate) async fn drain_h3_response_body(
     Ok(body)
 }
 
-fn is_response_body_complete(body: &[u8], content_length: Option<u64>) -> bool {
+fn is_response_body_complete(
+    body: &[u8],
+    method: &str,
+    status: u16,
+    content_length: Option<u64>,
+) -> bool {
+    if method.eq_ignore_ascii_case("HEAD") || status == 204 || status == 304 {
+        return body.is_empty();
+    }
     match content_length {
-        Some(declared) => body.len() as u64 >= declared,
+        Some(declared) => body.len() as u64 == declared,
         None => false,
     }
 }
@@ -853,7 +865,8 @@ impl Http3ConnectionPool {
             .get("content-length")
             .and_then(|v| v.parse().ok());
 
-        let response_body = drain_h3_response_body(&mut stream, content_length).await?;
+        let response_body =
+            drain_h3_response_body(&mut stream, method, status, content_length).await?;
 
         Ok((status, response_body, response_headers))
     }
@@ -1731,7 +1744,8 @@ impl Http3Client {
             .get("content-length")
             .and_then(|v| v.parse().ok());
 
-        let response_body = drain_h3_response_body(&mut stream, content_length).await?;
+        let response_body =
+            drain_h3_response_body(&mut stream, method, status, content_length).await?;
 
         Ok((status, response_body, response_headers))
     }

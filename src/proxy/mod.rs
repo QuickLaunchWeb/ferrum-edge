@@ -9055,6 +9055,8 @@ async fn proxy_to_backend_http3(
 
                             let response_body = match crate::http3::client::drain_h3_response_body(
                                 &mut recv_stream,
+                                method,
+                                status,
                                 content_length,
                             )
                             .await
