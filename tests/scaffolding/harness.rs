@@ -286,9 +286,20 @@ impl GatewayHarnessBuilder {
     pub fn pool_warmup_enabled(mut self, enabled: bool) -> Self {
         self.pool_warmup_enabled = enabled;
         // Explicit env override on every call so binary mode picks up the
-        // setting regardless of TestGateway's defaults.
+        // setting regardless of TestGateway's defaults. Append to BOTH
+        // `inner` (binary subprocess env) and `extra_env` (in-process
+        // `apply_env_overrides` input). Otherwise a caller chaining
+        // `.env("FERRUM_POOL_WARMUP_ENABLED", "true").pool_warmup_enabled(false)`
+        // gets divergent behaviour across modes:
+        //   - binary: subprocess env is key-keyed, last-wins → `false`
+        //   - in-process: extra_env still has the stale `true` from .env(),
+        //     `apply_env_overrides` runs over the field default and flips
+        //     it back to `true`.
+        // Pushing here makes in-process replay the same last-wins order.
         let v = if enabled { "true" } else { "false" };
         self.inner = self.inner.env("FERRUM_POOL_WARMUP_ENABLED", v);
+        self.extra_env
+            .push(("FERRUM_POOL_WARMUP_ENABLED".to_string(), v.to_string()));
         self
     }
 

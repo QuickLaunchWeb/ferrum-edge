@@ -699,3 +699,73 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
         "proxy port should be free after serve() failure cleaned up the orphan listener task",
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: `pool_warmup_enabled(...)` and `.env("FERRUM_POOL_WARMUP_ENABLED",
+// ...)` must agree on last-wins ordering across binary AND in-process modes.
+// Pre-fix the helper updated `inner` (binary subprocess env) but NOT
+// `extra_env` (in-process apply_env_overrides input), so chaining
+// `.env("...", "true").pool_warmup_enabled(false)` ended with warmup
+// off in binary mode but on in in-process — same builder chain, different
+// observable behaviour.
+//
+// We assert the post-`.pool_warmup_enabled(false)` reality via the
+// backend-capability registry: warmup-off keeps the registry empty (matches
+// the existing `in_process_harness_does_not_probe_backend_when_warmup_disabled`
+// test). With the bug the stale `.env("...", "true")` would flip warmup back
+// on inside `apply_env_overrides`, the registry would populate, and the
+// assertion would fail.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_pool_warmup_helper_wins_over_earlier_env_call() {
+    let backend_port = reserve_port().await.expect("port").port;
+    let _backend = ScriptedHttp1Backend::builder(
+        reserve_port()
+            .await
+            .expect("backend reserve")
+            .into_listener(),
+    )
+    .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+        "GET", "/ping",
+    )))
+    .step(HttpStep::RespondStatus {
+        status: 200,
+        reason: "OK".into(),
+    })
+    .spawn()
+    .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend(backend_port);
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        // Stale env first.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        // Then the helper. Last call must win.
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn in-process gateway");
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("gateway healthy");
+
+    // Cold registry == helper won (warmup off). Pre-fix the stale
+    // .env("...", "true") would have made apply_env_overrides flip
+    // warmup back on, and the registry would have at least one entry
+    // from the startup probe.
+    let snapshot = harness
+        .get_admin_json("/backend-capabilities")
+        .await
+        .expect("backend-capabilities");
+    let entry_count = snapshot["entries"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        entry_count, 0,
+        "pool_warmup_enabled(false) must win over earlier .env(...) — \
+         backend-capabilities snapshot was {snapshot:?}",
+    );
+}

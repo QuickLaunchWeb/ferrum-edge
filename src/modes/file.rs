@@ -425,6 +425,20 @@ pub async fn run(
     let reload_namespace = env_config.namespace.clone();
     let mut sighup_shutdown = shutdown_tx.subscribe();
     let sighup_handle = tokio::spawn(async move {
+        // Shutdown can already be `true` by the time this task starts —
+        // the SIGHUP handler is registered AFTER `serve()` returns, so
+        // anything that fires shutdown during startup (SIGTERM,
+        // serve-internal failure cleanup) lands the watch at `true`
+        // before we get here. `changed()` only completes on a *new*
+        // update, so without this short-circuit the task would block on
+        // `recv()` / `changed()` until something else moved the
+        // channel — and `run()`'s `tokio::time::timeout(5s, sighup_handle)`
+        // would always burn the full timeout on shutdown-during-startup
+        // paths.
+        if *sighup_shutdown.borrow() {
+            info!("SIGHUP listener: shutdown already signalled at startup, exiting");
+            return;
+        }
         #[cfg(unix)]
         {
             // Use the pre-installed signal stream from above so any HUPs
