@@ -575,3 +575,127 @@ async fn in_process_harness_rejects_db_mode_after_file_config() {
         "error must explain that in-process supports file mode only; got {msg:?}",
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: when `serve()` errors out of late startup (e.g. a stream
+// proxy can't bind because its `listen_port` is already taken), the
+// previously-spawned proxy / admin / DNS / overload / metrics tasks must
+// be drained before the error propagates. Without the cleanup the
+// `JoinHandle`s drop unawaited, the underlying tasks orphan, and the
+// in-process retry path in `GatewayHarnessBuilder::spawn_in_process`
+// accumulates leftover listeners holding sockets across attempts.
+//
+// Test recipe: pre-bind the proxy/admin listeners and a third TCP socket
+// on a "stream" port. Configure a TCP stream proxy on that occupied
+// stream port. Call `serve()` directly — it must error. Then re-bind the
+// proxy listener's port: with cleanup the previous listener task exits
+// and the port is free; without cleanup the orphan task keeps the port
+// and the rebind fails.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_drains_spawned_tasks_when_late_startup_fails() {
+    use ferrum_edge::admin::jwt_auth::{JwtConfig, JwtManager};
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::config::{EnvConfig, OperatingMode};
+    use ferrum_edge::modes::file::{self, ServeOptions};
+
+    // Reserve and bind the proxy + admin ports we'll hand to serve().
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind admin");
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+    let admin_port = admin_listener.local_addr().unwrap().port();
+
+    // Occupy a stream port so the gateway's `initial_reconcile_stream_listeners`
+    // bind fails. We hold this for the lifetime of the test so the
+    // gateway's bind attempt can't race in.
+    let stream_blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stream blocker");
+    let stream_port = stream_blocker.local_addr().unwrap().port();
+
+    // Config with a TCP stream proxy on the occupied stream port. Build
+    // via serde_json so the indent / multi-line YAML pitfalls don't
+    // creep in.
+    let config_json = serde_json::json!({
+        "proxies": [{
+            "id": "stream-proxy",
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 65000_u16,
+            "listen_port": stream_port,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let mut config: GatewayConfig =
+        serde_json::from_value(config_json).expect("deserialize config");
+    // Ad-hoc deserialization doesn't run the loader pipeline, so the
+    // proxy's `dispatch_kind` defaults to a non-stream variant — and
+    // `initial_reconcile_stream_listeners` would skip it. Call the
+    // resolver so the stream proxy is actually classified as a stream
+    // and the bind probe runs against `stream_port`.
+    config.resolve_dispatch_kind();
+
+    let env_config = EnvConfig {
+        mode: OperatingMode::File,
+        proxy_http_port: proxy_port,
+        proxy_https_port: 0,
+        admin_http_port: admin_port,
+        admin_https_port: 0,
+        admin_jwt_secret: Some("regression-test-secret-32-chars-min-len".to_string()),
+        admin_jwt_issuer: "regression-test".to_string(),
+        shutdown_drain_seconds: 0,
+        pool_warmup_enabled: false,
+        max_connections: 0,
+        // Match the blocker's bind address so the conflict is unambiguous
+        // (0.0.0.0 vs 127.0.0.1 binding semantics differ across platforms;
+        // pinning both to loopback removes the variability).
+        proxy_bind_address: "127.0.0.1".to_string(),
+        stream_proxy_bind_address: "127.0.0.1".to_string(),
+        ..EnvConfig::default()
+    };
+
+    let opts = ServeOptions {
+        proxy_http: Some(proxy_listener),
+        admin_http: Some(admin_listener),
+        admin_jwt_manager: Some(JwtManager::new(JwtConfig {
+            secret: env_config.admin_jwt_secret.clone().unwrap(),
+            issuer: env_config.admin_jwt_issuer.clone(),
+            max_ttl_seconds: 3600,
+            algorithm: jsonwebtoken::Algorithm::HS256,
+        })),
+        skip_initial_capability_refresh: true,
+        ..ServeOptions::default()
+    };
+
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let result = file::serve(env_config, config, opts, shutdown_tx.clone()).await;
+
+    let err = match result {
+        Ok(_) => panic!("serve() must fail when stream port {stream_port} is already taken",),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().to_lowercase().contains("listener")
+            || err.to_string().to_lowercase().contains("bind")
+            || err.to_string().to_lowercase().contains("port"),
+        "error must surface the bind failure; got {err}",
+    );
+
+    // The critical assertion: port released. With cleanup the proxy
+    // listener task observed shutdown, exited, and dropped its listener.
+    // Without cleanup the orphan task still owns the listener and this
+    // bind would fail with EADDRINUSE. A small grace lets the runtime
+    // finish dropping the listener after the task exits — generous
+    // compared to the actual cost.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let rebind = tokio::net::TcpListener::bind(format!("127.0.0.1:{proxy_port}")).await;
+    rebind.expect(
+        "proxy port should be free after serve() failure cleaned up the orphan listener task",
+    );
+}

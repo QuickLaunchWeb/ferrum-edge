@@ -224,6 +224,20 @@ impl ServeHandles {
         join_background_handles(self.background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
         listener_result
     }
+
+    /// Signal shutdown then drain inner listener / background handles.
+    ///
+    /// Intended for `serve()`'s own use when an early-startup `?` fires
+    /// after some tasks have already been spawned: without this the
+    /// spawned `JoinHandle`s drop unawaited and the underlying listener
+    /// loops orphan, holding sockets across the in-process retry path
+    /// and poisoning subsequent attempts in the same process. Discards
+    /// any listener `JoinError` because the original startup error is
+    /// the more useful one to surface.
+    pub async fn shutdown_and_join(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.join().await;
+    }
 }
 
 /// Await every listener handle. Logs each `JoinError` and returns the
@@ -940,16 +954,6 @@ pub async fn serve(
         }
     }
 
-    // Stream proxy listeners (TCP/UDP) — fatal if any binds fail in file mode.
-    proxy_state.initial_reconcile_stream_listeners().await?;
-    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
-    proxy_state
-        .stream_listener_manager
-        .wait_until_started(Duration::from_secs(10))
-        .await?;
-    startup_ready.store(true, Ordering::Relaxed);
-    info!("Gateway startup complete; /health now reports ready");
-
     // Background-task handles tracked separately so `ServeHandles::join`
     // can apply a hard `BACKGROUND_DRAIN_TIMEOUT` cap to them. The
     // pre-refactor `run()` did the same with an explicit
@@ -958,14 +962,49 @@ pub async fn serve(
     // stuck DNS / metrics task wedge shutdown indefinitely.
     let background_handles: Vec<JoinHandle<()>> = vec![dns_handle, overload_handle, metrics_handle];
 
-    Ok(ServeHandles {
-        proxy_state,
+    // Build `ServeHandles` BEFORE the late-startup `?` calls so that
+    // failure to bind stream listeners / receive listener-started
+    // signals / wait for the stream listener manager doesn't leave
+    // the proxy / admin / DNS / overload / metrics tasks orphaned.
+    // `shutdown_and_join` below signals shutdown via the watch channel
+    // and drains the spawned handles before propagating the error —
+    // critical for the in-process retry path in
+    // `GatewayHarnessBuilder::spawn_in_process`, which would otherwise
+    // accumulate orphan listeners holding sockets across attempts.
+    let serve_handles = ServeHandles {
+        proxy_state: proxy_state.clone(),
         bound,
         listener_handles: handles,
         background_handles,
         shutdown_tx,
         drain_seconds: env_config.shutdown_drain_seconds,
-    })
+    };
+
+    // Stream proxy listeners (TCP/UDP) — fatal if any binds fail in file mode.
+    let startup_result: Result<(), anyhow::Error> = async {
+        proxy_state.initial_reconcile_stream_listeners().await?;
+        wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(10))
+            .await?;
+        startup_ready.store(true, Ordering::Relaxed);
+        info!("Gateway startup complete; /health now reports ready");
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = startup_result {
+        warn!(
+            "Gateway startup failed after spawning listener / background tasks: {}; \
+             draining spawned tasks before returning",
+            e
+        );
+        serve_handles.shutdown_and_join().await;
+        return Err(e);
+    }
+
+    Ok(serve_handles)
 }
 
 #[cfg(test)]
