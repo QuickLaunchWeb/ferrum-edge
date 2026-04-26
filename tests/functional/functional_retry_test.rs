@@ -233,10 +233,11 @@ async fn retry_respects_retry_on_methods() {
 // request — the dispatch decision is made once per request, so all
 // in-request retry attempts use the native H3 pool. The 502 from the
 // first request is therefore the expected, documented behavior (see
-// CLAUDE.md "No same-request reqwest fallback after H3 failure"). The
-// retry-policy field is configured here only so the gateway exercises
-// the H3 retry loop; the configured `max_retries` is exhausted at the
-// H3 layer.
+// CLAUDE.md "Single-protocol-per-request contract" and the sibling
+// test `retry_attempts_within_same_request_stay_on_h3_pool` below).
+// The retry-policy field is configured here only so the gateway
+// exercises the H3 retry loop; the configured `max_retries` is
+// exhausted at the H3 layer.
 //
 // Setup: H3-capable backend on UDP that closes the connection on the
 // first stream. The TCP+TLS side answers OK. Retry policy is configured
