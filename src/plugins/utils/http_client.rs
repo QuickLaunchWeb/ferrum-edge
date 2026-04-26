@@ -137,8 +137,24 @@ impl PluginHttpClient {
             .dns_resolver(Arc::new(resolver));
 
         // Load custom CA bundle for verifying internal/corporate CAs.
-        // - Custom CA configured -> disable built-in roots, trust ONLY the custom CA
-        // - No CA configured -> reqwest uses webpki/system roots by default
+        // Trust resolution:
+        //   - tls_no_verify=true                 → skip verification entirely
+        //                                          (handled above via
+        //                                          danger_accept_invalid_certs)
+        //   - Custom CA configured               → trust ONLY that CA
+        //                                          (CA exclusivity via
+        //                                          tls_certs_only — replaces the
+        //                                          trust store wholesale)
+        //   - No CA configured (this branch       → fall through to reqwest 0.13's
+        //     skipped)                              rustls feature default, which
+        //                                          uses rustls-platform-verifier:
+        //                                          OS keychain on macOS, Windows
+        //                                          cert store on Windows, bundled
+        //                                          webpki on Linux. The backend
+        //                                          proxy path in src/tls/backend.rs
+        //                                          uses bundled webpki on every
+        //                                          platform via use_preconfigured_tls;
+        //                                          this helper-client path differs.
         if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
             match std::fs::read(ca_path) {
                 Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
