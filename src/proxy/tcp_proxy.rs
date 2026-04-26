@@ -50,6 +50,14 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
 /// EOF (e.g., the backend sending `RST` instead of `FIN` after finishing its
 /// response) is a genuine backend misbehaviour that operators must still
 /// see. Only write-side benign errnos are reclassified.
+///
+/// `ConnectionAborted` is intentionally excluded. On Linux it can mean
+/// `ECONNABORTED` from the kernel aborting the connection (keepalive failure,
+/// listen-queue overflow tail) which is not the close-race signal we're
+/// looking for. The retroactive Phase 2 grace-window check uses the
+/// precomputed `phase1_benign_write_candidate` flag captured here so that
+/// `ConnectionAborted` cannot leak through via post-classification matching
+/// (it shares `ErrorClass::ConnectionClosed` with `BrokenPipe`).
 fn is_post_eof_benign_write_error(side: StreamIoSide, kind: std::io::ErrorKind) -> bool {
     matches!(side, StreamIoSide::Write)
         && matches!(
@@ -58,29 +66,6 @@ fn is_post_eof_benign_write_error(side: StreamIoSide, kind: std::io::ErrorKind) 
                 | std::io::ErrorKind::ConnectionReset
                 | std::io::ErrorKind::WriteZero
         )
-}
-
-/// Check whether an already-recorded Phase 1 `first_failure` is the benign
-/// write-after-close pattern that retroactively qualifies for reclassification
-/// once the opposite half's grace-window poll reveals a clean `Ok(())`.
-///
-/// The classified `ErrorClass` is the evidence: `BrokenPipe` maps to
-/// `ConnectionClosed`, `ConnectionReset` stays `ConnectionReset` (see
-/// `classify_boxed_error` in `src/retry.rs`). A Write-side failure with one
-/// of these classes is the same benign pattern as
-/// `is_post_eof_benign_write_error`; the only reason we can't call that
-/// helper directly is that by Phase 2 the raw `io::ErrorKind` has already
-/// been consumed into the classified tuple.
-fn phase1_error_is_post_eof_race(
-    first_failure: &Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>,
-) -> bool {
-    match first_failure {
-        Some((_dir, class, Some(StreamIoSide::Write), _msg)) => matches!(
-            class,
-            ErrorClass::ConnectionClosed | ErrorClass::ConnectionReset
-        ),
-        _ => false,
-    }
 }
 
 // Shared error-message prefixes used at `anyhow::anyhow!` construction sites
@@ -2042,6 +2027,15 @@ where
 
     // Phase 1: race the two directions (plus optional idle check).
     let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>, String)> = None;
+    // Captured *before* `e` is moved into `anyhow::Error::new(e)` so that the
+    // Phase 2 grace-window reclassification can use the precise raw
+    // `io::ErrorKind` rather than the lossy classified `ErrorClass`. Two
+    // failure kinds collide on `ErrorClass::ConnectionClosed`: `BrokenPipe`
+    // (benign close race, admit) and `ConnectionAborted` (kernel abort, do
+    // NOT admit). `WriteZero` collapses to `ErrorClass::RequestError` and
+    // would otherwise be missed entirely. Storing the precise admission
+    // decision here keeps Phase 2 in lockstep with `is_post_eof_benign_write_error`.
+    let mut phase1_benign_write_candidate: bool = false;
     let mut c2b_done = false;
     let mut b2c_done = false;
 
@@ -2051,6 +2045,8 @@ where
             result = &mut c2b_fut, if !c2b_done => {
                 c2b_done = true;
                 if let Err((side, e)) = result {
+                    // Capture raw kind before `e` is consumed by anyhow::Error::new.
+                    let benign_write = is_post_eof_benign_write_error(side, e.kind());
                     let msg = format!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
                     // Wrap via `anyhow::Error::new(e)` so the source chain keeps
                     // the underlying `io::Error` — `classify_stream_error` walks
@@ -2069,6 +2065,7 @@ where
                             Some(side),
                             msg,
                         ));
+                        phase1_benign_write_candidate = benign_write;
                     }
                 }
                 break;
@@ -2076,6 +2073,7 @@ where
             result = &mut b2c_fut, if !b2c_done => {
                 b2c_done = true;
                 if let Err((side, e)) = result {
+                    let benign_write = is_post_eof_benign_write_error(side, e.kind());
                     let msg = format!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
                     let err: anyhow::Error = anyhow::Error::new(e).context(format!(
                         "Bidirectional copy error (backend→client, {:?})",
@@ -2088,6 +2086,7 @@ where
                             Some(side),
                             msg,
                         ));
+                        phase1_benign_write_candidate = benign_write;
                     }
                 }
                 break;
@@ -2175,10 +2174,13 @@ where
                 Ok(Ok(())) => {
                     // Phase 1 errored on b2c but c2b completed cleanly in
                     // the grace window. If the Phase 1 error was a benign
-                    // write-after-close, we now know the opposite half
-                    // EOF'd cleanly — the session shut down gracefully and
-                    // Phase 1's write error was just the close race tail.
-                    if phase1_error_is_post_eof_race(&first_failure) {
+                    // write-after-close (precise raw-`io::ErrorKind` check
+                    // captured at Phase 1 time — see
+                    // `phase1_benign_write_candidate`), we now know the
+                    // opposite half EOF'd cleanly: the session shut down
+                    // gracefully and Phase 1's write error was just the
+                    // close race tail.
+                    if phase1_benign_write_candidate {
                         first_failure = None;
                     }
                 }
@@ -2221,7 +2223,7 @@ where
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
                 Ok(Ok(())) => {
                     // Symmetric to the c2b grace path — see comment above.
-                    if phase1_error_is_post_eof_race(&first_failure) {
+                    if phase1_benign_write_candidate {
                         first_failure = None;
                     }
                 }

@@ -1292,3 +1292,177 @@ async fn test_bidirectional_copy_graceful_reclassification_preserves_byte_counts
         "write-after-close error aborts before counter bump"
     );
 }
+
+// ── Phase 1 grace-window reclassification (raw-kind precision) ──────────────
+//
+// The drain-path tests above exercise `drain_half_close_copy`, which sees
+// the raw `io::ErrorKind` directly. These tests target the *other* half
+// of the fix: the Phase 1 grace-window paths (lines ~2174 / ~2221 of
+// `bidirectional_copy`). Those paths fire when one direction errors first,
+// then the opposite direction completes `Ok(())` within the 100 ms grace
+// window. Phase 2 must use the **precise raw `io::ErrorKind`** captured at
+// Phase 1 time (`phase1_benign_write_candidate`) — never the post-classified
+// `ErrorClass`, which collapses two distinct errnos into one bucket
+// (`BrokenPipe` and `ConnectionAborted` both map to `ConnectionClosed`)
+// and drops `WriteZero` into `RequestError` entirely.
+
+/// Backend fixture for Phase 1 grace-window tests: reads return EOF
+/// immediately (so the b2c direction completes `Ok(())` cleanly when the
+/// grace window polls it), and writes return `Ok(0)` so the proxy's
+/// `copy_one_direction` write loop produces a `WriteZero` error in the
+/// c2b direction (raw `io::ErrorKind::WriteZero`).
+struct EofReadAndWriteZeroStream;
+
+impl AsyncRead for EofReadAndWriteZeroStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for EofReadAndWriteZeroStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        // Returning Ok(0) on a non-empty buffer makes tokio's `write_all`
+        // emit `io::ErrorKind::WriteZero` — the raw kind we need to admit.
+        Poll::Ready(Ok(0))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Backend fixture: reads return EOF, writes fail with `ConnectionAborted`.
+/// `ConnectionAborted` post-classifies to `ErrorClass::ConnectionClosed`
+/// (same bucket as `BrokenPipe`) but is **not** in the precise benign-write
+/// admission set — `is_post_eof_benign_write_error` rejects it because on
+/// Linux `ECONNABORTED` is the kernel aborting the connection (keepalive
+/// failure, not the close-race tail). The Phase 1 grace window must
+/// preserve the failure rather than over-admitting based on the lossy
+/// `ErrorClass` proxy.
+struct EofReadAndConnectionAbortedStream;
+
+impl AsyncRead for EofReadAndConnectionAbortedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for EofReadAndConnectionAbortedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "simulated kernel connection abort",
+        )))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Regression: a Phase 1 c2b `WriteZero` followed by an opposite-half
+/// `Ok(())` EOF in the grace window MUST reclassify as graceful shutdown.
+///
+/// Why this matters: `WriteZero` post-classifies to `ErrorClass::RequestError`
+/// (no match in `classify_boxed_error`'s `io::ErrorKind` arms). A previous
+/// version of the Phase 2 reclassification used a post-classification helper
+/// keyed on `ErrorClass::ConnectionClosed | ConnectionReset`, which silently
+/// dropped `WriteZero` cases on the floor — the very benign-write-after-close
+/// pattern produced by `copy_one_direction`'s own write loop when a TLS
+/// peer's receive side has gone away mid-flush.
+///
+/// Setup:
+/// - Client: bytes-once-then-EOF reader, accepts writes (so c2b reads bytes,
+///   then proceeds to write to the backend).
+/// - Backend: EOF on read, returns `Ok(0)` on write (drives `WriteZero`).
+///
+/// Trace:
+/// 1. Phase 1 (biased) polls c2b first. c2b reads bytes from client, then
+///    writes to backend → `Ok(0)` → tokio `write_all` emits `WriteZero`.
+/// 2. c2b errors with `(Write, WriteZero)`; `phase1_benign_write_candidate`
+///    is captured as `true` from the raw kind.
+/// 3. Phase 2 enters the b2c grace window. b2c reads from backend → EOF →
+///    completes `Ok(())`.
+/// 4. Phase 2 reclassifies: `first_failure = None` (graceful shutdown).
+#[tokio::test]
+async fn test_phase1_grace_window_reclassifies_write_zero_as_graceful() {
+    let client = ReadOncePayloadStream::new(512);
+    let backend = EofReadAndWriteZeroStream;
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "WriteZero on Phase 1 c2b followed by clean b2c EOF must reclassify as graceful, got {:?}",
+        result.first_failure
+    );
+}
+
+/// Regression (negative): a Phase 1 c2b `ConnectionAborted` followed by an
+/// opposite-half `Ok(())` EOF in the grace window MUST NOT be reclassified
+/// as graceful — `ConnectionAborted` is intentionally outside the benign
+/// admission set even though it shares `ErrorClass::ConnectionClosed` with
+/// the benign `BrokenPipe`.
+///
+/// Why this matters: a previous version of the Phase 2 reclassification
+/// used a post-classification helper that admitted any
+/// `ErrorClass::ConnectionClosed` Write-side failure. That over-admitted
+/// `ConnectionAborted` (kernel-aborted connection, e.g., keepalive
+/// failure) as if it were the benign TLS close-race tail. Operators would
+/// then lose visibility into a real connection-abort signal. The fix
+/// captures the precise raw `io::ErrorKind` at Phase 1 time so the Phase 2
+/// grace window can honor the same exclusion list as
+/// `is_post_eof_benign_write_error`.
+///
+/// Setup mirrors the WriteZero positive case but the backend write fails
+/// with `ConnectionAborted` instead of `Ok(0)`.
+#[tokio::test]
+async fn test_phase1_grace_window_does_not_reclassify_connection_aborted() {
+    let client = ReadOncePayloadStream::new(512);
+    let backend = EofReadAndConnectionAbortedStream;
+
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
+
+    let (dir, class, side, _msg) = result.first_failure.as_ref().expect(
+        "ConnectionAborted on Phase 1 c2b must NOT be reclassified as graceful — \
+         it is outside the precise benign-write admission set even though it \
+         shares ErrorClass::ConnectionClosed with the benign BrokenPipe",
+    );
+    assert_eq!(
+        *dir,
+        Direction::ClientToBackend,
+        "direction must be attributed to the c2b half that errored"
+    );
+    assert_eq!(
+        *class,
+        ErrorClass::ConnectionClosed,
+        "ConnectionAborted post-classifies to ConnectionClosed (per classify_boxed_error)"
+    );
+    assert_eq!(
+        *side,
+        Some(StreamIoSide::Write),
+        "the failure was on the write side of c2b"
+    );
+}
