@@ -136,6 +136,32 @@ pub mod _test_support {
         .await
     }
 
+    /// Connect to a WebSocket backend using production dialer settings that
+    /// are relevant to unit tests.
+    pub async fn connect_websocket_backend_for_test(
+        backend_url: &str,
+        proxy: &crate::config::types::Proxy,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let env_config = crate::config::EnvConfig::default();
+        let crls: crate::tls::CrlList = Arc::new(Vec::new());
+        crate::proxy::connect_websocket_backend(
+            backend_url,
+            proxy,
+            &env_config,
+            &[],
+            None,
+            &crls,
+            65_536,
+            4_096,
+        )
+        .await
+    }
+
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
     /// unit tests. Only available on Linux — on other platforms there is no
     /// splice path to exercise.
