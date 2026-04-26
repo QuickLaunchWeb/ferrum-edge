@@ -34,7 +34,7 @@ use crate::scaffolding::backends::{
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
 use crate::scaffolding::harness::GatewayHarness;
-use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::ports::{reserve_port, reserve_udp_port};
 use serde_json::json;
 use std::net::UdpSocket as StdUdpSocket;
 use std::time::Duration;
@@ -849,12 +849,16 @@ async fn retry_rotation_across_mixed_capability_targets_recomputes_dispatch() {
     // "ok-from-h3-b" — small body, no streaming. The script accepts the
     // first request stream, sends headers + body, then closes the
     // connection cleanly so the gateway's read terminates.
-    let target_b_reservation = reserve_port().await.expect("reserve target B port");
+    //
+    // Use `reserve_udp_port` (which holds the UDP socket through the
+    // hand-off into `ScriptedH3Backend`) rather than reserving a TCP
+    // port and dropping it before binding UDP — `CLAUDE.md`'s "Port
+    // allocation MUST retry: bind-drop-rebind races" rule applies to
+    // UDP too. Holding the reservation through bind eliminates the
+    // window where another parallel test could steal the port.
+    let target_b_reservation = reserve_udp_port().await.expect("reserve target B udp port");
     let target_b_port = target_b_reservation.port;
-    drop(target_b_reservation);
-    let target_b_udp = tokio::net::UdpSocket::bind(("127.0.0.1", target_b_port))
-        .await
-        .expect("bind target B udp");
+    let target_b_udp = target_b_reservation.into_socket();
     let target_b_h3 = ScriptedH3Backend::builder(target_b_udp, H3TlsConfig::new(cert, key))
         .step(H3Step::AcceptStream)
         .step(H3Step::RespondHeaders(vec![
