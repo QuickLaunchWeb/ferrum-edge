@@ -488,7 +488,13 @@ fn reqwest_error_response_for_cross_protocol(
         status_code: 502,
         body: crate::retry::ResponseBody::Buffered(error_body.as_bytes().to_vec()),
         headers: HashMap::new(),
-        connection_error: e.is_connect() || e.is_timeout(),
+        // Funnel through `request_reached_wire` instead of
+        // `e.is_connect() || e.is_timeout()` — the predicate-pair misses
+        // TLS-handshake failures and reqwest-level timeouts that landed on
+        // the connect side without surfacing as `is_connect()=true`. Every
+        // dispatch path in the gateway must agree on the wire boundary
+        // (see `retry::request_reached_wire`).
+        connection_error: !crate::retry::request_reached_wire(error_class),
         backend_resolved_ip,
         error_class: Some(error_class),
     }

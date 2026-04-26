@@ -333,6 +333,37 @@ The next periodic refresh re-probes and restores `Supported` if the backend reco
 
 **Admin introspection** (JWT-authenticated, always exposed): `GET /backend-capabilities` returns the full registry snapshot (`BackendCapabilityRegistry::snapshot()`); `POST /backend-capabilities/refresh` forces a synchronous classification pass. Operators use these for routing-decision debugging, protocol-rollout monitoring, and post-incident recovery (force-refresh after a live downgrade). Payloads carry only classifications + probe timestamps — no credentials or request bodies — so they're safe to leave permanently enabled. See [docs/admin_api.md](docs/admin_api.md#backend-capability-registry) + `openapi.yaml` for the full schema; Phase-3 scripted-backend tests assert on these endpoints.
 
+### Connection-Error Classification Boundary
+
+`BackendResponse::connection_error: bool` has exactly one meaning: **"the request body never reached the backend's application layer."** When `true`, the gateway-level retry loop fires `retry_on_connect_failure` regardless of HTTP method, because replaying a request that never went on the wire is idempotent by construction. When `false`, retries must respect `retry_on_methods` / `retryable_status_codes`.
+
+Every protocol classifier (reqwest, direct H2 pool, gRPC pool, native H3 pool, H3 cross-protocol bridge, recv-side body classifier) funnels its `ErrorClass` through one helper:
+
+```rust
+retry::request_reached_wire(error_class) -> bool
+// connection_error = !request_reached_wire(error_class)
+```
+
+`request_reached_wire` returns `false` only for pre-wire transport classes: `ConnectionRefused`, `ConnectionTimeout`, `DnsLookupError`, `TlsError`, `PortExhaustion`, `ConnectionPoolError`. Everything else (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`, `ReadWriteTimeout`, `RequestBodyTooLarge`, `ResponseBodyTooLarge`, `ClientDisconnect`, `RequestError`) is post-wire.
+
+**Per-classifier `connection_error: bool` fields are intentionally absent.** Earlier code derived the boolean separately at every dispatch site (`e.is_connect() || e.is_timeout()` for reqwest; an `is_conn_error` tuple element for H3) and the implementations disagreed. Concretely the H3 string-heuristic classifier matched `"reset"` BEFORE specific h3 / QUIC tokens, so a stream-level `RESET_STREAM` (an application-layer abort) classified as `ConnectionReset` with `connection_error=true` and an `ApplicationClose` (genuinely transport-class) classified as `ProtocolError` with `connection_error=false`. The H3 classifier in `proxy/mod.rs::classify_h3_error` is now a thin wrapper over `http3::client::classify_http3_error` so both paths agree byte-for-byte; the bare `"stream"` substring (which used to false-match `"upstream"` in load-balancer messages) is gone.
+
+**`retry::error_class_log_kind(class)`** centralizes the short label every dispatcher emits as the `error_kind` field on `tracing::error!` log lines. Operators grep one stable token per failure mode across all protocol logs.
+
+**H3 pool body-on-wire signal.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed [`H3PoolError`](src/http3/client.rs) instead of `anyhow::Error`. `H3PoolError::request_on_wire()` is `true` once the H3 stream has been opened on ANY internal attempt (cached → fallback → fresh-connect chain). Once the body has been (at least partially) committed, `with_request_on_wire(true)` promotes the final returned error to `request_on_wire=true` so a subsequent connect-class failure CANNOT mask the earlier wire commitment. Gateway H3 sites combine this with the classifier:
+
+```rust
+let request_on_wire = e.request_on_wire();
+let (error_kind, error_class) = classify_h3_error(e.as_ref());
+let is_conn_error = !request_on_wire && !retry::request_reached_wire(error_class);
+```
+
+This protects against the race where the H3 pool's first internal attempt sent the body on a stale cached connection (post-wire) and a fallback-attempt connect failure surfaces last (pre-wire-looking). Without the sticky promotion, the gateway would conclude `connection_error=true` and replay a non-idempotent request the backend may already have processed.
+
+**Out of scope (P9 follow-up).** The H3 pool still does internal `body.clone()` retries across cached/fallback indices; an attempt that committed the body and then died mid-stream causes a non-idempotent replay on the next internal index, regardless of `retry_on_methods`. The body-on-wire signal makes the OUTER gateway retry safe; tightening the INNER pool replay to honor `retry_on_methods` is a separate correctness fix.
+
+**`mark_h3_unsupported` is unrelated.** Capability downgrade uses `is_h3_transport_error_class(error_class)` — broader than `request_reached_wire` (it includes `ConnectionReset` / `ConnectionClosed` / `ProtocolError` / `ReadWriteTimeout` because a backend that resets H3 streams or times out reads is still failing the H3 transport, even if the request reached the wire). The two predicates intentionally diverge.
+
 ### Health Check Architecture (two-layer)
 
 - **Active probes** (periodic): shared per-upstream in `HealthChecker.active_unhealthy_targets: DashMap<"upstream_id::host:port", u64>`. Failure marks unhealthy for ALL proxies using that upstream (target is genuinely down).
