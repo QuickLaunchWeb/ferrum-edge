@@ -445,3 +445,97 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
         .expect("join_task panicked")
         .expect("listener task panicked");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: an invalid `FERRUM_BACKEND_ALLOW_IPS` value passed via
+// `.env(...)` to the in-process harness must surface as a spawn error,
+// not silently default to the most-permissive `Both`. Pre-fix the
+// harness mapped any unrecognised value (typo like `pubic`, or a
+// completely invalid string) to `Both`, while binary-mode startup
+// rejects the same value via `EnvValue::parse_env`. That mode-parity
+// gap let tests pass against permissive behaviour the real gateway
+// would never accept.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_harness_rejects_invalid_backend_allow_ips_override() {
+    let backend_port = reserve_port().await.expect("port").port;
+    let yaml = file_mode_yaml_for_backend(backend_port);
+    let result = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        // Typo of `public`. Binary mode would refuse this; the
+        // in-process harness must too.
+        .env("FERRUM_BACKEND_ALLOW_IPS", "pubic")
+        .spawn()
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!(
+            "harness must reject invalid FERRUM_BACKEND_ALLOW_IPS, not silently default to Both",
+        ),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FERRUM_BACKEND_ALLOW_IPS"),
+        "error must name the invalid env var; got {msg:?}",
+    );
+    assert!(
+        msg.contains("pubic"),
+        "error must include the invalid value so the operator knows what to fix; got {msg:?}",
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Regression: `stop_and_collect_logs` on the in-process backend must signal
+// shutdown without aborting the inner join task — same no-abort contract as
+// `Drop`. Codex P2 #8 flagged that the prior implementation aborted, which
+// detaches gateway tasks instead of draining them. Returns empty string in
+// in-process mode (log capture isn't available) and does not panic.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_process_stop_and_collect_logs_returns_empty_without_aborting_join() {
+    let backend_port = reserve_port().await.expect("port").port;
+    let _backend = ScriptedHttp1Backend::builder(
+        reserve_port()
+            .await
+            .expect("backend reserve")
+            .into_listener(),
+    )
+    .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+        "GET", "/ping",
+    )))
+    .step(HttpStep::RespondStatus {
+        status: 200,
+        reason: "OK".into(),
+    })
+    .spawn()
+    .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend(backend_port);
+    let mut harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .spawn()
+        .await
+        .expect("spawn in-process gateway");
+    harness
+        .wait_healthy(Duration::from_secs(5))
+        .await
+        .expect("gateway healthy");
+
+    // The contract for the in-process branch: returns the empty string
+    // (log capture isn't available) and does not panic. Aborting the join
+    // task here would silently work in this assertion, so the regression
+    // is also covered by the explicit `let _ = b.join.take()` (no abort
+    // call) in the body and the inline comment that documents why.
+    let logs = harness.stop_and_collect_logs();
+    assert_eq!(
+        logs, "",
+        "in-process stop_and_collect_logs must return empty string"
+    );
+    // Dropping the harness after stop_and_collect_logs already consumed
+    // shutdown_tx must not panic — the Drop impl handles `take()` returning
+    // None.
+    drop(harness);
+}

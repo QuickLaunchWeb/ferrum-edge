@@ -340,7 +340,8 @@ async fn try_spawn_in_process(
     // unrecognised key and the override is silently ignored (binary mode
     // would forward it to the subprocess). Add new fields as tests need
     // them.
-    apply_env_overrides(&mut env_config, &builder.extra_env);
+    apply_env_overrides(&mut env_config, &builder.extra_env)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     let config = ferrum_edge::config::file_loader::load_config_from_file(
         config_path.to_string_lossy().as_ref(),
@@ -416,37 +417,71 @@ async fn try_spawn_in_process(
     })
 }
 
-fn apply_env_overrides(env_config: &mut EnvConfig, overrides: &[(String, String)]) {
+fn apply_env_overrides(
+    env_config: &mut EnvConfig,
+    overrides: &[(String, String)],
+) -> Result<(), String> {
     for (k, v) in overrides {
         match k.as_str() {
             "FERRUM_NAMESPACE" => env_config.namespace = v.clone(),
             "FERRUM_LOG_LEVEL" => env_config.log_level = v.clone(),
-            "FERRUM_TLS_NO_VERIFY" => env_config.tls_no_verify = parse_bool(v),
-            "FERRUM_POOL_WARMUP_ENABLED" => env_config.pool_warmup_enabled = parse_bool(v),
+            "FERRUM_TLS_NO_VERIFY" => env_config.tls_no_verify = parse_bool(k, v)?,
+            "FERRUM_POOL_WARMUP_ENABLED" => env_config.pool_warmup_enabled = parse_bool(k, v)?,
             "FERRUM_TRUSTED_PROXIES" => env_config.trusted_proxies = v.clone(),
-            "FERRUM_BACKEND_ALLOW_IPS" => match v.as_str() {
-                "private" => env_config.backend_allow_ips = BackendAllowIps::Private,
-                "public" => env_config.backend_allow_ips = BackendAllowIps::Public,
-                _ => env_config.backend_allow_ips = BackendAllowIps::Both,
-            },
-            "FERRUM_MAX_CONNECTIONS" => {
-                if let Ok(n) = v.parse() {
-                    env_config.max_connections = n;
+            "FERRUM_BACKEND_ALLOW_IPS" => {
+                env_config.backend_allow_ips = match v.trim().to_ascii_lowercase().as_str() {
+                    "private" => BackendAllowIps::Private,
+                    "public" => BackendAllowIps::Public,
+                    "both" => BackendAllowIps::Both,
+                    _ => {
+                        // Match binary-mode `EnvValue::parse_env`: invalid
+                        // values are a hard error, not a silent "use the
+                        // most permissive default". A typo like `pubic`
+                        // would otherwise pass tests against permissive
+                        // behaviour that production startup rejects.
+                        return Err(format!(
+                            "FERRUM_BACKEND_ALLOW_IPS={v:?}: expected one of private, public, both"
+                        ));
+                    }
                 }
             }
+            "FERRUM_MAX_CONNECTIONS" => {
+                env_config.max_connections = parse_numeric(k, v)?;
+            }
             "FERRUM_SHUTDOWN_DRAIN_SECONDS" => {
-                if let Ok(n) = v.parse() {
-                    env_config.shutdown_drain_seconds = n;
-                }
+                env_config.shutdown_drain_seconds = parse_numeric(k, v)?;
             }
             // Unknown vars: ignored. Add cases as tests need them.
             _ => {}
         }
     }
+    Ok(())
 }
 
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+/// Mirror binary-mode `bool` parsing: only `true`/`false`/`1`/`0` (case-insensitive).
+/// Invalid values are an error rather than silently mapping to `false`,
+/// so a test typo can't pass against the permissive default while
+/// production startup would have rejected the same value.
+fn parse_bool(key: &str, raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(format!("{key}={raw:?}: expected true, false, 1, or 0")),
+    }
+}
+
+/// Parse a numeric env value with explicit error context. Silently
+/// ignoring `parse()` failures (the previous behaviour) lets a test typo
+/// fall through to the EnvConfig default while binary mode would reject
+/// the same value.
+fn parse_numeric<T>(key: &str, raw: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    raw.trim()
+        .parse::<T>()
+        .map_err(|e| format!("{key}={raw:?}: {e}"))
 }
 
 /// A running gateway + plumbing for observing it. Drops the underlying
@@ -707,12 +742,17 @@ impl GatewayHarness {
                 gateway.read_combined_captured_output().unwrap_or_default()
             }
             Backend::InProcess(b) => {
+                // Mirror the no-abort teardown from `Drop`: signal
+                // shutdown and let the spawned join task drain inner
+                // listener / background JoinHandles via the watch
+                // channel. Aborting here would cancel the only task
+                // awaiting them, detaching the underlying gateway
+                // tasks and letting them outlive the harness — exactly
+                // the cross-test interference Codex P2 #4 flagged.
                 if let Some(tx) = b.shutdown_tx.take() {
                     let _ = tx.send(true);
                 }
-                if let Some(handle) = b.join.take() {
-                    handle.abort();
-                }
+                let _ = b.join.take();
                 String::new()
             }
         }
