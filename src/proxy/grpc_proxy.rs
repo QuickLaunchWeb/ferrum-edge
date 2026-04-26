@@ -883,6 +883,10 @@ pub async fn proxy_grpc_request_streaming(
         exceeded: Arc::clone(&body_size_exceeded),
     };
 
+    let uri: hyper::Uri = backend_url
+        .parse()
+        .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
+
     // Build headers, apply proxy transforms
     let mut headers = parts.headers;
     headers.remove("connection");
@@ -894,6 +898,19 @@ pub async fn proxy_grpc_request_streaming(
         ) {
             headers.insert(name, val);
         }
+    }
+
+    // Apply per-route Host override AFTER the proxy_headers merge, mirroring
+    // `proxy_grpc_request_core` and the plain HTTP path in
+    // `proxy::proxy_to_backend`. Without this, an H2 or H3 frontend that
+    // synthesized `host` from `:authority` would forward the client's
+    // external authority to the gRPC backend even when
+    // `preserve_host_header == false`.
+    if !proxy.preserve_host_header
+        && let Some(target_host) = uri.host()
+        && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
+    {
+        headers.insert(hyper::header::HOST, val);
     }
 
     // For the streaming path, send_request() covers both body upload and
@@ -914,10 +931,6 @@ pub async fn proxy_grpc_request_streaming(
         None if proxy.backend_read_timeout_ms > 0 => Some(proxy.backend_read_timeout_ms),
         None => None,
     };
-
-    let uri: hyper::Uri = backend_url
-        .parse()
-        .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = parts.method;
@@ -1067,6 +1080,22 @@ pub(crate) async fn proxy_grpc_request_core(
         ) {
             headers.insert(name, val);
         }
+    }
+
+    // Apply per-route Host override AFTER the proxy_headers merge, mirroring
+    // the plain HTTP path in `proxy::proxy_to_backend`. Without this, an H2 or
+    // H3 frontend that synthesized `host` from `:authority` (see
+    // `src/http3/server.rs` and `src/proxy/mod.rs`) would forward the client's
+    // external authority to the gRPC backend even when
+    // `preserve_host_header == false`. With the override, the backend sees the
+    // upstream target host (taken from the parsed backend URL) in both
+    // `:authority` (set from the URI below) and `Host`, matching the plain
+    // HTTP non-preserve semantics.
+    if !proxy.preserve_host_header
+        && let Some(target_host) = uri.host()
+        && let Ok(val) = hyper::header::HeaderValue::from_str(target_host)
+    {
+        headers.insert(hyper::header::HOST, val);
     }
 
     // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins

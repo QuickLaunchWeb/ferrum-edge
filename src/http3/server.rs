@@ -761,6 +761,40 @@ async fn handle_h3_request(
             // Materialize headers now — path param injection writes to ctx.headers,
             // and all subsequent code (plugins, backend dispatch) needs the HashMap.
             ctx.materialize_headers();
+
+            // Synthesize a `Host` entry from the H3 `:authority` pseudo-header
+            // when the client did not send an explicit `Host` header. Real H3
+            // clients (curl, Chromium, Firefox) typically send only
+            // `:authority`, which the h3 crate parks in `req.uri().authority()`
+            // and explicitly does NOT add to `req.headers()`. Without this
+            // backfill, every downstream codepath that reads
+            // `headers.get("host")` — `build_h3_backend_headers`,
+            // `build_plain_request_builder`, the gRPC cross-protocol header
+            // map, X-Forwarded-Host, RFC 7239 `Forwarded`, and any plugin
+            // that gates on the inbound host — sees `None` and either
+            // forwards no Host to the backend or omits the forwarding
+            // header entirely. RFC 9114 §4.3.1 and RFC 9113 §8.3.1 both
+            // treat the H2/H3 `:authority` pseudo-header as the Host
+            // equivalent for forwarding purposes, so this is the canonical
+            // back-translation. Routing already runs above against
+            // `req.uri().authority()` directly, so it is unaffected.
+            //
+            // When `preserve_host_header == false`, the per-route Host
+            // override fires later in `build_plain_request_builder` (plain
+            // HTTP cross-protocol bridge) and `proxy_grpc_request_core` /
+            // `proxy_grpc_request_streaming` (gRPC dispatch — covers both
+            // the H1/H2 frontend gRPC path and the H3 cross-protocol gRPC
+            // map, since the cross-protocol path delegates to those
+            // functions) and replaces this synthetic value with the upstream
+            // target's host. The existing semantics for non-preserve mode
+            // are preserved.
+            if !ctx.headers.contains_key("host")
+                && let Some(authority) = req.uri().authority()
+            {
+                ctx.headers
+                    .insert("host".to_string(), authority.as_str().to_string());
+            }
+
             // Inject regex path parameters into context metadata and headers
             for (name, value) in &rm.path_params {
                 ctx.metadata
@@ -1333,7 +1367,13 @@ async fn handle_h3_request(
         }
 
         let client_ip_owned = ctx.client_ip.clone();
-        let h3_headers = build_h3_backend_headers(&proxy, &proxy_headers, &client_ip_owned, &state);
+        let h3_headers = build_h3_backend_headers(
+            &proxy,
+            upstream_target.as_deref(),
+            &proxy_headers,
+            &client_ip_owned,
+            &state,
+        );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
 
         let streaming_resp = if let Some(target) = upstream_target.as_deref() {
@@ -2238,13 +2278,28 @@ async fn handle_h3_request(
 /// Strips hop-by-hop headers per RFC 7230 §6.1, handles Host/preserve_host_header,
 /// and adds X-Forwarded-*, Via, and Forwarded proxy headers. Shared between the
 /// streaming and buffered backend dispatch paths.
+///
+/// `upstream_target` carries the load-balanced backend selection. When the
+/// proxy is upstream-backed and `preserve_host_header == false`, the Host
+/// header is rewritten to **the selected target's host** — not
+/// `proxy.backend_host`. Without this, the H3 connection routes to
+/// `upstream_target.host` while the synthesized Host points at the proxy's
+/// template `backend_host`, producing a Host/authority mismatch that strict
+/// backends reject and that breaks virtual-host routing on the upstream.
+/// Falls back to `proxy.backend_host` only when no upstream selection is
+/// available (single-target proxies).
 fn build_h3_backend_headers(
     proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
     headers: &HashMap<String, String>,
     client_ip: &str,
     state: &ProxyState,
 ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
     let mut h3_headers = Vec::with_capacity(headers.len() + 5);
+
+    let effective_backend_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(proxy.backend_host.as_str());
 
     for (k, v) in headers {
         match k.as_str() {
@@ -2252,7 +2307,7 @@ fn build_h3_backend_headers(
                 let host_val = if proxy.preserve_host_header {
                     v.as_str()
                 } else {
-                    &proxy.backend_host
+                    effective_backend_host
                 };
                 if let Ok(val) = http::header::HeaderValue::from_str(host_val) {
                     h3_headers.push((http::header::HOST, val));
@@ -2434,7 +2489,7 @@ async fn proxy_to_backend_h3_streaming(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
 ) -> Result<H3StreamResult, anyhow::Error> {
-    let h3_headers = build_h3_backend_headers(proxy, headers, client_ip, state);
+    let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
     let body = bytes::Bytes::from(body_bytes);
 
     // Dispatch via the h3+quinn connection pool
@@ -2718,7 +2773,7 @@ async fn proxy_to_backend_h3(
     HashMap<String, String>,
     Option<crate::retry::ErrorClass>,
 ) {
-    let h3_headers = build_h3_backend_headers(proxy, headers, client_ip, state);
+    let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
     let body = bytes::Bytes::copy_from_slice(body_bytes);
 
     let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(proxy);

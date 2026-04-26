@@ -785,3 +785,487 @@ async fn h3_pool_key_separates_by_dns_override() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 7 — H3 client sends only `:authority` (no explicit Host); gateway
+// must synthesize a Host header for the forwarded request.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Real H3 clients (curl, Chromium, Firefox) typically send only the H3
+// `:authority` pseudo-header — they do NOT add an explicit `Host` header.
+// The h3 crate parks `:authority` on `req.uri().authority()` and does
+// not insert it into `req.headers()`. Without server-side synthesis, the
+// gateway forwards no Host to the backend, breaking virtual hosting on
+// the upstream. This test pins the synthesis behavior in place across
+// both `preserve_host_header` settings.
+//
+// Wire shape: H3 → cross-protocol bridge → TLS HTTP/1.1 backend. We use
+// the cross-protocol bridge because it surfaces a recordable HTTP/1.1
+// request line + Host header on the wire (`ScriptedTlsBackend::received_bytes`),
+// which is the simplest way to make the Host visible to the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_client_without_host_header_synthesizes_from_authority_preserve_false() {
+    let ca = TestCa::new("phase-host-1").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let backend_reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = backend_reservation.port;
+
+    // TLS backend speaks HTTP/1.1 only — forces the cross-protocol bridge.
+    // Each connection: read request, send 200, drop.
+    let backend = ScriptedTlsBackend::builder(
+        backend_reservation.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone()).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // Default proxy → preserve_host_header is `false`: the backend Host
+    // should be the upstream target host, NOT the client's `:authority`.
+    let yaml = file_mode_yaml_for_h3(backend_port);
+    let reservation = reserve_port().await.expect("reserve https port");
+    let https_port = reservation.port;
+    drop(reservation);
+
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-host1");
+    Box::leak(Box::new(scratch));
+
+    let _harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Drive the H3 frontend with the canonical "no explicit Host" wire
+    // shape. The bug-fixed gateway must still emit a Host to the backend.
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/x");
+    let resp = client
+        .get_with_options(
+            &url,
+            crate::scaffolding::clients::GetOptions {
+                host_header: crate::scaffolding::clients::HostHeader::Auto,
+            },
+        )
+        .await
+        .expect("h3 response");
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "expected 200, got {}",
+        resp.status
+    );
+
+    // Backend wire bytes — extract the Host header that came alongside our
+    // GET. The backend may also have logged a HEAD probe from pool warmup
+    // (on a different ephemeral port); we scan for the GET prelude
+    // explicitly so the assertion is unambiguous.
+    let bytes = backend.received_bytes().await;
+    let prelude = String::from_utf8_lossy(&bytes);
+    let host_value = host_for_method(&prelude, "GET");
+    assert!(
+        host_value.is_some(),
+        "backend received no Host header for the GET request.\n\
+         prelude:\n{prelude}"
+    );
+    // preserve_host_header=false: backend Host should be the upstream target host.
+    // For the default config in `file_mode_yaml_for_h3`, that's "127.0.0.1".
+    assert_eq!(
+        host_value.as_deref(),
+        Some("127.0.0.1"),
+        "preserve_host_header=false: backend Host should be the upstream target host (127.0.0.1).\n\
+         prelude:\n{prelude}"
+    );
+}
+
+/// Extract the `Host:` header value from the FIRST request in `prelude`
+/// whose request-line method matches `method`. The gateway may run a
+/// pool-warmup probe (HEAD) before the test's request lands, so plain
+/// "first host: line" scans are ambiguous. The reqwest backend connections
+/// each terminate in `Connection: close` so request preludes are
+/// concatenated without interleaving.
+fn host_for_method(prelude: &str, method: &str) -> Option<String> {
+    let lines: Vec<&str> = prelude.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        if lines[idx].starts_with(&format!("{method} ")) {
+            // Found the request line — scan subsequent lines for Host.
+            for line in lines.iter().skip(idx + 1) {
+                if line.is_empty() {
+                    return None;
+                }
+                if line.to_ascii_lowercase().starts_with("host:") {
+                    return line.split_once(':').map(|(_, v)| v.trim().to_string());
+                }
+            }
+            return None;
+        }
+        idx += 1;
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_client_without_host_header_synthesizes_from_authority_preserve_true() {
+    let ca = TestCa::new("phase-host-2").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let backend_reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = backend_reservation.port;
+    let backend = ScriptedTlsBackend::builder(
+        backend_reservation.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone()).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // preserve_host_header=true: backend Host should be the H3 client's
+    // `:authority` value. Without the synthesis fix, no Host is emitted.
+    let config = json!({
+        "proxies": [{
+            "id": "scripted-h3-preserve",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "preserve_host_header": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("yaml");
+    let reservation = reserve_port().await.expect("reserve https port");
+    let https_port = reservation.port;
+    drop(reservation);
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-host2");
+    Box::leak(Box::new(scratch));
+
+    let _harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/x");
+    let resp = client
+        .get_with_options(
+            &url,
+            crate::scaffolding::clients::GetOptions {
+                host_header: crate::scaffolding::clients::HostHeader::Auto,
+            },
+        )
+        .await
+        .expect("h3 response");
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "expected 200, got {}",
+        resp.status
+    );
+
+    let bytes = backend.received_bytes().await;
+    let prelude = String::from_utf8_lossy(&bytes);
+    let host_value = host_for_method(&prelude, "GET");
+    let expected = format!("127.0.0.1:{https_port}");
+    assert_eq!(
+        host_value.as_deref(),
+        Some(expected.as_str()),
+        "preserve_host_header=true: backend Host should equal client's `:authority` ({expected}).\n\
+         prelude:\n{prelude}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_client_explicit_host_matches_authority_preserved() {
+    // When the H3 client sends an explicit Host header that matches
+    // `:authority` (the safe shape required by RFC 9114 §4.3.1 when both
+    // are present), the synthesis path is a no-op. preserve_host_header=true
+    // forwards the explicit Host unchanged.
+    let ca = TestCa::new("phase-host-3").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let backend_reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = backend_reservation.port;
+    let backend = ScriptedTlsBackend::builder(
+        backend_reservation.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone()).with_alpn(vec![b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let config = json!({
+        "proxies": [{
+            "id": "scripted-h3-preserve-explicit",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "preserve_host_header": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("yaml");
+    let reservation = reserve_port().await.expect("reserve https port");
+    let https_port = reservation.port;
+    drop(reservation);
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-host3");
+    Box::leak(Box::new(scratch));
+
+    let _harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/x");
+    let resp = client
+        .get_with_options(
+            &url,
+            crate::scaffolding::clients::GetOptions {
+                host_header: crate::scaffolding::clients::HostHeader::SameAsAuthority,
+            },
+        )
+        .await
+        .expect("h3 response");
+    assert_eq!(resp.status.as_u16(), 200);
+
+    let bytes = backend.received_bytes().await;
+    let prelude = String::from_utf8_lossy(&bytes);
+    let host_value = host_for_method(&prelude, "GET");
+    let expected = format!("127.0.0.1:{https_port}");
+    assert_eq!(
+        host_value.as_deref(),
+        Some(expected.as_str()),
+        "preserve_host_header=true with matching Host + :authority: backend should see the unchanged Host.\n\
+         prelude:\n{prelude}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Codex P1 regression — Use SELECTED upstream-target host on synthesis path.
+//
+// PR #492's first synthesis fix populated `Host` from `:authority` for H3
+// clients that didn't send an explicit Host. But on the H3 NATIVE pool path,
+// `build_h3_backend_headers` then rewrote Host with `proxy.backend_host` when
+// `preserve_host_header=false` — while `request_with_target*` still routed
+// to `upstream_target.host`. For upstream-backed proxies where those
+// differ (the common case: `backend_host` is a template fallback,
+// load-balanced targets are the real backends), the H3 connection went to
+// `upstream_target.host` while the synthesized Host pointed at
+// `proxy.backend_host`. Strict virtual-host routing on the upstream
+// rejected those requests; common clients (curl, Chromium, reqwest) all
+// sent only `:authority`, so the bug applied to the realistic majority.
+//
+// This test pins the fix: the synthesized Host MUST equal the
+// SELECTED target's host on an upstream-backed H3 native-pool dispatch.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_synthesizes_host_from_upstream_target_not_proxy_backend_host() {
+    let ca = TestCa::new("phase-host-codex-p1").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    // Colocated TCP+UDP so the capability probe reaches both transports
+    // and classifies h3 = Supported (gateway then takes the native H3 pool).
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    // TCP+TLS sidecar for the capability probe (advertises h2+http/1.1).
+    // It's never actually hit by the test request — that lands on H3.
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // Real H3 backend that records the inbound `:authority` + headers.
+    // Accept stream, send 200 + 2-byte body.
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "2".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(b"ok")))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    // Upstream-backed proxy. `backend_host` is a TEMPLATE fallback that's
+    // syntactically valid and resolvable but DIFFERS from the upstream
+    // target's host. Without the Codex P1 fix, the synthesized Host would
+    // end up as "localhost" while the H3 connection lands at "127.0.0.1".
+    // With the fix, the synthesized Host = upstream target host = "127.0.0.1".
+    let config = json!({
+        "proxies": [{
+            "id": "h3-codex-p1",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "upstream_id": "lb",
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+        }],
+        "upstreams": [{
+            "id": "lb",
+            "name": "lb",
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": backend_port,
+                "weight": 1,
+            }],
+            "algorithm": "round_robin",
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("yaml");
+
+    let reservation = reserve_port().await.expect("reserve https port");
+    let https_port = reservation.port;
+    drop(reservation);
+
+    let scratch = tempfile::tempdir().expect("scratch");
+    let (_ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-codex-p1");
+    Box::leak(Box::new(scratch));
+
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+        .env("FERRUM_TLS_NO_VERIFY", "true")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    // Wait for capability classification — gateway must see h3=supported
+    // before it'll route via the native H3 pool.
+    let _ = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("registry populated");
+
+    // H3 client sends only `:authority` (no explicit Host). Mimics curl,
+    // Chromium, Firefox, reqwest defaults.
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/x");
+    let resp = client
+        .get_with_options(
+            &url,
+            crate::scaffolding::clients::GetOptions {
+                host_header: crate::scaffolding::clients::HostHeader::Auto,
+            },
+        )
+        .await
+        .expect("h3 response");
+    if resp.status.as_u16() != 200 {
+        let logs = harness.captured_combined().unwrap_or_default();
+        let entry = fetch_capability_entry(&harness).await.ok().flatten();
+        panic!(
+            "expected 200 from H3 native pool; got {} \n--- registry: {:?}\n--- logs: ---\n{}",
+            resp.status, entry, logs
+        );
+    }
+
+    // The H3 backend recorded the request — assert the Host the gateway
+    // forwarded equals the SELECTED upstream-target host.
+    let received = h3_backend.received_requests().await;
+    let req = received
+        .iter()
+        .find(|r| r.method == "GET")
+        .expect("backend must have received a GET");
+    let host = req
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.as_str())
+        .expect("backend must have received a Host header");
+    assert_eq!(
+        host, "127.0.0.1",
+        "preserve_host_header=false on upstream-backed H3 native-pool dispatch: \
+         synthesized Host MUST equal SELECTED upstream-target host (127.0.0.1), \
+         NOT the proxy's template `backend_host` (\"localhost\"). \
+         Without the Codex P1 fix on PR #492, this assertion fails — the H3 \
+         connection lands at 127.0.0.1 while the Host header points at the \
+         template, breaking virtual-host routing on the backend. \
+         Recorded request: method={} authority={:?} host_header={host}",
+        req.method, req.authority,
+    );
+}

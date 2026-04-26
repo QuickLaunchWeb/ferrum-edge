@@ -781,3 +781,205 @@ async fn h2_tls_backend_fixture_can_complete_handshake() {
     assert_eq!(response.grpc_status(), Some(0));
     assert_eq!(backend.handshakes_completed(), 1);
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests 7–9 — `preserve_host_header` semantics on the gRPC dispatch path.
+// ────────────────────────────────────────────────────────────────────────────
+//
+// PR 492 backfilled `ctx.headers["host"]` from `:authority` whenever the
+// HTTP/2 (or HTTP/3) client sent only the pseudo-header — necessary so
+// X-Forwarded-Host, RFC 7239 Forwarded, and `preserve_host_header=true`
+// downstream consumers see a usable Host. The plain HTTP and direct H2
+// pool paths already applied the per-route `preserve_host_header=false`
+// override that swaps the synthesized value for the upstream target host
+// before dispatch (see `proxy::proxy_to_backend` and
+// `proxy::proxy_to_backend_http2`). The gRPC dispatch path did not, so
+// real H2/H3 gRPC clients (which send only `:authority` by convention)
+// silently leaked their external authority to the backend even when
+// `preserve_host_header` was at its default `false`.
+//
+// These tests pin both modes across both gRPC dispatch entry points:
+//
+//   - Test 7 — default (`preserve_host_header=false`), streaming fast path
+//     (`proxy_grpc_request_streaming`). Backend Host == upstream target.
+//   - Test 8 — `preserve_host_header=true`, streaming fast path. Backend
+//     Host == client `:authority`.
+//   - Test 9 — default, buffered path via `proxy_grpc_request_core`
+//     (forced by configuring retries, which makes the body replayable so
+//     the gateway must collect it before dispatch). Backend Host == upstream
+//     target — the override fires symmetrically with the streaming path.
+//
+// All three drive the gateway via `GrpcClient::h2c`, which sends an H2
+// HEADERS frame with `:authority = 127.0.0.1:{gw_port}` and *no* explicit
+// `host` header — the canonical wire shape for hyper, tonic, grpc-go, and
+// every other production gRPC client. The scripted backend captures the
+// regular `host` header that appears alongside the forwarded `:authority`
+// (`ReceivedStream::headers` excludes pseudo-headers). The gateway's
+// upstream `:authority` is always the backend target — what these tests
+// pin is the regular Host header that travels with it.
+
+/// Streaming path (no retries, no body hooks): when `preserve_host_header`
+/// is at its default `false`, the gateway must override the synthesized
+/// Host with the upstream target host before forwarding to the gRPC
+/// backend. Without the override, an H2/H3 client's `:authority` would
+/// be leaked downstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_grpc_preserve_false_overrides_client_authority_to_target_host() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    // Default config: `preserve_host_header` omitted, so it serializes as
+    // `false` and the override fires. No retries → streaming dispatch
+    // (`proxy_grpc_request_streaming`).
+    let yaml = grpc_file_config(backend_port, Value::Null);
+    let harness = spawn_grpc_harness(yaml).await;
+
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("unary completes");
+    assert_eq!(
+        response.grpc_status(),
+        Some(0),
+        "RPC must succeed for the host assertion to be meaningful"
+    );
+
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "expected exactly one RPC at backend");
+    let host_header = streams[0].header("host");
+    assert_eq!(
+        host_header,
+        Some("127.0.0.1"),
+        "preserve_host_header=false: backend Host should be the upstream target host (127.0.0.1), \
+         not the client's :authority. Without the override the synthesized Host (= client \
+         :authority `127.0.0.1:{gw_port}`) would leak to the gRPC backend. \
+         received headers: {:?}",
+        streams[0].headers
+    );
+}
+
+/// Streaming path with `preserve_host_header=true`: the synthesized Host
+/// must be forwarded unchanged so the backend sees the client's
+/// `:authority`. Pins the symmetric "preserve actually preserves" half
+/// of the contract for the gRPC dispatch path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_grpc_preserve_true_forwards_client_authority_as_host() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let overrides = json!({ "preserve_host_header": true });
+    let yaml = grpc_file_config(backend_port, overrides);
+    let harness = spawn_grpc_harness(yaml).await;
+
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("unary completes");
+    assert_eq!(response.grpc_status(), Some(0));
+
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "expected exactly one RPC at backend");
+    let expected_host = format!("127.0.0.1:{gw_port}");
+    let host_header = streams[0].header("host");
+    assert_eq!(
+        host_header,
+        Some(expected_host.as_str()),
+        "preserve_host_header=true: backend Host should equal the H2 client's :authority \
+         ({expected_host}). Without the synthesis fix from PR 492, no Host would reach \
+         the backend at all. received headers: {:?}",
+        streams[0].headers
+    );
+}
+
+/// Buffered path (`proxy_grpc_request` → `proxy_grpc_request_core`): when
+/// retries are configured the gateway must collect the request body before
+/// dispatch so it can replay on retry, exercising the buffered code path
+/// rather than the streaming fast path. The override must fire there too —
+/// regression guard against drift between the two functions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_grpc_preserve_false_buffered_path_overrides_host_to_target() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"ok")))
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    // Configure retries so the gateway picks the buffered dispatch
+    // (`proxy_grpc_request` → `proxy_grpc_request_core`) instead of the
+    // streaming fast path. The first attempt succeeds, so no actual retry
+    // fires — we just need the buffered code path executed once.
+    let overrides = json!({
+        "retry": {
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+        }
+    });
+    let yaml = grpc_file_config(backend_port, overrides);
+    let harness = spawn_grpc_harness(yaml).await;
+
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("unary completes");
+    assert_eq!(response.grpc_status(), Some(0));
+
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "expected exactly one RPC at backend");
+    let host_header = streams[0].header("host");
+    assert_eq!(
+        host_header,
+        Some("127.0.0.1"),
+        "preserve_host_header=false on the buffered gRPC path: backend Host should be \
+         the upstream target host (127.0.0.1). Drift between proxy_grpc_request_streaming \
+         and proxy_grpc_request_core would surface here. received headers: {:?}",
+        streams[0].headers
+    );
+}
