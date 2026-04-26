@@ -153,19 +153,18 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
 }
 
 /// Drain an H3 response stream into a `Vec<u8>`, tolerating a post-body
-/// graceful `CONNECTION_CLOSE(H3_NO_ERROR)`. See the module-level doc for the
-/// race this handles.
+/// graceful close signal. Two variants are recovered:
+///
+/// - `CONNECTION_CLOSE(H3_NO_ERROR)` — matched by `is_h3_no_error()`. The
+///   common case: backend finishes the response and tears down the connection.
+/// - `GOAWAY` — surfaces as `StreamError::RemoteClosing`. Per RFC 9114 §5.2,
+///   GOAWAY is graceful and in-progress streams should complete. If FIN+GOAWAY
+///   coalesce, recv_data returns `RemoteClosing` instead of `Ok(None)`.
 ///
 /// Note: `StreamError::RemoteTerminate { code: H3_NO_ERROR }` (stream-level
-/// reset) is NOT matched by h3's `is_h3_no_error()` — only connection-level
-/// and stream-error-frame codes are. This is intentional: a stream reset means
-/// the server aborted this particular stream, whereas the connection close
-/// we're recovering from affects all streams after the body was fully sent.
-///
-// TODO: `StreamError::RemoteClosing` (GOAWAY) has the same race shape per
-// RFC 9114 §5.2 — if FIN+GOAWAY coalesce, recv_data can return RemoteClosing
-// instead of Ok(None). Rare in practice (servers send GOAWAY before the final
-// response, not after) but worth extending the recovery predicate if observed.
+/// reset) is NOT recovered — a stream reset means the server aborted this
+/// particular stream, whereas the connection-level signals above don't
+/// invalidate already-sent data.
 pub(crate) async fn drain_h3_response_body(
     stream: &mut H3RequestStream,
     method: &str,
@@ -182,12 +181,12 @@ pub(crate) async fn drain_h3_response_body(
             Ok(Some(chunk)) => body.extend_from_slice(chunk.chunk()),
             Ok(None) => break,
             Err(e) => {
-                if e.is_h3_no_error()
+                if is_h3_graceful_close(&e)
                     && is_response_body_complete(&body, method, status, content_length)
                 {
                     debug!(
                         bytes_received = body.len(),
-                        "H3 recv_data hit graceful CONNECTION_CLOSE after complete body; treating as success"
+                        "H3 recv_data hit graceful close after complete body; treating as success"
                     );
                     break;
                 }
@@ -196,6 +195,12 @@ pub(crate) async fn drain_h3_response_body(
         }
     }
     Ok(body)
+}
+
+fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
+    // h3's RemoteClosing variant (GOAWAY) is #[non_exhaustive] and not
+    // matchable from outside the crate; fall back to Display string.
+    e.is_h3_no_error() || e.to_string() == "Remote is closing the connection"
 }
 
 /// Whether the received body is semantically complete for this response.
