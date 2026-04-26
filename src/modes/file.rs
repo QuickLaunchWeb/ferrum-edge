@@ -288,6 +288,49 @@ async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration
     }
 }
 
+/// Build the reserved-port set [`serve`] uses for stream-proxy conflict
+/// validation and for `AdminState::reserved_ports`.
+///
+/// Per-listener priority: a `Some(TcpListener)` in `prebound` wins over
+/// the matching `env_config.*_port` because the live port can differ
+/// when callers adopt FDs (in-process harness, future production
+/// integrations). Falls back to the env-config port when no listener
+/// is pre-bound. Port `0` is "disabled" — never reserved. CP gRPC
+/// isn't pre-bindable via `ServeOptions` so it always comes from env.
+fn effective_reserved_ports(
+    env_config: &EnvConfig,
+    prebound: &ServeOptions,
+) -> std::collections::HashSet<u16> {
+    let mut ports = std::collections::HashSet::new();
+    let resolve = |listener: &Option<TcpListener>, env_port: u16| -> Option<u16> {
+        if let Some(l) = listener {
+            l.local_addr().ok().map(|a| a.port())
+        } else if env_port != 0 {
+            Some(env_port)
+        } else {
+            None
+        }
+    };
+    for port in [
+        resolve(&prebound.proxy_http, env_config.proxy_http_port),
+        resolve(&prebound.proxy_https, env_config.proxy_https_port),
+        resolve(&prebound.admin_http, env_config.admin_http_port),
+        resolve(&prebound.admin_https, env_config.admin_https_port),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ports.insert(port);
+    }
+    if let Some(ref addr) = env_config.cp_grpc_listen_addr
+        && let Some(port_str) = addr.rsplit(':').next()
+        && let Ok(port) = port_str.parse::<u16>()
+    {
+        ports.insert(port);
+    }
+    ports
+}
+
 /// The binary entry point. Loads the YAML/JSON config from
 /// `FERRUM_FILE_CONFIG_PATH`, then dispatches into [`serve`] with a
 /// SIGHUP reload handler installed on top.
@@ -438,8 +481,18 @@ pub async fn serve(
         config.consumers.len()
     );
 
-    // Validate stream proxy ports don't conflict with gateway reserved ports
-    let reserved_ports = env_config.reserved_gateway_ports();
+    // Compute reserved ports from the listeners we'll actually bind, NOT
+    // from env_config alone. With pre-bound listeners (in-process harness,
+    // and any other `serve()` caller that adopts FDs) the live port can
+    // differ from `env_config.proxy_http_port` etc. — using env-config
+    // ports here would both:
+    //   - Reject valid configs (e.g., default 8000 marked reserved when
+    //     the actual proxy listener was adopted on an ephemeral port).
+    //   - Miss real clashes with the pre-bound socket and defer them to
+    //     bind time, where they bypass the up-front validation contract.
+    // CP gRPC isn't pre-bindable via `ServeOptions` so it still comes
+    // from env_config.
+    let reserved_ports = effective_reserved_ports(&env_config, &prebound);
     if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
         for msg in &errors {
             error!("{}", msg);
@@ -1038,6 +1091,86 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "helper should drain remaining listeners via shutdown trigger; took {elapsed:?}",
+        );
+    }
+
+    // Regression: pre-bound listener ports must take precedence over
+    // `env_config.*_port` when computing reserved ports. Codex flagged
+    // that using env-config ports alone both rejects valid configs (a
+    // stream proxy on the env-config default port that's never actually
+    // bound) and misses real conflicts with the pre-bound socket
+    // (deferred to bind-time errors).
+    #[tokio::test]
+    async fn effective_reserved_ports_uses_prebound_port_over_env_config() {
+        // Bind two ephemeral ports up front so we can hand them to
+        // ServeOptions and compare with env-config defaults.
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin");
+        let prebound_proxy_port = proxy_listener.local_addr().unwrap().port();
+        let prebound_admin_port = admin_listener.local_addr().unwrap().port();
+
+        // env_config carries production defaults (8000 / 9000) that don't
+        // match the actually-bound ports.
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 8000,
+            proxy_https_port: 0,
+            admin_http_port: 9000,
+            admin_https_port: 0,
+            ..EnvConfig::default()
+        };
+
+        let prebound = ServeOptions {
+            proxy_http: Some(proxy_listener),
+            admin_http: Some(admin_listener),
+            ..ServeOptions::default()
+        };
+
+        let reserved = effective_reserved_ports(&env_config, &prebound);
+
+        assert!(
+            reserved.contains(&prebound_proxy_port),
+            "prebound proxy port {prebound_proxy_port} must be reserved; got {reserved:?}",
+        );
+        assert!(
+            reserved.contains(&prebound_admin_port),
+            "prebound admin port {prebound_admin_port} must be reserved; got {reserved:?}",
+        );
+        assert!(
+            !reserved.contains(&8000),
+            "env-config proxy_http_port 8000 must NOT be reserved when a prebound \
+             listener is on a different port; got {reserved:?}",
+        );
+        assert!(
+            !reserved.contains(&9000),
+            "env-config admin_http_port 9000 must NOT be reserved when a prebound \
+             listener is on a different port; got {reserved:?}",
+        );
+    }
+
+    // Sanity: with no pre-bound listeners, fall back to env-config ports
+    // (the binary path) and skip port `0` which means "disabled."
+    #[test]
+    fn effective_reserved_ports_falls_back_to_env_when_no_prebound() {
+        let env_config = EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            proxy_http_port: 8000,
+            proxy_https_port: 8443,
+            admin_http_port: 9000,
+            admin_https_port: 0, // disabled
+            ..EnvConfig::default()
+        };
+        let reserved = effective_reserved_ports(&env_config, &ServeOptions::default());
+        assert!(reserved.contains(&8000));
+        assert!(reserved.contains(&8443));
+        assert!(reserved.contains(&9000));
+        assert!(
+            !reserved.contains(&0),
+            "port 0 means disabled and must not be reserved; got {reserved:?}",
         );
     }
 }
