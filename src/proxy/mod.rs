@@ -9227,16 +9227,23 @@ async fn proxy_to_backend_http3(
                                 None,
                             )
                         } else {
-                            let request_on_wire = e.request_on_wire();
+                            // `H3PoolError::request_on_wire()` is the
+                            // authoritative body-on-wire signal: it is set
+                            // to `true` once `send_request().await` succeeds
+                            // on ANY internal pool attempt (sticky across
+                            // cached → fallback → fresh-connect retries),
+                            // and `false` otherwise. The error class adds
+                            // no information beyond it for the
+                            // connection_error decision and can disagree
+                            // — e.g. a connect-phase QUIC reset is genuinely
+                            // pre-wire but the string-heuristic fallback
+                            // can classify it as `ConnectionReset` (which
+                            // `request_reached_wire` treats as post-wire).
+                            // ANDing the class here would silently skip
+                            // `retry_on_connect_failure` for those cases.
+                            // Trust the pool's typed signal.
+                            let is_conn_error = !e.request_on_wire();
                             let (error_kind, error_class) = classify_h3_error(e.as_ref());
-                            // `connection_error=true` requires BOTH: (a) the
-                            // pool reports NO internal attempt committed the
-                            // body, AND (b) the final error class is a
-                            // pre-wire transport failure. A late connect-class
-                            // failure that follows an earlier body-on-wire
-                            // attempt must NOT bypass `retry_on_methods`.
-                            let is_conn_error =
-                                !request_on_wire && !retry::request_reached_wire(error_class);
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -9435,15 +9442,11 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
-                let request_on_wire = e.request_on_wire();
+                // Trust the pool's body-on-wire signal — see the
+                // streaming-incoming-body branch above for why we drop
+                // the error-class contribution here.
+                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_error(e.as_ref());
-                // See the H3 streaming-incoming-body branch above for the
-                // `request_on_wire` rationale: any pool-internal attempt that
-                // committed the body forces `connection_error=false` so the
-                // gateway respects `retry_on_methods` instead of replaying
-                // a non-idempotent request that the backend may already
-                // have processed.
-                let is_conn_error = !request_on_wire && !retry::request_reached_wire(error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9517,13 +9520,10 @@ async fn proxy_to_backend_http3(
                 )
             }
             Err(e) => {
-                let request_on_wire = e.request_on_wire();
+                // Trust the pool's body-on-wire signal — see the streaming
+                // H3 branch above for why we drop the class contribution.
+                let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_error(e.as_ref());
-                // See `request_on_wire` rationale on the streaming H3 branch:
-                // the pool reports whether ANY internal attempt committed
-                // the body, and a late connect-class failure must not
-                // override that signal.
-                let is_conn_error = !request_on_wire && !retry::request_reached_wire(error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -9717,10 +9717,10 @@ async fn proxy_to_backend_http3_retry(
             }
         }
         Err(e) => {
-            let request_on_wire = e.request_on_wire();
+            // Trust the pool's body-on-wire signal — see the streaming
+            // H3 branch above for why we drop the class contribution.
+            let is_conn_error = !e.request_on_wire();
             let (error_kind, error_class) = classify_h3_error(e.as_ref());
-            // See `request_on_wire` rationale on the streaming H3 branch.
-            let is_conn_error = !request_on_wire && !retry::request_reached_wire(error_class);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,

@@ -355,15 +355,24 @@ retry::request_reached_wire(error_class) -> bool
 
 **`retry::error_class_log_kind(class)`** centralizes the short label every dispatcher emits as the `error_kind` field on `tracing::error!` log lines. Operators grep one stable token per failure mode across all protocol logs.
 
-**H3 pool body-on-wire signal.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed [`H3PoolError`](src/http3/client.rs) instead of `anyhow::Error`. `H3PoolError::request_on_wire()` is `true` once the H3 stream has been opened on ANY internal attempt (cached → fallback → fresh-connect chain). Once the body has been (at least partially) committed, `with_request_on_wire(true)` promotes the final returned error to `request_on_wire=true` so a subsequent connect-class failure CANNOT mask the earlier wire commitment. Gateway H3 sites combine this with the classifier:
+**H3 pool body-on-wire signal — authoritative when present.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed [`H3PoolError`](src/http3/client.rs) instead of `anyhow::Error`. `H3PoolError::request_on_wire()` is `true` once `send_request().await` has succeeded on ANY internal attempt (cached → fallback → fresh-connect chain), and `with_request_on_wire(true)` promotes the final returned error so a subsequent connect-class failure CANNOT mask the earlier wire commitment.
+
+Gateway H3 sites use the pool signal **exclusively** to drive `connection_error`:
 
 ```rust
-let request_on_wire = e.request_on_wire();
-let (error_kind, error_class) = classify_h3_error(e.as_ref());
-let is_conn_error = !request_on_wire && !retry::request_reached_wire(error_class);
+let is_conn_error = !e.request_on_wire();
+let (error_kind, error_class) = classify_h3_error(e.as_ref()); // labels + downgrade gating only
 ```
 
-This protects against the race where the H3 pool's first internal attempt sent the body on a stale cached connection (post-wire) and a fallback-attempt connect failure surfaces last (pre-wire-looking). Without the sticky promotion, the gateway would conclude `connection_error=true` and replay a non-idempotent request the backend may already have processed.
+Critically: do NOT AND with `!retry::request_reached_wire(error_class)` for H3. The class is a string heuristic that can disagree with the pool's typed signal — e.g. a connect-phase QUIC reset is genuinely pre-wire but the fallback string match emits `ConnectionReset` (which `request_reached_wire` treats as post-wire). ANDing would silently skip `retry_on_connect_failure` on those flaky-network paths. The pool's `request_on_wire` is ground truth; the class is a label.
+
+The fresh-connect setup path (`tls_config_fn()`, `create_or_get_proxy_sender()`) MUST also propagate the sticky flag — every `?` exit goes through `|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire)` so a post-wire cached attempt followed by a fresh-connect TLS failure doesn't surface as `request_on_wire=false`. Two inline tests in `h3_pool_error_tests` regression-protect this closure shape.
+
+**Connect-phase RST classification rule.** A SYN that gets RST'd is functionally equivalent to ECONNREFUSED — the request never reached the wire. Per-protocol classifiers must NOT emit `ConnectionReset` from connect-phase paths because `request_reached_wire(ConnectionReset) == true` (post-wire, mid-stream reset). Concrete enforcement points:
+
+- **`classify_reqwest_error`** (`src/retry.rs`): the `is_connect()` branch collapses both `"refused"` and `"reset"` substrings into `ErrorClass::ConnectionRefused`. Outside `is_connect()`, `"reset"` correctly stays `ConnectionReset` (mid-stream).
+- **`classify_http2_pool_error::classify_io_error`** (`src/proxy/http2_pool.rs`): the H2 pool is a pure connection-establishment layer, so `phase_is_connect=true` is hardcoded — `io::ErrorKind::ConnectionReset` maps to `ConnectionRefused` and `io::ErrorKind::TimedOut` maps to `ConnectionTimeout`.
+- **H3 pool**: the `request_on_wire` signal makes the class irrelevant for `connection_error`; the class is used only for log labels + capability-downgrade gating.
 
 **Out of scope (P9 follow-up).** The H3 pool still does internal `body.clone()` retries across cached/fallback indices; an attempt that committed the body and then died mid-stream causes a non-idempotent replay on the next internal index, regardless of `retry_on_methods`. The body-on-wire signal makes the OUTER gateway retry safe; tightening the INNER pool replay to honor `retry_on_methods` is a separate correctness fix.
 

@@ -301,7 +301,18 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     let source_chain = format!("{:?}", e);
 
     if e.is_connect() {
-        // Dig into the connect error to distinguish timeout, refused, TLS, DNS
+        // Dig into the connect error to distinguish timeout, refused, TLS, DNS.
+        //
+        // CRITICAL: every classification inside this branch is a PRE-WIRE
+        // failure (the TCP / TLS connect itself didn't succeed), so it
+        // MUST map to a class whose `request_reached_wire(class) == false`
+        // — otherwise `connection_error` ends up `false` and
+        // `retry_on_connect_failure` is silently skipped for the failure.
+        // In particular, do NOT map a connect-phase RST to
+        // `ConnectionReset`: that variant is reserved for mid-stream
+        // resets (post-wire), and treating connect-phase resets as
+        // post-wire was the regression Codex flagged. SYN-RST'd
+        // connections are functionally connect-refused.
         if e.is_timeout() {
             return ErrorClass::ConnectionTimeout;
         }
@@ -324,14 +335,23 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         {
             return ErrorClass::TlsError;
         }
+        // `refused` matches the explicit ECONNREFUSED case; the bare
+        // `reset` substring inside the is_connect() branch handles
+        // SYN-RST'd connect attempts (e.g. a firewall rejecting the
+        // initial SYN with RST). Both collapse to `ConnectionRefused`
+        // because from an application standpoint the connect attempt
+        // failed before any data could be exchanged — the request
+        // never reached the wire. The previous code emitted
+        // `ConnectionReset` here, which under the unified
+        // `request_reached_wire` boundary would mark this as
+        // post-wire and skip `retry_on_connect_failure`.
         if error_str.contains("refused")
             || source_chain.contains("Connection refused")
             || source_chain.contains("ConnectionRefused")
+            || source_chain.contains("reset")
+            || source_chain.contains("ConnectionReset")
         {
             return ErrorClass::ConnectionRefused;
-        }
-        if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
-            return ErrorClass::ConnectionReset;
         }
         // Generic connect failure
         return ErrorClass::ConnectionRefused;
@@ -341,7 +361,10 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::ReadWriteTimeout;
     }
 
-    // Check for connection reset/closed during request/response
+    // Check for connection reset/closed during request/response.
+    // Reaching this point means `e.is_connect()` was false — the connect
+    // succeeded, so any reset here is mid-stream and post-wire by
+    // construction.
     if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
         return ErrorClass::ConnectionReset;
     }
