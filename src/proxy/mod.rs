@@ -1659,6 +1659,19 @@ impl ProxyState {
 
                 match result {
                     Ok(_) => Ok(desc),
+                    // Pool-warmup classification: this is the startup
+                    // HEAD probe, not a retry decision. We only want to
+                    // surface "couldn't reach the backend at all" as an
+                    // error here; a backend that responds with any HTTP
+                    // status (including 5xx) is reachable enough to keep
+                    // the pool warm. `e.is_connect() || e.is_timeout()`
+                    // is the right predicate for that narrow purpose,
+                    // and intentionally diverges from the unified
+                    // `request_reached_wire` boundary used by the
+                    // request-time retry path — different decision,
+                    // different criteria. Don't "unify" this call to
+                    // the shared classifier without revisiting what the
+                    // warmup probe actually needs to gate.
                     Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
                     Err(_) => Ok(desc),
                 }

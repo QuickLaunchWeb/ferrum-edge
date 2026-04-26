@@ -355,7 +355,7 @@ retry::request_reached_wire(error_class) -> bool
 
 **`retry::error_class_log_kind(class)`** centralizes the short label every dispatcher emits as the `error_kind` field on `tracing::error!` log lines. Operators grep one stable token per failure mode across all protocol logs.
 
-**H3 pool body-on-wire signal — authoritative when present.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed [`H3PoolError`](src/http3/client.rs) instead of `anyhow::Error`. `H3PoolError::request_on_wire()` is `true` once `send_request().await` has succeeded on ANY internal attempt (cached → fallback → fresh-connect chain), and `with_request_on_wire(true)` promotes the final returned error so a subsequent connect-class failure CANNOT mask the earlier wire commitment.
+**H3 pool body-on-wire signal — authoritative when present.** [`Http3ConnectionPool`](src/http3/client.rs) returns a typed [`H3PoolError`](src/http3/client.rs) instead of `anyhow::Error`. `H3PoolError::request_on_wire()` is `true` once `send_request().await` has succeeded on ANY internal attempt (cached → fallback → fresh-connect chain). The pool's retry chain calls `e.promote_on_wire_if(any_request_on_wire)` on every fresh-connect setup `?` exit so the sticky flag survives a subsequent connect-class failure.
 
 Gateway H3 sites use the pool signal **exclusively** to drive `connection_error`:
 
@@ -366,7 +366,7 @@ let (error_kind, error_class) = classify_h3_error(e.as_ref()); // labels + downg
 
 Critically: do NOT AND with `!retry::request_reached_wire(error_class)` for H3. The class is a string heuristic that can disagree with the pool's typed signal — e.g. a connect-phase QUIC reset is genuinely pre-wire but the fallback string match emits `ConnectionReset` (which `request_reached_wire` treats as post-wire). ANDing would silently skip `retry_on_connect_failure` on those flaky-network paths. The pool's `request_on_wire` is ground truth; the class is a label.
 
-The fresh-connect setup path (`tls_config_fn()`, `create_or_get_proxy_sender()`) MUST also propagate the sticky flag — every `?` exit goes through `|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire)` so a post-wire cached attempt followed by a fresh-connect TLS failure doesn't surface as `request_on_wire=false`. Two inline tests in `h3_pool_error_tests` regression-protect this closure shape.
+The fresh-connect setup path (`tls_config_fn()`, `create_or_get_proxy_sender()`) MUST also propagate the sticky flag — every `?` exit goes through `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)` so a post-wire cached attempt followed by a fresh-connect TLS failure doesn't surface as `request_on_wire=false`. `promote_on_wire_if` is asymmetric by design: `condition=true` flips false → true; `condition=false` is a no-op (it must NOT demote a flag set by an earlier `H3PoolError::post_wire(...)` constructor). Two inline tests in `h3_pool_error_tests` regression-protect this closure shape.
 
 **Connect-phase RST classification rule.** A SYN that gets RST'd is functionally equivalent to ECONNREFUSED — the request never reached the wire. Per-protocol classifiers must NOT emit `ConnectionReset` from connect-phase paths because `request_reached_wire(ConnectionReset) == true` (post-wire, mid-stream reset). Concrete enforcement points:
 

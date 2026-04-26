@@ -180,10 +180,12 @@ pub type H3RequestStream =
 ///   TLS, connect, h3 session creation, or `send_request` itself failed).
 /// - [`H3PoolError::post_wire`] — request was at least partially sent;
 ///   any failure here loses idempotency safety.
-/// - [`H3PoolError::with_request_on_wire`] — promote a stored error to
-///   `request_on_wire=true` after a different internal attempt committed
-///   the body. Used by the pool's internal retry chain to ensure the
-///   "any attempt committed" semantics surface to the gateway.
+/// - [`H3PoolError::promote_on_wire_if`] — conditionally promote a stored
+///   error to `request_on_wire=true` (no-op when the condition is false).
+///   Used by the pool's internal retry chain to surface the "any attempt
+///   committed" semantics: each fresh-connect setup `?` exit threads
+///   `any_request_on_wire` through this method so a previous post-wire
+///   attempt's commitment is preserved across the final error.
 #[derive(Debug)]
 pub struct H3PoolError {
     inner: anyhow::Error,
@@ -220,17 +222,26 @@ impl H3PoolError {
 
     /// Returns `true` if the request was committed to the wire on any
     /// attempt covered by this error. Drives `BackendResponse::connection_error`
-    /// at the gateway: `connection_error = !request_on_wire && !reached_wire(class)`.
+    /// at the gateway: `connection_error = !request_on_wire`.
     pub fn request_on_wire(&self) -> bool {
         self.request_on_wire
     }
 
-    /// Promote the sticky `request_on_wire` flag, used by the pool's
-    /// internal retry chain to mark an error as post-wire when an earlier
-    /// internal attempt committed the body. Idempotent — only flips
-    /// `false` → `true`.
-    pub fn with_request_on_wire(mut self, on_wire: bool) -> Self {
-        if on_wire {
+    /// Conditionally promote the sticky `request_on_wire` flag.
+    ///
+    /// - When `condition` is `true`, the flag is set to `true` (no-op if
+    ///   already `true`).
+    /// - When `condition` is `false`, this is a NO-OP — the existing flag
+    ///   is preserved, never demoted from `true` back to `false`.
+    ///
+    /// This asymmetry is deliberate: the pool's internal retry chain
+    /// tracks `any_request_on_wire` across attempts, and threads that
+    /// boolean through `?` exits via `e.promote_on_wire_if(any_request_on_wire)`.
+    /// A `false` value just means "no earlier attempt committed the
+    /// body" — it must NOT clobber a `true` flag that an earlier
+    /// `H3PoolError::post_wire(...)` constructor set.
+    pub fn promote_on_wire_if(mut self, condition: bool) -> Self {
+        if condition {
             self.request_on_wire = true;
         }
         self
@@ -258,8 +269,24 @@ impl std::error::Error for H3PoolError {
     }
 }
 
-/// Convenience: classifiers want a `&(dyn std::error::Error + 'static)`,
-/// and the H3 pool error chain needs to flow through unchanged.
+/// Convenience: lets callers pass `&H3PoolError` directly to classifiers
+/// that take `&(dyn std::error::Error + 'static)` (e.g.
+/// [`classify_http3_error`] and the H3 dispatcher's `classify_h3_error`
+/// wrapper).
+///
+/// Without this impl, every call site would need a manual
+/// `e.as_error().as_ref()` to peel back to the inner anyhow chain —
+/// `anyhow::Error::deref` returns `&(dyn Error + Send + Sync + 'static)`,
+/// not the same trait-object shape the classifier signature expects, and
+/// `H3PoolError::as_error()` returns the wrapper rather than a trait
+/// object. Implementing `AsRef<dyn Error + Send + Sync + 'static>`
+/// lets `e.as_ref()` flow through the wrapper to the inner anyhow's
+/// `as_ref()` in one step, which the Rust trait-object upcast at the
+/// classifier signature accepts.
+///
+/// Net effect at call sites: `classify_h3_error(e.as_ref())` reads as
+/// "classify the underlying error chain" without leaking the
+/// `H3PoolError` -> `anyhow::Error` -> `dyn Error` shuffle.
 impl AsRef<dyn std::error::Error + Send + Sync + 'static> for H3PoolError {
     fn as_ref(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
         self.inner.as_ref()
@@ -640,12 +667,12 @@ impl Http3ConnectionPool {
         // non-idempotent request via `retry_on_connect_failure`. Each
         // `?` exit applies the promotion explicitly.
         let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request(
@@ -657,7 +684,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-        .map_err(|e| e.with_request_on_wire(any_request_on_wire))
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Send an HTTP/3 request to an explicit host/port target, independent of
@@ -742,7 +769,7 @@ impl Http3ConnectionPool {
         // attempt → fresh-connect setup failure must NOT report
         // request_on_wire=false).
         let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -754,7 +781,7 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request(
@@ -766,7 +793,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-        .map_err(|e| e.with_request_on_wire(any_request_on_wire))
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Create a new QUIC connection + h3 session using a shared endpoint.
@@ -1707,12 +1734,12 @@ impl Http3ConnectionPool {
         // See `request()` for why these `?` exits must apply the
         // sticky `any_request_on_wire` promotion.
         let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming(
@@ -1724,7 +1751,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-        .map_err(|e| e.with_request_on_wire(any_request_on_wire))
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 
     /// Send an HTTP/3 request to an explicit host/port target, returning headers
@@ -1808,7 +1835,7 @@ impl Http3ConnectionPool {
         // See `request()` for why these `?` exits must apply the
         // sticky `any_request_on_wire` promotion.
         let tls_config = tls_config_fn()
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let sr = self
             .create_or_get_target_sender(
@@ -1820,7 +1847,7 @@ impl Http3ConnectionPool {
                 h3_config,
             )
             .await
-            .map_err(|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire))?;
+            .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let mut sr_for_request = sr.clone();
 
         Self::do_request_streaming(
@@ -1832,7 +1859,7 @@ impl Http3ConnectionPool {
             body,
         )
         .await
-        .map_err(|e| e.with_request_on_wire(any_request_on_wire))
+        .map_err(|e| e.promote_on_wire_if(any_request_on_wire))
     }
 }
 
@@ -2096,21 +2123,24 @@ mod h3_pool_error_tests {
     }
 
     #[test]
-    fn with_request_on_wire_only_promotes_false_to_true() {
-        // The pool's retry chain uses this to mark a final pre-wire error
-        // as post-wire when an EARLIER internal attempt committed the body.
+    fn promote_on_wire_if_only_promotes_false_to_true() {
+        // The pool's retry chain calls `e.promote_on_wire_if(any_request_on_wire)`
+        // on each fresh-connect setup `?` exit. The contract is asymmetric:
+        // `condition=true` flips false → true; `condition=false` is a no-op.
         let pre = H3PoolError::pre_wire(anyhow::anyhow!("connect refused"));
-        let promoted = pre.with_request_on_wire(true);
+        let promoted = pre.promote_on_wire_if(true);
         assert!(promoted.request_on_wire());
 
-        // Promotion must be idempotent — calling with `true` on an
-        // already-true error doesn't flip back, and calling with `false`
-        // is a no-op (must not unset a previously-set flag).
+        // `condition=false` must NOT demote an already-true flag — that's
+        // exactly the case where an earlier post-wire attempt set the
+        // flag and a later pre-wire setup failure would otherwise clobber
+        // it. Verify both directions: `true → true` is idempotent and
+        // `false on an already-true` is a no-op.
         let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
-        assert!(post.with_request_on_wire(false).request_on_wire());
+        assert!(post.promote_on_wire_if(false).request_on_wire());
 
         let post = H3PoolError::post_wire(anyhow::anyhow!("recv_response failed"));
-        assert!(post.with_request_on_wire(true).request_on_wire());
+        assert!(post.promote_on_wire_if(true).request_on_wire());
     }
 
     #[test]
@@ -2163,11 +2193,22 @@ mod h3_pool_error_tests {
     /// though the FIRST internal attempt may already have been processed
     /// by the backend.
     ///
-    /// We can't exercise the real pool at unit-test scope (it needs a
-    /// QUIC endpoint), but we CAN assert the exact closure pattern the
-    /// fix introduced: `e -> pre_wire(e).with_request_on_wire(flag)`.
-    /// If a future refactor reverts to the bare `map_err(pre_wire)?`
-    /// shape, this test fails because `request_on_wire` would be `false`.
+    /// **Coverage scope.** This test is unit-level and only verifies the
+    /// closure shape — `H3PoolError::pre_wire(e).promote_on_wire_if(true)`
+    /// returns `request_on_wire=true`. It does NOT exercise the live
+    /// `Http3ConnectionPool::request*` retry chain (cached attempt's
+    /// post-wire failure → fresh-connect setup failure) end-to-end,
+    /// because doing that requires a scripted QUIC backend that:
+    /// (a) accepts the QUIC handshake, (b) accepts the stream open, (c)
+    /// fails the body / response so the cached attempt is post-wire,
+    /// then (d) refuses subsequent connect attempts so the fresh-connect
+    /// setup also fails. The functional test
+    /// `retry_on_connect_failure_fires_with_empty_methods_and_statuses`
+    /// covers the gateway-level retry contract end-to-end via ECONNREFUSED
+    /// but does not tickle this specific cached-success → fresh-connect
+    /// setup-failure ordering. Tracked as a follow-up coverage gap; the
+    /// closure-shape assertion below is the regression guard for the
+    /// fix that this PR introduces.
     #[test]
     fn pre_wire_setup_failure_after_post_wire_attempt_preserves_sticky_flag() {
         // Simulate: any_request_on_wire = true (an earlier internal attempt
@@ -2175,8 +2216,8 @@ mod h3_pool_error_tests {
         let any_request_on_wire = true;
         let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
 
-        let propagated: H3PoolError = H3PoolError::pre_wire(synthetic_setup_failure)
-            .with_request_on_wire(any_request_on_wire);
+        let propagated: H3PoolError =
+            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
 
         assert!(
             propagated.request_on_wire(),
@@ -2185,7 +2226,7 @@ mod h3_pool_error_tests {
              instead of replaying via retry_on_connect_failure. If this \
              assertion fails, a future refactor likely reverted to the \
              bare `map_err(pre_wire)?` shape — restore the closure form: \
-             `|e| H3PoolError::pre_wire(e).with_request_on_wire(any_request_on_wire)`"
+             `|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire)`"
         );
     }
 
@@ -2197,8 +2238,8 @@ mod h3_pool_error_tests {
         let any_request_on_wire = false;
         let synthetic_setup_failure = anyhow::anyhow!("synthetic tls_config_fn() failure");
 
-        let propagated: H3PoolError = H3PoolError::pre_wire(synthetic_setup_failure)
-            .with_request_on_wire(any_request_on_wire);
+        let propagated: H3PoolError =
+            H3PoolError::pre_wire(synthetic_setup_failure).promote_on_wire_if(any_request_on_wire);
 
         assert!(
             !propagated.request_on_wire(),
