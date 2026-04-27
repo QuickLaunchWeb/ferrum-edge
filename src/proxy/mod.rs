@@ -1651,11 +1651,22 @@ impl ProxyState {
                     .map_err(|e| format!("{}: {}", desc, e))?;
 
                 let url = format!("{}://{}:{}/", scheme, host, port);
-                let result = client
-                    .head(&url)
-                    .timeout(Duration::from_secs(5))
-                    .send()
-                    .await;
+                // Apply the proxy's `backend_connect_timeout_ms` as a per-request
+                // connect timeout, capped by the 5s overall warmup budget. Without
+                // this, the shared `reqwest::Client` carries no client-level
+                // connect timeout (we removed it so per-request overrides can
+                // diverge across pool-sharing siblings), so unreachable backends
+                // would consume the full 5s overall timeout per probe. Operators
+                // who set a tight `backend_connect_timeout_ms` (e.g. 500ms) get
+                // that bound at startup too. `0` disables — fall back to the 5s
+                // overall cap.
+                let mut req = client.head(&url).timeout(Duration::from_secs(5));
+                if proxy.backend_connect_timeout_ms > 0 {
+                    let warmup_cap = Duration::from_secs(5);
+                    let configured = Duration::from_millis(proxy.backend_connect_timeout_ms);
+                    req = req.connect_timeout(configured.min(warmup_cap));
+                }
+                let result = req.send().await;
 
                 match result {
                     Ok(_) => Ok(desc),
