@@ -1877,14 +1877,18 @@ async fn handle_h3_request(
         let response_status = h3_stream_result.status;
         let h3_error_class = h3_stream_result.error_class;
 
-        // Record outcome across CB, passive health, latency, and connection tracking
+        // Record outcome across CB, passive health, latency, and connection
+        // tracking. Same pre-wire/post-wire predicate as the buffered path —
+        // post-wire failures (graceful close, mid-stream reset, read timeout)
+        // mean the request did reach the wire, so latency / CB accounting
+        // must not treat them as transport faults.
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
-            h3_error_class.is_some(),
+            h3_class_implies_connection_error(h3_error_class),
             backend_start.elapsed(),
         );
 
@@ -1970,12 +1974,18 @@ async fn handle_h3_request(
             // Build a lightweight BackendResponse for should_retry — only
             // status_code and connection_error are read. Use empty body/headers
             // to avoid cloning the full response on every retry check.
+            //
+            // `connection_error` MUST be derived via `request_reached_wire` —
+            // not `err_class.is_some()` — so post-wire classes (including
+            // `GracefulRemoteClose` and `ConnectionReset` / `ProtocolError` /
+            // `ReadWriteTimeout`) do NOT bypass `retryable_methods` via
+            // `retry_on_connect_failure`. See `h3_class_implies_connection_error`.
             while crate::retry::should_retry(
                 retry_config,
                 &method,
                 &crate::retry::BackendResponse {
                     status_code: status,
-                    connection_error: err_class.is_some(),
+                    connection_error: h3_class_implies_connection_error(err_class),
                     body: crate::retry::ResponseBody::Buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
@@ -1983,14 +1993,17 @@ async fn handle_h3_request(
                 },
                 attempt,
             ) {
-                // Record failure against current target's circuit breaker
+                // Record failure against current target's circuit breaker.
+                // Same pre-wire/post-wire boundary as the retry decision so a
+                // graceful close (or any other post-wire fault) does not
+                // count as a transport-level failure for CB tripping.
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(status, err_class.is_some());
+                    cb.record_failure(status, h3_class_implies_connection_error(err_class));
                 }
 
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -2033,7 +2046,7 @@ async fn handle_h3_request(
                     proxy_id = %proxy.id,
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
-                    connection_error = err_class.is_some(),
+                    connection_error = h3_class_implies_connection_error(err_class),
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
@@ -2085,14 +2098,18 @@ async fn handle_h3_request(
             )
         };
 
-        // Record outcome against the final target (may differ from initial after retries)
+        // Record outcome against the final target (may differ from initial after retries).
+        // `connection_error` shares the same pre-wire/post-wire predicate as the
+        // retry decision and CB above so passive-health / least-latency LB
+        // accounting treats a graceful close as a successful (post-wire) request
+        // for latency purposes — the request did reach the backend.
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
             final_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
-            h3_error_class.is_some(),
+            h3_class_implies_connection_error(h3_error_class),
             backend_start.elapsed(),
         );
 
@@ -2461,6 +2478,35 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
     // attempt committed the body should consult `e.request_on_wire()`
     // separately rather than re-deriving it from `error_class`.
     crate::http3::client::classify_http3_error(e.as_error().as_ref())
+}
+
+/// Derive `connection_error: bool` from the optional `ErrorClass` returned
+/// by [`proxy_to_backend_h3`]. The 4-tuple return signature loses the
+/// typed [`crate::http3::client::H3PoolError::request_on_wire`] signal,
+/// so this re-derives via [`crate::retry::request_reached_wire`] —
+/// the same single boundary that drives `BackendResponse::connection_error`
+/// for every other dispatcher.
+///
+/// Returns `false` for `None` (success) and for any post-wire class
+/// (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`,
+/// `ReadWriteTimeout`, `GracefulRemoteClose`, ...). Returns `true` only
+/// for pre-wire classes (`ConnectionRefused`, `DnsLookupError`,
+/// `TlsError`, `PortExhaustion`, `ConnectionPoolError`).
+///
+/// Critical for `GracefulRemoteClose`: the request reached the wire
+/// (the backend may have processed it), so the retry decision must
+/// respect `retryable_methods` rather than treating the failure as a
+/// pre-wire idempotent replay via `retry_on_connect_failure`. The
+/// circuit breaker and load-balancer outcome reporting also share this
+/// predicate so a graceful close is not penalized as a transport fault.
+///
+/// Pre-existing classes (`ConnectionReset`, `ProtocolError`,
+/// `ReadWriteTimeout`) get the same correction as a beneficial side
+/// effect — `err_class.is_some()` previously over-reported all of them
+/// as connection errors, bypassing `retryable_methods` and tripping CB
+/// failure counters as if the request had not gone on the wire.
+fn h3_class_implies_connection_error(class: Option<crate::retry::ErrorClass>) -> bool {
+    class.is_some_and(|c| !crate::retry::request_reached_wire(c))
 }
 
 /// Outcome of a streaming H3 proxy operation.
@@ -3156,5 +3202,106 @@ fn record_request(state: &ProxyState, status: u16) {
             .entry(status)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod h3_class_implies_connection_error_tests {
+    //! Regression tests for the `h3_class_implies_connection_error` predicate
+    //! that drives the retry decision, circuit breaker, and outcome reporting
+    //! in the H3 frontend buffered- and streaming-response paths.
+    //!
+    //! Pre-fix the buffered-response retry loop derived `connection_error`
+    //! via `err_class.is_some()`, which over-reports every post-wire class
+    //! as a connection failure. That bypasses `retryable_methods` (a POST
+    //! that hit a graceful close or stream reset got replayed as if pre-wire)
+    //! and trips CB / passive-health counters as if the request had not
+    //! reached the backend.
+    use super::h3_class_implies_connection_error;
+    use crate::retry::ErrorClass;
+    use crate::retry::request_reached_wire;
+
+    #[test]
+    fn none_is_not_a_connection_error() {
+        assert!(
+            !h3_class_implies_connection_error(None),
+            "Successful request must report connection_error=false"
+        );
+    }
+
+    #[test]
+    fn graceful_remote_close_is_post_wire() {
+        // The reason this whole helper exists. A graceful close at
+        // recv_response is post-wire by construction (the backend
+        // received and may have processed the request before tearing
+        // down). Treating it as connection_error=true would bypass
+        // `retryable_methods` for non-idempotent requests.
+        assert!(
+            !h3_class_implies_connection_error(Some(ErrorClass::GracefulRemoteClose)),
+            "GracefulRemoteClose must NOT be treated as a connection error — \
+             the request reached the wire and may have been processed"
+        );
+    }
+
+    #[test]
+    fn pre_wire_classes_are_connection_errors() {
+        // Genuine connect-class failures must still drive
+        // `retry_on_connect_failure` regardless of HTTP method.
+        // This list mirrors the negative-list inside `request_reached_wire`;
+        // the cross-check below catches a future edit there.
+        for class in [
+            ErrorClass::ConnectionRefused,
+            ErrorClass::ConnectionTimeout,
+            ErrorClass::DnsLookupError,
+            ErrorClass::TlsError,
+            ErrorClass::PortExhaustion,
+            ErrorClass::ConnectionPoolError,
+        ] {
+            assert!(
+                h3_class_implies_connection_error(Some(class)),
+                "{class:?} is pre-wire and must report connection_error=true"
+            );
+            assert!(
+                !request_reached_wire(class),
+                "{class:?} listed as pre-wire here but request_reached_wire \
+                 disagrees — pick one source of truth"
+            );
+        }
+    }
+
+    #[test]
+    fn post_wire_classes_are_not_connection_errors() {
+        // The whole point of the fix: post-wire classes that would
+        // previously fall under `err_class.is_some() == true` now
+        // correctly report `connection_error=false` so the retry
+        // decision respects `retryable_methods` and CB / passive-health
+        // accounting attributes the failure to backend processing
+        // rather than transport unavailability.
+        let post_wire = [
+            ErrorClass::ConnectionReset,
+            ErrorClass::ConnectionClosed,
+            ErrorClass::ProtocolError,
+            ErrorClass::ReadWriteTimeout,
+            ErrorClass::GracefulRemoteClose,
+            ErrorClass::ClientDisconnect,
+            ErrorClass::RequestBodyTooLarge,
+            ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::RequestError,
+        ];
+        for class in post_wire {
+            assert!(
+                !h3_class_implies_connection_error(Some(class)),
+                "{class:?} is post-wire and must report connection_error=false"
+            );
+            // Cross-check: the helper must agree with the canonical
+            // `request_reached_wire` predicate. If a future edit shifts
+            // a class between pre-wire and post-wire, this assertion
+            // ensures both ends update together.
+            assert!(
+                request_reached_wire(class),
+                "{class:?} listed as post-wire here but request_reached_wire \
+                 disagrees — pick one source of truth"
+            );
+        }
     }
 }

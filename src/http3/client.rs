@@ -216,13 +216,46 @@ pub(crate) async fn drain_h3_response_body(
 /// Two distinct call sites use this predicate:
 /// - [`drain_h3_response_body`] / streaming-response paths: a graceful close
 ///   AFTER a complete body is silently recovered into a successful response.
-/// - The four `recv_response` `.map_err` sites: a graceful close BEFORE
-///   headers are parsed surfaces an unrecoverable 502 (no headers to forward),
-///   but is wrapped via [`H3PoolError::graceful_close`] so gateway dispatch
+/// - The four `recv_response` `.map_err` sites (via
+///   [`recv_response_err`]): a graceful close BEFORE headers are parsed
+///   surfaces an unrecoverable 502 (no headers to forward), but is
+///   wrapped via [`H3PoolError::graceful_close`] so gateway dispatch
 ///   sites suppress `mark_h3_unsupported` — `H3_NO_ERROR` is not a
 ///   transport-level capability failure even when the response is lost.
 pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
     e.is_h3_no_error() || e.to_string() == "Remote is closing the connection"
+}
+
+/// Map an h3 [`StreamError`](h3::error::StreamError) returned by
+/// `recv_response()` into the corresponding [`H3PoolError`] variant.
+///
+/// Centralises the four identical `.map_err` closures across the pool's
+/// inner request helpers (`do_request`, `do_request_streaming`,
+/// `do_request_streaming_body`, `do_request_streaming_incoming_body`) so
+/// the graceful-close detection cannot drift between sites on future
+/// edits.
+///
+/// - [`is_h3_graceful_close`] true → [`H3PoolError::graceful_close`]:
+///   the request was committed (post-wire) and the backend chose to
+///   tear down without an error code; gateway dispatch sites suppress
+///   `mark_h3_unsupported`. The 502 still propagates because no headers
+///   are available to forward.
+/// - Otherwise → [`H3PoolError::post_wire`]: a real transport / protocol
+///   failure that should drive the H3 capability downgrade.
+fn recv_response_err(e: h3::error::StreamError) -> H3PoolError {
+    if is_h3_graceful_close(&e) {
+        // Backend tore the connection down with `H3_NO_ERROR` (or sent
+        // GOAWAY) before we could parse a usable response. The 502 still
+        // propagates because no headers are available, but the gateway
+        // must NOT treat this as an H3 capability failure — see
+        // [`H3PoolError::graceful_close`] for the rationale.
+        H3PoolError::graceful_close(anyhow::anyhow!(
+            "recv_response after graceful remote close: {}",
+            e
+        ))
+    } else {
+        H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e))
+    }
 }
 
 /// Whether the received body is semantically complete for this response.
@@ -1142,22 +1175,7 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream.recv_response().await.map_err(|e| {
-            if is_h3_graceful_close(&e) {
-                // Backend tore the connection down with `H3_NO_ERROR`
-                // (or sent GOAWAY) before we could parse a usable
-                // response. The 502 still propagates because no
-                // headers are available, but the gateway must NOT
-                // treat this as an H3 capability failure — see
-                // [`H3PoolError::graceful_close`] for the rationale.
-                H3PoolError::graceful_close(anyhow::anyhow!(
-                    "recv_response after graceful remote close: {}",
-                    e
-                ))
-            } else {
-                H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e))
-            }
-        })?;
+        let response = stream.recv_response().await.map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1241,22 +1259,7 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = stream.recv_response().await.map_err(|e| {
-            if is_h3_graceful_close(&e) {
-                // Backend tore the connection down with `H3_NO_ERROR`
-                // (or sent GOAWAY) before we could parse a usable
-                // response. The 502 still propagates because no
-                // headers are available, but the gateway must NOT
-                // treat this as an H3 capability failure — see
-                // [`H3PoolError::graceful_close`] for the rationale.
-                H3PoolError::graceful_close(anyhow::anyhow!(
-                    "recv_response after graceful remote close: {}",
-                    e
-                ))
-            } else {
-                H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e))
-            }
-        })?;
+        let response = stream.recv_response().await.map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1367,22 +1370,10 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = backend_stream.recv_response().await.map_err(|e| {
-            if is_h3_graceful_close(&e) {
-                // Backend tore the connection down with `H3_NO_ERROR`
-                // (or sent GOAWAY) before we could parse a usable
-                // response. The 502 still propagates because no
-                // headers are available, but the gateway must NOT
-                // treat this as an H3 capability failure — see
-                // [`H3PoolError::graceful_close`] for the rationale.
-                H3PoolError::graceful_close(anyhow::anyhow!(
-                    "recv_response after graceful remote close: {}",
-                    e
-                ))
-            } else {
-                H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e))
-            }
-        })?;
+        let response = backend_stream
+            .recv_response()
+            .await
+            .map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
@@ -1487,22 +1478,10 @@ impl Http3ConnectionPool {
             .await
             .map_err(|e| H3PoolError::post_wire(anyhow::anyhow!("finish failed: {}", e)))?;
 
-        let response = backend_stream.recv_response().await.map_err(|e| {
-            if is_h3_graceful_close(&e) {
-                // Backend tore the connection down with `H3_NO_ERROR`
-                // (or sent GOAWAY) before we could parse a usable
-                // response. The 502 still propagates because no
-                // headers are available, but the gateway must NOT
-                // treat this as an H3 capability failure — see
-                // [`H3PoolError::graceful_close`] for the rationale.
-                H3PoolError::graceful_close(anyhow::anyhow!(
-                    "recv_response after graceful remote close: {}",
-                    e
-                ))
-            } else {
-                H3PoolError::post_wire(anyhow::anyhow!("recv_response failed: {}", e))
-            }
-        })?;
+        let response = backend_stream
+            .recv_response()
+            .await
+            .map_err(recv_response_err)?;
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());

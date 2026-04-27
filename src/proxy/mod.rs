@@ -10008,10 +10008,21 @@ mod tests {
         // Application-layer errors must NOT downgrade the H3 capability — the
         // backend is fine, the request itself is bad. Downgrading here would
         // route subsequent requests via reqwest for no operational reason.
+        //
+        // `GracefulRemoteClose` is also excluded: `H3_NO_ERROR` /
+        // `RemoteClosing` is a spec-legal teardown signal (RFC 9114 §8.1),
+        // not a transport-level capability fault — see the docstring on
+        // [`crate::http3::client::H3PoolError::graceful_close`] and the
+        // matching short-circuit in
+        // [`crate::http3::server::classify_h3_error`]. Adding it to the
+        // positive list in `is_h3_transport_error_class` would re-introduce
+        // the regression where a fast responder racing FIN with
+        // `CONNECTION_CLOSE` permanently disables H3 for the backend.
         for class in [
             retry::ErrorClass::ClientDisconnect,
             retry::ErrorClass::RequestBodyTooLarge,
             retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::GracefulRemoteClose,
             retry::ErrorClass::RequestError,
         ] {
             assert!(
