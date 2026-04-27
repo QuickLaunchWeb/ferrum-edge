@@ -52,6 +52,17 @@ use crate::scaffolding::ports::reserve_port;
 const PROXY_ID: &str = "fast-path-throttle-proxy";
 const PLUGIN_CONFIG_ID: &str = "throttle-1";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bind-drop-rebind retry budget. CLAUDE.md mandates that any test
+/// dropping a reserved port before re-binding must retry, because a
+/// parallel test can grab the freed port in that window. Three
+/// attempts mirrors the existing `start_gateway_with_retry` helpers
+/// elsewhere in the suite.
+const MAX_GATEWAY_ATTEMPTS: u32 = 3;
+/// Per-attempt deadline for `start_tcp_listener` to set
+/// `started=true`. Successful binds flip the flag in well under
+/// 100ms; anything past two seconds means the bind lost a race or
+/// hung, so we tear the task down and retry on a fresh port.
+const PER_ATTEMPT_STARTED_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build a TCP proxy that exercises the fast path: every relay timeout
 /// is 0, which is what `bidirectional_copy()` checks before delegating
@@ -176,18 +187,58 @@ async fn spawn_echo_backend(listener: TcpListener) -> tokio::task::JoinHandle<()
 }
 
 /// Bring up an in-process TCP gateway listener configured for the fast
-/// path with `tcp_connection_throttle` attached. Returns the live
-/// listen port, a shutdown sender, the listener task handle, and the
-/// metrics so callers can sanity-check connection accounting.
-async fn spawn_fast_path_gateway(
+/// path with `tcp_connection_throttle` attached, retrying on the
+/// bind-drop-rebind race that occurs when another parallel test grabs
+/// our reserved port between `drop_and_take_port()` and
+/// `start_tcp_listener`'s own bind. Each attempt reserves a fresh
+/// port. Returns the live listen port, a shutdown sender, the listener
+/// task handle, and the metrics so callers can sanity-check connection
+/// accounting.
+async fn spawn_fast_path_gateway_with_retry(
     backend_port: u16,
-    listen_port: u16,
 ) -> (
     u16,
     watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
     Arc<TcpProxyMetrics>,
 ) {
+    let mut last_port: u16 = 0;
+    for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
+        let frontend = reserve_port().await.expect("reserve frontend port");
+        let frontend_port = frontend.drop_and_take_port();
+        last_port = frontend_port;
+        if let Some(handles) = try_spawn_fast_path_gateway(backend_port, frontend_port).await {
+            return handles;
+        }
+        eprintln!(
+            "fast-path gateway start attempt {attempt}/{MAX_GATEWAY_ATTEMPTS} on port \
+             {frontend_port} failed (likely bind-drop-rebind race) — retrying"
+        );
+        if attempt < MAX_GATEWAY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    panic!(
+        "TCP gateway listener never reported started=true after \
+         {MAX_GATEWAY_ATTEMPTS} attempts; last attempted port: {last_port}"
+    );
+}
+
+/// One attempt at bringing up the gateway listener on the given port.
+/// Returns `None` if the listener task either exited before binding
+/// (typically EADDRINUSE because a parallel test stole the port) or
+/// failed to set `started=true` within `PER_ATTEMPT_STARTED_TIMEOUT`.
+/// On `None` the inner task is reaped before returning so retries do
+/// not leak background tasks.
+async fn try_spawn_fast_path_gateway(
+    backend_port: u16,
+    listen_port: u16,
+) -> Option<(
+    u16,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+    Arc<TcpProxyMetrics>,
+)> {
     let proxy = fast_path_tcp_proxy(listen_port, backend_port);
     let plugin_cfg = throttle_plugin_config();
     let gateway_config = GatewayConfig {
@@ -272,17 +323,53 @@ async fn spawn_fast_path_gateway(
         })
     };
 
-    // Wait until the listener has actually bound, otherwise the first
-    // connect attempt from the test races bind() and gets ECONNREFUSED.
-    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
-    while !started.load(Ordering::Acquire) {
+    // Race three terminal conditions:
+    //   - started = true                 → bind succeeded.
+    //   - join.is_finished() && !started → task exited without binding,
+    //                                      typically EADDRINUSE from a
+    //                                      parallel test grabbing the
+    //                                      port between our drop and
+    //                                      `start_tcp_listener`'s bind.
+    //   - deadline exceeded              → bind hung; treat as failure.
+    // Returning `None` on the latter two lets the outer retry loop try
+    // a fresh port instead of panicking.
+    let deadline = std::time::Instant::now() + PER_ATTEMPT_STARTED_TIMEOUT;
+    loop {
+        if started.load(Ordering::Acquire) {
+            return Some((listen_port, shutdown_tx, join, metrics));
+        }
+        if join.is_finished() {
+            // Reap so the failed task does not leak across retries.
+            let _ = join.await;
+            return None;
+        }
         if std::time::Instant::now() > deadline {
-            panic!("TCP gateway listener never reported started=true within {TEST_TIMEOUT:?}");
+            let _ = shutdown_tx.send(true);
+            join.abort();
+            let _ = join.await;
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
 
-    (listen_port, shutdown_tx, join, metrics)
+/// Drop the gateway listener cleanly and surface any shutdown
+/// regression. Failure here means the listener task panicked, hung,
+/// or exited before we asked it to — all of which would otherwise
+/// leak a background task into the next test or silently mask a
+/// shutdown-path bug.
+async fn shutdown_gateway_or_panic(
+    shutdown_tx: watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+) {
+    shutdown_tx
+        .send(true)
+        .expect("listener task should still be holding the shutdown receiver");
+    match tokio::time::timeout(TEST_TIMEOUT, join).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("listener task panicked during shutdown: {e:?}"),
+        Err(_) => panic!("listener task did not exit within {TEST_TIMEOUT:?} of shutdown signal"),
+    }
 }
 
 /// Connect to the gateway, exchange one round-trip, and confirm the
@@ -325,14 +412,10 @@ async fn fast_path_invokes_on_stream_connect_to_reject_throttled_connection() {
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend_task = spawn_echo_backend(backend.into_listener()).await;
 
-    // Gateway listener — drop the reservation immediately before
-    // start_tcp_listener does its own bind. Brief race window, but no
-    // worse than the rest of the integration suite.
-    let frontend = reserve_port().await.expect("reserve frontend port");
-    let frontend_port = frontend.drop_and_take_port();
-
+    // Gateway listener — `spawn_fast_path_gateway_with_retry` handles
+    // the bind-drop-rebind race against parallel tests internally.
     let (listen_port, shutdown_tx, join, metrics) =
-        spawn_fast_path_gateway(backend_port, frontend_port).await;
+        spawn_fast_path_gateway_with_retry(backend_port).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     // Connection #1 — should pass the throttle because the per-IP
@@ -365,8 +448,7 @@ async fn fast_path_invokes_on_stream_connect_to_reject_throttled_connection() {
     );
 
     drop(_conn1);
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(TEST_TIMEOUT, join).await;
+    shutdown_gateway_or_panic(shutdown_tx, join).await;
 }
 
 #[tokio::test]
@@ -376,10 +458,8 @@ async fn fast_path_invokes_on_stream_disconnect_to_release_throttle_slot() {
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend_task = spawn_echo_backend(backend.into_listener()).await;
 
-    let frontend = reserve_port().await.expect("reserve frontend port");
-    let frontend_port = frontend.drop_and_take_port();
     let (listen_port, shutdown_tx, join, _metrics) =
-        spawn_fast_path_gateway(backend_port, frontend_port).await;
+        spawn_fast_path_gateway_with_retry(backend_port).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port);
 
     // Hold one slot.
@@ -451,6 +531,5 @@ async fn fast_path_invokes_on_stream_disconnect_to_release_throttle_slot() {
         break;
     }
 
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(TEST_TIMEOUT, join).await;
+    shutdown_gateway_or_panic(shutdown_tx, join).await;
 }
