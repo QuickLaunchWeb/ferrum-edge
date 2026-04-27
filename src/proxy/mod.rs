@@ -153,6 +153,9 @@ type WarmupTask =
 /// gating phase can decide per-target whether to materialize the task at all
 /// (skipping is much cheaper than building a task and dropping it unrun).
 struct ReqwestWarmupCandidate {
+    /// Representative proxy used to build the `reqwest::Client`. Multiple
+    /// proxies sharing the same `(scheme, host, port)` collapse onto the
+    /// first one collected — same as the original warmup behaviour.
     proxy: Proxy,
     host: String,
     port: u16,
@@ -160,16 +163,33 @@ struct ReqwestWarmupCandidate {
     /// of `String` because the only valid values are the two compile-time
     /// constants the dispatcher accepts ("http", "https").
     scheme: &'static str,
+    /// `true` when at least one proxy routing to this `(scheme, host, port)`
+    /// would dispatch via reqwest at runtime — the OR across every proxy
+    /// merged into this candidate. The HTTPS gating phase must NOT skip
+    /// reqwest warmup when this is true, even if the capability registry
+    /// classifies the target as `h2_tls=Supported`: the direct H2 pool only
+    /// covers traffic that satisfies all of `can_use_direct_http2_pool`'s
+    /// guards (`enable_http2`, `!retain_request_body`,
+    /// `!requires_request_body_buffering`), and any proxy that fails one
+    /// of those guards still routes via reqwest.
+    requires_reqwest_warmup: bool,
 }
 
 /// Lookup the capability registry for a specific (proxy, host, port) triple
-/// and decide whether the direct HTTP/2 pool will handle all client traffic
-/// to this backend (so the reqwest pool does not need a startup HEAD).
+/// and decide whether the direct HTTP/2 pool *could* handle this backend
+/// (so the reqwest pool does not need a startup HEAD).
 ///
 /// Returns `true` only when `plain_http.h2_tls` is definitively `Supported`.
 /// `Unknown` (probe never ran or timed out) and `Unsupported` (post-ALPN
 /// HTTP/1.1 fallback) both fall back to "warm reqwest" so the fallback pool
 /// is always pre-warmed for any target the H2 pool cannot cover.
+///
+/// **NOT sufficient on its own to skip reqwest warmup.** The runtime
+/// dispatch path also gates on `can_use_direct_http2_pool` (per-proxy
+/// `enable_http2`, retain-request-body retries, request-body-buffering
+/// plugins), so the warmup gating must also consult
+/// `proxy_config_forces_reqwest_dispatch` for every proxy routing to the
+/// target before deciding to skip. See `ReqwestWarmupCandidate.requires_reqwest_warmup`.
 ///
 /// Constructed as a free function so the gating predicate is unit-testable
 /// against a stand-alone `BackendCapabilityRegistry` without needing to
@@ -193,6 +213,60 @@ fn target_uses_direct_h2_pool(
         .unwrap_or(false)
 }
 
+/// Decide whether a proxy's *configuration* would force at least some
+/// requests onto the reqwest dispatch path at runtime, regardless of
+/// what the capability registry says about the backend.
+///
+/// Mirrors the runtime guard set in `can_use_direct_http2_pool` plus the
+/// outer `dispatch_kind == HttpsPool` gate the dispatcher applies before
+/// it. Returns `true` when ANY of the following are true — meaning at
+/// least some traffic for this proxy will land on reqwest and the
+/// warmup gating MUST keep reqwest warmed for this target:
+///
+/// - `proxy.dispatch_kind` is HTTP-not-HTTPS — the direct H2 pool is
+///   never tried for plain-HTTP backends.
+/// - `enable_http2 = false` — operator explicitly disabled backend HTTP/2
+///   on this proxy (`pool_enable_http2: false`).
+/// - `requires_request_body_buffering = true` — at least one of the
+///   proxy's plugins needs to inspect/transform the request body, which
+///   the direct H2 sender path doesn't implement (per
+///   `can_use_direct_http2_pool`).
+/// - `proxy.retry` is configured with non-zero `max_retries` AND can
+///   actually retry something (connection-failure replay or a non-empty
+///   pair of retryable methods + statuses). When retries are effective,
+///   the request body is retained for replay and the direct H2 path is
+///   skipped (`retain_request_body` ⇒ false from `can_use_direct_http2_pool`).
+///
+/// Caller pre-computes the `enable_http2` and
+/// `requires_request_body_buffering` booleans from the
+/// `ConnectionPool::global_pool_config().for_proxy(proxy)` and
+/// `PluginCache::requires_request_body_buffering(&proxy.id)` accessors so
+/// this predicate is a pure function over its inputs and trivially
+/// unit-testable.
+fn proxy_config_forces_reqwest_dispatch(
+    proxy: &Proxy,
+    enable_http2: bool,
+    requires_request_body_buffering: bool,
+) -> bool {
+    if !matches!(proxy.backend_scheme, Some(BackendScheme::Https)) {
+        return true;
+    }
+    if !enable_http2 {
+        return true;
+    }
+    if requires_request_body_buffering {
+        return true;
+    }
+    if let Some(retry) = proxy.retry.as_ref()
+        && retry.max_retries > 0
+        && (retry.retry_on_connect_failure
+            || (!retry.retryable_status_codes.is_empty() && !retry.retryable_methods.is_empty()))
+    {
+        return true;
+    }
+    false
+}
+
 /// Collect reqwest warmup candidates for a single proxy, partitioning by
 /// scheme so the caller can run HTTP-only candidates in parallel with the
 /// capability refresh and apply capability-driven gating to HTTPS-only
@@ -203,16 +277,28 @@ fn target_uses_direct_h2_pool(
 /// candidates must wait for the refresh so the gating phase can consult
 /// the registry.
 ///
+/// `forces_reqwest` is the per-proxy verdict from
+/// `proxy_config_forces_reqwest_dispatch` — `true` when the proxy's
+/// configuration would route some traffic via reqwest at runtime. The
+/// flag is OR-merged into any existing candidate sharing the same
+/// `(scheme, host, port)`: if proxy A on the target can use the direct
+/// H2 pool but proxy B (same target) requires reqwest, the merged
+/// candidate's `requires_reqwest_warmup` stays `true` so the gating
+/// phase keeps the warmup task. This is the regression guard against
+/// the per-target dedup hiding a single proxy's reqwest dependency.
+///
+/// Maps (not sets) so the OR-merge can mutate the existing entry in
+/// place. Order is irrelevant: the warmup batch runs concurrently and
+/// log lines key off the per-target description, not insertion order.
+///
 /// Free function so it's callable from tests without constructing a full
-/// `ProxyState`. The pool-key dedup insertion (vestigial from the original
-/// implementation — pool key and per-target key never collide) stays in
-/// the caller so this function has no `ConnectionPool` dependency.
+/// `ProxyState`.
 fn collect_reqwest_warmup_candidates_for_proxy(
     proxy: &Proxy,
+    forces_reqwest: bool,
     upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
-    seen: &mut std::collections::HashSet<String>,
-    http_candidates: &mut Vec<ReqwestWarmupCandidate>,
-    https_candidates: &mut Vec<ReqwestWarmupCandidate>,
+    http_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
+    https_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
 ) {
     let scheme: &'static str = match proxy.backend_scheme {
         Some(BackendScheme::Http) => "http",
@@ -231,22 +317,28 @@ fn collect_reqwest_warmup_candidates_for_proxy(
         targets.push((proxy.backend_host.clone(), proxy.backend_port));
     }
 
+    let bucket = if scheme == "http" {
+        http_candidates
+    } else {
+        https_candidates
+    };
+
     for (host, port) in targets {
         let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
-        if !seen.insert(dedup_key) {
-            continue;
-        }
-        let candidate = ReqwestWarmupCandidate {
-            proxy: proxy.clone(),
-            host,
-            port,
-            scheme,
-        };
-        if scheme == "http" {
-            http_candidates.push(candidate);
-        } else {
-            https_candidates.push(candidate);
-        }
+        bucket
+            .entry(dedup_key)
+            .and_modify(|existing| {
+                // OR-merge: any proxy on this target that would use reqwest
+                // at runtime keeps the warmup enabled.
+                existing.requires_reqwest_warmup |= forces_reqwest;
+            })
+            .or_insert_with(|| ReqwestWarmupCandidate {
+                proxy: proxy.clone(),
+                host,
+                port,
+                scheme,
+                requires_reqwest_warmup: forces_reqwest,
+            });
     }
 }
 
@@ -1719,36 +1811,46 @@ impl ProxyState {
             .collect();
 
         // Collect ALL reqwest warmup candidates upfront, partitioned by
-        // scheme so each phase can build its own task list. Dedup is shared
-        // across both partitions: a (host, port) pair already accepted by
-        // one scheme bucket cannot be re-collected by the other (matching
-        // the original single-bucket dedup semantics).
-        let mut seen_reqwest: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut http_candidates: Vec<ReqwestWarmupCandidate> = Vec::new();
-        let mut https_candidates: Vec<ReqwestWarmupCandidate> = Vec::new();
+        // scheme so each phase can build its own task list. Each bucket is
+        // a `HashMap<dedup_key, ReqwestWarmupCandidate>` so the per-target
+        // entry can be OR-merged when multiple proxies route to the same
+        // (scheme, host, port) — see
+        // `collect_reqwest_warmup_candidates_for_proxy`.
+        let mut http_candidates: HashMap<String, ReqwestWarmupCandidate> = HashMap::new();
+        let mut https_candidates: HashMap<String, ReqwestWarmupCandidate> = HashMap::new();
+        let pool_config = self.connection_pool.global_pool_config();
         for proxy in &config.proxies {
             if !proxy.dispatch_kind.is_http_family() {
                 continue;
             }
-            // Preserve the historical pool-key insertion into the dedup set.
-            // The pool key has a different format than the per-target dedup
-            // key, so it never collides — but the original code did this and
-            // we keep behaviour bit-identical to avoid masking any subtle
-            // dedup interaction we don't yet see.
-            let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
-            let _ = seen_reqwest.insert(pool_key);
+            // Mirror the runtime dispatch decision: would this proxy ever
+            // route a request via reqwest? If yes, the warmup gating must
+            // keep the reqwest HEAD even when the capability registry says
+            // h2_tls=Supported. The flag is OR-merged across every proxy
+            // sharing the (scheme, host, port) dedup key — one
+            // reqwest-forcing proxy is enough to keep the pool warm.
+            let per_proxy_pool = pool_config.for_proxy(proxy);
+            let requires_request_body_buffering =
+                self.plugin_cache.requires_request_body_buffering(&proxy.id);
+            let forces_reqwest = proxy_config_forces_reqwest_dispatch(
+                proxy,
+                per_proxy_pool.enable_http2,
+                requires_request_body_buffering,
+            );
             collect_reqwest_warmup_candidates_for_proxy(
                 proxy,
+                forces_reqwest,
                 &upstream_map,
-                &mut seen_reqwest,
                 &mut http_candidates,
                 &mut https_candidates,
             );
         }
 
-        // Phase 1: capability refresh ‖ HTTP-only reqwest warmup.
+        // Phase 1: capability refresh ‖ HTTP-only reqwest warmup. HTTP
+        // candidates always warm — the direct H2 pool is HTTPS-only, so
+        // HTTP backends have no alternative dispatch path.
         let http_tasks: Vec<WarmupTask> = http_candidates
-            .into_iter()
+            .into_values()
             .map(|c| Self::build_reqwest_warmup_task(self.connection_pool.clone(), c))
             .collect();
         let http_label = "reqwest http";
@@ -1756,21 +1858,30 @@ impl ProxyState {
         let http_warmup_fut = run_warmup_task_batch(http_tasks, concurrency, http_label);
         tokio::join!(refresh_fut, http_warmup_fut);
 
-        // Phase 2: HTTPS reqwest warmup with capability gating. Skip targets
-        // the direct H2 pool already covers; warm everything else (Unknown,
-        // Unsupported, or HTTPS without an H2/TLS classification yet).
+        // Phase 2: HTTPS reqwest warmup with capability + needs-reqwest
+        // gating. Skip iff BOTH conditions hold for the target:
+        //   1. The capability registry classifies it h2_tls=Supported (so
+        //      the direct H2 pool can talk to the backend), AND
+        //   2. No proxy routing to this target has a configuration that
+        //      forces reqwest dispatch — i.e. `requires_reqwest_warmup`
+        //      is `false` after OR-merging all sharing proxies.
+        // If either condition is false we warm reqwest. This guards the
+        // reviewer-flagged regression where per-target dedup hides a
+        // sibling proxy whose retries / body plugins / explicit
+        // `pool_enable_http2: false` still routes via reqwest.
         let total_https_candidates = https_candidates.len();
-        let mut https_tasks: Vec<WarmupTask> = Vec::with_capacity(https_candidates.len());
+        let mut https_tasks: Vec<WarmupTask> = Vec::with_capacity(total_https_candidates);
         let mut skipped_h2_tls = 0usize;
-        for candidate in https_candidates {
-            if target_uses_direct_h2_pool(
+        for (_key, candidate) in https_candidates {
+            let h2_tls_covered = target_uses_direct_h2_pool(
                 &self.backend_capabilities,
                 &candidate.proxy,
                 &candidate.host,
                 candidate.port,
-            ) {
+            );
+            if h2_tls_covered && !candidate.requires_reqwest_warmup {
                 debug!(
-                    "Pool warmup: skipping reqwest HEAD for {}:{} (direct H2 pool covers this target)",
+                    "Pool warmup: skipping reqwest HEAD for {}:{} (direct H2 pool covers every routing proxy)",
                     candidate.host, candidate.port
                 );
                 skipped_h2_tls += 1;
@@ -1783,7 +1894,7 @@ impl ProxyState {
         }
         if skipped_h2_tls > 0 {
             info!(
-                "Pool warmup: gating skipped {} of {} HTTPS reqwest targets (direct H2 pool will handle them)",
+                "Pool warmup: gating skipped {} of {} HTTPS reqwest targets (direct H2 pool covers them and no routing proxy forces reqwest)",
                 skipped_h2_tls, total_https_candidates
             );
         }
@@ -1803,6 +1914,7 @@ impl ProxyState {
             host,
             port,
             scheme,
+            requires_reqwest_warmup: _,
         } = candidate;
         Box::pin(async move {
             let desc = format!("reqwest {}:{}", host, port);
@@ -10582,66 +10694,82 @@ mod tests {
         .expect("upstream should deserialize")
     }
 
+    use crate::config::types::{BackoffStrategy, RetryConfig};
+
+    /// Empty maps for tests that only need one bucket populated.
+    fn empty_candidate_maps() -> (
+        HashMap<String, ReqwestWarmupCandidate>,
+        HashMap<String, ReqwestWarmupCandidate>,
+    ) {
+        (HashMap::new(), HashMap::new())
+    }
+
     #[test]
     fn collect_partitions_http_and_https_proxies_into_separate_buckets() {
         let http_proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
         let https_proxy = warmup_test_proxy("s", BackendScheme::Https, "secure.test", 443);
 
         let upstreams: HashMap<&str, &Upstream> = HashMap::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut http_candidates = Vec::new();
-        let mut https_candidates = Vec::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
             &http_proxy,
+            true, // HTTP backends always force reqwest dispatch
             &upstreams,
-            &mut seen,
             &mut http_candidates,
             &mut https_candidates,
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &https_proxy,
+            false,
             &upstreams,
-            &mut seen,
             &mut http_candidates,
             &mut https_candidates,
         );
 
         assert_eq!(http_candidates.len(), 1);
-        assert_eq!(http_candidates[0].host, "plain.test");
-        assert_eq!(http_candidates[0].port, 80);
-        assert_eq!(http_candidates[0].scheme, "http");
+        let http = http_candidates.values().next().unwrap();
+        assert_eq!(http.host, "plain.test");
+        assert_eq!(http.port, 80);
+        assert_eq!(http.scheme, "http");
+        assert!(
+            http.requires_reqwest_warmup,
+            "HTTP candidates always require reqwest warmup"
+        );
 
         assert_eq!(https_candidates.len(), 1);
-        assert_eq!(https_candidates[0].host, "secure.test");
-        assert_eq!(https_candidates[0].port, 443);
-        assert_eq!(https_candidates[0].scheme, "https");
+        let https = https_candidates.values().next().unwrap();
+        assert_eq!(https.host, "secure.test");
+        assert_eq!(https.port, 443);
+        assert_eq!(https.scheme, "https");
+        assert!(
+            !https.requires_reqwest_warmup,
+            "forces_reqwest=false should leave the flag clear"
+        );
     }
 
     #[test]
     fn collect_dedupes_repeated_targets_across_proxies() {
         // Two HTTPS proxies pointing at the same backend host:port. The
-        // dedup set must collapse them into a single candidate so the
+        // dedup map must collapse them into a single candidate so the
         // warmup batch doesn't pay for two redundant HEAD requests.
         let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
         let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
 
         let upstreams: HashMap<&str, &Upstream> = HashMap::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut http_candidates = Vec::new();
-        let mut https_candidates = Vec::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_a,
+            false,
             &upstreams,
-            &mut seen,
             &mut http_candidates,
             &mut https_candidates,
         );
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy_b,
+            false,
             &upstreams,
-            &mut seen,
             &mut http_candidates,
             &mut https_candidates,
         );
@@ -10673,21 +10801,160 @@ mod tests {
         let mut upstreams: HashMap<&str, &Upstream> = HashMap::new();
         upstreams.insert("up1", &upstream);
 
-        let mut seen = std::collections::HashSet::new();
-        let mut http_candidates = Vec::new();
-        let mut https_candidates = Vec::new();
+        let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
             &proxy,
+            false,
             &upstreams,
-            &mut seen,
             &mut http_candidates,
             &mut https_candidates,
         );
 
         assert!(http_candidates.is_empty());
-        let mut hosts: Vec<&str> = https_candidates.iter().map(|c| c.host.as_str()).collect();
+        let mut hosts: Vec<&str> = https_candidates.values().map(|c| c.host.as_str()).collect();
         hosts.sort();
         assert_eq!(hosts, vec!["a.test", "b.test", "c.test"]);
+    }
+
+    #[test]
+    fn collect_or_merges_requires_reqwest_when_any_sharing_proxy_forces_it() {
+        // Regression guard for the dedup-hides-sibling-needs case the
+        // reviewer flagged: if ONE proxy on a shared (host, port) needs
+        // reqwest (e.g. has a body-buffering plugin), the merged
+        // candidate's `requires_reqwest_warmup` must end up `true`
+        // regardless of the order proxies are collected — otherwise the
+        // gating phase would skip the only pool that can serve that
+        // proxy's traffic.
+        let proxy_skip = warmup_test_proxy("skip", BackendScheme::Https, "shared.test", 443);
+        let proxy_force = warmup_test_proxy("force", BackendScheme::Https, "shared.test", 443);
+        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+
+        // Order 1: skip-eligible proxy first, reqwest-forcing proxy second.
+        let (mut http1, mut https1) = empty_candidate_maps();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_skip,
+            false,
+            &upstreams,
+            &mut http1,
+            &mut https1,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_force,
+            true,
+            &upstreams,
+            &mut http1,
+            &mut https1,
+        );
+        let merged = https1.values().next().unwrap();
+        assert!(
+            merged.requires_reqwest_warmup,
+            "OR-merge order 1 must mark candidate requires_reqwest_warmup=true"
+        );
+
+        // Order 2: reqwest-forcing first, skip-eligible second. The flag
+        // must remain `true` (the skip proxy's `false` must NOT clear it).
+        let (mut http2, mut https2) = empty_candidate_maps();
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_force,
+            true,
+            &upstreams,
+            &mut http2,
+            &mut https2,
+        );
+        collect_reqwest_warmup_candidates_for_proxy(
+            &proxy_skip,
+            false,
+            &upstreams,
+            &mut http2,
+            &mut https2,
+        );
+        let merged = https2.values().next().unwrap();
+        assert!(
+            merged.requires_reqwest_warmup,
+            "OR-merge order 2 must keep requires_reqwest_warmup=true (false must NOT downgrade true)"
+        );
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_for_http_backend() {
+        // HTTP backends never enter the direct H2 pool (HTTPS-only).
+        let proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
+        // enable_http2=true and no body-buffering — yet the scheme alone
+        // forces reqwest.
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_when_enable_http2_disabled() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // Operator set `pool_enable_http2: false` → direct H2 pool is
+        // never entered, every request goes via reqwest.
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, false, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_when_body_buffering_required() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // A request_transformer or similar plugin requires the request
+        // body to be buffered in-process before forwarding — direct H2
+        // sender path doesn't implement that, so reqwest is mandatory.
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, true, true));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_true_when_effective_retries_configured() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // Effective retries (max_retries > 0 + at least one trigger)
+        // force the request body to be retained for replay → reqwest.
+        proxy.retry = Some(RetryConfig {
+            max_retries: 2,
+            backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+            retry_on_connect_failure: true,
+            retryable_status_codes: vec![],
+            retryable_methods: vec![],
+        });
+        assert!(proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_false_for_inert_retry_config() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // `max_retries=0` → no retries actually fire even though the
+        // struct exists. Body retention does NOT activate, so direct H2
+        // is still eligible.
+        proxy.retry = Some(RetryConfig {
+            max_retries: 0,
+            backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+            retry_on_connect_failure: true,
+            retryable_status_codes: vec![500],
+            retryable_methods: vec!["GET".to_string()],
+        });
+        assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_false_when_no_retry_triggers() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // `max_retries > 0` but neither `retry_on_connect_failure` nor a
+        // populated `retryable_methods + retryable_status_codes` pair —
+        // `has_effective_http_retries` returns false for every method.
+        proxy.retry = Some(RetryConfig {
+            max_retries: 5,
+            backoff: BackoffStrategy::Fixed { delay_ms: 10 },
+            retry_on_connect_failure: false,
+            retryable_status_codes: vec![], // empty
+            retryable_methods: vec!["GET".to_string()],
+        });
+        assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
+    }
+
+    #[test]
+    fn proxy_config_forces_reqwest_dispatch_returns_false_for_clean_https_proxy() {
+        let proxy = warmup_test_proxy("p", BackendScheme::Https, "h2.test", 443);
+        // HTTPS, http2 enabled, no body buffering, no retries → the
+        // direct H2 pool covers every request, reqwest warmup IS
+        // skippable (assuming the registry agrees on h2_tls=Supported).
+        assert!(!proxy_config_forces_reqwest_dispatch(&proxy, true, false));
     }
 
     #[test]
