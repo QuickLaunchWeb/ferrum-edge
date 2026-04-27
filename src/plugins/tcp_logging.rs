@@ -173,15 +173,30 @@ impl TcpWriter {
 async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
     // Resolve via the gateway DNS cache so log shipping shares the same
     // pre-warmed / stale-while-revalidate behaviour as the proxy hot path.
-    // Fall back to the OS resolver only if the cache returns an error.
-    let socket_addr =
-        resolve_tcp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging").await?;
-    let addr_log = format!("{} ({socket_addr})", cfg.host);
+    //
+    // Both the resolve and the TCP connect happen inside `cfg.connect_timeout`:
+    // the previous `TcpStream::connect("host:port")` form had the OS DNS
+    // lookup implicitly bounded by the connect timeout. Now that we resolve
+    // explicitly first, a cold/expired cache or stuck upstream nameserver
+    // could otherwise block the batching task well past `connect_timeout_ms`,
+    // delaying log delivery and retries — so the timeout wraps the full
+    // resolve+connect sequence.
+    let host_log = cfg.host.clone();
+    let port = cfg.port;
+    let resolve_and_connect = async {
+        let socket_addr =
+            resolve_tcp_endpoint(&cfg.host, cfg.port, cfg.dns_cache.as_ref(), "tcp_logging")
+                .await?;
+        let addr_log = format!("{host_log} ({socket_addr})");
+        let stream = TcpStream::connect(socket_addr)
+            .await
+            .map_err(|e| format!("TCP logging: failed to connect to {addr_log}: {e}"))?;
+        Ok::<(TcpStream, String), String>((stream, addr_log))
+    };
 
-    let stream = tokio::time::timeout(cfg.connect_timeout, TcpStream::connect(socket_addr))
+    let (stream, addr_log) = tokio::time::timeout(cfg.connect_timeout, resolve_and_connect)
         .await
-        .map_err(|_| format!("TCP logging: connect timeout to {addr_log}"))?
-        .map_err(|e| format!("TCP logging: failed to connect to {addr_log}: {e}"))?;
+        .map_err(|_| format!("TCP logging: connect timeout to {host_log}:{port}"))??;
 
     if !cfg.tls_enabled {
         return Ok(TcpWriter::Plain(stream));
