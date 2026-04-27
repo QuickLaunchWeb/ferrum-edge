@@ -1880,38 +1880,53 @@ async fn handle_h3_request(
         // Record outcome across CB, passive health, latency, and connection
         // tracking.
         //
-        // CRITICAL: this site is the streaming-response path, where
-        // `H3StreamResult.error_class` carries `terminal_error_class` —
-        // populated ONLY when the body aborted mid-stream (see
-        // [`proxy_to_backend_h3_streaming`]: response_body_too_large,
-        // recv_data error after non-graceful close, etc.). Headers (often
-        // 2xx) have already been flushed to the client by the time we get
-        // here; an `error_class` of `Some(_)` therefore means the response
-        // was TRUNCATED, not that the request never went on the wire.
+        // The streaming-response path's `H3StreamResult.error_class` is
+        // populated in TWO distinct shapes:
         //
-        // We must NOT use `h3_class_implies_connection_error` here: that
-        // helper returns `false` for post-wire classes like `ProtocolError`
-        // / `ReadWriteTimeout`, which would let a mid-body abort record as
-        // a clean success — latency sample taken, CB sees the original
-        // 2xx status, passive health unaffected. That hides real backend
-        // reliability problems from CB / outlier detection.
+        //   1. PRE-HEADERS DISPATCH FAILURE: `request_streaming` errored
+        //      before any response headers were received. `status=502`
+        //      is synthetic, `request_on_wire` carries the typed
+        //      `H3PoolError::request_on_wire()` signal — `false` for
+        //      pre-`send_request` failures (DNS / TLS / connect),
+        //      `true` for post-`send_request` failures including
+        //      graceful close at `recv_response`.
         //
-        // Use `is_some()` to mark the streaming response as a backend
-        // failure for CB / passive-health / latency purposes when ANY
-        // class is set. This matches the pre-fix behavior for streamed
-        // body aborts and is the correct semantic for this specific site.
-        // The retry / `record_failure(connection_error=...)` semantics
-        // for the buffered-path retry loop continue to use
-        // `h3_class_implies_connection_error` (a different question:
-        // "did the request reach the wire so retries must respect
-        // `retryable_methods`?").
+        //   2. MID-BODY ABORT: headers (often 2xx) were already flushed
+        //      to the client; `error_class` then becomes
+        //      `terminal_error_class` set on `recv_data` error,
+        //      ResponseBodyTooLarge, etc. The request DEFINITELY reached
+        //      the wire (we have headers), so `request_on_wire=true` is
+        //      the contract — but for CB / passive-health / latency
+        //      this site MUST treat the truncation as a backend failure
+        //      regardless.
+        //
+        // The unified predicate: `connection_error = error_class.is_some()
+        // && (status >= 500 implies !request_on_wire, else true)`. Or
+        // equivalently, branch on shape:
+        //
+        //   * status >= 500 + error_class set → dispatch failure;
+        //     drive `connection_error` from `!request_on_wire` so
+        //     a graceful `recv_response` close (request_on_wire=true)
+        //     reports `connection_error=false`, matching the buffered
+        //     path. This is what the previous review caught: my prior
+        //     `is_some()` shortcut tripped CB / passive-health for the
+        //     exact graceful close this PR is trying not to penalize.
+        //   * status < 500 + error_class set → mid-body abort; treat
+        //     as backend fault for CB / passive-health / latency
+        //     regardless of pre/post-wire.
+        //   * error_class None → success, `connection_error=false`.
+        let connection_error = match (h3_error_class, response_status) {
+            (None, _) => false,
+            (Some(_), s) if s >= 500 => !h3_stream_result.request_on_wire,
+            (Some(_), _) => true,
+        };
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
-            h3_error_class.is_some(),
+            connection_error,
             backend_start.elapsed(),
         );
 
@@ -1969,11 +1984,23 @@ async fn handle_h3_request(
         // ===== BUFFERED RESPONSE PATH =====
         // Collect full response for plugin body inspection/transformation and retries.
         // When retries are configured, wrap in a retry loop with target switching.
+        //
+        // `connection_error` at every consumer site below is driven by the
+        // typed [`H3PoolError::request_on_wire`] signal that
+        // `proxy_to_backend_h3` carries on `H3BufferedDispatchResult`.
+        // We do NOT re-derive it from `error_class` via
+        // `request_reached_wire`: the string-heuristic fallback in
+        // `classify_http3_error` can label a connect-phase QUIC reset as
+        // `ConnectionReset` (post-wire) when the typed pool signal
+        // correctly reports `false` (no commitment) — that mismatch
+        // would suppress `retry_on_connect_failure` and mis-account a
+        // pre-wire failure as a 502 status fault on CB / passive health.
         let (
             mut response_status,
             response_body,
             mut response_headers,
             h3_error_class,
+            h3_request_on_wire,
             final_cb_target_key,
             final_target,
         ) = if let Some(retry_config) = &proxy.retry {
@@ -1982,7 +2009,7 @@ async fn handle_h3_request(
             let mut current_cb_target_key = cb_target_key.clone();
             let mut current_url = backend_url.clone();
 
-            let (mut status, mut resp_body, mut resp_headers, mut err_class) = proxy_to_backend_h3(
+            let mut result = proxy_to_backend_h3(
                 &state,
                 &proxy,
                 &current_url,
@@ -1997,36 +2024,30 @@ async fn handle_h3_request(
             // Build a lightweight BackendResponse for should_retry — only
             // status_code and connection_error are read. Use empty body/headers
             // to avoid cloning the full response on every retry check.
-            //
-            // `connection_error` MUST be derived via `request_reached_wire` —
-            // not `err_class.is_some()` — so post-wire classes (including
-            // `GracefulRemoteClose` and `ConnectionReset` / `ProtocolError` /
-            // `ReadWriteTimeout`) do NOT bypass `retryable_methods` via
-            // `retry_on_connect_failure`. See `h3_class_implies_connection_error`.
             while crate::retry::should_retry(
                 retry_config,
                 &method,
                 &crate::retry::BackendResponse {
-                    status_code: status,
-                    connection_error: h3_class_implies_connection_error(err_class),
+                    status_code: result.status,
+                    connection_error: !result.request_on_wire,
                     body: crate::retry::ResponseBody::Buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
-                    error_class: err_class,
+                    error_class: result.error_class,
                 },
                 attempt,
             ) {
                 // Record failure against current target's circuit breaker.
-                // Same pre-wire/post-wire boundary as the retry decision so a
-                // graceful close (or any other post-wire fault) does not
-                // count as a transport-level failure for CB tripping.
+                // Same typed signal as the retry decision: a graceful close
+                // (or any other post-`send_request` fault) does not count
+                // as a transport-level failure for CB tripping.
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(status, h3_class_implies_connection_error(err_class));
+                    cb.record_failure(result.status, !result.request_on_wire);
                 }
 
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -2069,11 +2090,11 @@ async fn handle_h3_request(
                     proxy_id = %proxy.id,
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
-                    connection_error = h3_class_implies_connection_error(err_class),
+                    connection_error = !result.request_on_wire,
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
-                let retry_result = proxy_to_backend_h3(
+                result = proxy_to_backend_h3(
                     &state,
                     &proxy,
                     &current_url,
@@ -2084,23 +2105,20 @@ async fn handle_h3_request(
                     current_target.as_deref(),
                 )
                 .await;
-                status = retry_result.0;
-                resp_body = retry_result.1;
-                resp_headers = retry_result.2;
-                err_class = retry_result.3;
             }
 
             (
-                status,
-                resp_body,
-                resp_headers,
-                err_class,
+                result.status,
+                result.body,
+                result.headers,
+                result.error_class,
+                result.request_on_wire,
                 current_cb_target_key,
                 current_target,
             )
         } else {
             // No retry configured — single attempt
-            let (status, resp_body, resp_headers, err_class) = proxy_to_backend_h3(
+            let result = proxy_to_backend_h3(
                 &state,
                 &proxy,
                 &backend_url,
@@ -2112,27 +2130,29 @@ async fn handle_h3_request(
             )
             .await;
             (
-                status,
-                resp_body,
-                resp_headers,
-                err_class,
+                result.status,
+                result.body,
+                result.headers,
+                result.error_class,
+                result.request_on_wire,
                 cb_target_key,
                 upstream_target.clone(),
             )
         };
 
         // Record outcome against the final target (may differ from initial after retries).
-        // `connection_error` shares the same pre-wire/post-wire predicate as the
+        // `connection_error` shares the same typed body-on-wire signal as the
         // retry decision and CB above so passive-health / least-latency LB
-        // accounting treats a graceful close as a successful (post-wire) request
-        // for latency purposes — the request did reach the backend.
+        // accounting treats a graceful close (or any other post-`send_request`
+        // fault) as a successful (post-wire) request for latency purposes —
+        // the request did reach the backend.
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
             final_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
-            h3_class_implies_connection_error(h3_error_class),
+            !h3_request_on_wire,
             backend_start.elapsed(),
         );
 
@@ -2503,51 +2523,6 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
     crate::http3::client::classify_http3_error(e.as_error().as_ref())
 }
 
-/// Derive `connection_error: bool` from the optional `ErrorClass` returned
-/// by [`proxy_to_backend_h3`] (the BUFFERED-dispatch path). The 4-tuple
-/// return signature loses the typed
-/// [`crate::http3::client::H3PoolError::request_on_wire`] signal, so this
-/// re-derives via [`crate::retry::request_reached_wire`] — the same
-/// single boundary that drives `BackendResponse::connection_error` for
-/// every other dispatcher.
-///
-/// Returns `false` for `None` (success) and for any post-wire class
-/// (`ConnectionReset`, `ConnectionClosed`, `ProtocolError`,
-/// `ReadWriteTimeout`, `GracefulRemoteClose`, ...). Returns `true` only
-/// for pre-wire classes (`ConnectionRefused`, `DnsLookupError`,
-/// `TlsError`, `PortExhaustion`, `ConnectionPoolError`).
-///
-/// Critical for `GracefulRemoteClose`: the request reached the wire
-/// (the backend may have processed it), so the retry decision must
-/// respect `retryable_methods` rather than treating the failure as a
-/// pre-wire idempotent replay via `retry_on_connect_failure`. The
-/// circuit breaker and load-balancer outcome reporting in the buffered
-/// path also share this predicate so a graceful close is not penalized
-/// as a transport fault.
-///
-/// Pre-existing classes (`ConnectionReset`, `ProtocolError`,
-/// `ReadWriteTimeout`) get the same correction as a beneficial side
-/// effect when surfaced from `proxy_to_backend_h3` — those mean
-/// dispatch failed (status=502) at a post-wire stage, so CB sees the
-/// 502 as a status failure rather than a transport fault.
-///
-/// # Scope
-///
-/// **Only valid for sites where `error_class` represents a DISPATCH
-/// failure** (request never reached the response phase, status is the
-/// synthetic 502). The buffered-path retry loop and its final
-/// `record_backend_outcome` qualify. The STREAMING-path
-/// `record_backend_outcome` does NOT — there `error_class` carries
-/// `terminal_error_class`, which is only set when the response body
-/// aborts mid-stream AFTER 2xx headers were already flushed to the
-/// client. That site uses `error_class.is_some()` directly so a body
-/// abort is recorded as a backend failure for CB / passive-health /
-/// latency purposes. See the comment block at the streaming-path
-/// `record_backend_outcome` call for the full rationale.
-fn h3_class_implies_connection_error(class: Option<crate::retry::ErrorClass>) -> bool {
-    class.is_some_and(|c| !crate::retry::request_reached_wire(c))
-}
-
 /// Outcome of a streaming H3 proxy operation.
 ///
 /// Carries pre-stream fields (status/error_class) and body-streaming outcome
@@ -2583,6 +2558,21 @@ struct H3StreamResult {
     bytes_streamed: u64,
     client_disconnected: bool,
     body_error_class: Option<crate::retry::ErrorClass>,
+    /// Mirrors [`crate::http3::client::H3PoolError::request_on_wire`] —
+    /// `false` only when a pre-headers dispatch failure occurred where
+    /// no internal pool attempt committed the request to the backend's
+    /// application layer (DNS / TLS / connect / pre-`send_request`).
+    /// `true` for every other case: success, mid-body abort,
+    /// post-`send_request` dispatch failure, graceful close at
+    /// `recv_response`, ResponseBodyTooLarge, client disconnect.
+    ///
+    /// This is the typed signal the streaming-path
+    /// `record_backend_outcome` site uses to drive `connection_error`
+    /// for dispatch failures. See the call site comment block for why
+    /// re-deriving from `error_class` is wrong (a connect-phase QUIC
+    /// reset can string-classify as `ConnectionReset` even though no
+    /// request reached the backend).
+    request_on_wire: bool,
 }
 
 /// Streaming proxy path: sends backend response chunks directly to the H3 client
@@ -2639,6 +2629,18 @@ async fn proxy_to_backend_h3_streaming(
         Ok(r) => r,
         Err(e) => {
             error!("Backend request failed (HTTP/3 streaming): {}", e);
+            // Capture the typed body-on-wire signal BEFORE classifying so
+            // the streaming-path `record_backend_outcome` can drive
+            // `connection_error` from `H3PoolError::request_on_wire()`
+            // rather than re-deriving from `error_class`. The class is a
+            // string-heuristic-friendly label; the typed bool is
+            // ground-truth for "did any internal pool attempt commit the
+            // request to the backend?". A connect-phase QUIC reset can
+            // string-classify as `ConnectionReset` (post-wire by
+            // `request_reached_wire`) even though no request reached the
+            // backend — the typed signal correctly reports `false` for
+            // that case.
+            let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
@@ -2658,6 +2660,7 @@ async fn proxy_to_backend_h3_streaming(
                 bytes_streamed: 0,
                 client_disconnected: false,
                 body_error_class: None,
+                request_on_wire,
             });
         }
     };
@@ -2703,6 +2706,11 @@ async fn proxy_to_backend_h3_streaming(
             bytes_streamed: 0,
             client_disconnected: false,
             body_error_class: None,
+            // Headers were already received from the backend before we
+            // discovered the body exceeded our limit, so the request
+            // reached the wire. The 502 we synthesize is a gateway-side
+            // policy rejection, not a transport failure.
+            request_on_wire: true,
         });
     }
 
@@ -2753,6 +2761,9 @@ async fn proxy_to_backend_h3_streaming(
             bytes_streamed: 0,
             client_disconnected: true,
             body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+            // Headers came back from the backend; the request reached
+            // the wire. The client gave up on us between then and now.
+            request_on_wire: true,
         });
     }
 
@@ -2891,7 +2902,41 @@ async fn proxy_to_backend_h3_streaming(
         bytes_streamed,
         client_disconnected,
         body_error_class,
+        // Reached this point only after `request_streaming` returned
+        // `Ok(_)`, which means the H3 pool committed the request and
+        // produced response headers. Mid-stream aborts are post-wire
+        // by construction — we already have headers from the backend.
+        request_on_wire: true,
     })
+}
+
+/// Outcome of a buffered HTTP/3 backend request.
+///
+/// Carries the typed [`crate::http3::client::H3PoolError::request_on_wire`]
+/// signal alongside the conventional response fields so call sites can
+/// drive `connection_error` directly from the pool's body-on-wire bool
+/// rather than re-deriving it from `error_class` via
+/// [`crate::retry::request_reached_wire`]. The latter is fragile for
+/// H3 because the string-heuristic fallback in `classify_http3_error`
+/// can label a connect-phase QUIC reset as `ConnectionReset`
+/// (post-wire by `request_reached_wire`) when the typed signal would
+/// correctly report it as `request_on_wire=false` (no commitment).
+///
+/// `request_on_wire` semantics:
+/// - `true` for success and for any error path where the H3 pool
+///   committed the request to the backend on at least one internal
+///   attempt (post-`send_request`, including graceful-close at
+///   `recv_response`, mid-body abort, ResponseBodyTooLarge).
+/// - `false` only for pre-commitment dispatch failures: DNS / TLS /
+///   connect / pre-`send_request`. Drives
+///   `BackendResponse::connection_error = true` so
+///   `retry_on_connect_failure` can fire regardless of HTTP method.
+struct H3BufferedDispatchResult {
+    status: u16,
+    body: Vec<u8>,
+    headers: HashMap<String, String>,
+    error_class: Option<crate::retry::ErrorClass>,
+    request_on_wire: bool,
 }
 
 /// Proxy a request to the backend (buffered path — collects full response body).
@@ -2907,12 +2952,7 @@ async fn proxy_to_backend_h3(
     body_bytes: &[u8],
     client_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
-) -> (
-    u16,
-    Vec<u8>,
-    HashMap<String, String>,
-    Option<crate::retry::ErrorClass>,
-) {
+) -> H3BufferedDispatchResult {
     let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
     let body = bytes::Bytes::copy_from_slice(body_bytes);
 
@@ -2951,23 +2991,47 @@ async fn proxy_to_backend_h3(
                     resp_body.len(),
                     state.max_response_body_size_bytes
                 );
-                return (
-                    502,
-                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                return H3BufferedDispatchResult {
+                    status: 502,
+                    body: r#"{"error":"Backend response body exceeds maximum size"}"#
                         .as_bytes()
                         .to_vec(),
-                    HashMap::new(),
-                    Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-                );
+                    headers: HashMap::new(),
+                    error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                    // We received the full response from the backend before
+                    // discovering the size violation; the request reached
+                    // the wire. The 502 we synthesize here is a gateway-
+                    // side policy rejection.
+                    request_on_wire: true,
+                };
             }
 
-            (status, resp_body, resp_headers, None)
+            H3BufferedDispatchResult {
+                status,
+                body: resp_body,
+                headers: resp_headers,
+                error_class: None,
+                // Successful response — the request was committed and
+                // the response was received. `request_on_wire=true` means
+                // `connection_error=false` at every consumer site.
+                request_on_wire: true,
+            }
         }
         Err(e) => {
             error!(
                 "Backend request failed (HTTP/3 frontend): connection error details: {}",
                 e
             );
+            // Capture the typed body-on-wire signal BEFORE classifying
+            // the error: it is the authoritative input to
+            // `connection_error` at every consumer site (retry decision,
+            // CB record_failure, warn log, record_backend_outcome).
+            // Re-deriving from `error_class` via `request_reached_wire`
+            // is fragile because the string-heuristic fallback in
+            // `classify_http3_error` can label a connect-phase QUIC
+            // reset as `ConnectionReset` (post-wire) when the typed
+            // signal correctly reports `false` (no commitment).
+            let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
@@ -2979,12 +3043,13 @@ async fn proxy_to_backend_h3(
             } else {
                 br#"{"error":"Backend unavailable"}"#
             };
-            (
-                502,
-                error_body.to_vec(),
-                HashMap::new(),
-                Some(h3_error_class),
-            )
+            H3BufferedDispatchResult {
+                status: 502,
+                body: error_body.to_vec(),
+                headers: HashMap::new(),
+                error_class: Some(h3_error_class),
+                request_on_wire,
+            }
         }
     }
 }
@@ -3245,165 +3310,157 @@ fn record_request(state: &ProxyState, status: u16) {
 }
 
 #[cfg(test)]
-mod h3_class_implies_connection_error_tests {
-    //! Regression tests for the `h3_class_implies_connection_error` predicate
-    //! that drives the retry decision, circuit breaker, and outcome reporting
-    //! in the H3 frontend buffered-DISPATCH path.
+mod h3_streaming_outcome_tests {
+    //! Regression tests for the streaming-path `record_backend_outcome`
+    //! predicate that drives CB / passive-health / latency reporting.
     //!
-    //! Pre-fix the buffered-response retry loop derived `connection_error`
-    //! via `err_class.is_some()`, which over-reports every post-wire class
-    //! as a connection failure. That bypasses `retryable_methods` (a POST
-    //! that hit a graceful close or stream reset got replayed as if pre-wire)
-    //! and trips CB / passive-health counters as if the request had not
-    //! reached the backend.
+    //! The contract has two distinct shapes that the predicate must
+    //! disambiguate (see the comment block at the call site for the
+    //! full rationale):
     //!
-    //! IMPORTANT scope: the helper is only valid for sites where
-    //! `error_class` represents a DISPATCH failure (status=502, response
-    //! never started). The STREAMING-response path uses `error_class.is_some()`
-    //! directly because there `error_class` carries `terminal_error_class`,
-    //! which is set when the body aborts mid-stream AFTER 2xx headers were
-    //! flushed — a real backend fault that the helper would mis-report as
-    //! a clean response. See `streaming_path_predicate_treats_mid_body_abort_as_failure`.
-    use super::h3_class_implies_connection_error;
+    //! 1. PRE-HEADERS DISPATCH FAILURE (status >= 500): use the typed
+    //!    `H3StreamResult::request_on_wire` signal directly. A graceful
+    //!    close at `recv_response` reports `request_on_wire=true`, so
+    //!    `connection_error=false` — matching the buffered path,
+    //!    avoiding the CB/health trip that the previous review flagged.
+    //!
+    //! 2. MID-BODY ABORT (status < 500, error_class set): always treat
+    //!    as backend failure. The request DID reach the wire (we
+    //!    received headers), but the response was truncated.
+    //!
+    //! Pre-fix the streaming site used `error_class.is_some()`, which
+    //! conflated these shapes — graceful `recv_response` close trips
+    //! CB / passive-health for the exact case the PR is meant to
+    //! suppress. The current site uses a 3-arm match on
+    //! `(error_class, status)` plus the typed bool to disambiguate.
     use crate::retry::ErrorClass;
-    use crate::retry::request_reached_wire;
+
+    /// Mirrors the predicate in `handle_h3_request`'s streaming branch.
+    /// Kept as a free function so the test can assert against it
+    /// without setting up the full handler harness.
+    fn streaming_path_connection_error(
+        error_class: Option<ErrorClass>,
+        status: u16,
+        request_on_wire: bool,
+    ) -> bool {
+        match (error_class, status) {
+            (None, _) => false,
+            (Some(_), s) if s >= 500 => !request_on_wire,
+            (Some(_), _) => true,
+        }
+    }
 
     #[test]
-    fn none_is_not_a_connection_error() {
+    fn dispatch_graceful_close_is_not_connection_error() {
+        // The exact case the PR review caught. Pre-fix `is_some()` said
+        // true; helper-derived predicate said true via ConnectionClosed
+        // string-matching; only the typed signal correctly says false.
         assert!(
-            !h3_class_implies_connection_error(None),
-            "Successful request must report connection_error=false"
+            !streaming_path_connection_error(
+                Some(ErrorClass::GracefulRemoteClose),
+                502,
+                /* request_on_wire = */ true,
+            ),
+            "graceful close at recv_response (post-`send_request`) must NOT \
+             trip CB / passive-health"
         );
     }
 
     #[test]
-    fn graceful_remote_close_is_post_wire() {
-        // The reason this whole helper exists. A graceful close at
-        // recv_response is post-wire by construction (the backend
-        // received and may have processed the request before tearing
-        // down). Treating it as connection_error=true would bypass
-        // `retryable_methods` for non-idempotent requests.
-        assert!(
-            !h3_class_implies_connection_error(Some(ErrorClass::GracefulRemoteClose)),
-            "GracefulRemoteClose must NOT be treated as a connection error — \
-             the request reached the wire and may have been processed"
-        );
-    }
-
-    #[test]
-    fn pre_wire_classes_are_connection_errors() {
-        // Genuine connect-class failures must still drive
-        // `retry_on_connect_failure` regardless of HTTP method.
-        // This list mirrors the negative-list inside `request_reached_wire`;
-        // the cross-check below catches a future edit there.
+    fn dispatch_pre_wire_failure_is_connection_error() {
+        // DNS / TLS / connect failures: the request never reached the
+        // backend. CB sees a real transport-level failure.
         for class in [
-            ErrorClass::ConnectionRefused,
-            ErrorClass::ConnectionTimeout,
             ErrorClass::DnsLookupError,
             ErrorClass::TlsError,
+            ErrorClass::ConnectionRefused,
+            ErrorClass::ConnectionTimeout,
             ErrorClass::PortExhaustion,
             ErrorClass::ConnectionPoolError,
         ] {
             assert!(
-                h3_class_implies_connection_error(Some(class)),
-                "{class:?} is pre-wire and must report connection_error=true"
-            );
-            assert!(
-                !request_reached_wire(class),
-                "{class:?} listed as pre-wire here but request_reached_wire \
-                 disagrees — pick one source of truth"
+                streaming_path_connection_error(
+                    Some(class),
+                    502,
+                    /* request_on_wire = */ false,
+                ),
+                "{class:?}: pre-wire dispatch failure must record connection_error=true"
             );
         }
     }
 
     #[test]
-    fn post_wire_classes_are_not_connection_errors() {
-        // The whole point of the fix: post-wire classes that would
-        // previously fall under `err_class.is_some() == true` now
-        // correctly report `connection_error=false` so the retry
-        // decision respects `retryable_methods` and CB / passive-health
-        // accounting attributes the failure to backend processing
-        // rather than transport unavailability.
-        let post_wire = [
-            ErrorClass::ConnectionReset,
-            ErrorClass::ConnectionClosed,
+    fn dispatch_post_wire_non_graceful_uses_typed_signal() {
+        // A connect-phase QUIC reset can string-classify as
+        // ConnectionReset (post-wire by `request_reached_wire`) when no
+        // request actually reached the backend. The typed signal —
+        // `H3PoolError::request_on_wire()` plumbed through to
+        // `H3StreamResult::request_on_wire` — disambiguates correctly.
+        // Pre-fix the helper-derived predicate was wrong here:
+        //   * helper(ConnectionReset) = false (post-wire by class)
+        //   * connect-phase reality: pre-wire (no commitment)
+        // The typed signal makes this trivially correct.
+        assert!(
+            streaming_path_connection_error(
+                Some(ErrorClass::ConnectionReset),
+                502,
+                /* request_on_wire = */ false,
+            ),
+            "connect-phase ConnectionReset (typed signal=false) must record \
+             connection_error=true regardless of class string heuristics"
+        );
+        assert!(
+            !streaming_path_connection_error(
+                Some(ErrorClass::ConnectionReset),
+                502,
+                /* request_on_wire = */ true,
+            ),
+            "post-`send_request` ConnectionReset (typed signal=true) must \
+             record connection_error=false — matches buffered-path semantics"
+        );
+    }
+
+    #[test]
+    fn mid_body_abort_is_connection_error_regardless_of_typed_signal() {
+        // Headers were already flushed to the client (status<500); the
+        // body then aborted. Even though the request demonstrably
+        // reached the wire (request_on_wire=true), CB / passive-health /
+        // latency should treat the truncation as a backend fault.
+        for class in [
             ErrorClass::ProtocolError,
             ErrorClass::ReadWriteTimeout,
-            ErrorClass::GracefulRemoteClose,
-            ErrorClass::ClientDisconnect,
-            ErrorClass::RequestBodyTooLarge,
+            ErrorClass::ConnectionReset,
+            ErrorClass::ConnectionClosed,
             ErrorClass::ResponseBodyTooLarge,
-            ErrorClass::RequestError,
-        ];
-        for class in post_wire {
+        ] {
             assert!(
-                !h3_class_implies_connection_error(Some(class)),
-                "{class:?} is post-wire and must report connection_error=false"
-            );
-            // Cross-check: the helper must agree with the canonical
-            // `request_reached_wire` predicate. If a future edit shifts
-            // a class between pre-wire and post-wire, this assertion
-            // ensures both ends update together.
-            assert!(
-                request_reached_wire(class),
-                "{class:?} listed as post-wire here but request_reached_wire \
-                 disagrees — pick one source of truth"
+                streaming_path_connection_error(
+                    Some(class),
+                    200,
+                    /* request_on_wire = */ true,
+                ),
+                "{class:?}: mid-body abort with status<500 must record \
+                 connection_error=true even though request reached the wire"
             );
         }
     }
 
-    /// Regression for the [PR #506 review P1
-    /// finding](https://github.com/ferrum-edge/ferrum-edge/pull/506#discussion_r3145422373):
-    /// the streaming-response site of `record_backend_outcome` must treat
-    /// a non-`None` `H3StreamResult.error_class` as a backend failure,
-    /// regardless of pre-wire/post-wire classification. `error_class` at
-    /// that site carries `terminal_error_class`, which `proxy_to_backend_h3_streaming`
-    /// only sets when the body aborts mid-stream AFTER 2xx headers were
-    /// flushed to the client.
-    ///
-    /// If a future refactor tries to consolidate the two `record_backend_outcome`
-    /// sites onto `h3_class_implies_connection_error`, the assertions
-    /// below fire and direct the reader at this docstring.
     #[test]
-    fn streaming_path_predicate_treats_mid_body_abort_as_failure() {
-        // Body aborts on a streaming response surface as `terminal_error_class`
-        // populated with one of these (see `proxy_to_backend_h3_streaming`).
-        // ALL of them must drive `connection_error=true` for CB / passive-health /
-        // latency at the streaming-path site — even though the helper would
-        // (correctly, for its own scope) say `false`.
-        let body_abort_classes = [
-            ErrorClass::ProtocolError,        // h3 RESET_STREAM mid-body
-            ErrorClass::ReadWriteTimeout,     // recv_data timed out mid-body
-            ErrorClass::ConnectionReset,      // QUIC reset mid-body
-            ErrorClass::ConnectionClosed,     // non-graceful close mid-body
-            ErrorClass::ResponseBodyTooLarge, // body exceeded configured limit
-        ];
-
-        for class in body_abort_classes {
-            // The helper says false (request reached the wire) — correct
-            // for retry / dispatch semantics, WRONG for streaming outcome.
-            assert!(
-                !h3_class_implies_connection_error(Some(class)),
-                "{class:?}: helper should say 'reached wire'"
-            );
-
-            // The streaming path's site uses `is_some()` instead — that's
-            // the predicate this regression test pins down.
-            let streaming_path_predicate = Some(class).is_some();
-            assert!(
-                streaming_path_predicate,
-                "{class:?}: streaming-path `error_class.is_some()` MUST report \
-                 a body abort as a backend failure for CB / passive-health / \
-                 latency. If a refactor replaces this with the helper, the \
-                 mid-body abort silently records as a clean 2xx success."
-            );
-        }
-
-        // Sanity: a clean streaming response (error_class=None) records as success.
+    fn clean_streaming_response_is_not_connection_error() {
+        // No error class set — the streaming response completed.
         assert!(
-            Option::<ErrorClass>::None.is_none(),
-            "successful streaming response (error_class=None) must NOT report \
-             a connection error — record latency, CB success, passive-health success"
+            !streaming_path_connection_error(None, 200, /* request_on_wire = */ true),
+            "successful streaming response must record connection_error=false \
+             so latency is sampled and CB sees a success"
+        );
+        // Even a 5xx STATUS from the backend with no error_class is a
+        // legitimate response that the backend chose to send. Not a
+        // transport-level failure; CB sees the 5xx via its
+        // `failure_status_codes` config, not via `connection_error`.
+        assert!(
+            !streaming_path_connection_error(None, 503, /* request_on_wire = */ true),
+            "backend-emitted 5xx without an error class is a status failure, \
+             not a connection failure"
         );
     }
 }
