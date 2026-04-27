@@ -242,6 +242,7 @@ pub(crate) fn is_h3_graceful_close(e: &h3::error::StreamError) -> bool {
 ///   are available to forward.
 /// - Otherwise → [`H3PoolError::post_wire`]: a real transport / protocol
 ///   failure that should drive the H3 capability downgrade.
+#[inline]
 fn recv_response_err(e: h3::error::StreamError) -> H3PoolError {
     if is_h3_graceful_close(&e) {
         // Backend tore the connection down with `H3_NO_ERROR` (or sent
