@@ -369,17 +369,26 @@ fn collect_reqwest_warmup_candidates_for_proxy(
 /// and the gated HTTPS warmup phase. `label` identifies the batch in log
 /// lines so operators can tell the two phases apart.
 ///
-/// The semaphore is the actual concurrency cap — `for_each_concurrent` only
-/// provides the polling buffer. Phase-1 shares the semaphore with the
-/// capability refresh so the combined fanout never exceeds
-/// `pool_warmup_concurrency`. Without the shared semaphore, two
+/// The semaphore is the actual concurrency cap — `for_each_concurrent`'s
+/// `buffer` argument is only the *polling-window* size. Phase-1 shares the
+/// semaphore with the capability refresh so the combined fanout never
+/// exceeds `pool_warmup_concurrency`. Without the shared semaphore, two
 /// `tokio::join!`-ed batches each independently respecting that limit
 /// would burst to ~2× (or more, since per-HTTPS-target probes also
 /// `tokio::join!` H2 + H3 internally) — overloading backends and
 /// triggering avoidable startup timeouts in large configs.
+///
+/// `polling_buffer` is the configured `pool_warmup_concurrency` cap, NOT
+/// `semaphore.available_permits()`. The semaphore can be momentarily
+/// drained by the parallel capability refresh at the moment this function
+/// is entered, which would clamp the polling buffer to 1 and serialize
+/// the rest of the batch even after the refresh releases its permits.
+/// Sizing the buffer from the configured cap keeps the polling window
+/// large enough to absorb permit churn.
 async fn run_warmup_task_batch(
     tasks: Vec<WarmupTask>,
     semaphore: Arc<Semaphore>,
+    polling_buffer: usize,
     label: &'static str,
 ) {
     use futures_util::stream;
@@ -390,16 +399,15 @@ async fn run_warmup_task_batch(
     }
 
     let total = tasks.len();
-    let concurrency_cap = semaphore.available_permits();
     info!(
         "Pool warmup ({}): establishing {} backend connections (shared concurrency cap={})",
-        label, total, concurrency_cap
+        label, total, polling_buffer
     );
 
     let ok = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
 
-    let buffer = concurrency_cap.max(1);
+    let buffer = polling_buffer.max(1);
     stream::iter(tasks)
         .for_each_concurrent(buffer, |task| {
             let ok = ok.clone();
@@ -1688,25 +1696,33 @@ impl ProxyState {
     }
 
     pub async fn refresh_backend_capabilities(&self) {
-        let semaphore = Arc::new(Semaphore::new(
-            self.env_config.pool_warmup_concurrency.max(1),
-        ));
-        self.refresh_backend_capabilities_with_semaphore(semaphore)
+        let cap = self.env_config.pool_warmup_concurrency.max(1);
+        let semaphore = Arc::new(Semaphore::new(cap));
+        self.refresh_backend_capabilities_with_semaphore(semaphore, cap)
             .await;
     }
 
     /// Inner implementation of `refresh_backend_capabilities` that takes an
-    /// externally-supplied semaphore. The startup `warmup_connection_pools`
-    /// path uses this entry point to share a single concurrency budget
-    /// across the capability refresh AND the parallel HTTP reqwest warmup
-    /// batch — without it, each `for_each_concurrent` independently honours
-    /// its own `pool_warmup_concurrency` cap, doubling (or worse) the
-    /// effective fanout when both batches run via `tokio::join!`. The
-    /// public `refresh_backend_capabilities()` wrapper preserves the
+    /// externally-supplied semaphore plus the configured polling buffer
+    /// size. The startup `warmup_connection_pools` path uses this entry
+    /// point to share a single concurrency budget across the capability
+    /// refresh AND the parallel HTTP reqwest warmup batch — without it,
+    /// each `for_each_concurrent` independently honours its own
+    /// `pool_warmup_concurrency` cap, doubling (or worse) the effective
+    /// fanout when both batches run via `tokio::join!`. The public
+    /// `refresh_backend_capabilities()` wrapper preserves the
     /// background-refresh semantics by minting a per-call semaphore.
+    ///
+    /// `polling_buffer` is the configured `pool_warmup_concurrency` cap,
+    /// NOT `semaphore.available_permits()`. The semaphore can be
+    /// momentarily drained by the parallel HTTP warmup batch at the
+    /// moment this function is entered (or vice-versa), which would
+    /// clamp the polling buffer and serialize subsequent work. Passing
+    /// the configured cap keeps the polling window stable.
     pub(crate) async fn refresh_backend_capabilities_with_semaphore(
         &self,
         semaphore: Arc<Semaphore>,
+        polling_buffer: usize,
     ) {
         use futures_util::stream;
 
@@ -1717,11 +1733,7 @@ impl ProxyState {
             return;
         }
 
-        // Buffer for `for_each_concurrent` is just a polling-window upper
-        // bound — the semaphore is the actual concurrency cap. Sized to
-        // the semaphore's permit count so we don't over-buffer per-target
-        // futures sitting blocked on the permit.
-        let buffer = semaphore.available_permits().max(1);
+        let buffer = polling_buffer.max(1);
         let refreshed = Arc::new(AtomicU64::new(0));
         let h2_supported = Arc::new(AtomicU64::new(0));
         let h3_supported = Arc::new(AtomicU64::new(0));
@@ -1939,29 +1951,47 @@ impl ProxyState {
 
         // Phase 1: capability refresh ‖ HTTP-only reqwest warmup. HTTP
         // candidates always warm — the direct H2 pool is HTTPS-only, so
-        // HTTP backends have no alternative dispatch path.
+        // HTTP backends have no alternative dispatch path. Both batches
+        // share the same semaphore (concurrency cap) AND get the same
+        // configured polling buffer — see `run_warmup_task_batch` for
+        // why we don't size the buffer from `available_permits()`.
         let http_tasks: Vec<WarmupTask> = http_candidates
             .into_values()
             .map(|c| Self::build_reqwest_warmup_task(self.connection_pool.clone(), c))
             .collect();
         let http_label = "reqwest http";
         let refresh_fut =
-            self.refresh_backend_capabilities_with_semaphore(warmup_semaphore.clone());
-        let http_warmup_fut =
-            run_warmup_task_batch(http_tasks, warmup_semaphore.clone(), http_label);
+            self.refresh_backend_capabilities_with_semaphore(warmup_semaphore.clone(), concurrency);
+        let http_warmup_fut = run_warmup_task_batch(
+            http_tasks,
+            warmup_semaphore.clone(),
+            concurrency,
+            http_label,
+        );
         tokio::join!(refresh_fut, http_warmup_fut);
 
         // Phase 2: HTTPS reqwest warmup with capability + needs-reqwest
-        // gating. Skip iff BOTH conditions hold for the target:
+        // gating. Skip iff ALL of these hold for the target:
         //   1. The capability registry classifies it h2_tls=Supported (so
-        //      the direct H2 pool can talk to the backend), AND
+        //      the direct H2 pool can talk to the backend for H1/H2
+        //      frontend traffic), AND
         //   2. No proxy routing to this target has a configuration that
         //      forces reqwest dispatch — i.e. `requires_reqwest_warmup`
-        //      is `false` after OR-merging all sharing proxies.
-        // If either condition is false we warm reqwest. This guards the
-        // reviewer-flagged regression where per-target dedup hides a
-        // sibling proxy whose retries / body plugins / explicit
-        // `pool_enable_http2: false` still routes via reqwest.
+        //      is `false` after OR-merging all sharing proxies, AND
+        //   3. The HTTP/3 frontend listener is NOT enabled. The
+        //      `http3::cross_protocol::run` bridge sends ALL non-native-H3
+        //      backend traffic from H3 frontend clients through
+        //      `connection_pool.get_client(proxy)` (reqwest), regardless of
+        //      whether the direct H2 pool would have served the same
+        //      request from an H1/H2 frontend client. That means:
+        //      - gRPC over H3 frontend → reqwest (always cross-protocol)
+        //      - Plain over H3 frontend when backend `h3=Unsupported` →
+        //        reqwest (cross-protocol fallback)
+        //      We can't predict at warmup time whether a proxy will see
+        //      H3 frontend traffic of either flavor, so the safe rule is:
+        //      H3 enabled ⇒ keep reqwest warm for every HTTPS target.
+        // If any condition is false we warm reqwest.
+        let h3_frontend_enabled = self.env_config.enable_http3;
         let total_https_candidates = https_candidates.len();
         let mut https_tasks: Vec<WarmupTask> = Vec::with_capacity(total_https_candidates);
         let mut skipped_h2_tls = 0usize;
@@ -1972,9 +2002,9 @@ impl ProxyState {
                 &candidate.host,
                 candidate.port,
             );
-            if h2_tls_covered && !candidate.requires_reqwest_warmup {
+            if h2_tls_covered && !candidate.requires_reqwest_warmup && !h3_frontend_enabled {
                 debug!(
-                    "Pool warmup: skipping reqwest HEAD for {}:{} (direct H2 pool covers every routing proxy)",
+                    "Pool warmup: skipping reqwest HEAD for {}:{} (direct H2 pool covers every routing proxy, H3 frontend disabled)",
                     candidate.host, candidate.port
                 );
                 skipped_h2_tls += 1;
@@ -1990,8 +2020,13 @@ impl ProxyState {
                 "Pool warmup: gating skipped {} of {} HTTPS reqwest targets (direct H2 pool covers them and no routing proxy forces reqwest)",
                 skipped_h2_tls, total_https_candidates
             );
+        } else if h3_frontend_enabled && total_https_candidates > 0 {
+            debug!(
+                "Pool warmup: H3 frontend enabled, keeping reqwest warm for all {} HTTPS targets (cross-protocol bridge dispatches non-native-H3 backend traffic via reqwest)",
+                total_https_candidates
+            );
         }
-        run_warmup_task_batch(https_tasks, warmup_semaphore, "reqwest https").await;
+        run_warmup_task_batch(https_tasks, warmup_semaphore, concurrency, "reqwest https").await;
     }
 
     /// Build a single reqwest HEAD warmup task from a candidate. The
@@ -11192,8 +11227,8 @@ mod tests {
         );
 
         tokio::join!(
-            run_warmup_task_batch(batch_a, semaphore.clone(), "batch-a"),
-            run_warmup_task_batch(batch_b, semaphore.clone(), "batch-b"),
+            run_warmup_task_batch(batch_a, semaphore.clone(), PERMITS, "batch-a"),
+            run_warmup_task_batch(batch_b, semaphore.clone(), PERMITS, "batch-b"),
         );
 
         let peak = observed_peak.load(Ordering::SeqCst);
@@ -11207,6 +11242,94 @@ mod tests {
         assert!(
             peak >= 1,
             "sanity: at least one task should have been observed in-flight"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every task must release its permit on completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_warmup_task_batch_polling_buffer_survives_initial_permit_drain() {
+        // Codex P3 regression: previously the polling buffer for the
+        // batch's `for_each_concurrent` was sized from
+        // `semaphore.available_permits()` at function entry. If a sibling
+        // task (the parallel capability refresh) had already taken every
+        // permit at that moment, `available_permits()` returned 0, the
+        // buffer clamped to 1, and the rest of the batch was serialized
+        // — the buffer never grew back even after the sibling released
+        // permits. The fix passes the configured cap as a separate
+        // `polling_buffer` parameter.
+        //
+        // This test pre-drains every permit from a small semaphore,
+        // releases them after a brief delay, and then runs a batch of
+        // tasks that record their concurrent count. With the bug, the
+        // batch would observe peak ≈ 1 (serialized). With the fix, the
+        // batch observes peak ≈ permit count.
+        use std::sync::atomic::AtomicUsize;
+
+        const PERMITS: usize = 4;
+        const POLLING_BUFFER: usize = PERMITS;
+        const TASKS: usize = 16;
+
+        let semaphore = Arc::new(Semaphore::new(PERMITS));
+
+        // Pre-drain every permit BEFORE entering `run_warmup_task_batch`.
+        // This simulates the parallel-batch race the bug observes — the
+        // sibling refresh has already grabbed the budget at function
+        // entry. Hold the permits in a separate task that releases them
+        // ~50 ms in (long enough for `run_warmup_task_batch` to enter and
+        // size its polling buffer).
+        let mut held = Vec::with_capacity(PERMITS);
+        for _ in 0..PERMITS {
+            held.push(
+                semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("acquire permit for pre-drain"),
+            );
+        }
+        let release_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let observed_peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<WarmupTask> = (0..TASKS)
+            .map(|i| {
+                let in_flight = in_flight.clone();
+                let observed_peak = observed_peak.clone();
+                let task: WarmupTask = Box::pin(async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    observed_peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(format!("task-{i}"))
+                });
+                task
+            })
+            .collect();
+
+        run_warmup_task_batch(tasks, semaphore.clone(), POLLING_BUFFER, "buffer-test").await;
+        release_handle.await.expect("release task");
+
+        let peak = observed_peak.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "polling buffer must NOT clamp to 1 when permits are momentarily \
+             unavailable at function entry: observed peak={peak} (Codex P3 \
+             regression — sizing buffer from `available_permits()` at entry \
+             would serialize the rest of the batch even after permits free up). \
+             Permit count={PERMITS}, expected peak ~= {PERMITS} once the \
+             pre-drain releases."
+        );
+        assert!(
+            peak <= PERMITS,
+            "polling buffer expansion must still honour the semaphore cap: \
+             observed peak={peak} > permits={PERMITS}"
         );
         assert_eq!(
             in_flight.load(Ordering::SeqCst),
