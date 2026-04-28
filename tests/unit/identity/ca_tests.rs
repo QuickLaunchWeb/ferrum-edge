@@ -157,3 +157,74 @@ async fn internal_ca_rejects_unknown_trust_domain_for_bundle() {
     let result = ca.trust_bundle(&other).await;
     assert!(matches!(result, Err(CaError::UnknownTrustDomain(_))));
 }
+
+#[test]
+fn internal_ca_rejects_mismatched_cert_and_key() {
+    // Bootstrap two unrelated dev roots, then construct an InternalCa with
+    // root #1's cert and root #2's key. The self-test in `InternalCa::new`
+    // must catch this mismatch and refuse to start.
+    let guard = EnvGuard::new(&[
+        "FERRUM_MESH_PRODUCTION_MODE",
+        "FERRUM_MESH_CA_BOOTSTRAP_DEV",
+    ]);
+    let root_a = dev_root_inside_guard("td.mismatch-a", &guard);
+    let root_b = dev_root_inside_guard("td.mismatch-b", &guard);
+    let trust_domain = TrustDomain::new("td.mismatch-a").unwrap();
+    let cfg = internal::InternalCaConfig {
+        root_cert_pem: root_a.root_cert_pem,
+        root_key_pem: root_b.root_key_pem,
+        trust_domain,
+        bundle_refresh_hint_secs: None,
+        default_svid_ttl_secs: 600,
+        max_svid_ttl_secs: 3600,
+    };
+    let result = internal::InternalCa::new(cfg);
+    match result {
+        Err(CaError::Config(msg)) => {
+            assert!(
+                msg.contains("cert/key mismatch") || msg.contains("does not match"),
+                "expected cert/key mismatch error, got: {msg}"
+            );
+        }
+        Ok(_) => panic!("expected CaError::Config(cert/key mismatch), got Ok"),
+        Err(other) => panic!("expected CaError::Config, got {other:?}"),
+    }
+}
+
+#[test]
+fn internal_ca_rejects_multi_block_root_pem() {
+    // Two valid roots concatenated. `InternalCa::new` must reject this — a
+    // chain in the root slot would silently use only the first block as the
+    // trust anchor.
+    let guard = EnvGuard::new(&[
+        "FERRUM_MESH_PRODUCTION_MODE",
+        "FERRUM_MESH_CA_BOOTSTRAP_DEV",
+    ]);
+    let root_a = dev_root_inside_guard("td.multi-a", &guard);
+    let root_b = dev_root_inside_guard("td.multi-b", &guard);
+    let mut concat = root_a.root_cert_pem.clone();
+    if !concat.ends_with('\n') {
+        concat.push('\n');
+    }
+    concat.push_str(&root_b.root_cert_pem);
+    let trust_domain = TrustDomain::new("td.multi-a").unwrap();
+    let cfg = internal::InternalCaConfig {
+        root_cert_pem: concat,
+        root_key_pem: root_a.root_key_pem,
+        trust_domain,
+        bundle_refresh_hint_secs: None,
+        default_svid_ttl_secs: 600,
+        max_svid_ttl_secs: 3600,
+    };
+    let result = internal::InternalCa::new(cfg);
+    match result {
+        Err(CaError::Config(msg)) => {
+            assert!(
+                msg.contains("more than one") || msg.contains("multiple"),
+                "expected multi-block PEM rejection, got: {msg}"
+            );
+        }
+        Ok(_) => panic!("expected CaError::Config(multi-block), got Ok"),
+        Err(other) => panic!("expected CaError::Config, got {other:?}"),
+    }
+}

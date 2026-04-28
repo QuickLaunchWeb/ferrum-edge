@@ -35,7 +35,7 @@ pub const MAX_SPIFFE_ID_LEN: usize = 2048;
 /// Use [`SpiffeId::new`] / [`SpiffeId::from_str`] to parse. The internal
 /// representation stores the canonical URI string; the trust domain and path
 /// are also kept as parsed views to avoid re-parsing on every access.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpiffeId {
     /// Full URI form (`spiffe://<td>/<path>`), validated.
     uri: String,
@@ -44,6 +44,17 @@ pub struct SpiffeId {
     path_offset: usize,
     /// Cached trust domain.
     trust_domain: TrustDomain,
+}
+
+impl std::hash::Hash for SpiffeId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The validated `uri` string is canonical: `path_offset` and
+        // `trust_domain` are derived from it. Hashing only `uri` matches the
+        // documented "byte-exact on the validated string form" semantics
+        // and ensures that the manual impl never drifts from `PartialEq`,
+        // which also keys on `uri` byte-equality.
+        self.uri.hash(state);
+    }
 }
 
 impl SpiffeId {

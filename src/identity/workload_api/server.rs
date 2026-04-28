@@ -139,13 +139,17 @@ impl WorkloadApiService {
             x509_svid: chain_concat,
             x509_svid_key: svid.private_key_pkcs8_der,
             bundle: bundle_concat,
-            hint: svid.not_after.timestamp(),
+            // The SPIFFE Workload API `hint` field is an operator-specified
+            // workload-matching hint (string), not a timestamp. We have no
+            // hint to propagate today; the cert's NotAfter is in the cert
+            // itself and is what consumers parse for rotation.
+            hint: String::new(),
         };
 
         Ok(X509svidResponse {
             svids: vec![proto_svid],
+            crl: Vec::new(),
             federated_bundles: Default::default(),
-            hint: bundle.refresh_hint_secs.unwrap_or(0) as i64,
         })
     }
 }
@@ -184,7 +188,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         bundles.insert(self.trust_domain.to_string(), bundle_concat);
 
         let response = X509BundlesResponse {
-            hint: bundle.refresh_hint_secs.unwrap_or(0) as i64,
+            crl: Vec::new(),
             bundles,
         };
         let stream = futures_util::stream::iter(vec![Ok(response)]);

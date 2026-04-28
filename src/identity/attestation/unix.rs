@@ -124,6 +124,26 @@ impl Attestor for UnixAttestor {
     }
 }
 
+// PERF/SECURITY (Phase B caching deferral):
+//
+// The current implementation reads `/proc/<pid>/exe` and SHA-256s the entire
+// binary on every attestation. Two concerns to resolve before the unix
+// attestor sees production sidecar load:
+//
+//   - **TOCTOU**: an exec-after-attestation race lets a workload swap its
+//     binary between the attestation read and the SVID issuance. The pid is
+//     the same, but the binary the cert authorises is not the binary that
+//     gets to use it.
+//   - **DoS**: a 100 MB binary hashed under attestation churn is slow. With
+//     a malicious or misbehaving workload spamming `FetchX509SVID` reconnects,
+//     the attestor becomes a synchronous bottleneck for the workload-API
+//     server.
+//
+// Phase B should cache fingerprints by `(pid, dev, ino, mtime)` with a TTL
+// so repeat attestations are O(1) and post-fork cert reissuance does not
+// re-hash. Until then, callers should rate-limit attestation requests at
+// the workload-API-server layer (existing rate-limiting plugins can do
+// this).
 #[cfg(target_os = "linux")]
 fn binary_fingerprint_linux(pid: i32) -> Result<Option<String>, AttestError> {
     let exe = PathBuf::from(format!("/proc/{}/exe", pid));

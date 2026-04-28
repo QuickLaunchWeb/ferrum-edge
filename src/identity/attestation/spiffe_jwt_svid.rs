@@ -107,9 +107,18 @@ impl Attestor for JwtSvidAttestor {
 }
 
 /// Cheap heuristic: a JWT has exactly two `.` separators. Good enough to
-/// distinguish from a K8s SA token (also a JWT) when the K8s attestor
-/// wasn't configured — we don't aim to disambiguate here, we just want to
-/// avoid sending obvious non-JWTs through the validator.
+/// distinguish a JWT-shaped token from random opaque bearer tokens before
+/// handing the value to the validator.
+///
+/// **K8s PSAT tokens are also JWTs and pass this heuristic.** The
+/// federation attestor cannot tell them apart by shape. The attestor chain
+/// must therefore order K8s PSAT BEFORE the JWT-SVID federation attestor
+/// when both are configured: the K8s attestor will either consume the
+/// token (returning an identity) or reject it as `NotApplicable` /
+/// `Failed`, and the chain runner moves to the next attestor. Reversing
+/// the order would cause federation to attempt validating in-cluster SA
+/// tokens against federated trust-domain JWKS, fail, and shadow the K8s
+/// path.
 fn looks_like_jwt(s: &str) -> bool {
     s.matches('.').count() == 2
 }

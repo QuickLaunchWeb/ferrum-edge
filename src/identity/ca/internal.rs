@@ -109,10 +109,24 @@ pub struct InternalCa {
 
 impl InternalCa {
     /// Build the CA from a raw config. Validates that the PEM blobs parse and
-    /// that the cert + key match.
+    /// that the cert + key actually match (fail-fast at startup rather than
+    /// at first issuance).
     pub fn new(config: InternalCaConfig) -> Result<Self, CaError> {
         let key_pair = KeyPair::from_pem(&config.root_key_pem)
             .map_err(|e| CaError::Config(format!("invalid root key PEM: {e}")))?;
+
+        // Strip PEM envelope to get DER for the trust bundle response. The
+        // `pem_to_der` helper also rejects multi-block PEMs (an operator who
+        // concatenates a root + intermediate would otherwise silently use
+        // only the first cert as the trust anchor).
+        let root_cert_der = pem_to_der(&config.root_cert_pem)?;
+
+        // Cert/key match self-test. `Issuer::from_ca_cert_pem` does not
+        // verify that the key actually corresponds to the cert; without this
+        // check, a misconfiguration surfaces only at first SVID issuance —
+        // the gateway happily comes up and breaks under traffic. Compare the
+        // SubjectPublicKeyInfo DER on both sides.
+        verify_cert_key_match(&root_cert_der, &key_pair)?;
 
         // Parse the root cert and assemble a usable issuer. `from_ca_cert_pem`
         // requires the rcgen `pem` + `x509-parser` features (declared in
@@ -120,9 +134,6 @@ impl InternalCa {
         let issuer: Issuer<'static, KeyPair> =
             Issuer::from_ca_cert_pem(&config.root_cert_pem, key_pair)
                 .map_err(|e| CaError::Config(format!("invalid root cert PEM: {e}")))?;
-
-        // Strip PEM envelope to get DER for the trust bundle response.
-        let root_cert_der = pem_to_der(&config.root_cert_pem)?;
 
         info!(
             trust_domain = %config.trust_domain,
@@ -251,6 +262,24 @@ impl CertificateAuthority for InternalCa {
                 // Re-derive the requester's public key from the CSR. We
                 // deliberately ignore any SAN already present in the CSR —
                 // the caller-attested `spiffe_id` is authoritative.
+                //
+                // SECURITY (TODO before non-UDS callers in Phase B+):
+                // `rcgen::CertificateSigningRequestParams::from_der` does NOT
+                // verify the CSR self-signature (proof-of-possession). For
+                // the local UDS Workload API server this is acceptable — the
+                // transport itself authenticates the calling workload via
+                // SO_PEERCRED-class attestation, and the SVID's URI SAN is
+                // determined by attestation, not by anything in the CSR.
+                //
+                // For ANY future caller that flows CSRs over a remote
+                // transport (Vault PKI bridge, cert-manager Issuer, federated
+                // SPIFFE bundle endpoint, mesh-expansion VM bootstrap), the
+                // PoP signature MUST be verified before we sign the public
+                // key — otherwise an attacker who intercepts a CSR can swap
+                // in their own public key and obtain a valid SVID for the
+                // victim's identity. Add a webpki / x509-parser-based PoP
+                // verification step at the start of this arm before wiring
+                // any non-UDS transport into `IssuanceRequest::Csr`.
                 let csr = rcgen::CertificateSigningRequestParams::from_der(&csr_der.into())
                     .map_err(|e| CaError::BadCsr(format!("CSR parse failed: {e}")))?;
                 let public_key = csr.public_key;
@@ -318,28 +347,74 @@ impl CertificateAuthority for InternalCa {
     }
 }
 
-/// Decode a single PEM block (CERTIFICATE or X509 CERTIFICATE) into raw DER.
+/// Decode exactly one PEM CERTIFICATE block into raw DER. Rejects PEMs that
+/// contain more than one block — concatenating root + intermediate would
+/// otherwise silently use the first block as the trust anchor (and an
+/// operator who put the intermediate first would issue with the intermediate
+/// as "root", breaking chain validation in subtle ways).
 fn pem_to_der(pem: &str) -> Result<Vec<u8>, CaError> {
     let mut reader = pem.as_bytes();
-    let der = rustls_pemfile::certs(&mut reader)
+    let mut iter = rustls_pemfile::certs(&mut reader);
+    let first = iter
         .next()
         .ok_or_else(|| CaError::Config("no CERTIFICATE block in root cert PEM".to_string()))?
         .map_err(|e| CaError::Config(format!("PEM parse failed: {e}")))?;
-    Ok(der.as_ref().to_vec())
+    if iter.next().is_some() {
+        return Err(CaError::Config(
+            "root cert PEM contains more than one CERTIFICATE block; the internal CA expects \
+             a single self-signed root, not a chain. If you have intermediates, configure them \
+             on the verifier side rather than embedding them in the root file."
+                .to_string(),
+        ));
+    }
+    Ok(first.as_ref().to_vec())
+}
+
+/// Compare the public key embedded in `root_cert_der` against the supplied
+/// `KeyPair`. The two must encode to identical SubjectPublicKeyInfo DER, or
+/// the cert was issued under a different key and signing operations will
+/// produce certs that no peer can verify.
+fn verify_cert_key_match(root_cert_der: &[u8], key_pair: &KeyPair) -> Result<(), CaError> {
+    use rcgen::PublicKeyData;
+    use x509_parser::prelude::*;
+    let (_, parsed_root) = X509Certificate::from_der(root_cert_der)
+        .map_err(|e| CaError::Config(format!("root cert parse failed: {e}")))?;
+    let cert_spki_raw = parsed_root.tbs_certificate.subject_pki.raw;
+    let key_spki_der = key_pair.subject_public_key_info();
+    if cert_spki_raw != key_spki_der.as_slice() {
+        return Err(CaError::Config(
+            "internal CA: root certificate public key does not match the supplied private key \
+             (cert/key mismatch); refusing to start"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `rand` 0.10 is a dev dep but not a runtime dep here. We use the system
 /// random source available via `ring` (already in our deps).
+///
+/// RFC 5280 §4.1.2.2 requires serial numbers to be positive ASN.1 INTEGERs.
+/// The DER encoding of an INTEGER is sign-bit-sensitive: a high MSB makes
+/// the value negative. We clear the high bit explicitly so the produced
+/// serial round-trips as positive on every parser, regardless of whether
+/// `rcgen` would otherwise add a sign-extension byte. We also avoid the
+/// all-zero serial.
 fn rand_u64() -> u64 {
     use ring::rand::SecureRandom;
     let rng = ring::rand::SystemRandom::new();
     let mut buf = [0u8; 8];
     if rng.fill(&mut buf).is_ok() {
+        buf[0] &= 0x7f;
+        if buf == [0u8; 8] {
+            buf[7] = 1;
+        }
         u64::from_be_bytes(buf)
     } else {
         // Fallback to a process-counter — astronomically unlikely to fire.
+        // The counter starts at 1 so the all-zero case never appears.
         static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x7fff_ffff_ffff_ffff
     }
 }
 

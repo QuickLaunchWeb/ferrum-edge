@@ -167,11 +167,12 @@ fn svid_response_to_bundle(
             trust_domain: trust_domain.clone(),
             x509_authorities: local_bundle_der,
             jwt_authorities: Vec::new(),
-            refresh_hint_seconds: if first.hint > 0 {
-                Some(first.hint as u64)
-            } else {
-                None
-            },
+            // The SPIFFE Workload API X509SVID stream is event-driven —
+            // the server pushes updates eagerly when the SVID rotates or
+            // the bundle changes. There is no per-SVID refresh hint on the
+            // wire, so leave this `None`. (The `X509SVID.hint` field is an
+            // operator-provided workload-matching hint, not a timestamp.)
+            refresh_hint_seconds: None,
         },
         federated: Default::default(),
     };
@@ -210,6 +211,12 @@ fn svid_response_to_bundle(
 /// Split a buffer that holds one or more concatenated DER certs. Each cert
 /// starts with the ASN.1 SEQUENCE tag (0x30) followed by a length-of-length
 /// byte. We parse just enough to slice at the next boundary.
+///
+/// **DER-only**: the BER indefinite-length form (`0x80` length byte) is
+/// rejected. Real X.509 certs are always DER (RFC 5280 §4.1) so this is a
+/// strictness, not a compatibility, requirement — and silently accepting
+/// indefinite-length here would yield an empty (zero-length) cert that
+/// blows up downstream with a less clear error.
 fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut out = Vec::new();
     let mut cursor = 0;
@@ -221,6 +228,12 @@ fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             return Err("buffer ends mid-tag".to_string());
         }
         let first_len = buf[cursor + 1];
+        if first_len == 0x80 {
+            return Err(
+                "BER indefinite-length encoding is not allowed in DER-encoded certificates"
+                    .to_string(),
+            );
+        }
         let (header_len, content_len) = if first_len & 0x80 == 0 {
             (2, first_len as usize)
         } else {
@@ -242,6 +255,37 @@ fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         cursor += total;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod der_split_tests {
+    use super::split_concatenated_der;
+
+    #[test]
+    fn rejects_ber_indefinite_length() {
+        // SEQUENCE tag (0x30) + indefinite-length form (0x80). DER must use
+        // a definite length; this is a BER-only encoding that real X.509
+        // certs never produce.
+        let buf = [0x30u8, 0x80, 0x00, 0x00];
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(err.contains("indefinite-length"));
+    }
+
+    #[test]
+    fn accepts_short_form_length() {
+        // SEQUENCE, length=2, two content bytes.
+        let buf = [0x30u8, 0x02, 0xAA, 0xBB];
+        let parsed = split_concatenated_der(&buf).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0], buf);
+    }
+
+    #[test]
+    fn rejects_truncated_buffer() {
+        // SEQUENCE, claimed length=10, only 1 content byte present.
+        let buf = [0x30u8, 0x0A, 0xAA];
+        assert!(split_concatenated_der(&buf).is_err());
+    }
 }
 
 /// Errors raised by the Workload API client.

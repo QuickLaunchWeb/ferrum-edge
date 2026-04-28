@@ -82,6 +82,42 @@ impl K8sPsatAttestor {
     }
 
     fn render_id(&self, review: &TokenReviewResult) -> Result<SpiffeId, AttestError> {
+        // Defence-in-depth against TokenReview-response injection.
+        //
+        // We treat the K8s API as semi-trusted (it is the authority for the
+        // {namespace, serviceaccount, pod} triple), but a poisoned or
+        // mis-configured TokenReviewer must not be able to smuggle path
+        // characters into the SPIFFE ID via the template substitution. A
+        // namespace value like `evil/sa/admin` would otherwise produce a
+        // perfectly valid — but wrong-shaped — SPIFFE ID after substitution.
+        //
+        // Validate each substituent against the DNS-1123 label grammar
+        // (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, max 63 chars) before they reach
+        // the template. K8s namespaces, ServiceAccounts and Pod names are
+        // all DNS-1123 labels per the Kubernetes API conventions, so this
+        // is a tight upper bound that does not reject any legitimate input.
+        if !is_dns1123_label(&review.namespace) {
+            return Err(AttestError::Failed(format!(
+                "TokenReview namespace '{}' is not a valid DNS-1123 label",
+                review.namespace
+            )));
+        }
+        if !is_dns1123_label(&review.service_account) {
+            return Err(AttestError::Failed(format!(
+                "TokenReview service_account '{}' is not a valid DNS-1123 label",
+                review.service_account
+            )));
+        }
+        if let Some(ref pod) = review.pod_name
+            && !pod.is_empty()
+            && !is_dns1123_label(pod)
+        {
+            return Err(AttestError::Failed(format!(
+                "TokenReview pod_name '{}' is not a valid DNS-1123 label",
+                pod
+            )));
+        }
+
         let mut rendered = self.config.spiffe_id_template.clone();
         rendered = rendered.replace("{trust_domain}", self.config.trust_domain.as_str());
         rendered = rendered.replace("{namespace}", &review.namespace);
@@ -90,6 +126,20 @@ impl K8sPsatAttestor {
         SpiffeId::new(rendered)
             .map_err(|e| AttestError::Failed(format!("rendered SPIFFE ID is invalid: {}", e)))
     }
+}
+
+/// DNS-1123 label per Kubernetes API conventions:
+/// `[a-z0-9]([-a-z0-9]*[a-z0-9])?`, max 63 characters.
+fn is_dns1123_label(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let valid_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    if !valid_alnum(bytes[0]) || !valid_alnum(bytes[bytes.len() - 1]) {
+        return false;
+    }
+    bytes.iter().all(|b| valid_alnum(*b) || *b == b'-')
 }
 
 #[async_trait]

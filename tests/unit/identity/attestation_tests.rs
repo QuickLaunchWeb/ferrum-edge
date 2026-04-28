@@ -124,6 +124,113 @@ async fn k8s_psat_enforces_namespace_allowlist() {
     assert!(matches!(result, Err(AttestError::Failed(_))));
 }
 
+#[tokio::test]
+async fn k8s_psat_rejects_namespace_with_path_separator() {
+    // Defence-in-depth: a TokenReview response that smuggles `/` in the
+    // namespace must not produce a wrong-shaped SPIFFE ID via template
+    // substitution. The DNS-1123 label check rejects it before substitution.
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    let reviewer = Arc::new(MockReviewer {
+        result: Ok(TokenReviewResult {
+            authenticated: true,
+            namespace: "evil/sa/admin".into(),
+            service_account: "victim".into(),
+            pod_name: None,
+            pod_uid: None,
+        }),
+    });
+    let config = K8sPsatAttestorConfig::istio_default(trust_domain, reviewer);
+    let attestor = K8sPsatAttestor::new(config).unwrap();
+    let peer = PeerInfo {
+        bearer_token: Some("t".into()),
+        ..Default::default()
+    };
+    let err = attestor.attest(&peer).await.unwrap_err();
+    match err {
+        AttestError::Failed(msg) => {
+            assert!(
+                msg.contains("DNS-1123") && msg.contains("namespace"),
+                "expected DNS-1123 namespace rejection, got: {msg}"
+            );
+        }
+        other => panic!("expected AttestError::Failed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn k8s_psat_rejects_serviceaccount_with_uppercase() {
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    let reviewer = Arc::new(MockReviewer {
+        result: Ok(TokenReviewResult {
+            authenticated: true,
+            namespace: "production".into(),
+            service_account: "Capitalized".into(),
+            pod_name: None,
+            pod_uid: None,
+        }),
+    });
+    let config = K8sPsatAttestorConfig::istio_default(trust_domain, reviewer);
+    let attestor = K8sPsatAttestor::new(config).unwrap();
+    let peer = PeerInfo {
+        bearer_token: Some("t".into()),
+        ..Default::default()
+    };
+    let err = attestor.attest(&peer).await.unwrap_err();
+    assert!(matches!(err, AttestError::Failed(ref msg) if msg.contains("service_account")));
+}
+
+#[tokio::test]
+async fn k8s_psat_rejects_namespace_starting_with_hyphen() {
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    let reviewer = Arc::new(MockReviewer {
+        result: Ok(TokenReviewResult {
+            authenticated: true,
+            namespace: "-leading-hyphen".into(),
+            service_account: "ok".into(),
+            pod_name: None,
+            pod_uid: None,
+        }),
+    });
+    let config = K8sPsatAttestorConfig::istio_default(trust_domain, reviewer);
+    let attestor = K8sPsatAttestor::new(config).unwrap();
+    let peer = PeerInfo {
+        bearer_token: Some("t".into()),
+        ..Default::default()
+    };
+    let err = attestor.attest(&peer).await.unwrap_err();
+    assert!(matches!(err, AttestError::Failed(_)));
+}
+
+#[tokio::test]
+async fn k8s_psat_accepts_realistic_pod_name() {
+    // Realistic pod names like `app-deploy-7b4f6c5dcd-zk8r9` must still pass
+    // — they're valid DNS-1123 labels even though they look long.
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    let reviewer = Arc::new(MockReviewer {
+        result: Ok(TokenReviewResult {
+            authenticated: true,
+            namespace: "production".into(),
+            service_account: "app".into(),
+            pod_name: Some("app-deploy-7b4f6c5dcd-zk8r9".into()),
+            pod_uid: Some("uuid-x".into()),
+        }),
+    });
+    let config = K8sPsatAttestorConfig::istio_default(trust_domain, reviewer);
+    let attestor = K8sPsatAttestor::new(config).unwrap();
+    let peer = PeerInfo {
+        bearer_token: Some("t".into()),
+        ..Default::default()
+    };
+    let identity = attestor
+        .attest(&peer)
+        .await
+        .expect("realistic pod name passes");
+    assert_eq!(
+        identity.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/production/sa/app"
+    );
+}
+
 // ── Static ────────────────────────────────────────────────────────────────
 
 #[test]
