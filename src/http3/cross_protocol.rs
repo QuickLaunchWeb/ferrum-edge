@@ -1496,28 +1496,24 @@ where
     if grpc_has_retry && let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         loop {
-            // Local pre-wire predicate for the gRPC retry loop. Both
-            // listed `GrpcProxyError` variants are pre-wire by
-            // construction:
-            //   * `BackendUnavailable` is emitted only when the gRPC
-            //     dispatch never gets past TCP / TLS / h2 / h2c
-            //     handshake (no request frame ever leaves the gateway).
-            //   * `BackendTimeout::Connect` is the connect-timeout
-            //     timer, identical semantics.
-            // Both satisfy `request_reached_wire(class) == false` when
-            // mapped through `classify_grpc_proxy_error`, so this
-            // `matches!` agrees with the unified boundary by
-            // construction — but the agreement is invariant-by-listing,
-            // not invariant-by-derivation. If a future `GrpcProxyError`
-            // variant is added (e.g. a "TLS rejected after handshake"
-            // marker that's still pre-wire), it MUST be added to this
-            // arm AND to `classify_grpc_proxy_error` in lockstep. Run
-            // `cargo check` against the new variant; the surrounding
-            // tests in `tests/unit/gateway_core/grpc_*` will catch a
-            // misclassification mismatch.
-            // Narrow to the connect-class kinds — see the equivalent
-            // matcher in `proxy/mod.rs` for the rationale (post-wire
-            // BackendRequest must NOT bypass retry_on_methods).
+            // Pre-wire predicate for the H3→gRPC retry loop, derived from
+            // the typed kind (NOT a wildcard match on `BackendUnavailable`).
+            // The retry-on-connect-failure path bypasses `retry_on_methods`,
+            // which is only safe when the request bytes never reached the
+            // backend's application layer — i.e. when the kind is in the
+            // `is_connect_class()` set (DNS / TCP connect / TLS handshake /
+            // H2 handshake / H2c handshake / InvalidServerName).
+            // `BackendUnavailable::BackendRequest` is post-wire by definition
+            // (emitted from `sender.send_request().await` after H2 / ALPN)
+            // and MUST be excluded so non-idempotent gRPC POSTs aren't
+            // silently replayed on a mid-stream failure. `BackendTimeout::Connect`
+            // is the connect-timeout timer — pre-wire by construction.
+            // A regression test
+            // (`test_every_connect_class_kind_classifies_as_pre_wire`)
+            // structurally enforces that every kind in `is_connect_class()`
+            // also satisfies `request_reached_wire(class) == false`, so the
+            // predicate here cannot drift from the unified wire boundary in
+            // [`crate::retry::request_reached_wire`].
             let is_connection_error = match &result {
                 Err(grpc_proxy::GrpcProxyError::BackendUnavailable { kind, .. }) => {
                     kind.is_connect_class()

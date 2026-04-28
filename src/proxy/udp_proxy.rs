@@ -1716,7 +1716,9 @@ async fn handle_dtls_client_inner(
             client = %client_addr,
             "DTLS session rejected: circuit breaker open"
         );
-        return Err(anyhow::anyhow!("circuit breaker open"));
+        return Err(
+            StreamSetupError::new(StreamSetupKind::CircuitBreakerOpen, "(DTLS session)").into(),
+        );
     }
 
     let resolved_ip = match dns_cache
@@ -2174,7 +2176,9 @@ async fn create_session(
             client = %client_addr,
             "UDP session rejected: circuit breaker open"
         );
-        return Err(anyhow::anyhow!("circuit breaker open"));
+        return Err(
+            StreamSetupError::new(StreamSetupKind::CircuitBreakerOpen, "(UDP session)").into(),
+        );
     }
 
     // DNS resolve

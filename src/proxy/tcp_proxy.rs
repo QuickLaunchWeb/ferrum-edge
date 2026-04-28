@@ -122,6 +122,7 @@ pub(crate) const STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED: &str = "Frontend TLS 
 pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS handshake failed";
 pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
+pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -1329,7 +1330,11 @@ async fn handle_tcp_connection_inner(
                 }
             }
             warn!(proxy_id = %proxy_id, client = %remote_addr, "TCP connection rejected: circuit breaker open");
-            return Err(anyhow::anyhow!("circuit breaker open"));
+            return Err(StreamSetupError::new(
+                StreamSetupKind::CircuitBreakerOpen,
+                format!("for {}:{}", current_host, current_port),
+            )
+            .into());
         }
 
         // Resolve backend IP via DNS
@@ -3808,6 +3813,24 @@ mod cause_direction_tests {
     #[test]
     fn typed_no_healthy_targets_maps_to_backend_error_and_backend_direction() {
         let e = err(StreamSetupKind::NoHealthyTargets);
+        assert_eq!(
+            pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
+            DisconnectCause::BackendError
+        );
+        assert_eq!(
+            pre_copy_disconnect_direction(&e, &ErrorClass::RequestError),
+            Direction::BackendToClient
+        );
+    }
+
+    #[test]
+    fn typed_circuit_breaker_open_maps_to_backend_error_and_backend_direction() {
+        // Circuit-breaker rejects are gateway shedding traffic away from a
+        // known-bad upstream — backend-side, not client-side. Without the
+        // typed kind they classify as RequestError and the class-based
+        // fallback routes them to RecvError / ClientToBackend (a
+        // misattribution that breaks backend-error dashboards).
+        let e = err(StreamSetupKind::CircuitBreakerOpen);
         assert_eq!(
             pre_copy_disconnect_cause(&e, &ErrorClass::RequestError),
             DisconnectCause::BackendError

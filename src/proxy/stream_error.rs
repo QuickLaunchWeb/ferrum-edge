@@ -66,8 +66,20 @@ pub enum StreamSetupKind {
     RejectedByPlugin,
     /// Load balancer returned no healthy targets for the configured upstream.
     /// Backend-side — the configured pool is empty or all targets are
-    /// circuit-broken.
+    /// failing active health checks.
+    ///
+    /// Distinct from [`Self::CircuitBreakerOpen`]: this kind fires from the LB
+    /// selection layer when no candidate target is healthy; circuit-breaker
+    /// rejections fire from the per-proxy circuit breaker check (a separate
+    /// passive-health gate). Operators querying logs for "all targets bad"
+    /// should match either kind via the prefix wording or the typed enum.
     NoHealthyTargets,
+    /// Per-proxy circuit breaker is open — the failure rate against the
+    /// upstream exceeded the configured threshold and new connection
+    /// attempts are short-circuited until the cooldown window elapses.
+    /// Backend-side: the gateway is shedding traffic away from a known-bad
+    /// upstream, not rejecting the client.
+    CircuitBreakerOpen,
 }
 
 impl StreamSetupKind {
@@ -81,7 +93,7 @@ impl StreamSetupKind {
         match self {
             Self::FrontendTlsHandshake => Some(TlsErrorSide::Frontend),
             Self::BackendTlsHandshake | Self::BackendDtlsHandshake => Some(TlsErrorSide::Backend),
-            Self::RejectedByPlugin | Self::NoHealthyTargets => None,
+            Self::RejectedByPlugin | Self::NoHealthyTargets | Self::CircuitBreakerOpen => None,
         }
     }
 
@@ -138,6 +150,7 @@ impl StreamSetupKind {
             }
             Self::RejectedByPlugin => crate::proxy::tcp_proxy::STREAM_ERR_REJECTED_BY_PLUGIN,
             Self::NoHealthyTargets => crate::proxy::tcp_proxy::STREAM_ERR_NO_HEALTHY_TARGETS,
+            Self::CircuitBreakerOpen => crate::proxy::tcp_proxy::STREAM_ERR_CIRCUIT_BREAKER_OPEN,
         }
     }
 }
@@ -236,6 +249,7 @@ mod tests {
         );
         assert_eq!(StreamSetupKind::RejectedByPlugin.tls_side(), None);
         assert_eq!(StreamSetupKind::NoHealthyTargets.tls_side(), None);
+        assert_eq!(StreamSetupKind::CircuitBreakerOpen.tls_side(), None);
     }
 
     #[test]
@@ -251,11 +265,14 @@ mod tests {
                 "{kind:?} should be client-side (RecvError-mapped)"
             );
         }
-        // Backend-side: backend setup or LB selection failures.
+        // Backend-side: backend setup or LB selection failures, plus
+        // circuit-breaker rejects (the gateway is shedding traffic away
+        // from a known-bad upstream — backend's fault, not the client's).
         for kind in [
             StreamSetupKind::BackendTlsHandshake,
             StreamSetupKind::BackendDtlsHandshake,
             StreamSetupKind::NoHealthyTargets,
+            StreamSetupKind::CircuitBreakerOpen,
         ] {
             assert!(
                 !kind.is_client_side(),
@@ -288,6 +305,10 @@ mod tests {
         assert_eq!(
             StreamSetupKind::NoHealthyTargets.prefix(),
             "No healthy targets"
+        );
+        assert_eq!(
+            StreamSetupKind::CircuitBreakerOpen.prefix(),
+            "circuit breaker open"
         );
     }
 

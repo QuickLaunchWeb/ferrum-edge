@@ -207,10 +207,16 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         | StreamSetupKind::BackendTlsHandshake
         | StreamSetupKind::BackendDtlsHandshake => ErrorClass::TlsError,
         // Plugin reject (umbrella for ACL/policy/throttle) is a
-        // gateway-side decision, not a transport error.
-        StreamSetupKind::RejectedByPlugin | StreamSetupKind::NoHealthyTargets => {
-            ErrorClass::RequestError
-        }
+        // gateway-side decision, not a transport error. NoHealthyTargets
+        // and CircuitBreakerOpen are both backend-side gateway-policy
+        // rejections that share the RequestError class — the typed kind
+        // (consumed via the `find_stream_setup_error` chain walk by the
+        // disconnect-cause / direction mappers) carries the
+        // backend-vs-client attribution that the class itself can't
+        // express.
+        StreamSetupKind::RejectedByPlugin
+        | StreamSetupKind::NoHealthyTargets
+        | StreamSetupKind::CircuitBreakerOpen => ErrorClass::RequestError,
     }
 }
 

@@ -19,7 +19,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
 | `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, alert). | `false` (pre-wire) |
 | `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
-| `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error (stream reset, GOAWAY, h2c handshake), or RFC 6455 WebSocket protocol violation. | `true` (post-wire) |
+| `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error after a stream is opened (stream reset, GOAWAY, RST_STREAM), or RFC 6455 WebSocket protocol violation. NOTE: gRPC h2c handshake failure classifies as `ConnectionRefused` (pre-wire), NOT `ProtocolError` — see the gRPC kind table below. | `true` (post-wire) |
 | `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
 | `RequestBodyTooLarge` | Request body exceeded the configured maximum size. | `true` (post-wire) |
 | `ConnectionPoolError` | Could not acquire or create an HTTP client from the pool. | `false` (pre-wire) |
