@@ -864,18 +864,38 @@ fn test_classify_boxed_error_ws_protocol_error_is_protocol_class() {
 // --- Typed rustls and io::Error walks (tightened typed-first classification) ---
 
 #[test]
-fn test_classify_boxed_error_typed_rustls_alert() {
-    // rustls::Error walked via downcast — no message inspection needed.
-    // Used to require matching "TLS"/"AlertReceived"/etc substrings.
+fn test_classify_boxed_error_post_connect_rustls_is_post_wire() {
+    // `classify_boxed_error` calls `classify_typed_chain` with
+    // `phase_is_connect=false` because its callers (WebSocket session
+    // forwarding, TCP relay mid-stream, response-body classification)
+    // are all post-handshake. A rustls error here means a record-layer
+    // failure mid-session (decrypt failed, unexpected alert, peer
+    // protocol violation). It MUST classify as a post-wire class so
+    // request_reached_wire returns true and `retry_on_connect_failure`
+    // does NOT replay non-idempotent requests whose bytes may already
+    // have crossed the encrypted channel.
     let alert = rustls::AlertDescription::HandshakeFailure;
     let err: Box<dyn std::error::Error + Send + Sync> =
         Box::new(rustls::Error::AlertReceived(alert));
-    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+    let class = classify_boxed_error(&*err);
+    assert_eq!(
+        class,
+        ErrorClass::ConnectionReset,
+        "post-connect rustls errors must map to a mid-stream class"
+    );
+    assert!(
+        ferrum_edge::retry::request_reached_wire(class),
+        "post-connect rustls error must be post-wire (got {class:?}); \
+         a pre-wire class would let retry_on_connect_failure replay \
+         non-idempotent requests already on the wire"
+    );
 }
 
 #[test]
-fn test_classify_boxed_error_typed_rustls_buried_in_chain() {
-    // rustls::Error wrapped in another error type — chain walk must reach it.
+fn test_classify_boxed_error_post_connect_rustls_buried_in_chain() {
+    // The phase-gating must survive a wrapper in the source chain — the
+    // chain walker reaches the rustls error and applies the post-connect
+    // mapping just like the direct case.
     #[derive(Debug)]
     struct Wrapper(rustls::Error);
     impl std::fmt::Display for Wrapper {
@@ -889,7 +909,30 @@ fn test_classify_boxed_error_typed_rustls_buried_in_chain() {
         }
     }
     let wrapped = Wrapper(rustls::Error::HandshakeNotComplete);
-    assert_eq!(classify_boxed_error(&wrapped), ErrorClass::TlsError);
+    let class = classify_boxed_error(&wrapped);
+    assert_eq!(class, ErrorClass::ConnectionReset);
+    assert!(ferrum_edge::retry::request_reached_wire(class));
+}
+
+#[test]
+fn test_classify_reqwest_setup_phase_rustls_is_pre_wire_via_typed_kinds() {
+    // In setup contexts (gRPC pool, H2 pool, reqwest is_connect() branch)
+    // the classifier sees `phase_is_connect=true` and rustls errors map
+    // to TlsError (pre-wire) — handshake failures predate any wire
+    // commit, so retry_on_connect_failure can replay safely. Exercise
+    // this via the gRPC TlsHandshake kind which threads through
+    // `classify_grpc_proxy_error` with the setup-phase path.
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::TlsHandshake,
+        "TLS handshake failed: certificate verify failed".into(),
+    );
+    let class = classify_grpc_proxy_error(&err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "setup-phase TLS handshake failure must remain pre-wire so \
+         retry_on_connect_failure can replay safely"
+    );
 }
 
 #[test]

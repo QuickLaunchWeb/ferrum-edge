@@ -341,7 +341,26 @@ fn classify_typed_chain(
             }
         }
         if err.downcast_ref::<rustls::Error>().is_some() {
-            return Some(ErrorClass::TlsError);
+            // `rustls::Error` covers both setup-phase failures (handshake
+            // alert, certificate verify) AND post-connect record-layer
+            // failures (decrypt error, mid-stream alert, peer protocol
+            // violation). Phase-gate the class so post-connect rustls
+            // errors don't end up pre-wire — `request_reached_wire(TlsError)
+            // == false` would let `retry_on_connect_failure` replay a
+            // non-idempotent request whose bytes may already have crossed
+            // the wire under the encrypted channel. `ConnectionReset`
+            // (post-wire / mid-stream transport failure) is the closest
+            // semantic fit for a post-handshake TLS record failure: the
+            // encrypted channel can't be recovered and either side will
+            // tear down the TCP connection. Setup-phase contexts
+            // (`phase_is_connect=true`, exercised by
+            // `classify_reqwest_error::is_connect()` and the H2/H3 pool
+            // setup classifiers) keep the historical `TlsError` mapping.
+            return Some(if phase_is_connect {
+                ErrorClass::TlsError
+            } else {
+                ErrorClass::ConnectionReset
+            });
         }
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
             if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
