@@ -17,9 +17,11 @@
 // Re-export so Wave 3 handlers can `use crate::admin::api_specs::SpecFormat`
 // without knowing that the canonical definition lives in config::types.
 pub use crate::config::types::SpecFormat;
-use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
+use crate::config::types::validate_resource_id;
+use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use regex::Regex;
 use std::sync::LazyLock;
+use uuid::Uuid;
 
 /// HTTP method keys counted when computing `operation_count`.
 const HTTP_METHODS: &[&str] = &[
@@ -219,6 +221,20 @@ pub fn extract(
     })?;
     proxy.namespace = namespace.to_string();
 
+    // --- ID generation / validation for proxy (BEFORE auto-linking) ----------
+    // Empty id → generate a fresh UUID so downstream auto-linking has a stable
+    // id to stamp onto plugins and the upstream back-reference.
+    // Non-empty id → validate format; malformed ids are rejected here rather
+    // than at the DB layer so the error message is actionable.
+    if proxy.id.is_empty() {
+        proxy.id = Uuid::new_v4().to_string();
+    } else if let Err(e) = validate_resource_id(&proxy.id) {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-proxy",
+            error: format!("invalid id: {}", e),
+        });
+    }
+
     // --- x-ferrum-upstream (optional) ------------------------------------
     let upstream = if let Some(up_val) = root.get("x-ferrum-upstream") {
         let mut up: Upstream = serde_json::from_value(up_val.clone()).map_err(|e| {
@@ -228,6 +244,17 @@ pub fn extract(
             }
         })?;
         up.namespace = namespace.to_string();
+
+        // --- ID generation / validation for upstream (BEFORE auto-linking) --
+        if up.id.is_empty() {
+            up.id = Uuid::new_v4().to_string();
+        } else if let Err(e) = validate_resource_id(&up.id) {
+            return Err(ExtractError::MalformedExtension {
+                which: "x-ferrum-upstream",
+                error: format!("invalid id: {}", e),
+            });
+        }
+
         Some(up)
     } else {
         None
@@ -279,6 +306,16 @@ pub fn extract(
                 }
             })?;
 
+            // --- ID generation / validation for plugin (BEFORE auto-linking) --
+            if pc.id.is_empty() {
+                pc.id = Uuid::new_v4().to_string();
+            } else if let Err(e) = validate_resource_id(&pc.id) {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!("invalid id: {}", e),
+                });
+            }
+
             // Scope must be proxy (or absent/defaulted to proxy).
             if pc.scope != PluginScope::Proxy {
                 let scope_str = match pc.scope {
@@ -321,6 +358,25 @@ pub fn extract(
     } else {
         Vec::new()
     };
+
+    // --- Build proxy.plugins association list (Fix 2) -----------------------
+    // The PluginCache only instantiates plugins whose IDs appear in the proxy's
+    // `plugins` association list (junction table). Without this step, imported
+    // plugins are stored in plugin_configs but never run.
+    // Preserve any associations the operator wrote into x-ferrum-proxy.plugins
+    // directly (e.g. associating an existing global plugin), then add the
+    // spec-extracted ones.
+    {
+        let mut associations = std::mem::take(&mut proxy.plugins);
+        for plugin in &plugins {
+            if !associations.iter().any(|a| a.plugin_config_id == plugin.id) {
+                associations.push(PluginAssociation {
+                    plugin_config_id: plugin.id.clone(),
+                });
+            }
+        }
+        proxy.plugins = associations;
+    }
 
     let metadata = SpecMetadata {
         version,
@@ -1236,5 +1292,216 @@ x-ferrum-proxy:
         let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "test").unwrap();
         assert_eq!(bundle.plugins.len(), 1);
         assert_eq!(bundle.plugins[0].plugin_name, "jwt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 1: ID generation happens BEFORE auto-linking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_id_empty_generates_uuid_and_plugins_stamped_correctly() {
+        // When x-ferrum-proxy.id is empty, a UUID must be generated BEFORE
+        // plugins are stamped with proxy_id, so plugin.proxy_id == proxy.id.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-plugins": [
+                {
+                    "id": "plugin-a",
+                    "plugin_name": "rate_limiting",
+                    "config": {"window_size": 60, "window_count": 100}
+                }
+            ]
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+
+        // proxy.id must be a non-empty generated UUID
+        assert!(!bundle.proxy.id.is_empty(), "proxy.id must be generated");
+        assert!(
+            bundle.proxy.id.len() > 8,
+            "generated id looks like a UUID: {}",
+            bundle.proxy.id
+        );
+
+        // plugin.proxy_id must equal the generated proxy.id (not empty-string)
+        assert_eq!(bundle.plugins.len(), 1);
+        assert_eq!(
+            bundle.plugins[0].proxy_id.as_deref(),
+            Some(bundle.proxy.id.as_str()),
+            "plugin.proxy_id must be stamped with the generated proxy.id"
+        );
+
+        // proxy.plugins association list must also reference the plugin
+        assert_eq!(bundle.proxy.plugins.len(), 1);
+        assert_eq!(
+            bundle.proxy.plugins[0].plugin_config_id,
+            bundle.plugins[0].id
+        );
+    }
+
+    #[test]
+    fn test_upstream_id_empty_generates_uuid_and_proxy_upstream_id_matches() {
+        // When x-ferrum-upstream.id is empty, a UUID is generated and
+        // proxy.upstream_id must equal that generated id.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "fixed-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-upstream": {
+                "id": "",
+                "targets": [{"host": "t.internal", "port": 443}]
+            }
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+
+        let upstream = bundle.upstream.as_ref().expect("upstream must be present");
+        assert!(!upstream.id.is_empty(), "upstream.id must be generated");
+        assert_eq!(
+            bundle.proxy.upstream_id.as_deref(),
+            Some(upstream.id.as_str()),
+            "proxy.upstream_id must equal the generated upstream.id"
+        );
+    }
+
+    #[test]
+    fn test_plugin_id_empty_generates_uuid() {
+        // When a plugin entry has id = "", a UUID must be assigned and the
+        // proxy_id stamp must use the correct proxy.id.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "my-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-plugins": [
+                {
+                    "id": "",
+                    "plugin_name": "cors",
+                    "config": {}
+                }
+            ]
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+
+        assert_eq!(bundle.plugins.len(), 1);
+        let plugin = &bundle.plugins[0];
+        assert!(!plugin.id.is_empty(), "plugin.id must be generated");
+        assert_eq!(
+            plugin.proxy_id.as_deref(),
+            Some("my-proxy"),
+            "plugin.proxy_id must be stamped with proxy.id"
+        );
+    }
+
+    #[test]
+    fn test_invalid_proxy_id_returns_malformed_extension() {
+        // An id with spaces is invalid and must return MalformedExtension.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "has spaces",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            }
+        }"#;
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::MalformedExtension { which, .. }
+                if *which == "x-ferrum-proxy"
+            ),
+            "expected MalformedExtension for x-ferrum-proxy, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2: proxy.plugins association list is populated
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_imported_plugins_appear_in_proxy_plugins_associations() {
+        // After extraction, proxy.plugins must contain PluginAssociation entries
+        // for every plugin in x-ferrum-plugins, so PluginCache can instantiate them.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "assoc-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-plugins": [
+                {"id": "p1", "plugin_name": "rate_limiting", "config": {}},
+                {"id": "p2", "plugin_name": "cors", "config": {}}
+            ]
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+
+        assert_eq!(bundle.plugins.len(), 2);
+        assert_eq!(
+            bundle.proxy.plugins.len(),
+            2,
+            "proxy.plugins must have one entry per imported plugin"
+        );
+
+        let assoc_ids: Vec<&str> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .map(|a| a.plugin_config_id.as_str())
+            .collect();
+        assert!(assoc_ids.contains(&"p1"), "proxy.plugins must reference p1");
+        assert!(assoc_ids.contains(&"p2"), "proxy.plugins must reference p2");
+    }
+
+    #[test]
+    fn test_existing_proxy_plugins_preserved_when_importing() {
+        // If the operator writes an explicit plugin association in x-ferrum-proxy.plugins
+        // (e.g., pointing to a pre-existing global plugin), those entries must survive
+        // and spec-extracted plugins must be added without duplication.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "preserve-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443,
+                "plugins": [{"plugin_config_id": "existing-global-plugin"}]
+            },
+            "x-ferrum-plugins": [
+                {"id": "new-plugin", "plugin_name": "cors", "config": {}}
+            ]
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+
+        // Must have both the pre-existing association AND the newly imported one
+        let ids: Vec<&str> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .map(|a| a.plugin_config_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"existing-global-plugin"),
+            "pre-existing association must be preserved"
+        );
+        assert!(
+            ids.contains(&"new-plugin"),
+            "newly imported plugin must be added"
+        );
+        assert_eq!(ids.len(), 2, "no duplicates");
     }
 }

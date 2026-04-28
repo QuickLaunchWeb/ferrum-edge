@@ -15,7 +15,9 @@ use ferrum_edge::{
     config::{
         db_backend::{ApiSpecListFilter, ApiSpecSortBy, SortOrder},
         db_loader::{DatabaseStore, DbPoolConfig},
-        types::{ApiSpec, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream},
+        types::{
+            ApiSpec, PluginAssociation, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream,
+        },
     },
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2014,5 +2016,233 @@ async fn list_default_sort_is_updated_at_desc() {
             .windows(2)
             .all(|w| w[0].updated_at >= w[1].updated_at),
         "default sort must be updated_at DESC"
+    );
+}
+
+// ===========================================================================
+// Round 2 PR review fixes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Fix 2: imported plugins appear in proxy.plugins associations
+// ---------------------------------------------------------------------------
+
+/// Build an `ExtractedBundle` that mimics what the extractor now produces:
+/// plugins have the proxy_id stamped, and proxy.plugins contains associations.
+fn make_bundle_with_plugins(
+    proxy_id: &str,
+    namespace: &str,
+    plugin_ids: &[&str],
+    upstream: Option<Upstream>,
+) -> ExtractedBundle {
+    let mut proxy = make_proxy(proxy_id, namespace);
+    let mut plugins: Vec<PluginConfig> = Vec::new();
+    let mut associations: Vec<PluginAssociation> = Vec::new();
+
+    for &pid in plugin_ids {
+        let mut p = make_plugin(pid, proxy_id, namespace, None);
+        p.proxy_id = Some(proxy_id.to_string());
+        associations.push(PluginAssociation {
+            plugin_config_id: pid.to_string(),
+        });
+        plugins.push(p);
+    }
+    proxy.plugins = associations;
+    ExtractedBundle {
+        proxy,
+        upstream,
+        plugins,
+    }
+}
+
+/// After submit_api_spec_bundle, proxy.plugins associations must be persisted
+/// so the gateway's PluginCache can instantiate them.
+#[tokio::test]
+async fn submit_imported_plugins_appear_in_proxy_plugins_associations() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let plugin_id_1 = uid("plugin");
+    let plugin_id_2 = uid("plugin");
+    let spec_id = uid("spec");
+
+    let bundle = make_bundle_with_plugins(&proxy_id, ns, &[&plugin_id_1, &plugin_id_2], None);
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"spec with plugins");
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit_api_spec_bundle failed");
+
+    // Verify proxy.plugins association list was persisted (via proxy_plugins table).
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist");
+    assert!(
+        proxy_after.plugins.len() >= 2,
+        "proxy.plugins must have at least 2 entries; got {}",
+        proxy_after.plugins.len()
+    );
+    let assoc_ids: Vec<&str> = proxy_after
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+    assert!(
+        assoc_ids.contains(&plugin_id_1.as_str()),
+        "plugin_id_1 must be in proxy.plugins"
+    );
+    assert!(
+        assoc_ids.contains(&plugin_id_2.as_str()),
+        "plugin_id_2 must be in proxy.plugins"
+    );
+}
+
+/// After replace_api_spec_bundle, the new plugin associations replace the old ones.
+#[tokio::test]
+async fn replace_updates_proxy_plugins_associations() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let plugin_id_v1 = uid("plugin");
+    let spec_id = uid("spec");
+
+    // Initial submit with one plugin.
+    let bundle_v1 = make_bundle_with_plugins(&proxy_id, ns, &[&plugin_id_v1], None);
+    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 with plugin");
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("submit failed");
+
+    // Replace with a different plugin.
+    let plugin_id_v2 = uid("plugin");
+    let bundle_v2 = make_bundle_with_plugins(&proxy_id, ns, &[&plugin_id_v2], None);
+    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 with different plugin");
+    store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect("replace failed");
+
+    // Proxy associations must now reference only the new plugin (for spec-owned entries).
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist");
+    let assoc_ids: Vec<&str> = proxy_after
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+    assert!(
+        assoc_ids.contains(&plugin_id_v2.as_str()),
+        "v2 plugin must be in proxy.plugins after replace"
+    );
+    // v1 plugin is gone from plugin_configs so its association should not appear.
+    assert!(
+        !assoc_ids.contains(&plugin_id_v1.as_str()),
+        "v1 plugin must not be in proxy.plugins after replace"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix 3: replace with changed upstream_id does not fail FK constraint
+// ---------------------------------------------------------------------------
+
+/// submit spec A with upstream U1; then replace with spec A' containing a
+/// different upstream U2. The replace must succeed (the old upstream FK must
+/// be cleared before deleting U1).
+#[tokio::test]
+async fn replace_with_changed_upstream_id_does_not_fail_fk() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let upstream_id_v1 = uid("upstream");
+    let upstream_id_v2 = uid("upstream");
+    let spec_id = uid("spec");
+
+    // Initial submit: proxy + upstream U1.
+    let mut proxy_v1 = make_proxy(&proxy_id, ns);
+    proxy_v1.upstream_id = Some(upstream_id_v1.clone());
+    let bundle_v1 = ExtractedBundle {
+        proxy: proxy_v1,
+        upstream: Some(make_upstream(&upstream_id_v1, ns)),
+        plugins: vec![],
+    };
+    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 upstream");
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("initial submit failed");
+
+    // Confirm U1 exists and proxy references it.
+    let u1 = store
+        .get_upstream(&upstream_id_v1)
+        .await
+        .expect("get u1")
+        .expect("u1 must exist");
+    assert_eq!(u1.id, upstream_id_v1);
+    let p_before = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get proxy")
+        .expect("proxy must exist");
+    assert_eq!(
+        p_before.upstream_id.as_deref(),
+        Some(upstream_id_v1.as_str())
+    );
+
+    // Replace: proxy + upstream U2. The FK proxies.upstream_id → upstreams(id) ON DELETE
+    // RESTRICT would fail if we deleted U1 before clearing proxy.upstream_id.
+    let mut proxy_v2 = make_proxy(&proxy_id, ns);
+    proxy_v2.upstream_id = Some(upstream_id_v2.clone());
+    let bundle_v2 = ExtractedBundle {
+        proxy: proxy_v2,
+        upstream: Some(make_upstream(&upstream_id_v2, ns)),
+        plugins: vec![],
+    };
+    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 different upstream");
+    store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect("replace with changed upstream failed (FK violation?)");
+
+    // U1 must be gone.
+    let u1_after = store
+        .get_upstream(&upstream_id_v1)
+        .await
+        .expect("get u1 after");
+    assert!(
+        u1_after.is_none(),
+        "old upstream U1 must be deleted after replace"
+    );
+
+    // U2 must exist.
+    let u2_after = store
+        .get_upstream(&upstream_id_v2)
+        .await
+        .expect("get u2 after")
+        .expect("U2 must exist");
+    assert_eq!(u2_after.id, upstream_id_v2);
+
+    // Proxy must reference U2.
+    let p_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get proxy")
+        .expect("proxy must exist");
+    assert_eq!(
+        p_after.upstream_id.as_deref(),
+        Some(upstream_id_v2.as_str()),
+        "proxy.upstream_id must be updated to U2 after replace"
     );
 }

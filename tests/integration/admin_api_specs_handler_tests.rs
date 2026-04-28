@@ -1708,9 +1708,14 @@ async fn post_with_empty_proxy_id_assigns_uuid() {
 }
 
 /// A spec with an invalid plugin id (contains spaces and special chars) must
-/// return 422 with a failures entry whose resource_type is "plugin".
+/// return 400 with a MalformedExtension error code.
+///
+/// Note: ID validation was moved into the extractor (Fix 1) so that UUIDs are
+/// generated before auto-linking. Invalid IDs now surface as
+/// ExtractError::MalformedExtension → 400 "Spec parse failed", which is a
+/// more appropriate status than 422 (the resource is malformed, not unprocessable).
 #[tokio::test]
-async fn post_with_invalid_plugin_id_returns_422() {
+async fn post_with_invalid_plugin_id_returns_400() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
@@ -1737,20 +1742,13 @@ async fn post_with_invalid_plugin_id_returns_422() {
     let (status, body) = client.post_json("/api-specs", &spec).await;
     assert_eq!(
         status,
-        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        "invalid plugin id must return 422; body: {body}"
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid plugin id must return 400 (MalformedExtension from extractor); body: {body}"
     );
-    let failures = body["failures"].as_array().expect("failures must be array");
-    let plugin_failure = failures
-        .iter()
-        .find(|f| f["resource_type"].as_str() == Some("plugin"))
-        .unwrap_or_else(|| panic!("expected a plugin failure; body: {body}"));
-    assert!(
-        plugin_failure["errors"]
-            .as_array()
-            .map(|e| !e.is_empty())
-            .unwrap_or(false),
-        "plugin failure must have at least one error message; body: {body}"
+    assert_eq!(
+        body["code"].as_str(),
+        Some("MalformedExtension"),
+        "error code must be MalformedExtension; body: {body}"
     );
 }
 
@@ -1865,5 +1863,84 @@ async fn post_two_specs_with_same_upstream_name_different_ids_returns_conflict()
     assert!(
         s2 == reqwest::StatusCode::CONFLICT || s2 == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         "second spec with duplicate upstream name must return 409 or 422; got {s2}; body: {b2}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix 4: PUT with same upstream name must not self-collide (409)
+// ---------------------------------------------------------------------------
+
+/// POST a spec that includes an upstream named "my-upstream". Then PUT the
+/// same spec (same proxy_id, same upstream name). Without Fix 4, the
+/// check_upstream_name_unique call on the PUT path returns false (the spec
+/// collides with its own existing upstream row), producing a 422/409. With
+/// the fix, the existing upstream_id is excluded from the uniqueness check
+/// and the PUT returns 200.
+#[tokio::test]
+async fn put_keeps_same_upstream_name_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let state = make_admin_state(store, 10);
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let upstream_id = uid("upstream");
+    let shared_upstream_name = uid("shared-upstream");
+    let listen_path = format!("/{proxy_id}");
+
+    // POST: initial spec with an upstream.
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "PUT same upstream test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_id,
+            "name": shared_upstream_name,
+            "targets": [{"host": "target.internal", "port": 443}]
+        }
+    });
+
+    let (s1, b1) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(
+        s1,
+        reqwest::StatusCode::CREATED,
+        "POST must succeed; body: {b1}"
+    );
+    let spec_id = b1["id"]
+        .as_str()
+        .expect("response must include id")
+        .to_string();
+
+    // PUT: same proxy + same upstream name (same upstream_id).
+    // This is the normal "re-submit without changing anything meaningful" case.
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "PUT same upstream test v2", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_id,
+            "name": shared_upstream_name,
+            "targets": [{"host": "target-v2.internal", "port": 443}]
+        }
+    });
+
+    let (s2, b2) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        s2,
+        reqwest::StatusCode::OK,
+        "PUT with same upstream name must succeed (not 409/422); body: {b2}"
     );
 }

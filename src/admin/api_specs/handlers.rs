@@ -323,61 +323,14 @@ async fn extract_and_validate(
     db: &dyn DatabaseBackend,
     state: &AdminState,
     existing_proxy_id: Option<&str>, // None = create, Some(id) = update (skip self-conflict)
+    existing_upstream_id: Option<&str>, // None = create, Some(id) = exclude self on name check
 ) -> Result<ValidatedBundle, ApiSpecError> {
     let (mut bundle, metadata) = extract(&input.body, input.declared_format, &input.namespace)
         .map_err(ApiSpecError::Extract)?;
-
-    // --- Validate / generate resource IDs ----------------------------------
-    // Mirror direct-admin create logic: empty id → generate UUID; non-empty
-    // but malformed id → 422 with a structured failure entry.
-    {
-        use crate::config::types::validate_resource_id;
-        let mut id_failures: Vec<ValidationFailure> = Vec::new();
-
-        // Proxy id
-        if bundle.proxy.id.is_empty() {
-            bundle.proxy.id = Uuid::new_v4().to_string();
-        } else if let Err(msg) = validate_resource_id(&bundle.proxy.id) {
-            id_failures.push(ValidationFailure {
-                resource_type: "proxy",
-                id: bundle.proxy.id.clone(),
-                errors: vec![format!("invalid resource id: {}", msg)],
-            });
-        }
-
-        // Upstream id (if present)
-        if let Some(ref mut upstream) = bundle.upstream {
-            if upstream.id.is_empty() {
-                upstream.id = Uuid::new_v4().to_string();
-            } else if let Err(msg) = validate_resource_id(&upstream.id) {
-                id_failures.push(ValidationFailure {
-                    resource_type: "upstream",
-                    id: upstream.id.clone(),
-                    errors: vec![format!("invalid resource id: {}", msg)],
-                });
-            }
-        }
-
-        // Plugin ids
-        for plugin in &mut bundle.plugins {
-            if plugin.id.is_empty() {
-                plugin.id = Uuid::new_v4().to_string();
-            } else if let Err(msg) = validate_resource_id(&plugin.id) {
-                id_failures.push(ValidationFailure {
-                    resource_type: "plugin",
-                    id: plugin.id.clone(),
-                    errors: vec![format!("invalid resource id: {}", msg)],
-                });
-            }
-        }
-
-        if !id_failures.is_empty() {
-            return Err(ApiSpecError::ValidationFailures {
-                spec_version: metadata.version.clone(),
-                failures: id_failures,
-            });
-        }
-    }
+    // ID generation and validation now happen inside extract() (the extractor
+    // generates UUIDs for empty ids and validates non-empty ones before
+    // performing auto-linking). Malformed ids surface as ExtractError::MalformedExtension
+    // → 400, consistent with other parse errors.
 
     // --- Normalize + validate bundle resources ---
 
@@ -504,8 +457,10 @@ async fn extract_and_validate(
 
         if let Some(ref upstream) = bundle.upstream {
             if let Some(ref name) = upstream.name {
+                // On PUT, exclude the spec's current upstream so a spec that
+                // keeps the same upstream name doesn't collide with itself.
                 match db
-                    .check_upstream_name_unique(&input.namespace, name, None)
+                    .check_upstream_name_unique(&input.namespace, name, existing_upstream_id)
                     .await
                 {
                     Ok(true) => {}
@@ -803,7 +758,7 @@ pub async fn handle_post_api_spec(
     };
 
     let ValidatedBundle { bundle, metadata } =
-        match extract_and_validate(input, db.as_ref(), state, None).await {
+        match extract_and_validate(input, db.as_ref(), state, None, None).await {
             Ok(v) => v,
             Err(e) => return Ok(error_response(e)),
         };
@@ -886,6 +841,15 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
+    // Resolve the existing upstream_id so the upstream name uniqueness check
+    // can exclude the spec's own upstream (Fix 4: PUT with unchanged name
+    // must not self-collide).
+    let existing_upstream_id: Option<String> = match db.get_proxy(&existing_spec.proxy_id).await {
+        Ok(Some(p)) => p.upstream_id,
+        Ok(None) => None,
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
+
     // Pass existing proxy id so uniqueness checks exclude it
     let input = SubmitInput {
         body: body.clone(),
@@ -898,6 +862,7 @@ pub async fn handle_put_api_spec(
         db.as_ref(),
         state,
         Some(&existing_spec.proxy_id),
+        existing_upstream_id.as_deref(),
     )
     .await
     {

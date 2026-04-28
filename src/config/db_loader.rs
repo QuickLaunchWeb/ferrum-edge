@@ -3382,16 +3382,10 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
 
-            // Insert proxy plugin associations in the junction table.
-            for assoc in &p.plugins {
-                sqlx::query(
-                    &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
-                )
-                .bind(&p.id)
-                .bind(&assoc.plugin_config_id)
-                .execute(&mut *tx)
-                .await?;
-            }
+            // NOTE: proxy_plugins junction rows are inserted AFTER plugin_configs
+            // below (step 3) to satisfy the FK: plugin_config_id REFERENCES
+            // plugin_configs(id). Inserting them here would violate that FK because
+            // the plugin_configs rows don't exist yet.
         }
 
         // 3. INSERT plugin_configs, tagged with api_spec_id.
@@ -3419,6 +3413,21 @@ impl DatabaseStore {
             .bind(pc.updated_at.to_rfc3339())
             .execute(&mut *tx)
             .await?;
+        }
+
+        // 3b. INSERT proxy_plugins junction rows — AFTER plugin_configs so the
+        //     plugin_config_id FK is satisfied.
+        {
+            let p = &bundle.proxy;
+            for assoc in &p.plugins {
+                sqlx::query(
+                    &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
+                )
+                .bind(&p.id)
+                .bind(&assoc.plugin_config_id)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
 
         // 4. INSERT api_specs row.
@@ -3504,7 +3513,18 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
 
-        // Delete spec-owned upstreams (proxies.upstream_id FK is ON DELETE SET NULL, safe).
+        // Fix 3: proxies.upstream_id FK is ON DELETE RESTRICT (not SET NULL).
+        // We must clear proxy.upstream_id BEFORE deleting the old upstream row,
+        // otherwise the DELETE violates the FK and rolls back the transaction.
+        sqlx::query(
+            &self.q("UPDATE proxies SET upstream_id = NULL WHERE id = ? AND api_spec_id = ?"),
+        )
+        .bind(&spec.proxy_id)
+        .bind(&spec.id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Now safe to delete spec-owned upstreams — no proxy references them.
         sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ?"))
             .bind(&spec.id)
             .execute(&mut *tx)
@@ -3699,6 +3719,35 @@ impl DatabaseStore {
             .bind(&spec.id)
             .bind(pc.created_at.to_rfc3339())
             .bind(pc.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Fix 2: rebuild the proxy_plugins junction table for this proxy.
+        // Delete all existing spec-owned junction rows (the hand-added plugin
+        // associations written by the operator are keyed by non-spec plugin ids
+        // and survive because we only clear associations whose plugin_config_id
+        // belongs to the newly re-generated spec-owned plugin_configs). For
+        // simplicity — and correctness — delete all associations whose
+        // plugin_config_id is now in the new plugin list, then re-insert.
+        // Hand-added associations (referencing plugin_configs with api_spec_id IS NULL)
+        // are not touched because their plugin_config_ids are not in bundle.plugins.
+        for assoc in &bundle.proxy.plugins {
+            sqlx::query(
+                &self.q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
+            )
+            .bind(&bundle.proxy.id)
+            .bind(&assoc.plugin_config_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        // Re-insert — plugin_configs rows now exist (inserted above), so FK is satisfied.
+        for assoc in &bundle.proxy.plugins {
+            sqlx::query(
+                &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
+            )
+            .bind(&bundle.proxy.id)
+            .bind(&assoc.plugin_config_id)
             .execute(&mut *tx)
             .await?;
         }
