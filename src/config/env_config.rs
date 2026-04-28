@@ -483,14 +483,14 @@ pub struct EnvConfig {
     pub http3_idle_timeout: u64,
     /// HTTP/3 max concurrent streams (default: 1000)
     pub http3_max_streams: u32,
-    /// HTTP/3 per-stream receive window in bytes (default: 8 MiB).
+    /// HTTP/3 per-stream receive window in bytes (default: 16 MiB).
     /// Controls how much data a peer can send on a single QUIC stream
     /// before the receiver must send a flow-control credit update.
     pub http3_stream_receive_window: u64,
-    /// HTTP/3 connection-level receive window in bytes (default: 32 MiB).
+    /// HTTP/3 connection-level receive window in bytes (default: 128 MiB).
     /// Aggregate budget shared across all concurrent streams on one QUIC connection.
     pub http3_receive_window: u64,
-    /// HTTP/3 per-connection send window in bytes (default: 8 MiB).
+    /// HTTP/3 per-connection send window in bytes (default: 64 MiB).
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
     pub http3_send_window: u64,
@@ -501,13 +501,13 @@ pub struct EnvConfig {
     /// Connections idle longer than this are evicted from the pool.
     pub http3_pool_idle_timeout_seconds: u64,
     /// Minimum bytes buffered before flushing a coalesced HTTP/3 DATA frame
-    /// on the response streaming path (default: 32_768). Acts as the flush
+    /// on the response streaming path (default: 131_072). Acts as the flush
     /// target — once the buffer reaches this size on chunk arrival, it is
     /// flushed. Clamped to `<= http3_coalesce_max_bytes` at parse time.
     /// Legal range: [1024, http3_coalesce_max_bytes].
     pub http3_coalesce_min_bytes: usize,
     /// Maximum bytes for the HTTP/3 response streaming coalesce buffer
-    /// (default: 32_768). Used as the `BytesMut::with_capacity` initial
+    /// (default: 131_072). Used as the `BytesMut::with_capacity` initial
     /// allocation and as the upper bound that clamps `coalesce_min_bytes`
     /// at parse time. Higher values reduce reallocations for large-backend
     /// responses at the cost of per-stream memory. Legal range:
@@ -1038,13 +1038,13 @@ impl Default for EnvConfig {
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 1000,
-            http3_stream_receive_window: 8_388_608, // 8 MiB
-            http3_receive_window: 33_554_432,       // 32 MiB
-            http3_send_window: 8_388_608,           // 8 MiB
+            http3_stream_receive_window: crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            http3_receive_window: crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+            http3_send_window: crate::http3::config::H3_SEND_WINDOW_DEFAULT,
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
-            http3_coalesce_min_bytes: 32_768,
-            http3_coalesce_max_bytes: 32_768,
+            http3_coalesce_min_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
+            http3_coalesce_max_bytes: crate::http3::config::H3_COALESCE_MAX_DEFAULT,
             http3_flush_interval_micros: 200,
             http3_request_body_channel_capacity: 32,
             h3_request_body_drain_ms: 50,
@@ -1293,9 +1293,9 @@ impl EnvConfig {
             enable_http3: bool = "FERRUM_ENABLE_HTTP3" => false;
             http3_idle_timeout: u64 = "FERRUM_HTTP3_IDLE_TIMEOUT" => 30u64;
             http3_max_streams: u32 = "FERRUM_HTTP3_MAX_STREAMS" => 1000u32;
-            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => 8_388_608u64;
-            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => 33_554_432u64;
-            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => 8_388_608u64;
+            http3_stream_receive_window: u64 = "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW" => crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT;
+            http3_receive_window: u64 = "FERRUM_HTTP3_RECEIVE_WINDOW" => crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT;
+            http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_SEND_WINDOW_DEFAULT;
             http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
             http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);

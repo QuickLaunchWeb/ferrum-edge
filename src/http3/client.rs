@@ -1019,14 +1019,14 @@ impl Http3ConnectionPool {
 
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(cfg.stream_receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(cfg.receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
-        );
+        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.stream_receive_window,
+            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        ));
+        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.receive_window,
+            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        ));
         transport_config.send_window(cfg.send_window);
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
@@ -1095,14 +1095,14 @@ impl Http3ConnectionPool {
 
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(cfg.stream_receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(cfg.receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
-        );
+        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.stream_receive_window,
+            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        ));
+        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.receive_window,
+            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        ));
         transport_config.send_window(cfg.send_window);
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
@@ -2116,14 +2116,14 @@ impl Http3Client {
         // Apply QUIC transport tuning for the client side
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(cfg.stream_receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(cfg.receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
-        );
+        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.stream_receive_window,
+            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        ));
+        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.receive_window,
+            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        ));
         transport_config.send_window(cfg.send_window);
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));

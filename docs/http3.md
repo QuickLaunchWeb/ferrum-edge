@@ -14,6 +14,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [WebSocket over HTTP/3 — not supported](#websocket-over-http3--not-supported)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
+- [Flow-control window tuning](#flow-control-window-tuning)
 - [Environment variables](#environment-variables)
 
 ## Listener and enablement
@@ -154,8 +155,8 @@ Both the native H3 path and the cross-protocol bridge use the same response-side
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | 32,768 | Flush target — buffer reaches this size on chunk arrival, flush |
-| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | 32,768 | Buffer `with_capacity` + clamp for `min_bytes` |
+| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | 131,072 | Flush target — buffer reaches this size on chunk arrival, flush |
+| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | 131,072 | Buffer `with_capacity` + clamp for `min_bytes` |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | 200 | Time-based flush when the buffer has data but isn't full |
 
 The coalesce loop is identical across the two paths — source of bytes differs (`RequestStream::recv_data()` for native H3 vs `reqwest::Response::chunk()` or hyper `Incoming::frame()` for cross-protocol), but the output QUIC DATA frame cadence is identical. Operators running mixed workloads see the same per-stream write pattern regardless of dispatch kind.
@@ -203,6 +204,10 @@ The H3 listener enforces its own per-header and total-header size limits:
 
 These are enforced separately from hyper's built-in validation because the H3 listener parses headers via the `h3` crate, not via hyper. The `Host` value used for routing is extracted from an already-validated header, so separate host-length validation is unnecessary.
 
+## Flow-control window tuning
+
+The default QUIC flow-control windows are tuned for higher throughput on concurrent medium/large payload streams: 16 MiB per stream, 128 MiB receive budget per connection, and 64 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; halve both for memory-constrained deployments at the cost of throughput on medium/large payloads. Explicit env values continue to override these defaults.
+
 ## Environment variables
 
 | Variable | Default | Purpose |
@@ -210,13 +215,13 @@ These are enforced separately from hyper's built-in validation because the H3 li
 | `FERRUM_ENABLE_HTTP3` | `false` | Enable the QUIC listener |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | `30` | QUIC idle timeout (seconds) |
 | `FERRUM_HTTP3_MAX_STREAMS` | `1000` | Max concurrent streams per QUIC connection |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `8,388,608` | Per-stream QUIC flow-control window (8 MiB) |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | `33,554,432` | Connection-level QUIC flow-control window (32 MiB) |
-| `FERRUM_HTTP3_SEND_WINDOW` | `8,388,608` | Connection-level send window (8 MiB) |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | `16,777,216` | Per-stream QUIC flow-control window (16 MiB) |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | `134,217,728` | Connection-level QUIC flow-control window (128 MiB) |
+| `FERRUM_HTTP3_SEND_WINDOW` | `67,108,864` | Connection-level send window (64 MiB) |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | H3 backend pool connections per target |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 backend connection idle eviction |
-| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32,768` | Response coalesce flush target |
-| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32,768` | Response coalesce buffer capacity |
+| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `131,072` | Response coalesce flush target |
+| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `131,072` | Response coalesce buffer capacity |
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | Response coalesce time-based flush interval |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | `32` | Cross-protocol bridge mpsc capacity (range: 1–1024) |
 | `FERRUM_HTTP3_INITIAL_MTU` | `1500` | Initial QUIC path MTU (quinn clamps 1200–65527) |
