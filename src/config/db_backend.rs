@@ -9,6 +9,53 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 
+// ---------------------------------------------------------------------------
+// ApiSpec list filter types (Wave 5)
+// ---------------------------------------------------------------------------
+
+/// Sort column for `list_api_specs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApiSpecSortBy {
+    /// `updated_at` — default, most recent first.
+    #[default]
+    UpdatedAt,
+    Title,
+    OperationCount,
+    CreatedAt,
+}
+
+/// Sort direction for `list_api_specs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SortOrder {
+    /// Descending — default (most recent first for timestamps).
+    #[default]
+    Desc,
+    Asc,
+}
+
+/// Filter parameters for `list_api_specs`.
+#[derive(Debug, Clone, Default)]
+pub struct ApiSpecListFilter {
+    /// Exact match on `proxy_id`.
+    pub proxy_id: Option<String>,
+    /// Prefix match on `spec_version` (e.g. `"3.1"` matches `"3.1.0"`, `"3.1.1"`).
+    pub spec_version_prefix: Option<String>,
+    /// Case-insensitive substring match on `title`.
+    pub title_contains: Option<String>,
+    /// `updated_at >= ?`
+    pub updated_since: Option<DateTime<Utc>>,
+    /// Exact tag membership (tag name must appear in the stored JSON array).
+    pub has_tag: Option<String>,
+    /// Column to sort by (default: `UpdatedAt`).
+    pub sort_by: ApiSpecSortBy,
+    /// Sort direction (default: `Desc`).
+    pub order: SortOrder,
+    /// Maximum number of rows to return (default 50, max 200).
+    pub limit: u32,
+    /// Row offset for pagination (default 0).
+    pub offset: u32,
+}
+
 /// Result of an incremental config poll.
 ///
 /// Contains only the resources that changed since the last poll, plus IDs of
@@ -409,14 +456,14 @@ pub trait DatabaseBackend: Send + Sync {
         proxy_id: &str,
     ) -> Result<Option<ApiSpec>, anyhow::Error>;
 
-    /// List ApiSpecs in a namespace, paginated by `limit`/`offset`.
+    /// List ApiSpecs in a namespace, with filtering, sorting, and pagination.
     ///
-    /// Results are ordered by `id` ascending for stable pagination.
+    /// Default sort is `updated_at DESC` (most recent first).
+    /// `filter.limit` and `filter.offset` drive pagination.
     async fn list_api_specs(
         &self,
         namespace: &str,
-        limit: u32,
-        offset: u32,
+        filter: &ApiSpecListFilter,
     ) -> Result<Vec<ApiSpec>, anyhow::Error>;
 
     /// Delete an ApiSpec and all resources it owns.

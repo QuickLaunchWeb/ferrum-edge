@@ -18,9 +18,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
-use crate::admin::api_specs::{ExtractError, SpecFormat, extract};
+use crate::admin::api_specs::{ExtractError, SpecFormat, extract, hash_resource_bundle};
 use crate::admin::spec_codec;
-use crate::config::db_backend::DatabaseBackend;
+use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
 use crate::config::types::ApiSpec;
 
 // ---------------------------------------------------------------------------
@@ -39,6 +39,8 @@ enum ApiSpecError {
     BodyCollect(String),
     /// Extraction/parse error (400)
     Extract(ExtractError),
+    /// Generic 400 (invalid query params, etc.)
+    BadRequest(String),
     /// Validation failures (422)
     ValidationFailures {
         spec_version: String,
@@ -108,6 +110,7 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::BAD_REQUEST,
             &json!({"error": format!("Failed to read request body: {}", msg)}),
         ),
+        ApiSpecError::BadRequest(msg) => json_resp(StatusCode::BAD_REQUEST, &json!({"error": msg})),
         ApiSpecError::Extract(e) => {
             let code = extract_error_code(&e);
             json_resp(
@@ -475,17 +478,19 @@ async fn extract_and_validate(
     Ok(ValidatedBundle { bundle, metadata })
 }
 
-/// Build an `ApiSpec` row from body bytes + metadata.
+/// Build an `ApiSpec` row from body bytes, metadata, and bundle.
 fn build_spec_row(
     id: String,
     proxy_id: String,
     namespace: String,
     body: &[u8],
     metadata: &crate::admin::api_specs::SpecMetadata,
+    bundle: &crate::admin::api_specs::ExtractedBundle,
 ) -> Result<ApiSpec, ApiSpecError> {
     let spec_content = spec_codec::compress_gzip(body)
         .map_err(|e| ApiSpecError::Internal(format!("gzip compress failed: {e}")))?;
     let content_hash = spec_codec::sha256_hex(body);
+    let resource_hash = hash_resource_bundle(bundle);
     let now = Utc::now();
     Ok(ApiSpec {
         id,
@@ -499,6 +504,15 @@ fn build_spec_row(
         content_hash,
         title: metadata.title.clone(),
         info_version: metadata.info_version.clone(),
+        description: metadata.description.clone(),
+        contact_name: metadata.contact_name.clone(),
+        contact_email: metadata.contact_email.clone(),
+        license_name: metadata.license_name.clone(),
+        license_identifier: metadata.license_identifier.clone(),
+        tags: metadata.tags.clone(),
+        server_urls: metadata.server_urls.clone(),
+        operation_count: metadata.operation_count,
+        resource_hash,
         created_at: now,
         updated_at: now,
     })
@@ -574,31 +588,114 @@ fn spec_content_response(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: parse limit/offset from query string for the list endpoint
+// Helper: parse list filter from query string (Wave 5)
 // ---------------------------------------------------------------------------
 
-fn parse_list_params(uri: &hyper::Uri) -> (usize, usize) {
-    const DEFAULT_LIMIT: usize = 50;
-    const MAX_LIMIT: usize = 200;
-    let mut limit = DEFAULT_LIMIT;
-    let mut offset = 0usize;
+/// Parse `GET /api-specs` query parameters into an [`ApiSpecListFilter`].
+///
+/// Unknown parameters are silently ignored. Returns `Err` only for invalid
+/// `sort_by` values (rejected with 400 to prevent accidental SQL-like injection).
+fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError> {
+    const DEFAULT_LIMIT: u32 = 50;
+    const MAX_LIMIT: u32 = 200;
 
-    if let Some(query) = uri.query() {
-        for pair in query.split('&') {
-            let mut parts = pair.splitn(2, '=');
-            match (parts.next(), parts.next()) {
-                (Some("limit"), Some(v)) => {
-                    let parsed = v.parse::<usize>().unwrap_or(DEFAULT_LIMIT);
-                    limit = parsed.min(MAX_LIMIT).max(1);
-                }
-                (Some("offset"), Some(v)) => {
-                    offset = v.parse::<usize>().unwrap_or(0);
-                }
-                _ => {}
+    let mut filter = ApiSpecListFilter {
+        limit: DEFAULT_LIMIT,
+        ..Default::default()
+    };
+
+    let Some(query) = uri.query() else {
+        return Ok(filter);
+    };
+
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let val = parts.next().unwrap_or("");
+        // URL-decode the value (simple percent-decoding for common chars)
+        let val = percent_decode(val);
+
+        match key {
+            "limit" => {
+                let parsed = val.parse::<u32>().unwrap_or(DEFAULT_LIMIT);
+                filter.limit = parsed.min(MAX_LIMIT).max(1);
             }
+            "offset" => {
+                filter.offset = val.parse::<u32>().unwrap_or(0);
+            }
+            "proxy_id" if !val.is_empty() => {
+                filter.proxy_id = Some(val);
+            }
+            "spec_version" if !val.is_empty() => {
+                filter.spec_version_prefix = Some(val);
+            }
+            "title_contains" if !val.is_empty() => {
+                filter.title_contains = Some(val);
+            }
+            "updated_since" if !val.is_empty() => {
+                // Accept ISO-8601 / RFC-3339 format.
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&val) {
+                    filter.updated_since = Some(dt.to_utc());
+                }
+                // Silently ignore unparseable values (best-effort).
+            }
+            "has_tag" if !val.is_empty() => {
+                filter.has_tag = Some(val);
+            }
+            "sort_by" if !val.is_empty() => {
+                filter.sort_by = match val.as_str() {
+                    "updated_at" => ApiSpecSortBy::UpdatedAt,
+                    "title" => ApiSpecSortBy::Title,
+                    "operation_count" => ApiSpecSortBy::OperationCount,
+                    "created_at" => ApiSpecSortBy::CreatedAt,
+                    other => {
+                        return Err(ApiSpecError::BadRequest(format!(
+                            "invalid sort_by value '{}'; allowed: updated_at, title, operation_count, created_at",
+                            other
+                        )));
+                    }
+                };
+            }
+            "order" if !val.is_empty() => {
+                filter.order = match val.as_str() {
+                    "asc" => SortOrder::Asc,
+                    "desc" => SortOrder::Desc,
+                    other => {
+                        return Err(ApiSpecError::BadRequest(format!(
+                            "invalid order value '{}'; allowed: asc, desc",
+                            other
+                        )));
+                    }
+                };
+            }
+            _ => {}
         }
     }
-    (limit, offset)
+
+    Ok(filter)
+}
+
+/// Simple percent-decode for query parameter values.
+/// Only decodes `%XX` sequences; `+` is NOT decoded as space (RFC 3986 query semantics).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                char::from(bytes[i + 1]).to_digit(16),
+                char::from(bytes[i + 2]).to_digit(16),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +765,7 @@ pub async fn handle_post_api_spec(
         namespace.to_string(),
         &body,
         &metadata,
+        &bundle,
     ) {
         Ok(s) => s,
         Err(e) => return Ok(error_response(e)),
@@ -763,6 +861,7 @@ pub async fn handle_put_api_spec(
         namespace.to_string(),
         &body,
         &metadata,
+        &bundle,
     ) {
         Ok(s) => s,
         Err(e) => return Ok(error_response(e)),
@@ -847,17 +946,20 @@ pub async fn handle_list_api_specs(
         Err(e) => return Ok(error_response(e)),
     };
 
-    let (limit, offset) = parse_list_params(req.uri());
+    let filter = match parse_list_filter(req.uri()) {
+        Ok(f) => f,
+        Err(e) => return Ok(error_response(e)),
+    };
+    let limit = filter.limit as usize;
+    let offset = filter.offset as usize;
 
-    let specs = match db
-        .list_api_specs(namespace, limit as u32, offset as u32)
-        .await
-    {
+    let specs = match db.list_api_specs(namespace, &filter).await {
         Ok(s) => s,
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    // Build summary items — intentionally OMIT spec_content (heavy blob).
+    // Build summary items — intentionally OMIT spec_content (heavy blob) and
+    // resource_hash (internal implementation detail, not for client display).
     let items: Vec<Value> = specs
         .iter()
         .map(|s| {
@@ -868,6 +970,14 @@ pub async fn handle_list_api_specs(
                 "spec_format": s.spec_format,
                 "title": s.title,
                 "info_version": s.info_version,
+                "description": s.description,
+                "contact_name": s.contact_name,
+                "contact_email": s.contact_email,
+                "license_name": s.license_name,
+                "license_identifier": s.license_identifier,
+                "tags": s.tags,
+                "server_urls": s.server_urls,
+                "operation_count": s.operation_count,
                 "uncompressed_size": s.uncompressed_size,
                 "content_hash": s.content_hash,
                 "created_at": s.created_at,

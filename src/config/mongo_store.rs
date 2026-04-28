@@ -25,7 +25,10 @@
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
-    use crate::config::db_backend::{DatabaseBackend, IncrementalResult, PaginatedResult};
+    use crate::config::db_backend::{
+        ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, PaginatedResult,
+        SortOrder,
+    };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy, Upstream,
     };
@@ -38,6 +41,8 @@ mod inner {
     use std::path::PathBuf;
     use std::time::Duration;
     use tracing::{debug, info, warn};
+    // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
+    use regex::escape as regex_escape;
 
     /// MongoDB-backed config store.
     ///
@@ -515,6 +520,8 @@ mod inner {
     ///
     /// `spec_content` (gzip bytes) serializes as BSON Binary. The document
     /// size limit is ~16 MiB; callers must check before insert.
+    ///
+    /// Wave 5: `tags` and `server_urls` are stored as native BSON arrays.
     fn api_spec_to_doc(spec: &ApiSpec) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(spec)?;
         doc.insert("_id", spec.id.as_str());
@@ -1599,6 +1606,36 @@ mod inner {
                         .build(),
                 )
                 .await?;
+            // Wave 5 indexes — spec_version filter, operation_count/created_at sorting,
+            // and tags multikey index for has_tag membership filter.
+            self.api_specs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "spec_version": 1 })
+                        .build(),
+                )
+                .await?;
+            self.api_specs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "operation_count": 1 })
+                        .build(),
+                )
+                .await?;
+            self.api_specs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "created_at": -1 })
+                        .build(),
+                )
+                .await?;
+            self.api_specs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "tags": 1 })
+                        .build(),
+                )
+                .await?;
 
             info!("MongoDB indexes ensured");
             Ok(())
@@ -1742,6 +1779,29 @@ mod inner {
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
+            // --- Hash short-circuit (Wave 5 Feature A) -----------------------
+            // If the resource bundle is byte-identical (same resource_hash),
+            // only update the api_specs document metadata and leave all other
+            // collections untouched. This prevents spurious updated_at bumps
+            // and unnecessary polling cycle processing for doc-only edits.
+            if !spec.resource_hash.is_empty() {
+                let existing = self
+                    .api_specs()
+                    .find_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
+                    .await?;
+                if let Some(ref existing_doc) = existing {
+                    let old_hash = existing_doc.get_str("resource_hash").unwrap_or("");
+                    if old_hash == spec.resource_hash {
+                        // Only update metadata fields on the spec doc.
+                        let spec_doc = api_spec_to_doc(spec)?;
+                        self.api_specs()
+                            .replace_one(doc! { "_id": &spec.id }, spec_doc)
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
             // Pre-flight size check.
             let approx_size = spec.spec_content.len() + 8192;
             if approx_size > 15 * 1024 * 1024 {
@@ -1906,19 +1966,56 @@ mod inner {
         async fn list_api_specs(
             &self,
             namespace: &str,
-            limit: u32,
-            offset: u32,
+            filter: &ApiSpecListFilter,
         ) -> Result<Vec<ApiSpec>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let ns_filter = doc! { "namespace": namespace };
+
+            // Build filter document
+            let mut filter_doc = doc! { "namespace": namespace };
+            if let Some(ref pid) = filter.proxy_id {
+                filter_doc.insert("proxy_id", pid.as_str());
+            }
+            if let Some(ref prefix) = filter.spec_version_prefix {
+                // prefix match via regex
+                filter_doc.insert(
+                    "spec_version",
+                    doc! { "$regex": format!("^{}", regex_escape(prefix)) },
+                );
+            }
+            if let Some(ref substr) = filter.title_contains {
+                filter_doc.insert(
+                    "title",
+                    doc! { "$regex": regex_escape(substr), "$options": "i" },
+                );
+            }
+            if let Some(ref since) = filter.updated_since {
+                filter_doc.insert("updated_at", doc! { "$gte": since.to_rfc3339() });
+            }
+            if let Some(ref tag) = filter.has_tag {
+                // Native array membership query (multikey index used)
+                filter_doc.insert("tags", tag.as_str());
+            }
+
+            // Sort document
+            let sort_field = match filter.sort_by {
+                ApiSpecSortBy::UpdatedAt => "updated_at",
+                ApiSpecSortBy::Title => "title",
+                ApiSpecSortBy::OperationCount => "operation_count",
+                ApiSpecSortBy::CreatedAt => "created_at",
+            };
+            let sort_dir: i32 = match filter.order {
+                SortOrder::Asc => 1,
+                SortOrder::Desc => -1,
+            };
+
             let options = mongodb::options::FindOptions::builder()
-                .sort(doc! { "_id": 1 })
-                .skip(Some(offset as u64))
-                .limit(Some(limit as i64))
+                .sort(doc! { sort_field: sort_dir })
+                .skip(Some(filter.offset as u64))
+                .limit(Some(filter.limit as i64))
                 .build();
             let mut cursor = self
                 .api_specs()
-                .find(ns_filter)
+                .find(filter_doc)
                 .with_options(options)
                 .await?;
             let mut specs = Vec::new();

@@ -1210,6 +1210,35 @@ pub struct ApiSpec {
     /// Version string from the spec's `info.version` field, if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info_version: Option<String>,
+    /// `info.description` from the spec, truncated to 4096 bytes at a UTF-8 boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `info.contact.name` from the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_name: Option<String>,
+    /// `info.contact.email` from the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_email: Option<String>,
+    /// `info.license.name` from the spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_name: Option<String>,
+    /// `info.license.identifier` (3.1+) or `info.license.url` fallback, or None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_identifier: Option<String>,
+    /// Top-level `tags[].name` entries, de-duplicated and sorted.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Server URLs: `servers[].url` for 3.x; constructed from `schemes + host + basePath` for 2.0.
+    #[serde(default)]
+    pub server_urls: Vec<String>,
+    /// Count of HTTP method entries (`get`/`post`/`put`/`delete`/`options`/`head`/`patch`/`trace`)
+    /// across all `paths.*` entries.
+    #[serde(default)]
+    pub operation_count: u32,
+    /// SHA-256 hex of the serialised bundle resources (proxy + upstream + plugins), excluding
+    /// metadata timestamps. Used to short-circuit idempotent PUT writes.
+    #[serde(default)]
+    pub resource_hash: String,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]

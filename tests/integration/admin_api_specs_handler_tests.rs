@@ -1433,3 +1433,239 @@ async fn post_pathological_inputs_handled_gracefully() {
         "deeply nested YAML must not cause 500 (no panic / DoS)"
     );
 }
+
+// ============================================================================
+// Wave 5 — list filters, sort, metadata in summary, idempotent PUT
+// ============================================================================
+
+/// Minimal spec builder with all Tier 1 metadata fields populated.
+fn full_spec_json(proxy_id: &str, title: &str, tag: &str, spec_version: &str) -> Value {
+    json!({
+        "openapi": spec_version,
+        "info": {
+            "title": title,
+            "version": "1.0.0",
+            "description": format!("Description for {title}"),
+            "contact": { "name": "Bob", "email": "bob@example.com" },
+            "license": { "name": "Apache-2.0", "identifier": "Apache-2.0" }
+        },
+        "tags": [{"name": tag}],
+        "servers": [{"url": "https://api.example.com"}],
+        "paths": {
+            "/items": { "get": {}, "post": {} }
+        },
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        }
+    })
+}
+
+/// `GET /api-specs` with ?proxy_id, ?spec_version, and ?sort_by filters works.
+#[tokio::test]
+async fn list_endpoint_accepts_query_filters() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // POST three specs: two 3.1.x, one 3.0.x.
+    let proxy_a = uid("proxy-a");
+    let proxy_b = uid("proxy-b");
+    let proxy_c = uid("proxy-c");
+
+    client
+        .post_json(
+            "/api-specs",
+            &full_spec_json(&proxy_a, "Alpha", "v3", "3.1.0"),
+        )
+        .await;
+    client
+        .post_json(
+            "/api-specs",
+            &full_spec_json(&proxy_b, "Beta", "v3", "3.1.0"),
+        )
+        .await;
+    client
+        .post_json(
+            "/api-specs",
+            &full_spec_json(&proxy_c, "Gamma", "v3", "3.0.3"),
+        )
+        .await;
+
+    // Filter by proxy_id.
+    let (status, body) = client
+        .get_json(&format!("/api-specs?proxy_id={proxy_a}"))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "proxy_id filter: {body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "proxy_id filter must return 1 item");
+    assert_eq!(items[0]["proxy_id"].as_str().unwrap(), proxy_a);
+
+    // Filter by spec_version prefix.
+    let (status2, body2) = client.get_json("/api-specs?spec_version=3.1").await;
+    assert_eq!(
+        status2,
+        reqwest::StatusCode::OK,
+        "spec_version filter: {body2}"
+    );
+    let items2 = body2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 2, "spec_version=3.1 must return 2 items");
+
+    // Sort by title asc.
+    let (status3, body3) = client.get_json("/api-specs?sort_by=title&order=asc").await;
+    assert_eq!(status3, reqwest::StatusCode::OK, "sort: {body3}");
+    let items3 = body3["items"].as_array().unwrap();
+    // Alpha < Beta < Gamma
+    if items3.len() >= 2 {
+        let titles: Vec<_> = items3.iter().filter_map(|i| i["title"].as_str()).collect();
+        assert!(
+            titles.windows(2).all(|w| w[0] <= w[1]),
+            "titles must be ascending: {titles:?}"
+        );
+    }
+}
+
+/// `?sort_by=DROP_TABLE` returns 400.
+#[tokio::test]
+async fn list_endpoint_invalid_sort_by_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let (status, body) = client.get_json("/api-specs?sort_by=DROP_TABLE").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid sort_by must return 400: {body}"
+    );
+}
+
+/// `?order=INVALID` returns 400.
+#[tokio::test]
+async fn list_endpoint_invalid_order_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let (status, body) = client.get_json("/api-specs?order=INVALID").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid order must return 400: {body}"
+    );
+}
+
+/// The list summary includes Tier 1 metadata fields but excludes resource_hash.
+#[tokio::test]
+async fn list_summary_includes_tier1_metadata_excludes_resource_hash() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (status, post_body) = client
+        .post_json(
+            "/api-specs",
+            &full_spec_json(&proxy_id, "Products API", "products", "3.1.0"),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "POST: {post_body}");
+
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK, "list: {list_body}");
+
+    let items = list_body["items"].as_array().expect("items array");
+    assert!(!items.is_empty(), "list must have at least one item");
+    let item = &items[0];
+
+    // Must have Tier 1 fields.
+    assert!(
+        item.get("description").is_some(),
+        "description must be present"
+    );
+    assert!(
+        item.get("contact_name").is_some(),
+        "contact_name must be present"
+    );
+    assert!(
+        item.get("contact_email").is_some(),
+        "contact_email must be present"
+    );
+    assert!(
+        item.get("license_name").is_some(),
+        "license_name must be present"
+    );
+    assert!(
+        item.get("license_identifier").is_some(),
+        "license_identifier must be present"
+    );
+    assert!(item.get("tags").is_some(), "tags must be present");
+    assert!(
+        item.get("server_urls").is_some(),
+        "server_urls must be present"
+    );
+    assert!(
+        item.get("operation_count").is_some(),
+        "operation_count must be present"
+    );
+
+    // operation_count: /items has get+post = 2.
+    assert_eq!(item["operation_count"].as_u64().unwrap_or(0), 2);
+
+    // Must NOT expose resource_hash (internal implementation detail).
+    assert!(
+        item.get("resource_hash").is_none(),
+        "resource_hash must NOT appear in list summary"
+    );
+}
+
+/// PUT with the same proxy bundle does not bump proxy.updated_at (handler-level smoke test).
+#[tokio::test]
+async fn put_with_unchanged_resources_does_not_bump_proxy_updated_at() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let db_arc = std::sync::Arc::new(store.clone());
+
+    // We need direct DB access to check proxy.updated_at, so we hold onto the store.
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec_body = full_spec_json(&proxy_id, "Stable API", "stable", "3.1.0");
+
+    // POST → get the spec id.
+    let (post_status, post_resp) = client.post_json("/api-specs", &spec_body).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST: {post_resp}"
+    );
+    let spec_id = post_resp["id"].as_str().expect("id").to_string();
+
+    // Read proxy.updated_at before PUT.
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    let proxy_before = db_arc.get_proxy(&proxy_id).await.unwrap().unwrap();
+    let before_ts = proxy_before.updated_at;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // PUT with exactly the same body (same bundle → same resource_hash).
+    let (put_status, put_resp) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_body)
+        .await;
+    assert_eq!(put_status, reqwest::StatusCode::OK, "PUT: {put_resp}");
+
+    // proxy.updated_at must NOT have advanced.
+    let proxy_after = db_arc.get_proxy(&proxy_id).await.unwrap().unwrap();
+    assert_eq!(
+        proxy_after.updated_at.timestamp(),
+        before_ts.timestamp(),
+        "proxy.updated_at must not advance when bundle is unchanged (idempotent PUT)"
+    );
+}

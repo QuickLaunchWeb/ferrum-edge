@@ -37,8 +37,8 @@ use tracing::{debug, error, info, warn};
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    DatabaseBackend, IncrementalResult, PaginatedResult, extract_db_hostname, extract_known_ids,
-    redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, IncrementalResult, PaginatedResult,
+    SortOrder, extract_db_hostname, extract_known_ids, redact_url,
 };
 
 struct PluginConfigRef {
@@ -3437,6 +3437,63 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
+        // --- Hash short-circuit (Wave 5 Feature A) ---------------------------
+        // Fetch the current resource_hash. If the bundle is byte-identical to
+        // what's already stored, only update the api_specs metadata row and
+        // leave the proxy/upstream/plugin tables untouched. This prevents
+        // spurious `updated_at` bumps on proxy/plugin rows for doc-only edits,
+        // which would otherwise trigger router-cache rebuilds + DP gRPC broadcasts.
+        let old_hash: Option<String> = {
+            let row: Option<sqlx::any::AnyRow> = sqlx::query(
+                &self.q("SELECT resource_hash FROM api_specs WHERE namespace = ? AND id = ?"),
+            )
+            .bind(&spec.namespace)
+            .bind(&spec.id)
+            .fetch_optional(&self.pool())
+            .await?;
+            row.and_then(|r| r.try_get::<String, _>("resource_hash").ok())
+        };
+
+        if old_hash.as_deref() == Some(&spec.resource_hash) && !spec.resource_hash.is_empty() {
+            // Bundle is unchanged — only update the api_specs metadata row.
+            let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+            let server_urls_json =
+                serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+            let spec_format_str = match spec.spec_format {
+                crate::config::types::SpecFormat::Json => "json",
+                crate::config::types::SpecFormat::Yaml => "yaml",
+            };
+            sqlx::query(&self.q("UPDATE api_specs SET \
+                 spec_content = ?, content_hash = ?, uncompressed_size = ?, \
+                 spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
+                 description = ?, contact_name = ?, contact_email = ?, \
+                 license_name = ?, license_identifier = ?, \
+                 tags = ?, server_urls = ?, operation_count = ?, \
+                 updated_at = ? \
+                 WHERE namespace = ? AND id = ?"))
+            .bind(&spec.spec_content)
+            .bind(&spec.content_hash)
+            .bind(spec.uncompressed_size as i64)
+            .bind(spec_format_str)
+            .bind(&spec.spec_version)
+            .bind(&spec.title)
+            .bind(&spec.info_version)
+            .bind(&spec.description)
+            .bind(&spec.contact_name)
+            .bind(&spec.contact_email)
+            .bind(&spec.license_name)
+            .bind(&spec.license_identifier)
+            .bind(&tags_json)
+            .bind(&server_urls_json)
+            .bind(spec.operation_count as i64)
+            .bind(spec.updated_at.to_rfc3339())
+            .bind(&spec.namespace)
+            .bind(&spec.id)
+            .execute(&self.pool())
+            .await?;
+            return Ok(());
+        }
+
         let mut tx = self.pool().begin().await?;
 
         // Delete spec-owned resources (leaf-first to respect FKs).
@@ -3675,11 +3732,16 @@ impl DatabaseStore {
             crate::config::types::SpecFormat::Json => "json",
             crate::config::types::SpecFormat::Yaml => "yaml",
         };
+        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let server_urls_json =
+            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
         sqlx::query(&self.q("INSERT INTO api_specs \
              (id, namespace, proxy_id, spec_version, spec_format, spec_content, \
               content_encoding, uncompressed_size, content_hash, title, info_version, \
+              description, contact_name, contact_email, license_name, license_identifier, \
+              tags, server_urls, operation_count, resource_hash, \
               created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
         .bind(&spec.id)
         .bind(&spec.namespace)
         .bind(&spec.proxy_id)
@@ -3691,6 +3753,15 @@ impl DatabaseStore {
         .bind(&spec.content_hash)
         .bind(&spec.title)
         .bind(&spec.info_version)
+        .bind(&spec.description)
+        .bind(&spec.contact_name)
+        .bind(&spec.contact_email)
+        .bind(&spec.license_name)
+        .bind(&spec.license_identifier)
+        .bind(&tags_json)
+        .bind(&server_urls_json)
+        .bind(spec.operation_count as i64)
+        .bind(&spec.resource_hash)
         .bind(spec.created_at.to_rfc3339())
         .bind(spec.updated_at.to_rfc3339())
         .execute(&mut **tx)
@@ -3734,21 +3805,91 @@ impl DatabaseStore {
         }
     }
 
-    /// List ApiSpecs in a namespace, paginated.
+    /// List ApiSpecs in a namespace with optional filtering, sorting, and pagination.
     pub async fn list_api_specs(
         &self,
         namespace: &str,
-        limit: u32,
-        offset: u32,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
     ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
-        let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id ASC LIMIT ? OFFSET ?"),
-        )
-        .bind(namespace)
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool())
-        .await?;
+        use crate::config::db_backend::{ApiSpecSortBy, SortOrder};
+
+        // Build WHERE clause dynamically.
+        // We collect bind values as strings/i64 in order to use sqlx's typed bind API.
+        // All column references are whitelisted — no user input goes into the SQL template.
+        let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
+        let mut proxy_id_val: Option<String> = None;
+        let mut spec_version_val: Option<String> = None;
+        let mut title_contains_val: Option<String> = None;
+        let mut updated_since_val: Option<String> = None;
+        let mut has_tag_val: Option<String> = None;
+
+        if filter.proxy_id.is_some() {
+            conditions.push("proxy_id = ?");
+            proxy_id_val = filter.proxy_id.clone();
+        }
+        if let Some(ref prefix) = filter.spec_version_prefix {
+            conditions.push("spec_version LIKE ?");
+            spec_version_val = Some(format!("{prefix}%"));
+        }
+        if let Some(ref substr) = filter.title_contains {
+            // LOWER() + LIKE for case-insensitive substring.
+            conditions.push("LOWER(title) LIKE ?");
+            title_contains_val = Some(format!("%{}%", substr.to_lowercase()));
+        }
+        if let Some(ref since) = filter.updated_since {
+            conditions.push("updated_at >= ?");
+            updated_since_val = Some(since.to_rfc3339());
+        }
+        if let Some(ref tag) = filter.has_tag {
+            // Tags are stored as a JSON text array e.g. `["foo","bar"]`.
+            // We match with LIKE `%"tag_name"%` — this correctly handles the JSON
+            // quote-wrapping without requiring JSON functions (cross-dialect).
+            // Tags containing '"' or '%' are rejected at extract time; see extractor.rs.
+            // This is a known limitation: tag names with quote chars would need escaping.
+            conditions.push(r#"tags LIKE ?"#);
+            has_tag_val = Some(format!("%\"{}\"", tag) + "%");
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        // Whitelist the ORDER BY column to prevent injection.
+        let order_col = match filter.sort_by {
+            ApiSpecSortBy::UpdatedAt => "updated_at",
+            ApiSpecSortBy::Title => "title",
+            ApiSpecSortBy::OperationCount => "operation_count",
+            ApiSpecSortBy::CreatedAt => "created_at",
+        };
+        let order_dir = match filter.order {
+            SortOrder::Asc => "ASC",
+            SortOrder::Desc => "DESC",
+        };
+
+        let sql = self.q(&format!(
+            "SELECT * FROM api_specs WHERE {where_clause} \
+             ORDER BY {order_col} {order_dir} LIMIT ? OFFSET ?"
+        ));
+
+        let mut query = sqlx::query(&sql).bind(namespace);
+        if let Some(ref v) = proxy_id_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = spec_version_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = title_contains_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = updated_since_val {
+            query = query.bind(v);
+        }
+        if let Some(ref v) = has_tag_val {
+            query = query.bind(v);
+        }
+        let rows: Vec<AnyRow> = query
+            .bind(filter.limit as i64)
+            .bind(filter.offset as i64)
+            .fetch_all(&self.pool())
+            .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
             specs.push(row_to_api_spec(row)?);
@@ -4241,10 +4382,9 @@ impl DatabaseBackend for DatabaseStore {
     async fn list_api_specs(
         &self,
         namespace: &str,
-        limit: u32,
-        offset: u32,
+        filter: &crate::config::db_backend::ApiSpecListFilter,
     ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
-        DatabaseStore::list_api_specs(self, namespace, limit, offset).await
+        DatabaseStore::list_api_specs(self, namespace, filter).await
     }
 
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
@@ -4703,6 +4843,25 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
     let spec_content: Vec<u8> = row.try_get("spec_content")?;
     let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
 
+    // Wave 5: parse JSON-text arrays for tags / server_urls.
+    let tags: Vec<String> = row
+        .try_get::<String, _>("tags")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let server_urls: Vec<String> = row
+        .try_get::<String, _>("server_urls")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let operation_count: u32 = row
+        .try_get::<i64, _>("operation_count")
+        .map(|v| v.max(0) as u32)
+        .unwrap_or(0);
+    let resource_hash: String = row
+        .try_get::<String, _>("resource_hash")
+        .unwrap_or_default();
+
     Ok(ApiSpec {
         id: row.try_get("id")?,
         namespace: row
@@ -4719,6 +4878,15 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
         content_hash: row.try_get("content_hash")?,
         title: row.try_get("title").ok().flatten(),
         info_version: row.try_get("info_version").ok().flatten(),
+        description: row.try_get("description").ok().flatten(),
+        contact_name: row.try_get("contact_name").ok().flatten(),
+        contact_email: row.try_get("contact_email").ok().flatten(),
+        license_name: row.try_get("license_name").ok().flatten(),
+        license_identifier: row.try_get("license_identifier").ok().flatten(),
+        tags,
+        server_urls,
+        operation_count,
+        resource_hash,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

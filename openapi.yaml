@@ -1461,8 +1461,13 @@ paths:
         from list responses — use `GET /api-specs/{id}` to retrieve the full
         document for a specific spec.
 
-        Defaults to 50 items per page, maximum 200. Results are ordered by
-        `created_at` ascending. Use `offset` to page through results.
+        Defaults to 50 items per page, maximum 200. Default sort is
+        `updated_at DESC` (most recently updated first). Use `sort_by` and
+        `order` to change ordering. Use `offset` to page through results.
+
+        Supports the following optional filters: `proxy_id`, `spec_version`
+        (prefix match), `title_contains` (case-insensitive substring),
+        `updated_since` (ISO-8601 timestamp), and `has_tag` (exact tag name).
 
         This endpoint is available in database and CP modes. It returns 503 in
         DP and file modes where no database is present.
@@ -1485,6 +1490,63 @@ paths:
             minimum: 0
             default: 0
           description: Number of items to skip.
+        - name: proxy_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Exact match on `proxy_id`. Returns only the spec that owns this proxy.
+        - name: spec_version
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Prefix match on `spec_version`. For example, `spec_version=3.1`
+            matches `3.1.0`, `3.1.1`, etc.
+        - name: title_contains
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Case-insensitive substring match on `title`.
+        - name: updated_since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: |
+            Return only specs with `updated_at >= ?`. Accepts ISO-8601 /
+            RFC-3339 format (e.g. `2026-04-01T00:00:00Z`).
+        - name: has_tag
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Exact tag membership filter. Returns only specs whose `tags` array
+            contains this tag name.
+        - name: sort_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [updated_at, title, operation_count, created_at]
+            default: updated_at
+          description: |
+            Column to sort results by. Allowed values: `updated_at` (default),
+            `title`, `operation_count`, `created_at`. Any other value returns 400.
+        - name: order
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: |
+            Sort direction. `desc` (default) = largest/newest first; `asc` =
+            smallest/oldest first. Any other value returns 400.
         - name: X-Ferrum-Namespace
           in: header
           required: false
@@ -1498,6 +1560,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiSpecListResponse"
+        "400":
+          description: |
+            Invalid query parameter — for example, an unknown `sort_by` value.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -1735,6 +1807,17 @@ paths:
         The spec must reference the same proxy ID as the original submission.
         Changing the proxy ID requires deleting the spec (`DELETE /api-specs/{id}`)
         and submitting a new one (`POST /api-specs`).
+
+        **Idempotent PUT (resource-hash short-circuit)**: At submit time, the
+        gateway computes a SHA-256 hash over the serialised proxy, upstream, and
+        plugin definitions (the "resource bundle"). If a PUT supplies a bundle
+        that produces the same hash as the stored one — for example, when only
+        `info.description` or other doc-only fields changed — the proxy, upstream,
+        and plugin rows are left untouched. Their `updated_at` timestamps do NOT
+        advance, and the polling cycle / DP gRPC broadcast sees no delta.
+        The `api_specs` row is always updated (new `updated_at`, `content_hash`,
+        and any changed metadata fields). This makes PUT safe to run on every
+        CI/CD deploy cycle without causing unnecessary cache rebuilds.
 
         `created_at` is preserved from the original spec; `updated_at` and
         `content_hash` reflect the new document.
@@ -6840,6 +6923,47 @@ components:
         info_version:
           type: [string, "null"]
           description: "`info.version` from the spec document, if present"
+        description:
+          type: [string, "null"]
+          description: |
+            `info.description` from the spec, truncated to 4096 bytes at a
+            UTF-8 character boundary if necessary.
+        contact_name:
+          type: [string, "null"]
+          description: "`info.contact.name` from the spec, if present"
+        contact_email:
+          type: [string, "null"]
+          description: "`info.contact.email` from the spec, if present"
+        license_name:
+          type: [string, "null"]
+          description: "`info.license.name` from the spec, if present"
+        license_identifier:
+          type: [string, "null"]
+          description: |
+            `info.license.identifier` (OpenAPI 3.1+) or `info.license.url`
+            fallback, if present.
+        tags:
+          type: array
+          items:
+            type: string
+          description: |
+            Top-level `tags[].name` entries from the spec, de-duplicated and
+            sorted alphabetically. Empty array when no tags are defined.
+        server_urls:
+          type: array
+          items:
+            type: string
+          description: |
+            Server URLs: `servers[].url` for OpenAPI 3.x; for Swagger 2.0,
+            constructed as `{scheme}://{host}{basePath}` for each scheme.
+            Empty array when no server information is present.
+        operation_count:
+          type: integer
+          format: int32
+          description: |
+            Count of HTTP method keys (`get`, `post`, `put`, `delete`,
+            `options`, `head`, `patch`, `trace`) summed across all `paths.*`
+            entries in the spec.
         uncompressed_size:
           type: integer
           format: int64

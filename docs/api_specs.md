@@ -118,6 +118,15 @@ The following are rejected at parse time with a 400 error:
 | `uncompressed_size` | int64 | Byte count before compression |
 | `title` | string? | `info.title` from the spec, if present |
 | `info_version` | string? | `info.version` from the spec, if present |
+| `description` | string? | `info.description`, truncated to 4096 bytes at a UTF-8 boundary |
+| `contact_name` | string? | `info.contact.name` from the spec |
+| `contact_email` | string? | `info.contact.email` from the spec |
+| `license_name` | string? | `info.license.name` from the spec |
+| `license_identifier` | string? | `info.license.identifier` (3.1+) or `info.license.url` fallback |
+| `tags` | string[] | Top-level `tags[].name` entries, de-duplicated and sorted (3.x and 2.0) |
+| `server_urls` | string[] | `servers[].url` for 3.x; `{scheme}://{host}{basePath}` for 2.0 |
+| `operation_count` | uint32 | HTTP method keys summed across all `paths.*` entries |
+| `resource_hash` | string | SHA-256 hex of the serialised bundle (internal; not returned in list) |
 | `created_at` | timestamp | Set on POST; preserved on PUT |
 | `updated_at` | timestamp | Set on POST and PUT |
 
@@ -134,7 +143,7 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 | Operation | What happens |
 |---|---|
 | `POST /api-specs` | Resources tagged with the new `api_spec_id`. New proxy, optional upstream, and plugins are inserted. |
-| `PUT /api-specs/{id}` | All resources with `api_spec_id = {id}` are deleted and re-inserted from the new document. Resources on the same proxy with `api_spec_id = null` (manually added) are untouched. |
+| `PUT /api-specs/{id}` | Idempotent if the bundle is unchanged (see "PUT semantics" below). When changed, all resources with `api_spec_id = {id}` are deleted and re-inserted from the new document. Resources on the same proxy with `api_spec_id = null` (manually added) are untouched. |
 | `DELETE /api-specs/{id}` | Spec-owned proxy is deleted → FK cascade removes all of its plugins (including manually-added ones). Spec-owned upstream is deleted explicitly. Non-spec upstreams survive. The spec row is deleted. |
 | `DELETE /proxies/{id}` | The database `ON DELETE CASCADE` on `api_specs.proxy_id → proxies(id)` removes the spec row automatically. The spec-owned upstream is NOT automatically cleaned up in this case. |
 
@@ -152,6 +161,63 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 **SQL backends (PostgreSQL, MySQL, SQLite)**: `POST /api-specs` and `PUT /api-specs/{id}` execute within a single database transaction. Either all resources are created/replaced or none are (full rollback on error).
 
 **MongoDB without a replica set**: atomicity is limited to single-document operations. Multi-resource submissions use a best-effort approach with compensating deletes on failure. In the event of an infrastructure fault mid-submission, orphaned resources are possible. Use a MongoDB replica set for production deployments that require atomic multi-document writes.
+
+## Listable metadata
+
+At submit time, the gateway extracts the following fields from the spec document and stores them as indexed columns on the `api_specs` row. They appear in every `GET /api-specs` list item and can be used as search filters.
+
+| Field | Source | Notes |
+|---|---|---|
+| `description` | `info.description` | Truncated to 4096 bytes at a UTF-8 char boundary |
+| `contact_name` | `info.contact.name` | |
+| `contact_email` | `info.contact.email` | |
+| `license_name` | `info.license.name` | |
+| `license_identifier` | `info.license.identifier` (3.1+) or `info.license.url` | |
+| `tags` | `tags[].name` | De-duplicated and sorted; supported in both 2.0 and 3.x |
+| `server_urls` | `servers[].url` (3.x) or `{scheme}://{host}{basePath}` (2.0) | |
+| `operation_count` | Count of HTTP methods across all `paths.*` | `get`, `post`, `put`, `delete`, `options`, `head`, `patch`, `trace` |
+
+These fields are stored at INSERT time and do not require re-parsing the spec for list queries.
+
+## List filters
+
+`GET /api-specs` supports the following query parameters in addition to `limit` and `offset`:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `proxy_id` | string | Exact match on `proxy_id` |
+| `spec_version` | string | Prefix match (e.g. `3.1` matches `3.1.0`, `3.1.1`) |
+| `title_contains` | string | Case-insensitive substring on `title` |
+| `updated_since` | ISO-8601 | `updated_at >= ?` (e.g. `2026-04-01T00:00:00Z`) |
+| `has_tag` | string | Exact tag name membership |
+| `sort_by` | enum | `updated_at` (default), `title`, `operation_count`, `created_at` |
+| `order` | enum | `desc` (default), `asc` |
+
+Unknown `sort_by` or `order` values return HTTP 400.
+
+```bash
+# Filter examples
+curl "https://gateway/api-specs?spec_version=3.1&sort_by=title&order=asc" \
+  -H "Authorization: Bearer $JWT"
+
+curl "https://gateway/api-specs?has_tag=public&updated_since=2026-04-01T00:00:00Z" \
+  -H "Authorization: Bearer $JWT"
+
+curl "https://gateway/api-specs?title_contains=orders&sort_by=operation_count&order=desc" \
+  -H "Authorization: Bearer $JWT"
+```
+
+## PUT semantics
+
+**Idempotent PUT (resource-hash short-circuit)**: At submit time, the gateway computes a SHA-256 hash over the serialised proxy, upstream, and plugin definitions (the "resource bundle"). On PUT, if the new bundle produces the same hash as the stored one — for example, when only `info.description` or other doc-only fields changed — the proxy, upstream, and plugin rows are left **untouched**:
+
+- Their `updated_at` timestamps do **not** advance.
+- The polling cycle sees no delta and skips router-cache and plugin-cache rebuilds.
+- DP gRPC broadcast is not triggered.
+
+The `api_specs` row is **always** updated: new `updated_at`, `content_hash`, spec content, and all extracted metadata fields.
+
+This makes PUT safe to run on every CI/CD deploy cycle without causing unnecessary cache rebuilds or downstream configuration churn.
 
 ## Worked examples
 

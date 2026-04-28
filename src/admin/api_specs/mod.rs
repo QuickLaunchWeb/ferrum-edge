@@ -5,4 +5,6 @@
 pub mod extractor;
 pub mod handlers;
 
-pub use extractor::{ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract};
+pub use extractor::{
+    ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract, hash_resource_bundle,
+};

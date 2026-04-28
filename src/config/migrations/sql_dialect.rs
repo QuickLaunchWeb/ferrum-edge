@@ -99,6 +99,11 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
             "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace ON api_specs (namespace)",
             "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace_updated_at ON api_specs (namespace, updated_at)",
+            // Wave 5 indexes — for spec_version filter, title sort, operation_count sort, created_at sort
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_spec_version ON api_specs (namespace, spec_version)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_operation_count ON api_specs (namespace, operation_count)",
+            "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_created_at ON api_specs (namespace, created_at)",
         ];
 
         for idx_sql in indexes {
@@ -433,6 +438,15 @@ impl V001SqlBuilder {
                 content_hash VARCHAR(64) NOT NULL,
                 title TEXT,
                 info_version VARCHAR(255),
+                description LONGTEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash VARCHAR(64) NOT NULL DEFAULT '',
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -452,6 +466,15 @@ impl V001SqlBuilder {
                 content_hash TEXT NOT NULL,
                 title TEXT,
                 info_version TEXT,
+                description TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

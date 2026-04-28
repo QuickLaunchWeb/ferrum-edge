@@ -13,13 +13,22 @@
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
     config::{
-        db_backend::DatabaseBackend as _,
+        db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend as _, SortOrder},
         db_loader::{DatabaseStore, DbPoolConfig},
         types::{ApiSpec, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream},
     },
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tempfile::TempDir;
+
+/// Build a default list filter with just limit/offset (for existing pagination tests).
+fn simple_filter(limit: u32, offset: u32) -> ApiSpecListFilter {
+    ApiSpecListFilter {
+        limit,
+        offset,
+        ..Default::default()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -125,6 +134,16 @@ fn make_spec(id: &str, proxy_id: &str, namespace: &str, content: &[u8]) -> ApiSp
         content_hash: hash,
         title: Some("Test API".to_string()),
         info_version: Some("1.0.0".to_string()),
+        // Wave 5 fields — defaults for existing tests
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: String::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -527,18 +546,18 @@ async fn list_api_specs_namespace_scoped_and_paginated() {
 
     // All 3 ns_a specs.
     let all_a = store
-        .list_api_specs(ns_a, 100, 0)
+        .list_api_specs(ns_a, &simple_filter(100, 0))
         .await
         .expect("list_api_specs failed");
     assert_eq!(all_a.len(), 3, "ns_a must have 3 specs");
 
     // Pagination: first page (limit=2), second page (limit=2, offset=2).
     let page1 = store
-        .list_api_specs(ns_a, 2, 0)
+        .list_api_specs(ns_a, &simple_filter(2, 0))
         .await
         .expect("page1 failed");
     let page2 = store
-        .list_api_specs(ns_a, 2, 2)
+        .list_api_specs(ns_a, &simple_filter(2, 2))
         .await
         .expect("page2 failed");
     assert_eq!(page1.len(), 2, "page1 should have 2 items");
@@ -546,7 +565,7 @@ async fn list_api_specs_namespace_scoped_and_paginated() {
 
     // Namespace isolation: ns_b must have exactly 1 spec.
     let all_b = store
-        .list_api_specs(ns_b, 100, 0)
+        .list_api_specs(ns_b, &simple_filter(100, 0))
         .await
         .expect("list ns_b failed");
     assert_eq!(all_b.len(), 1, "ns_b must have 1 spec");
@@ -701,7 +720,7 @@ async fn spec_in_ns_a_invisible_from_ns_b() {
 
     // list_api_specs for ns-b → empty.
     let list = store
-        .list_api_specs("ns-b", 100, 0)
+        .list_api_specs("ns-b", &simple_filter(100, 0))
         .await
         .expect("list_api_specs failed");
     assert!(list.is_empty(), "ns-b must have no specs");
@@ -857,5 +876,941 @@ async fn delete_proxy_cascades_api_spec_row_via_fk() {
     assert!(
         after_plugin.is_none(),
         "spec-owned plugin must be cascade-deleted when its proxy is deleted"
+    );
+}
+
+// ===========================================================================
+// Wave 5 tests — Tier 1 metadata extraction, idempotent PUT, list filters
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test helpers for Wave 5
+// ---------------------------------------------------------------------------
+
+/// Build a full spec with all Tier 1 metadata fields populated. The spec body
+/// is a valid OpenAPI 3.1 JSON document with info, contact, license, tags,
+/// servers, and paths that the extractor can parse.
+fn make_spec_with_metadata(
+    id: &str,
+    proxy_id: &str,
+    namespace: &str,
+    title: &str,
+    spec_version_suffix: &str,
+    tags: &[&str],
+) -> (ferrum_edge::admin::api_specs::ExtractedBundle, ApiSpec) {
+    use ferrum_edge::admin::api_specs::{SpecMetadata, hash_resource_bundle};
+    use ferrum_edge::admin::spec_codec;
+    use ferrum_edge::config::types::SpecFormat;
+
+    let tags_json: String = tags
+        .iter()
+        .map(|t| format!(r#"{{"name": "{t}"}}"#))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let body = format!(
+        r#"{{
+            "openapi": "3.1.{spec_version_suffix}",
+            "info": {{
+                "title": "{title}",
+                "version": "1.0.0",
+                "description": "Test description for {title}",
+                "contact": {{ "name": "Alice", "email": "alice@example.com" }},
+                "license": {{ "name": "MIT", "identifier": "MIT" }}
+            }},
+            "tags": [{tags_json}],
+            "servers": [{{"url": "https://api.example.com/v1"}}],
+            "paths": {{
+                "/foo": {{ "get": {{}}, "post": {{}} }},
+                "/bar": {{ "delete": {{}} }}
+            }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let body_bytes = body.as_bytes();
+
+    let (bundle, meta) = ferrum_edge::admin::api_specs::extract(body_bytes, None, namespace)
+        .expect("extract failed");
+
+    let compressed = spec_codec::compress_gzip(body_bytes).expect("compress failed");
+    let content_hash = spec_codec::sha256_hex(body_bytes);
+    let resource_hash = hash_resource_bundle(&bundle);
+
+    let spec = ApiSpec {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        proxy_id: proxy_id.to_string(),
+        spec_version: meta.version.clone(),
+        spec_format: SpecFormat::Json,
+        spec_content: compressed,
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body_bytes.len() as u64,
+        content_hash,
+        title: meta.title.clone(),
+        info_version: meta.info_version.clone(),
+        description: meta.description.clone(),
+        contact_name: meta.contact_name.clone(),
+        contact_email: meta.contact_email.clone(),
+        license_name: meta.license_name.clone(),
+        license_identifier: meta.license_identifier.clone(),
+        tags: meta.tags.clone(),
+        server_urls: meta.server_urls.clone(),
+        operation_count: meta.operation_count,
+        resource_hash,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    (bundle, spec)
+}
+
+// ---------------------------------------------------------------------------
+// Feature B: Tier 1 metadata extraction
+// ---------------------------------------------------------------------------
+
+/// Submit a spec with full info/contact/license/tags/servers/paths and verify
+/// all 8 metadata fields are stored correctly.
+#[tokio::test]
+async fn submit_extracts_tier1_metadata() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+
+    let (bundle, spec) = make_spec_with_metadata(
+        &spec_id,
+        &proxy_id,
+        ns,
+        "Orders API",
+        "0",
+        &["public", "orders"],
+    );
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit failed");
+
+    let fetched = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get failed")
+        .expect("spec not found");
+
+    // description
+    assert!(
+        fetched
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .contains("Orders API"),
+        "description must contain title text: {:?}",
+        fetched.description
+    );
+    // contact
+    assert_eq!(fetched.contact_name.as_deref(), Some("Alice"));
+    assert_eq!(fetched.contact_email.as_deref(), Some("alice@example.com"));
+    // license
+    assert_eq!(fetched.license_name.as_deref(), Some("MIT"));
+    assert_eq!(fetched.license_identifier.as_deref(), Some("MIT"));
+    // tags — de-duplicated and sorted
+    assert_eq!(fetched.tags, vec!["orders", "public"]);
+    // server_urls
+    assert_eq!(fetched.server_urls, vec!["https://api.example.com/v1"]);
+    // operation_count: /foo has get+post (2), /bar has delete (1) = 3
+    assert_eq!(fetched.operation_count, 3, "3 HTTP methods in paths");
+    // resource_hash present
+    assert!(!fetched.resource_hash.is_empty());
+}
+
+/// Description longer than 4096 bytes is truncated at a UTF-8 boundary.
+#[tokio::test]
+async fn submit_truncates_long_description_at_4kib() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+
+    // Build a 10 KiB description using multi-byte chars to test UTF-8 boundary.
+    // U+00E9 (é) is 2 bytes in UTF-8; 10 KiB / 2 = 5120 chars.
+    let long_desc: String = "é".repeat(5120);
+    assert!(
+        long_desc.len() >= 10240,
+        "description must be ≥ 10 KiB in bytes"
+    );
+
+    let body = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{
+                "title": "Long Desc API",
+                "version": "1.0.0",
+                "description": "{long_desc}"
+            }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "b.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let body_bytes = body.as_bytes();
+    let (bundle, _) =
+        ferrum_edge::admin::api_specs::extract(body_bytes, None, ns).expect("extract failed");
+
+    let meta = ferrum_edge::admin::api_specs::extract(body_bytes, None, ns)
+        .expect("extract failed")
+        .1;
+    let compressed = ferrum_edge::admin::spec_codec::compress_gzip(body_bytes).unwrap();
+    let content_hash = ferrum_edge::admin::spec_codec::sha256_hex(body_bytes);
+    let resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle);
+
+    let spec = ApiSpec {
+        id: spec_id.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_id.clone(),
+        spec_version: meta.version,
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: compressed,
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body_bytes.len() as u64,
+        content_hash,
+        title: meta.title,
+        info_version: meta.info_version,
+        description: meta.description.clone(),
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit failed");
+
+    let fetched = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get failed")
+        .expect("spec not found");
+
+    let stored_desc = fetched.description.expect("description must be stored");
+    assert!(
+        stored_desc.len() <= 4096,
+        "stored description ({} bytes) must be ≤ 4096 bytes",
+        stored_desc.len()
+    );
+    // Must be valid UTF-8 (Rust String guarantees this, but also check it's a
+    // clean boundary by encoding/decoding).
+    assert!(std::str::from_utf8(stored_desc.as_bytes()).is_ok());
+}
+
+/// Swagger 2.0: server_urls are constructed from `schemes + host + basePath`.
+#[tokio::test]
+async fn swagger_2_0_server_urls_constructed_from_schemes_host_basepath() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+
+    let body = format!(
+        r#"{{
+            "swagger": "2.0",
+            "info": {{ "title": "Swagger API", "version": "1.0" }},
+            "host": "api.example.com",
+            "basePath": "/v1",
+            "schemes": ["https"],
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "b.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let body_bytes = body.as_bytes();
+    let (bundle, meta) =
+        ferrum_edge::admin::api_specs::extract(body_bytes, None, ns).expect("extract failed");
+    let compressed = ferrum_edge::admin::spec_codec::compress_gzip(body_bytes).unwrap();
+    let content_hash = ferrum_edge::admin::spec_codec::sha256_hex(body_bytes);
+    let resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle);
+
+    let spec = ApiSpec {
+        id: spec_id.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_id.clone(),
+        spec_version: meta.version,
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: compressed,
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body_bytes.len() as u64,
+        content_hash,
+        title: meta.title,
+        info_version: meta.info_version,
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: meta.server_urls.clone(),
+        operation_count: 0,
+        resource_hash,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit failed");
+
+    let fetched = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get failed")
+        .expect("not found");
+
+    assert_eq!(
+        fetched.server_urls,
+        vec!["https://api.example.com/v1"],
+        "server_urls must be constructed from schemes+host+basePath for Swagger 2.0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Feature A: idempotent PUT (hash short-circuit)
+// ---------------------------------------------------------------------------
+
+/// PUT with the same bundle (but potentially different spec document text like
+/// description changes) must NOT update proxy.updated_at, but MUST advance
+/// api_specs.updated_at.
+#[tokio::test]
+async fn replace_with_unchanged_resources_skips_proxy_write() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+
+    // Initial submit.
+    let body1 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API v1", "version": "1.0", "description": "Original desc" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "b.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let (bundle1, meta1) =
+        ferrum_edge::admin::api_specs::extract(body1.as_bytes(), None, ns).expect("extract1");
+    let resource_hash1 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle1);
+    let spec1 = ApiSpec {
+        id: spec_id.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_id.clone(),
+        spec_version: meta1.version.clone(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(body1.as_bytes()).unwrap(),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body1.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(body1.as_bytes()),
+        title: meta1.title.clone(),
+        info_version: meta1.info_version.clone(),
+        description: meta1.description.clone(),
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: resource_hash1.clone(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    store
+        .submit_api_spec_bundle(&bundle1, &spec1)
+        .await
+        .expect("initial submit");
+
+    // Capture proxy.updated_at before the PUT.
+    let proxy_before = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy not found");
+    let proxy_updated_at_before = proxy_before.updated_at;
+
+    // Small sleep to ensure any write would bump the timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // PUT with same bundle, different description (same resource_hash).
+    let body2 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API v1", "version": "1.0", "description": "Updated desc" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "b.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let (bundle2, meta2) =
+        ferrum_edge::admin::api_specs::extract(body2.as_bytes(), None, ns).expect("extract2");
+    let resource_hash2 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle2);
+    // Sanity: hashes must be identical (proxy unchanged).
+    assert_eq!(
+        resource_hash1, resource_hash2,
+        "resource_hash must match when bundle is identical"
+    );
+
+    let now2 = chrono::Utc::now();
+    let spec2 = ApiSpec {
+        id: spec_id.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_id.clone(),
+        spec_version: meta2.version.clone(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(body2.as_bytes()).unwrap(),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body2.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(body2.as_bytes()),
+        title: meta2.title.clone(),
+        info_version: meta2.info_version.clone(),
+        description: meta2.description.clone(),
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: resource_hash2,
+        created_at: spec1.created_at,
+        updated_at: now2,
+    };
+
+    store
+        .replace_api_spec_bundle(&bundle2, &spec2)
+        .await
+        .expect("replace failed");
+
+    // proxy.updated_at must NOT have advanced.
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy not found");
+    assert_eq!(
+        proxy_after.updated_at.timestamp(),
+        proxy_updated_at_before.timestamp(),
+        "proxy.updated_at must not change when bundle is unchanged"
+    );
+
+    // api_specs.updated_at MUST have advanced.
+    let spec_after = store
+        .get_api_spec(ns, &spec_id)
+        .await
+        .expect("get_api_spec failed")
+        .expect("spec not found");
+    assert!(
+        spec_after.updated_at > proxy_updated_at_before,
+        "api_specs.updated_at must advance on PUT even when bundle is unchanged"
+    );
+}
+
+/// PUT with a real proxy field change must update proxy.updated_at.
+#[tokio::test]
+async fn replace_with_changed_resources_updates_proxy() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+
+    let body1 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend-v1.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let (bundle1, meta1) =
+        ferrum_edge::admin::api_specs::extract(body1.as_bytes(), None, ns).expect("extract1");
+    let resource_hash1 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle1);
+
+    let spec1 = ApiSpec {
+        id: spec_id.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_id.clone(),
+        spec_version: meta1.version,
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(body1.as_bytes()).unwrap(),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body1.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(body1.as_bytes()),
+        title: meta1.title,
+        info_version: meta1.info_version,
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: resource_hash1.clone(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    store
+        .submit_api_spec_bundle(&bundle1, &spec1)
+        .await
+        .expect("initial submit");
+
+    let proxy_before = store.get_proxy(&proxy_id).await.unwrap().unwrap();
+    let before_ts = proxy_before.updated_at;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Change backend_host → different resource_hash.
+    let body2 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend-v2.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let (bundle2, meta2) =
+        ferrum_edge::admin::api_specs::extract(body2.as_bytes(), None, ns).expect("extract2");
+    let resource_hash2 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle2);
+    assert_ne!(
+        resource_hash1, resource_hash2,
+        "resource_hash must differ when proxy backend_host changes"
+    );
+
+    let now2 = chrono::Utc::now();
+    let spec2 = ApiSpec {
+        id: spec_id.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_id.clone(),
+        spec_version: meta2.version,
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(body2.as_bytes()).unwrap(),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body2.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(body2.as_bytes()),
+        title: meta2.title,
+        info_version: meta2.info_version,
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: resource_hash2,
+        created_at: spec1.created_at,
+        updated_at: now2,
+    };
+
+    store
+        .replace_api_spec_bundle(&bundle2, &spec2)
+        .await
+        .expect("replace failed");
+
+    // Proxy must have been re-inserted with new backend_host.
+    let proxy_after = store.get_proxy(&proxy_id).await.unwrap().unwrap();
+    assert_eq!(proxy_after.backend_host, "backend-v2.internal");
+    assert!(
+        proxy_after.updated_at > before_ts || proxy_after.updated_at >= before_ts,
+        "proxy.updated_at must advance when bundle changes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Feature C: list filters
+// ---------------------------------------------------------------------------
+
+/// `?proxy_id=foo` returns only specs whose proxy_id matches exactly.
+/// Each spec must have a unique proxy_id (DB constraint), so we use 2 proxies
+/// in group A and 1 in group B. The test checks that filtering by one
+/// specific proxy_id returns exactly that spec.
+#[tokio::test]
+async fn list_filter_proxy_id() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // Submit three specs with distinct proxy_ids. We'll filter by proxy_a1.
+    let proxy_a1 = uid("proxy-a1");
+    let proxy_a2 = uid("proxy-a2");
+    let proxy_b1 = uid("proxy-b1");
+
+    let spec_a1 = uid("spec");
+    let spec_a2 = uid("spec");
+    let spec_b1 = uid("spec");
+
+    let (bundle, spec) = make_spec_with_metadata(&spec_a1, &proxy_a1, ns, "API A1", "0", &[]);
+    store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+
+    let (bundle, spec) = make_spec_with_metadata(&spec_a2, &proxy_a2, ns, "API A2", "0", &[]);
+    store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+
+    let (bundle, spec) = make_spec_with_metadata(&spec_b1, &proxy_b1, ns, "API B1", "0", &[]);
+    store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+
+    // Filter by proxy_a1 — should return exactly 1.
+    let filter = ApiSpecListFilter {
+        proxy_id: Some(proxy_a1.clone()),
+        limit: 100,
+        ..Default::default()
+    };
+    let results = store
+        .list_api_specs(ns, &filter)
+        .await
+        .expect("list failed");
+    assert_eq!(results.len(), 1, "must return 1 spec for proxy_a1");
+    assert_eq!(results[0].proxy_id, proxy_a1);
+
+    // Filter by proxy_b1 — should return exactly 1.
+    let filter2 = ApiSpecListFilter {
+        proxy_id: Some(proxy_b1.clone()),
+        limit: 100,
+        ..Default::default()
+    };
+    let results2 = store.list_api_specs(ns, &filter2).await.expect("list b1");
+    assert_eq!(results2.len(), 1, "must return 1 spec for proxy_b1");
+
+    // No filter — should return all 3.
+    let all = store
+        .list_api_specs(ns, &simple_filter(100, 0))
+        .await
+        .expect("list all");
+    assert_eq!(all.len(), 3, "must return 3 specs without filter");
+}
+
+/// `?spec_version=3.1` returns only specs whose spec_version starts with `3.1`.
+#[tokio::test]
+async fn list_filter_spec_version_prefix() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // Submit specs with versions 3.1.0, 3.1.0 (different proxy), 3.2.0.
+    // Note: make_spec_with_metadata builds "3.1.{suffix}".
+    let versions: Vec<(&str, &str)> = vec![("0", "v1"), ("0", "v2"), ("0", "v3")];
+    // proxy for 3.2.0 needs a separate spec
+    let proxy_32 = uid("proxy-32");
+    let spec_32 = uid("spec-32");
+    let body_32 = format!(
+        r#"{{
+            "openapi": "3.2.0",
+            "info": {{ "title": "API 3.2", "version": "1.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_32}",
+                "backend_host": "b.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_32}"
+            }}
+        }}"#
+    );
+    let (b32, m32) =
+        ferrum_edge::admin::api_specs::extract(body_32.as_bytes(), None, ns).expect("extract 3.2");
+    let rh32 = ferrum_edge::admin::api_specs::hash_resource_bundle(&b32);
+    let s32 = ApiSpec {
+        id: spec_32.clone(),
+        namespace: ns.to_string(),
+        proxy_id: proxy_32.clone(),
+        spec_version: m32.version,
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(body_32.as_bytes()).unwrap(),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body_32.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(body_32.as_bytes()),
+        title: m32.title,
+        info_version: m32.info_version,
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: rh32,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store.submit_api_spec_bundle(&b32, &s32).await.unwrap();
+
+    for (suffix, title) in versions {
+        let proxy_id = uid("proxy-31");
+        let spec_id = uid("spec-31");
+        let (bundle, spec) = make_spec_with_metadata(&spec_id, &proxy_id, ns, title, suffix, &[]);
+        store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    }
+
+    let filter = ApiSpecListFilter {
+        spec_version_prefix: Some("3.1".to_string()),
+        limit: 100,
+        ..Default::default()
+    };
+    let results = store
+        .list_api_specs(ns, &filter)
+        .await
+        .expect("list failed");
+    assert_eq!(
+        results.len(),
+        3,
+        "should return 3 specs with version prefix 3.1"
+    );
+    assert!(
+        results.iter().all(|s| s.spec_version.starts_with("3.1")),
+        "all results must have spec_version starting with 3.1"
+    );
+}
+
+/// `?title_contains=orders` is case-insensitive.
+#[tokio::test]
+async fn list_filter_title_contains_case_insensitive() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // Titles: "Orders API", "ORDERS Service", "Catalog"
+    for (title, suffix) in &[
+        ("Orders API", "0"),
+        ("ORDERS Service", "1"),
+        ("Catalog", "2"),
+    ] {
+        let proxy_id = uid("proxy");
+        let spec_id = uid("spec");
+        let (bundle, spec) = make_spec_with_metadata(&spec_id, &proxy_id, ns, title, suffix, &[]);
+        store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    }
+
+    let filter = ApiSpecListFilter {
+        title_contains: Some("orders".to_string()),
+        limit: 100,
+        ..Default::default()
+    };
+    let results = store
+        .list_api_specs(ns, &filter)
+        .await
+        .expect("list failed");
+    assert_eq!(
+        results.len(),
+        2,
+        "should return 2 specs matching 'orders' case-insensitively"
+    );
+}
+
+/// `?updated_since=<timestamp>` returns only specs updated at or after that time.
+#[tokio::test]
+async fn list_filter_updated_since() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // Insert 2 specs.
+    for i in 0..2u8 {
+        let proxy_id = uid("proxy");
+        let spec_id = uid("spec");
+        let (bundle, spec) =
+            make_spec_with_metadata(&spec_id, &proxy_id, ns, "API", &i.to_string(), &[]);
+        store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    }
+
+    // The cutoff is "right now" — both specs were inserted just before this,
+    // so updated_since = now means 0 results.
+    let cutoff = chrono::Utc::now() + chrono::Duration::seconds(1);
+    let filter = ApiSpecListFilter {
+        updated_since: Some(cutoff),
+        limit: 100,
+        ..Default::default()
+    };
+    let results = store
+        .list_api_specs(ns, &filter)
+        .await
+        .expect("list failed");
+    assert!(
+        results.is_empty(),
+        "no specs updated after the cutoff (got {})",
+        results.len()
+    );
+
+    // With past cutoff, all specs are returned.
+    let past_cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+    let filter2 = ApiSpecListFilter {
+        updated_since: Some(past_cutoff),
+        limit: 100,
+        ..Default::default()
+    };
+    let results2 = store
+        .list_api_specs(ns, &filter2)
+        .await
+        .expect("list failed");
+    assert_eq!(results2.len(), 2, "all 2 specs must match past cutoff");
+}
+
+/// `?has_tag=public` returns only specs that have the tag "public".
+#[tokio::test]
+async fn list_filter_has_tag() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // Three specs: two tagged "public", one tagged "private".
+    for (tags, suffix) in &[
+        (vec!["public", "api"], "0"),
+        (vec!["public"], "1"),
+        (vec!["private"], "2"),
+    ] {
+        let proxy_id = uid("proxy");
+        let spec_id = uid("spec");
+        let (bundle, spec) =
+            make_spec_with_metadata(&spec_id, &proxy_id, ns, "API", suffix, tags.as_slice());
+        store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    }
+
+    let filter = ApiSpecListFilter {
+        has_tag: Some("public".to_string()),
+        limit: 100,
+        ..Default::default()
+    };
+    let results = store
+        .list_api_specs(ns, &filter)
+        .await
+        .expect("list failed");
+    assert_eq!(results.len(), 2, "2 specs must have the 'public' tag");
+    assert!(
+        results
+            .iter()
+            .all(|s| s.tags.contains(&"public".to_string()))
+    );
+}
+
+/// Sort by title ascending then descending.
+#[tokio::test]
+async fn list_sort_by_title_asc_then_desc() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    for (title, suffix) in &[("Bravo", "0"), ("Alpha", "1"), ("Charlie", "2")] {
+        let proxy_id = uid("proxy");
+        let spec_id = uid("spec");
+        let (bundle, spec) = make_spec_with_metadata(&spec_id, &proxy_id, ns, title, suffix, &[]);
+        store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+    }
+
+    let asc_filter = ApiSpecListFilter {
+        sort_by: ApiSpecSortBy::Title,
+        order: SortOrder::Asc,
+        limit: 100,
+        ..Default::default()
+    };
+    let asc = store
+        .list_api_specs(ns, &asc_filter)
+        .await
+        .expect("list asc");
+    let asc_titles: Vec<_> = asc.iter().filter_map(|s| s.title.as_deref()).collect();
+    assert!(
+        asc_titles.windows(2).all(|w| w[0] <= w[1]),
+        "titles must be in ascending order: {:?}",
+        asc_titles
+    );
+
+    let desc_filter = ApiSpecListFilter {
+        sort_by: ApiSpecSortBy::Title,
+        order: SortOrder::Desc,
+        limit: 100,
+        ..Default::default()
+    };
+    let desc = store
+        .list_api_specs(ns, &desc_filter)
+        .await
+        .expect("list desc");
+    let desc_titles: Vec<_> = desc.iter().filter_map(|s| s.title.as_deref()).collect();
+    assert!(
+        desc_titles.windows(2).all(|w| w[0] >= w[1]),
+        "titles must be in descending order: {:?}",
+        desc_titles
+    );
+}
+
+/// Default sort is `updated_at DESC` (most-recent first).
+#[tokio::test]
+async fn list_default_sort_is_updated_at_desc() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // Insert 3 specs with a short sleep between each so timestamps differ.
+    let mut spec_ids = Vec::new();
+    for i in 0..3u8 {
+        let proxy_id = uid("proxy");
+        let spec_id = uid("spec");
+        let (bundle, spec) =
+            make_spec_with_metadata(&spec_id, &proxy_id, ns, "API", &i.to_string(), &[]);
+        store.submit_api_spec_bundle(&bundle, &spec).await.unwrap();
+        spec_ids.push(spec_id);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let filter = ApiSpecListFilter {
+        limit: 100,
+        ..Default::default()
+    };
+    let results = store.list_api_specs(ns, &filter).await.expect("list");
+    assert_eq!(results.len(), 3);
+    // Most recently inserted should appear first.
+    assert!(
+        results
+            .windows(2)
+            .all(|w| w[0].updated_at >= w[1].updated_at),
+        "default sort must be updated_at DESC"
     );
 }

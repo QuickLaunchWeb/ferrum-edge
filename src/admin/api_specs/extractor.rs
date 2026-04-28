@@ -21,6 +21,11 @@ use crate::config::types::{PluginConfig, PluginScope, Proxy, Upstream};
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// HTTP method keys counted when computing `operation_count`.
+const HTTP_METHODS: &[&str] = &[
+    "get", "post", "put", "delete", "options", "head", "patch", "trace",
+];
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -43,6 +48,23 @@ pub struct SpecMetadata {
     pub title: Option<String>,
     /// `info.version` from the spec, if present and a string.
     pub info_version: Option<String>,
+    // --- Tier 1 metadata (Wave 5) ---
+    /// `info.description` truncated at 4096 bytes (UTF-8-safe).
+    pub description: Option<String>,
+    /// `info.contact.name`
+    pub contact_name: Option<String>,
+    /// `info.contact.email`
+    pub contact_email: Option<String>,
+    /// `info.license.name`
+    pub license_name: Option<String>,
+    /// `info.license.identifier` (3.1+) or `info.license.url` fallback.
+    pub license_identifier: Option<String>,
+    /// Top-level `tags[].name`, de-duplicated and sorted.
+    pub tags: Vec<String>,
+    /// Server URLs (`servers[].url` for 3.x; constructed from `schemes + host + basePath` for 2.0).
+    pub server_urls: Vec<String>,
+    /// Count of HTTP method keys across all `paths.*` entries.
+    pub operation_count: u32,
 }
 
 /// Errors that can occur during spec extraction.
@@ -168,6 +190,9 @@ pub fn extract(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    // --- Tier 1 metadata (Wave 5) ----------------------------------------
+    let tier1 = extract_spec_metadata(&root, &version);
+
     // --- x-ferrum-consumers guard ----------------------------------------
     if root.get("x-ferrum-consumers").is_some() {
         return Err(ExtractError::ConsumerExtensionNotAllowed);
@@ -222,13 +247,12 @@ pub fn extract(
                     .or_insert(serde_json::Value::String("proxy".to_string()));
             }
 
-            let mut pc: PluginConfig =
-                serde_json::from_value(entry_with_default).map_err(|e| {
-                    ExtractError::MalformedExtension {
-                        which: "x-ferrum-plugins",
-                        error: e.to_string(),
-                    }
-                })?;
+            let mut pc: PluginConfig = serde_json::from_value(entry_with_default).map_err(|e| {
+                ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: e.to_string(),
+                }
+            })?;
 
             // Scope must be proxy (or absent/defaulted to proxy).
             if pc.scope != PluginScope::Proxy {
@@ -278,6 +302,14 @@ pub fn extract(
         format: fmt,
         title,
         info_version,
+        description: tier1.description,
+        contact_name: tier1.contact_name,
+        contact_email: tier1.contact_email,
+        license_name: tier1.license_name,
+        license_identifier: tier1.license_identifier,
+        tags: tier1.tags,
+        server_urls: tier1.server_urls,
+        operation_count: tier1.operation_count,
     };
 
     Ok((
@@ -288,6 +320,196 @@ pub fn extract(
         },
         metadata,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Public helpers — metadata extraction + resource hashing
+// ---------------------------------------------------------------------------
+
+/// Intermediate result from [`extract_spec_metadata`].
+pub struct ExtractedMetadata {
+    pub description: Option<String>,
+    pub contact_name: Option<String>,
+    pub contact_email: Option<String>,
+    pub license_name: Option<String>,
+    pub license_identifier: Option<String>,
+    pub tags: Vec<String>,
+    pub server_urls: Vec<String>,
+    pub operation_count: u32,
+}
+
+/// Truncate a string at a UTF-8 character boundary so the result is ≤ `max_bytes` bytes.
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    // Walk char boundaries; keep the last one that fits within max_bytes.
+    let mut last_boundary = 0usize;
+    for (i, _) in s.char_indices() {
+        if i > max_bytes {
+            break;
+        }
+        last_boundary = i;
+    }
+    s[..last_boundary].to_string()
+}
+
+/// Extract Tier 1 metadata from the parsed spec root value.
+///
+/// Handles both Swagger 2.0 and OpenAPI 3.x.
+pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMetadata {
+    let info = root.get("info");
+
+    // description — truncated to 4096 bytes.
+    let description = info
+        .and_then(|i| i.get("description"))
+        .and_then(|v| v.as_str())
+        .map(|s| truncate_utf8(s, 4096));
+
+    // contact.name / email
+    let contact = info.and_then(|i| i.get("contact"));
+    let contact_name = contact
+        .and_then(|c| c.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let contact_email = contact
+        .and_then(|c| c.get("email"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // license.name / identifier-or-url
+    let license = info.and_then(|i| i.get("license"));
+    let license_name = license
+        .and_then(|l| l.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let license_identifier = license
+        .and_then(|l| {
+            // 3.1+ uses `identifier`; fallback to `url`
+            l.get("identifier").or_else(|| l.get("url"))
+        })
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // tags — top-level `tags[].name` (both 2.0 and 3.x)
+    let mut tags: Vec<String> = root
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("name"))
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    tags.sort();
+    tags.dedup();
+
+    // server_urls
+    let server_urls = if version == "2.0" {
+        // Swagger 2.0: construct from schemes[] + host + basePath
+        let host = root.get("host").and_then(|v| v.as_str()).unwrap_or("");
+        let base_path = root.get("basePath").and_then(|v| v.as_str()).unwrap_or("");
+        if host.is_empty() {
+            Vec::new()
+        } else {
+            let schemes: Vec<&str> = root
+                .get("schemes")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            if schemes.is_empty() {
+                Vec::new()
+            } else {
+                schemes
+                    .iter()
+                    .map(|scheme| format!("{scheme}://{host}{base_path}"))
+                    .collect()
+            }
+        }
+    } else {
+        // OpenAPI 3.x: servers[].url
+        root.get("servers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("url"))
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // operation_count — count HTTP method keys across all paths.*
+    let operation_count = root
+        .get("paths")
+        .and_then(|v| v.as_object())
+        .map(|paths| {
+            paths
+                .values()
+                .filter_map(|path_item| path_item.as_object())
+                .flat_map(|path_item| path_item.keys())
+                .filter(|k| HTTP_METHODS.contains(&k.as_str()))
+                .count() as u32
+        })
+        .unwrap_or(0);
+
+    ExtractedMetadata {
+        description,
+        contact_name,
+        contact_email,
+        license_name,
+        license_identifier,
+        tags,
+        server_urls,
+        operation_count,
+    }
+}
+
+/// Compute a stable SHA-256 hex hash over the resource bundle, excluding
+/// metadata fields (`api_spec_id`, `created_at`, `updated_at`).
+///
+/// Same bundle in → same hash out. Used by [`replace_api_spec_bundle`] to
+/// skip proxy/upstream/plugin writes when only the spec document changed.
+pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> String {
+    let mut buf = Vec::new();
+
+    // Proxy — strip metadata then serialize
+    let proxy_json =
+        strip_metadata(serde_json::to_value(&bundle.proxy).unwrap_or(serde_json::Value::Null));
+    buf.extend_from_slice(&serde_json::to_vec(&proxy_json).unwrap_or_default());
+    buf.push(b'|');
+
+    // Upstream (optional)
+    if let Some(u) = &bundle.upstream {
+        let upstream_json =
+            strip_metadata(serde_json::to_value(u).unwrap_or(serde_json::Value::Null));
+        buf.extend_from_slice(&serde_json::to_vec(&upstream_json).unwrap_or_default());
+    }
+    buf.push(b'|');
+
+    // Plugins sorted by id for determinism
+    let mut plugins: Vec<_> = bundle.plugins.iter().collect();
+    plugins.sort_by(|a, b| a.id.cmp(&b.id));
+    for p in plugins {
+        let pj = strip_metadata(serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
+        buf.extend_from_slice(&serde_json::to_vec(&pj).unwrap_or_default());
+        buf.push(b';');
+    }
+
+    crate::admin::spec_codec::sha256_hex(&buf)
+}
+
+/// Remove metadata-only fields from a JSON value so they don't affect the hash.
+fn strip_metadata(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("api_spec_id");
+        obj.remove("created_at");
+        obj.remove("updated_at");
+    }
+    v
 }
 
 // ---------------------------------------------------------------------------

@@ -380,10 +380,15 @@ Returns **201** with `{ id, proxy_id, content_hash, spec_version }` on success. 
 
 ### `GET /api-specs`
 
-Returns paginated spec summaries (no spec content). Use `limit` and `offset` query parameters.
+Returns paginated spec summaries (no spec content). The list includes Tier 1 metadata fields extracted at submit time (`description`, `contact_name`, `contact_email`, `license_name`, `license_identifier`, `tags`, `server_urls`, `operation_count`). The internal `resource_hash` is excluded.
+
+Supports filter and sort query parameters: `proxy_id` (exact), `spec_version` (prefix), `title_contains` (case-insensitive substring), `updated_since` (ISO-8601), `has_tag` (exact tag membership), `sort_by` (`updated_at`, `title`, `operation_count`, `created_at`; default `updated_at`), and `order` (`asc`/`desc`; default `desc`). Unknown `sort_by` or `order` values return 400.
 
 ```bash
 curl "https://gateway/api-specs?limit=20&offset=0" \
+  -H "Authorization: Bearer $JWT"
+
+curl "https://gateway/api-specs?has_tag=public&spec_version=3.1&sort_by=title&order=asc" \
   -H "Authorization: Bearer $JWT"
 ```
 
@@ -410,6 +415,8 @@ curl https://gateway/api-specs/by-proxy/orders-proxy \
 ### `PUT /api-specs/{id}`
 
 Replaces the spec and recreates all **spec-owned** resources (those with `api_spec_id` matching this spec). Resources added manually to the same proxy via direct admin endpoints (`api_spec_id = null`) are not touched. `created_at` is preserved; `updated_at` and `content_hash` reflect the new document.
+
+**Idempotent PUT**: if the submitted bundle produces the same resource hash as the stored one (e.g. only `info.description` changed), the proxy/upstream/plugin rows are left untouched — their `updated_at` does not advance and no polling or DP broadcast fires. The `api_specs` row is always updated. This makes PUT safe to call on every CI/CD deploy cycle.
 
 ### `DELETE /api-specs/{id}`
 
