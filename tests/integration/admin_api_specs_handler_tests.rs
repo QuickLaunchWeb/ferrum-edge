@@ -1649,7 +1649,6 @@ async fn put_with_unchanged_resources_does_not_bump_proxy_updated_at() {
     let spec_id = post_resp["id"].as_str().expect("id").to_string();
 
     // Read proxy.updated_at before PUT.
-    use ferrum_edge::config::db_backend::DatabaseBackend;
     let proxy_before = db_arc.get_proxy(&proxy_id).await.unwrap().unwrap();
     let before_ts = proxy_before.updated_at;
 

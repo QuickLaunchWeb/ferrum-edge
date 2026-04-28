@@ -13,7 +13,7 @@
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,
     config::{
-        db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend as _, SortOrder},
+        db_backend::{ApiSpecListFilter, ApiSpecSortBy, SortOrder},
         db_loader::{DatabaseStore, DbPoolConfig},
         types::{ApiSpec, PluginConfig, PluginScope, Proxy, SpecFormat, Upstream},
     },
@@ -898,7 +898,7 @@ fn make_spec_with_metadata(
     spec_version_suffix: &str,
     tags: &[&str],
 ) -> (ferrum_edge::admin::api_specs::ExtractedBundle, ApiSpec) {
-    use ferrum_edge::admin::api_specs::{SpecMetadata, hash_resource_bundle};
+    use ferrum_edge::admin::api_specs::hash_resource_bundle;
     use ferrum_edge::admin::spec_codec;
     use ferrum_edge::config::types::SpecFormat;
 

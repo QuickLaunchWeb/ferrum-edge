@@ -795,18 +795,16 @@ x-ferrum-proxy:
     #[test]
     fn test_namespace_override_ignores_spec_namespace() {
         // Spec embeds namespace "evil"; extractor must stamp "prod" instead.
-        let spec = format!(
-            r#"{{
-                "swagger": "2.0",
-                "info": {{"title": "T", "version": "1"}},
-                "x-ferrum-proxy": {{
-                    "id": "ns-proxy",
-                    "namespace": "evil",
-                    "backend_host": "be.internal",
-                    "backend_port": 443
-                }}
-            }}"#
-        );
+        let spec = r#"{
+            "swagger": "2.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "ns-proxy",
+                "namespace": "evil",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            }
+        }"#;
         let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod").unwrap();
         assert_eq!(bundle.proxy.namespace, "prod");
     }
