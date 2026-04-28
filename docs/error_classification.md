@@ -61,9 +61,12 @@ pub enum StreamSetupKind {
     BackendTlsHandshake,    // gateway → backend TCP-TLS failed (backend-side)
     BackendDtlsHandshake,   // gateway → backend DTLS failed (backend-side)
     RejectedByPlugin,       // umbrella for ACL/policy/throttle rejections (client-side)
-    NoHealthyTargets,       // load-balancer pool empty / all circuit-broken (backend-side)
+    NoHealthyTargets,       // LB pool empty or all targets failing active health checks (backend-side)
+    CircuitBreakerOpen,     // per-proxy passive-health circuit breaker is open (backend-side)
 }
 ```
+
+`NoHealthyTargets` and `CircuitBreakerOpen` are intentionally split: the former fires from LB target selection (active health checks / empty pool), the latter from the per-proxy circuit-breaker check (passive health, failure-rate threshold). Operators can distinguish "no candidate exists" from "candidates exist but the gateway is shedding traffic away from them" without joining across log streams.
 
 `StreamSetupKind::tls_side()`, `is_client_side()`, and `direction()` derive cause/direction attribution **directly from the typed kind**. The `Display` impl reproduces the legacy `STREAM_ERR_*` prefix verbatim (a regression test enforces this) so log consumers and dashboards keying on the wording continue to work.
 
