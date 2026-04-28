@@ -83,6 +83,7 @@ fn admin_state_with_capability_registry(jwt: JwtManager) -> AdminState {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let env_config = ferrum_edge::config::env_config::EnvConfig::default();
     let dns_cache = DnsCache::new(DnsConfig::default());

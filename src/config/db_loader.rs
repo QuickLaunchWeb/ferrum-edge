@@ -577,6 +577,7 @@ impl DatabaseStore {
             upstreams,
             loaded_at,
             known_namespaces: Vec::new(),
+            ..Default::default()
         };
 
         ValidationPipeline::new(&mut config)

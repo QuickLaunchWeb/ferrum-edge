@@ -253,6 +253,7 @@ async fn test_cp_dp_grpc_config_sync() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
 
     // Start CP gRPC server
@@ -334,6 +335,7 @@ async fn test_cp_dp_grpc_config_sync() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
 
     config_arc.store(Arc::new(updated_config.clone()));
@@ -767,6 +769,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: vec!["production".to_string(), "staging".to_string()],
+        ..Default::default()
     };
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(prod_only_config.clone())));
@@ -847,6 +850,7 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: vec!["production".to_string(), "staging".to_string()],
+        ..Default::default()
     };
 
     config_arc.store(Arc::new(updated_prod_config.clone()));

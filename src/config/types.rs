@@ -1169,6 +1169,24 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
+    // ── Mesh model (Phase A — strictly additive) ─────────────────────────
+    //
+    // Every mesh field is `#[serde(default)]` + `skip_serializing_if` so a
+    // non-mesh `GatewayConfig` round-trips byte-identical (no extra keys in
+    // the output). Phase B/C wires these into the runtime; Phase A only
+    // models them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workloads: Vec<crate::config::mesh::Workload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::config::mesh::MeshService>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mesh_policies: Vec<crate::config::mesh::MeshPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_authentications: Vec<crate::config::mesh::PeerAuthentication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_entries: Vec<crate::config::mesh::ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundles: Option<crate::config::mesh::TrustBundleSet>,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -3854,6 +3872,36 @@ impl GatewayConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Validate the mesh portion of the config (Layer 2 — Phase A).
+    ///
+    /// Returns a flat `Vec<String>` of error messages so each mode can
+    /// dispatch the result per its own policy:
+    /// - **File mode**: fatal (bail)
+    /// - **DB mode**: warn (data already in DB)
+    /// - **DP mode**: reject the update, keep the cached config
+    ///
+    /// This is separate from `validate_all_fields_with_ip_policy()` so the
+    /// mesh fields can fail independently — operators may want to
+    /// experiment with mesh resources in dev without bricking their
+    /// existing proxy config.
+    #[allow(dead_code)] // Phase A scaffolding — wired into modes in Phase B/C.
+    pub fn validate_mesh_fields(&self) -> Vec<String> {
+        crate::config::mesh::validate_mesh_config(
+            &self.workloads,
+            &self.services,
+            &self.mesh_policies,
+            &self.peer_authentications,
+            &self.service_entries,
+            self.trust_bundles.as_ref(),
+        )
+    }
+
+    /// Normalise hostname-bearing mesh fields (lower-case ASCII). Idempotent.
+    #[allow(dead_code)] // Phase A scaffolding — wired into loaders in Phase B/C.
+    pub fn normalize_mesh_fields(&mut self) {
+        crate::config::mesh::normalize_mesh_fields(&mut self.service_entries, &mut self.workloads);
     }
 
     /// Validate file dependencies for plugins that reference external files
