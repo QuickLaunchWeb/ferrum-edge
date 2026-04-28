@@ -18,10 +18,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
-use crate::admin::api_specs::{ExtractError, SpecFormat, extract, hash_resource_bundle};
+use crate::admin::api_specs::{
+    ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
+};
 use crate::admin::spec_codec;
 use crate::config::db_backend::{ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, SortOrder};
-use crate::config::types::ApiSpec;
+use crate::config::types::{ApiSpec, PluginAssociation};
 
 // ---------------------------------------------------------------------------
 // Internal error type
@@ -304,32 +306,210 @@ fn require_db(state: &AdminState) -> Result<&Arc<dyn DatabaseBackend>, ApiSpecEr
 }
 
 // ---------------------------------------------------------------------------
-// Shared extract + validate logic (POST and PUT share most of the pipeline)
+// ID assignment helpers (Fix 1 — PUT idempotency)
 // ---------------------------------------------------------------------------
 
-struct SubmitInput {
-    body: Vec<u8>,
-    declared_format: Option<SpecFormat>,
-    namespace: String,
+/// Assign IDs to bundle resources for the POST path.
+///
+/// For each resource (proxy, upstream, plugins) with an empty `id`, mints a
+/// new UUID. Re-links cross-references so `plugin.proxy_id` and
+/// `proxy.upstream_id` always reference the final IDs. Rebuilds the proxy
+/// `plugins` association list to reference the final plugin IDs.
+fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
+    // Proxy
+    if bundle.proxy.id.is_empty() {
+        bundle.proxy.id = Uuid::new_v4().to_string();
+    }
+
+    // Upstream
+    if let Some(ref mut u) = bundle.upstream {
+        if u.id.is_empty() {
+            u.id = Uuid::new_v4().to_string();
+        }
+    }
+
+    // Plugins — assign IDs then re-link proxy_id
+    for pc in &mut bundle.plugins {
+        if pc.id.is_empty() {
+            pc.id = Uuid::new_v4().to_string();
+        }
+        pc.proxy_id = Some(bundle.proxy.id.clone());
+    }
+
+    // Re-link proxy.upstream_id
+    if let Some(ref u) = bundle.upstream {
+        if bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty() {
+            bundle.proxy.upstream_id = Some(u.id.clone());
+        }
+    }
+
+    // Rebuild proxy.plugins association list with final plugin IDs.
+    // Preserve any operator-written associations pointing to pre-existing
+    // plugins (non-empty IDs that are NOT in bundle.plugins are left as-is).
+    let spec_plugin_ids: Vec<String> = bundle.plugins.iter().map(|p| p.id.clone()).collect();
+    // Remove stale associations that used the now-replaced empty IDs, then
+    // add the final ones. The simplest safe approach: keep associations whose
+    // plugin_config_id is non-empty and NOT an empty-string leftover, then
+    // merge in the spec-extracted final IDs.
+    let mut assocs: Vec<PluginAssociation> = bundle
+        .proxy
+        .plugins
+        .drain(..)
+        .filter(|a| {
+            // Keep operator-written associations to pre-existing plugins
+            // (non-empty IDs that are not in the spec-extracted list).
+            !a.plugin_config_id.is_empty() && !spec_plugin_ids.contains(&a.plugin_config_id)
+        })
+        .collect();
+    for id in &spec_plugin_ids {
+        if !assocs.iter().any(|a| &a.plugin_config_id == id) {
+            assocs.push(PluginAssociation {
+                plugin_config_id: id.clone(),
+            });
+        }
+    }
+    bundle.proxy.plugins = assocs;
 }
 
+/// Assign IDs to bundle resources for the PUT path, reusing existing stored
+/// IDs where the spec leaves IDs empty so re-submitting the same ID-less spec
+/// is idempotent.
+///
+/// Matching strategy:
+/// - `proxy.id`: always use `existing_proxy_id` (the same-proxy-id rule
+///   enforces this anyway; if the spec sets a non-matching proxy.id
+///   explicitly, the immutability check catches it later).
+/// - `upstream.id`: if empty, reuse existing `proxy.upstream_id` if `Some`
+///   and non-empty, else mint UUID.
+/// - `plugin.id`: if empty, match by `plugin_name` against existing
+///   spec-owned plugins and reuse the matched id. If no match, mint UUID.
+///   If two extracted plugins share the same name and only one stored plugin
+///   matches, the first gets the stored ID, the second gets a fresh UUID.
+/// - For non-empty extracted IDs, leave as-is — operator opted in.
+///
+/// After ID assignment, re-links: `proxy.upstream_id = upstream.id` (if
+/// present); `plugin.proxy_id = proxy.id`; rebuilds `proxy.plugins`
+/// association list to reference the final plugin IDs.
+async fn assign_ids_for_put(
+    bundle: &mut ExtractedBundle,
+    db: &Arc<dyn DatabaseBackend>,
+    namespace: &str,
+    existing_spec: &ApiSpec,
+) -> Result<(), ApiSpecError> {
+    // If proxy.id is empty (operator did not supply one), fill it in from
+    // the existing spec so the resource hash + immutability check work correctly.
+    // If the operator supplied a non-empty proxy.id, leave it; the immutability
+    // check downstream will reject it if it differs from existing_spec.proxy_id.
+    if bundle.proxy.id.is_empty() {
+        bundle.proxy.id = existing_spec.proxy_id.clone();
+    }
+
+    // Load the existing proxy to get upstream_id.
+    let existing_proxy = match db.get_proxy(&existing_spec.proxy_id).await {
+        Ok(Some(p)) => Some(p),
+        Ok(None) => None,
+        Err(e) => return Err(classify_db_error(e)),
+    };
+
+    // Upstream ID: reuse existing if empty.
+    if let Some(ref mut u) = bundle.upstream {
+        if u.id.is_empty() {
+            let reuse_id = existing_proxy
+                .as_ref()
+                .and_then(|p| p.upstream_id.as_deref())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            u.id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        }
+    }
+
+    // Load existing spec-owned plugins for name-based matching.
+    let existing_plugins = match db
+        .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return Err(classify_db_error(e)),
+    };
+
+    // Build a map from plugin_name → list of existing IDs (FIFO).
+    let mut name_to_ids: std::collections::HashMap<&str, std::collections::VecDeque<&str>> =
+        std::collections::HashMap::new();
+    for ep in &existing_plugins {
+        name_to_ids
+            .entry(ep.plugin_name.as_str())
+            .or_default()
+            .push_back(ep.id.as_str());
+    }
+
+    // Assign plugin IDs.
+    for pc in &mut bundle.plugins {
+        if pc.id.is_empty() {
+            let reused = name_to_ids
+                .get_mut(pc.plugin_name.as_str())
+                .and_then(|q| q.pop_front());
+            pc.id = reused
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+        }
+        pc.proxy_id = Some(bundle.proxy.id.clone());
+    }
+
+    // Re-link proxy.upstream_id.
+    if let Some(ref u) = bundle.upstream {
+        if bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty() {
+            bundle.proxy.upstream_id = Some(u.id.clone());
+        }
+    }
+
+    // Rebuild proxy.plugins association list with final plugin IDs.
+    let spec_plugin_ids: Vec<String> = bundle.plugins.iter().map(|p| p.id.clone()).collect();
+    let mut assocs: Vec<PluginAssociation> = bundle
+        .proxy
+        .plugins
+        .drain(..)
+        .filter(|a| {
+            !a.plugin_config_id.is_empty() && !spec_plugin_ids.contains(&a.plugin_config_id)
+        })
+        .collect();
+    for id in &spec_plugin_ids {
+        if !assocs.iter().any(|a| &a.plugin_config_id == id) {
+            assocs.push(PluginAssociation {
+                plugin_config_id: id.clone(),
+            });
+        }
+    }
+    bundle.proxy.plugins = assocs;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared validate logic (POST and PUT share the validation pipeline)
+// ---------------------------------------------------------------------------
+
 struct ValidatedBundle {
-    bundle: crate::admin::api_specs::ExtractedBundle,
+    bundle: ExtractedBundle,
     metadata: crate::admin::api_specs::SpecMetadata,
 }
 
-async fn extract_and_validate(
-    input: SubmitInput,
+/// Validate an already-extracted and ID-assigned bundle.
+///
+/// `existing_proxy_id` — when `Some`, the uniqueness checks exclude this proxy
+/// (PUT path). `existing_upstream_id` — analogous for upstream name check.
+async fn validate_bundle(
+    mut bundle: ExtractedBundle,
+    metadata: crate::admin::api_specs::SpecMetadata,
+    namespace: &str,
     db: &dyn DatabaseBackend,
     state: &AdminState,
-    existing_proxy_id: Option<&str>, // None = create, Some(id) = update (skip self-conflict)
-    existing_upstream_id: Option<&str>, // None = create, Some(id) = exclude self on name check
+    existing_proxy_id: Option<&str>,
+    existing_upstream_id: Option<&str>,
 ) -> Result<ValidatedBundle, ApiSpecError> {
-    let (mut bundle, metadata) = extract(&input.body, input.declared_format, &input.namespace)
-        .map_err(ApiSpecError::Extract)?;
-    // ID generation and validation now happen inside extract() (the extractor
-    // generates UUIDs for empty ids and validates non-empty ones before
-    // performing auto-linking). Malformed ids surface as ExtractError::MalformedExtension
+    // ID assignment (minting UUIDs for empty IDs) is the caller's responsibility
+    // (assign_ids_for_post / assign_ids_for_put) and happens BEFORE this
+    // function is called. By the time we arrive here, all resource IDs are
+    // non-empty. Malformed non-empty ids surface as ExtractError::MalformedExtension
     // → 400, consistent with other parse errors.
 
     // --- Normalize + validate bundle resources ---
@@ -411,6 +591,68 @@ async fn extract_and_validate(
         }
     }
 
+    // Proxy plugin associations (Fix 2) — validate any operator-written
+    // associations in x-ferrum-proxy.plugins that reference pre-existing
+    // plugins (spec-extracted plugins are in bundle.plugins and are always
+    // OK; associations pointing to non-existent or wrong-proxy plugins are
+    // rejected here rather than silently admitted and only caught at
+    // load_full_config time).
+    {
+        // Filter to associations NOT covered by bundle.plugins (operator-written only).
+        let new_plugin_ids: std::collections::HashSet<&str> =
+            bundle.plugins.iter().map(|p| p.id.as_str()).collect();
+        let extra_associations: Vec<&PluginAssociation> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .filter(|a| !new_plugin_ids.contains(a.plugin_config_id.as_str()))
+            .collect();
+
+        if !extra_associations.is_empty() {
+            let proxy_id = bundle.proxy.id.clone();
+            let mut assoc_errors: Vec<String> = Vec::new();
+
+            for assoc in &extra_associations {
+                let pid = &assoc.plugin_config_id;
+                match db.get_plugin_config(pid).await {
+                    Ok(Some(existing)) => {
+                        use crate::config::types::PluginScope;
+                        match existing.scope {
+                            PluginScope::Global => {
+                                // Global plugins are allowed in spec-managed proxy associations.
+                            }
+                            PluginScope::ProxyGroup => {
+                                // Any proxy may reference a ProxyGroup plugin.
+                            }
+                            PluginScope::Proxy => {
+                                if existing.proxy_id.as_deref() != Some(proxy_id.as_str()) {
+                                    assoc_errors.push(format!(
+                                        "plugin_config_id '{}' belongs to proxy '{}', not '{}'",
+                                        pid,
+                                        existing.proxy_id.as_deref().unwrap_or("<none>"),
+                                        proxy_id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        assoc_errors.push(format!("plugin_config_id '{}' does not exist", pid));
+                    }
+                    Err(e) => return Err(classify_db_error(e)),
+                }
+            }
+
+            if !assoc_errors.is_empty() {
+                failures.push(ValidationFailure {
+                    resource_type: "proxy_plugin_association",
+                    id: proxy_id,
+                    errors: assoc_errors,
+                });
+            }
+        }
+    }
+
     // DB cross-checks (only when no structural failures found — avoids spurious FK errors)
     if failures.is_empty() {
         let proxy = &bundle.proxy;
@@ -421,7 +663,7 @@ async fn extract_and_validate(
             // Exclude self when replacing (PUT path passes existing proxy id)
             match db
                 .check_listen_path_unique(
-                    &input.namespace,
+                    namespace,
                     proxy.listen_path.as_deref(),
                     &proxy.hosts,
                     existing_proxy_id,
@@ -442,7 +684,7 @@ async fn extract_and_validate(
 
         if let Some(name) = proxy.name.as_deref() {
             match db
-                .check_proxy_name_unique(&input.namespace, name, existing_proxy_id)
+                .check_proxy_name_unique(namespace, name, existing_proxy_id)
                 .await
             {
                 Ok(true) => {}
@@ -460,7 +702,7 @@ async fn extract_and_validate(
                 // On PUT, exclude the spec's current upstream so a spec that
                 // keeps the same upstream name doesn't collide with itself.
                 match db
-                    .check_upstream_name_unique(&input.namespace, name, existing_upstream_id)
+                    .check_upstream_name_unique(namespace, name, existing_upstream_id)
                     .await
                 {
                     Ok(true) => {}
@@ -751,14 +993,18 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    let input = SubmitInput {
-        body: body.clone(),
-        declared_format,
-        namespace: namespace.to_string(),
+    // Extract resources from the spec body.
+    let (mut bundle, metadata) = match extract(&body, declared_format, namespace) {
+        Ok(v) => v,
+        Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
     };
 
+    // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
+    assign_ids_for_post(&mut bundle);
+
+    // Validate: field checks + DB cross-checks (listen_path uniqueness, etc.)
     let ValidatedBundle { bundle, metadata } =
-        match extract_and_validate(input, db.as_ref(), state, None, None).await {
+        match validate_bundle(bundle, metadata, namespace, db.as_ref(), state, None, None).await {
             Ok(v) => v,
             Err(e) => return Ok(error_response(e)),
         };
@@ -841,34 +1087,18 @@ pub async fn handle_put_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    // Resolve the existing upstream_id so the upstream name uniqueness check
-    // can exclude the spec's own upstream (Fix 4: PUT with unchanged name
-    // must not self-collide).
-    let existing_upstream_id: Option<String> = match db.get_proxy(&existing_spec.proxy_id).await {
-        Ok(Some(p)) => p.upstream_id,
-        Ok(None) => None,
-        Err(e) => return Ok(error_response(classify_db_error(e))),
-    };
-
-    // Pass existing proxy id so uniqueness checks exclude it
-    let input = SubmitInput {
-        body: body.clone(),
-        declared_format,
-        namespace: namespace.to_string(),
-    };
-
-    let ValidatedBundle { bundle, metadata } = match extract_and_validate(
-        input,
-        db.as_ref(),
-        state,
-        Some(&existing_spec.proxy_id),
-        existing_upstream_id.as_deref(),
-    )
-    .await
-    {
+    // Extract resources from the spec body.
+    let (mut bundle, metadata) = match extract(&body, declared_format, namespace) {
         Ok(v) => v,
-        Err(e) => return Ok(error_response(e)),
+        Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
     };
+
+    // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
+    // re-submitting the same ID-less spec is idempotent (Fix 1). This must
+    // happen BEFORE the proxy-id immutability check and hash comparison.
+    if let Err(e) = assign_ids_for_put(&mut bundle, db, namespace, &existing_spec).await {
+        return Ok(error_response(e));
+    }
 
     // Enforce that the new spec targets the same proxy as the existing spec.
     // PUT cannot change which proxy a spec belongs to.
@@ -885,6 +1115,27 @@ pub async fn handle_put_api_spec(
             }],
         }));
     }
+
+    // Resolve the existing upstream_id so the upstream name uniqueness check
+    // can exclude the spec's own upstream (PUT with unchanged name must not
+    // self-collide). After assign_ids_for_put the upstream.id is already set
+    // to the existing one; we still need the current DB value for the check.
+    let existing_upstream_id: Option<String> = bundle.upstream.as_ref().map(|u| u.id.clone());
+
+    let ValidatedBundle { bundle, metadata } = match validate_bundle(
+        bundle,
+        metadata,
+        namespace,
+        db.as_ref(),
+        state,
+        Some(&existing_spec.proxy_id),
+        existing_upstream_id.as_deref(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return Ok(error_response(e)),
+    };
 
     let proxy_id = bundle.proxy.id.clone();
 

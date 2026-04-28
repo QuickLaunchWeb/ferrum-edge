@@ -2246,3 +2246,154 @@ async fn replace_with_changed_upstream_id_does_not_fail_fk() {
         "proxy.upstream_id must be updated to U2 after replace"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fix 3: replace_with_changed_resources_keeps_manual_proxy_plugin_association
+// ---------------------------------------------------------------------------
+
+/// When replace_api_spec_bundle runs with a genuinely changed bundle, a
+/// manually-associated plugin (one whose proxy_plugins junction row was added
+/// by the operator directly, not by the spec) must survive.
+///
+/// This tests the SQL-layer invariant: the junction-table delete is scoped to
+/// spec-owned plugin IDs only (via `DELETE FROM plugin_configs WHERE api_spec_id
+/// = ?` which removes the plugin_configs rows, and then for proxy_plugins only
+/// those association rows are deleted because we only insert/delete associations
+/// for spec-owned plugin IDs). The hand-added junction row for a non-spec plugin
+/// is never touched.
+///
+/// The Mongo path mirrors this via the `proxy_to_persist` merge logic in
+/// `replace_api_spec_bundle` (mongo_store.rs). No Mongo-specific assertion
+/// here since it requires a live MongoDB; the SQL test is the authoritative
+/// parity check.
+#[tokio::test]
+async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let spec_plugin_id = uid("plugin");
+
+    // Initial submit with one spec-owned plugin.
+    let spec_plugin = make_plugin(&spec_plugin_id, &proxy_id, ns, None);
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: spec_plugin_id.clone(),
+    }];
+    let bundle_v1 = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![spec_plugin],
+    };
+    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec content");
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("initial submit failed");
+
+    // Create a global plugin and associate it with the proxy manually (simulating
+    // an operator adding a shared plugin after spec creation via direct admin API).
+    let global_plugin_id = uid("global-plugin");
+    let global_plugin = PluginConfig {
+        id: global_plugin_id.clone(),
+        namespace: ns.to_string(),
+        plugin_name: "cors".to_string(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store
+        .create_plugin_config(&global_plugin)
+        .await
+        .expect("create global plugin failed");
+
+    // Add the junction row manually (direct DB update to proxy.plugins).
+    let proxy_with_manual = {
+        let mut p = store
+            .get_proxy(&proxy_id)
+            .await
+            .expect("get_proxy failed")
+            .expect("proxy must exist");
+        p.plugins.push(PluginAssociation {
+            plugin_config_id: global_plugin_id.clone(),
+        });
+        p
+    };
+    store
+        .update_proxy(&proxy_with_manual)
+        .await
+        .expect("update proxy with manual association failed");
+
+    // Replace with a new bundle (different spec-owned plugin → different resource hash).
+    let new_spec_plugin_id = uid("plugin");
+    let new_spec_plugin = make_plugin(&new_spec_plugin_id, &proxy_id, ns, None);
+    let mut proxy_v2 = make_proxy(&proxy_id, ns);
+    proxy_v2.plugins = vec![PluginAssociation {
+        plugin_config_id: new_spec_plugin_id.clone(),
+    }];
+    let bundle_v2 = ExtractedBundle {
+        proxy: proxy_v2,
+        upstream: None,
+        plugins: vec![new_spec_plugin],
+    };
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"v2 spec content with changed resources",
+    );
+    store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect("replace failed");
+
+    // The global plugin itself must still exist (not deleted).
+    let global_row = store
+        .get_plugin_config(&global_plugin_id)
+        .await
+        .expect("get_plugin_config failed");
+    assert!(
+        global_row.is_some(),
+        "global plugin must still exist after replace"
+    );
+
+    // The proxy's plugin associations must include the global plugin.
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must still exist");
+    let plugin_ids: Vec<&str> = proxy_after
+        .plugins
+        .iter()
+        .map(|a| a.plugin_config_id.as_str())
+        .collect();
+    assert!(
+        plugin_ids.contains(&global_plugin_id.as_str()),
+        "manual global plugin association must be preserved after replace; \
+         proxy.plugins = {:?}",
+        plugin_ids
+    );
+    // The new spec-owned plugin must also be referenced.
+    assert!(
+        plugin_ids.contains(&new_spec_plugin_id.as_str()),
+        "new spec-owned plugin must be in proxy.plugins; found: {:?}",
+        plugin_ids
+    );
+    // The old spec-owned plugin must be gone.
+    let old_spec_row = store
+        .get_plugin_config(&spec_plugin_id)
+        .await
+        .expect("get_plugin_config failed");
+    assert!(
+        old_spec_row.is_none(),
+        "old spec-owned plugin must be removed after replace"
+    );
+}

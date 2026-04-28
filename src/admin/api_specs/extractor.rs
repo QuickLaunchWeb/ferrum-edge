@@ -21,7 +21,6 @@ use crate::config::types::validate_resource_id;
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use regex::Regex;
 use std::sync::LazyLock;
-use uuid::Uuid;
 
 /// HTTP method keys counted when computing `operation_count`.
 const HTTP_METHODS: &[&str] = &[
@@ -33,7 +32,7 @@ const HTTP_METHODS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// Resources extracted from an OpenAPI spec document.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExtractedBundle {
     pub proxy: Proxy,
     pub upstream: Option<Upstream>,
@@ -221,18 +220,19 @@ pub fn extract(
     })?;
     proxy.namespace = namespace.to_string();
 
-    // --- ID generation / validation for proxy (BEFORE auto-linking) ----------
-    // Empty id → generate a fresh UUID so downstream auto-linking has a stable
-    // id to stamp onto plugins and the upstream back-reference.
+    // --- ID validation for proxy (BEFORE auto-linking) ----------------------
     // Non-empty id → validate format; malformed ids are rejected here rather
     // than at the DB layer so the error message is actionable.
-    if proxy.id.is_empty() {
-        proxy.id = Uuid::new_v4().to_string();
-    } else if let Err(e) = validate_resource_id(&proxy.id) {
-        return Err(ExtractError::MalformedExtension {
-            which: "x-ferrum-proxy",
-            error: format!("invalid id: {}", e),
-        });
+    // Empty id → leave empty; the route handler (assign_ids_for_post /
+    // assign_ids_for_put) is responsible for assigning or reusing IDs so that
+    // PUT idempotency works correctly.
+    if !proxy.id.is_empty() {
+        if let Err(e) = validate_resource_id(&proxy.id) {
+            return Err(ExtractError::MalformedExtension {
+                which: "x-ferrum-proxy",
+                error: format!("invalid id: {}", e),
+            });
+        }
     }
 
     // --- x-ferrum-upstream (optional) ------------------------------------
@@ -245,14 +245,15 @@ pub fn extract(
         })?;
         up.namespace = namespace.to_string();
 
-        // --- ID generation / validation for upstream (BEFORE auto-linking) --
-        if up.id.is_empty() {
-            up.id = Uuid::new_v4().to_string();
-        } else if let Err(e) = validate_resource_id(&up.id) {
-            return Err(ExtractError::MalformedExtension {
-                which: "x-ferrum-upstream",
-                error: format!("invalid id: {}", e),
-            });
+        // --- ID validation for upstream (BEFORE auto-linking) ---------------
+        // Empty id → leave empty; handler assigns / reuses IDs.
+        if !up.id.is_empty() {
+            if let Err(e) = validate_resource_id(&up.id) {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-upstream",
+                    error: format!("invalid id: {}", e),
+                });
+            }
         }
 
         Some(up)
@@ -306,14 +307,15 @@ pub fn extract(
                 }
             })?;
 
-            // --- ID generation / validation for plugin (BEFORE auto-linking) --
-            if pc.id.is_empty() {
-                pc.id = Uuid::new_v4().to_string();
-            } else if let Err(e) = validate_resource_id(&pc.id) {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-plugins",
-                    error: format!("invalid id: {}", e),
-                });
+            // --- ID validation for plugin (BEFORE auto-linking) -------------
+            // Empty id → leave empty; handler assigns / reuses IDs.
+            if !pc.id.is_empty() {
+                if let Err(e) = validate_resource_id(&pc.id) {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "x-ferrum-plugins",
+                        error: format!("invalid id: {}", e),
+                    });
+                }
             }
 
             // Scope must be proxy (or absent/defaulted to proxy).
@@ -1295,13 +1297,18 @@ x-ferrum-proxy:
     }
 
     // -----------------------------------------------------------------------
-    // Fix 1: ID generation happens BEFORE auto-linking
+    // Fix 1: ID assignment is deferred to the route handler (extractor
+    // leaves empty IDs empty; handler calls assign_ids_for_post /
+    // assign_ids_for_put). The extractor only does auto-linking with
+    // whatever id values are present.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_proxy_id_empty_generates_uuid_and_plugins_stamped_correctly() {
-        // When x-ferrum-proxy.id is empty, a UUID must be generated BEFORE
-        // plugins are stamped with proxy_id, so plugin.proxy_id == proxy.id.
+    fn test_proxy_id_empty_leaves_id_empty_and_plugins_stamped_to_empty() {
+        // When x-ferrum-proxy.id is empty, the extractor must leave it empty
+        // (ID assignment is deferred to the handler). The plugin's proxy_id
+        // and the association list will also reference the empty string — the
+        // handler's assign_ids_for_* call fixes these up.
         let spec = r#"{
             "openapi": "3.1.0",
             "info": {"title": "T", "version": "1"},
@@ -1320,34 +1327,29 @@ x-ferrum-proxy:
         }"#;
         let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
 
-        // proxy.id must be a non-empty generated UUID
-        assert!(!bundle.proxy.id.is_empty(), "proxy.id must be generated");
+        // proxy.id must remain empty — handler will assign it.
         assert!(
-            bundle.proxy.id.len() > 8,
-            "generated id looks like a UUID: {}",
-            bundle.proxy.id
+            bundle.proxy.id.is_empty(),
+            "extractor must leave empty proxy.id empty"
         );
 
-        // plugin.proxy_id must equal the generated proxy.id (not empty-string)
+        // plugin.proxy_id must be empty (reflecting the empty proxy.id).
         assert_eq!(bundle.plugins.len(), 1);
         assert_eq!(
             bundle.plugins[0].proxy_id.as_deref(),
-            Some(bundle.proxy.id.as_str()),
-            "plugin.proxy_id must be stamped with the generated proxy.id"
+            Some(""),
+            "plugin.proxy_id is stamped with whatever proxy.id is (empty here)"
         );
 
-        // proxy.plugins association list must also reference the plugin
+        // proxy.plugins association list must reference plugin-a
         assert_eq!(bundle.proxy.plugins.len(), 1);
-        assert_eq!(
-            bundle.proxy.plugins[0].plugin_config_id,
-            bundle.plugins[0].id
-        );
+        assert_eq!(bundle.proxy.plugins[0].plugin_config_id, "plugin-a");
     }
 
     #[test]
-    fn test_upstream_id_empty_generates_uuid_and_proxy_upstream_id_matches() {
-        // When x-ferrum-upstream.id is empty, a UUID is generated and
-        // proxy.upstream_id must equal that generated id.
+    fn test_upstream_id_empty_leaves_id_empty_and_proxy_upstream_id_auto_links() {
+        // When x-ferrum-upstream.id is empty, the extractor leaves it empty.
+        // The auto-link sets proxy.upstream_id = Some("") — handler fixes it.
         let spec = r#"{
             "openapi": "3.1.0",
             "info": {"title": "T", "version": "1"},
@@ -1364,18 +1366,22 @@ x-ferrum-proxy:
         let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
 
         let upstream = bundle.upstream.as_ref().expect("upstream must be present");
-        assert!(!upstream.id.is_empty(), "upstream.id must be generated");
+        assert!(
+            upstream.id.is_empty(),
+            "extractor must leave empty upstream.id empty"
+        );
+        // Auto-link still fires: proxy.upstream_id set to the upstream's id (empty).
         assert_eq!(
             bundle.proxy.upstream_id.as_deref(),
-            Some(upstream.id.as_str()),
-            "proxy.upstream_id must equal the generated upstream.id"
+            Some(""),
+            "auto-link sets proxy.upstream_id to upstream.id even when both are empty"
         );
     }
 
     #[test]
-    fn test_plugin_id_empty_generates_uuid() {
-        // When a plugin entry has id = "", a UUID must be assigned and the
-        // proxy_id stamp must use the correct proxy.id.
+    fn test_plugin_id_empty_leaves_id_empty_and_proxy_id_stamped() {
+        // When a plugin entry has id = "", the extractor leaves it empty.
+        // proxy_id is stamped with proxy.id (which may also be empty if not provided).
         let spec = r#"{
             "openapi": "3.1.0",
             "info": {"title": "T", "version": "1"},
@@ -1396,7 +1402,10 @@ x-ferrum-proxy:
 
         assert_eq!(bundle.plugins.len(), 1);
         let plugin = &bundle.plugins[0];
-        assert!(!plugin.id.is_empty(), "plugin.id must be generated");
+        assert!(
+            plugin.id.is_empty(),
+            "extractor must leave empty plugin.id empty"
+        );
         assert_eq!(
             plugin.proxy_id.as_deref(),
             Some("my-proxy"),

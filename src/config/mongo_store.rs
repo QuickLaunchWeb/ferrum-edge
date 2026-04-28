@@ -1849,6 +1849,86 @@ mod inner {
                 );
             }
 
+            // Fix 3 (Mongo): Preserve manual proxy.plugins associations added
+            // after spec creation (e.g. a global rate-limit plugin associated
+            // via the direct admin API). The SQL path is correct because it only
+            // deletes spec-owned junction rows and the proxy is updated in-place.
+            // Mongo deletes and re-inserts the entire proxy doc, which loses any
+            // associations not in the bundle. The fix:
+            //
+            // 1. Collect spec-owned plugin IDs for THIS spec (about to be replaced).
+            // 2. Read the existing proxy doc's `plugins` array.
+            // 3. Keep associations whose plugin_config_id is NOT in the spec-owned set
+            //    (these are manual associations the operator added separately).
+            // 4. Merge: manual associations + new bundle's spec-extracted associations.
+            //
+            // See the SQL parity test `replace_with_changed_resources_keeps_manual_proxy_plugin_association`
+            // in admin_db_api_specs_tests.rs for the invariant being maintained.
+            let proxy_to_persist: std::borrow::Cow<'_, crate::admin::api_specs::ExtractedBundle> = {
+                // 1. Spec-owned plugin IDs currently in the DB.
+                let old_spec_plugin_ids: std::collections::HashSet<String> = {
+                    let mut cursor = self
+                        .plugin_configs()
+                        .find(doc! { "api_spec_id": &spec.id })
+                        .await?;
+                    let mut ids = std::collections::HashSet::new();
+                    while cursor.advance().await? {
+                        let d = cursor.deserialize_current()?;
+                        if let Ok(id) = d.get_str("_id") {
+                            ids.insert(id.to_string());
+                        }
+                    }
+                    ids
+                };
+
+                // 2. Existing proxy doc (may be absent on first replace or orphaned).
+                let existing_proxy_doc = self
+                    .proxies()
+                    .find_one(doc! { "_id": &spec.proxy_id })
+                    .await?;
+
+                if let Some(existing_doc) = existing_proxy_doc {
+                    // 3. Manual associations = existing plugins not in spec-owned set.
+                    let existing_proxy = doc_to_proxy(existing_doc)?;
+                    let new_spec_plugin_ids: std::collections::HashSet<&str> = bundle
+                        .proxy
+                        .plugins
+                        .iter()
+                        .map(|a| a.plugin_config_id.as_str())
+                        .collect();
+
+                    let preserved: Vec<crate::config::types::PluginAssociation> = existing_proxy
+                        .plugins
+                        .into_iter()
+                        .filter(|a| {
+                            // Keep manual associations: not spec-owned AND not already
+                            // in the new bundle's plugin list (avoid duplicates).
+                            !old_spec_plugin_ids.contains(&a.plugin_config_id)
+                                && !new_spec_plugin_ids.contains(a.plugin_config_id.as_str())
+                        })
+                        .collect();
+
+                    if preserved.is_empty() {
+                        // No manual associations — use bundle as-is.
+                        std::borrow::Cow::Borrowed(bundle)
+                    } else {
+                        // 4. Merge: manual (preserved) + new spec-extracted.
+                        let mut proxy_clone = bundle.proxy.clone();
+                        let mut merged = preserved;
+                        merged.extend(bundle.proxy.plugins.iter().cloned());
+                        proxy_clone.plugins = merged;
+                        std::borrow::Cow::Owned(crate::admin::api_specs::ExtractedBundle {
+                            proxy: proxy_clone,
+                            upstream: bundle.upstream.clone(),
+                            plugins: bundle.plugins.clone(),
+                        })
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(bundle)
+                }
+            };
+            let effective_bundle: &crate::admin::api_specs::ExtractedBundle = &proxy_to_persist;
+
             if self.replica_set_configured() {
                 let mut session = self.client.start_session().await?;
                 session.start_transaction().await?;
@@ -1872,8 +1952,8 @@ mod inner {
                     .session(&mut session)
                     .await?;
 
-                // Re-insert.
-                if let Some(u) = &bundle.upstream {
+                // Re-insert with the effective bundle (manual associations preserved).
+                if let Some(u) = &effective_bundle.upstream {
                     let mut doc = upstream_to_doc(u)?;
                     doc.insert("api_spec_id", spec.id.as_str());
                     self.upstreams()
@@ -1882,11 +1962,11 @@ mod inner {
                         .await?;
                 }
                 {
-                    let mut doc = proxy_to_doc(&bundle.proxy)?;
+                    let mut doc = proxy_to_doc(&effective_bundle.proxy)?;
                     doc.insert("api_spec_id", spec.id.as_str());
                     self.proxies().insert_one(doc).session(&mut session).await?;
                 }
-                for pc in &bundle.plugins {
+                for pc in &effective_bundle.plugins {
                     let mut doc = plugin_config_to_doc(pc)?;
                     doc.insert("api_spec_id", spec.id.as_str());
                     self.plugin_configs()
@@ -1944,18 +2024,18 @@ mod inner {
                     );
                 }
 
-                // Re-insert new bundle.
-                if let Some(u) = &bundle.upstream {
+                // Re-insert new bundle with manual associations preserved.
+                if let Some(u) = &effective_bundle.upstream {
                     let mut doc = upstream_to_doc(u)?;
                     doc.insert("api_spec_id", spec.id.as_str());
                     self.upstreams().insert_one(doc).await?;
                 }
                 {
-                    let mut doc = proxy_to_doc(&bundle.proxy)?;
+                    let mut doc = proxy_to_doc(&effective_bundle.proxy)?;
                     doc.insert("api_spec_id", spec.id.as_str());
                     self.proxies().insert_one(doc).await?;
                 }
-                for pc in &bundle.plugins {
+                for pc in &effective_bundle.plugins {
                     let mut doc = plugin_config_to_doc(pc)?;
                     doc.insert("api_spec_id", spec.id.as_str());
                     self.plugin_configs().insert_one(doc).await?;
@@ -2063,6 +2143,37 @@ mod inner {
             }
             self.check_slow_query("list_api_specs", start);
             Ok(specs)
+        }
+
+        async fn list_spec_owned_plugin_configs(
+            &self,
+            namespace: &str,
+            spec_id: &str,
+        ) -> Result<Vec<crate::config::types::PluginConfig>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let mut cursor = self
+                .plugin_configs()
+                .find(doc! { "namespace": namespace, "api_spec_id": spec_id })
+                .await?;
+            let mut configs = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                match doc_to_plugin_config(doc) {
+                    Ok(mut pc) => {
+                        // Strip api_spec_id: admin-only metadata, not for runtime.
+                        pc.api_spec_id = None;
+                        configs.push(pc);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "list_spec_owned_plugin_configs: skipping malformed doc: {}",
+                            e
+                        );
+                    }
+                }
+            }
+            self.check_slow_query("list_spec_owned_plugin_configs", start);
+            Ok(configs)
         }
 
         async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {

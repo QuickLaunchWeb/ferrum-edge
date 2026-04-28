@@ -4029,6 +4029,34 @@ impl DatabaseStore {
         tx.commit().await?;
         Ok(true)
     }
+
+    /// List plugin configs owned by `spec_id` (i.e., tagged with
+    /// `api_spec_id = spec_id`).
+    ///
+    /// Used by the PUT handler to reuse existing plugin IDs rather than
+    /// minting fresh UUIDs on every re-submit of a spec with empty plugin IDs.
+    /// Admin-only — NEVER call from polling loops or GatewayConfig loading.
+    pub async fn list_spec_owned_plugin_configs(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let start = std::time::Instant::now();
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND api_spec_id = ?"),
+        )
+        .bind(namespace)
+        .bind(spec_id)
+        .fetch_all(&self.pool())
+        .await?;
+
+        let mut configs = Vec::with_capacity(rows.len());
+        for row in rows {
+            configs.push(row_to_plugin_config(&row)?);
+        }
+        self.check_slow_query("list_spec_owned_plugin_configs", start);
+        Ok(configs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4462,6 +4490,14 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_api_spec(self, namespace, id).await
+    }
+
+    async fn list_spec_owned_plugin_configs(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        DatabaseStore::list_spec_owned_plugin_configs(self, namespace, spec_id).await
     }
 }
 

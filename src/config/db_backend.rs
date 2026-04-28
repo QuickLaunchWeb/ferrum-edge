@@ -473,6 +473,21 @@ pub trait DatabaseBackend: Send + Sync {
     /// proxy (whose FK cascade also removes the api_specs row). Returns `true`
     /// if a spec was found and deleted.
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+
+    /// List the plugin configs owned by a specific api spec (tagged with
+    /// `api_spec_id = spec_id`).
+    ///
+    /// Used by the PUT handler to resolve existing spec-owned plugin IDs so
+    /// re-submitted specs with empty plugin IDs can reuse them rather than
+    /// minting fresh UUIDs every time.
+    ///
+    /// Admin-only. NEVER call from polling loops, gRPC distribution, or
+    /// GatewayConfig loading.
+    async fn list_spec_owned_plugin_configs(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+    ) -> Result<Vec<crate::config::types::PluginConfig>, anyhow::Error>;
 }
 
 /// Extract known IDs from a full config (used to seed the incremental poller).
