@@ -4,7 +4,7 @@
 //! polling are defined here. Each backend (sqlx, MongoDB) provides its own
 //! implementation. The trait is object-safe so it can be used as `Arc<dyn DatabaseBackend>`.
 
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
+use crate::config::types::{ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
@@ -363,6 +363,69 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Return all distinct namespaces across all resource tables.
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
+
+    // -----------------------------------------------------------------------
+    // ApiSpec CRUD (admin-only — NEVER call from polling loops, gRPC
+    // distribution, or GatewayConfig loading. Hot-path isolation is critical.)
+    // -----------------------------------------------------------------------
+
+    /// Atomically insert the api_spec row plus all bundle resources.
+    ///
+    /// Insertion order: upstream (optional) → proxy → plugin_configs → api_spec.
+    /// All four resource kinds are tagged with `api_spec_id = spec.id`.
+    ///
+    /// Returns `Err` if any unique constraint is violated (e.g. duplicate proxy
+    /// id or duplicate `(namespace, proxy_id)` on api_specs). Wave 3 handlers
+    /// map constraint violations to HTTP 409.
+    async fn submit_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &ApiSpec,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Atomically replace an existing api spec identified by `spec.id`.
+    ///
+    /// Deletes the spec-owned resources (those whose `api_spec_id = spec.id`),
+    /// then inserts the new bundle in their place, and updates the api_spec row.
+    /// Resources not owned by the spec (e.g. hand-added plugins whose
+    /// `api_spec_id` is NULL) are left untouched.
+    async fn replace_api_spec_bundle(
+        &self,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &ApiSpec,
+    ) -> Result<(), anyhow::Error>;
+
+    /// Fetch a single ApiSpec by namespace + id.
+    async fn get_api_spec(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
+    /// Fetch the ApiSpec that owns a given proxy (by proxy_id), if any.
+    async fn get_api_spec_by_proxy(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<Option<ApiSpec>, anyhow::Error>;
+
+    /// List ApiSpecs in a namespace, paginated by `limit`/`offset`.
+    ///
+    /// Results are ordered by `id` ascending for stable pagination.
+    async fn list_api_specs(
+        &self,
+        namespace: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<ApiSpec>, anyhow::Error>;
+
+    /// Delete an ApiSpec and all resources it owns.
+    ///
+    /// Deletion order: spec-owned plugin_configs and upstreams (manual cleanup
+    /// because the `api_spec_id` back-links are not FK-enforced), then the
+    /// proxy (whose FK cascade also removes the api_specs row). Returns `true`
+    /// if a spec was found and deleted.
+    async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
 }
 
 /// Extract known IDs from a full config (used to seed the incremental poller).

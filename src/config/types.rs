@@ -452,6 +452,11 @@ pub struct Upstream {
     /// Path to a PEM CA bundle for verifying backend server certificates.
     #[serde(default)]
     pub backend_tls_server_ca_cert_path: Option<String>,
+    /// ID of the `ApiSpec` that created this upstream via the spec-import admin API.
+    /// `None` for hand-crafted upstreams. Used to scope cascading DELETE when a
+    /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_spec_id: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -1020,6 +1025,11 @@ pub struct Proxy {
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
     pub upstream_id: Option<String>,
+    /// ID of the `ApiSpec` that created this proxy via the spec-import admin API.
+    /// `None` for hand-crafted proxies. Used to scope cascading DELETE when a
+    /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_spec_id: Option<String>,
     /// Circuit breaker configuration.
     #[serde(default)]
     pub circuit_breaker: Option<CircuitBreakerConfig>,
@@ -1137,6 +1147,69 @@ pub struct PluginConfig {
     /// and you need to control their relative execution order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_override: Option<u16>,
+    /// ID of the `ApiSpec` that created this plugin config via the spec-import admin API.
+    /// `None` for hand-crafted plugin configs. Used to scope cascading DELETE when a
+    /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_spec_id: Option<String>,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Wire format of the stored OpenAPI / Swagger spec document.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpecFormat {
+    Json,
+    Yaml,
+}
+
+/// An ingested OpenAPI / Swagger spec — admin-only metadata.
+///
+/// # Hot-path isolation
+///
+/// `ApiSpec` is intentionally absent from [`GatewayConfig`] and from every
+/// polling / gRPC-distribution path. The gateway runtime never reads this
+/// table; it is used exclusively by the admin API for spec storage and
+/// resource generation. Do NOT add it to `db_loader.rs`, any `IncrementalResult`
+/// variant, or the CP broadcast channel.
+///
+/// # Storage
+///
+/// `spec_content` holds the **gzip-compressed** original document. The
+/// uncompressed size and a SHA-256 hex digest of the uncompressed bytes are
+/// stored alongside for integrity verification and size reporting without
+/// requiring decompression. See [`crate::admin::spec_codec`] for the
+/// compression + hashing helpers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSpec {
+    #[serde(default)]
+    pub id: String,
+    /// Namespace this resource belongs to. Defaults to "ferrum".
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// ID of the proxy created from this spec.
+    pub proxy_id: String,
+    /// OpenAPI / Swagger schema version string, e.g. `"2.0"`, `"3.0.3"`, `"3.1.0"`.
+    pub spec_version: String,
+    /// Original document format (JSON or YAML).
+    pub spec_format: SpecFormat,
+    /// Gzip-compressed spec document bytes.
+    pub spec_content: Vec<u8>,
+    /// Content encoding — always `"gzip"` for v1.
+    pub content_encoding: String,
+    /// Size of the spec document before compression, in bytes.
+    pub uncompressed_size: u64,
+    /// Lowercase hex SHA-256 digest of the **uncompressed** spec bytes.
+    pub content_hash: String,
+    /// Human-readable title from the spec's `info.title` field, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Version string from the spec's `info.version` field, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_version: Option<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]

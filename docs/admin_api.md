@@ -350,6 +350,95 @@ curl http://localhost:9000/charges?format=json
 
 **Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.
 
+## API Spec Management
+
+Ferrum Edge can ingest an OpenAPI 2.0 (Swagger), 3.0.x, 3.1.x, or 3.2.x specification document and atomically provision a proxy, optional upstream, and proxy-scoped plugins as a single bundle. This is an admin-only feature; specs are stored as compressed metadata and the gateway runtime never reads them — submitting or updating a spec has no effect on in-flight requests. See [docs/api_specs.md](api_specs.md) for the full extension contract, worked examples, and curl recipes.
+
+**Endpoints at a glance:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api-specs` | Submit new spec; create proxy + upstream + plugins |
+| `GET` | `/api-specs` | List spec metadata (paginated, no content) |
+| `GET` | `/api-specs/{id}` | Retrieve spec document (content negotiation + ETag) |
+| `PUT` | `/api-specs/{id}` | Replace spec; recreate spec-owned resources |
+| `DELETE` | `/api-specs/{id}` | Delete spec; cascade proxy + plugins + upstream |
+| `GET` | `/api-specs/by-proxy/{proxy_id}` | Look up spec by proxy ID |
+
+### `POST /api-specs`
+
+Submit an OpenAPI or Swagger document. The spec must include a `x-ferrum-proxy` extension at the root. Optional `x-ferrum-upstream` and `x-ferrum-plugins` extensions create additional resources. All created resources are tagged with the spec's `api_spec_id`.
+
+```bash
+curl -X POST https://gateway/api-specs \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/yaml" \
+  --data-binary @orders-api.yaml
+```
+
+Returns **201** with `{ id, proxy_id, content_hash, spec_version }` on success. The `Location` header points to the new spec. Returns **400** for parse failures, **409** if a spec already exists for the same proxy, **422** if resources fail validation, **413** if the body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB).
+
+### `GET /api-specs`
+
+Returns paginated spec summaries (no spec content). Use `limit` and `offset` query parameters.
+
+```bash
+curl "https://gateway/api-specs?limit=20&offset=0" \
+  -H "Authorization: Bearer $JWT"
+```
+
+### `GET /api-specs/{id}` and `GET /api-specs/by-proxy/{proxy_id}`
+
+Return the raw spec document. Supports `Accept` header content negotiation (`application/json` ↔ `application/yaml`) and conditional GET via `If-None-Match` using the `ETag` (SHA-256 hex content hash). Returns **304 Not Modified** when the ETag matches.
+
+```bash
+# Retrieve as YAML (regardless of stored format)
+curl https://gateway/api-specs/SPEC_ID \
+  -H "Authorization: Bearer $JWT" \
+  -H "Accept: application/yaml"
+
+# Conditional GET
+curl https://gateway/api-specs/SPEC_ID \
+  -H "Authorization: Bearer $JWT" \
+  -H "If-None-Match: \"abc123...\""
+
+# Look up by proxy ID
+curl https://gateway/api-specs/by-proxy/orders-proxy \
+  -H "Authorization: Bearer $JWT"
+```
+
+### `PUT /api-specs/{id}`
+
+Replaces the spec and recreates all **spec-owned** resources (those with `api_spec_id` matching this spec). Resources added manually to the same proxy via direct admin endpoints (`api_spec_id = null`) are not touched. `created_at` is preserved; `updated_at` and `content_hash` reflect the new document.
+
+### `DELETE /api-specs/{id}`
+
+Deletes the spec and cascades:
+
+- Spec-owned **proxy** is deleted → FK cascade removes its plugins (including any added manually after import).
+- Spec-owned **upstream** is deleted if present. Upstreams without `api_spec_id` survive.
+- Calling `DELETE /proxies/{id}` directly also removes the spec row via the `ON DELETE CASCADE` FK constraint.
+
+### Cascade and ownership summary
+
+| Operation | Spec-owned resources | Hand-added resources |
+|---|---|---|
+| `POST /api-specs` | Created; tagged with `api_spec_id` | — |
+| `PUT /api-specs/{id}` | Replaced (deleted + re-inserted) | Survive unchanged |
+| `DELETE /api-specs/{id}` | Proxy + plugins deleted; spec-owned upstream deleted | Non-spec upstreams survive |
+| `DELETE /proxies/{id}` | Spec row deleted by FK cascade | — |
+
+### Mode behavior
+
+| Mode | Write (`POST`/`PUT`/`DELETE`) | Read (`GET`) |
+|---|---|---|
+| `database` | Supported | Supported |
+| `cp` | Supported — resources distributed to DPs via gRPC; spec stays on CP | Supported |
+| `dp` | 503 (no database) | 503 (no database) |
+| `file` | 403 (read-only) | 503 (no database) |
+
+For the full extension contract, supported versions, validation rules, and worked examples, see [docs/api_specs.md](api_specs.md).
+
 ## Backend Capability Registry
 
 Ferrum Edge classifies each HTTP-family backend target's protocol support (HTTP/1.1, HTTP/2 over TLS, HTTP/3, gRPC-over-TLS, h2c) at startup and on a periodic background refresh (`FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS`, default 24h). The hot path consults this registry to decide whether to route plain HTTPS traffic through the native H3 pool, the direct HTTP/2 pool, or the generic reqwest path without per-request probing. See [CLAUDE.md — Backend Capability Registry](../CLAUDE.md) and [docs/http3.md](http3.md) for the underlying design.
