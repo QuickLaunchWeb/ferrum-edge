@@ -135,7 +135,7 @@ When you add a dispatcher or a new failure mode:
 
 ## Example log output
 
-When a backend connection times out, the `TransactionSummary` JSON includes:
+When a backend connection times out, the `TransactionSummary` JSON includes the matched-proxy identity (so dashboards can attribute the failure to the right route) plus the typed `error_class`:
 
 ```json
 {
@@ -143,6 +143,10 @@ When a backend connection times out, the `TransactionSummary` JSON includes:
   "client_ip": "10.0.0.1",
   "http_method": "GET",
   "request_path": "/api/v1/users",
+  "matched_proxy_id": "abc123",
+  "matched_proxy_name": "users-api",
+  "backend_target_url": "https://upstream.internal:8443/api/v1/users",
+  "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 502,
   "error_class": "connection_timeout",
   "latency_total_ms": 30000.0
@@ -151,17 +155,21 @@ When a backend connection times out, the `TransactionSummary` JSON includes:
 
 For a successful request, `error_class` is omitted entirely (skipped via `#[serde(skip_serializing_if = "Option::is_none")]`).
 
-For a TCP/DTLS session that the backend tore down mid-relay:
+For a TCP/DTLS session that the backend tore down mid-relay (`StreamTransactionSummary`, which carries `proxy_id`/`proxy_name`/`backend_target` directly rather than as `matched_*` fields):
 
 ```json
 {
   "proxy_id": "abc123",
+  "proxy_name": "redis-tls",
   "client_ip": "10.0.0.1",
+  "backend_target": "10.0.2.10:6379",
+  "backend_resolved_ip": "10.0.2.10",
   "protocol": "tcp_tls",
+  "listen_port": 6379,
   "duration_ms": 1234.5,
   "bytes_sent": 65536,
   "bytes_received": 0,
-  "connection_error": "Backend TLS handshake failed to 10.0.2.10:8443: alert: bad_certificate",
+  "connection_error": "Backend TLS handshake failed to 10.0.2.10:6379: alert: bad_certificate",
   "error_class": "tls_error",
   "disconnect_direction": "backend_to_client",
   "disconnect_cause": "backend_error"
