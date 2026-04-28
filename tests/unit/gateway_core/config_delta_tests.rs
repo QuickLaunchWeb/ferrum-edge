@@ -135,6 +135,7 @@ fn test_empty_delta_when_configs_identical() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let delta = ConfigDelta::compute(&config, &config);
     assert!(delta.is_empty());

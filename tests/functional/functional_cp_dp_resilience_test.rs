@@ -336,6 +336,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let (cp_url, update_tx, config_arc, _registry, server_handle) =
         spawn_cp(initial_config, 4).await;
@@ -401,6 +402,7 @@ async fn test_broadcast_overflow_triggers_full_snapshot_recovery() {
             upstreams: vec![],
             loaded_at: Utc::now(),
             known_namespaces: Vec::new(),
+            ..Default::default()
         };
         config_arc.store(Arc::new(updated.clone()));
         CpGrpcServer::broadcast_update(&update_tx, &updated);
@@ -469,6 +471,7 @@ async fn test_multi_cp_failover_connects_to_fallback() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let (fallback_url, _fallback_tx, _fallback_config_arc, _fallback_registry, fallback_handle) =
         spawn_cp(fallback_config, 16).await;
@@ -579,6 +582,7 @@ async fn test_primary_retry_reconnects_to_primary() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let (fallback_url, _fb_tx, _fb_cfg, _fb_reg, fallback_handle) =
         spawn_cp(fallback_config, 16).await;
@@ -637,6 +641,7 @@ async fn test_primary_retry_reconnects_to_primary() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let mut primary_handle_opt: Option<tokio::task::JoinHandle<()>> = None;
     for attempt in 1..=5 {
@@ -739,6 +744,7 @@ async fn test_cluster_endpoint_shape_cp_and_dp() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let (cp_url, _tx, cached_config_arc, registry, server_handle) =
         spawn_cp(initial_config, 16).await;

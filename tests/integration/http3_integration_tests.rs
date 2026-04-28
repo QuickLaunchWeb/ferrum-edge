@@ -114,6 +114,7 @@ fn create_http3_test_gateway_config() -> GatewayConfig {
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -766,6 +767,7 @@ async fn test_http3_streaming_decision_logic() {
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
 
     let plugin_cache = PluginCache::new(&gc).unwrap();

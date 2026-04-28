@@ -143,6 +143,7 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 

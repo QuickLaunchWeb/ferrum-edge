@@ -13,6 +13,8 @@ mod db_loader_tests;
 mod env_config_tests;
 mod field_validation_tests;
 mod frontend_tls_tests;
+mod mesh_types_tests;
+mod mesh_validation_tests;
 mod migration_runner_tests;
 mod plugin_migration_tests;
 mod pool_config_tests;

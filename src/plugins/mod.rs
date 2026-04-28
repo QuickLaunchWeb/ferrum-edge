@@ -278,6 +278,12 @@ pub struct RequestContext {
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    /// Peer SPIFFE identity, populated by the `mtls_auth` plugin when the
+    /// client certificate carries a `spiffe://` URI SAN. `None` for non-mesh
+    /// deployments and for clients that present a non-SPIFFE certificate.
+    /// Plugins downstream of `mtls_auth` may read this for identity-aware
+    /// authorization (e.g. mesh policy evaluation in Phase C).
+    pub peer_spiffe_id: Option<crate::identity::SpiffeId>,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
@@ -335,6 +341,7 @@ impl RequestContext {
             metadata: HashMap::new(),
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
+            peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,

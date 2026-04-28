@@ -1905,6 +1905,7 @@ dependencies = [
  "flate2",
  "futures",
  "futures-util",
+ "glob",
  "google-cloud-secretmanager-v1",
  "h2 0.4.13",
  "h3",

@@ -132,6 +132,7 @@ fn empty_config() -> GatewayConfig {
         plugin_configs: vec![],
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 
