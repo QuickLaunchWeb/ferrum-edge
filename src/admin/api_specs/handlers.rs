@@ -545,15 +545,14 @@ fn spec_content_response(
     if let Some(inm) = request_headers
         .get("if-none-match")
         .and_then(|v| v.to_str().ok())
+        && (inm == etag || inm == "*")
     {
-        if inm == etag || inm == "*" {
-            return Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header("ETag", etag)
-                .header("Cache-Control", "no-store")
-                .body(Full::new(Bytes::new()))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
-        }
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", etag)
+            .header("Cache-Control", "no-store")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
     }
 
     // Content negotiation
@@ -618,7 +617,7 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
         match key {
             "limit" => {
                 let parsed = val.parse::<u32>().unwrap_or(DEFAULT_LIMIT);
-                filter.limit = parsed.min(MAX_LIMIT).max(1);
+                filter.limit = parsed.clamp(1, MAX_LIMIT);
             }
             "offset" => {
                 filter.offset = val.parse::<u32>().unwrap_or(0);
@@ -682,15 +681,16 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (
                 char::from(bytes[i + 1]).to_digit(16),
                 char::from(bytes[i + 2]).to_digit(16),
-            ) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1260,25 +1260,25 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_list_params_defaults() {
+    fn parse_list_filter_defaults() {
         let uri: hyper::Uri = "/api-specs".parse().unwrap();
-        let (limit, offset) = parse_list_params(&uri);
-        assert_eq!(limit, 50);
-        assert_eq!(offset, 0);
+        let f = parse_list_filter(&uri).expect("parse failed");
+        assert_eq!(f.limit, 50);
+        assert_eq!(f.offset, 0);
     }
 
     #[test]
-    fn parse_list_params_custom() {
+    fn parse_list_filter_custom() {
         let uri: hyper::Uri = "/api-specs?limit=10&offset=20".parse().unwrap();
-        let (limit, offset) = parse_list_params(&uri);
-        assert_eq!(limit, 10);
-        assert_eq!(offset, 20);
+        let f = parse_list_filter(&uri).expect("parse failed");
+        assert_eq!(f.limit, 10);
+        assert_eq!(f.offset, 20);
     }
 
     #[test]
-    fn parse_list_params_clamps_max() {
+    fn parse_list_filter_clamps_max() {
         let uri: hyper::Uri = "/api-specs?limit=9999".parse().unwrap();
-        let (limit, _) = parse_list_params(&uri);
-        assert_eq!(limit, 200);
+        let f = parse_list_filter(&uri).expect("parse failed");
+        assert_eq!(f.limit, 200);
     }
 }

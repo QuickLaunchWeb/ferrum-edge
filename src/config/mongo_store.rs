@@ -1764,7 +1764,7 @@ mod inner {
                         &inserted_upstream,
                         &inserted_proxy,
                         &inserted_plugins,
-                        inserted_spec.then(|| spec.id.as_str()),
+                        inserted_spec.then_some(spec.id.as_str()),
                     )
                     .await;
                     return Err(e);
@@ -2149,13 +2149,13 @@ mod inner {
             plugin_ids: &[String],
             spec_id: Option<&str>,
         ) {
-            if let Some(sid) = spec_id {
-                if let Err(e) = self.api_specs().delete_one(doc! { "_id": sid }).await {
-                    warn!(
-                        "compensate_bundle_insert: failed to delete api_spec {}: {}",
-                        sid, e
-                    );
-                }
+            if let Some(sid) = spec_id
+                && let Err(e) = self.api_specs().delete_one(doc! { "_id": sid }).await
+            {
+                warn!(
+                    "compensate_bundle_insert: failed to delete api_spec {}: {}",
+                    sid, e
+                );
             }
             for pid in plugin_ids {
                 if let Err(e) = self.plugin_configs().delete_one(doc! { "_id": pid }).await {
@@ -2165,21 +2165,21 @@ mod inner {
                     );
                 }
             }
-            if let Some(pid) = proxy_id {
-                if let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await {
-                    warn!(
-                        "compensate_bundle_insert: failed to delete proxy {}: {}",
-                        pid, e
-                    );
-                }
+            if let Some(pid) = proxy_id
+                && let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await
+            {
+                warn!(
+                    "compensate_bundle_insert: failed to delete proxy {}: {}",
+                    pid, e
+                );
             }
-            if let Some(uid) = upstream_id {
-                if let Err(e) = self.upstreams().delete_one(doc! { "_id": uid }).await {
-                    warn!(
-                        "compensate_bundle_insert: failed to delete upstream {}: {}",
-                        uid, e
-                    );
-                }
+            if let Some(uid) = upstream_id
+                && let Err(e) = self.upstreams().delete_one(doc! { "_id": uid }).await
+            {
+                warn!(
+                    "compensate_bundle_insert: failed to delete upstream {}: {}",
+                    uid, e
+                );
             }
         }
     }

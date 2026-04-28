@@ -143,11 +143,11 @@ pub fn autodetect_format(body: &[u8]) -> SpecFormat {
 ///
 /// # Arguments
 ///
-/// * `body`             – raw bytes of the spec document.
-/// * `declared_format`  – caller-supplied format hint (`Content-Type` header).
-///                        When `None`, [`autodetect_format`] is used.
-/// * `namespace`        – the namespace to stamp on every extracted resource,
-///                        overriding whatever the spec document declares.
+/// * `body` – raw bytes of the spec document.
+/// * `declared_format` – caller-supplied format hint (`Content-Type` header).
+///   When `None`, [`autodetect_format`] is used.
+/// * `namespace` – the namespace to stamp on every extracted resource,
+///   overriding whatever the spec document declares.
 ///
 /// # Returns
 ///
@@ -268,14 +268,14 @@ pub fn extract(
             }
 
             // proxy_id must be absent or match the spec's proxy id.
-            if let Some(ref pid) = pc.proxy_id {
-                if pid != &proxy.id {
-                    return Err(ExtractError::PluginProxyIdMismatch {
-                        plugin_id: pc.id,
-                        plugin_proxy_id: pid.clone(),
-                        spec_proxy_id: proxy.id.clone(),
-                    });
-                }
+            if let Some(ref pid) = pc.proxy_id
+                && pid != &proxy.id
+            {
+                return Err(ExtractError::PluginProxyIdMismatch {
+                    plugin_id: pc.id,
+                    plugin_proxy_id: pid.clone(),
+                    spec_proxy_id: proxy.id.clone(),
+                });
             }
 
             // Walk config for forbidden credential / consumer keys.
@@ -519,19 +519,18 @@ fn strip_metadata(mut v: serde_json::Value) -> serde_json::Value {
 /// Determine the OpenAPI version from the root JSON value.
 fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
     // OpenAPI 2.0 (Swagger)
-    if let Some(sw) = root.get("swagger") {
-        if sw.as_str() == Some("2.0") {
-            return Ok("2.0".to_string());
-        }
+    if let Some(sw) = root.get("swagger")
+        && sw.as_str() == Some("2.0")
+    {
+        return Ok("2.0".to_string());
     }
 
     // OpenAPI 3.x
-    if let Some(oa) = root.get("openapi") {
-        if let Some(s) = oa.as_str() {
-            if OPENAPI3_VERSION_RE.is_match(s) {
-                return Ok(s.to_string());
-            }
-        }
+    if let Some(oa) = root.get("openapi")
+        && let Some(s) = oa.as_str()
+        && OPENAPI3_VERSION_RE.is_match(s)
+    {
+        return Ok(s.to_string());
     }
 
     Err(ExtractError::UnknownVersion)
