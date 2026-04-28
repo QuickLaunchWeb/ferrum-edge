@@ -3496,30 +3496,21 @@ impl DatabaseStore {
 
         let mut tx = self.pool().begin().await?;
 
-        // Delete spec-owned resources (leaf-first to respect FKs).
-        // plugin_configs.proxy_id FK ON DELETE CASCADE handles these when the
-        // proxy is deleted, but we also clean them up by api_spec_id to be
-        // explicit and to handle the case where the proxy FK cascade doesn't
-        // fire (e.g. different proxy_id in replace).
+        // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
+        // are intentionally preserved. The proxy itself is updated in place (not deleted)
+        // so FK cascades do not wipe hand-added plugins.
         sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ?"))
             .bind(&spec.id)
             .execute(&mut *tx)
             .await?;
 
-        // Delete spec-owned proxy. FK ON DELETE CASCADE on api_specs removes
-        // the api_specs row automatically; we'll INSERT a fresh one below.
-        sqlx::query(&self.q("DELETE FROM proxies WHERE api_spec_id = ?"))
-            .bind(&spec.id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Delete spec-owned upstreams (no FK cascade from proxies to upstreams).
+        // Delete spec-owned upstreams (proxies.upstream_id FK is ON DELETE SET NULL, safe).
         sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ?"))
             .bind(&spec.id)
             .execute(&mut *tx)
             .await?;
 
-        // Re-insert the upstream (if present).
+        // Insert the new upstream (if present).
         if let Some(u) = &bundle.upstream {
             let targets_json = serde_json::to_string(&u.targets)?;
             let algo_json = serde_json::to_string(&u.algorithm)?;
@@ -3566,7 +3557,8 @@ impl DatabaseStore {
             .await?;
         }
 
-        // Re-insert proxy.
+        // UPDATE proxy in place (preserves the primary key and created_at, so
+        // hand-added plugins whose proxy_id FK points at this row are unaffected).
         {
             let p = &bundle.proxy;
             let hosts_json = serde_json::to_string(&p.hosts)?;
@@ -3581,27 +3573,31 @@ impl DatabaseStore {
                 ResponseBodyMode::Stream => "stream",
             };
 
-            sqlx::query(&self.q("INSERT INTO proxies \
-                 (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, \
-                  backend_port, backend_path, strip_listen_path, preserve_host_header, \
-                  backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
-                  backend_tls_client_cert_path, backend_tls_client_key_path, \
-                  backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
-                  dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, \
-                  circuit_breaker, retry, response_body_mode, \
-                  pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
-                  pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
-                  pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
-                  pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
-                  pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
-                  pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, \
-                  udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
-                  allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
-                  api_spec_id, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?)"))
-            .bind(&p.id)
+            sqlx::query(&self.q("UPDATE proxies SET \
+                 namespace = ?, name = ?, hosts = ?, listen_path = ?, backend_scheme = ?, \
+                 backend_host = ?, backend_port = ?, backend_path = ?, \
+                 strip_listen_path = ?, preserve_host_header = ?, \
+                 backend_connect_timeout_ms = ?, backend_read_timeout_ms = ?, \
+                 backend_write_timeout_ms = ?, \
+                 backend_tls_client_cert_path = ?, backend_tls_client_key_path = ?, \
+                 backend_tls_verify_server_cert = ?, backend_tls_server_ca_cert_path = ?, \
+                 dns_override = ?, dns_cache_ttl_seconds = ?, auth_mode = ?, upstream_id = ?, \
+                 circuit_breaker = ?, retry = ?, response_body_mode = ?, \
+                 pool_idle_timeout_seconds = ?, pool_enable_http_keep_alive = ?, \
+                 pool_enable_http2 = ?, pool_tcp_keepalive_seconds = ?, \
+                 pool_http2_keep_alive_interval_seconds = ?, \
+                 pool_http2_keep_alive_timeout_seconds = ?, \
+                 pool_http2_initial_stream_window_size = ?, \
+                 pool_http2_initial_connection_window_size = ?, \
+                 pool_http2_adaptive_window = ?, pool_http2_max_frame_size = ?, \
+                 pool_http2_max_concurrent_streams = ?, \
+                 pool_http3_connections_per_backend = ?, \
+                 listen_port = ?, frontend_tls = ?, passthrough = ?, \
+                 udp_idle_timeout_seconds = ?, tcp_idle_timeout_seconds = ?, \
+                 allowed_methods = ?, allowed_ws_origins = ?, \
+                 udp_max_response_amplification_factor = ?, \
+                 api_spec_id = ?, updated_at = ? \
+                 WHERE id = ? AND namespace = ?"))
             .bind(&p.namespace)
             .bind(&p.name)
             .bind(&hosts_json)
@@ -3672,23 +3668,15 @@ impl DatabaseStore {
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
             .bind(&spec.id)
-            .bind(p.created_at.to_rfc3339())
             .bind(p.updated_at.to_rfc3339())
+            // WHERE clause — match by primary key
+            .bind(&p.id)
+            .bind(&p.namespace)
             .execute(&mut *tx)
             .await?;
-
-            for assoc in &p.plugins {
-                sqlx::query(
-                    &self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)"),
-                )
-                .bind(&p.id)
-                .bind(&assoc.plugin_config_id)
-                .execute(&mut *tx)
-                .await?;
-            }
         }
 
-        // Re-insert plugin_configs.
+        // Insert new spec-owned plugin_configs.
         for pc in &bundle.plugins {
             let config_json = serde_json::to_string(&pc.config)?;
             let scope_str = match pc.scope {
@@ -3715,8 +3703,44 @@ impl DatabaseStore {
             .await?;
         }
 
-        // Upsert api_specs row (the proxy cascade deleted the old one above).
-        self.insert_api_spec_tx(&mut tx, spec).await?;
+        // Update the api_specs row (no CASCADE delete needed since proxy survives).
+        let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
+        let server_urls_json =
+            serde_json::to_string(&spec.server_urls).unwrap_or_else(|_| "[]".to_string());
+        let spec_format_str = match spec.spec_format {
+            crate::config::types::SpecFormat::Json => "json",
+            crate::config::types::SpecFormat::Yaml => "yaml",
+        };
+        sqlx::query(&self.q("UPDATE api_specs SET \
+             proxy_id = ?, spec_content = ?, content_hash = ?, uncompressed_size = ?, \
+             spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
+             description = ?, contact_name = ?, contact_email = ?, \
+             license_name = ?, license_identifier = ?, \
+             tags = ?, server_urls = ?, operation_count = ?, resource_hash = ?, \
+             updated_at = ? \
+             WHERE namespace = ? AND id = ?"))
+        .bind(&spec.proxy_id)
+        .bind(&spec.spec_content)
+        .bind(&spec.content_hash)
+        .bind(spec.uncompressed_size as i64)
+        .bind(spec_format_str)
+        .bind(&spec.spec_version)
+        .bind(&spec.title)
+        .bind(&spec.info_version)
+        .bind(&spec.description)
+        .bind(&spec.contact_name)
+        .bind(&spec.contact_email)
+        .bind(&spec.license_name)
+        .bind(&spec.license_identifier)
+        .bind(&tags_json)
+        .bind(&server_urls_json)
+        .bind(spec.operation_count as i64)
+        .bind(&spec.resource_hash)
+        .bind(spec.updated_at.to_rfc3339())
+        .bind(&spec.namespace)
+        .bind(&spec.id)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
         Ok(())

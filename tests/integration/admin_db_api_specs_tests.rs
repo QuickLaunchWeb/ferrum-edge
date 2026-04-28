@@ -406,13 +406,28 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
         "new spec-owned plugin must exist after replace"
     );
 
-    // The hand-added plugin (NULL api_spec_id) is deleted as part of the
-    // proxy delete + re-insert: the proxy FK ON DELETE CASCADE removes all
-    // proxy-scoped plugin_configs when the proxy is deleted, regardless of
-    // api_spec_id. This is correct and expected behaviour — replacing a spec
-    // deletes and re-creates its proxy, so orphaned hand-added plugins go away.
-    // (Wave 3 handlers should warn the caller about this; Wave 2 just does the
-    // atomic operation faithfully.)
+    // The hand-added plugin (NULL api_spec_id) must survive because replace now
+    // UPDATE-s the proxy in place rather than DELETE + INSERT, so the proxy PK
+    // is stable and the FK cascade does NOT fire.
+    let hand_plugin_row = store
+        .get_plugin_config(&hand_plugin_id)
+        .await
+        .expect("get_plugin_config for hand plugin failed");
+    assert!(
+        hand_plugin_row.is_some(),
+        "hand-added plugin must survive spec replace (proxy updated in place)"
+    );
+
+    // Proxy primary key must be stable — same id, same created_at.
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must still exist after replace");
+    assert_eq!(
+        proxy_after.id, proxy_id,
+        "proxy id must be unchanged after replace"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +830,75 @@ async fn api_specs_not_in_gateway_config_load() {
 }
 
 // ---------------------------------------------------------------------------
+// Fix 5: runtime load strips api_spec_id from resources
+// ---------------------------------------------------------------------------
+
+/// Resources created via submit_api_spec_bundle carry an api_spec_id tag in the
+/// DB. load_full_config must strip that tag (set it to None) on every Proxy,
+/// PluginConfig, and Upstream it returns, mirroring the SQL path's explicit
+/// `api_spec_id: None` in the row-to-struct helpers.
+///
+/// The Mongo path enforces the same invariant via post-processing in
+/// load_full_config / the incremental polling loop — see mongo_store.rs.
+#[tokio::test]
+async fn runtime_load_strips_api_spec_id_from_resources() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let upstream_id = uid("upstream");
+    let plugin_id = uid("plugin");
+    let spec_id = uid("spec");
+
+    let upstream = make_upstream(&upstream_id, ns);
+    let plugin = make_plugin(&plugin_id, &proxy_id, ns, None);
+    let bundle = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: Some(upstream),
+        plugins: vec![plugin],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"spec for load-strip test");
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit failed");
+
+    // Load the runtime config.
+    let config: GatewayConfig = store
+        .load_full_config(ns)
+        .await
+        .expect("load_full_config failed");
+
+    // Every proxy in the loaded config must have api_spec_id = None.
+    for p in &config.proxies {
+        assert!(
+            p.api_spec_id.is_none(),
+            "Proxy {}: api_spec_id must be None in runtime config (hot-path isolation)",
+            p.id
+        );
+    }
+
+    // Every plugin in the loaded config must have api_spec_id = None.
+    for pc in &config.plugin_configs {
+        assert!(
+            pc.api_spec_id.is_none(),
+            "PluginConfig {}: api_spec_id must be None in runtime config",
+            pc.id
+        );
+    }
+
+    // Every upstream in the loaded config must have api_spec_id = None.
+    for u in &config.upstreams {
+        assert!(
+            u.api_spec_id.is_none(),
+            "Upstream {}: api_spec_id must be None in runtime config",
+            u.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gap #4: DELETE proxy cascades the api_spec row via FK
 // ---------------------------------------------------------------------------
 
@@ -822,6 +906,15 @@ async fn api_specs_not_in_gateway_config_load() {
 /// `delete_api_spec`), the `api_specs` row that FKs onto that proxy must be
 /// removed automatically by the `ON DELETE CASCADE` constraint, and the
 /// spec-owned plugin must also be gone (double cascade via plugin_configs FK).
+///
+/// # Mongo equivalence (Fix 3)
+///
+/// The SQL path relies on the `api_specs.proxy_id REFERENCES proxies(id) ON DELETE CASCADE`
+/// FK. The Mongo path has no FK, so `MongoStore::delete_proxy` calls
+/// `api_specs().delete_many({proxy_id})` explicitly to mirror this behaviour.
+/// See `src/config/mongo_store.rs` — the implementation is directly tested here
+/// for SQL; the Mongo path requires a running MongoDB instance and follows the
+/// same invariant by code-review and inline assertion.
 #[tokio::test]
 async fn delete_proxy_cascades_api_spec_row_via_fk() {
     let dir = TempDir::new().unwrap();
@@ -876,6 +969,115 @@ async fn delete_proxy_cascades_api_spec_row_via_fk() {
     assert!(
         after_plugin.is_none(),
         "spec-owned plugin must be cascade-deleted when its proxy is deleted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fix 2: replace_with_changed_resources_keeps_hand_added_plugins
+// ---------------------------------------------------------------------------
+
+/// When replace_api_spec_bundle is called with a genuinely new bundle (different
+/// resource_hash), hand-added plugins (api_spec_id = NULL) on the proxy must
+/// survive because the proxy is updated in place rather than deleted.
+#[tokio::test]
+async fn replace_with_changed_resources_keeps_hand_added_plugins() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let spec_plugin_id = uid("plugin");
+    let hand_plugin_id = uid("plugin");
+
+    // Initial submit with one spec-owned plugin.
+    let spec_plugin = make_plugin(&spec_plugin_id, &proxy_id, ns, None);
+    let bundle_v1 = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![spec_plugin],
+    };
+    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec content");
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("initial submit failed");
+
+    // Capture proxy created_at before replace.
+    let proxy_before = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist before replace");
+    let created_at_before = proxy_before.created_at;
+
+    // Hand-add a plugin directly (api_spec_id = NULL).
+    let hand_plugin = make_plugin(&hand_plugin_id, &proxy_id, ns, None);
+    store
+        .create_plugin_config(&hand_plugin)
+        .await
+        .expect("hand-add plugin failed");
+
+    // Replace with a new bundle (different spec-owned plugin → different resource hash).
+    let new_spec_plugin_id = uid("plugin");
+    let new_spec_plugin = make_plugin(&new_spec_plugin_id, &proxy_id, ns, None);
+    let bundle_v2 = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![new_spec_plugin],
+    };
+    let spec_v2 = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"v2 spec content with changed resources",
+    );
+    store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect("replace failed");
+
+    // Hand-added plugin must still exist.
+    let hand_row = store
+        .get_plugin_config(&hand_plugin_id)
+        .await
+        .expect("get_plugin_config for hand plugin failed");
+    assert!(
+        hand_row.is_some(),
+        "hand-added plugin must survive replace_api_spec_bundle with changed resources"
+    );
+
+    // Old spec-owned plugin must be gone.
+    let old_spec_row = store
+        .get_plugin_config(&spec_plugin_id)
+        .await
+        .expect("get_plugin_config failed");
+    assert!(
+        old_spec_row.is_none(),
+        "old spec-owned plugin must be removed after replace"
+    );
+
+    // New spec-owned plugin must exist.
+    let new_spec_row = store
+        .get_plugin_config(&new_spec_plugin_id)
+        .await
+        .expect("get_plugin_config failed");
+    assert!(
+        new_spec_row.is_some(),
+        "new spec-owned plugin must exist after replace"
+    );
+
+    // Proxy primary key must be preserved (created_at unchanged).
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must still exist after replace");
+    assert_eq!(proxy_after.id, proxy_id, "proxy id must be unchanged");
+    assert_eq!(
+        proxy_after.created_at.timestamp(),
+        created_at_before.timestamp(),
+        "proxy created_at must be unchanged after replace (proxy updated in place)"
     );
 }
 

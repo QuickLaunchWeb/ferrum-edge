@@ -575,12 +575,18 @@ mod inner {
             let loaded_at = Utc::now();
             let ns_filter = doc! { "namespace": namespace };
 
-            // Load all collections scoped to namespace
+            // Load all collections scoped to namespace.
+            // api_spec_id is admin-only metadata; the gateway runtime must never see it.
+            // Strip it to None on every resource the runtime will use, mirroring
+            // the SQL path's explicit `api_spec_id: None` in row_to_proxy / row_to_upstream
+            // / row_to_plugin_config. Do NOT strip on write paths or admin-read paths.
             let mut proxies = Vec::new();
             let mut cursor = self.proxies().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                proxies.push(doc_to_proxy(doc)?);
+                let mut p = doc_to_proxy(doc)?;
+                p.api_spec_id = None;
+                proxies.push(p);
             }
 
             let mut consumers = Vec::new();
@@ -594,14 +600,18 @@ mod inner {
             let mut cursor = self.plugin_configs().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                plugin_configs.push(doc_to_plugin_config(doc)?);
+                let mut pc = doc_to_plugin_config(doc)?;
+                pc.api_spec_id = None;
+                plugin_configs.push(pc);
             }
 
             let mut upstreams = Vec::new();
             let mut cursor = self.upstreams().find(ns_filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                upstreams.push(doc_to_upstream(doc)?);
+                let mut u = doc_to_upstream(doc)?;
+                u.api_spec_id = None;
+                upstreams.push(u);
             }
 
             self.check_slow_query("load_full_config", start);
@@ -645,12 +655,16 @@ mod inner {
             let since_str = since_with_margin.to_rfc3339();
             let filter = doc! { "namespace": namespace, "updated_at": { "$gt": &since_str } };
 
-            // Load changed resources
+            // Load changed resources.
+            // Strip api_spec_id on every resource for the same reason as load_full_config:
+            // api_spec_id is admin-only metadata and must not reach the gateway runtime.
             let mut added_or_modified_proxies = Vec::new();
             let mut cursor = self.proxies().find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                added_or_modified_proxies.push(doc_to_proxy(doc)?);
+                let mut p = doc_to_proxy(doc)?;
+                p.api_spec_id = None;
+                added_or_modified_proxies.push(p);
             }
 
             let mut added_or_modified_consumers = Vec::new();
@@ -664,14 +678,18 @@ mod inner {
             let mut cursor = self.plugin_configs().find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                added_or_modified_plugin_configs.push(doc_to_plugin_config(doc)?);
+                let mut pc = doc_to_plugin_config(doc)?;
+                pc.api_spec_id = None;
+                added_or_modified_plugin_configs.push(pc);
             }
 
             let mut added_or_modified_upstreams = Vec::new();
             let mut cursor = self.upstreams().find(filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                added_or_modified_upstreams.push(doc_to_upstream(doc)?);
+                let mut u = doc_to_upstream(doc)?;
+                u.api_spec_id = None;
+                added_or_modified_upstreams.push(u);
             }
 
             // Detect deletions by loading current IDs (scoped to namespace) and diffing against known sets
@@ -741,6 +759,26 @@ mod inner {
                 .delete_many(doc! { "proxy_id": id })
                 .await?;
             let result = self.proxies().delete_one(doc! { "_id": id }).await?;
+            // Mirror SQL's ON DELETE CASCADE: remove any api_specs row that references
+            // this proxy. In SQL this is handled by the FK constraint; Mongo has no FK
+            // so we do it explicitly. Log if the count is unexpected but don't fail.
+            if result.deleted_count > 0 {
+                match self.api_specs().delete_many(doc! { "proxy_id": id }).await {
+                    Ok(r) if r.deleted_count > 1 => {
+                        warn!(
+                            "delete_proxy: deleted {} api_specs rows for proxy {} (expected 0 or 1)",
+                            r.deleted_count, id
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            "delete_proxy: failed to delete api_specs for proxy {}: {}",
+                            id, e
+                        );
+                    }
+                }
+            }
             // Clean up orphaned proxy_group plugin configs (no proxy references them)
             self.cleanup_orphaned_proxy_group_plugins().await?;
             self.check_slow_query("delete_proxy", start);

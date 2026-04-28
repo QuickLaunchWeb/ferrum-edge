@@ -174,6 +174,7 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::PluginInvalidScope { .. } => "PluginInvalidScope",
         ExtractError::PluginProxyIdMismatch { .. } => "PluginProxyIdMismatch",
         ExtractError::PluginContainsCredentials { .. } => "PluginContainsCredentials",
+        ExtractError::ProxyUpstreamIdMismatch { .. } => "ProxyUpstreamIdMismatch",
     }
 }
 
@@ -326,6 +327,58 @@ async fn extract_and_validate(
     let (mut bundle, metadata) = extract(&input.body, input.declared_format, &input.namespace)
         .map_err(ApiSpecError::Extract)?;
 
+    // --- Validate / generate resource IDs ----------------------------------
+    // Mirror direct-admin create logic: empty id → generate UUID; non-empty
+    // but malformed id → 422 with a structured failure entry.
+    {
+        use crate::config::types::validate_resource_id;
+        let mut id_failures: Vec<ValidationFailure> = Vec::new();
+
+        // Proxy id
+        if bundle.proxy.id.is_empty() {
+            bundle.proxy.id = Uuid::new_v4().to_string();
+        } else if let Err(msg) = validate_resource_id(&bundle.proxy.id) {
+            id_failures.push(ValidationFailure {
+                resource_type: "proxy",
+                id: bundle.proxy.id.clone(),
+                errors: vec![format!("invalid resource id: {}", msg)],
+            });
+        }
+
+        // Upstream id (if present)
+        if let Some(ref mut upstream) = bundle.upstream {
+            if upstream.id.is_empty() {
+                upstream.id = Uuid::new_v4().to_string();
+            } else if let Err(msg) = validate_resource_id(&upstream.id) {
+                id_failures.push(ValidationFailure {
+                    resource_type: "upstream",
+                    id: upstream.id.clone(),
+                    errors: vec![format!("invalid resource id: {}", msg)],
+                });
+            }
+        }
+
+        // Plugin ids
+        for plugin in &mut bundle.plugins {
+            if plugin.id.is_empty() {
+                plugin.id = Uuid::new_v4().to_string();
+            } else if let Err(msg) = validate_resource_id(&plugin.id) {
+                id_failures.push(ValidationFailure {
+                    resource_type: "plugin",
+                    id: plugin.id.clone(),
+                    errors: vec![format!("invalid resource id: {}", msg)],
+                });
+            }
+        }
+
+        if !id_failures.is_empty() {
+            return Err(ApiSpecError::ValidationFailures {
+                spec_version: metadata.version.clone(),
+                failures: id_failures,
+            });
+        }
+    }
+
     // --- Normalize + validate bundle resources ---
 
     use crate::admin::crud::ValidationCtx;
@@ -450,20 +503,19 @@ async fn extract_and_validate(
         }
 
         if let Some(ref upstream) = bundle.upstream {
-            match db
-                .check_upstream_name_unique(&input.namespace, &upstream.id, None)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => failures.push(ValidationFailure {
-                    resource_type: "upstream",
-                    id: upstream.id.clone(),
-                    errors: vec![format!(
-                        "An upstream with id '{}' already exists",
-                        upstream.id
-                    )],
-                }),
-                Err(e) => return Err(classify_db_error(e)),
+            if let Some(ref name) = upstream.name {
+                match db
+                    .check_upstream_name_unique(&input.namespace, name, None)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => failures.push(ValidationFailure {
+                        resource_type: "upstream",
+                        id: upstream.id.clone(),
+                        errors: vec![format!("An upstream with name '{}' already exists", name)],
+                    }),
+                    Err(e) => return Err(classify_db_error(e)),
+                }
             }
         }
     }
@@ -852,6 +904,22 @@ pub async fn handle_put_api_spec(
         Ok(v) => v,
         Err(e) => return Ok(error_response(e)),
     };
+
+    // Enforce that the new spec targets the same proxy as the existing spec.
+    // PUT cannot change which proxy a spec belongs to.
+    if bundle.proxy.id != existing_spec.proxy_id {
+        return Ok(error_response(ApiSpecError::ValidationFailures {
+            spec_version: metadata.version.clone(),
+            failures: vec![ValidationFailure {
+                resource_type: "proxy",
+                id: bundle.proxy.id.clone(),
+                errors: vec![format!(
+                    "PUT cannot change proxy_id; existing spec is for proxy '{}'",
+                    existing_spec.proxy_id
+                )],
+            }],
+        }));
+    }
 
     let proxy_id = bundle.proxy.id.clone();
 

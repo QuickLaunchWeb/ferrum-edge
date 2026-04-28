@@ -1668,3 +1668,202 @@ async fn put_with_unchanged_resources_does_not_bump_proxy_updated_at() {
         "proxy.updated_at must not advance when bundle is unchanged (idempotent PUT)"
     );
 }
+
+// ============================================================================
+// Fix 4 — ID validation / UUID generation (PR review)
+// ============================================================================
+
+/// A spec submitted with `"id": ""` on x-ferrum-proxy must succeed (201) and
+/// the handler assigns a valid UUID for the proxy_id.
+#[tokio::test]
+async fn post_with_empty_proxy_id_assigns_uuid() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let spec = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {"title": "T", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": "",
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": "/empty-id-path"
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "body: {body}");
+
+    // The returned proxy_id must be a valid non-empty UUID.
+    let proxy_id = body["proxy_id"]
+        .as_str()
+        .expect("proxy_id must be a string");
+    assert!(!proxy_id.is_empty(), "proxy_id must be non-empty");
+    assert!(
+        uuid::Uuid::parse_str(proxy_id).is_ok(),
+        "proxy_id must be a valid UUID when spec omits id; got: {proxy_id}"
+    );
+}
+
+/// A spec with an invalid plugin id (contains spaces and special chars) must
+/// return 422 with a failures entry whose resource_type is "plugin".
+#[tokio::test]
+async fn post_with_invalid_plugin_id_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {"title": "T", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": "has spaces and !@#",
+            "plugin_name": "cors",
+            "scope": "proxy",
+            "config": {}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid plugin id must return 422; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures must be array");
+    let plugin_failure = failures
+        .iter()
+        .find(|f| f["resource_type"].as_str() == Some("plugin"))
+        .unwrap_or_else(|| panic!("expected a plugin failure; body: {body}"));
+    assert!(
+        plugin_failure["errors"]
+            .as_array()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false),
+        "plugin failure must have at least one error message; body: {body}"
+    );
+}
+
+// ============================================================================
+// Fix 6 — PUT enforces same proxy_id rule (PR review)
+// ============================================================================
+
+/// PUT with a spec whose x-ferrum-proxy.id differs from the existing spec's
+/// proxy_id must return 422 with a proxy failure entry.
+#[tokio::test]
+async fn put_with_different_proxy_id_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // POST a spec for proxy A.
+    let proxy_a = uid("proxy-a");
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_a))
+        .await;
+    assert_eq!(post_status, reqwest::StatusCode::CREATED, "{post_body}");
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    // PUT with x-ferrum-proxy.id = proxy B (different from proxy A).
+    let proxy_b = uid("proxy-b");
+    let (put_status, put_body) = client
+        .put_json(
+            &format!("/api-specs/{spec_id}"),
+            &minimal_json_spec(&proxy_b),
+        )
+        .await;
+
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT with different proxy_id must return 422; body: {put_body}"
+    );
+    let failures = put_body["failures"].as_array().expect("failures array");
+    let proxy_failure = failures
+        .iter()
+        .find(|f| f["resource_type"].as_str() == Some("proxy"))
+        .unwrap_or_else(|| panic!("expected a proxy failure; body: {put_body}"));
+    assert!(
+        proxy_failure["errors"]
+            .as_array()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false),
+        "proxy failure must have error messages; body: {put_body}"
+    );
+}
+
+// ============================================================================
+// Fix 7 — Upstream name uniqueness check uses name not id (PR review)
+// ============================================================================
+
+/// Two specs with upstreams that share the same NAME but have different IDs
+/// must trigger a conflict on the second submit.
+#[tokio::test]
+async fn post_two_specs_with_same_upstream_name_different_ids_returns_conflict() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let shared_name = format!("shared-upstream-{}", uid("name"));
+
+    // First spec: upstream with shared_name.
+    let proxy_a = uid("proxy-a");
+    let upstream_a = uid("upstream-a");
+    let spec_a = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Spec A", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_a,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_a}")
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_a,
+            "name": shared_name,
+            "targets": [{"host": "target.internal", "port": 443}]
+        }
+    });
+    let (s1, b1) = client.post_json("/api-specs", &spec_a).await;
+    assert_eq!(
+        s1,
+        reqwest::StatusCode::CREATED,
+        "first spec must succeed; body: {b1}"
+    );
+
+    // Second spec: different upstream id but same name → conflict.
+    let proxy_b = uid("proxy-b");
+    let upstream_b = uid("upstream-b");
+    let spec_b = serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Spec B", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_b,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_b}")
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_b,
+            "name": shared_name,
+            "targets": [{"host": "target.internal", "port": 443}]
+        }
+    });
+    let (s2, b2) = client.post_json("/api-specs", &spec_b).await;
+    assert!(
+        s2 == reqwest::StatusCode::CONFLICT || s2 == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "second spec with duplicate upstream name must return 409 or 422; got {s2}; body: {b2}"
+    );
+}

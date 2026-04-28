@@ -96,6 +96,14 @@ pub enum ExtractError {
     },
     #[error("plugin {plugin_id} contains forbidden credential/consumer key '{key}'")]
     PluginContainsCredentials { plugin_id: String, key: String },
+    #[error(
+        "proxy {proxy_id}: upstream_id '{proxy_upstream_id}' conflicts with x-ferrum-upstream id '{spec_upstream_id}'"
+    )]
+    ProxyUpstreamIdMismatch {
+        proxy_id: String,
+        proxy_upstream_id: String,
+        spec_upstream_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +232,23 @@ pub fn extract(
     } else {
         None
     };
+
+    // --- Auto-link upstream to proxy ----------------------------------------
+    // If the spec includes an upstream, set proxy.upstream_id to the upstream's
+    // id unless the operator already pinned a different one (which is an error).
+    if let Some(ref u) = upstream {
+        match proxy.upstream_id.as_deref() {
+            None => proxy.upstream_id = Some(u.id.clone()),
+            Some(existing) if existing == u.id => {} // explicit + same → ok
+            Some(existing) => {
+                return Err(ExtractError::ProxyUpstreamIdMismatch {
+                    proxy_id: proxy.id.clone(),
+                    proxy_upstream_id: existing.to_string(),
+                    spec_upstream_id: u.id.clone(),
+                });
+            }
+        }
+    }
 
     // --- x-ferrum-plugins (optional array) --------------------------------
     let plugins = if let Some(plugins_val) = root.get("x-ferrum-plugins") {
@@ -1096,6 +1121,93 @@ x-ferrum-proxy:
     // -----------------------------------------------------------------------
     // Counter-example: a `jwt` plugin with legitimate config is NOT flagged
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Fix 1: Upstream auto-link to proxy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_upstream_auto_links_to_proxy() {
+        // Proxy has no upstream_id; extractor must set it from the upstream's id.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "link-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443
+            },
+            "x-ferrum-upstream": {
+                "id": "link-upstream",
+                "targets": [{"host": "t.internal", "port": 443}]
+            }
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+        assert_eq!(
+            bundle.proxy.upstream_id.as_deref(),
+            Some("link-upstream"),
+            "upstream_id must be auto-linked to the spec upstream's id"
+        );
+    }
+
+    #[test]
+    fn test_upstream_auto_link_skipped_when_proxy_already_has_matching_id() {
+        // Proxy explicitly declares the same upstream_id as the spec upstream — no error.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "matching-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443,
+                "upstream_id": "same-upstream"
+            },
+            "x-ferrum-upstream": {
+                "id": "same-upstream",
+                "targets": [{"host": "t.internal", "port": 443}]
+            }
+        }"#;
+        let (bundle, _) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap();
+        assert_eq!(
+            bundle.proxy.upstream_id.as_deref(),
+            Some("same-upstream"),
+            "matching explicit upstream_id must be accepted unchanged"
+        );
+    }
+
+    #[test]
+    fn test_upstream_link_mismatch_rejected() {
+        // Proxy pinned a different upstream_id than the spec upstream's id — hard error.
+        let spec = r#"{
+            "openapi": "3.1.0",
+            "info": {"title": "T", "version": "1"},
+            "x-ferrum-proxy": {
+                "id": "mismatch-proxy",
+                "backend_host": "be.internal",
+                "backend_port": 443,
+                "upstream_id": "pinned-upstream"
+            },
+            "x-ferrum-upstream": {
+                "id": "spec-upstream",
+                "targets": [{"host": "t.internal", "port": 443}]
+            }
+        }"#;
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ExtractError::ProxyUpstreamIdMismatch {
+                    proxy_id,
+                    proxy_upstream_id,
+                    spec_upstream_id,
+                }
+                if proxy_id == "mismatch-proxy"
+                    && proxy_upstream_id == "pinned-upstream"
+                    && spec_upstream_id == "spec-upstream"
+            ),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn test_jwt_plugin_with_legitimate_config_is_allowed() {
