@@ -185,7 +185,7 @@ impl LokiLogging {
     fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
         let mut labels = self.label_config.static_labels.clone();
         if self.label_config.include_proxy_id
-            && let Some(ref proxy_id) = summary.matched_proxy_id
+            && let Some(ref proxy_id) = summary.proxy_id
         {
             labels.insert("proxy_id".to_string(), proxy_id.clone());
         }
@@ -421,7 +421,7 @@ mod tests {
             client_ip: "10.0.0.1".to_string(),
             http_method: "GET".to_string(),
             request_path: "/t".to_string(),
-            matched_proxy_id: proxy_id.map(str::to_owned),
+            proxy_id: proxy_id.map(str::to_owned),
             response_status_code: status,
             latency_total_ms: 1.0,
             latency_gateway_processing_ms: 1.0,

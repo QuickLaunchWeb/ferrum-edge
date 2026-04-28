@@ -135,7 +135,7 @@ When you add a dispatcher or a new failure mode:
 
 ## Example log output
 
-When a backend connection times out, the `TransactionSummary` JSON includes the matched-proxy identity (so dashboards can attribute the failure to the right route) plus the typed `error_class`:
+When a backend connection times out, the `TransactionSummary` JSON includes the proxy identity (so dashboards can attribute the failure to the right route) plus the typed `error_class`. `proxy_id` / `proxy_name` use the same JSON keys here as on `StreamTransactionSummary`, so log queries don't need to branch on protocol family:
 
 ```json
 {
@@ -143,8 +143,8 @@ When a backend connection times out, the `TransactionSummary` JSON includes the 
   "client_ip": "10.0.0.1",
   "http_method": "GET",
   "request_path": "/api/v1/users",
-  "matched_proxy_id": "abc123",
-  "matched_proxy_name": "users-api",
+  "proxy_id": "abc123",
+  "proxy_name": "users-api",
   "backend_target_url": "https://upstream.internal:8443/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 502,
@@ -155,7 +155,7 @@ When a backend connection times out, the `TransactionSummary` JSON includes the 
 
 For a successful request, `error_class` is omitted entirely (skipped via `#[serde(skip_serializing_if = "Option::is_none")]`).
 
-For a TCP/DTLS session that the backend tore down mid-relay (`StreamTransactionSummary`, which carries `proxy_id`/`proxy_name`/`backend_target` directly rather than as `matched_*` fields):
+For a TCP/DTLS session that the backend tore down mid-relay — same `proxy_id` / `proxy_name` keys as the HTTP example, plus the stream-only fields (`backend_target`, `protocol`, `listen_port`, `disconnect_*`):
 
 ```json
 {
@@ -164,7 +164,7 @@ For a TCP/DTLS session that the backend tore down mid-relay (`StreamTransactionS
   "client_ip": "10.0.0.1",
   "backend_target": "10.0.2.10:6379",
   "backend_resolved_ip": "10.0.2.10",
-  "protocol": "tcp_tls",
+  "protocol": "tcps",
   "listen_port": 6379,
   "duration_ms": 1234.5,
   "bytes_sent": 65536,
