@@ -164,6 +164,33 @@ fn allows_comma_separated_with_ows() {
     assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
 }
 
+#[test]
+fn rejects_empty_content_length_token_trailing_comma() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42,"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn rejects_empty_content_length_token_leading_comma_on_http2() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static(",42"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn rejects_empty_content_length_token_middle_comma_on_http3() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42,,42"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
 // --- Multiple Host headers (HTTP/1.1) ---
 
 #[test]

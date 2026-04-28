@@ -1252,6 +1252,7 @@ impl ProxyState {
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.tcp_half_close_max_wait_seconds,
+            env_config_arc.frontend_tls_handshake_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
             tls_policy_arc.clone(),
@@ -4644,7 +4645,32 @@ async fn handle_tls_connection(
     set_tcp_keepalive(&stream);
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(stream).await {
+    let accept_fut = acceptor.accept(stream);
+    let accept_result = if state.env_config.frontend_tls_handshake_timeout_seconds > 0 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(state.env_config.frontend_tls_handshake_timeout_seconds),
+            accept_fut,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    "TLS handshake timed out from {} after {}s",
+                    remote_addr.ip(),
+                    state.env_config.frontend_tls_handshake_timeout_seconds
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "frontend TLS handshake timed out",
+                )
+                .into());
+            }
+        }
+    } else {
+        accept_fut.await
+    };
+    let tls_stream = match accept_result {
         Ok(stream) => {
             info!("TLS connection established from {}", remote_addr.ip());
             stream
@@ -9068,7 +9094,9 @@ pub fn check_protocol_headers(
             for token in val.as_bytes().split(|&b| b == b',') {
                 let trimmed = trim_ows(token);
                 if trimmed.is_empty() {
-                    continue;
+                    return Some(
+                        r#"{"error":"Content-Length header contains invalid empty value"}"#,
+                    );
                 }
                 // 2a. Must be ASCII digits only (no signs, decimals, hex, or garbage)
                 if !trimmed.iter().all(|&b| b.is_ascii_digit()) {

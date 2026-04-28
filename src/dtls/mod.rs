@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -39,6 +40,7 @@ const DEFAULT_DTLS_RECORD_OVERHEAD: usize = 64;
 ///
 /// Override: `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default: 16384).
 const DEFAULT_DTLS_MAX_PLAINTEXT: usize = 16_384;
+const DEFAULT_DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cached DTLS buffer configuration, initialized from `EnvConfig` at startup.
 struct DtlsBufConfig {
@@ -83,6 +85,29 @@ pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
     pub certificate: DtlsCertificate,
     pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+}
+
+/// Admission controls for the frontend DTLS demuxer.
+#[derive(Clone)]
+pub struct DtlsServerLimits {
+    /// Maximum number of DTLS peers tracked by the demuxer, including peers
+    /// still in the handshake and not yet visible through `accept()`.
+    pub max_sessions: Option<usize>,
+    /// Maximum time a peer may occupy demux state before completing its handshake.
+    /// `None` disables the deadline.
+    pub handshake_timeout: Option<Duration>,
+    /// Optional gate checked before allocating per-peer handshake state.
+    pub allow_new_session: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+}
+
+impl Default for DtlsServerLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: None,
+            handshake_timeout: Some(DEFAULT_DTLS_HANDSHAKE_TIMEOUT),
+            allow_new_session: None,
+        }
+    }
 }
 
 /// Build a DTLS client config for backend connections (gateway → backend).
@@ -422,6 +447,8 @@ pub struct DtlsServer {
     config: Arc<Config>,
     certificate: DtlsCertificate,
     sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
+    active_sessions: Arc<AtomicUsize>,
+    limits: DtlsServerLimits,
     /// Channel to deliver accepted (post-handshake) connections.
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<(DtlsServerConn, SocketAddr)>>,
@@ -435,6 +462,16 @@ struct DtlsSessionState {
     incoming_tx: mpsc::Sender<Vec<u8>>,
     /// Signal this session's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
+}
+
+fn remove_session(
+    sessions: &DashMap<SocketAddr, DtlsSessionState>,
+    active_sessions: &AtomicUsize,
+    peer_addr: &SocketAddr,
+) {
+    if sessions.remove(peer_addr).is_some() {
+        active_sessions.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// A server-side DTLS connection for a single accepted client.
@@ -515,14 +552,28 @@ impl DtlsServerConn {
 
 impl DtlsServer {
     /// Create a new DTLS server bound to the given address.
+    #[allow(dead_code)] // Public helper used by tests and external DTLS backends.
     pub async fn bind(
         addr: SocketAddr,
         frontend_config: FrontendDtlsConfig,
     ) -> Result<Self, anyhow::Error> {
+        Self::bind_with_limits(addr, frontend_config, DtlsServerLimits::default()).await
+    }
+
+    /// Create a new DTLS server bound to the given address with admission limits.
+    pub async fn bind_with_limits(
+        addr: SocketAddr,
+        frontend_config: FrontendDtlsConfig,
+        limits: DtlsServerLimits,
+    ) -> Result<Self, anyhow::Error> {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind DTLS server on {}: {}", addr, e))?;
-        Ok(Self::from_socket(socket, frontend_config))
+        Ok(Self::from_socket_with_limits(
+            socket,
+            frontend_config,
+            limits,
+        ))
     }
 
     /// Create a `DtlsServer` from an already-bound `UdpSocket`. Useful when the
@@ -531,7 +582,17 @@ impl DtlsServer {
     /// reserve-then-construct gap to avoid the bind-drop-rebind race) and
     /// wants to hand the socket directly to the DTLS server without any
     /// release/rebind window.
+    #[allow(dead_code)] // Public helper used by tests and scripted DTLS backends.
     pub fn from_socket(socket: UdpSocket, frontend_config: FrontendDtlsConfig) -> Self {
+        Self::from_socket_with_limits(socket, frontend_config, DtlsServerLimits::default())
+    }
+
+    /// Create a `DtlsServer` from an already-bound `UdpSocket` with admission limits.
+    pub fn from_socket_with_limits(
+        socket: UdpSocket,
+        frontend_config: FrontendDtlsConfig,
+        limits: DtlsServerLimits,
+    ) -> Self {
         let socket = Arc::new(socket);
         let (accept_tx, accept_rx) = mpsc::channel(256);
         let (shutdown_tx, _) = watch::channel(false);
@@ -541,6 +602,8 @@ impl DtlsServer {
             config: frontend_config.dimpl_config,
             certificate: frontend_config.certificate,
             sessions: Arc::new(DashMap::new()),
+            active_sessions: Arc::new(AtomicUsize::new(0)),
+            limits,
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
             client_cert_verifier: frontend_config.client_cert_verifier,
@@ -554,6 +617,12 @@ impl DtlsServer {
         self.socket
             .local_addr()
             .expect("DTLS server socket has no local address")
+    }
+
+    /// Number of peers currently tracked by the DTLS demuxer.
+    #[allow(dead_code)] // Used by tests and useful for diagnostics.
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.load(Ordering::Relaxed)
     }
 
     /// Accept the next fully-handshaked DTLS client connection.
@@ -603,7 +672,7 @@ impl DtlsServer {
                 if session.incoming_tx.send(data).await.is_err() {
                     // Driver task exited — remove stale session
                     drop(session);
-                    self.sessions.remove(&peer_addr);
+                    remove_session(&self.sessions, &self.active_sessions, &peer_addr);
                 }
             } else {
                 // New client — spawn a session driver
@@ -614,6 +683,38 @@ impl DtlsServer {
 
     /// Spawn a driver task for a new client session.
     fn spawn_session(&self, peer_addr: SocketAddr, initial_packet: Vec<u8>) {
+        if let Some(ref allow) = self.limits.allow_new_session
+            && !allow()
+        {
+            trace!(client = %peer_addr, "DTLS new session rejected by admission gate");
+            return;
+        }
+
+        if let Some(max_sessions) = self.limits.max_sessions {
+            let mut current = self.active_sessions.load(Ordering::Relaxed);
+            loop {
+                if current >= max_sessions {
+                    debug!(
+                        client = %peer_addr,
+                        max_sessions,
+                        "DTLS pre-handshake session limit reached, dropping datagram"
+                    );
+                    return;
+                }
+                match self.active_sessions.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+        } else {
+            self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        }
+
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(256);
         let (app_out_tx, app_out_rx) = mpsc::channel::<Vec<u8>>(256);
         let mut app_out_rx = Some(app_out_rx);
@@ -633,7 +734,12 @@ impl DtlsServer {
         let certificate = self.certificate.clone();
         let accept_tx = self.accept_tx.clone();
         let sessions = self.sessions.clone();
+        let active_sessions = self.active_sessions.clone();
         let client_cert_verifier = self.client_cert_verifier.clone();
+        let handshake_deadline = self
+            .limits
+            .handshake_timeout
+            .map(|timeout| Instant::now() + timeout);
 
         tokio::spawn(async move {
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
@@ -662,7 +768,7 @@ impl DtlsServer {
             // Process the initial ClientHello packet
             if let Err(e) = dtls.handle_packet(&initial_packet) {
                 warn!(client = %peer_addr, "DTLS initial packet error: {}", e);
-                sessions.remove(&peer_addr);
+                remove_session(&sessions, &active_sessions, &peer_addr);
                 return;
             }
 
@@ -679,12 +785,19 @@ impl DtlsServer {
                 Ok(_) => {}
                 Err(e) => {
                     warn!(client = %peer_addr, "DTLS initial drain error: {}", e);
-                    sessions.remove(&peer_addr);
+                    remove_session(&sessions, &active_sessions, &peer_addr);
                     return;
                 }
             }
 
             loop {
+                let handshake_sleep_dur = if connected {
+                    Duration::from_secs(60)
+                } else {
+                    handshake_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_secs(60))
+                };
                 let sleep_dur = next_timeout
                     .map(|t| t.saturating_duration_since(Instant::now()))
                     .unwrap_or(Duration::from_secs(60));
@@ -724,6 +837,10 @@ impl DtlsServer {
                             }
                             next_timeout = None;
                         }
+                    }
+                    _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
+                        trace!(client = %peer_addr, "DTLS handshake timed out");
+                        break;
                     }
                     _ = shutdown_rx.recv() => {
                         break;
@@ -775,7 +892,7 @@ impl DtlsServer {
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
                                 // Server shut down
-                                sessions.remove(&peer_addr);
+                                remove_session(&sessions, &active_sessions, &peer_addr);
                                 return;
                             }
                         }
@@ -784,7 +901,7 @@ impl DtlsServer {
                                 && let Err(e) = validate_client_cert(der, verifier)
                             {
                                 warn!(client = %peer_addr, "Client cert validation failed: {}", e);
-                                sessions.remove(&peer_addr);
+                                remove_session(&sessions, &active_sessions, &peer_addr);
                                 return;
                             }
                             // Store the certificate DER for plugin access after Connected
@@ -803,7 +920,7 @@ impl DtlsServer {
                 }
             }
 
-            sessions.remove(&peer_addr);
+            remove_session(&sessions, &active_sessions, &peer_addr);
         });
     }
 
@@ -1074,4 +1191,53 @@ async fn drain_server_outputs(
         }
     }
     Ok(connected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_server(limits: DtlsServerLimits) -> DtlsServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind UDP");
+        let config = Config::builder().build().expect("build DTLS config");
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate cert");
+        DtlsServer::from_socket_with_limits(
+            socket,
+            FrontendDtlsConfig {
+                dimpl_config: Arc::new(config),
+                certificate,
+                client_cert_verifier: None,
+            },
+            limits,
+        )
+    }
+
+    #[tokio::test]
+    async fn dtls_server_rejects_new_peer_when_pre_handshake_cap_is_full() {
+        let server = test_server(DtlsServerLimits {
+            max_sessions: Some(0),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session("127.0.0.1:12345".parse().unwrap(), vec![0x16; 32]);
+
+        assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dtls_server_rejects_new_peer_when_admission_gate_is_closed() {
+        let server = test_server(DtlsServerLimits {
+            allow_new_session: Some(Arc::new(|| false)),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session("127.0.0.1:12346".parse().unwrap(), vec![0x16; 32]);
+
+        assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
 }

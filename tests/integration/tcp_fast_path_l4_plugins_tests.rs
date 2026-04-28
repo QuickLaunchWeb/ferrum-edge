@@ -304,6 +304,7 @@ async fn try_spawn_fast_path_gateway(
             // helps if it isn't ceiling'd by a non-zero global.
             tcp_idle_timeout_seconds: 0,
             tcp_half_close_max_wait_seconds: 0,
+            frontend_tls_handshake_timeout_seconds: 10,
             circuit_breaker_cache,
             tls_policy: None,
             crls: Arc::new(Vec::new()),

@@ -1289,7 +1289,18 @@ async fn start_dtls_frontend_listener(
     overload: Arc<crate::overload::OverloadState>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
-    let server = Arc::new(crate::dtls::DtlsServer::bind(addr, dtls_config).await?);
+    let admission_overload = overload.clone();
+    let dtls_limits = crate::dtls::DtlsServerLimits {
+        max_sessions: Some(max_sessions),
+        allow_new_session: Some(Arc::new(move || {
+            !admission_overload
+                .reject_new_connections
+                .load(Ordering::Relaxed)
+        })),
+        ..crate::dtls::DtlsServerLimits::default()
+    };
+    let server =
+        Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);
     ensure_coarse_timer_started();
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);

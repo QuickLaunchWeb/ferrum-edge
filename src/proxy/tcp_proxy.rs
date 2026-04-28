@@ -464,6 +464,9 @@ pub struct TcpListenerConfig {
     /// Applies even when the session idle timeout is disabled, so a stuck
     /// peer cannot wedge the relay task forever. `0` disables the cap.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Frontend TLS handshake timeout in seconds for TCP+TLS stream listeners.
+    /// `0` disables the timeout.
+    pub frontend_tls_handshake_timeout_seconds: u64,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
@@ -512,6 +515,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
         tls_policy,
         crls,
@@ -659,6 +663,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds,
+                        frontend_tls_handshake_timeout_seconds,
                         &cb_cache,
                         &plugins,
                         &mut stream_ctx,
@@ -883,6 +888,7 @@ async fn handle_tcp_connection(
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
@@ -915,6 +921,7 @@ async fn handle_tcp_connection(
         cached_backend_tls,
         global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
         start,
         &mut backend_info,
@@ -949,6 +956,7 @@ async fn handle_tcp_connection_inner(
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     start: Instant,
     backend_info: &mut TcpBackendInfo,
@@ -1416,7 +1424,28 @@ async fn handle_tcp_connection_inner(
     let mut used_splice = false;
     let copy_result = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        let tls_stream = match acceptor.accept(client_stream).await {
+        let accept_fut = acceptor.accept(client_stream);
+        let accept_result = if frontend_tls_handshake_timeout_seconds > 0 {
+            match tokio::time::timeout(
+                Duration::from_secs(frontend_tls_handshake_timeout_seconds),
+                accept_fut,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "{} from {}: timed out after {}s",
+                        STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
+                        remote_addr,
+                        frontend_tls_handshake_timeout_seconds
+                    ));
+                }
+            }
+        } else {
+            accept_fut.await
+        };
+        let tls_stream = match accept_result {
             Ok(s) => s,
             Err(e) => {
                 // Frontend TLS failures are client-side — do not penalise the backend CB.
