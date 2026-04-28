@@ -1917,8 +1917,16 @@ impl ProxyState {
         //     end up with separate `reqwest::Client`s — each one needs
         //     its own warm connection or the first request through
         //     whichever client wasn't warmed pays a cold connect).
-        let mut http_candidates: HashMap<String, ReqwestWarmupCandidate> = HashMap::new();
-        let mut https_candidates: HashMap<String, ReqwestWarmupCandidate> = HashMap::new();
+        // Upper-bound capacity at proxy count. Real candidate count can
+        // exceed this when upstreams expand multiple targets, but the
+        // hint avoids the ~log2(N) rehashes default-sized maps would do
+        // under N inserts; if it's an undercount the HashMap auto-grows
+        // exactly once or twice — still cheaper than starting from 4.
+        let cap_hint = config.proxies.len();
+        let mut http_candidates: HashMap<String, ReqwestWarmupCandidate> =
+            HashMap::with_capacity(cap_hint);
+        let mut https_candidates: HashMap<String, ReqwestWarmupCandidate> =
+            HashMap::with_capacity(cap_hint);
         let pool_config = self.connection_pool.global_pool_config();
         for proxy in &config.proxies {
             if !proxy.dispatch_kind.is_http_family() {
