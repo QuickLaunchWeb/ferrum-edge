@@ -7,6 +7,7 @@
 
 use crate::config::types::{BackoffStrategy, RetryConfig};
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::time::Duration;
 use tracing::warn;
 
@@ -267,156 +268,237 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
     }
 }
 
-/// Classify a generic boxed error (e.g. from WebSocket connections) into an
-/// `ErrorClass` by walking its `source()` chain for typed errors and falling
-/// back to Display/Debug substring matching. Called on the error path only.
+/// Walk an `std::error::Error` chain starting at `start` and return the
+/// first classification a typed downcast can pin down.
 ///
-/// **Source chain order (typed-first):**
+/// Recognises (in this order, per chain node):
 /// 1. [`crate::proxy::stream_error::StreamSetupError`] — typed kind from a
-///    stream-family construction site. Frontend TLS / backend TLS / DTLS
-///    handshake / plugin reject / no-healthy-targets get a class without
-///    inspecting the message string.
-/// 2. `tokio_tungstenite::tungstenite::Error::ConnectionClosed` / `AlreadyClosed`
-///    — peer sent a clean RFC 6455 Close frame (or we wrote after one).
-///    Maps to [`ErrorClass::GracefulRemoteClose`] so WebSocket sessions
-///    that ended cleanly don't inflate transport-failure metrics.
-/// 3. `tungstenite::Error::Protocol` — RFC 6455 protocol-level failure.
-///    Maps to [`ErrorClass::ProtocolError`].
-/// 4. `io::Error` — kind / raw_os_error → connect/reset/closed/timeout/EADDRNOTAVAIL.
-/// 5. `hyper::Error` — `is_timeout` / `is_incomplete_message`.
+///    stream-family construction site. Wins over everything because the
+///    construction site explicitly declared the failure mode.
+/// 2. `tokio_tungstenite::tungstenite::Error` — `ConnectionClosed` /
+///    `AlreadyClosed` → `GracefulRemoteClose`; `Protocol(_)` → `ProtocolError`.
+///    Other variants (Io / Tls / Http / Url) wrap typed sources we keep walking.
+/// 3. `rustls::Error` — any rustls error in the chain → `TlsError`. Mirrors
+///    the [`crate::proxy::http2_pool::classify_chain_from`] template; since
+///    every TLS path in the gateway flows through rustls, this catches
+///    handshake / cert / alert errors without needing the lowercase `"tls"`
+///    substring fallback that previously matched too aggressively.
+/// 4. `std::io::Error` — kind / `raw_os_error == EADDRNOTAVAIL` → port
+///    exhaustion / connect / reset / closed / timeout. `phase_is_connect`
+///    collapses connect-phase RSTs into `ConnectionRefused` so the unified
+///    `request_reached_wire` boundary stays consistent (a SYN-RST'd
+///    connection is functionally `ECONNREFUSED`, not a mid-stream reset).
+/// 5. `hyper::Error` — `is_timeout` → `ReadWriteTimeout`;
+///    `is_incomplete_message` → `ConnectionClosed`.
 ///
-/// The Display/Debug substring fallbacks below remain as defence-in-depth
-/// for legacy error types that don't expose typed source chains; new code
-/// should prefer to add a typed downcast here rather than extending the
-/// substring set.
-pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> ErrorClass {
-    // Walk the source chain for typed errors first so classification is
-    // stable regardless of Display wording.
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+/// Returns `None` only when the entire chain is exhausted with no typed
+/// match — callers fall back to substring matching at that point.
+fn classify_typed_chain(
+    start: Option<&(dyn std::error::Error + 'static)>,
+    phase_is_connect: bool,
+) -> Option<ErrorClass> {
+    let mut current = start;
     while let Some(err) = current {
-        // Typed stream-family setup error — see `proxy::stream_error`.
         if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
         {
-            return classify_stream_setup_kind(setup_err.kind);
+            return Some(classify_stream_setup_kind(setup_err.kind));
         }
-        // tokio-tungstenite WebSocket errors. `ConnectionClosed` and
-        // `AlreadyClosed` represent an orderly RFC 6455 close (the peer
-        // sent a Close frame, or we wrote after observing one); these are
-        // not transport failures and must not pollute connection-error
-        // dashboards.
         if let Some(ws_err) = err.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
             use tokio_tungstenite::tungstenite::Error as WsError;
             match ws_err {
                 WsError::ConnectionClosed | WsError::AlreadyClosed => {
-                    return ErrorClass::GracefulRemoteClose;
+                    return Some(ErrorClass::GracefulRemoteClose);
                 }
-                WsError::Protocol(_) => return ErrorClass::ProtocolError,
-                // Other WsError variants (Io, Tls, Http, Url, etc.) wrap
-                // typed sources we keep walking for below.
+                WsError::Protocol(_) => return Some(ErrorClass::ProtocolError),
+                // Other variants wrap typed sources — keep walking.
                 _ => {}
             }
         }
+        if err.downcast_ref::<rustls::Error>().is_some() {
+            return Some(ErrorClass::TlsError);
+        }
         if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+                return Some(ErrorClass::PortExhaustion);
+            }
             match io_err.kind() {
-                std::io::ErrorKind::TimedOut => return ErrorClass::ReadWriteTimeout,
-                std::io::ErrorKind::ConnectionRefused => return ErrorClass::ConnectionRefused,
-                std::io::ErrorKind::ConnectionReset => return ErrorClass::ConnectionReset,
+                std::io::ErrorKind::TimedOut => {
+                    return Some(if phase_is_connect {
+                        ErrorClass::ConnectionTimeout
+                    } else {
+                        ErrorClass::ReadWriteTimeout
+                    });
+                }
+                std::io::ErrorKind::ConnectionRefused => {
+                    return Some(ErrorClass::ConnectionRefused);
+                }
+                std::io::ErrorKind::ConnectionReset => {
+                    // Connect-phase RST is functionally ECONNREFUSED. See
+                    // CLAUDE.md "Connect-phase RST classification rule" and
+                    // `classify_reqwest_error`'s is_connect() branch.
+                    return Some(if phase_is_connect {
+                        ErrorClass::ConnectionRefused
+                    } else {
+                        ErrorClass::ConnectionReset
+                    });
+                }
                 std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
-                    return ErrorClass::ConnectionClosed;
+                    return Some(ErrorClass::ConnectionClosed);
                 }
                 _ => {}
-            }
-            if let Some(raw) = io_err.raw_os_error()
-                && (raw == 99 || raw == 49 || raw == 10049)
-            {
-                return ErrorClass::PortExhaustion;
             }
         }
         if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
             if hyper_err.is_timeout() {
-                return ErrorClass::ReadWriteTimeout;
+                return Some(ErrorClass::ReadWriteTimeout);
             }
             if hyper_err.is_incomplete_message() {
-                return ErrorClass::ConnectionClosed;
+                return Some(ErrorClass::ConnectionClosed);
             }
         }
         current = err.source();
     }
+    None
+}
 
-    let error_str = format!("{}", e);
-    let debug_str = format!("{:?}", e);
-
-    if is_port_exhaustion_message(&error_str) || is_port_exhaustion_message(&debug_str) {
-        return ErrorClass::PortExhaustion;
+/// Tightened substring fallback for boxed/reqwest errors when the typed
+/// walk is exhausted.
+///
+/// Returns `Some(class)` for an anchored match, `None` otherwise. Tokens are
+/// chosen to be robust against benign collisions (e.g., `"tls"` lowercased
+/// matches "kettle" — checks here use specific multi-character anchors like
+/// `"TLS"`, `" tls"`, `"tls "`, `"tls_"`, `"TlsError"`, plus rustls / SSL
+/// variant names that are unlikely to appear in unrelated error wording).
+///
+/// This fallback only fires for non-rustls TLS implementations or for
+/// stringly-typed errors where the typed source chain doesn't expose a
+/// downcastable error — `classify_typed_chain` covers every typed case the
+/// gateway emits in-process.
+fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<ErrorClass> {
+    if is_port_exhaustion_message(error_str) || is_port_exhaustion_message(debug_str) {
+        return Some(ErrorClass::PortExhaustion);
     }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
-        return ErrorClass::ConnectionTimeout;
+        return Some(ErrorClass::ConnectionTimeout);
     }
-    if error_str.contains("refused") || debug_str.contains("ConnectionRefused") {
-        return ErrorClass::ConnectionRefused;
-    }
+    // DNS — no typed error type bridges from reqwest/hyper-util's GAI
+    // resolver, so substrings are the only signal here. Tokens are
+    // distinctive multi-word phrases.
     if debug_str.contains("dns error")
-        || debug_str.contains("resolve")
         || debug_str.contains("Name or service not known")
         || debug_str.contains("No such host")
         || debug_str.contains("no record found")
         || debug_str.contains("failed to lookup address")
     {
-        return ErrorClass::DnsLookupError;
+        return Some(ErrorClass::DnsLookupError);
     }
-    if debug_str.contains("certificate")
-        || debug_str.contains("SSL")
-        || debug_str.contains("tls")
-        || debug_str.contains("TLS")
+    if error_str.contains("refused") || debug_str.contains("ConnectionRefused") {
+        return Some(ErrorClass::ConnectionRefused);
+    }
+    // TLS: anchor tokens to avoid the historical false positives where the
+    // bare 3-char `"tls"` matched any string (e.g., a backend hostname
+    // ending in `tls.example.com`). Each anchor below is either capitalized
+    // ("TLS", "SSL"), CamelCase rustls variant names, or a 3-char `tls`
+    // followed by a punctuation/whitespace boundary that wouldn't appear
+    // inside a normal hostname.
+    if error_str.contains("certificate")
+        || debug_str.contains("certificate")
+        || debug_str.contains("Certificate")
         || debug_str.contains("AlertReceived")
         || debug_str.contains("HandshakeFailure")
         || debug_str.contains("InvalidCertificate")
+        || debug_str.contains(" SSL ")
+        || debug_str.contains("SslError")
+        || debug_str.contains(" TLS ")
+        || debug_str.contains("TlsError")
+        || debug_str.contains("tls handshake")
+        || debug_str.contains("tls alert")
     {
-        return ErrorClass::TlsError;
+        return Some(ErrorClass::TlsError);
     }
-    if debug_str.contains("reset") || debug_str.contains("ConnectionReset") {
-        return ErrorClass::ConnectionReset;
+    // Reset / broken pipe — typed io::Error already caught these in the
+    // typed walk; the substrings here only fire for stringified errors
+    // (plain `String` boxed as `dyn Error`, etc.). Anchored multi-word
+    // phrases avoid the historical false-positive matches where a bare
+    // `"reset"` substring caught unrelated wording (`"reset_stream"`,
+    // `"upstream"`).
+    if error_str.contains("connection reset") || debug_str.contains("ConnectionReset") {
+        return Some(ErrorClass::ConnectionReset);
     }
-    if debug_str.contains("broken pipe")
+    if error_str.contains("broken pipe")
+        || error_str.contains("connection closed")
         || debug_str.contains("BrokenPipe")
-        || debug_str.contains("connection closed")
     {
-        return ErrorClass::ConnectionClosed;
+        return Some(ErrorClass::ConnectionClosed);
     }
-    ErrorClass::RequestError
+    None
 }
 
-/// Classify a `reqwest::Error` into an `ErrorClass` by inspecting its
-/// error chain and message. This is called on the error path only (not hot path).
+/// Classify a generic boxed error (e.g. from WebSocket connections, TCP
+/// relays, or other non-reqwest sources) into an `ErrorClass`.
+///
+/// **Two-phase classification:**
+/// 1. [`classify_typed_chain`] walks the `source()` chain for typed
+///    downcasts (`StreamSetupError`, `tungstenite::Error`, `rustls::Error`,
+///    `io::Error`, `hyper::Error`).
+/// 2. If the typed walk returns `None`, fall back to
+///    [`classify_substring_fallback`] (anchored substring tokens).
+///
+/// New code SHOULD add a typed downcast in `classify_typed_chain` rather
+/// than extend the substring set — the substring fallback is intentionally
+/// kept narrow to avoid the historical false-positive matches where bare
+/// 3-char tokens like `"tls"` matched unrelated wording.
+pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> ErrorClass {
+    // phase_is_connect=false: callers of classify_boxed_error are typically
+    // post-connect (WebSocket session, TCP relay mid-stream); pre-wire
+    // callers go through classify_reqwest_error::is_connect() which sets the
+    // flag explicitly.
+    if let Some(class) = classify_typed_chain(Some(e), false) {
+        return class;
+    }
+    let error_str = format!("{}", e);
+    let debug_str = format!("{:?}", e);
+    classify_substring_fallback(&error_str, &debug_str).unwrap_or(ErrorClass::RequestError)
+}
+
+/// Classify a `reqwest::Error` into an `ErrorClass` by walking its typed
+/// source chain and falling back to anchored substring matches.
+///
+/// Called on the error path only.
+///
+/// **Order:**
+/// 1. Port-exhaustion typed walk via [`is_port_exhaustion`].
+/// 2. `is_connect()` branch — pre-wire by construction:
+///    - `is_timeout()` → `ConnectionTimeout`.
+///    - [`classify_typed_chain`] with `phase_is_connect = true`. Connect-phase
+///      RSTs collapse to `ConnectionRefused`; rustls errors become `TlsError`;
+///      io errors map per-kind. Every class here MUST satisfy
+///      `request_reached_wire == false` so `retry_on_connect_failure` fires.
+///    - DNS substring fallback (no typed DNS error from reqwest/hyper-util).
+///    - Generic refused fallback.
+/// 3. `is_timeout()` (post-connect) → `ReadWriteTimeout`.
+/// 4. [`classify_typed_chain`] with `phase_is_connect = false` — mid-stream
+///    classification.
+/// 5. HTTP/2 protocol-error substring fallback (`h2` / `GOAWAY` / `RESET_STREAM`).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
-    // Check for port exhaustion (EADDRNOTAVAIL) before other classifications.
-    // Walk the source chain since reqwest wraps io::Error in multiple layers.
     if is_port_exhaustion(e) {
         return ErrorClass::PortExhaustion;
     }
 
-    // Check the error chain for specific std::io errors
-    let error_str = format!("{}", e);
-    let source_chain = format!("{:?}", e);
-
     if e.is_connect() {
-        // Dig into the connect error to distinguish timeout, refused, TLS, DNS.
-        //
-        // CRITICAL: every classification inside this branch is a PRE-WIRE
-        // failure (the TCP / TLS connect itself didn't succeed), so it
-        // MUST map to a class whose `request_reached_wire(class) == false`
-        // — otherwise `connection_error` ends up `false` and
-        // `retry_on_connect_failure` is silently skipped for the failure.
-        // In particular, do NOT map a connect-phase RST to
-        // `ConnectionReset`: that variant is reserved for mid-stream
-        // resets (post-wire), and treating connect-phase resets as
-        // post-wire was the regression Codex flagged. SYN-RST'd
-        // connections are functionally connect-refused.
         if e.is_timeout() {
             return ErrorClass::ConnectionTimeout;
         }
+        if let Some(class) = classify_typed_chain(StdError::source(e), true) {
+            // CRITICAL: every typed-walk return inside is_connect() is
+            // pre-wire by construction. `classify_typed_chain` enforces this
+            // when `phase_is_connect = true` (connect-phase RSTs collapse to
+            // ConnectionRefused, etc.).
+            return class;
+        }
+
+        let source_chain = format!("{:?}", e);
         if source_chain.contains("dns error")
-            || source_chain.contains("resolve")
             || source_chain.contains("Name or service not known")
             || source_chain.contains("No such host")
             || source_chain.contains("no record found")
@@ -424,35 +506,22 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         {
             return ErrorClass::DnsLookupError;
         }
+        // After typed rustls and io walks, the remaining TLS-error wording
+        // would come from non-rustls sources (none exist in-process today)
+        // OR from reqwest's own connect-error Display. Anchored tokens —
+        // see `classify_substring_fallback` for the rationale.
         if source_chain.contains("certificate")
-            || source_chain.contains("SSL")
-            || source_chain.contains("tls")
-            || source_chain.contains("TLS")
+            || source_chain.contains("Certificate")
             || source_chain.contains("AlertReceived")
             || source_chain.contains("HandshakeFailure")
             || source_chain.contains("InvalidCertificate")
+            || source_chain.contains("TlsError")
+            || source_chain.contains(" TLS ")
+            || source_chain.contains("tls handshake")
         {
             return ErrorClass::TlsError;
         }
-        // `refused` matches the explicit ECONNREFUSED case; the bare
-        // `reset` substring inside the is_connect() branch handles
-        // SYN-RST'd connect attempts (e.g. a firewall rejecting the
-        // initial SYN with RST). Both collapse to `ConnectionRefused`
-        // because from an application standpoint the connect attempt
-        // failed before any data could be exchanged — the request
-        // never reached the wire. The previous code emitted
-        // `ConnectionReset` here, which under the unified
-        // `request_reached_wire` boundary would mark this as
-        // post-wire and skip `retry_on_connect_failure`.
-        if error_str.contains("refused")
-            || source_chain.contains("Connection refused")
-            || source_chain.contains("ConnectionRefused")
-            || source_chain.contains("reset")
-            || source_chain.contains("ConnectionReset")
-        {
-            return ErrorClass::ConnectionRefused;
-        }
-        // Generic connect failure
+        // Generic connect failure — refused/reset both pre-wire.
         return ErrorClass::ConnectionRefused;
     }
 
@@ -460,24 +529,23 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::ReadWriteTimeout;
     }
 
-    // Check for connection reset/closed during request/response.
-    // Reaching this point means `e.is_connect()` was false — the connect
-    // succeeded, so any reset here is mid-stream and post-wire by
-    // construction.
-    if source_chain.contains("reset") || source_chain.contains("ConnectionReset") {
-        return ErrorClass::ConnectionReset;
-    }
-    if source_chain.contains("broken pipe")
-        || source_chain.contains("BrokenPipe")
-        || source_chain.contains("connection closed")
-        || source_chain.contains("closed before")
-    {
-        return ErrorClass::ConnectionClosed;
+    // Mid-stream / post-connect: walk typed chain for io/hyper/rustls.
+    if let Some(class) = classify_typed_chain(StdError::source(e), false) {
+        return class;
     }
 
-    // HTTP/2 specific errors
-    if source_chain.contains("h2") || source_chain.contains("GOAWAY") {
+    // HTTP/2 protocol errors don't surface a typed downcast through
+    // reqwest's chain (reqwest hides hyper internals), so this substring
+    // fallback remains. Tokens are HTTP/2-specific, not generic.
+    let source_chain = format!("{:?}", e);
+    if source_chain.contains("GOAWAY")
+        || source_chain.contains("RESET_STREAM")
+        || source_chain.contains("h2::")
+    {
         return ErrorClass::ProtocolError;
+    }
+    if source_chain.contains("closed before") {
+        return ErrorClass::ConnectionClosed;
     }
 
     ErrorClass::RequestError

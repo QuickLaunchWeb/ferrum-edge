@@ -760,3 +760,80 @@ fn test_classify_boxed_error_ws_protocol_error_is_protocol_class() {
     );
     assert_eq!(classify_boxed_error(&*err), ErrorClass::ProtocolError);
 }
+
+// --- Typed rustls and io::Error walks (tightened typed-first classification) ---
+
+#[test]
+fn test_classify_boxed_error_typed_rustls_alert() {
+    // rustls::Error walked via downcast — no message inspection needed.
+    // Used to require matching "TLS"/"AlertReceived"/etc substrings.
+    let alert = rustls::AlertDescription::HandshakeFailure;
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(rustls::Error::AlertReceived(alert));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_boxed_error_typed_rustls_buried_in_chain() {
+    // rustls::Error wrapped in another error type — chain walk must reach it.
+    #[derive(Debug)]
+    struct Wrapper(rustls::Error);
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "outer wrapper: {}", self.0)
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let wrapped = Wrapper(rustls::Error::HandshakeNotComplete);
+    assert_eq!(classify_boxed_error(&wrapped), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_classify_boxed_error_typed_io_error_takes_precedence_over_substrings() {
+    // An io::Error with a Display string that would substring-match
+    // something else. The typed walk must win.
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        // Adversarial wording — would substring-match TLS via "tls handshake".
+        "tls handshake didn't make it past the kernel",
+    ));
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::ConnectionRefused);
+}
+
+// --- Substring-fallback anchoring regression tests ---
+
+#[test]
+fn test_substring_fallback_does_not_match_bare_tls_in_hostname() {
+    // Regression: legacy classifier matched bare lowercase `"tls"` and
+    // would mis-classify any unrelated error wording containing "tls" as
+    // TlsError. Tightened anchors require a more specific token.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "request to backend tls.example.com failed unexpectedly".into();
+    // Without "TLS handshake" / "certificate" / "TlsError" / etc. anchors,
+    // this falls through to RequestError.
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::RequestError);
+}
+
+#[test]
+fn test_substring_fallback_does_not_match_bare_reset_in_unrelated_wording() {
+    // Regression: legacy classifier matched bare `"reset"` which collided
+    // with `stream_reset`, `reset_stream`, etc. The tightened anchor
+    // requires `"connection reset"` (multi-word) or `"ConnectionReset"`
+    // (PascalCase).
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "stream_reset received from upstream".into();
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::RequestError);
+}
+
+#[test]
+fn test_substring_fallback_anchored_tls_handshake() {
+    // Anchored multi-word phrase "tls handshake" does match — the previous
+    // bare `"tls"` was the false-positive risk, not full phrases.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "outbound request failed: tls handshake aborted by peer".into();
+    assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+}
