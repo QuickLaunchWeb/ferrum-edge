@@ -399,6 +399,15 @@ pub async fn run(
         drop(grpc_server); // consumed by the gRPC spawn when enabled
         None
     };
+
+    // ── xDS server (optional, gated by FERRUM_XDS_ENABLED) ─────────────────
+    let xds_handle = if env_config.xds_enabled {
+        Some(start_xds_server(&env_config, config_arc.clone(), &shutdown_tx).await?)
+    } else {
+        info!("FERRUM_XDS_ENABLED=false — xDS server disabled");
+        None
+    };
+
     startup_ready.store(true, Ordering::Relaxed);
     info!("Control plane startup complete; /health now reports ready");
 
@@ -703,6 +712,13 @@ pub async fn run(
             }
         } => {}
         _ = async {
+            if let Some(handle) = xds_handle {
+                let _ = handle.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
             while !*wait_shutdown.borrow() {
                 if wait_shutdown.changed().await.is_err() {
                     return;
@@ -821,4 +837,87 @@ fn update_known_ids(
     for id in added {
         known.insert(id.clone());
     }
+}
+
+/// Start the Envoy-compatible xDS Aggregated Discovery Service.
+///
+/// Gated by `FERRUM_XDS_ENABLED`. Called only when the gate is on so this
+/// function panics by reading `unwrap`s would be wrong — every fallible
+/// path returns `anyhow::Error`.
+async fn start_xds_server(
+    env_config: &EnvConfig,
+    config_arc: Arc<ArcSwap<crate::config::types::GatewayConfig>>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<()>, anyhow::Error> {
+    use crate::xds::{FerrumXdsServer, XdsRefreshSignal, XdsSnapshotCache, XdsState};
+
+    let xds_addr: SocketAddr = env_config.xds_listen_addr.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "FERRUM_XDS_LISTEN_ADDR '{}' is invalid: {}",
+            env_config.xds_listen_addr,
+            e
+        )
+    })?;
+
+    let snapshots = XdsSnapshotCache::new();
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<XdsRefreshSignal>(
+        env_config.cp_broadcast_channel_capacity.max(16),
+    );
+    let xds_state = Arc::new(XdsState {
+        config: config_arc,
+        snapshots,
+        broadcast: broadcast_tx,
+    });
+
+    let jwt_secret = env_config.cp_dp_grpc_jwt_secret.clone();
+    let require_auth = env_config.xds_require_authenticated_client;
+    let server = FerrumXdsServer::new(xds_state, jwt_secret, require_auth);
+
+    let xds_tls_config = if let (Some(cert_path), Some(key_path)) =
+        (&env_config.xds_tls_cert_path, &env_config.xds_tls_key_path)
+    {
+        let cert_pem = std::fs::read(cert_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read xDS TLS cert {}: {}", cert_path, e))?;
+        let key_pem = std::fs::read(key_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read xDS TLS key {}: {}", key_path, e))?;
+        Some(ServerTlsConfig::new().identity(Identity::from_pem(&cert_pem, &key_pem)))
+    } else {
+        None
+    };
+
+    let max_streams = env_config.xds_max_concurrent_streams;
+    let listener = tokio::net::TcpListener::bind(xds_addr).await?;
+    info!("xDS server listening on {}", xds_addr);
+    let mut xds_shutdown = shutdown_tx.subscribe();
+
+    let handle = tokio::spawn(async move {
+        let mut builder = Server::builder().max_concurrent_streams(Some(max_streams));
+        if let Some(tls) = xds_tls_config {
+            builder = match builder.tls_config(tls) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Failed to configure xDS TLS: {}", e);
+                    return;
+                }
+            };
+        }
+        let shutdown_signal = async move {
+            while !*xds_shutdown.borrow() {
+                if xds_shutdown.changed().await.is_err() {
+                    return;
+                }
+            }
+            info!("xDS server shutting down");
+        };
+        let incoming = TcpListenerStream::new(listener);
+        if let Err(e) = builder
+            .add_service(server.into_service())
+            .serve_with_incoming_shutdown(incoming, shutdown_signal)
+            .await
+        {
+            error!("xDS server error: {}", e);
+        }
+    });
+
+    Ok(handle)
 }

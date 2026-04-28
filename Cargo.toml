@@ -133,6 +133,12 @@ glob = "0.3"
 # choice — it needs `time::OffsetDateTime`). Already in `[dev-dependencies]`
 # for testing; promoting to a regular dep so the mesh CA can reference it.
 time = "0.3"
+# Envoy + xDS protobuf types — used by the Phase B xDS server (LDS/RDS/CDS/
+# EDS/SDS + ADS service stubs). Tracks tonic 0.14 / prost 0.14 (matches
+# Ferrum's existing gRPC stack), so adding it does not split the dependency
+# graph. Saves ~30 protos worth of vendoring; the crate ships pre-generated
+# Rust modules under `envoy_types::pb::*`.
+envoy-types = "0.7"
 
 # Secrets management (optional cloud backends — gate via cargo features)
 vaultrs = { version = "0.8", optional = true }

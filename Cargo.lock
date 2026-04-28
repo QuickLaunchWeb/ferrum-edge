@@ -1815,6 +1815,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-types"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71205be41837bfbb3340812d0ccdda7ebf81d78f8d1d6bcb9f6472e949cd021"
+dependencies = [
+ "futures-core",
+ "prost",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1902,6 +1914,7 @@ dependencies = [
  "clap",
  "dashmap",
  "dimpl",
+ "envoy-types",
  "flate2",
  "futures",
  "futures-util",

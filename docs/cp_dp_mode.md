@@ -47,6 +47,7 @@ CP and DP communicate via the `ConfigSync` gRPC service defined in `proto/ferrum
 
 - **`Subscribe(SubscribeRequest) -> stream ConfigUpdate`** — Server-streaming RPC. The DP subscribes and receives an initial full config snapshot followed by streaming updates whenever the CP detects config changes.
 - **`GetFullConfig(FullConfigRequest) -> FullConfigResponse`** — Unary RPC for on-demand full config retrieval.
+- **`MeshSubscribe(MeshSubscribeRequest) -> stream MeshConfigUpdate`** — Server-streaming RPC for mesh data planes (Phase C). Streams a per-workload `MeshSlice` (only the resources the workload identified by `spiffe_id` needs). The existing `Subscribe` and `GetFullConfig` RPCs are byte-identical to before — non-mesh deployments observe zero regression. See [mesh_control_plane.md](mesh_control_plane.md).
 
 ### Authentication
 

@@ -349,6 +349,32 @@ pub struct EnvConfig {
     /// high config churn. Default: 128.
     pub cp_broadcast_channel_capacity: usize,
 
+    // ── xDS (Layer 3 mesh control protocol) ────────────────────────────
+    /// When true, the CP also serves the Envoy-compatible xDS Aggregated
+    /// Discovery Service. Default: false. When false, the existing CP/DP
+    /// behaviour is byte-identical to before — the xDS server is not
+    /// started. Independent of the native `MeshSubscribe` RPC, which is
+    /// always exposed and gated only by the existing CP/DP JWT auth.
+    pub xds_enabled: bool,
+    /// Listen address for the xDS server. Default: 0.0.0.0:18000. Note:
+    /// Istio's pilot-agent uses 15010 plaintext / 15012 mTLS. We pick
+    /// 18000 to keep out of conflict with sidecar listener ports until
+    /// the production port matrix is settled in Phase C.
+    pub xds_listen_addr: String,
+    /// Optional PEM cert path for mTLS-protected xDS gRPC. When set with
+    /// `xds_tls_key_path`, the xDS server requires client certificates.
+    pub xds_tls_cert_path: Option<String>,
+    /// Optional PEM key path matching `xds_tls_cert_path`.
+    pub xds_tls_key_path: Option<String>,
+    /// When true, the xDS server rejects subscriptions that arrive
+    /// without a verified JWT (uses the same `cp_dp_grpc_jwt_secret`).
+    /// Default: true.
+    pub xds_require_authenticated_client: bool,
+    /// HTTP/2 max concurrent streams for the xDS server. Default: 1000.
+    /// At fleet scale this is the soft cap on parallel sidecar
+    /// subscriptions; bump alongside the OS fd limit.
+    pub xds_max_concurrent_streams: u32,
+
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
     /// When set, the DP verifies the CP server's identity.
@@ -986,6 +1012,12 @@ impl Default for EnvConfig {
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
+            xds_enabled: false,
+            xds_listen_addr: "0.0.0.0:18000".to_string(),
+            xds_tls_cert_path: None,
+            xds_tls_key_path: None,
+            xds_require_authenticated_client: true,
+            xds_max_concurrent_streams: 1000,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1227,6 +1259,12 @@ impl EnvConfig {
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
+            xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
+            xds_listen_addr: String = "FERRUM_XDS_LISTEN_ADDR" => "0.0.0.0:18000".to_string();
+            xds_tls_cert_path: Option<String> = "FERRUM_XDS_TLS_CERT_PATH";
+            xds_tls_key_path: Option<String> = "FERRUM_XDS_TLS_KEY_PATH";
+            xds_require_authenticated_client: bool = "FERRUM_XDS_REQUIRE_AUTHENTICATED_CLIENT" => true;
+            xds_max_concurrent_streams: u32 = "FERRUM_XDS_MAX_CONCURRENT_STREAMS" => 1000u32;
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1563,6 +1601,12 @@ impl EnvConfig {
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
+            xds_enabled,
+            xds_listen_addr,
+            xds_tls_cert_path,
+            xds_tls_key_path,
+            xds_require_authenticated_client,
+            xds_max_concurrent_streams,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,

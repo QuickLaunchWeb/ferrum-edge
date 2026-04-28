@@ -5,3 +5,4 @@ mod gateway_core;
 mod identity;
 mod plugins;
 mod secrets;
+mod xds;

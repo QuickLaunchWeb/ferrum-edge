@@ -17,6 +17,9 @@ use std::collections::HashMap;
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{JwtAuthority as IdentityJwtAuthority, TrustBundle as IdentityTrustBundle};
 
+pub mod slice;
+pub use slice::MeshSlice;
+
 /// Application-layer protocol classification for mesh ports.
 ///
 /// Mirrors Istio's `appProtocol` field on `Service` ports + endpoints. Phase

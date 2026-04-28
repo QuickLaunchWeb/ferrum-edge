@@ -28,9 +28,15 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
-use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
+use super::proto::{
+    ConfigUpdate, FullConfigRequest, FullConfigResponse, MeshConfigUpdate, MeshSubscribeRequest,
+    SubscribeRequest,
+};
 use crate::FERRUM_VERSION;
+use crate::config::mesh::MeshSlice;
 use crate::config::types::GatewayConfig;
+use crate::identity::spiffe::SpiffeId;
+use std::str::FromStr;
 
 /// Metadata about a connected Data Plane node.
 #[derive(Clone, Serialize)]
@@ -436,6 +442,173 @@ impl ConfigSync for CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
         }))
     }
+
+    type MeshSubscribeStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
+
+    async fn mesh_subscribe(
+        &self,
+        request: Request<MeshSubscribeRequest>,
+    ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+        // Same JWT auth as the existing Subscribe RPC.
+        self.verify_jwt_metadata(request.metadata())?;
+
+        let inner = request.into_inner();
+        let node_id = inner.node_id;
+        let dp_version = inner.ferrum_version;
+        let namespace = inner.namespace;
+        let spiffe_str = inner.spiffe_id;
+
+        Self::check_version_compatibility(&dp_version)?;
+
+        let spiffe_id = SpiffeId::from_str(&spiffe_str).map_err(|e| {
+            warn!(
+                "MeshSubscribe rejected — invalid SPIFFE ID '{}': {}",
+                spiffe_str, e
+            );
+            Status::invalid_argument(format!("invalid spiffe_id '{}': {}", spiffe_str, e))
+        })?;
+
+        // Per-node isolation security boundary: refuse to issue a slice for
+        // a workload that isn't registered in the namespace the caller
+        // claims to be in. Stops a sidecar from cross-namespace probing by
+        // forging an arbitrary spiffe_id.
+        let initial_config = self.config.load_full();
+        let slice = match build_slice(&initial_config, &namespace, &spiffe_id) {
+            Some(s) => s,
+            None => {
+                warn!(
+                    "MeshSubscribe rejected — workload '{}' not found in namespace '{}'",
+                    spiffe_id, namespace
+                );
+                return Err(Status::not_found(format!(
+                    "workload '{}' not registered in namespace '{}'",
+                    spiffe_id, namespace
+                )));
+            }
+        };
+
+        info!(
+            "Mesh DP node '{}' (v{}) subscribed for mesh slice (namespace='{}', spiffe_id='{}')",
+            node_id, dp_version, namespace, spiffe_id
+        );
+
+        // Initial FULL_SNAPSHOT.
+        let initial_json = serde_json::to_string(&slice).map_err(|e| {
+            error!("Failed to serialize MeshSlice in mesh_subscribe: {}", e);
+            Status::internal("Failed to serialize mesh slice")
+        })?;
+        let initial = MeshConfigUpdate {
+            update_type: 0, // FULL_SNAPSHOT
+            mesh_slice_json: initial_json,
+            version: initial_config.loaded_at.to_rfc3339(),
+            timestamp: chrono::Utc::now().timestamp(),
+            ferrum_version: FERRUM_VERSION.to_string(),
+        };
+
+        // Subscribe to the same broadcast stream the regular ConfigSync
+        // uses; the mesh stream re-slices on every update before emitting.
+        let rx = self.update_tx.subscribe();
+        let config_for_slice = self.config.clone();
+        let namespace_clone = namespace.clone();
+        let spiffe_clone = spiffe_id.clone();
+        let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+            Ok(_update) => {
+                // Recompute the slice from the current full config. The
+                // delta carried by `_update` is the *full* (or delta)
+                // GatewayConfig — re-slicing per node guarantees workload A
+                // never sees workload B's slice, regardless of whether the
+                // upstream broadcast was a delta or a snapshot.
+                let cfg = config_for_slice.load_full();
+                match build_slice(cfg.as_ref(), &namespace_clone, &spiffe_clone) {
+                    Some(slice) => match serde_json::to_string(&slice) {
+                        Ok(json) => Some(Ok(MeshConfigUpdate {
+                            update_type: 1, // DELTA
+                            mesh_slice_json: json,
+                            version: cfg.loaded_at.to_rfc3339(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            ferrum_version: FERRUM_VERSION.to_string(),
+                        })),
+                        Err(e) => {
+                            error!("Failed to serialize MeshSlice update: {}", e);
+                            None
+                        }
+                    },
+                    None => {
+                        // The workload was de-registered. The DP should
+                        // tear down — emit a final empty FULL_SNAPSHOT so
+                        // it observes the change, then the broadcast
+                        // continues but yields nothing further for this
+                        // identity.
+                        warn!(
+                            "Mesh slice no longer available for spiffe_id='{}' (workload de-registered)",
+                            spiffe_clone
+                        );
+                        None
+                    }
+                }
+            }
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                warn!(
+                    "Mesh DP slice stream lagged behind by {} updates — sending full snapshot to recover",
+                    n
+                );
+                let cfg = config_for_slice.load_full();
+                match build_slice(cfg.as_ref(), &namespace_clone, &spiffe_clone) {
+                    Some(slice) => match serde_json::to_string(&slice) {
+                        Ok(json) => Some(Ok(MeshConfigUpdate {
+                            update_type: 0, // FULL_SNAPSHOT
+                            mesh_slice_json: json,
+                            version: cfg.loaded_at.to_rfc3339(),
+                            timestamp: chrono::Utc::now().timestamp(),
+                            ferrum_version: FERRUM_VERSION.to_string(),
+                        })),
+                        Err(e) => {
+                            error!("Failed to serialize MeshSlice recovery snapshot: {}", e);
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            }
+        });
+
+        let initial_stream = tokio_stream::once(Ok(initial));
+        let combined = initial_stream.chain(stream);
+        Ok(Response::new(Box::pin(combined)))
+    }
+}
+
+/// Build a `MeshSlice` from the full `GatewayConfig` for a given namespace +
+/// SPIFFE ID. Returns `None` if the workload is not registered in the
+/// namespace.
+///
+/// Public so the xDS server can reuse the same slice computation.
+pub fn build_slice(
+    config: &GatewayConfig,
+    namespace: &str,
+    spiffe_id: &SpiffeId,
+) -> Option<MeshSlice> {
+    // Workloads in this namespace only — preserves namespace isolation
+    // before the slice computation runs. We still need a vec for this
+    // one because `for_workload` takes a `&[Workload]` and we need to
+    // narrow the namespace.
+    let workloads_in_ns: Vec<_> = config
+        .workloads
+        .iter()
+        .filter(|w| w.namespace == namespace)
+        .cloned()
+        .collect();
+
+    MeshSlice::for_workload(
+        spiffe_id,
+        &workloads_in_ns,
+        &config.services,
+        &config.mesh_policies,
+        &config.peer_authentications,
+        &config.service_entries,
+        config.trust_bundles.as_ref(),
+    )
 }
 
 // Version compatibility is tested inline because `check_version_compatibility` is private.

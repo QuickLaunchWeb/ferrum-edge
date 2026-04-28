@@ -7,6 +7,19 @@ service ConfigSync {
   rpc Subscribe(SubscribeRequest) returns (stream ConfigUpdate);
   // DP can request a full config snapshot
   rpc GetFullConfig(FullConfigRequest) returns (FullConfigResponse);
+
+  // Mesh data planes subscribe to a per-workload "slice" of the canonical
+  // mesh model: only the Workload, the MeshServices it can reach as a
+  // client, the MeshPolicies where its identity is `from` or `to`, the
+  // PeerAuthentications that scope it, the ServiceEntries it consumes, and
+  // its trust bundle. Keeps fleet-scale CP load tractable (a sidecar with
+  // 10 peer services should not pay the cost of streaming 10000 workloads'
+  // config every reload).
+  //
+  // Strictly additive — the existing Subscribe / GetFullConfig RPCs are
+  // unchanged on the wire so non-mesh CP/DP deployments observe zero
+  // regression. JWT auth uses the same FERRUM_CP_DP_GRPC_JWT_SECRET.
+  rpc MeshSubscribe(MeshSubscribeRequest) returns (stream MeshConfigUpdate);
 }
 
 message SubscribeRequest {
@@ -42,5 +55,36 @@ message ConfigUpdate {
   string version = 3;
   int64 timestamp = 4;
   // Ferrum Edge binary version of the CP (e.g. "0.9.0")
+  string ferrum_version = 5;
+}
+
+// MeshSubscribe request from a mesh data plane sidecar.
+//
+// `spiffe_id` identifies the workload requesting config; the CP uses it to
+// compute the per-workload MeshSlice (only resources the workload can
+// reach / is authorised against). `trust_domain` is sent for cross-trust-
+// domain federation (multi-cluster mesh). `namespace` lets the CP filter to
+// the right Ferrum namespace before slicing.
+message MeshSubscribeRequest {
+  string node_id = 1;
+  string ferrum_version = 2;
+  string namespace = 3;
+  string spiffe_id = 4;
+  string trust_domain = 5;
+}
+
+message MeshConfigUpdate {
+  enum UpdateType {
+    FULL_SNAPSHOT = 0;
+    DELTA = 1;
+  }
+  UpdateType update_type = 1;
+  // JSON-encoded `MeshSlice` (definition lives Rust-side in
+  // `crate::config::mesh::slice::MeshSlice`). Streaming JSON keeps the wire
+  // format mirror-symmetric with the existing ConfigSync RPCs and avoids
+  // proto schema churn every time we add a mesh field.
+  string mesh_slice_json = 2;
+  string version = 3;
+  int64 timestamp = 4;
   string ferrum_version = 5;
 }

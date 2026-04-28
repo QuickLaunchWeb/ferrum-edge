@@ -43,6 +43,7 @@ mod startup;
 mod tls;
 #[allow(dead_code)]
 mod tls_offload;
+mod xds;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
