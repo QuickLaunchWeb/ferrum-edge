@@ -619,7 +619,17 @@ async fn validate_bundle(
                         use crate::config::types::PluginScope;
                         match existing.scope {
                             PluginScope::Global => {
-                                // Global plugins are allowed in spec-managed proxy associations.
+                                // Mirrors the system-wide invariant enforced by
+                                // GatewayConfig::validate_plugin_references and SQL
+                                // validate_proxy_plugin_associations: proxy
+                                // associations may only reference proxy-scoped or
+                                // proxy_group-scoped plugin configs. Global plugins
+                                // apply implicitly via the plugin_cache and must
+                                // remain unassociated.
+                                assoc_errors.push(format!(
+                                    "plugin_config_id '{}' has scope=global; global plugins must remain unassociated",
+                                    pid
+                                ));
                             }
                             PluginScope::ProxyGroup => {
                                 // Any proxy may reference a ProxyGroup plugin.
@@ -1118,9 +1128,14 @@ pub async fn handle_put_api_spec(
 
     // Resolve the existing upstream_id so the upstream name uniqueness check
     // can exclude the spec's own upstream (PUT with unchanged name must not
-    // self-collide). After assign_ids_for_put the upstream.id is already set
-    // to the existing one; we still need the current DB value for the check.
-    let existing_upstream_id: Option<String> = bundle.upstream.as_ref().map(|u| u.id.clone());
+    // self-collide). Use the *stored* upstream_id from the existing proxy in
+    // the DB — NOT the bundle's post-assignment upstream.id, which can be
+    // operator-changed and would falsely match the old DB row as a duplicate.
+    let existing_upstream_id: Option<String> = match db.get_proxy(&existing_spec.proxy_id).await {
+        Ok(Some(p)) => p.upstream_id,
+        Ok(None) => None,
+        Err(e) => return Ok(error_response(classify_db_error(e))),
+    };
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
         bundle,

@@ -1945,6 +1945,72 @@ async fn put_keeps_same_upstream_name_succeeds() {
     );
 }
 
+/// PUT changes the upstream `id` but keeps the same upstream `name`.
+///
+/// The `check_upstream_name_unique` exclusion must be the *stored*
+/// upstream_id from the existing proxy in the DB, not the bundle's
+/// post-assign_ids_for_put upstream.id. If the exclusion uses the bundle's
+/// (new) id, the stored row (with the same name, old id) is still seen
+/// and reported as a duplicate, falsely rejecting the change.
+#[tokio::test]
+async fn put_with_changed_upstream_id_same_name_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let state = make_admin_state(store, 10);
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let upstream_v1_id = uid("upstream-v1");
+    let upstream_v2_id = uid("upstream-v2");
+    let shared_name = uid("shared-name");
+    let listen_path = format!("/{proxy_id}");
+
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "PUT changed upstream id", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_v1_id,
+            "name": shared_name,
+            "targets": [{"host": "target.internal", "port": 443}]
+        }
+    });
+    let (s1, b1) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED, "POST: {b1}");
+    let spec_id = b1["id"].as_str().unwrap().to_string();
+
+    // PUT: change the upstream id, keep the upstream name.
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "PUT changed upstream id", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_v2_id,
+            "name": shared_name,
+            "targets": [{"host": "target-v2.internal", "port": 443}]
+        }
+    });
+    let (s2, b2) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        s2,
+        reqwest::StatusCode::OK,
+        "PUT with changed upstream id (same name) must succeed; body: {b2}"
+    );
+}
+
 // ============================================================================
 // Fix 1 — PUT idempotency: reuse existing IDs for empty-id re-submissions
 // ============================================================================
@@ -2325,10 +2391,16 @@ async fn post_proxy_plugin_association_to_other_proxy_returns_422() {
     );
 }
 
-/// POST a spec where x-ferrum-proxy.plugins references a GLOBAL plugin that
-/// already exists in the DB → 201 (global plugins are allowed).
+/// POST a spec where x-ferrum-proxy.plugins references a GLOBAL plugin → 422.
+///
+/// Mirrors the system-wide invariant enforced by
+/// `GatewayConfig::validate_plugin_references` and SQL
+/// `validate_proxy_plugin_associations`: proxy associations may only
+/// reference proxy-scoped or proxy_group-scoped configs. Global plugins
+/// apply implicitly to all proxies via `plugin_cache` and must remain
+/// unassociated.
 #[tokio::test]
-async fn post_proxy_plugin_association_to_global_plugin_succeeds() {
+async fn post_proxy_plugin_association_to_global_plugin_returns_422() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
@@ -2367,8 +2439,22 @@ async fn post_proxy_plugin_association_to_global_plugin_succeeds() {
     let (status, body) = client.post_json("/api-specs", &spec).await;
     assert_eq!(
         status,
-        reqwest::StatusCode::CREATED,
-        "association to global plugin must succeed; body: {body}"
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "association to global plugin must be rejected; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["resource_type"] == "proxy_plugin_association"
+                && f["errors"]
+                    .as_array()
+                    .and_then(|a| a.iter().find(|e| e
+                        .as_str()
+                        .map(|s| s.contains("scope=global"))
+                        .unwrap_or(false)))
+                    .is_some()),
+        "must include the scope=global rejection in failures: {body}"
     );
 }
 
