@@ -3095,22 +3095,34 @@ async fn handle_websocket_request_authenticated(
         {
             Ok(stream) => break stream,
             Err(e) => {
-                // WSS backend dial runs BEFORE the gateway sends 101/200 to
-                // the client — every failure here is pre-wire (the
-                // request hasn't been forwarded yet, only the upgrade
-                // handshake intent has been computed). Use the
-                // setup-phase classifier so a tokio-tungstenite TLS
-                // handshake error surfaces as `TlsError` (pre-wire) and
-                // `request_reached_wire == false`, instead of
-                // `ConnectionReset` (post-wire) which would mislabel the
-                // failure in transaction logs and skip
-                // `retry_on_connect_failure`.
+                // `connect_websocket_backend` covers more than TCP+TLS setup:
+                // `connect_async_tls_with_config` ALSO sends the WebSocket
+                // upgrade request and reads the backend's response. A failure
+                // here can be either pre-wire (DNS / TCP connect / TLS
+                // handshake — request bytes never crossed) or post-wire (the
+                // backend received the upgrade request and rejected it with a
+                // protocol error / non-101 response). Use the setup-phase
+                // classifier so handshake-time rustls errors stay pre-wire
+                // (`TlsError`), then gate the retry decision and the
+                // circuit-breaker connect-flag on the unified
+                // `request_reached_wire` boundary so genuinely post-wire
+                // failures (ProtocolError, RequestError surfaced from
+                // tungstenite::Error::Http / Protocol) do NOT replay under
+                // `retry_on_connect_failure` and do NOT charge passive
+                // health as a connect-class failure.
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
+                let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
 
-                // Check if we should retry this connection failure
+                // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
+                // handshake / port exhaustion). A backend that got the
+                // upgrade request and chose to reject it must not be
+                // retried under retry_on_connect_failure — that bypasses
+                // retry_on_methods and would also lie in transaction logs.
                 let should_retry_ws = if let Some(retry_config) = &proxy.retry {
-                    ws_attempt < retry_config.max_retries && retry_config.retry_on_connect_failure
+                    ws_attempt < retry_config.max_retries
+                        && retry_config.retry_on_connect_failure
+                        && ws_is_pre_wire
                 } else {
                     false
                 };
@@ -3131,7 +3143,16 @@ async fn handle_websocket_request_authenticated(
                         }
                     };
 
-                    // Record circuit breaker failure for current target
+                    // Record circuit breaker failure for current target.
+                    // The second argument is the "is_connect_error" flag
+                    // that drives passive-health connect-class accounting
+                    // — pass `ws_is_pre_wire` so a backend-side upgrade
+                    // rejection (post-wire) doesn't charge the breaker as
+                    // a connect failure. (We're inside the
+                    // `should_retry_ws` branch so `ws_is_pre_wire == true`
+                    // here by construction, but using the same predicate
+                    // value keeps the invariant readable and survives a
+                    // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb_key = current_target
                             .as_ref()
@@ -3141,7 +3162,7 @@ async fn handle_websocket_request_authenticated(
                             cb_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, ws_is_pre_wire);
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
@@ -3187,11 +3208,17 @@ async fn handle_websocket_request_authenticated(
                     continue;
                 }
 
-                // No retry — return error
+                // No retry — return error. Use the unified
+                // `error_class_log_kind` so the `error_kind` field matches
+                // the per-protocol log labels emitted everywhere else
+                // (operators grep one set of strings); a backend that
+                // rejected the upgrade will now log
+                // `error_kind=protocol_error` or `request_error` rather
+                // than the misleading hardcoded `connect_failure`.
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %current_backend_url,
-                    error_kind = "connect_failure",
+                    error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,
                     "WebSocket backend connection failed"

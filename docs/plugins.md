@@ -891,7 +891,7 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 5011.85,
   "request_user_agent": "Mozilla/5.0",
-  "error_class": "ConnectionFailed",
+  "error_class": "connection_refused",
   "metadata": {"rejection_phase": "websocket_backend_error"}
 }
 ```
@@ -951,13 +951,13 @@ Rejected requests have `backend_target_url: null` (no backend was contacted), la
   "proxy_name": "tcp-database",
   "client_ip": "10.0.1.80",
   "backend_target": "db-primary.internal:5432",
-  "protocol": "tcp_tls",
+  "protocol": "tcps",
   "listen_port": 5432,
   "duration_ms": 5002.0,
   "bytes_sent": 0,
   "bytes_received": 0,
   "connection_error": "DNS resolution failed for db-primary.internal: NXDOMAIN",
-  "error_class": "ConnectionTimeout",
+  "error_class": "dns_lookup_error",
   "timestamp_connected": "2026-03-31T14:24:00.000+00:00",
   "timestamp_disconnected": "2026-03-31T14:24:05.002+00:00"
 }

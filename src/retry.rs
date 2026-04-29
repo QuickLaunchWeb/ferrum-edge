@@ -336,6 +336,15 @@ fn classify_typed_chain(
                     return Some(ErrorClass::GracefulRemoteClose);
                 }
                 WsError::Protocol(_) => return Some(ErrorClass::ProtocolError),
+                // The backend received the upgrade request and responded
+                // with a non-101/200 HTTP response (4xx/5xx). Post-wire by
+                // definition — the request crossed to the backend's
+                // application layer. Classify as `RequestError` so
+                // `request_reached_wire == true` and
+                // `retry_on_connect_failure` does NOT replay the upgrade
+                // (otherwise a 4xx upgrade rejection would loop forever
+                // until max_retries is exhausted).
+                WsError::Http(_) => return Some(ErrorClass::RequestError),
                 // Other variants wrap typed sources — keep walking.
                 _ => {}
             }

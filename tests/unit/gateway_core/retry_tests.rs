@@ -861,6 +861,37 @@ fn test_classify_boxed_error_ws_protocol_error_is_protocol_class() {
     assert_eq!(classify_boxed_error(&*err), ErrorClass::ProtocolError);
 }
 
+#[test]
+fn test_classify_boxed_error_ws_http_response_is_post_wire_request_error() {
+    // The backend received the upgrade request and replied with a non-101
+    // response (e.g., 401, 403, 404). Post-wire by definition — request
+    // bytes already crossed to the backend's application layer. Classify
+    // as RequestError so request_reached_wire == true and the
+    // retry-on-connect-failure path does NOT loop forever replaying an
+    // upgrade the backend already rejected.
+    let response = http::Response::builder()
+        .status(401)
+        .body(None)
+        .expect("valid http response");
+    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(
+        tokio_tungstenite::tungstenite::Error::Http(Box::new(response)),
+    );
+    let class = classify_boxed_error(&*err);
+    assert_eq!(class, ErrorClass::RequestError);
+    assert!(
+        ferrum_edge::retry::request_reached_wire(class),
+        "WS upgrade rejection (HTTP response from backend) must be post-wire"
+    );
+    // Setup-phase classifier MUST also keep this post-wire — the WSS dial
+    // path uses classify_boxed_setup_error, but a backend-side upgrade
+    // rejection is post-wire regardless of phase.
+    let setup_class = classify_boxed_setup_error(&*err);
+    assert!(
+        ferrum_edge::retry::request_reached_wire(setup_class),
+        "even via setup classifier, WS Http response is post-wire"
+    );
+}
+
 // --- Typed rustls and io::Error walks (tightened typed-first classification) ---
 
 #[test]
