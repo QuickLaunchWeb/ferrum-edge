@@ -5366,6 +5366,14 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    if let Some(error_body) =
+        check_host_authority_consistency(req.headers(), req.uri(), req.version())
+    {
+        warn!("Rejected request: {}", error_body);
+        record_request(&state, 400);
+        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
+    }
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     // TRACE echoes request headers (including cookies and auth tokens) in the
     // response body, which can be exploited to steal credentials.
@@ -5512,14 +5520,7 @@ async fn handle_proxy_request_inner(
     let request_host: Option<String> = ctx
         .raw_header_get("host")
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
-            // DNS treats "example.com." and "example.com" as identical, so routing
-            // must normalize to prevent host-matching bypasses.
-            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
-            normalized.to_lowercase()
-        });
+        .and_then(normalize_request_host_for_routing);
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
@@ -9037,6 +9038,107 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('@') {
+        return None;
+    }
+
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        let host = &value[..=end];
+        let suffix = &value[end + 1..];
+        if suffix.is_empty() {
+            return Some((host, None));
+        }
+        if let Some(port) = suffix.strip_prefix(':')
+            && !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Some((host, Some(port)));
+        }
+        return None;
+    }
+
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            if !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                Some((host, Some(port)))
+            } else {
+                None
+            }
+        }
+        _ => Some((value, None)),
+    }
+}
+
+fn normalize_authority_host(host: &str) -> String {
+    let normalized = host.strip_suffix('.').unwrap_or(host);
+    normalized.to_ascii_lowercase()
+}
+
+/// Normalize a Host/authority value for host-based routing.
+///
+/// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
+/// DNS trailing dots, and lowercases ASCII hostnames. Invalid authority syntax
+/// returns `None` so callers can avoid routing on ambiguous host data.
+pub fn normalize_request_host_for_routing(value: &str) -> Option<String> {
+    split_request_authority(value).map(|(host, _)| normalize_authority_host(host))
+}
+
+fn normalize_authority_for_consistency(value: &str) -> Option<String> {
+    split_request_authority(value).map(|(host, port)| match port {
+        Some(port) => {
+            let mut normalized = normalize_authority_host(host);
+            normalized.push(':');
+            normalized.push_str(port);
+            normalized
+        }
+        None => normalize_authority_host(host),
+    })
+}
+
+/// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
+///
+/// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
+/// RFC 9114 says that if both are present, they must contain the same value.
+/// Rejecting disagreement here prevents routing/plugin decisions from keying on
+/// one authority while a backend sees another during H2/H3-to-H1 translation.
+pub fn check_host_authority_consistency(
+    headers: &hyper::HeaderMap,
+    uri: &hyper::Uri,
+    version: hyper::Version,
+) -> Option<&'static str> {
+    if version != hyper::Version::HTTP_2 && version != hyper::Version::HTTP_3 {
+        return None;
+    }
+
+    let mut host_values = headers.get_all("host").iter();
+    let host = host_values.next();
+    if host_values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+    }
+
+    let host = host?;
+    let Ok(host) = host.to_str() else {
+        return Some(r#"{"error":"Host header contains invalid characters"}"#);
+    };
+    let Some(host) = normalize_authority_for_consistency(host) else {
+        return Some(r#"{"error":"Host header contains invalid authority"}"#);
+    };
+
+    if let Some(authority) = uri.authority() {
+        let Some(authority) = normalize_authority_for_consistency(authority.as_str()) else {
+            return Some(r#"{"error":"Request authority contains invalid authority"}"#);
+        };
+        if host != authority {
+            return Some(r#"{"error":"Host header and request authority disagree"}"#);
+        }
+    }
+
+    None
+}
+
 /// Validate protocol-level header constraints to block smuggling and desync attacks.
 ///
 /// Returns an error message string if the request violates protocol rules, `None` if valid.
@@ -9137,10 +9239,15 @@ pub fn check_protocol_headers(
             if let Ok(te_str) = te_val.to_str() {
                 for token in te_str.split(',') {
                     let trimmed = token.trim();
-                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
+                    if trimmed.is_empty() {
+                        return Some(r#"{"error":"TE header contains invalid empty value"}"#);
+                    }
+                    if !trimmed.eq_ignore_ascii_case("trailers") {
                         return Some(r#"{"error":"TE header must be 'trailers' or absent"}"#);
                     }
                 }
+            } else {
+                return Some(r#"{"error":"TE header contains invalid characters"}"#);
             }
         }
     }

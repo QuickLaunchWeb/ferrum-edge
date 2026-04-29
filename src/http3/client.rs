@@ -12,10 +12,11 @@
 //! for H3 backend targets and the H3 frontend server (`http3/server.rs`).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -290,6 +291,69 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 /// Type alias for the h3 client request stream (bidirectional).
 pub type H3RequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+
+async fn timeout_backend_connect<F>(
+    future: F,
+    connect_timeout: Duration,
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+    phase: &str,
+) -> Result<quinn::Connection, anyhow::Error>
+where
+    F: Future<Output = Result<quinn::Connection, quinn::ConnectionError>>,
+{
+    tokio::time::timeout(connect_timeout, future)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "HTTP/3 backend connect timeout after {}ms during {} to {}:{} for proxy {}",
+                proxy.backend_connect_timeout_ms,
+                phase,
+                host,
+                port,
+                proxy.id
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("{} connection failed: {}", phase, e))
+}
+
+async fn timeout_backend_handshake<F, D>(
+    future: F,
+    connect_started: Instant,
+    connect_timeout: Duration,
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+    phase: &str,
+) -> Result<(D, H3SendRequest), anyhow::Error>
+where
+    F: Future<Output = Result<(D, H3SendRequest), h3::error::ConnectionError>>,
+{
+    let remaining = connect_timeout.checked_sub(connect_started.elapsed()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "HTTP/3 backend connect timeout before {} handshake completed to {}:{} for proxy {}",
+            phase,
+            host,
+            port,
+            proxy.id
+        )
+    })?;
+
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "HTTP/3 backend connect timeout after {}ms during {} handshake to {}:{} for proxy {}",
+                proxy.backend_connect_timeout_ms,
+                phase,
+                host,
+                port,
+                proxy.id
+            )
+        })?
+        .map_err(|e| anyhow::anyhow!("{} handshake failed: {}", phase, e))
+}
 
 /// Error returned by [`Http3ConnectionPool`] when an HTTP/3 request fails.
 ///
@@ -1101,13 +1165,23 @@ impl Http3ConnectionPool {
             host, port, addr
         );
 
-        let connection = endpoint
-            .connect_with(client_config, addr, host)?
-            .await
-            .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let connect_started = Instant::now();
+        let connecting = endpoint.connect_with(client_config, addr, host)?;
+        let connection =
+            timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
 
-        let (mut driver, send_request) =
-            h3::client::new(h3_quinn::Connection::new(connection)).await?;
+        let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
+        let (mut driver, send_request) = timeout_backend_handshake(
+            h3_handshake,
+            connect_started,
+            connect_timeout,
+            proxy,
+            host,
+            port,
+            "HTTP/3",
+        )
+        .await?;
 
         tokio::spawn(async move {
             let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -1175,13 +1249,23 @@ impl Http3ConnectionPool {
             host, port, addr
         );
 
-        let connection = endpoint
-            .connect_with(client_config, addr, host)?
-            .await
-            .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let connect_started = Instant::now();
+        let connecting = endpoint.connect_with(client_config, addr, host)?;
+        let connection =
+            timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
 
-        let (mut driver, send_request) =
-            h3::client::new(h3_quinn::Connection::new(connection)).await?;
+        let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
+        let (mut driver, send_request) = timeout_backend_handshake(
+            h3_handshake,
+            connect_started,
+            connect_timeout,
+            proxy,
+            host,
+            port,
+            "HTTP/3",
+        )
+        .await?;
 
         tokio::spawn(async move {
             let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;

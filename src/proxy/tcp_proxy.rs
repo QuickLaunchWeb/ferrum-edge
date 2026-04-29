@@ -1810,6 +1810,7 @@ async fn connect_backend_tls_cached(
     tcp_fastopen: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
+    let connect_started = Instant::now();
     let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
 
     let tls_config = cached_tls
@@ -1822,9 +1823,24 @@ async fn connect_backend_tls_cached(
 
     // Prefix is a shared constant so `pre_copy_disconnect_cause` can detect
     // "backend TLS side" without drifting from the wording here.
-    let tls_stream = connector
-        .connect(server_name, tcp_stream)
+    let remaining = connect_timeout
+        .checked_sub(connect_started.elapsed())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Backend connect timeout to {} before TLS handshake completed",
+                addr
+            )
+        })?;
+
+    let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp_stream))
         .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Backend TLS handshake timeout after {}ms to {}",
+                connect_timeout.as_millis(),
+                addr
+            )
+        })?
         .map_err(|e| {
             anyhow::anyhow!(
                 "{} to {}: {}",

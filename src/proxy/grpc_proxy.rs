@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -424,6 +424,7 @@ impl GrpcPoolManager {
         let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
         let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let connect_started = Instant::now();
 
         // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
         // before connect() so the kernel can co-select ephemeral ports.
@@ -471,10 +472,35 @@ impl GrpcPoolManager {
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
         if use_tls {
-            self.create_tls_connection(tcp, host, proxy, &pool_config)
-                .await
+            self.create_tls_connection(
+                tcp,
+                host,
+                proxy,
+                &pool_config,
+                connect_started,
+                connect_timeout,
+            )
+            .await
         } else {
-            self.create_h2c_connection(tcp, &pool_config).await
+            self.create_h2c_connection(tcp, &pool_config, proxy, connect_started, connect_timeout)
+                .await
+        }
+    }
+
+    fn remaining_connect_timeout(
+        connect_started: Instant,
+        connect_timeout: Duration,
+    ) -> Option<Duration> {
+        connect_timeout.checked_sub(connect_started.elapsed())
+    }
+
+    fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> GrpcProxyError {
+        GrpcProxyError::BackendTimeout {
+            kind: GrpcTimeoutKind::Connect,
+            message: format!(
+                "Connect timeout after {}ms during {} to {}:{}",
+                proxy.backend_connect_timeout_ms, phase, proxy.backend_host, proxy.backend_port
+            ),
         }
     }
 
@@ -535,13 +561,24 @@ impl GrpcPoolManager {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
+        proxy: &Proxy,
+        connect_started: Instant,
+        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("h2c handshake failed: {}", e))
-        })?;
+        let Some(remaining) = Self::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "h2c handshake"));
+        };
+
+        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2c handshake"))?
+            .map_err(|e| {
+                GrpcProxyError::BackendUnavailable(format!("h2c handshake failed: {}", e))
+            })?;
 
         // Spawn the connection driver
         tokio::spawn(async move {
@@ -560,6 +597,8 @@ impl GrpcPoolManager {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
+        connect_started: Instant,
+        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
@@ -570,16 +609,32 @@ impl GrpcPoolManager {
             GrpcProxyError::BackendUnavailable(format!("Invalid server name: {}", e))
         })?;
 
-        let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("TLS handshake failed: {}", e))
-        })?;
+        let Some(remaining) = Self::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
+        };
+
+        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "TLS handshake"))?
+            .map_err(|e| {
+                GrpcProxyError::BackendUnavailable(format!("TLS handshake failed: {}", e))
+            })?;
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            GrpcProxyError::BackendUnavailable(format!("h2 handshake failed: {}", e))
-        })?;
+        let Some(remaining) = Self::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "h2 handshake"));
+        };
+
+        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2 handshake"))?
+            .map_err(|e| {
+                GrpcProxyError::BackendUnavailable(format!("h2 handshake failed: {}", e))
+            })?;
 
         // Spawn the connection driver
         tokio::spawn(async move {
