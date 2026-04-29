@@ -58,6 +58,10 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
   "active_requests": 3891,
   "red_drop_probability_pct": 0.0,
   "port_exhaustion_events": 0,
+  "stream_listeners": {
+    "dtls_demux_sessions_total": 0,
+    "dtls_demux_sessions": []
+  },
   "pressure": {
     "file_descriptors": {
       "current": 1247,
@@ -97,6 +101,20 @@ The `port_exhaustion_events` counter in the `/overload` response is a monotonic 
 - Reduce max idle connections per host: `FERRUM_POOL_MAX_IDLE_PER_HOST=16`
 
 All port exhaustion events are also logged at `error` level with the message prefix `PORT EXHAUSTION` and include remediation guidance.
+
+## DTLS Pre-Handshake Monitoring
+
+The `/overload.stream_listeners.dtls_demux_sessions_total` field reports the
+number of frontend DTLS peers currently tracked by stream listeners, including
+peers that have not finished the DTLS handshake yet. A non-zero or rising value
+with dropped UDP+DTLS traffic usually means clients are slow to complete
+handshakes or a spoofed/high-cardinality ClientHello spray is filling the
+pre-handshake cap.
+
+Mitigation knobs:
+- `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
+- `FERRUM_UDP_MAX_SESSIONS` caps total UDP/DTLS sessions per proxy, including DTLS peers still in handshake.
+- Overload critical mode rejects new DTLS demux state before per-peer channels/tasks are allocated.
 
 ## Platform Support
 

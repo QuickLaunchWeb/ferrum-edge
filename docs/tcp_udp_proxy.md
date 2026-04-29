@@ -248,7 +248,8 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 
 - DTLS uses ECDSA P-256 or Ed25519 certificates only (RSA is not supported by the underlying DTLS library)
 - Each UDP client session gets its own DTLS connection to the backend
-- DTLS handshake occurs when the first datagram arrives from a new client
+- Frontend DTLS allocates demux state when the first datagram arrives from a new client, before the session is accepted by the UDP proxy
+- Pre-handshake DTLS demux state is capped by `FERRUM_UDP_MAX_SESSIONS` and released on `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`
 - The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP
 - Frontend DTLS uses separate certificates from TLS (set via `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`)
 - Frontend DTLS mTLS uses a separate trust store from TCP TLS mTLS (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` vs `FERRUM_TLS_CLIENT_CA_CERT_PATH`)
@@ -413,6 +414,7 @@ Notes:
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_TLS_CLIENT_CA_CERT_PATH` used for TCP. |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
