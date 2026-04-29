@@ -684,7 +684,24 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome.
 
-**`error_class` values:** `ConnectionFailed`, `Timeout`, `BadGateway`, `ServiceUnavailable`. Only set when the gateway itself could not communicate with the backend. Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.
+**`error_class` values** (serialized as `snake_case` strings — see [docs/error_classification.md](error_classification.md) for the canonical taxonomy and per-protocol semantics):
+
+- `connection_refused` — TCP connect refused / firewall RST during connect
+- `connection_timeout` — TCP connect did not complete before the timeout
+- `connection_reset` — mid-stream RST received after the connection was established (post-wire)
+- `connection_closed` — peer FIN / broken pipe / aborted connection (post-wire)
+- `dns_lookup_error` — backend hostname could not be resolved
+- `tls_error` — TLS or DTLS handshake failed (certificate, ALPN, alert)
+- `read_write_timeout` — backend read or write exceeded the configured watermark
+- `protocol_error` — HTTP/2 or HTTP/3 protocol-level error after a stream is opened (RST_STREAM, GOAWAY, RFC 6455 WS protocol violation)
+- `response_body_too_large` / `request_body_too_large` — body exceeded the configured maximum
+- `connection_pool_error` — could not acquire/create an HTTP client from the pool
+- `port_exhaustion` — EADDRNOTAVAIL — all ephemeral ports in use
+- `client_disconnect` — client gave up before the gateway could complete the response
+- `graceful_remote_close` — peer closed cleanly (HTTP/3 `H3_NO_ERROR`, RFC 6455 Close frame); informational, not a transport failure
+- `request_error` — catch-all for unclassified gateway-side rejections
+
+Only set when the gateway itself could not communicate with the backend (or when a streaming body fails after headers — that goes on `body_error_class`). Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.
 
 #### StreamTransactionSummary Fields (TCP / UDP / DTLS)
 

@@ -4,7 +4,7 @@ use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
 use ferrum_edge::proxy::grpc_proxy::{GrpcProxyError, GrpcTimeoutKind};
 use ferrum_edge::retry::{
     BackendResponse, ErrorClass, ResponseBody, classify_body_error, classify_boxed_error,
-    classify_grpc_proxy_error, retry_delay, should_retry,
+    classify_boxed_setup_error, classify_grpc_proxy_error, retry_delay, should_retry,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -933,6 +933,56 @@ fn test_classify_reqwest_setup_phase_rustls_is_pre_wire_via_typed_kinds() {
         "setup-phase TLS handshake failure must remain pre-wire so \
          retry_on_connect_failure can replay safely"
     );
+}
+
+#[test]
+fn test_classify_boxed_setup_error_keeps_rustls_as_tls_error_pre_wire() {
+    // The WSS backend dial path uses `classify_boxed_setup_error` because
+    // every failure there is pre-wire (the gateway hasn't sent 101/200 to
+    // the client yet). A tokio-tungstenite TLS handshake failure surfaces
+    // through that path with a rustls::Error in the source chain — it
+    // MUST classify as TlsError (pre-wire), NOT ConnectionReset (which
+    // post-connect callers get from the same rustls error).
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(rustls::Error::HandshakeNotComplete);
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(class, ErrorClass::TlsError);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "setup-phase rustls error must be pre-wire"
+    );
+}
+
+#[test]
+fn test_substring_fallback_matches_capitalized_os_wording() {
+    // Several stream paths stringify io::Error before classifying (TCP
+    // fast-path copy errors, UDP backend recv/send errors). The OS wording
+    // from `io::Error::Display` is capitalized — `Connection reset by peer`,
+    // `Broken pipe`, `Connection aborted`. The substring fallback must
+    // recognize both lowercase application wording AND the capitalized
+    // OS wording so stringified errors don't fall through to RequestError.
+    for (msg, want) in [
+        (
+            "Connection reset by peer (os error 54)",
+            ErrorClass::ConnectionReset,
+        ),
+        (
+            "Connection reset by peer (os error 104)",
+            ErrorClass::ConnectionReset,
+        ),
+        ("Broken pipe (os error 32)", ErrorClass::ConnectionClosed),
+        (
+            "Connection aborted (os error 53)",
+            ErrorClass::ConnectionClosed,
+        ),
+    ] {
+        let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+        assert_eq!(
+            classify_boxed_error(&*err),
+            want,
+            "stringified OS wording {msg:?} must classify as {want:?} via the substring fallback"
+        );
+    }
 }
 
 #[test]

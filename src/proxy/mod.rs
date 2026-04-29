@@ -3095,7 +3095,17 @@ async fn handle_websocket_request_authenticated(
         {
             Ok(stream) => break stream,
             Err(e) => {
-                let ws_error_class = retry::classify_boxed_error(e.as_ref());
+                // WSS backend dial runs BEFORE the gateway sends 101/200 to
+                // the client — every failure here is pre-wire (the
+                // request hasn't been forwarded yet, only the upgrade
+                // handshake intent has been computed). Use the
+                // setup-phase classifier so a tokio-tungstenite TLS
+                // handshake error surfaces as `TlsError` (pre-wire) and
+                // `request_reached_wire == false`, instead of
+                // `ConnectionReset` (post-wire) which would mislabel the
+                // failure in transaction logs and skip
+                // `retry_on_connect_failure`.
+                let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
 
                 // Check if we should retry this connection failure

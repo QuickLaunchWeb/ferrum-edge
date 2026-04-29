@@ -463,16 +463,30 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     }
     // Reset / broken pipe — typed io::Error already caught these in the
     // typed walk; the substrings here only fire for stringified errors
-    // (plain `String` boxed as `dyn Error`, etc.). Anchored multi-word
-    // phrases avoid the historical false-positive matches where a bare
-    // `"reset"` substring caught unrelated wording (`"reset_stream"`,
-    // `"upstream"`).
-    if error_str.contains("connection reset") || debug_str.contains("ConnectionReset") {
+    // (plain `String` boxed as `dyn Error`, plus any call site that did
+    // `e.to_string()` before reaching the classifier — TCP fast-path
+    // copy errors and UDP backend recv/send errors stringify their
+    // io::Error before classifying). Anchored multi-word phrases avoid
+    // the historical false-positive matches where a bare `"reset"`
+    // substring caught unrelated wording (`"reset_stream"`, `"upstream"`).
+    //
+    // Match BOTH lowercase application wording and the capitalized OS
+    // wording that `io::Error::Display` emits — `Connection reset by peer`,
+    // `Broken pipe`, etc. (capital first letter from libc's `strerror`).
+    // Without the capitalized variants, stringified IO errors miss the
+    // typed walk and fall through to `RequestError`.
+    if error_str.contains("connection reset")
+        || error_str.contains("Connection reset")
+        || debug_str.contains("ConnectionReset")
+    {
         return Some(ErrorClass::ConnectionReset);
     }
     if error_str.contains("broken pipe")
+        || error_str.contains("Broken pipe")
         || error_str.contains("connection closed")
+        || error_str.contains("Connection aborted")
         || debug_str.contains("BrokenPipe")
+        || debug_str.contains("ConnectionAborted")
     {
         return Some(ErrorClass::ConnectionClosed);
     }
@@ -496,9 +510,35 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
 pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> ErrorClass {
     // phase_is_connect=false: callers of classify_boxed_error are typically
     // post-connect (WebSocket session, TCP relay mid-stream); pre-wire
-    // callers go through classify_reqwest_error::is_connect() which sets the
-    // flag explicitly.
-    if let Some(class) = classify_typed_chain(Some(e), false) {
+    // callers go through `classify_boxed_setup_error` (below) or
+    // `classify_reqwest_error::is_connect()` which set the flag explicitly.
+    classify_boxed_with_phase(e, false)
+}
+
+/// Classify a boxed setup-phase error (`phase_is_connect = true`).
+///
+/// Use this from contexts where the error is known to be pre-wire — the
+/// connect / TLS handshake / ALPN negotiation hasn't completed and request
+/// bytes have not crossed to the backend's application layer. The
+/// canonical use is the WebSocket backend dial path
+/// ([`crate::proxy::connect_websocket_backend`] callers): a TLS handshake
+/// failure there must classify as `TlsError` (pre-wire) rather than
+/// `ConnectionReset` (mid-stream) so `request_reached_wire == false` and
+/// `retry_on_connect_failure` can replay safely.
+///
+/// Falls back to the same anchored substring set as
+/// [`classify_boxed_error`] when the typed walk doesn't pin down a class.
+pub fn classify_boxed_setup_error(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+) -> ErrorClass {
+    classify_boxed_with_phase(e, true)
+}
+
+fn classify_boxed_with_phase(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+    phase_is_connect: bool,
+) -> ErrorClass {
+    if let Some(class) = classify_typed_chain(Some(e), phase_is_connect) {
         return class;
     }
     let error_str = format!("{}", e);
