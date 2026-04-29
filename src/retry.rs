@@ -345,7 +345,48 @@ fn classify_typed_chain(
                 // (otherwise a 4xx upgrade rejection would loop forever
                 // until max_retries is exhausted).
                 WsError::Http(_) => return Some(ErrorClass::RequestError),
-                // Other variants wrap typed sources — keep walking.
+                // tokio-tungstenite's `connect_async_tls_with_config`
+                // writes and flushes the backend Upgrade request BEFORE
+                // it starts reading the response. Once we hit an io error
+                // wrapped in `tungstenite::Error::Io`, the request bytes
+                // may already be on the wire — even when the outer
+                // classifier was invoked with `phase_is_connect=true`
+                // (the WSS backend dial path). Without this explicit arm,
+                // walking past WsError::Io into the io::Error arm would
+                // apply the connect-phase override that maps
+                // `ConnectionReset` → `ConnectionRefused` (pre-wire), and
+                // the retry-loop predicate `!request_reached_wire(...)`
+                // would replay the already-sent Upgrade (and the circuit
+                // breaker would charge it as a connect-class failure).
+                //
+                // Conservative resolution: classify the inner io::Error
+                // as if `phase_is_connect=false` so ambiguous kinds stay
+                // post-wire. ECONNREFUSED is the one io kind we can be
+                // confident about — it means the SYN got RST before any
+                // bytes were written, so it's genuinely pre-wire even
+                // through tungstenite. Trade: we lose retry-on-connect
+                // coverage for some genuinely pre-wire errors that
+                // surface as Error::Io(ConnectionReset/TimedOut), but
+                // that's the right side of the safety boundary.
+                WsError::Io(io_err) => {
+                    if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+                        return Some(ErrorClass::PortExhaustion);
+                    }
+                    return Some(match io_err.kind() {
+                        std::io::ErrorKind::ConnectionRefused => ErrorClass::ConnectionRefused,
+                        std::io::ErrorKind::TimedOut => ErrorClass::ReadWriteTimeout,
+                        std::io::ErrorKind::ConnectionReset => ErrorClass::ConnectionReset,
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+                            ErrorClass::ConnectionClosed
+                        }
+                        _ => ErrorClass::RequestError,
+                    });
+                }
+                // Other variants (Tls, Capacity, Utf8, AttackAttempt,
+                // Url, HttpFormat, WriteBufferFull) wrap typed sources we
+                // keep walking for below — Tls in particular surfaces a
+                // rustls::Error in the source chain and the rustls arm
+                // handles phase gating.
                 _ => {}
             }
         }

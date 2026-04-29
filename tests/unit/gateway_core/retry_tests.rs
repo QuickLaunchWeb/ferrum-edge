@@ -862,6 +862,58 @@ fn test_classify_boxed_error_ws_protocol_error_is_protocol_class() {
 }
 
 #[test]
+fn test_classify_boxed_setup_error_ws_io_reset_stays_post_wire() {
+    // Regression for the WSS handshake-reset hazard: tokio-tungstenite's
+    // `connect_async_tls_with_config` writes and flushes the Upgrade
+    // request BEFORE reading the response. If the backend RSTs the
+    // connection after receiving the request but before sending a 101,
+    // the failure surfaces as `tungstenite::Error::Io(ConnectionReset)`.
+    //
+    // The hazard: with phase_is_connect=true (WSS dial uses
+    // classify_boxed_setup_error), the io::Error walker would override
+    // ConnectionReset → ConnectionRefused (pre-wire) per the standard
+    // connect-phase RST rule. The WS retry predicate
+    // `!request_reached_wire(...)` would then return true and
+    // retry_on_connect_failure would replay the already-sent upgrade.
+    // The explicit `WsError::Io` arm in the typed walker keeps the
+    // io::Error::ConnectionReset → ConnectionReset (post-wire) mapping
+    // even when invoked from the setup classifier.
+    let io_reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(tokio_tungstenite::tungstenite::Error::Io(io_reset));
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(
+        class,
+        ErrorClass::ConnectionReset,
+        "tungstenite Io(ConnectionReset) must stay post-wire even via the setup classifier"
+    );
+    assert!(
+        ferrum_edge::retry::request_reached_wire(class),
+        "WS handshake-read reset must be post-wire so retry_on_connect_failure \
+         doesn't replay the already-sent Upgrade"
+    );
+}
+
+#[test]
+fn test_classify_boxed_setup_error_ws_io_econnrefused_stays_pre_wire() {
+    // Counterpart to the reset test: a genuine ECONNREFUSED on initial
+    // TCP connect (SYN got RST before any bytes were written) is still
+    // pre-wire and should stay retryable as a connect failure. tungstenite
+    // wraps this as Error::Io too, but the io::ErrorKind unambiguously
+    // identifies the case.
+    let io_refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(tokio_tungstenite::tungstenite::Error::Io(io_refused));
+    let class = classify_boxed_setup_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionRefused);
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "ECONNREFUSED on initial connect must remain pre-wire \
+         so retry_on_connect_failure can replay safely"
+    );
+}
+
+#[test]
 fn test_classify_boxed_error_ws_http_response_is_post_wire_request_error() {
     // The backend received the upgrade request and replied with a non-101
     // response (e.g., 401, 403, 404). Post-wire by definition — request
