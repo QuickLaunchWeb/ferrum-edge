@@ -457,9 +457,9 @@ impl LoadTestHarness {
             .env("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS", "1000")
             // HTTP/3 (QUIC) transport tuning
             .env("FERRUM_HTTP3_MAX_STREAMS", "1000")
-            .env("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW", "16777216")
-            .env("FERRUM_HTTP3_RECEIVE_WINDOW", "134217728")
-            .env("FERRUM_HTTP3_SEND_WINDOW", "67108864")
+            .env("FERRUM_HTTP3_STREAM_RECEIVE_WINDOW", "8388608")
+            .env("FERRUM_HTTP3_RECEIVE_WINDOW", "33554432")
+            .env("FERRUM_HTTP3_SEND_WINDOW", "8388608")
             .env("FERRUM_LOG_LEVEL", "error")
             .spawn()?;
 

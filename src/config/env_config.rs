@@ -483,14 +483,14 @@ pub struct EnvConfig {
     pub http3_idle_timeout: u64,
     /// HTTP/3 max concurrent streams (default: 1000)
     pub http3_max_streams: u32,
-    /// HTTP/3 per-stream receive window in bytes (default: 16 MiB).
+    /// HTTP/3 per-stream receive window in bytes (default: 8 MiB).
     /// Controls how much data a peer can send on a single QUIC stream
     /// before the receiver must send a flow-control credit update.
     pub http3_stream_receive_window: u64,
-    /// HTTP/3 connection-level receive window in bytes (default: 128 MiB).
+    /// HTTP/3 connection-level receive window in bytes (default: 32 MiB).
     /// Aggregate budget shared across all concurrent streams on one QUIC connection.
     pub http3_receive_window: u64,
-    /// HTTP/3 per-connection send window in bytes (default: 64 MiB).
+    /// HTTP/3 per-connection send window in bytes (default: 8 MiB).
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
     pub http3_send_window: u64,
@@ -501,13 +501,13 @@ pub struct EnvConfig {
     /// Connections idle longer than this are evicted from the pool.
     pub http3_pool_idle_timeout_seconds: u64,
     /// Minimum bytes buffered before flushing a coalesced HTTP/3 DATA frame
-    /// on the response streaming path (default: 131_072). Acts as the flush
+    /// on the response streaming path (default: 32_768). Acts as the flush
     /// target — once the buffer reaches this size on chunk arrival, it is
     /// flushed. Clamped to `<= http3_coalesce_max_bytes` at parse time.
     /// Legal range: [1024, http3_coalesce_max_bytes].
     pub http3_coalesce_min_bytes: usize,
     /// Maximum bytes for the HTTP/3 response streaming coalesce buffer
-    /// (default: 131_072). Used as the `BytesMut::with_capacity` initial
+    /// (default: 32_768). Used as the `BytesMut::with_capacity` initial
     /// allocation and as the upper bound that clamps `coalesce_min_bytes`
     /// at parse time. Higher values reduce reallocations for large-backend
     /// responses at the cost of per-stream memory. Legal range:

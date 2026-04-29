@@ -4,20 +4,17 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 
-/// Default HTTP/3 per-stream receive window. Large enough for the 5 MiB
-/// benchmark payloads without per-stream flow-control churn, while the
-/// connection window below remains the aggregate memory governor.
-pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 16 * 1024 * 1024;
+/// Default HTTP/3 per-stream receive window. Larger than quinn's baseline
+/// while keeping the aggregate connection budget modest by default.
+pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
 
-/// Default HTTP/3 connection-level receive window. H3 clients commonly issue
-/// 100+ concurrent streams; the previous 32 MiB cap left the connection-level
-/// window cycling under medium/large payload concurrency. This aggregate
-/// connection budget bounds the sum of active per-stream receive windows.
-pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 128 * 1024 * 1024;
+/// Default HTTP/3 connection-level receive window. This aggregate connection
+/// budget bounds the sum of active per-stream receive windows.
+pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 32 * 1024 * 1024;
 
 /// Default HTTP/3 send window. This bounds unacknowledged outbound data per
-/// QUIC connection; 8 MiB was too small for high-concurrency response streams.
-pub const H3_SEND_WINDOW_DEFAULT: u64 = 64 * 1024 * 1024;
+/// QUIC connection.
+pub const H3_SEND_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
 
 /// Largest value encodable as a QUIC variable-length integer.
 pub const QUIC_VARINT_MAX_U64: u64 = (1 << 62) - 1;
@@ -29,7 +26,7 @@ const _: () = assert!(H3_SEND_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
 /// Default value for the H3 response streaming coalesce-buffer initial capacity
 /// and MIN upper bound (when `FERRUM_HTTP3_COALESCE_MAX_BYTES` is unset).
 /// See `FERRUM_HTTP3_COALESCE_MAX_BYTES` for runtime tuning.
-pub const H3_COALESCE_MAX_DEFAULT: usize = 131_072;
+pub const H3_COALESCE_MAX_DEFAULT: usize = 32_768;
 
 /// Absolute upper bound operators may set via `FERRUM_HTTP3_COALESCE_MAX_BYTES`.
 /// Bounds per-stream memory regardless of configuration.
@@ -105,19 +102,19 @@ pub struct Http3ServerConfig {
     /// Per-stream receive window in bytes.
     /// Controls how much data a peer can send on a single stream before
     /// the receiver must send a flow-control credit update.
-    /// Default: 16 MiB (16_777_216).
+    /// Default: 8 MiB (8_388_608).
     pub stream_receive_window: u64,
 
     /// Connection-level receive window in bytes.
     /// Aggregate budget shared across all concurrent streams.
     /// Should be ≥ stream_receive_window × expected_concurrency.
-    /// Default: 128 MiB (134_217_728).
+    /// Default: 32 MiB (33_554_432).
     pub receive_window: u64,
 
     /// Per-connection send window in bytes.
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
-    /// Default: 64 MiB (67_108_864).
+    /// Default: 8 MiB (8_388_608).
     pub send_window: u64,
 
     /// Initial QUIC path MTU in bytes (`TransportConfig::initial_mtu`).
