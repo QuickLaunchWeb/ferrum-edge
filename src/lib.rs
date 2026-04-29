@@ -43,7 +43,7 @@ pub mod tls;
 pub mod tls_offload;
 
 pub use admin::api_specs::ExtractedBundle;
-pub use admin::spec_codec::{compress_gzip, decompress_gzip, sha256_hex};
+pub use admin::spec_codec::{compress_gzip, decompress_gzip_capped, sha256_hex};
 pub use config::types::{
     ApiSpec, AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
     Proxy, SpecFormat,

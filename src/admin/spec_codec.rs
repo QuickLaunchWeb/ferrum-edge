@@ -22,21 +22,6 @@ pub fn compress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// Decompress gzip-compressed `input` bytes.
-///
-/// Returns the original uncompressed bytes. Used when the admin API needs
-/// to serve the raw spec to a client (e.g., `GET /api-specs/:id/raw`).
-///
-/// No output cap is applied; callers that wish to guard against corrupt or
-/// adversarially crafted entries (e.g. a bomb ratio row from the DB) should
-/// use [`decompress_gzip_capped`] instead.
-pub fn decompress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut decoder = GzDecoder::new(input);
-    let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
 /// Decompress gzip-compressed `input` bytes, returning an error if the
 /// decompressed output would exceed `max_output` bytes.
 ///
@@ -73,13 +58,17 @@ pub fn sha256_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compress_gzip, decompress_gzip, decompress_gzip_capped, sha256_hex};
+    use super::{compress_gzip, decompress_gzip_capped, sha256_hex};
+
+    /// Generous cap for round-trip tests — comfortably above any test input below.
+    const TEST_DECOMPRESS_CAP: usize = 16 * 1024 * 1024;
 
     #[test]
     fn roundtrip_preserves_bytes() {
         let input = b"hello, ferrum-edge spec!";
         let compressed = compress_gzip(input).expect("compress failed");
-        let decompressed = decompress_gzip(&compressed).expect("decompress failed");
+        let decompressed =
+            decompress_gzip_capped(&compressed, TEST_DECOMPRESS_CAP).expect("decompress failed");
         assert_eq!(decompressed, input);
     }
 
@@ -94,7 +83,8 @@ mod tests {
             })
             .collect();
         let compressed = compress_gzip(&input).expect("compress failed");
-        let decompressed = decompress_gzip(&compressed).expect("decompress failed");
+        let decompressed =
+            decompress_gzip_capped(&compressed, TEST_DECOMPRESS_CAP).expect("decompress failed");
         assert_eq!(decompressed, input);
     }
 
@@ -102,7 +92,8 @@ mod tests {
     fn roundtrip_handles_empty() {
         let input: &[u8] = &[];
         let compressed = compress_gzip(input).expect("compress failed on empty");
-        let decompressed = decompress_gzip(&compressed).expect("decompress failed on empty");
+        let decompressed = decompress_gzip_capped(&compressed, TEST_DECOMPRESS_CAP)
+            .expect("decompress failed on empty");
         assert_eq!(decompressed, input);
     }
 
