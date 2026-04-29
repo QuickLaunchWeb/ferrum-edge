@@ -808,8 +808,8 @@ async fn test_http3_streaming_decision_logic() {
 #[tokio::test]
 async fn test_http3_coalesce_defaults() {
     let env = ferrum_edge::config::EnvConfig::default();
-    assert_eq!(env.http3_coalesce_min_bytes, 32_768);
-    assert_eq!(env.http3_coalesce_max_bytes, 32_768);
+    assert_eq!(env.http3_coalesce_min_bytes, 131_072);
+    assert_eq!(env.http3_coalesce_max_bytes, 131_072);
     assert_eq!(env.http3_flush_interval_micros, 200);
     assert!(
         env.http3_coalesce_min_bytes <= env.http3_coalesce_max_bytes,
