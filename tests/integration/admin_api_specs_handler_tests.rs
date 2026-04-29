@@ -2206,20 +2206,23 @@ async fn put_with_renamed_plugin_gets_new_id() {
         "PUT with renamed plugin must succeed; body: {put_body}"
     );
 
-    // Proxy must still exist.
+    // Proxy must still exist and its id must be unchanged.
     let proxy_after = store
         .get_proxy(&proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy must still exist");
-    // The replace path ran (different resource hash) — proxy.updated_at advances.
-    let proxy_before_updated_at = {
-        // Fetch before-sleep proxy (from the first store state).
-        // We compare timestamps indirectly: if replace ran, updated_at > created_at.
-        proxy_after.updated_at
-    };
-    // At minimum, the proxy survived and its id is unchanged.
     assert_eq!(proxy_after.id, proxy_id);
+
+    // The replace path ran (different resource hash — correlation_id ≠ cors).
+    // updated_at must be >= created_at (the server-side stamp from Fix 1 ensures
+    // this is always true; a stale embedded timestamp would make it go backward).
+    assert!(
+        proxy_after.updated_at >= proxy_after.created_at,
+        "proxy.updated_at ({}) must be >= created_at ({}) after replace",
+        proxy_after.updated_at,
+        proxy_after.created_at
+    );
 }
 
 /// POST a spec with plugin_name "cors" (empty id → gets UUID "pl_x"). PUT with
@@ -2618,4 +2621,495 @@ async fn put_keeps_manually_added_global_plugin_association() {
         "global plugin association must be preserved after PUT; found: {:?}",
         plugin_ids
     );
+}
+
+// ============================================================================
+// Fix 2 — Stream proxy port validation
+// ============================================================================
+
+/// POST a spec with a TCP proxy whose listen_port collides with an already-stored
+/// stream proxy → must return 422 with a "port" error.
+#[tokio::test]
+async fn post_spec_with_stream_proxy_port_collision_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    // Pre-create a stream proxy on port 7777 directly in the DB.
+    let existing_tcp_proxy: Proxy = serde_json::from_value(json!({
+        "id": uid("existing-tcp"),
+        "namespace": "ferrum",
+        "backend_host": "tcp-backend.internal",
+        "backend_port": 9001,
+        "backend_scheme": "tcp",
+        "listen_port": 7777
+    }))
+    .expect("stream proxy deserialization");
+    store
+        .create_proxy(&existing_tcp_proxy)
+        .await
+        .expect("create existing tcp proxy");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // Submit a spec with a different TCP proxy that wants the same port 7777.
+    let proxy_id = uid("tcp-proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Stream port collision test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "other-tcp.internal",
+            "backend_port": 9002,
+            "backend_scheme": "tcp",
+            "listen_port": 7777
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 on stream port collision; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["resource_type"].as_str() == Some("proxy")
+                && f["errors"]
+                    .as_array()
+                    .map(|errs| errs
+                        .iter()
+                        .any(|e| e.as_str().unwrap_or("").contains("7777")))
+                    .unwrap_or(false)),
+        "expected port-collision error in failures; body: {body}"
+    );
+}
+
+/// POST a spec with a TCP proxy on a reserved gateway port → must return 422.
+#[tokio::test]
+async fn post_spec_with_reserved_gateway_port_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    let mut state = make_admin_state(store, 25);
+    // Mark port 9000 as a reserved gateway port (mirrors the admin HTTP port default).
+    state.reserved_ports = std::collections::HashSet::from([9000u16]);
+
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("tcp-reserved");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Reserved port test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "tcp-backend.internal",
+            "backend_port": 9001,
+            "backend_scheme": "tcp",
+            "listen_port": 9000
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 for reserved port; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["resource_type"].as_str() == Some("proxy")),
+        "expected proxy failure for reserved port; body: {body}"
+    );
+}
+
+// ============================================================================
+// Fix 3 — Generic PluginConfig field validation
+// ============================================================================
+
+/// POST a spec with a plugin whose priority_override exceeds the allowed maximum
+/// (10000) → must return 422 with the priority-override error.
+#[tokio::test]
+async fn post_spec_with_plugin_priority_override_too_high_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Priority override test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("plugin"),
+            "plugin_name": "cors",
+            "priority_override": 10001,
+            "config": {}
+        }]
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 for priority_override > 10000; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures.iter().any(|f| {
+            f["resource_type"].as_str() == Some("plugin")
+                && f["errors"]
+                    .as_array()
+                    .map(|errs| {
+                        errs.iter().any(|e| {
+                            let s = e.as_str().unwrap_or("");
+                            s.contains("priority_override") || s.contains("10000")
+                        })
+                    })
+                    .unwrap_or(false)
+        }),
+        "expected priority_override error in plugin failures; body: {body}"
+    );
+}
+
+// ============================================================================
+// Fix 4 — Reject duplicate proxy plugin associations
+// ============================================================================
+
+/// POST a spec where the operator writes the same plugin_config_id twice in
+/// x-ferrum-proxy.plugins → must return 422.
+#[tokio::test]
+async fn post_spec_with_duplicate_proxy_plugin_association_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    // Create a pre-existing proxy-scoped plugin in the DB to reference.
+    let proxy_id = uid("proxy");
+    // First create the proxy so the plugin FK is valid.
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": proxy_id,
+        "namespace": "ferrum",
+        "backend_host": "backend.internal",
+        "backend_port": 443,
+        "listen_path": format!("/{proxy_id}")
+    }))
+    .expect("proxy deserialization");
+    store.create_proxy(&proxy).await.expect("create proxy");
+
+    use ferrum_edge::config::types::PluginConfig;
+    let shared_plugin_id = uid("shared-plugin");
+    let shared_plugin: PluginConfig = serde_json::from_value(json!({
+        "id": shared_plugin_id,
+        "namespace": "ferrum",
+        "plugin_name": "cors",
+        "scope": "proxy_group",
+        "config": {}
+    }))
+    .expect("plugin deserialization");
+    store
+        .create_plugin_config(&shared_plugin)
+        .await
+        .expect("create shared plugin");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // Spec references shared_plugin_id twice in x-ferrum-proxy.plugins.
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Duplicate assoc test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}"),
+            "plugins": [
+                {"plugin_config_id": shared_plugin_id},
+                {"plugin_config_id": shared_plugin_id}
+            ]
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 for duplicate plugin association; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f["resource_type"].as_str() == Some("proxy_plugin_association")),
+        "expected proxy_plugin_association failure; body: {body}"
+    );
+}
+
+// ============================================================================
+// Fix 5 — Canonical plugin matching on PUT
+// ============================================================================
+
+/// PUT with two id-less plugins of the same plugin_name and IDENTICAL configs →
+/// existing IDs are reused in deterministic FIFO order; the resource hash does
+/// not change between identical re-submissions (idempotent).
+#[tokio::test]
+async fn put_with_two_id_less_same_name_plugins_identical_configs_is_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let listen_path = format!("/{proxy_id}");
+
+    // Both plugins have the same plugin_name AND identical config — the
+    // extractor allows multiple proxy-scoped instances of the same plugin.
+    let two_cors_plugins = json!([
+        {"id": "", "plugin_name": "cors", "config": {}},
+        {"id": "", "plugin_name": "cors", "config": {}}
+    ]);
+
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Two identical plugins", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": two_cors_plugins
+    });
+
+    // POST — initial create.
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST: {post_body}"
+    );
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    // Fetch the resource_hash from the spec row via the list endpoint.
+    let (_, list_body) = client.get_json("/api-specs").await;
+    // (resource_hash is intentionally omitted from the list response per spec;
+    //  we verify idempotency via the proxy's updated_at staying the same.)
+
+    // Sleep to make timestamp differences detectable.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    let proxy_before = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist");
+    let updated_at_before = proxy_before.updated_at;
+
+    // PUT with the same spec (identical content → same resource hash → short-circuit).
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "PUT identical spec must succeed; body: {put_body}"
+    );
+
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy after PUT")
+        .expect("proxy must still exist");
+
+    // Short-circuit: no DB write happened, updated_at must not have advanced.
+    assert_eq!(
+        proxy_after.updated_at, updated_at_before,
+        "proxy.updated_at must not advance on idempotent PUT (resource hash unchanged)"
+    );
+
+    // Suppress the unused-variable warning from the list body (used for context).
+    let _ = list_body;
+}
+
+/// PUT with two id-less plugins of the same plugin_name but DIFFERENT configs →
+/// must return 422 requiring explicit IDs.
+#[tokio::test]
+async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let listen_path = format!("/{proxy_id}");
+
+    // Initial POST with one cors plugin.
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Ambiguous PUT test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [{"id": "", "plugin_name": "cors", "config": {}}]
+    });
+    let (post_status, post_body) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST: {post_body}"
+    );
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    // PUT with two cors plugins that have DIFFERENT configs and both have empty IDs.
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Ambiguous PUT test v2", "version": "2.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [
+            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}},
+            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["b.example"]}}
+        ]
+    });
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 for ambiguous same-name different-config plugins; body: {put_body}"
+    );
+    let failures = put_body["failures"].as_array().expect("failures array");
+    assert!(
+        failures.iter().any(|f| {
+            f["resource_type"].as_str() == Some("plugin")
+                && f["errors"]
+                    .as_array()
+                    .map(|errs| {
+                        errs.iter().any(|e| {
+                            let s = e.as_str().unwrap_or("");
+                            s.contains("explicit") || s.contains("disambiguate")
+                        })
+                    })
+                    .unwrap_or(false)
+        }),
+        "expected 'explicit ids' error; body: {put_body}"
+    );
+}
+
+// ============================================================================
+// Fix 1 — Timestamp stamping (server-side overrides operator-supplied values)
+// ============================================================================
+
+/// POST a spec, then PUT with an artificially-old updated_at embedded in the
+/// x-ferrum-proxy extension.  The server must overwrite it with a fresh
+/// server-side timestamp, so the incremental polling delta path can see the
+/// change.
+#[tokio::test]
+async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+
+    // POST the initial spec.
+    let (post_status, post_body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST: {post_body}"
+    );
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    let proxy_after_post = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy")
+        .expect("proxy must exist after POST");
+    let post_updated_at = proxy_after_post.updated_at;
+
+    // Sleep to ensure the wall clock advances.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+    // PUT with an explicitly-old updated_at embedded in the spec document.
+    // If the server-side stamp does NOT fire, the stored updated_at would be
+    // 1970-01-01 and polling would never pick up the change.
+    let spec_with_old_ts = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Timestamp overwrite test", "version": "2.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "new-backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}"),
+            "updated_at": "1970-01-01T00:00:00Z"
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("plugin"),
+            "plugin_name": "cors",
+            "config": {},
+            "updated_at": "1970-01-01T00:00:00Z"
+        }]
+    });
+    let (put_status, put_body) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_with_old_ts)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "PUT must succeed; body: {put_body}"
+    );
+
+    let proxy_after_put = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy after PUT")
+        .expect("proxy must still exist");
+
+    // The server-side stamp must have overwritten the embedded 1970 timestamp.
+    assert!(
+        proxy_after_put.updated_at > post_updated_at,
+        "proxy.updated_at ({}) must be NEWER than the initial POST timestamp ({}) \
+         — server-side stamping must override the 1970-01-01 embedded in the spec",
+        proxy_after_put.updated_at,
+        post_updated_at
+    );
+
+    // Also verify for the plugin.
+    let plugins = store
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list_spec_owned_plugin_configs");
+    if let Some(plugin) = plugins.first() {
+        let epoch = chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        assert!(
+            plugin.updated_at > epoch,
+            "plugin.updated_at must be overwritten by server-side stamp; got {}",
+            plugin.updated_at
+        );
+    }
 }

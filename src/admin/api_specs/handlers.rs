@@ -315,6 +315,11 @@ fn require_db(state: &AdminState) -> Result<&Arc<dyn DatabaseBackend>, ApiSpecEr
 /// new UUID. Re-links cross-references so `plugin.proxy_id` and
 /// `proxy.upstream_id` always reference the final IDs. Rebuilds the proxy
 /// `plugins` association list to reference the final plugin IDs.
+///
+/// Also stamps server-side `created_at`/`updated_at` timestamps so any
+/// operator-supplied timestamps in the spec document are ignored — the
+/// polling cycle's incremental delta path uses `updated_at > since`, and
+/// stale embedded timestamps would cause real config changes to be skipped.
 fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
     // Proxy
     if bundle.proxy.id.is_empty() {
@@ -341,6 +346,21 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
         if bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty() {
             bundle.proxy.upstream_id = Some(u.id.clone());
         }
+    }
+
+    // Stamp server-side timestamps (Fix 1). Mirrors handle_write's convention:
+    //   Create → set_created_at(now) + set_updated_at(now).
+    // This overwrites any operator-embedded timestamps from the spec document.
+    let now = Utc::now();
+    bundle.proxy.created_at = now;
+    bundle.proxy.updated_at = now;
+    if let Some(ref mut u) = bundle.upstream {
+        u.created_at = now;
+        u.updated_at = now;
+    }
+    for pc in &mut bundle.plugins {
+        pc.created_at = now;
+        pc.updated_at = now;
     }
 
     // Rebuild proxy.plugins association list with final plugin IDs.
@@ -381,11 +401,18 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
 ///   explicitly, the immutability check catches it later).
 /// - `upstream.id`: if empty, reuse existing `proxy.upstream_id` if `Some`
 ///   and non-empty, else mint UUID.
-/// - `plugin.id`: if empty, match by `plugin_name` against existing
-///   spec-owned plugins and reuse the matched id. If no match, mint UUID.
-///   If two extracted plugins share the same name and only one stored plugin
-///   matches, the first gets the stored ID, the second gets a fresh UUID.
+/// - `plugin.id`: if empty, match by canonical `(plugin_name, config_json,
+///   priority_override)` tuple against existing spec-owned plugins (Fix 5).
+///   If two extracted plugins share the same plugin_name with DIFFERENT
+///   configs, explicit IDs are required — returns a structured error.
+///   If they share the same name AND identical canonical config, falls back
+///   to FIFO ordering (deterministic index pairing). If no match found, mints
+///   a new UUID.
 /// - For non-empty extracted IDs, leave as-is — operator opted in.
+///
+/// Also stamps server-side timestamps (Fix 1): `updated_at = now` always;
+/// `created_at` is preserved from the stored row on PUT, or set to `now` for
+/// genuinely new resources introduced by this PUT.
 ///
 /// After ID assignment, re-links: `proxy.upstream_id = upstream.id` (if
 /// present); `plugin.proxy_id = proxy.id`; rebuilds `proxy.plugins`
@@ -404,7 +431,7 @@ async fn assign_ids_for_put(
         bundle.proxy.id = existing_spec.proxy_id.clone();
     }
 
-    // Load the existing proxy to get upstream_id.
+    // Load the existing proxy to get upstream_id and created_at.
     let existing_proxy = match db.get_proxy(&existing_spec.proxy_id).await {
         Ok(Some(p)) => Some(p),
         Ok(None) => None,
@@ -423,7 +450,7 @@ async fn assign_ids_for_put(
         }
     }
 
-    // Load existing spec-owned plugins for name-based matching.
+    // Load existing spec-owned plugins for canonical-tuple matching (Fix 5).
     let existing_plugins = match db
         .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
         .await
@@ -432,27 +459,76 @@ async fn assign_ids_for_put(
         Err(e) => return Err(classify_db_error(e)),
     };
 
-    // Build a map from plugin_name → list of existing IDs (FIFO).
-    let mut name_to_ids: std::collections::HashMap<&str, std::collections::VecDeque<&str>> =
-        std::collections::HashMap::new();
+    // Build a map from canonical key → FIFO queue of existing plugins.
+    // Canonical key = (plugin_name, sorted-keys config JSON, priority_override).
+    let mut canonical_to_existing: std::collections::HashMap<
+        (String, String, Option<u16>),
+        std::collections::VecDeque<&crate::config::types::PluginConfig>,
+    > = std::collections::HashMap::new();
     for ep in &existing_plugins {
-        name_to_ids
-            .entry(ep.plugin_name.as_str())
+        canonical_to_existing
+            .entry(plugin_canonical_key(ep))
             .or_default()
-            .push_back(ep.id.as_str());
+            .push_back(ep);
     }
 
-    // Assign plugin IDs.
-    for pc in &mut bundle.plugins {
+    // Count how many extracted (empty-id) plugins share each plugin_name, so
+    // we can detect the ambiguous case: same name, different configs, both
+    // without explicit IDs.  Use owned `String` keys so the map does not hold
+    // borrows on bundle.plugins across the later mutable loop.
+    let mut extracted_name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for pc in &bundle.plugins {
         if pc.id.is_empty() {
-            let reused = name_to_ids
-                .get_mut(pc.plugin_name.as_str())
-                .and_then(|q| q.pop_front());
-            pc.id = reused
-                .map(str::to_string)
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            *extracted_name_counts
+                .entry(pc.plugin_name.clone())
+                .or_default() += 1;
         }
-        pc.proxy_id = Some(bundle.proxy.id.clone());
+    }
+
+    // Snapshot proxy_id before the mutable plugin loop to avoid split borrows.
+    let proxy_id_snap = bundle.proxy.id.clone();
+
+    // Assign plugin IDs (Fix 5 canonical matching).
+    for pc in &mut bundle.plugins {
+        if !pc.id.is_empty() {
+            // Operator supplied an explicit ID — leave as-is.
+            pc.proxy_id = Some(proxy_id_snap.clone());
+            continue;
+        }
+
+        let key = plugin_canonical_key(pc);
+        if let Some(q) = canonical_to_existing.get_mut(&key) {
+            if let Some(matched) = q.pop_front() {
+                // Exact canonical match — reuse the stored ID.
+                pc.id = matched.id.clone();
+                pc.proxy_id = Some(proxy_id_snap.clone());
+                continue;
+            }
+        }
+
+        // No exact canonical match. If this plugin_name has more than one
+        // extracted instance without explicit IDs, we cannot safely assign
+        // an existing ID without risking config-identity swaps. Reject with a
+        // structured error so operators learn to use explicit IDs.
+        if *extracted_name_counts.get(&pc.plugin_name).unwrap_or(&0) > 1 {
+            return Err(ApiSpecError::ValidationFailures {
+                spec_version: String::new(), // filled by caller if needed
+                failures: vec![ValidationFailure {
+                    resource_type: "plugin",
+                    id: proxy_id_snap.clone(),
+                    errors: vec![format!(
+                        "duplicate plugin_name '{}' on PUT requires explicit ids to disambiguate; \
+                         set a non-empty 'id' on each instance",
+                        pc.plugin_name
+                    )],
+                }],
+            });
+        }
+
+        // New plugin or config genuinely changed — mint a fresh UUID.
+        pc.id = Uuid::new_v4().to_string();
+        pc.proxy_id = Some(proxy_id_snap.clone());
     }
 
     // Re-link proxy.upstream_id.
@@ -460,6 +536,50 @@ async fn assign_ids_for_put(
         if bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty() {
             bundle.proxy.upstream_id = Some(u.id.clone());
         }
+    }
+
+    // Stamp server-side timestamps (Fix 1). Mirrors handle_write's convention:
+    //   Update → set_updated_at(now), preserve created_at from stored row.
+    let now = Utc::now();
+
+    // Proxy: preserve stored created_at, refresh updated_at.
+    bundle.proxy.updated_at = now;
+    bundle.proxy.created_at = existing_proxy.as_ref().map(|p| p.created_at).unwrap_or(now);
+
+    // Upstream: preserve existing created_at if the same ID is being reused.
+    if let Some(ref mut u) = bundle.upstream {
+        u.updated_at = now;
+        // If the upstream ID matches what was previously stored, preserve its
+        // created_at. Otherwise (new upstream) use now.
+        let stored_upstream_id = existing_proxy
+            .as_ref()
+            .and_then(|p| p.upstream_id.as_deref())
+            .unwrap_or("");
+        if u.id == stored_upstream_id {
+            // Fetch the stored upstream's created_at if available.
+            if let Ok(Some(stored_upstream)) = db.get_upstream(&u.id).await {
+                u.created_at = stored_upstream.created_at;
+            } else {
+                u.created_at = now;
+            }
+        } else {
+            u.created_at = now;
+        }
+    }
+
+    // Plugins: for each plugin, if we reused an existing stored ID, preserve
+    // that plugin's created_at. For genuinely new plugins, use now.
+    let existing_plugin_map: std::collections::HashMap<&str, &crate::config::types::PluginConfig> =
+        existing_plugins
+            .iter()
+            .map(|ep| (ep.id.as_str(), ep))
+            .collect();
+    for pc in &mut bundle.plugins {
+        pc.updated_at = now;
+        pc.created_at = existing_plugin_map
+            .get(pc.id.as_str())
+            .map(|ep| ep.created_at)
+            .unwrap_or(now);
     }
 
     // Rebuild proxy.plugins association list with final plugin IDs.
@@ -482,6 +602,40 @@ async fn assign_ids_for_put(
     bundle.proxy.plugins = assocs;
 
     Ok(())
+}
+
+/// Compute the canonical matching key for a plugin during PUT id-assignment.
+///
+/// The key is `(plugin_name, sorted-keys config JSON, priority_override)`.
+/// Sorting JSON object keys via a `BTreeMap` round-trip ensures two configs
+/// with the same key-value pairs but different insertion order compare equal,
+/// which is necessary for idempotent re-submission of specs produced by
+/// different tooling.
+fn plugin_canonical_key(pc: &crate::config::types::PluginConfig) -> (String, String, Option<u16>) {
+    let canonical_config = sort_json_keys(&pc.config);
+    let config_str = serde_json::to_string(&canonical_config).unwrap_or_default();
+    (pc.plugin_name.clone(), config_str, pc.priority_override)
+}
+
+/// Recursively sort all JSON object keys so that canonical comparison is
+/// key-order-independent. Arrays are left in their original order (order
+/// matters for arrays). Uses a `BTreeMap` round-trip for objects.
+fn sort_json_keys(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let sorted: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(k, val)| (k.clone(), sort_json_keys(val)))
+                .collect();
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +731,15 @@ async fn validate_bundle(
     for plugin in &bundle.plugins {
         let mut plugin_errors: Vec<String> = Vec::new();
 
+        // Generic PluginConfig field constraints (Fix 3): priority_override
+        // range, config JSON size, nesting depth.  Direct admin runs
+        // validate_fields() on every PluginConfig before persistence; we
+        // must do the same here.
+        if let Err(errs) = plugin.validate_fields() {
+            plugin_errors.extend(errs);
+        }
+
+        // Plugin-specific config schema validation.
         if let Err(e) = crate::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
         {
             plugin_errors.push(e);
@@ -587,6 +750,31 @@ async fn validate_bundle(
                 resource_type: "plugin",
                 id: plugin.id.clone(),
                 errors: plugin_errors,
+            });
+        }
+    }
+
+    // Duplicate proxy plugin associations (Fix 4): detect operator-written
+    // duplicate plugin_config_id entries in bundle.proxy.plugins.  SQL's
+    // proxy_plugins(proxy_id, plugin_config_id) PK would conflict on insert;
+    // MongoDB would persist duplicates and runtime validate_plugin_references
+    // would reject.
+    {
+        let mut seen_assoc_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut dupe_assoc_ids: Vec<String> = Vec::new();
+        for assoc in &bundle.proxy.plugins {
+            if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
+                dupe_assoc_ids.push(assoc.plugin_config_id.clone());
+            }
+        }
+        if !dupe_assoc_ids.is_empty() {
+            failures.push(ValidationFailure {
+                resource_type: "proxy_plugin_association",
+                id: bundle.proxy.id.clone(),
+                errors: dupe_assoc_ids
+                    .iter()
+                    .map(|id| format!("duplicate plugin_config_id '{id}' in proxy.plugins"))
+                    .collect(),
             });
         }
     }
@@ -666,11 +854,43 @@ async fn validate_bundle(
     // DB cross-checks (only when no structural failures found — avoids spurious FK errors)
     if failures.is_empty() {
         let proxy = &bundle.proxy;
-        // Namespace already stamped by extractor; set bind-address + reserved ports ctx
-        let _ = &vctx; // vctx used for mode/ports; cross-check uses db directly
 
-        if !proxy.dispatch_kind.is_stream() {
-            // Exclude self when replacing (PUT path passes existing proxy id)
+        if proxy.dispatch_kind.is_stream() {
+            // Stream-family: validate port uniqueness and reserved-port conflict.
+            // Mirrors Proxy::check_uniqueness + Proxy::after_validate in crud.rs.
+            if let Some(port) = proxy.listen_port {
+                // Port uniqueness (across all stream proxies in this namespace).
+                match db
+                    .check_listen_port_unique(namespace, port, existing_proxy_id)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => failures.push(ValidationFailure {
+                        resource_type: "proxy",
+                        id: proxy.id.clone(),
+                        errors: vec![format!(
+                            "listen_port {port} is already in use by another proxy"
+                        )],
+                    }),
+                    Err(e) => return Err(classify_db_error(e)),
+                }
+
+                // Reserved gateway ports check (skip in CP mode — CP can't know each
+                // DP's reserved ports; matches the Proxy::after_validate guard).
+                if vctx.mode != "cp" && vctx.reserved_ports.contains(&port) {
+                    failures.push(ValidationFailure {
+                        resource_type: "proxy",
+                        id: proxy.id.clone(),
+                        errors: vec![format!(
+                            "listen_port {port} conflicts with a gateway reserved port \
+                             (proxy/admin/gRPC listener)"
+                        )],
+                    });
+                }
+            }
+        } else {
+            // HTTP-family: validate listen_path + hosts uniqueness.
+            // Exclude self when replacing (PUT path passes existing proxy id).
             match db
                 .check_listen_path_unique(
                     namespace,
