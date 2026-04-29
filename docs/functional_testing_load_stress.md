@@ -338,9 +338,9 @@ The test configures the gateway with optimized connection pool settings matching
 | Env Var | Value | Purpose |
 |---------|-------|---------|
 | `FERRUM_HTTP3_MAX_STREAMS` | 1000 | QUIC max concurrent streams |
-| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | 16777216 (16 MiB) | Per-stream QUIC receive window |
-| `FERRUM_HTTP3_RECEIVE_WINDOW` | 134217728 (128 MiB) | Per-connection QUIC receive window |
-| `FERRUM_HTTP3_SEND_WINDOW` | 67108864 (64 MiB) | QUIC send window |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | 8388608 (8 MiB) | Per-stream QUIC receive window |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | 33554432 (32 MiB) | Per-connection QUIC receive window |
+| `FERRUM_HTTP3_SEND_WINDOW` | 8388608 (8 MiB) | QUIC send window |
 
 ### Other
 

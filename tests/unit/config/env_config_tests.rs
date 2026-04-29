@@ -323,9 +323,9 @@ fn test_env_config_http3_defaults() {
             assert!(!config.enable_http3);
             assert_eq!(config.http3_idle_timeout, 30);
             assert_eq!(config.http3_max_streams, 1000);
-            assert_eq!(config.http3_stream_receive_window, 16_777_216);
-            assert_eq!(config.http3_receive_window, 134_217_728);
-            assert_eq!(config.http3_send_window, 67_108_864);
+            assert_eq!(config.http3_stream_receive_window, 8_388_608);
+            assert_eq!(config.http3_receive_window, 33_554_432);
+            assert_eq!(config.http3_send_window, 8_388_608);
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 64);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 256);
             assert_eq!(config.websocket_max_connections, 20_000);
@@ -343,7 +343,7 @@ fn test_http3_coalesce_min_default() {
         || {
             remove_var("FERRUM_HTTP3_COALESCE_MIN_BYTES");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.http3_coalesce_min_bytes, 131_072);
+            assert_eq!(config.http3_coalesce_min_bytes, 32_768);
         },
     );
 }
@@ -373,7 +373,7 @@ fn test_http3_coalesce_min_clamped_above_max() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.http3_coalesce_min_bytes, 131_072);
+            assert_eq!(config.http3_coalesce_min_bytes, 32_768);
         },
     );
 }
@@ -403,7 +403,7 @@ fn test_http3_coalesce_max_default() {
         || {
             remove_var("FERRUM_HTTP3_COALESCE_MAX_BYTES");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.http3_coalesce_max_bytes, 131_072);
+            assert_eq!(config.http3_coalesce_max_bytes, 32_768);
         },
     );
 }
