@@ -102,19 +102,19 @@ pub struct Http3ServerConfig {
     /// Per-stream receive window in bytes.
     /// Controls how much data a peer can send on a single stream before
     /// the receiver must send a flow-control credit update.
-    /// Default: 8 MiB (8_388_608).
+    /// Default: 16 MiB (16_777_216).
     pub stream_receive_window: u64,
 
     /// Connection-level receive window in bytes.
     /// Aggregate budget shared across all concurrent streams.
     /// Should be ≥ stream_receive_window × expected_concurrency.
-    /// Default: 32 MiB (33_554_432).
+    /// Default: 128 MiB (134_217_728).
     pub receive_window: u64,
 
     /// Per-connection send window in bytes.
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
-    /// Default: 8 MiB (8_388_608).
+    /// Default: 64 MiB (67_108_864).
     pub send_window: u64,
 
     /// Initial QUIC path MTU in bytes (`TransportConfig::initial_mtu`).

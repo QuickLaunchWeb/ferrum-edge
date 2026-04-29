@@ -64,8 +64,9 @@ message X509SVIDResponse {
   // single-identity callers.
   repeated X509SVID svids = 1;
 
-  // ASN.1 DER-encoded list of certificate revocation lists.
-  bytes crl = 2;
+  // ASN.1 DER-encoded list of certificate revocation lists. Each entry is
+  // a separate CRL — agents may publish multiple CRLs per response.
+  repeated bytes crl = 2;
 
   // Federated bundles keyed by trust domain (string form,
   // e.g. "spiffe://prod.example.com" or "prod.example.com"). ASN.1 DER
@@ -91,8 +92,9 @@ message X509SVID {
 message X509BundlesRequest {}
 
 message X509BundlesResponse {
-  // ASN.1 DER-encoded list of certificate revocation lists.
-  bytes crl = 1;
+  // ASN.1 DER-encoded list of certificate revocation lists. Each entry is
+  // a separate CRL.
+  repeated bytes crl = 1;
   // CA bundles keyed by trust domain. ASN.1 DER encoded.
   map<string, bytes> bundles = 2;
 }

@@ -12,12 +12,17 @@
 //! - [`WorkloadApiClient::fetch_x509_svid_once`] — convenience helper that
 //!   returns the FIRST bundle from the stream and drops the connection.
 
+use hyper_util::rt::TokioIo;
 use std::time::Duration;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tonic::Request;
+use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::{Channel, Endpoint};
+use tower::service_fn;
 use tracing::{debug, info, warn};
 
 use super::proto::X509svidRequest;
@@ -28,6 +33,24 @@ use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
 /// Default Unix-socket path used when `FERRUM_MESH_WORKLOAD_API_SOCKET` is unset.
 pub const DEFAULT_WORKLOAD_API_SOCKET: &str = "/run/spire/agent/agent.sock";
 
+/// SPIFFE Workload API security header. Per the SPIFFE Workload Endpoint spec
+/// (`SPIFFE_Workload_Endpoint.md`), every RPC must carry this metadata; servers
+/// MUST reject calls that omit it. We attach it to every request via
+/// [`workload_request`].
+const WORKLOAD_METADATA_KEY: &str = "workload.spiffe.io";
+const WORKLOAD_METADATA_VAL: &str = "true";
+
+/// Wrap a payload into a `tonic::Request` carrying the SPIFFE Workload API
+/// security metadata. Use this for every Workload API RPC.
+fn workload_request<T>(payload: T) -> Request<T> {
+    let mut req = Request::new(payload);
+    req.metadata_mut().insert(
+        WORKLOAD_METADATA_KEY,
+        AsciiMetadataValue::from_static(WORKLOAD_METADATA_VAL),
+    );
+    req
+}
+
 /// gRPC client wrapper.
 pub struct WorkloadApiClient {
     inner: SpiffeWorkloadApiClient<Channel>,
@@ -35,18 +58,38 @@ pub struct WorkloadApiClient {
 }
 
 impl WorkloadApiClient {
-    /// Connect to the SPIRE agent at `socket_path`. The connection is
-    /// established lazily — failures surface on first RPC.
+    /// Connect to the SPIRE agent at `socket_path`.
+    ///
+    /// Tonic's default HTTP connector cannot dial a Unix socket — formatting
+    /// `unix://...` into an `Endpoint::connect()` URL produces a TCP attempt
+    /// against the path-as-hostname. We instead build the channel with
+    /// [`Endpoint::connect_with_connector`] and a `tower::service_fn`
+    /// connector that opens a [`tokio::net::UnixStream`] for every dial,
+    /// wrapping it via [`hyper_util::rt::TokioIo`] so hyper sees the
+    /// expected `Read + Write` shape. The base URI is a dummy — it's only
+    /// used as the HTTP/2 `:authority`; the actual transport is the UDS
+    /// the connector returns.
     pub async fn connect(socket_path: impl Into<String>) -> Result<Self, WorkloadApiClientError> {
         let socket_path = socket_path.into();
-        let uri = format!("unix://{socket_path}");
-        let endpoint = Endpoint::try_from(uri)
-            .map_err(|e| WorkloadApiClientError::Config(format!("invalid UDS URI: {e}")))?
+        let socket_for_connector = socket_path.clone();
+
+        let endpoint = Endpoint::try_from("http://[::1]:0")
+            .map_err(|e| {
+                WorkloadApiClientError::Config(format!("workload API endpoint init: {e}"))
+            })?
             .connect_timeout(Duration::from_secs(5));
+
         let channel = endpoint
-            .connect()
+            .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+                let path = socket_for_connector.clone();
+                async move {
+                    let stream = UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
             .await
             .map_err(|e| WorkloadApiClientError::Transport(e.to_string()))?;
+
         let inner = SpiffeWorkloadApiClient::new(channel);
         info!(socket = %socket_path, "connected to SPIFFE Workload API agent");
         Ok(Self { inner, socket_path })
@@ -74,7 +117,7 @@ impl WorkloadApiClient {
     > {
         let response = self
             .inner
-            .fetch_x509svid(X509svidRequest {})
+            .fetch_x509svid(workload_request(X509svidRequest {}))
             .await
             .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
         let mut inbound = response.into_inner();
