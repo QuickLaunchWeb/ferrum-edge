@@ -2729,6 +2729,239 @@ async fn post_spec_with_reserved_gateway_port_returns_422() {
 }
 
 // ============================================================================
+// Fix 2b — OS-level port availability probe on spec import
+// ============================================================================
+
+/// POST a spec with a TCP proxy on a port that is already bound by another
+/// process → must return 422 (or 409 as direct admin does). The port is held
+/// for the entire test by a TcpListener guard.
+#[tokio::test]
+async fn post_spec_with_unbindable_stream_port_returns_422_or_equivalent() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    // Bind a TCP listener on an ephemeral port and hold it for the duration
+    // of the test so the gateway's OS-level probe fails.
+    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied_port = bound.local_addr().unwrap().port();
+
+    let mut state = make_admin_state(store, 25);
+    // Point the stream bind address to 127.0.0.1 so the probe targets the
+    // same interface as our held listener.
+    state.stream_proxy_bind_address = "127.0.0.1".to_string();
+
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("tcp-occupied");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Port unavailable test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "tcp-backend.internal",
+            "backend_port": 9001,
+            "backend_scheme": "tcp",
+            "listen_port": occupied_port
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    // Direct admin returns 409 CONFLICT for port probe failures; spec validation
+    // surfaces the same error via the 422 ValidationFailures path since we
+    // accumulate all errors before returning.
+    assert!(
+        status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            || status == reqwest::StatusCode::CONFLICT,
+        "expected 422 or 409 for unavailable port; got {status}; body: {body}"
+    );
+
+    // Keep the listener alive until after the request to ensure the port stays
+    // occupied during the probe.
+    drop(bound);
+}
+
+/// POST a spec with a CP-mode state → port probe must NOT fire.
+/// Verified by binding a port, submitting a spec targeting that port via a
+/// CP-mode AdminState, and expecting success (201) since CP skips the probe.
+/// The DB uniqueness check must still pass (no prior stream proxy on the port).
+#[tokio::test]
+async fn post_spec_stream_port_cp_mode_skips_os_probe() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    // Bind a port to make it appear occupied.
+    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied_port = bound.local_addr().unwrap().port();
+
+    let mut state = make_admin_state(store, 25);
+    state.mode = "cp".to_string();
+    state.stream_proxy_bind_address = "127.0.0.1".to_string();
+
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("tcp-cp-probe");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "CP port probe skip test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "tcp-backend.internal",
+            "backend_port": 9001,
+            "backend_scheme": "tcp",
+            "listen_port": occupied_port
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    // CP mode skips the OS probe (matches Proxy::after_validate guard), so the
+    // spec must be accepted even though the port is currently occupied locally.
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "CP mode must skip port probe and accept spec; body: {body}"
+    );
+
+    drop(bound);
+}
+
+// ============================================================================
+// Fix 1 — upstream_id existence validation on spec import
+// ============================================================================
+
+/// POST a spec that sets proxy.upstream_id to a non-existent upstream and
+/// includes no x-ferrum-upstream → must return 422 with upstream_id error.
+#[tokio::test]
+async fn post_spec_with_dangling_upstream_id_returns_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy-dangling");
+    let dangling_uid = uid("non-existent-upstream");
+
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Dangling upstream_id test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}"),
+            "upstream_id": dangling_uid
+        }
+        // Intentionally no x-ferrum-upstream
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 422 for dangling upstream_id; body: {body}"
+    );
+    let failures = body["failures"].as_array().expect("failures array");
+    assert!(
+        failures.iter().any(|f| {
+            f["resource_type"].as_str() == Some("proxy")
+                && f["errors"]
+                    .as_array()
+                    .map(|errs| {
+                        errs.iter()
+                            .any(|e| e.as_str().unwrap_or("").contains("upstream_id"))
+                    })
+                    .unwrap_or(false)
+        }),
+        "expected upstream_id error in failures; body: {body}"
+    );
+}
+
+/// POST a spec where proxy.upstream_id matches the bundled x-ferrum-upstream
+/// id → must succeed (201).  The bundled upstream is not yet in the DB but
+/// is about to be inserted together with the proxy.
+#[tokio::test]
+async fn post_spec_with_upstream_id_referencing_bundled_upstream_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy-bundled-up");
+    let upstream_id = uid("bundled-upstream");
+
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Bundled upstream test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}"),
+            "upstream_id": upstream_id
+        },
+        "x-ferrum-upstream": {
+            "id": upstream_id,
+            "targets": [{"host": "target.internal", "port": 443}]
+        }
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "spec with upstream_id matching bundled upstream must succeed; body: {body}"
+    );
+}
+
+/// POST a spec where proxy.upstream_id references an upstream that was already
+/// created in the DB via direct admin → must succeed (201).
+#[tokio::test]
+async fn post_spec_with_upstream_id_referencing_existing_db_upstream_succeeds() {
+    use ferrum_edge::config::types::Upstream;
+
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+
+    // Pre-create an upstream directly in the DB.
+    let pre_upstream_id = uid("pre-upstream");
+    let pre_upstream: Upstream = serde_json::from_value(json!({
+        "id": pre_upstream_id,
+        "namespace": "ferrum",
+        "targets": [{"host": "target.internal", "port": 443}]
+    }))
+    .expect("upstream deserialization");
+    store
+        .create_upstream(&pre_upstream)
+        .await
+        .expect("create pre-upstream");
+
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy-pre-upstream");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Pre-existing upstream test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}"),
+            "upstream_id": pre_upstream_id
+        }
+        // No x-ferrum-upstream: the proxy references the pre-existing one.
+    });
+
+    let (status, body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "spec with upstream_id referencing existing DB upstream must succeed; body: {body}"
+    );
+}
+
+// ============================================================================
 // Fix 3 — Generic PluginConfig field validation
 // ============================================================================
 

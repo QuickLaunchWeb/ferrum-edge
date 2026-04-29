@@ -2512,3 +2512,78 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
          handler-level stamping is what prevents stale timestamps in production"
     );
 }
+
+// ============================================================================
+// Fix 3 — Mongo / SQL delete_proxy cleans up orphaned upstream
+// ============================================================================
+
+/// `delete_proxy` must cascade-delete the proxy's upstream when no other proxy
+/// still references it (mirrors SQL delete_proxy behavior).
+///
+/// This test runs against SQLite which is the reference implementation.
+/// The invariant is: delete P1 (sole referencer of U1) → U1 is removed.
+/// Negative: delete P1 when P2 also references U1 → U1 must survive.
+#[tokio::test]
+async fn delete_proxy_cleans_up_orphaned_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    // ------------------------------------------------------------------ setup
+    let upstream_id = uid("upstream-orphan");
+    let proxy_id_1 = uid("proxy-sole-ref");
+    let proxy_id_2 = uid("proxy-second-ref");
+
+    // Create the shared upstream.
+    let upstream = make_upstream(&upstream_id, ns);
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("create upstream");
+
+    // Create proxy P1 that references the upstream.
+    let mut p1 = make_proxy(&proxy_id_1, ns);
+    p1.upstream_id = Some(upstream_id.clone());
+    store.create_proxy(&p1).await.expect("create P1");
+
+    // ------------------------------------------------------------------ negative: P2 also references → upstream must survive
+    // Use a distinct listen_path so uniqueness constraints don't fire.
+    let p2: Proxy = serde_json::from_value(serde_json::json!({
+        "id": proxy_id_2,
+        "namespace": ns,
+        "backend_host": "backend.example.com",
+        "backend_port": 443,
+        "listen_path": format!("/{proxy_id_2}"),
+        "upstream_id": upstream_id
+    }))
+    .expect("p2 deserialization");
+    store.create_proxy(&p2).await.expect("create P2");
+
+    // Delete P1 — P2 still references the upstream → upstream must NOT be deleted.
+    let deleted = store.delete_proxy(&proxy_id_1).await.expect("delete P1");
+    assert!(deleted, "delete_proxy P1 must return true");
+
+    let upstream_after_p1_delete = store
+        .get_upstream(&upstream_id)
+        .await
+        .expect("get_upstream after P1 delete");
+    assert!(
+        upstream_after_p1_delete.is_some(),
+        "upstream must survive when P2 still references it; got None"
+    );
+
+    // ------------------------------------------------------------------ positive: delete P2 → upstream now orphaned → must be removed
+    let deleted2 = store.delete_proxy(&proxy_id_2).await.expect("delete P2");
+    assert!(deleted2, "delete_proxy P2 must return true");
+
+    let upstream_after_p2_delete = store
+        .get_upstream(&upstream_id)
+        .await
+        .expect("get_upstream after P2 delete");
+    assert!(
+        upstream_after_p2_delete.is_none(),
+        "orphaned upstream must be cascade-deleted after last referencing proxy is removed; \
+         got Some({:?})",
+        upstream_after_p2_delete
+    );
+}

@@ -651,6 +651,9 @@ struct ValidatedBundle {
 ///
 /// `existing_proxy_id` — when `Some`, the uniqueness checks exclude this proxy
 /// (PUT path). `existing_upstream_id` — analogous for upstream name check.
+/// `existing_proxy` — the stored proxy row for PUT requests; used to detect
+/// listen_port / transport changes so the OS-level port-availability probe is
+/// only fired when the port or transport actually changed.
 async fn validate_bundle(
     mut bundle: ExtractedBundle,
     metadata: crate::admin::api_specs::SpecMetadata,
@@ -659,6 +662,7 @@ async fn validate_bundle(
     state: &AdminState,
     existing_proxy_id: Option<&str>,
     existing_upstream_id: Option<&str>,
+    existing_proxy: Option<&crate::config::types::Proxy>,
 ) -> Result<ValidatedBundle, ApiSpecError> {
     // ID assignment (minting UUIDs for empty IDs) is the caller's responsibility
     // (assign_ids_for_post / assign_ids_for_put) and happens BEFORE this
@@ -855,8 +859,34 @@ async fn validate_bundle(
     if failures.is_empty() {
         let proxy = &bundle.proxy;
 
+        // --- Fix 1: upstream_id existence check ---
+        // Mirrors Proxy::after_validate in crud.rs: when the proxy references an
+        // upstream by ID, verify the upstream actually exists.  If the bundle
+        // includes its own upstream (x-ferrum-upstream) whose ID matches, we
+        // accept it without a DB round-trip (it's about to be inserted).
+        // Otherwise call check_upstream_exists and reject with 422 if missing.
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            let bundled_id_matches = bundle
+                .upstream
+                .as_ref()
+                .map(|u| u.id.as_str() == upstream_id.as_str())
+                .unwrap_or(false);
+            if !bundled_id_matches {
+                match db.check_upstream_exists(upstream_id).await {
+                    Ok(true) => {}
+                    Ok(false) => failures.push(ValidationFailure {
+                        resource_type: "proxy",
+                        id: proxy.id.clone(),
+                        errors: vec![format!("upstream_id '{upstream_id}' does not exist")],
+                    }),
+                    Err(e) => return Err(classify_db_error(e)),
+                }
+            }
+        }
+
         if proxy.dispatch_kind.is_stream() {
-            // Stream-family: validate port uniqueness and reserved-port conflict.
+            // Stream-family: validate port uniqueness, reserved-port conflict, and
+            // OS-level port availability.
             // Mirrors Proxy::check_uniqueness + Proxy::after_validate in crud.rs.
             if let Some(port) = proxy.listen_port {
                 // Port uniqueness (across all stream proxies in this namespace).
@@ -886,6 +916,36 @@ async fn validate_bundle(
                              (proxy/admin/gRPC listener)"
                         )],
                     });
+                }
+
+                // --- Fix 2: OS-level port availability probe ---
+                // Mirrors the Proxy::after_validate check in crud.rs.
+                // Skip in CP mode — CP can't know each DP's OS bind state.
+                // Skip on PUT when neither the port nor the transport changed.
+                if vctx.mode != "cp" && failures.is_empty() {
+                    let port_changed = existing_proxy.and_then(|p| p.listen_port) != Some(port);
+                    let transport_changed = existing_proxy
+                        .map(|p| p.dispatch_kind.is_udp() != proxy.dispatch_kind.is_udp())
+                        .unwrap_or(false);
+                    let should_probe =
+                        existing_proxy.is_none() || port_changed || transport_changed;
+                    if should_probe {
+                        if let Err(error) = crate::admin::crud::check_port_available(
+                            port,
+                            vctx.stream_bind_address,
+                            proxy.dispatch_kind.is_udp(),
+                        )
+                        .await
+                        {
+                            failures.push(ValidationFailure {
+                                resource_type: "proxy",
+                                id: proxy.id.clone(),
+                                errors: vec![format!(
+                                    "listen_port {port} is not available on the host: {error}"
+                                )],
+                            });
+                        }
+                    }
                 }
             }
         } else {
@@ -1233,11 +1293,21 @@ pub async fn handle_post_api_spec(
     assign_ids_for_post(&mut bundle);
 
     // Validate: field checks + DB cross-checks (listen_path uniqueness, etc.)
-    let ValidatedBundle { bundle, metadata } =
-        match validate_bundle(bundle, metadata, namespace, db.as_ref(), state, None, None).await {
-            Ok(v) => v,
-            Err(e) => return Ok(error_response(e)),
-        };
+    let ValidatedBundle { bundle, metadata } = match validate_bundle(
+        bundle,
+        metadata,
+        namespace,
+        db.as_ref(),
+        state,
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return Ok(error_response(e)),
+    };
 
     let spec_id = Uuid::new_v4().to_string();
     let proxy_id = bundle.proxy.id.clone();
@@ -1346,16 +1416,21 @@ pub async fn handle_put_api_spec(
         }));
     }
 
-    // Resolve the existing upstream_id so the upstream name uniqueness check
-    // can exclude the spec's own upstream (PUT with unchanged name must not
-    // self-collide). Use the *stored* upstream_id from the existing proxy in
-    // the DB — NOT the bundle's post-assignment upstream.id, which can be
-    // operator-changed and would falsely match the old DB row as a duplicate.
-    let existing_upstream_id: Option<String> = match db.get_proxy(&existing_spec.proxy_id).await {
-        Ok(Some(p)) => p.upstream_id,
-        Ok(None) => None,
-        Err(e) => return Ok(error_response(classify_db_error(e))),
-    };
+    // Fetch the existing proxy row once so we can:
+    //   1. Exclude the spec's own upstream from the name-uniqueness check
+    //      (PUT with unchanged name must not self-collide).
+    //   2. Detect listen_port / transport changes for the port-probe
+    //      skip-on-unchanged logic (Fix 2).
+    // Use the *stored* upstream_id — NOT the bundle's post-assignment
+    // upstream.id, which can be operator-changed.
+    let existing_proxy_row: Option<crate::config::types::Proxy> =
+        match db.get_proxy(&existing_spec.proxy_id).await {
+            Ok(p) => p,
+            Err(e) => return Ok(error_response(classify_db_error(e))),
+        };
+    let existing_upstream_id: Option<&str> = existing_proxy_row
+        .as_ref()
+        .and_then(|p| p.upstream_id.as_deref());
 
     let ValidatedBundle { bundle, metadata } = match validate_bundle(
         bundle,
@@ -1364,7 +1439,8 @@ pub async fn handle_put_api_spec(
         db.as_ref(),
         state,
         Some(&existing_spec.proxy_id),
-        existing_upstream_id.as_deref(),
+        existing_upstream_id,
+        existing_proxy_row.as_ref(),
     )
     .await
     {

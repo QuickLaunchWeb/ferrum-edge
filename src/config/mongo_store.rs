@@ -754,6 +754,16 @@ mod inner {
 
         async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+
+            // Capture upstream_id BEFORE deleting the proxy so we can cascade-delete
+            // the upstream if it becomes orphaned.  Mirrors SQL delete_proxy which
+            // SELECTs upstream_id inside the transaction before issuing DELETE.
+            let upstream_id_to_check: Option<String> = self
+                .proxies()
+                .find_one(doc! { "_id": id })
+                .await?
+                .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
+
             // Also remove associated plugin_config entries scoped to this proxy
             self.plugin_configs()
                 .delete_many(doc! { "proxy_id": id })
@@ -776,6 +786,25 @@ mod inner {
                             "delete_proxy: failed to delete api_specs for proxy {}: {}",
                             id, e
                         );
+                    }
+                }
+
+                // Mirror SQL delete_proxy: if the proxy referenced an upstream,
+                // delete the upstream when no other proxy still references it.
+                if let Some(ref uid) = upstream_id_to_check {
+                    let still_referenced = self
+                        .proxies()
+                        .count_documents(doc! { "upstream_id": uid })
+                        .await?
+                        > 0;
+                    if !still_referenced {
+                        info!("Cascade-deleting orphaned upstream {}", uid);
+                        if let Err(e) = self.upstreams().delete_one(doc! { "_id": uid }).await {
+                            warn!(
+                                "delete_proxy: failed to delete orphaned upstream {}: {}",
+                                uid, e
+                            );
+                        }
                     }
                 }
             }
