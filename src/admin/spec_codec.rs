@@ -26,10 +26,37 @@ pub fn compress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
 ///
 /// Returns the original uncompressed bytes. Used when the admin API needs
 /// to serve the raw spec to a client (e.g., `GET /api-specs/:id/raw`).
+///
+/// No output cap is applied; callers that wish to guard against corrupt or
+/// adversarially crafted entries (e.g. a bomb ratio row from the DB) should
+/// use [`decompress_gzip_capped`] instead.
 pub fn decompress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut decoder = GzDecoder::new(input);
     let mut buf = Vec::new();
     decoder.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Decompress gzip-compressed `input` bytes, returning an error if the
+/// decompressed output would exceed `max_output` bytes.
+///
+/// # Errors
+///
+/// Returns an `io::Error` of kind `Other` with message
+/// `"decompressed size exceeds max_output cap"` when the limit is reached.
+/// The caller should surface this as a 500 with a generic
+/// `"spec content corrupt or oversized"` message — operators investigate via
+/// the DB directly.
+pub fn decompress_gzip_capped(input: &[u8], max_output: usize) -> std::io::Result<Vec<u8>> {
+    let decoder = GzDecoder::new(input);
+    let mut buf = Vec::new();
+    decoder.take(max_output as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > max_output {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "decompressed size exceeds max_output cap",
+        ));
+    }
     Ok(buf)
 }
 
@@ -46,7 +73,7 @@ pub fn sha256_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compress_gzip, decompress_gzip, sha256_hex};
+    use super::{compress_gzip, decompress_gzip, decompress_gzip_capped, sha256_hex};
 
     #[test]
     fn roundtrip_preserves_bytes() {
@@ -116,5 +143,40 @@ mod tests {
         let a = sha256_hex(b"hello");
         let b = sha256_hex(b"world");
         assert_ne!(a, b, "different inputs must produce different digests");
+    }
+
+    /// Compressing a large block of zeros produces a tiny gzip stream.
+    /// `decompress_gzip_capped` with a cap smaller than the decompressed size
+    /// must return an error.  This guards against bomb-ratio rows in the DB
+    /// expanding to GB on every admin GET (M3).
+    #[test]
+    fn decompress_caps_oversized_output() {
+        // 4 MiB of zeros — compresses to ~a few KB.
+        let input: Vec<u8> = vec![0u8; 4 * 1024 * 1024];
+        let compressed = compress_gzip(&input).expect("compress failed");
+
+        // Cap at 1 MiB — the decompressed output (4 MiB) exceeds the cap.
+        let cap = 1 * 1024 * 1024;
+        let result = decompress_gzip_capped(&compressed, cap);
+        assert!(
+            result.is_err(),
+            "decompress_gzip_capped must error when decompressed size exceeds cap"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max_output cap"),
+            "error message must mention cap; got: {err}"
+        );
+    }
+
+    /// `decompress_gzip_capped` with a cap at or above the decompressed size
+    /// must succeed and return the full bytes.
+    #[test]
+    fn decompress_capped_within_limit_succeeds() {
+        let input = b"hello, ferrum-edge spec!";
+        let compressed = compress_gzip(input).expect("compress failed");
+        let result =
+            decompress_gzip_capped(&compressed, 1024).expect("decompress within cap must succeed");
+        assert_eq!(result, input);
     }
 }

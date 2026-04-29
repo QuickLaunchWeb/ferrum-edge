@@ -625,9 +625,9 @@ pub async fn handle_admin_request(
         }
         (Method::DELETE, ["api-specs", id]) => {
             let id = id.to_string();
-            // DELETE has no body; consume remainder via a throw-away read before
-            // handing off, so hyper's connection stays healthy.
-            let _ = req.into_body();
+            // DELETE should have no body. Drop the receiver so hyper discards
+            // any remaining bytes via Drop without buffering them in userspace.
+            drop(req.into_body());
             return api_specs::handlers::handle_delete_api_spec(&state, &namespace, &id).await;
         }
         _ => {}

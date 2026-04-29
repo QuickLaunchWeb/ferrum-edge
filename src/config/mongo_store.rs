@@ -2225,31 +2225,96 @@ mod inner {
                 .and_then(|d| d.get_str("proxy_id").ok())
                 .map(str::to_string);
 
-            // Delete leaf-first.
-            // 1. Spec-owned plugin_configs.
-            let _ = self
-                .plugin_configs()
-                .delete_many(doc! { "api_spec_id": id })
-                .await;
-            // 2. The proxy (also removes any proxy-scoped plugins not tagged with api_spec_id,
-            //    since Mongo's delete_proxy cleans them up by proxy_id).
-            if let Some(ref pid) = proxy_id {
-                let _ = self
+            if self.replica_set_configured() {
+                // With a replica set: use a multi-document transaction so that a
+                // partial failure does not leave orphaned proxy/upstream/plugin rows.
+                // Mirrors `submit_api_spec_bundle` and `replace_api_spec_bundle`.
+                let mut session = self.client.start_session().await?;
+                session.start_transaction().await?;
+
+                // 1. Spec-owned plugin_configs.
+                self.plugin_configs()
+                    .delete_many(doc! { "api_spec_id": id })
+                    .session(&mut session)
+                    .await?;
+                // 2. All plugin_configs attached to the proxy (catches proxy-scoped
+                //    plugins that were added after spec creation and are not tagged
+                //    with api_spec_id).
+                if let Some(ref pid) = proxy_id {
+                    self.plugin_configs()
+                        .delete_many(doc! { "proxy_id": pid })
+                        .session(&mut session)
+                        .await?;
+                    self.proxies()
+                        .delete_one(doc! { "_id": pid })
+                        .session(&mut session)
+                        .await?;
+                }
+                // 3. Spec-owned upstreams.
+                self.upstreams()
+                    .delete_many(doc! { "api_spec_id": id })
+                    .session(&mut session)
+                    .await?;
+                // 4. The spec row itself.
+                self.api_specs()
+                    .delete_one(doc! { "_id": id })
+                    .session(&mut session)
+                    .await?;
+
+                session.commit_transaction().await?;
+            } else {
+                // No replica set: best-effort deletes.  Log failures as warnings so
+                // operators can detect partial-delete orphans; the function still
+                // returns Ok(true) so the caller knows the spec was found and the
+                // attempt was made.  Production MongoDB deployments should use a
+                // replica set (see FERRUM_MONGO_REPLICA_SET).
+                if let Err(e) = self
                     .plugin_configs()
-                    .delete_many(doc! { "proxy_id": pid })
-                    .await;
-                let _ = self.proxies().delete_one(doc! { "_id": pid }).await;
+                    .delete_many(doc! { "api_spec_id": id })
+                    .await
+                {
+                    warn!(
+                        "delete_api_spec: failed to delete spec-owned plugin_configs for \
+                         spec {}: {}",
+                        id, e
+                    );
+                }
+                if let Some(ref pid) = proxy_id {
+                    if let Err(e) = self
+                        .plugin_configs()
+                        .delete_many(doc! { "proxy_id": pid })
+                        .await
+                    {
+                        warn!(
+                            "delete_api_spec: failed to delete proxy-scoped plugin_configs for \
+                             proxy {}: {}",
+                            pid, e
+                        );
+                    }
+                    if let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await {
+                        warn!(
+                            "delete_api_spec: failed to delete proxy {} for spec {}: {}",
+                            pid, id, e
+                        );
+                    }
+                }
+                if let Err(e) = self
+                    .upstreams()
+                    .delete_many(doc! { "api_spec_id": id })
+                    .await
+                {
+                    warn!(
+                        "delete_api_spec: failed to delete spec-owned upstreams for spec {}: {}",
+                        id, e
+                    );
+                }
+                // The spec row deletion is the one we must succeed on — if this fails
+                // the spec appears to still exist, which is worse than an orphan.
+                self.api_specs().delete_one(doc! { "_id": id }).await?;
             }
-            // 3. Spec-owned upstreams.
-            let _ = self
-                .upstreams()
-                .delete_many(doc! { "api_spec_id": id })
-                .await;
-            // 4. The spec row itself.
-            let result = self.api_specs().delete_one(doc! { "_id": id }).await?;
 
             self.check_slow_query("delete_api_spec", start);
-            Ok(result.deleted_count > 0)
+            Ok(true)
         }
     }
 

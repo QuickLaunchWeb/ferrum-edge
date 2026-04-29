@@ -430,10 +430,21 @@ async fn post_with_x_ferrum_consumers_returns_400_with_code() {
     });
 
     let (status, body) = client.post_json("/api-specs", &spec).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
+    // ConsumerExtensionNotAllowed is a semantic violation → 422 (L5 fix).
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {body}"
+    );
     assert_eq!(
         body["code"].as_str().unwrap_or(""),
         "ConsumerExtensionNotAllowed"
+    );
+    // Body shape must be consistent with other extract errors.
+    assert!(body["error"].is_string(), "body must have 'error' field");
+    assert!(
+        body["details"].is_string(),
+        "body must have 'details' field"
     );
 }
 
@@ -463,7 +474,12 @@ async fn post_with_plugin_scope_global_returns_400() {
     });
 
     let (status, body) = client.post_json("/api-specs", &spec).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
+    // PluginInvalidScope is a semantic violation → 422 (L5 fix).
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {body}"
+    );
     assert_eq!(body["code"].as_str().unwrap_or(""), "PluginInvalidScope");
 }
 
@@ -3229,6 +3245,12 @@ async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() 
         put_status,
         reqwest::StatusCode::UNPROCESSABLE_ENTITY,
         "expected 422 for ambiguous same-name different-config plugins; body: {put_body}"
+    );
+    // spec_version must be populated — previously this was String::new() (M2 fix).
+    let sv = put_body["spec_version"].as_str().unwrap_or("");
+    assert!(
+        sv.starts_with("3."),
+        "spec_version must be non-empty and start with '3.' (got '{sv}'); body: {put_body}"
     );
     let failures = put_body["failures"].as_array().expect("failures array");
     assert!(

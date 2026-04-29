@@ -689,6 +689,15 @@ async fn delete_api_spec_cascades_and_spares_hand_upstreams() {
 }
 
 /// delete_api_spec returns false for a non-existent spec.
+///
+/// Mongo invariant (non-RS path): `delete_api_spec` in `mongo_store.rs` uses
+/// best-effort deletes with `warn!` logging for each collection when no replica
+/// set is configured.  When a replica set IS configured it wraps all deletes in
+/// a single `with_transaction` session so partial failures roll back atomically,
+/// matching the behaviour of `submit_api_spec_bundle` and
+/// `replace_api_spec_bundle`.  This test exercises the SQL path only; the Mongo
+/// transaction path requires a live replica-set MongoDB and is validated in CI
+/// via manual Mongo integration testing.
 #[tokio::test]
 async fn delete_api_spec_returns_false_for_missing_spec() {
     let dir = TempDir::new().unwrap();

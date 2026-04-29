@@ -714,6 +714,55 @@ impl DatabaseStore {
         Ok(configs)
     }
 
+    // ---- Proxy INSERT SQL helpers ----
+    //
+    // The column list for a proxy INSERT appears in three places:
+    //   1. `create_proxy`           — direct admin POST /proxies
+    //   2. `batch_create_proxies_chunk` — bulk import
+    //   3. `submit_api_spec_bundle` — spec-owned INSERT (adds `api_spec_id` column)
+    //
+    // Sites 1 and 2 share `PROXY_INSERT_SQL` (no api_spec_id).
+    // Site 3 uses `PROXY_INSERT_WITH_SPEC_SQL` (adds api_spec_id before created_at).
+    //
+    // IMPORTANT: when adding a new column to `proxies`, update BOTH constants and
+    // the corresponding `.bind()` chains in all three call sites.  The direct-admin
+    // `update_proxy` (also in this file) and `replace_api_spec_bundle` UPDATE paths
+    // are separate SQL strings and must be updated independently.
+    //
+    // NOTE: `submit_api_spec_bundle` uses a literal multi-line query string with
+    // `\` continuation rather than this const because it adds the `api_spec_id`
+    // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
+    // If/when the column set diverges further, consider a `bind_proxy_base_columns`
+    // free function that takes `sqlx::query::Query<sqlx::Any, _>` — see the M5
+    // discussion in the PR review notes for the trade-off (the sqlx::Any generic
+    // makes fully-generic helpers verbose; the const approach below is lighter).
+
+    /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
+    ///
+    /// Note: the `?` placeholder is rewritten to `$N` for PostgreSQL by `self.q()`.
+    /// Any new column must be appended in the same position in `PROXY_INSERT_SQL`
+    /// and the corresponding `.bind()` chain.
+    const PROXY_INSERT_SQL: &'static str = "\
+        INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, \
+         backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, \
+         backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, \
+         backend_tls_client_cert_path, backend_tls_client_key_path, \
+         backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, \
+         dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, \
+         circuit_breaker, retry, response_body_mode, \
+         pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, \
+         pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, \
+         pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, \
+         pool_http2_initial_connection_window_size, pool_http2_adaptive_window, \
+         pool_http2_max_frame_size, pool_http2_max_concurrent_streams, \
+         pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, \
+         udp_idle_timeout_seconds, tcp_idle_timeout_seconds, \
+         allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+         created_at, updated_at) \
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                ?, ?)";
+
     // ---- CRUD for Admin API ----
 
     pub async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
@@ -737,58 +786,101 @@ impl DatabaseStore {
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
-        sqlx::query(
-            &self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        )
-        .bind(&proxy.id)
-        .bind(&proxy.namespace)
-        .bind(&proxy.name)
-        .bind(&hosts_json)
-        .bind(&proxy.listen_path)
-        .bind(proxy.effective_scheme().to_scheme_str())
-        .bind(&proxy.backend_host)
-        .bind(proxy.backend_port as i32)
-        .bind(&proxy.backend_path)
-        .bind(if proxy.strip_listen_path { 1i32 } else { 0 })
-        .bind(if proxy.preserve_host_header { 1i32 } else { 0 })
-        .bind(proxy.backend_connect_timeout_ms as i64)
-        .bind(proxy.backend_read_timeout_ms as i64)
-        .bind(proxy.backend_write_timeout_ms as i64)
-        .bind(&proxy.backend_tls_client_cert_path)
-        .bind(&proxy.backend_tls_client_key_path)
-        .bind(if proxy.backend_tls_verify_server_cert { 1i32 } else { 0 })
-        .bind(&proxy.backend_tls_server_ca_cert_path)
-        .bind(&proxy.dns_override)
-        .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
-        .bind(match proxy.auth_mode { AuthMode::Multi => "multi", _ => "single" })
-        .bind(&proxy.upstream_id)
-        .bind(&circuit_breaker_json)
-        .bind(&retry_json)
-        .bind(response_body_mode_str)
-        .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
-        .bind(proxy.pool_enable_http_keep_alive.map(|v| if v { 1i32 } else { 0 }))
-        .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
-        .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
-        .bind(proxy.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
-        .bind(proxy.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
-        .bind(proxy.pool_http2_initial_stream_window_size.map(|v| v as i64))
-        .bind(proxy.pool_http2_initial_connection_window_size.map(|v| v as i64))
-        .bind(proxy.pool_http2_adaptive_window.map(|v| if v { 1i32 } else { 0 }))
-        .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
-        .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
-        .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
-        .bind(proxy.listen_port.map(|v| v as i32))
-        .bind(if proxy.frontend_tls { 1i32 } else { 0 })
-        .bind(if proxy.passthrough { 1i32 } else { 0 })
-        .bind(proxy.udp_idle_timeout_seconds as i64)
-        .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
-        .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
-        .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
-        .bind(proxy.created_at.to_rfc3339())
-        .bind(proxy.updated_at.to_rfc3339())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(&self.q(Self::PROXY_INSERT_SQL))
+            .bind(&proxy.id)
+            .bind(&proxy.namespace)
+            .bind(&proxy.name)
+            .bind(&hosts_json)
+            .bind(&proxy.listen_path)
+            .bind(proxy.effective_scheme().to_scheme_str())
+            .bind(&proxy.backend_host)
+            .bind(proxy.backend_port as i32)
+            .bind(&proxy.backend_path)
+            .bind(if proxy.strip_listen_path { 1i32 } else { 0 })
+            .bind(if proxy.preserve_host_header { 1i32 } else { 0 })
+            .bind(proxy.backend_connect_timeout_ms as i64)
+            .bind(proxy.backend_read_timeout_ms as i64)
+            .bind(proxy.backend_write_timeout_ms as i64)
+            .bind(&proxy.backend_tls_client_cert_path)
+            .bind(&proxy.backend_tls_client_key_path)
+            .bind(if proxy.backend_tls_verify_server_cert {
+                1i32
+            } else {
+                0
+            })
+            .bind(&proxy.backend_tls_server_ca_cert_path)
+            .bind(&proxy.dns_override)
+            .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
+            .bind(match proxy.auth_mode {
+                AuthMode::Multi => "multi",
+                _ => "single",
+            })
+            .bind(&proxy.upstream_id)
+            .bind(&circuit_breaker_json)
+            .bind(&retry_json)
+            .bind(response_body_mode_str)
+            .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                proxy
+                    .pool_enable_http_keep_alive
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+            .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
+            .bind(
+                proxy
+                    .pool_http2_keep_alive_interval_seconds
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_keep_alive_timeout_seconds
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_initial_stream_window_size
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_initial_connection_window_size
+                    .map(|v| v as i64),
+            )
+            .bind(
+                proxy
+                    .pool_http2_adaptive_window
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
+            .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
+            .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
+            .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
+            .bind(proxy.listen_port.map(|v| v as i32))
+            .bind(if proxy.frontend_tls { 1i32 } else { 0 })
+            .bind(if proxy.passthrough { 1i32 } else { 0 })
+            .bind(proxy.udp_idle_timeout_seconds as i64)
+            .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
+            .bind(
+                proxy
+                    .allowed_methods
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .bind(if proxy.allowed_ws_origins.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&proxy.allowed_ws_origins)?)
+            })
+            .bind(
+                proxy
+                    .udp_max_response_amplification_factor
+                    .map(|v| v as f64),
+            )
+            .bind(proxy.created_at.to_rfc3339())
+            .bind(proxy.updated_at.to_rfc3339())
+            .execute(&mut *tx)
+            .await?;
 
         // Persist plugin associations in the junction table
         for assoc in &proxy.plugins {
@@ -2452,7 +2544,7 @@ impl DatabaseStore {
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let insert_sql = self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let insert_sql = self.q(Self::PROXY_INSERT_SQL);
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -3272,6 +3364,12 @@ impl DatabaseStore {
         }
 
         // 2. INSERT proxy, tagged with api_spec_id.
+        //
+        // This SQL differs from `Self::PROXY_INSERT_SQL` only by the addition of
+        // the `api_spec_id` column before `created_at`.  When adding a new column
+        // to `proxies`, update BOTH this query AND `Self::PROXY_INSERT_SQL` (and
+        // the corresponding `.bind()` chains in `create_proxy`, `batch_create_proxies_chunk`,
+        // and the `replace_api_spec_bundle` UPDATE path).
         {
             let p = &bundle.proxy;
             let hosts_json = serde_json::to_string(&p.hosts)?;
@@ -3917,8 +4015,9 @@ impl DatabaseStore {
             // Tags are stored as a JSON text array e.g. `["foo","bar"]`.
             // We match with LIKE `%"tag_name"%` — this correctly handles the JSON
             // quote-wrapping without requiring JSON functions (cross-dialect).
-            // Tags containing '"' or '%' are rejected at extract time; see extractor.rs.
-            // This is a known limitation: tag names with quote chars would need escaping.
+            // Tags containing '"', '%', or '\' are rejected at extract time via
+            // `ExtractError::InvalidTagName` in extractor.rs, so no escaping is needed
+            // here.  MongoDB uses native array membership and is unaffected.
             conditions.push(r#"tags LIKE ?"#);
             has_tag_val = Some(format!("%\"{}\"", tag) + "%");
         }

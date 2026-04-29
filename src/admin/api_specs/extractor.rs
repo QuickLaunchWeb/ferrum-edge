@@ -105,6 +105,14 @@ pub enum ExtractError {
         proxy_upstream_id: String,
         spec_upstream_id: String,
     },
+    /// Tag name contains a character that would cause false LIKE matches in the
+    /// SQL `has_tag` filter (`"`, `%`, or `\`).  Tag names with these characters
+    /// are rejected at extraction time rather than escaping them at query time,
+    /// because tag names are short identifiers and these characters have no
+    /// legitimate use in them.  See `db_loader.rs` `list_api_specs` `has_tag`
+    /// branch for the matching LIKE pattern.
+    #[error("tag '{name}' contains forbidden character '{char}' (\", %, or \\\\)")]
+    InvalidTagName { name: String, char: char },
 }
 
 // ---------------------------------------------------------------------------
@@ -187,20 +195,39 @@ pub fn extract(
     let version = detect_version(&root)?;
 
     // --- info.title / info.version ---------------------------------------
+    // Both fields are truncated at UTF-8 character boundaries so an operator
+    // with a 25 MiB spec cannot store a 1 MiB title or version string.
+    // `description` was already bounded to 4096 bytes in `extract_spec_metadata`.
     let title = root
         .get("info")
         .and_then(|i| i.get("title"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| truncate_utf8(s, 1024)); // titles are short identifiers
 
     let info_version = root
         .get("info")
         .and_then(|i| i.get("version"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| truncate_utf8(s, 256)); // version strings are short
 
     // --- Tier 1 metadata (Wave 5) ----------------------------------------
     let tier1 = extract_spec_metadata(&root, &version);
+
+    // --- Tag name validation ---------------------------------------------
+    // SQL `has_tag` filter uses LIKE `%"tag_name"%`.  Tag names containing
+    // `"`, `%`, or `\` would cause false positives or break the pattern.
+    // We reject them at extract time rather than escaping at query time;
+    // these characters are not valid in well-formed tag identifiers.
+    for tag in &tier1.tags {
+        for ch in ['"', '%', '\\'] {
+            if tag.contains(ch) {
+                return Err(ExtractError::InvalidTagName {
+                    name: tag.clone(),
+                    char: ch,
+                });
+            }
+        }
+    }
 
     // --- x-ferrum-consumers guard ----------------------------------------
     if root.get("x-ferrum-consumers").is_some() {
@@ -619,6 +646,16 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
     Err(ExtractError::UnknownVersion)
 }
 
+/// Maximum recursion depth for [`find_forbidden_key`].
+///
+/// serde_yaml's own parser enforces a depth limit of ~128 for the YAML
+/// document. We set an explicit, lower limit here (32) so the contract
+/// is documented in code rather than relying on the parser's internal
+/// behaviour.  Configs nested deeper than 32 levels are rejected with a
+/// synthetic `"__depth_exceeded__"` sentinel, causing the spec to be
+/// rejected at extract time (fail-closed).
+const MAX_FORBIDDEN_KEY_SCAN_DEPTH: usize = 32;
+
 /// Recursively walk a JSON value and return the first key whose name appears
 /// in [`FORBIDDEN_CONFIG_KEYS`], or `None` if the value is clean.
 ///
@@ -626,7 +663,20 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
 /// The walk is on the plugin's `config` VALUE only, not on the plugin
 /// metadata fields (`plugin_name`, `scope`, etc.), so legitimate auth plugins
 /// (`plugin_name: "jwt"`) are not falsely flagged.
+///
+/// Recursion is bounded by [`MAX_FORBIDDEN_KEY_SCAN_DEPTH`].  When the depth
+/// limit is reached the function returns `Some("__depth_exceeded__")` so the
+/// spec is rejected (fail-closed), consistent with discovering a real
+/// forbidden key.
 fn find_forbidden_key(value: &serde_json::Value) -> Option<&'static str> {
+    find_forbidden_key_depth(value, MAX_FORBIDDEN_KEY_SCAN_DEPTH)
+}
+
+fn find_forbidden_key_depth(value: &serde_json::Value, depth: usize) -> Option<&'static str> {
+    if depth == 0 {
+        // Fail closed: treat excessively nested config as forbidden.
+        return Some("__depth_exceeded__");
+    }
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
@@ -635,7 +685,7 @@ fn find_forbidden_key(value: &serde_json::Value) -> Option<&'static str> {
                     return Some(found);
                 }
                 // Recurse into the child value.
-                if let Some(found) = find_forbidden_key(child) {
+                if let Some(found) = find_forbidden_key_depth(child, depth - 1) {
                     return Some(found);
                 }
             }
@@ -643,7 +693,7 @@ fn find_forbidden_key(value: &serde_json::Value) -> Option<&'static str> {
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Some(found) = find_forbidden_key(item) {
+                if let Some(found) = find_forbidden_key_depth(item, depth - 1) {
                     return Some(found);
                 }
             }
@@ -1297,6 +1347,35 @@ x-ferrum-proxy:
     }
 
     // -----------------------------------------------------------------------
+    // L2 — find_forbidden_key depth limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_forbidden_key_depth_limit() {
+        // Build a 50-level-deep nested object whose innermost value is
+        // {"keyauth": {}}.  The scan must stop at MAX_FORBIDDEN_KEY_SCAN_DEPTH (32)
+        // and return Some("__depth_exceeded__"), rejecting the spec before it
+        // reaches the keyauth key at depth 50.
+        let mut inner = serde_json::json!({ "keyauth": {} });
+        for _ in 0..50 {
+            inner = serde_json::json!({ "nested": inner });
+        }
+
+        let result = find_forbidden_key(&inner);
+        assert!(
+            result.is_some(),
+            "deeply nested config must be rejected (fail-closed)"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "__depth_exceeded__",
+            "depth limit must fire before finding keyauth at depth 50 \
+             (limit is {})",
+            MAX_FORBIDDEN_KEY_SCAN_DEPTH
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Fix 1: ID assignment is deferred to the route handler (extractor
     // leaves empty IDs empty; handler calls assign_ids_for_post /
     // assign_ids_for_put). The extractor only does auto-linking with
@@ -1512,5 +1591,126 @@ x-ferrum-proxy:
             "newly imported plugin must be added"
         );
         assert_eq!(ids.len(), 2, "no duplicates");
+    }
+
+    // -----------------------------------------------------------------------
+    // M1 — Tag name validation (reject forbidden SQL LIKE characters)
+    // -----------------------------------------------------------------------
+
+    fn spec_with_tag(tag: &str) -> String {
+        format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "tags": [{{"name": "{tag}"}}],
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        )
+    }
+
+    #[test]
+    fn test_tag_with_percent_rejected() {
+        let spec = spec_with_tag("foo%bar");
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidTagName { name, char: '%' } if name == "foo%bar"),
+            "expected InvalidTagName for '%'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tag_with_quote_rejected() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "tags": [{{"name": "foo\"bar"}}],
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidTagName { char: '"', .. }),
+            "expected InvalidTagName for '\"'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tag_with_backslash_rejected() {
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "1"}},
+                "tags": [{{"name": "foo\\\\bar"}}],
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidTagName { char: '\\', .. }),
+            "expected InvalidTagName for '\\\\'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tag_with_normal_chars_accepted() {
+        let spec = spec_with_tag("my-tag_v1.0");
+        // Must not error.
+        let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum")
+            .expect("tag with normal chars must be accepted");
+        assert!(meta.tags.contains(&"my-tag_v1.0".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // L3 — title and info_version truncation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_title_truncated_to_1024_bytes() {
+        // Construct a title that is 2048 ASCII characters long.
+        let long_title: String = "A".repeat(2048);
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "{long_title}", "version": "1.0"}},
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum")
+            .expect("extract with long title must succeed");
+        let title = meta.title.expect("title must be present");
+        assert_eq!(
+            title.len(),
+            1024,
+            "title must be truncated to 1024 bytes; got {} bytes",
+            title.len()
+        );
+    }
+
+    #[test]
+    fn test_info_version_truncated_to_256_bytes() {
+        // Construct a version string that is 1024 ASCII characters long.
+        let long_ver: String = "1".repeat(1024);
+        let spec = format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{"title": "T", "version": "{long_ver}"}},
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum")
+            .expect("extract with long info_version must succeed");
+        let iv = meta.info_version.expect("info_version must be present");
+        assert_eq!(
+            iv.len(),
+            256,
+            "info_version must be truncated to 256 bytes; got {} bytes",
+            iv.len()
+        );
     }
 }

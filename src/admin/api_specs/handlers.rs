@@ -115,8 +115,14 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
         ApiSpecError::BadRequest(msg) => json_resp(StatusCode::BAD_REQUEST, &json!({"error": msg})),
         ApiSpecError::Extract(e) => {
             let code = extract_error_code(&e);
+            // Parse-time errors (syntactically invalid or structurally missing
+            // required fields) → 400 Bad Request.
+            // Semantic-violation errors (valid structure but forbidden by
+            // Ferrum policy) → 422 Unprocessable Entity, matching how the
+            // ValidationFailures path behaves.
+            let status = extract_error_status(&e);
             json_resp(
-                StatusCode::BAD_REQUEST,
+                status,
                 &json!({
                     "error": "Spec parse failed",
                     "code": code,
@@ -177,6 +183,33 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::PluginProxyIdMismatch { .. } => "PluginProxyIdMismatch",
         ExtractError::PluginContainsCredentials { .. } => "PluginContainsCredentials",
         ExtractError::ProxyUpstreamIdMismatch { .. } => "ProxyUpstreamIdMismatch",
+        ExtractError::InvalidTagName { .. } => "InvalidTagName",
+    }
+}
+
+/// HTTP status code for an `ExtractError`.
+///
+/// Parse-time / structural errors → 400 Bad Request (the document is malformed
+/// or missing required fields at the syntax level).
+///
+/// Semantic-violation errors → 422 Unprocessable Entity (the document is
+/// syntactically valid but violates Ferrum policy rules, just like
+/// `ValidationFailures` which already returns 422).
+fn extract_error_status(e: &ExtractError) -> StatusCode {
+    match e {
+        // Parse-time / structural: 400
+        ExtractError::InvalidJson(_)
+        | ExtractError::InvalidYaml(_)
+        | ExtractError::UnknownVersion
+        | ExtractError::MissingProxyExtension
+        | ExtractError::MalformedExtension { .. } => StatusCode::BAD_REQUEST,
+        // Semantic violations: 422
+        ExtractError::ConsumerExtensionNotAllowed
+        | ExtractError::PluginInvalidScope { .. }
+        | ExtractError::PluginProxyIdMismatch { .. }
+        | ExtractError::PluginContainsCredentials { .. }
+        | ExtractError::ProxyUpstreamIdMismatch { .. }
+        | ExtractError::InvalidTagName { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -218,27 +251,196 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 /// Returns the `SpecFormat` the caller should use to serialise the body.
 ///
 /// Rules:
-/// - `Accept: */*, missing, or matching stored format` → stored format
-/// - `Accept: application/json` and stored is YAML     → Json (convert)
-/// - `Accept: application/yaml` and stored is JSON     → Yaml (convert)
-/// - Unknown accept types                              → stored format (best-effort)
+/// - Missing, `*/*`, or matching stored format → stored format
+/// - `application/json` and stored is YAML     → Json (convert)
+/// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
+/// - Unknown accept types                       → stored format (best-effort)
+///
+/// Uses a small media-range parser: splits on `,`, strips `q=` quality
+/// parameters, trims whitespace, and compares exact tokens.  Wildcards
+/// (`*/*`, `application/*`) accept the stored format.  Highest-quality
+/// match wins; ties resolve to the first listed entry.
 pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -> SpecFormat {
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("*/*");
+        .unwrap_or("");
 
-    // Very lightweight; we only care about top-level type tokens.
-    let wants_json = accept.contains("application/json");
-    let wants_yaml = accept.contains("application/yaml")
-        || accept.contains("application/x-yaml")
-        || accept.contains("text/yaml")
-        || accept.contains("text/x-yaml");
+    if accept.is_empty() {
+        return stored;
+    }
 
-    match (wants_json, wants_yaml, stored) {
-        (true, false, SpecFormat::Yaml) => SpecFormat::Json,
-        (false, true, SpecFormat::Json) => SpecFormat::Yaml,
-        _ => stored,
+    /// Quality weight for a media range, parsed from `;q=N.NNN`.
+    /// Returns a value in `[0, 1000]` (1000 = q=1.0, default).
+    fn parse_quality(params: &str) -> u32 {
+        for param in params.split(';') {
+            let p = param.trim();
+            if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                // Parse up to 3 decimal places; clamp to [0, 1000].
+                if let Ok(f) = rest.parse::<f64>() {
+                    return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
+                }
+            }
+        }
+        1000 // default q=1.0
+    }
+
+    let mut best_json: Option<u32> = None;
+    let mut best_yaml: Option<u32> = None;
+    let mut best_wildcard: Option<u32> = None;
+    let mut best_stored: Option<u32> = None;
+
+    for entry in accept.split(',') {
+        // Split type/subtype from parameters.
+        let mut parts = entry.splitn(2, ';');
+        let media_type = parts.next().unwrap_or("").trim();
+        let params = parts.next().unwrap_or("");
+        let q = parse_quality(params);
+
+        match media_type {
+            "*/*" | "application/*" => {
+                if best_wildcard.map_or(true, |prev| q > prev) {
+                    best_wildcard = Some(q);
+                }
+            }
+            "application/json" => {
+                if best_json.map_or(true, |prev| q > prev) {
+                    best_json = Some(q);
+                }
+            }
+            "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
+                if best_yaml.map_or(true, |prev| q > prev) {
+                    best_yaml = Some(q);
+                }
+            }
+            m if m
+                == match stored {
+                    SpecFormat::Json => "application/json",
+                    SpecFormat::Yaml => "application/yaml",
+                } =>
+            {
+                if best_stored.map_or(true, |prev| q > prev) {
+                    best_stored = Some(q);
+                }
+            }
+            _ => {} // unknown media type — ignored
+        }
+    }
+
+    // Determine the best-quality format.
+    // Wildcard and "exact stored" both map to `stored`; they are treated
+    // together as the same outcome.
+    let stored_quality = best_stored.or(best_wildcard).unwrap_or(0);
+    let json_quality = best_json.unwrap_or(0);
+    let yaml_quality = best_yaml.unwrap_or(0);
+
+    // If no explicit preference was found, default to stored format.
+    if json_quality == 0 && yaml_quality == 0 && stored_quality == 0 {
+        return stored;
+    }
+
+    if json_quality >= yaml_quality && json_quality >= stored_quality {
+        SpecFormat::Json
+    } else if yaml_quality >= json_quality && yaml_quality >= stored_quality {
+        SpecFormat::Yaml
+    } else {
+        stored
+    }
+}
+
+#[cfg(test)]
+mod negotiate_accept_tests {
+    use super::*;
+
+    fn headers_with_accept(accept: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(
+            "accept",
+            hyper::header::HeaderValue::from_str(accept).unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn negotiate_accept_exact_json() {
+        let h = headers_with_accept("application/json");
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Yaml),
+            SpecFormat::Json,
+            "application/json must select JSON even when stored is YAML"
+        );
+    }
+
+    #[test]
+    fn negotiate_accept_exact_yaml() {
+        let h = headers_with_accept("application/yaml");
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Json),
+            SpecFormat::Yaml,
+            "application/yaml must select YAML even when stored is JSON"
+        );
+    }
+
+    #[test]
+    fn negotiate_accept_does_not_match_jsonpath_plus_json() {
+        // "application/jsonpath+json" contains "application/json" as a
+        // substring; the old `contains()` check would have matched it.
+        let h = headers_with_accept("application/jsonpath+json");
+        // Unknown media type → fall back to stored format.
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Yaml),
+            SpecFormat::Yaml,
+            "application/jsonpath+json must NOT trigger JSON negotiation"
+        );
+    }
+
+    #[test]
+    fn negotiate_accept_wildcard() {
+        let h = headers_with_accept("*/*");
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Yaml),
+            SpecFormat::Yaml,
+            "*/* must return stored format"
+        );
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Json),
+            SpecFormat::Json,
+            "*/* must return stored format"
+        );
+    }
+
+    #[test]
+    fn negotiate_accept_quality_ordering() {
+        // YAML at q=0.9, JSON at q=1.0 — JSON wins.
+        let h = headers_with_accept("application/yaml;q=0.9, application/json;q=1.0");
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Yaml),
+            SpecFormat::Json,
+            "highest-quality type must win"
+        );
+        // JSON at q=0.5, YAML at q=0.9 — YAML wins.
+        let h2 = headers_with_accept("application/json;q=0.5, application/yaml;q=0.9");
+        assert_eq!(
+            negotiate_accept(&h2, SpecFormat::Json),
+            SpecFormat::Yaml,
+            "highest-quality type must win"
+        );
+    }
+
+    #[test]
+    fn negotiate_accept_missing_or_empty_returns_stored_format() {
+        let empty = hyper::HeaderMap::new();
+        assert_eq!(
+            negotiate_accept(&empty, SpecFormat::Json),
+            SpecFormat::Json,
+            "missing Accept must return stored format"
+        );
+        let h = headers_with_accept("");
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Yaml),
+            SpecFormat::Yaml,
+            "empty Accept must return stored format"
+        );
     }
 }
 
@@ -422,6 +624,7 @@ async fn assign_ids_for_put(
     db: &Arc<dyn DatabaseBackend>,
     namespace: &str,
     existing_spec: &ApiSpec,
+    spec_version: &str,
 ) -> Result<(), ApiSpecError> {
     // If proxy.id is empty (operator did not supply one), fill it in from
     // the existing spec so the resource hash + immutability check work correctly.
@@ -513,7 +716,7 @@ async fn assign_ids_for_put(
         // structured error so operators learn to use explicit IDs.
         if *extracted_name_counts.get(&pc.plugin_name).unwrap_or(&0) > 1 {
             return Err(ApiSpecError::ValidationFailures {
-                spec_version: String::new(), // filled by caller if needed
+                spec_version: spec_version.to_string(),
                 failures: vec![ValidationFailure {
                     resource_type: "plugin",
                     id: proxy_id_snap.clone(),
@@ -1061,18 +1264,28 @@ fn build_spec_row(
 // Helper: build spec-fetch response with ETag + content negotiation
 // ---------------------------------------------------------------------------
 
+/// `max_decompress_bytes` is the upper bound on decompressed output bytes.
+/// Guards against corrupt or adversarially inflated DB rows.  Callers should
+/// pass `2 * admin_spec_max_body_size_mib * 1024 * 1024`.
 fn spec_content_response(
     spec: &ApiSpec,
     request_headers: &hyper::HeaderMap,
+    max_decompress_bytes: usize,
 ) -> Response<Full<Bytes>> {
-    // Decompress
-    let raw = match spec_codec::decompress_gzip(&spec.spec_content) {
+    // Decompress with an output cap.  A corrupted or bomb-ratio row from the
+    // DB would otherwise expand to GB on every admin GET.
+    let raw = match spec_codec::decompress_gzip_capped(&spec.spec_content, max_decompress_bytes) {
         Ok(b) => b,
         Err(e) => {
-            tracing::error!("decompress_gzip failed for spec {}: {}", spec.id, e);
+            tracing::error!(
+                "decompress_gzip_capped failed for spec {} (cap={} bytes): {}",
+                spec.id,
+                max_decompress_bytes,
+                e
+            );
             return json_resp(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &json!({"error": "Failed to decompress spec content"}),
+                &json!({"error": "spec content corrupt or oversized"}),
             );
         }
     };
@@ -1102,9 +1315,34 @@ fn spec_content_response(
         match convert_format(&raw, spec.spec_format, target_fmt) {
             Ok(converted) => (converted, content_type_for_format(target_fmt)),
             Err(e) => {
-                tracing::warn!("format conversion failed for spec {}: {}", spec.id, e);
-                // Serve raw in stored format rather than 500
-                (raw, content_type_for_format(spec.spec_format))
+                // Conversion failed — the stored document is corrupt or not valid
+                // in the stored format.  Return 406 so the caller knows the
+                // requested format is unavailable; silently serving the wrong
+                // Content-Type would confuse clients.
+                //
+                // Note: this path is hard to trigger in practice because
+                // documents are validated at submit time, but a DB row that was
+                // corrupted after storage or a future serialisation bug could
+                // reach here.
+                tracing::warn!(
+                    "format conversion ({:?} → {:?}) failed for spec {}: {}",
+                    spec.spec_format,
+                    target_fmt,
+                    spec.id,
+                    e
+                );
+                let stored_fmt_str = content_type_for_format(spec.spec_format);
+                let accepted_fmt_str = content_type_for_format(target_fmt);
+                return json_resp(
+                    StatusCode::NOT_ACCEPTABLE,
+                    &json!({
+                        "error": format!(
+                            "Cannot convert stored {} to requested {}; \
+                             accept the stored format or request raw bytes via Accept: */*",
+                            stored_fmt_str, accepted_fmt_str
+                        )
+                    }),
+                );
             }
         }
     };
@@ -1396,7 +1634,15 @@ pub async fn handle_put_api_spec(
     // Assign IDs for PUT: reuse existing stored IDs for empty-id resources so
     // re-submitting the same ID-less spec is idempotent (Fix 1). This must
     // happen BEFORE the proxy-id immutability check and hash comparison.
-    if let Err(e) = assign_ids_for_put(&mut bundle, db, namespace, &existing_spec).await {
+    if let Err(e) = assign_ids_for_put(
+        &mut bundle,
+        db,
+        namespace,
+        &existing_spec,
+        &metadata.version,
+    )
+    .await
+    {
         return Ok(error_response(e));
     }
 
@@ -1500,7 +1746,8 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    Ok(spec_content_response(&spec, req.headers()))
+    let max_decompress = 2 * state.admin_spec_max_body_size_mib * 1024 * 1024;
+    Ok(spec_content_response(&spec, req.headers(), max_decompress))
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,7 +1771,8 @@ pub async fn handle_get_api_spec_by_proxy(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    Ok(spec_content_response(&spec, req.headers()))
+    let max_decompress = 2 * state.admin_spec_max_body_size_mib * 1024 * 1024;
+    Ok(spec_content_response(&spec, req.headers(), max_decompress))
 }
 
 // ---------------------------------------------------------------------------
