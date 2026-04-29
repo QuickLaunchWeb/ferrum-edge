@@ -4645,41 +4645,14 @@ async fn handle_tls_connection(
     set_tcp_keepalive(&stream);
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let accept_fut = acceptor.accept(stream);
-    let accept_result = if state.env_config.frontend_tls_handshake_timeout_seconds > 0 {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(state.env_config.frontend_tls_handshake_timeout_seconds),
-            accept_fut,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    "TLS handshake timed out from {} after {}s",
-                    remote_addr.ip(),
-                    state.env_config.frontend_tls_handshake_timeout_seconds
-                );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "frontend TLS handshake timed out",
-                )
-                .into());
-            }
-        }
-    } else {
-        accept_fut.await
-    };
-    let tls_stream = match accept_result {
-        Ok(stream) => {
-            info!("TLS connection established from {}", remote_addr.ip());
-            stream
-        }
-        Err(e) => {
-            warn!("TLS handshake failed from {}: {}", remote_addr.ip(), e);
-            return Err(e.into());
-        }
-    };
+    let tls_stream = crate::tls::accept_with_optional_timeout(
+        &acceptor,
+        stream,
+        state.env_config.frontend_tls_handshake_timeout_seconds,
+        &remote_addr,
+    )
+    .await?;
+    info!("TLS connection established from {}", remote_addr.ip());
 
     // Extract peer certificate and chain before wrapping the stream.
     // This is the only point where the ServerConnection is accessible — once

@@ -40,6 +40,9 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 #[derive(Default)]
 pub struct UdpProxyMetrics {
     pub active_sessions: AtomicU64,
+    /// DTLS demux peers tracked by the frontend DTLS server. Includes peers
+    /// that have not completed the handshake yet.
+    pub dtls_demux_sessions: Arc<AtomicU64>,
     pub total_sessions: AtomicU64,
     pub datagrams_in: AtomicU64,
     pub datagrams_out: AtomicU64,
@@ -333,6 +336,8 @@ pub struct UdpListenerConfig {
     pub tls_no_verify: bool,
     /// Maximum concurrent sessions per proxy (from `FERRUM_UDP_MAX_SESSIONS`, default 10000).
     pub max_sessions: usize,
+    /// Frontend TLS/DTLS handshake timeout in seconds. 0 disables the deadline.
+    pub frontend_tls_handshake_timeout_seconds: u64,
     /// Session cleanup interval in seconds (from `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`, default 10).
     pub cleanup_interval_seconds: u64,
     pub plugin_cache: Arc<PluginCache>,
@@ -387,6 +392,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         frontend_dtls_config,
         tls_no_verify,
         max_sessions,
+        frontend_tls_handshake_timeout_seconds,
         cleanup_interval_seconds,
         plugin_cache,
         circuit_breaker_cache,
@@ -419,6 +425,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             dtls_config,
             tls_no_verify,
             max_sessions,
+            frontend_tls_handshake_timeout_seconds,
             plugin_cache,
             circuit_breaker_cache,
             crls,
@@ -1282,6 +1289,7 @@ async fn start_dtls_frontend_listener(
     dtls_config: crate::dtls::FrontendDtlsConfig,
     tls_no_verify: bool,
     max_sessions: usize,
+    frontend_tls_handshake_timeout_seconds: u64,
     plugin_cache: Arc<PluginCache>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     crls: crate::tls::CrlList,
@@ -1292,12 +1300,14 @@ async fn start_dtls_frontend_listener(
     let admission_overload = overload.clone();
     let dtls_limits = crate::dtls::DtlsServerLimits {
         max_sessions: Some(max_sessions),
+        handshake_timeout: (frontend_tls_handshake_timeout_seconds > 0)
+            .then_some(Duration::from_secs(frontend_tls_handshake_timeout_seconds)),
         allow_new_session: Some(Arc::new(move || {
             !admission_overload
                 .reject_new_connections
                 .load(Ordering::Relaxed)
         })),
-        ..crate::dtls::DtlsServerLimits::default()
+        active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
     };
     let server =
         Arc::new(crate::dtls::DtlsServer::bind_with_limits(addr, dtls_config, dtls_limits).await?);

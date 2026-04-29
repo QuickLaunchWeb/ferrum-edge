@@ -500,10 +500,20 @@ pub async fn handle_admin_request(
                 crate::overload::OverloadLevel::Pressure => StatusCode::OK,
                 crate::overload::OverloadLevel::Critical => StatusCode::SERVICE_UNAVAILABLE,
             };
-            return Ok(json_response(
-                status,
-                &serde_json::to_value(&snapshot).unwrap_or_default(),
-            ));
+            let mut snapshot_value = serde_json::to_value(&snapshot).unwrap_or_default();
+            if let Some(obj) = snapshot_value.as_object_mut() {
+                obj.insert(
+                    "stream_listeners".to_string(),
+                    serde_json::to_value(
+                        proxy_state
+                            .stream_listener_manager
+                            .overload_snapshot()
+                            .await,
+                    )
+                    .unwrap_or_default(),
+                );
+            }
+            return Ok(json_response(status, &snapshot_value));
         }
         return Ok(json_response(
             StatusCode::OK,

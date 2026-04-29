@@ -1424,41 +1424,24 @@ async fn handle_tcp_connection_inner(
     let mut used_splice = false;
     let copy_result = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        let accept_fut = acceptor.accept(client_stream);
-        let accept_result = if frontend_tls_handshake_timeout_seconds > 0 {
-            match tokio::time::timeout(
-                Duration::from_secs(frontend_tls_handshake_timeout_seconds),
-                accept_fut,
+        // Frontend TLS failures are client-side, so do not penalise the backend CB.
+        // Prefix is a shared constant so `pre_copy_disconnect_cause` can detect
+        // "frontend side" without drifting from the wording here.
+        let tls_stream = crate::tls::accept_with_optional_timeout(
+            &acceptor,
+            client_stream,
+            frontend_tls_handshake_timeout_seconds,
+            &remote_addr,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{} from {}: {}",
+                STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
+                remote_addr,
+                e
             )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "{} from {}: timed out after {}s",
-                        STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
-                        remote_addr,
-                        frontend_tls_handshake_timeout_seconds
-                    ));
-                }
-            }
-        } else {
-            accept_fut.await
-        };
-        let tls_stream = match accept_result {
-            Ok(s) => s,
-            Err(e) => {
-                // Frontend TLS failures are client-side — do not penalise the backend CB.
-                // Prefix is a shared constant so `pre_copy_disconnect_cause` can
-                // detect "frontend side" without drifting from the wording here.
-                return Err(anyhow::anyhow!(
-                    "{} from {}: {}",
-                    STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
-                    remote_addr,
-                    e
-                ));
-            }
-        };
+        })?;
 
         // Extract peer certificate DER from TLS handshake for plugin use.
         let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {

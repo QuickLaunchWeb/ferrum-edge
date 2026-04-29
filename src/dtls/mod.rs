@@ -12,7 +12,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -98,6 +98,9 @@ pub struct DtlsServerLimits {
     pub handshake_timeout: Option<Duration>,
     /// Optional gate checked before allocating per-peer handshake state.
     pub allow_new_session: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
+    /// Optional diagnostic mirror for surfaces that need to report demux state
+    /// outside this server object, such as the admin `/overload` endpoint.
+    pub active_session_mirror: Option<Arc<AtomicU64>>,
 }
 
 impl Default for DtlsServerLimits {
@@ -106,6 +109,7 @@ impl Default for DtlsServerLimits {
             max_sessions: None,
             handshake_timeout: Some(DEFAULT_DTLS_HANDSHAKE_TIMEOUT),
             allow_new_session: None,
+            active_session_mirror: None,
         }
     }
 }
@@ -467,10 +471,14 @@ struct DtlsSessionState {
 fn remove_session(
     sessions: &DashMap<SocketAddr, DtlsSessionState>,
     active_sessions: &AtomicUsize,
+    active_session_mirror: Option<&AtomicU64>,
     peer_addr: &SocketAddr,
 ) {
     if sessions.remove(peer_addr).is_some() {
-        active_sessions.fetch_sub(1, Ordering::AcqRel);
+        active_sessions.fetch_sub(1, Ordering::Relaxed);
+        if let Some(mirror) = active_session_mirror {
+            mirror.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -672,7 +680,12 @@ impl DtlsServer {
                 if session.incoming_tx.send(data).await.is_err() {
                     // Driver task exited — remove stale session
                     drop(session);
-                    remove_session(&self.sessions, &self.active_sessions, &peer_addr);
+                    remove_session(
+                        &self.sessions,
+                        &self.active_sessions,
+                        self.limits.active_session_mirror.as_deref(),
+                        &peer_addr,
+                    );
                 }
             } else {
                 // New client — spawn a session driver
@@ -704,7 +717,7 @@ impl DtlsServer {
                 match self.active_sessions.compare_exchange_weak(
                     current,
                     current + 1,
-                    Ordering::AcqRel,
+                    Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => break,
@@ -713,6 +726,9 @@ impl DtlsServer {
             }
         } else {
             self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(mirror) = self.limits.active_session_mirror.as_deref() {
+            mirror.fetch_add(1, Ordering::Relaxed);
         }
 
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -735,6 +751,7 @@ impl DtlsServer {
         let accept_tx = self.accept_tx.clone();
         let sessions = self.sessions.clone();
         let active_sessions = self.active_sessions.clone();
+        let active_session_mirror = self.limits.active_session_mirror.clone();
         let client_cert_verifier = self.client_cert_verifier.clone();
         let handshake_deadline = self
             .limits
@@ -768,7 +785,12 @@ impl DtlsServer {
             // Process the initial ClientHello packet
             if let Err(e) = dtls.handle_packet(&initial_packet) {
                 warn!(client = %peer_addr, "DTLS initial packet error: {}", e);
-                remove_session(&sessions, &active_sessions, &peer_addr);
+                remove_session(
+                    &sessions,
+                    &active_sessions,
+                    active_session_mirror.as_deref(),
+                    &peer_addr,
+                );
                 return;
             }
 
@@ -785,7 +807,12 @@ impl DtlsServer {
                 Ok(_) => {}
                 Err(e) => {
                     warn!(client = %peer_addr, "DTLS initial drain error: {}", e);
-                    remove_session(&sessions, &active_sessions, &peer_addr);
+                    remove_session(
+                        &sessions,
+                        &active_sessions,
+                        active_session_mirror.as_deref(),
+                        &peer_addr,
+                    );
                     return;
                 }
             }
@@ -892,7 +919,12 @@ impl DtlsServer {
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
                                 // Server shut down
-                                remove_session(&sessions, &active_sessions, &peer_addr);
+                                remove_session(
+                                    &sessions,
+                                    &active_sessions,
+                                    active_session_mirror.as_deref(),
+                                    &peer_addr,
+                                );
                                 return;
                             }
                         }
@@ -901,7 +933,12 @@ impl DtlsServer {
                                 && let Err(e) = validate_client_cert(der, verifier)
                             {
                                 warn!(client = %peer_addr, "Client cert validation failed: {}", e);
-                                remove_session(&sessions, &active_sessions, &peer_addr);
+                                remove_session(
+                                    &sessions,
+                                    &active_sessions,
+                                    active_session_mirror.as_deref(),
+                                    &peer_addr,
+                                );
                                 return;
                             }
                             // Store the certificate DER for plugin access after Connected
@@ -920,7 +957,12 @@ impl DtlsServer {
                 }
             }
 
-            remove_session(&sessions, &active_sessions, &peer_addr);
+            remove_session(
+                &sessions,
+                &active_sessions,
+                active_session_mirror.as_deref(),
+                &peer_addr,
+            );
         });
     }
 
@@ -1213,6 +1255,23 @@ mod tests {
         )
     }
 
+    fn client_hello_packet() -> Vec<u8> {
+        let config = Arc::new(Config::builder().build().expect("build DTLS config"));
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate client cert");
+        let mut client = Dtls::new_auto(config, certificate, Instant::now());
+        client.set_active(true);
+        let mut buf = vec![0u8; 4096];
+
+        for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+            if let Output::Packet(data) = client.poll_output(&mut buf) {
+                return data.to_vec();
+            }
+        }
+
+        panic!("client did not emit a ClientHello packet");
+    }
+
     #[tokio::test]
     async fn dtls_server_rejects_new_peer_when_pre_handshake_cap_is_full() {
         let server = test_server(DtlsServerLimits {
@@ -1238,6 +1297,36 @@ mod tests {
         server.spawn_session("127.0.0.1:12346".parse().unwrap(), vec![0x16; 32]);
 
         assert_eq!(server.active_session_count(), 0);
+        assert!(server.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dtls_server_rejects_second_peer_at_cap_and_releases_mirror_on_timeout() {
+        let mirror = Arc::new(AtomicU64::new(0));
+        let server = test_server(DtlsServerLimits {
+            max_sessions: Some(1),
+            handshake_timeout: Some(Duration::from_millis(50)),
+            active_session_mirror: Some(mirror.clone()),
+            ..DtlsServerLimits::default()
+        })
+        .await;
+
+        server.spawn_session("127.0.0.1:12347".parse().unwrap(), client_hello_packet());
+        assert_eq!(server.active_session_count(), 1);
+        assert_eq!(mirror.load(Ordering::Relaxed), 1);
+
+        server.spawn_session("127.0.0.1:12348".parse().unwrap(), client_hello_packet());
+        assert_eq!(server.active_session_count(), 1);
+        assert_eq!(mirror.load(Ordering::Relaxed), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.active_session_count() != 0 || mirror.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("DTLS handshake timeout should release the reserved slot");
+
         assert!(server.sessions.is_empty());
     }
 }

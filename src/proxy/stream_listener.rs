@@ -32,6 +32,20 @@ struct ListenerHandle {
     frontend_tls: bool,
     passthrough: bool,
     started: Arc<AtomicBool>,
+    udp_metrics: Option<Arc<UdpProxyMetrics>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct StreamListenerOverloadSnapshot {
+    pub dtls_demux_sessions_total: u64,
+    pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DtlsDemuxSessionSnapshot {
+    pub listener_key: String,
+    pub listen_port: u16,
+    pub sessions: u64,
 }
 
 /// Manages the set of active TCP/UDP stream listeners.
@@ -376,7 +390,7 @@ impl StreamListenerManager {
             let cb_cache = self.circuit_breaker_cache.clone();
             let started = Arc::new(AtomicBool::new(false));
 
-            let join_handle = if scheme.is_udp() {
+            let (join_handle, udp_metrics) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
@@ -412,6 +426,7 @@ impl StreamListenerManager {
                 };
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 let udp_max_sessions = self.udp_max_sessions;
+                let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
                 let consumer_index = self.consumer_index.clone();
                 let plugin_cache = self.plugin_cache.clone();
@@ -424,7 +439,8 @@ impl StreamListenerManager {
                 let udp_gro_enabled = self.udp_gro_enabled;
                 let udp_gso_enabled = self.udp_gso_enabled;
                 let udp_pktinfo_enabled = self.udp_pktinfo_enabled;
-                tokio::spawn(async move {
+                let listener_udp_metrics = Some(metrics.clone());
+                let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
                         bind_addr,
@@ -438,6 +454,7 @@ impl StreamListenerManager {
                         frontend_dtls_config,
                         tls_no_verify,
                         max_sessions: udp_max_sessions,
+                        frontend_tls_handshake_timeout_seconds: frontend_tls_handshake_timeout,
                         cleanup_interval_seconds: udp_cleanup_interval,
                         plugin_cache,
                         circuit_breaker_cache: cb_cache,
@@ -461,7 +478,8 @@ impl StreamListenerManager {
                             e
                         );
                     }
-                })
+                });
+                (join_handle, listener_udp_metrics)
             } else {
                 let started_for_listener = started.clone();
                 // TCP or TcpTls listener
@@ -486,7 +504,7 @@ impl StreamListenerManager {
                 let overload = self.overload.clone();
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
-                tokio::spawn(async move {
+                let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
                         bind_addr,
@@ -524,7 +542,8 @@ impl StreamListenerManager {
                             e
                         );
                     }
-                })
+                });
+                (join_handle, None)
             };
 
             info!(
@@ -545,11 +564,43 @@ impl StreamListenerManager {
                     frontend_tls: *frontend_tls,
                     passthrough: *passthrough,
                     started,
+                    udp_metrics,
                 },
             );
         }
 
         bind_failures
+    }
+
+    /// Lightweight stream-listener diagnostics included in the admin `/overload`
+    /// response. This keeps protocol-specific counters out of the hot path while
+    /// making DTLS pre-handshake pressure visible to operators.
+    pub async fn overload_snapshot(&self) -> StreamListenerOverloadSnapshot {
+        let listeners = self.listeners.lock().await;
+        let mut dtls_demux_sessions = Vec::new();
+        let mut dtls_demux_sessions_total = 0;
+
+        for (listener_key, handle) in listeners.iter() {
+            if !handle.frontend_tls {
+                continue;
+            }
+            let Some(metrics) = &handle.udp_metrics else {
+                continue;
+            };
+            let sessions = metrics.dtls_demux_sessions.load(Ordering::Relaxed);
+            dtls_demux_sessions_total += sessions;
+            dtls_demux_sessions.push(DtlsDemuxSessionSnapshot {
+                listener_key: listener_key.clone(),
+                listen_port: handle.listen_port,
+                sessions,
+            });
+        }
+
+        dtls_demux_sessions.sort_by(|a, b| a.listener_key.cmp(&b.listener_key));
+        StreamListenerOverloadSnapshot {
+            dtls_demux_sessions_total,
+            dtls_demux_sessions,
+        }
     }
 
     /// Wait until all currently configured stream listeners have successfully
