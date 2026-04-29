@@ -46,11 +46,28 @@ impl SvidFetchHandle {
 
     /// Resolves once the first SVID has been observed. If a bundle is
     /// already present, resolves immediately.
+    ///
+    /// Race-free against a concurrent [`install`]: we register as a waiter
+    /// (via `Notified::enable`) BEFORE checking `has_first`. `notify_waiters()`
+    /// does not stash a permit — a notification fired between the load and
+    /// the await would otherwise be lost and this future would block
+    /// forever. The order here is:
+    ///
+    /// 1. Build the `Notified` future and `enable()` it (registers as a
+    ///    waiter without polling).
+    /// 2. Load the flag. If already set, drop the waiter and return.
+    /// 3. Otherwise, await — guaranteed to wake on the next `install()`.
+    ///
+    /// [`install`]: SvidFetchHandle::install
     pub async fn wait_for_first_svid(&self) {
+        let notified = self.first_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if self.has_first.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        self.first_ready.notified().await;
+        notified.await;
     }
 
     fn install(&self, bundle: SvidBundle) {

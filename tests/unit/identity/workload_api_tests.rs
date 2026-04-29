@@ -161,3 +161,90 @@ async fn attest_chain_rejects_empty() {
     let result = attest_chain(&attestors, &PeerInfo::default()).await;
     assert!(matches!(result, Err(AttestError::Config(_))));
 }
+
+// ── SvidFetchHandle::wait_for_first_svid race regression ─────────────────
+
+/// Build a minimally-valid `SvidBundle` for handle tests. The `install`
+/// path doesn't inspect contents, so the cert/key are placeholder bytes.
+fn dummy_bundle() -> ferrum_edge::identity::SvidBundle {
+    use ferrum_edge::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+    let id = SpiffeId::new("spiffe://td.test/ns/foo/sa/bar").unwrap();
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    SvidBundle {
+        spiffe_id: id,
+        cert_chain_der: vec![b"placeholder-cert".to_vec()],
+        private_key_pkcs8_der: b"placeholder-key".to_vec(),
+        trust_bundles: TrustBundleSet {
+            local: TrustBundle {
+                trust_domain,
+                x509_authorities: vec![b"placeholder-ca".to_vec()],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+            federated: Default::default(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn wait_for_first_svid_returns_immediately_after_install() {
+    use ferrum_edge::identity::workload_api::fetch_loop::{SvidFetchHandle, install_test_bundle};
+    use std::time::Duration;
+
+    let handle = SvidFetchHandle::new();
+    install_test_bundle(&handle, dummy_bundle());
+
+    // Already installed → must return without blocking.
+    tokio::time::timeout(Duration::from_secs(2), handle.wait_for_first_svid())
+        .await
+        .expect("wait_for_first_svid should return immediately when already installed");
+}
+
+#[tokio::test]
+async fn wait_for_first_svid_wakes_on_subsequent_install() {
+    use ferrum_edge::identity::workload_api::fetch_loop::{SvidFetchHandle, install_test_bundle};
+    use std::time::Duration;
+
+    let handle = SvidFetchHandle::new();
+    let h2 = handle.clone();
+
+    // Spawn the waiter first. It must register as a waiter via the
+    // `Notified::enable()` pattern so the install below cannot race past it.
+    let waiter = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(3), h2.wait_for_first_svid())
+            .await
+            .expect("wait_for_first_svid timed out — lost-notify race")
+    });
+
+    // Yield once so the waiter has a real chance to be polled, then install.
+    tokio::task::yield_now().await;
+    install_test_bundle(&handle, dummy_bundle());
+
+    waiter.await.expect("waiter task panicked");
+}
+
+#[tokio::test]
+async fn wait_for_first_svid_no_deadlock_under_concurrent_install_storm() {
+    // Stress the race window by hammering install() against many parallel
+    // waiters. Each waiter must complete within the timeout. With the
+    // pre-fix code (load-then-await) at least one of these would block
+    // forever; with the fix all waiters wake.
+    use ferrum_edge::identity::workload_api::fetch_loop::{SvidFetchHandle, install_test_bundle};
+    use std::time::Duration;
+
+    let handle = SvidFetchHandle::new();
+    let mut waiters = Vec::new();
+    for _ in 0..32 {
+        let h = handle.clone();
+        waiters.push(tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(3), h.wait_for_first_svid())
+                .await
+                .expect("wait_for_first_svid race regressed")
+        }));
+    }
+    tokio::task::yield_now().await;
+    install_test_bundle(&handle, dummy_bundle());
+    for w in waiters {
+        w.await.expect("waiter task panicked");
+    }
+}
