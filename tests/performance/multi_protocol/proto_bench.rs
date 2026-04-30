@@ -509,7 +509,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("  h3 recv_response error: Remote reset: {e}");
+                                eprintln!("  h3 recv_response error: {e}");
                                 metrics.record_error();
                                 break;
                             }
