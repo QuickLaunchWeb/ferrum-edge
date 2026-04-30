@@ -767,6 +767,15 @@ main() {
         for size in $PAYLOAD_SIZES; do
             run_bench "direct" "$size" "direct"
         done
+        # Restart backend so gateways get a clean server with no leftover
+        # session state. DTLS in particular accumulates per-client state
+        # machines that linger for 60s after the direct test ends; those
+        # zombie sessions contend for CPU and cause ferrum's backend DTLS
+        # handshake to stall on the first gateway run.
+        echo "[main] restarting backend (clean slate for gateway tests)..."
+        [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
+        sleep 1
+        start_backend
     fi
 
     for gw in $GATEWAYS; do
