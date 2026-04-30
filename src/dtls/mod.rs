@@ -484,6 +484,24 @@ fn remove_session(
     }
 }
 
+struct SessionGuard {
+    sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
+    active_sessions: Arc<AtomicUsize>,
+    active_session_mirror: Option<Arc<AtomicU64>>,
+    peer_addr: SocketAddr,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        remove_session(
+            &self.sessions,
+            &self.active_sessions,
+            self.active_session_mirror.as_deref(),
+            &self.peer_addr,
+        );
+    }
+}
+
 /// A server-side DTLS connection for a single accepted client.
 ///
 /// Provides `send()` / `recv()` / `close()` similar to `DtlsConnection`.
@@ -761,6 +779,13 @@ impl DtlsServer {
             .map(|timeout| Instant::now() + timeout);
 
         tokio::spawn(async move {
+            let _session_guard = SessionGuard {
+                sessions: sessions.clone(),
+                active_sessions: active_sessions.clone(),
+                active_session_mirror: active_session_mirror.clone(),
+                peer_addr,
+            };
+
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
             // Server role (default — is_active=false)
             // Initialize server state (random, etc.) — required before handle_packet.
@@ -787,12 +812,6 @@ impl DtlsServer {
             // Process the initial ClientHello packet
             if let Err(e) = dtls.handle_packet(&initial_packet) {
                 warn!(client = %peer_addr, "DTLS initial packet error: {}", e);
-                remove_session(
-                    &sessions,
-                    &active_sessions,
-                    active_session_mirror.as_deref(),
-                    &peer_addr,
-                );
                 return;
             }
 
@@ -809,12 +828,6 @@ impl DtlsServer {
                 Ok(_) => {}
                 Err(e) => {
                     warn!(client = %peer_addr, "DTLS initial drain error: {}", e);
-                    remove_session(
-                        &sessions,
-                        &active_sessions,
-                        active_session_mirror.as_deref(),
-                        &peer_addr,
-                    );
                     return;
                 }
             }
@@ -920,13 +933,6 @@ impl DtlsServer {
                                 tls_client_cert_chain_der: chain_certs,
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
-                                // Server shut down
-                                remove_session(
-                                    &sessions,
-                                    &active_sessions,
-                                    active_session_mirror.as_deref(),
-                                    &peer_addr,
-                                );
                                 return;
                             }
                         }
@@ -935,12 +941,6 @@ impl DtlsServer {
                                 && let Err(e) = validate_client_cert(der, verifier)
                             {
                                 warn!(client = %peer_addr, "Client cert validation failed: {}", e);
-                                remove_session(
-                                    &sessions,
-                                    &active_sessions,
-                                    active_session_mirror.as_deref(),
-                                    &peer_addr,
-                                );
                                 return;
                             }
                             // Store the certificate DER for plugin access after Connected
@@ -958,13 +958,6 @@ impl DtlsServer {
                     }
                 }
             }
-
-            remove_session(
-                &sessions,
-                &active_sessions,
-                active_session_mirror.as_deref(),
-                &peer_addr,
-            );
         });
     }
 
