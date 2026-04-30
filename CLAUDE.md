@@ -461,6 +461,10 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 **Failover**: `FERRUM_DB_FAILOVER_URLS` (same `FERRUM_DB_TYPE`); `FERRUM_DB_READ_REPLICA_URL` offloads polling (writes always primary). **MongoDB** (`docs/mongodb.md`): `readPreference` in URL replaces read-replica var; replica sets handle failover natively (list members in `FERRUM_DB_URL`); pool via driver (`maxPoolSize`/`minPoolSize` in URL) — `FERRUM_DB_POOL_*` ignored.
 
+### Dependency Version Sync
+
+`tests/performance/multi_protocol/` is a standalone crate (not a workspace member) with its own `Cargo.toml` and `Cargo.lock`. Protocol-level dependencies shared with the root crate **must stay version-aligned** — cross-version wire incompatibilities cause silent failures (e.g., dimpl 0.5 ↔ 0.6 DTLS handshakes hang). When bumping any of these deps in the root `Cargo.toml`, also bump the matching line in `tests/performance/multi_protocol/Cargo.toml` and run `cd tests/performance/multi_protocol && cargo update -p <crate>`. Look for `# SYNC:` comments in both files.
+
 ### PR Checklist
 
 `cargo fmt` clean; `cargo clippy --all-targets -- -D warnings`; unit + integration tests pass; new features have normal/edge/error tests; no `.unwrap()`/`.expect()` in prod; no dead code (`-D dead-code`); PR description with summary + changes + test plan; docs updated (FEATURES.md, README.md, docs/, openapi.yaml); new `FERRUM_*` env vars in `ferrum.conf` with commented defaults.
