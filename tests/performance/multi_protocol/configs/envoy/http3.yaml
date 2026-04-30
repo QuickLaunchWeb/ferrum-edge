@@ -41,7 +41,7 @@ static_resources:
                   quic_protocol_options:
                     max_concurrent_streams: { value: 1000 }
                     initial_stream_window_size: { value: 8388608 }
-                    initial_connection_window_size: { value: 33554432 }
+                    initial_connection_window_size: { value: 25165824 }
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -72,7 +72,7 @@ static_resources:
               quic_protocol_options:
                 max_concurrent_streams: { value: 1000 }
                 initial_stream_window_size: { value: 8388608 }
-                initial_connection_window_size: { value: 33554432 }
+                initial_connection_window_size: { value: 25165824 }
       transport_socket:
         name: envoy.transport_sockets.quic
         typed_config:
