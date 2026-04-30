@@ -467,17 +467,51 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                         }
                         let _ = stream.finish().await;
                         match stream.recv_response().await {
-                            Ok(_resp) => {
+                            Ok(resp) => {
+                                let expected_len = resp
+                                    .headers()
+                                    .get("content-length")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.parse::<usize>().ok());
                                 let mut body_bytes = 0usize;
-                                while let Ok(Some(chunk)) = stream.recv_data().await {
-                                    body_bytes += chunk.remaining();
+                                let mut recv_err: Option<String> = None;
+                                loop {
+                                    match stream.recv_data().await {
+                                        Ok(Some(chunk)) => body_bytes += chunk.remaining(),
+                                        Ok(None) => break,
+                                        Err(e) => {
+                                            recv_err = Some(e.to_string());
+                                            break;
+                                        }
+                                    }
                                 }
-                                let latency = start.elapsed().as_micros() as u64;
-                                metrics.record(latency, body_bytes);
+                                if let Some(e) = recv_err {
+                                    let expected = expected_len.unwrap_or(payload.len());
+                                    eprintln!(
+                                        "  h3 recv_data error after {} bytes (expected {}): {}",
+                                        body_bytes, expected, e
+                                    );
+                                    metrics.record_error();
+                                } else if let Some(cl) = expected_len {
+                                    if body_bytes != cl {
+                                        eprintln!(
+                                            "  h3 truncated response: got {} bytes, content-length {}",
+                                            body_bytes, cl
+                                        );
+                                        metrics.record_error();
+                                    } else {
+                                        let latency = start.elapsed().as_micros() as u64;
+                                        metrics.record(latency, body_bytes);
+                                    }
+                                } else {
+                                    let latency = start.elapsed().as_micros() as u64;
+                                    metrics.record(latency, body_bytes);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("  h3 recv_response error: {e}");
                                 metrics.record_error();
+                                break;
                             }
                         }
                     }
