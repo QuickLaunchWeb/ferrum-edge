@@ -10,13 +10,27 @@ ca_certificates:
 
 
 # Kong DB-less declarative configuration — HTTP/1.1 end-to-end TLS.
-# Client HTTPS → Kong → HTTPS upstream on 3443. Every hop encrypted.
+# Client HTTPS → Kong → HTTPS upstream on 3447. Every hop encrypted.
 # Listener is configured via KONG_PROXY_LISTEN env var in harness script.
+#
+# Without an explicit upstream entity, Kong's default HTTP/1.1 keepalive
+# pool is tiny (or absent when the service points at an IP literal),
+# causing a fresh TLS handshake per request (~460ms floor, ~435 RPS at
+# 10KB, 99% overhead vs direct). The upstream below enables a 512-slot
+# keepalive pool so connections are reused across requests.
+
+upstreams:
+  - name: echo-upstream
+    targets:
+      - target: "127.0.0.1:3447"
+        weight: 100
+    # Kong upstream keepalive pool settings for HTTP/1.1 connection reuse
+    keepalive_pool_size: 512
+    keepalive_idle_timeout: 120
 
 services:
   - name: echo-service
-    host: 127.0.0.1
-    port: 3447
+    host: echo-upstream
     protocol: https
     tls_verify: true
     ca_certificates:
