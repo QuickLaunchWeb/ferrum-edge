@@ -11,8 +11,8 @@ proxies:
     strip_listen_path: false
     preserve_host_header: false
     backend_connect_timeout_ms: 5000
-    backend_read_timeout_ms: 10000
-    backend_write_timeout_ms: 10000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
     backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"
     auth_mode: single
     pool_enable_http2: true
