@@ -254,17 +254,6 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }
 # suppression in PR #506 stays — it is correct independently of whether the
 # underlying h3 library can recover the response.
 # See `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md`.
-#
-# We also carry a vendored copy of h3-quinn 0.0.10 that routes framed H3 writes
-# through Quinn's chunk-oriented `write_all_chunks` API. This keeps the tiny H3
-# frame header and large DATA payload as separate `Bytes` chunks, avoiding the
-# two independent Quinn write polls that upstream currently performs for each
-# response DATA frame.
-#
-# Retirement plan: drop this patch when h3-quinn exposes the same chunked write
-# path upstream or when benchmark data shows it does not help Ferrum's H3 tails.
-# See `docs/upstream-h3-quinn-patches/001-quinn-write-chunks/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.2-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
-h3-quinn = { path = "vendor/h3-quinn-0.0.10-ferrum-patched" }

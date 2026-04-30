@@ -689,6 +689,19 @@ impl Http3ConnectionPool {
         key
     }
 
+    /// Return the shard indices startup warmup should attempt for a proxy.
+    #[doc(hidden)]
+    pub fn warmup_shard_indices(
+        proxy: &Proxy,
+        default_connections_per_backend: usize,
+    ) -> std::ops::Range<usize> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(default_connections_per_backend)
+            .max(1);
+        0..conns_per_backend
+    }
+
     async fn create_or_get_proxy_sender(
         &self,
         key: String,
@@ -749,10 +762,7 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
     ) -> Result<(), anyhow::Error> {
-        let conns_per_backend = proxy
-            .pool_http3_connections_per_backend
-            .unwrap_or(self.connections_per_backend)
-            .max(1);
+        let conns_per_backend = Self::warmup_shard_indices(proxy, self.connections_per_backend).end;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
 
         let primary_key = Self::pool_key(proxy, 0);
