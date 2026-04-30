@@ -914,6 +914,21 @@ fn host_single_dot_rejected_for_routing() {
     assert!(normalize_request_host_for_routing(".").is_none());
 }
 
+#[test]
+fn host_trailing_colon_no_port_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("example.com:").is_none());
+}
+
+#[test]
+fn host_non_numeric_port_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("example.com:notaport").is_none());
+}
+
+#[test]
+fn host_with_userinfo_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("user@example.com").is_none());
+}
+
 /// Verify that hyper's HeaderMap normalizes header names to lowercase,
 /// preventing header name case obfuscation (e.g., "Transfer-Encoding" vs "transfer-encoding").
 #[test]

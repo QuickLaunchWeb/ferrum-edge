@@ -757,12 +757,31 @@ async fn handle_h3_request(
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
     // Also check the host header as a fallback. Strip port and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let request_host: Option<String> = req
+    let raw_host = req
         .uri()
         .authority()
         .map(|a| a.as_str())
-        .or_else(|| ctx.raw_header_get("host"))
-        .and_then(crate::proxy::normalize_request_host_for_routing);
+        .or_else(|| ctx.raw_header_get("host"));
+    let request_host: Option<String> = match raw_host {
+        Some(h) => match crate::proxy::normalize_request_host_for_routing(h) {
+            Some(normalized) => Some(normalized),
+            None => {
+                warn!("Rejected HTTP/3 request: malformed Host/authority value");
+                record_request(&state, 400);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request contains malformed Host or authority"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Malformed Host or authority",
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
 
     // Route: host + longest prefix match via router cache
     let route_match = state

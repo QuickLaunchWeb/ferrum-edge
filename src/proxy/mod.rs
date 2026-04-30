@@ -5490,10 +5490,23 @@ async fn handle_proxy_request_inner(
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
     // (exposed via req.uri().authority()). Strip port if present and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let request_host: Option<String> = ctx
+    let raw_host = ctx
         .raw_header_get("host")
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .and_then(normalize_request_host_for_routing);
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let request_host: Option<String> = match raw_host {
+        Some(h) => match normalize_request_host_for_routing(h) {
+            Some(normalized) => Some(normalized),
+            None => {
+                warn!("Rejected request: malformed Host/authority value");
+                record_request(&state, 400);
+                return Ok(build_response(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request contains malformed Host or authority"}"#,
+                ));
+            }
+        },
+        None => None,
+    };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
