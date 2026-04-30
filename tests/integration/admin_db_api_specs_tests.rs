@@ -565,18 +565,21 @@ async fn list_api_specs_namespace_scoped_and_paginated() {
     let all_a = store
         .list_api_specs(ns_a, &simple_filter(100, 0))
         .await
-        .expect("list_api_specs failed");
+        .expect("list_api_specs failed")
+        .items;
     assert_eq!(all_a.len(), 3, "ns_a must have 3 specs");
 
     // Pagination: first page (limit=2), second page (limit=2, offset=2).
     let page1 = store
         .list_api_specs(ns_a, &simple_filter(2, 0))
         .await
-        .expect("page1 failed");
+        .expect("page1 failed")
+        .items;
     let page2 = store
         .list_api_specs(ns_a, &simple_filter(2, 2))
         .await
-        .expect("page2 failed");
+        .expect("page2 failed")
+        .items;
     assert_eq!(page1.len(), 2, "page1 should have 2 items");
     assert_eq!(page2.len(), 1, "page2 should have 1 item");
 
@@ -584,7 +587,8 @@ async fn list_api_specs_namespace_scoped_and_paginated() {
     let all_b = store
         .list_api_specs(ns_b, &simple_filter(100, 0))
         .await
-        .expect("list ns_b failed");
+        .expect("list ns_b failed")
+        .items;
     assert_eq!(all_b.len(), 1, "ns_b must have 1 spec");
 
     // ns_b spec must not appear in ns_a results.
@@ -748,7 +752,8 @@ async fn spec_in_ns_a_invisible_from_ns_b() {
     let list = store
         .list_api_specs("ns-b", &simple_filter(100, 0))
         .await
-        .expect("list_api_specs failed");
+        .expect("list_api_specs failed")
+        .items;
     assert!(list.is_empty(), "ns-b must have no specs");
 
     // delete_api_spec with wrong namespace → false.
@@ -1152,7 +1157,8 @@ fn make_spec_with_metadata(
 
     let compressed = spec_codec::compress_gzip(body_bytes).expect("compress failed");
     let content_hash = spec_codec::sha256_hex(body_bytes);
-    let resource_hash = hash_resource_bundle(&bundle);
+    let resource_hash = hash_resource_bundle(&bundle)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
 
     let spec = ApiSpec {
         id: id.to_string(),
@@ -1286,7 +1292,8 @@ async fn submit_truncates_long_description_at_4kib() {
         .1;
     let compressed = ferrum_edge::admin::spec_codec::compress_gzip(body_bytes).unwrap();
     let content_hash = ferrum_edge::admin::spec_codec::sha256_hex(body_bytes);
-    let resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle);
+    let resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
 
     let spec = ApiSpec {
         id: spec_id.clone(),
@@ -1365,7 +1372,8 @@ async fn swagger_2_0_server_urls_constructed_from_schemes_host_basepath() {
         ferrum_edge::admin::api_specs::extract(body_bytes, None, ns).expect("extract failed");
     let compressed = ferrum_edge::admin::spec_codec::compress_gzip(body_bytes).unwrap();
     let content_hash = ferrum_edge::admin::spec_codec::sha256_hex(body_bytes);
-    let resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle);
+    let resource_hash = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
 
     let spec = ApiSpec {
         id: spec_id.clone(),
@@ -1441,7 +1449,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
     );
     let (bundle1, meta1) =
         ferrum_edge::admin::api_specs::extract(body1.as_bytes(), None, ns).expect("extract1");
-    let resource_hash1 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle1);
+    let resource_hash1 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle1)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
     let spec1 = ApiSpec {
         id: spec_id.clone(),
         namespace: ns.to_string(),
@@ -1498,7 +1507,8 @@ async fn replace_with_unchanged_resources_skips_proxy_write() {
     );
     let (bundle2, meta2) =
         ferrum_edge::admin::api_specs::extract(body2.as_bytes(), None, ns).expect("extract2");
-    let resource_hash2 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle2);
+    let resource_hash2 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle2)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
     // Sanity: hashes must be identical (proxy unchanged).
     assert_eq!(
         resource_hash1, resource_hash2,
@@ -1584,7 +1594,8 @@ async fn replace_with_changed_resources_updates_proxy() {
     );
     let (bundle1, meta1) =
         ferrum_edge::admin::api_specs::extract(body1.as_bytes(), None, ns).expect("extract1");
-    let resource_hash1 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle1);
+    let resource_hash1 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle1)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
 
     let spec1 = ApiSpec {
         id: spec_id.clone(),
@@ -1636,7 +1647,8 @@ async fn replace_with_changed_resources_updates_proxy() {
     );
     let (bundle2, meta2) =
         ferrum_edge::admin::api_specs::extract(body2.as_bytes(), None, ns).expect("extract2");
-    let resource_hash2 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle2);
+    let resource_hash2 = ferrum_edge::admin::api_specs::hash_resource_bundle(&bundle2)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
     assert_ne!(
         resource_hash1, resource_hash2,
         "resource_hash must differ when proxy backend_host changes"
@@ -1723,7 +1735,8 @@ async fn list_filter_proxy_id() {
     let results = store
         .list_api_specs(ns, &filter)
         .await
-        .expect("list failed");
+        .expect("list failed")
+        .items;
     assert_eq!(results.len(), 1, "must return 1 spec for proxy_a1");
     assert_eq!(results[0].proxy_id, proxy_a1);
 
@@ -1733,14 +1746,19 @@ async fn list_filter_proxy_id() {
         limit: 100,
         ..Default::default()
     };
-    let results2 = store.list_api_specs(ns, &filter2).await.expect("list b1");
+    let results2 = store
+        .list_api_specs(ns, &filter2)
+        .await
+        .expect("list b1")
+        .items;
     assert_eq!(results2.len(), 1, "must return 1 spec for proxy_b1");
 
     // No filter — should return all 3.
     let all = store
         .list_api_specs(ns, &simple_filter(100, 0))
         .await
-        .expect("list all");
+        .expect("list all")
+        .items;
     assert_eq!(all.len(), 3, "must return 3 specs without filter");
 }
 
@@ -1771,7 +1789,8 @@ async fn list_filter_spec_version_prefix() {
     );
     let (b32, m32) =
         ferrum_edge::admin::api_specs::extract(body_32.as_bytes(), None, ns).expect("extract 3.2");
-    let rh32 = ferrum_edge::admin::api_specs::hash_resource_bundle(&b32);
+    let rh32 = ferrum_edge::admin::api_specs::hash_resource_bundle(&b32)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
     let s32 = ApiSpec {
         id: spec_32.clone(),
         namespace: ns.to_string(),
@@ -1813,7 +1832,8 @@ async fn list_filter_spec_version_prefix() {
     let results = store
         .list_api_specs(ns, &filter)
         .await
-        .expect("list failed");
+        .expect("list failed")
+        .items;
     assert_eq!(
         results.len(),
         3,
@@ -1852,7 +1872,8 @@ async fn list_filter_title_contains_case_insensitive() {
     let results = store
         .list_api_specs(ns, &filter)
         .await
-        .expect("list failed");
+        .expect("list failed")
+        .items;
     assert_eq!(
         results.len(),
         2,
@@ -1887,7 +1908,8 @@ async fn list_filter_updated_since() {
     let results = store
         .list_api_specs(ns, &filter)
         .await
-        .expect("list failed");
+        .expect("list failed")
+        .items;
     assert!(
         results.is_empty(),
         "no specs updated after the cutoff (got {})",
@@ -1904,7 +1926,8 @@ async fn list_filter_updated_since() {
     let results2 = store
         .list_api_specs(ns, &filter2)
         .await
-        .expect("list failed");
+        .expect("list failed")
+        .items;
     assert_eq!(results2.len(), 2, "all 2 specs must match past cutoff");
 }
 
@@ -1936,7 +1959,8 @@ async fn list_filter_has_tag() {
     let results = store
         .list_api_specs(ns, &filter)
         .await
-        .expect("list failed");
+        .expect("list failed")
+        .items;
     assert_eq!(results.len(), 2, "2 specs must have the 'public' tag");
     assert!(
         results
@@ -1968,7 +1992,8 @@ async fn list_sort_by_title_asc_then_desc() {
     let asc = store
         .list_api_specs(ns, &asc_filter)
         .await
-        .expect("list asc");
+        .expect("list asc")
+        .items;
     let asc_titles: Vec<_> = asc.iter().filter_map(|s| s.title.as_deref()).collect();
     assert!(
         asc_titles.windows(2).all(|w| w[0] <= w[1]),
@@ -1985,7 +2010,8 @@ async fn list_sort_by_title_asc_then_desc() {
     let desc = store
         .list_api_specs(ns, &desc_filter)
         .await
-        .expect("list desc");
+        .expect("list desc")
+        .items;
     let desc_titles: Vec<_> = desc.iter().filter_map(|s| s.title.as_deref()).collect();
     assert!(
         desc_titles.windows(2).all(|w| w[0] >= w[1]),
@@ -2017,7 +2043,7 @@ async fn list_default_sort_is_updated_at_desc() {
         limit: 100,
         ..Default::default()
     };
-    let results = store.list_api_specs(ns, &filter).await.expect("list");
+    let results = store.list_api_specs(ns, &filter).await.expect("list").items;
     assert_eq!(results.len(), 3);
     // Most recently inserted should appear first.
     assert!(
@@ -2594,5 +2620,192 @@ async fn delete_proxy_cleans_up_orphaned_upstream() {
         "orphaned upstream must be cascade-deleted after last referencing proxy is removed; \
          got Some({:?})",
         upstream_after_p2_delete
+    );
+}
+
+// ===========================================================================
+// Round 8 PR review fixes — concurrency and MongoDB gap documentation
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P2: Concurrent access tests (SQLite — always run, no external services)
+// ---------------------------------------------------------------------------
+//
+// MongoDB coverage note:
+//   The SQL tests below exercise the cross-backend invariants: uniqueness
+//   constraints, resource-hash idempotency, and namespace isolation.
+//   The MongoDB implementations (`MongoStore`) mirror the SQL ones — see
+//   `src/config/mongo_store.rs` functions `submit_api_spec_bundle`,
+//   `replace_api_spec_bundle`, and `list_api_specs`.
+//
+//   Automated MongoDB tests require a live Mongo instance and are NOT part
+//   of CI. To run them locally:
+//
+//     1. Start a replica set: docker run --rm -p 27017:27017 mongo:7 \
+//          mongod --replSet rs0 --bind_ip_all
+//        Then: mongo --eval "rs.initiate()"
+//     2. Set MONGO_URL=mongodb://localhost:27017/ferrum_test?replicaSet=rs0
+//     3. Run: cargo test --test integration_tests -- --ignored
+//
+//   Functions to exercise (these have no automated Mongo-specific tests today):
+//     - mongo_store::submit_api_spec_bundle   (unique proxy_id constraint via Mongo unique index)
+//     - mongo_store::replace_api_spec_bundle  (resource_hash short-circuit; idempotent PUT)
+//     - mongo_store::list_api_specs           (count_documents + find; filter/sort/pagination)
+//     - mongo_store::delete_api_spec          (multi-document best-effort delete)
+//
+//   TODO: Add a `#[cfg(feature = "mongo-tests")] mod mongo` sub-module or a
+//   `tests/integration/admin_mongo_api_specs_tests.rs` with `#[ignore]` tests
+//   gated on `std::env::var("MONGO_URL").is_ok()`.  The SQL tests above are
+//   the current source of truth for all cross-backend behavioral invariants.
+
+/// Two concurrent `submit_api_spec_bundle` calls with the same `proxy_id` must
+/// result in exactly one succeeding and one failing with a uniqueness error.
+///
+/// SQLite serialises writes at the WAL level, so exactly one will win the UNIQUE
+/// constraint on `(namespace, proxy_id)` in the `api_specs` table.
+///
+/// Concurrency note: `tokio::join!` issues both futures simultaneously but SQLite
+/// serialises at the WAL write-lock level.  The loser consistently sees the
+/// UNIQUE constraint violation.  This test is deterministic on SQLite; behaviour
+/// on Postgres / MySQL is identical (row-level locking guarantees one winner).
+#[tokio::test]
+async fn concurrent_post_same_proxy_id_one_succeeds_one_conflicts() {
+    let dir = TempDir::new().unwrap();
+    let store = std::sync::Arc::new(make_store(&dir).await);
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy-concurrent");
+    let spec_id_a = uid("spec-concurrent-a");
+    let spec_id_b = uid("spec-concurrent-b");
+
+    let (bundle_a, spec_a) = make_spec_with_metadata(&spec_id_a, &proxy_id, ns, "API A", "0", &[]);
+    let (bundle_b, spec_b) = make_spec_with_metadata(&spec_id_b, &proxy_id, ns, "API B", "0", &[]);
+
+    // Both tasks use the same proxy_id → UNIQUE(namespace, proxy_id) must fire for one.
+    let store_a = store.clone();
+    let store_b = store.clone();
+    let (result_a, result_b) = tokio::join!(
+        tokio::spawn(async move { store_a.submit_api_spec_bundle(&bundle_a, &spec_a).await }),
+        tokio::spawn(async move { store_b.submit_api_spec_bundle(&bundle_b, &spec_b).await }),
+    );
+
+    let result_a = result_a.expect("task A panicked");
+    let result_b = result_b.expect("task B panicked");
+
+    let success_count = [result_a.is_ok(), result_b.is_ok()]
+        .iter()
+        .filter(|&&ok| ok)
+        .count();
+    let failure_count = [result_a.is_err(), result_b.is_err()]
+        .iter()
+        .filter(|&&err| err)
+        .count();
+
+    assert_eq!(
+        success_count, 1,
+        "exactly one concurrent submit must succeed; got {success_count} successes"
+    );
+    assert_eq!(
+        failure_count, 1,
+        "exactly one concurrent submit must fail; got {failure_count} failures"
+    );
+
+    // Verify the DB has exactly one spec for this proxy_id.
+    let listed = store
+        .list_api_specs(
+            ns,
+            &ApiSpecListFilter {
+                proxy_id: Some(proxy_id.clone()),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("list_api_specs failed");
+    assert_eq!(
+        listed.items.len(),
+        1,
+        "DB must contain exactly one spec for proxy_id after concurrent conflict; got {}",
+        listed.items.len()
+    );
+    assert_eq!(
+        listed.total, 1,
+        "total must also be 1; got {}",
+        listed.total
+    );
+}
+
+/// Two concurrent `replace_api_spec_bundle` calls with byte-identical bundles
+/// (same resource_hash) must both succeed — the resource-hash short-circuit makes
+/// the replace idempotent.
+///
+/// Post-condition: `proxy.updated_at` must NOT advance beyond the initial POST
+/// timestamp for either PUT (the short-circuit skips the proxy row update).
+#[tokio::test]
+async fn concurrent_put_same_spec_resource_hash_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let store = std::sync::Arc::new(make_store(&dir).await);
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy-concurrent-put");
+    let spec_id = uid("spec-concurrent-put");
+
+    // Initial POST.
+    let (bundle_initial, spec_initial) =
+        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Idempotent API", "0", &[]);
+    store
+        .submit_api_spec_bundle(&bundle_initial, &spec_initial)
+        .await
+        .expect("initial submit failed");
+
+    let proxy_after_post = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy after POST")
+        .expect("proxy must exist after POST");
+    let post_updated_at = proxy_after_post.updated_at;
+
+    // Two identical PUTs (same resource_hash → short-circuit, proxy row untouched).
+    let (bundle_put_a, mut spec_put_a) =
+        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Idempotent API", "0", &[]);
+    let (bundle_put_b, mut spec_put_b) =
+        make_spec_with_metadata(&spec_id, &proxy_id, ns, "Idempotent API", "0", &[]);
+    // The api_specs row always gets a fresh updated_at, but the proxy row does not.
+    spec_put_a.updated_at = chrono::Utc::now();
+    spec_put_b.updated_at = chrono::Utc::now();
+
+    let store_a = store.clone();
+    let store_b = store.clone();
+    let (result_a, result_b) = tokio::join!(
+        tokio::spawn(async move {
+            store_a
+                .replace_api_spec_bundle(&bundle_put_a, &spec_put_a)
+                .await
+        }),
+        tokio::spawn(async move {
+            store_b
+                .replace_api_spec_bundle(&bundle_put_b, &spec_put_b)
+                .await
+        }),
+    );
+
+    result_a
+        .expect("task A panicked")
+        .expect("concurrent PUT A must succeed for identical bundle");
+    result_b
+        .expect("task B panicked")
+        .expect("concurrent PUT B must succeed for identical bundle");
+
+    // The proxy row must not have advanced its updated_at (resource_hash short-circuit).
+    let proxy_after_puts = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy after PUTs")
+        .expect("proxy must still exist");
+    assert_eq!(
+        proxy_after_puts.updated_at, post_updated_at,
+        "proxy.updated_at must NOT advance when resource_hash short-circuit fires; \
+         got {} (expected {})",
+        proxy_after_puts.updated_at, post_updated_at
     );
 }

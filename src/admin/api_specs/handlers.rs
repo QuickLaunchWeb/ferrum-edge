@@ -145,16 +145,27 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::NOT_FOUND,
             &json!({"error": "API spec not found"}),
         ),
-        ApiSpecError::Conflict(msg) => json_resp(
-            StatusCode::CONFLICT,
-            &json!({"error": format!("Conflict: {}", msg)}),
-        ),
+        ApiSpecError::Conflict(detail) => {
+            tracing::warn!("api-spec conflict (raw DB error): {}", detail);
+            json_resp(
+                StatusCode::CONFLICT,
+                &json!({
+                    "error": "Resource conflict — the operation collides with an existing row (likely a duplicate id, name, or unique constraint)"
+                }),
+            )
+        }
         ApiSpecError::MongoDocTooLarge => json_resp(
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": "Spec document exceeds MongoDB document size limit"}),
         ),
-        ApiSpecError::Unprocessable(msg) => {
-            json_resp(StatusCode::UNPROCESSABLE_ENTITY, &json!({"error": msg}))
+        ApiSpecError::Unprocessable(detail) => {
+            tracing::warn!("api-spec unprocessable (raw DB error): {}", detail);
+            json_resp(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &json!({
+                    "error": "The submitted spec references a resource that does not exist or violates referential integrity"
+                }),
+            )
         }
         ApiSpecError::NoDatabase => json_resp(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -816,7 +827,12 @@ async fn assign_ids_for_put(
 /// different tooling.
 fn plugin_canonical_key(pc: &crate::config::types::PluginConfig) -> (String, String, Option<u16>) {
     let canonical_config = sort_json_keys(&pc.config);
-    let config_str = serde_json::to_string(&canonical_config).unwrap_or_default();
+    // Serializing a serde_json::Value should never fail; if it somehow does,
+    // panic loudly in dev so the bug is caught — a silent empty string would
+    // cause two different plugins to collide on the same canonical key, silently
+    // re-assigning IDs during PUT and serving the wrong plugin config.
+    let config_str = serde_json::to_string(&canonical_config)
+        .expect("serializing a serde_json::Value should never fail");
     (pc.plugin_name.clone(), config_str, pc.priority_override)
 }
 
@@ -1232,7 +1248,8 @@ fn build_spec_row(
     let spec_content = spec_codec::compress_gzip(body)
         .map_err(|e| ApiSpecError::Internal(format!("gzip compress failed: {e}")))?;
     let content_hash = spec_codec::sha256_hex(body);
-    let resource_hash = hash_resource_bundle(bundle);
+    let resource_hash = hash_resource_bundle(bundle)
+        .map_err(|e| ApiSpecError::Internal(format!("resource hash failed: {e}")))?;
     let now = Utc::now();
     Ok(ApiSpec {
         id,
@@ -1796,14 +1813,15 @@ pub async fn handle_list_api_specs(
     let limit = filter.limit as usize;
     let offset = filter.offset as usize;
 
-    let specs = match db.list_api_specs(namespace, &filter).await {
-        Ok(s) => s,
+    let paginated = match db.list_api_specs(namespace, &filter).await {
+        Ok(p) => p,
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
     // Build summary items — intentionally OMIT spec_content (heavy blob) and
     // resource_hash (internal implementation detail, not for client display).
-    let items: Vec<Value> = specs
+    let items: Vec<Value> = paginated
+        .items
         .iter()
         .map(|s| {
             json!({
@@ -1840,6 +1858,7 @@ pub async fn handle_list_api_specs(
         "limit": limit,
         "offset": offset,
         "next_offset": next_offset,
+        "total": paginated.total,
     });
 
     Ok(json_resp(StatusCode::OK, &body))

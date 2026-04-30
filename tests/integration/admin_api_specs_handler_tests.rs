@@ -543,6 +543,70 @@ async fn post_same_proxy_id_twice_returns_conflict_or_validation_error() {
     );
 }
 
+/// P1 regression: 409 Conflict responses must NOT expose raw DB error strings
+/// (constraint names, table names, schema internals) to the caller.
+///
+/// The handler logs the raw detail at WARN but returns only a generic message.
+#[tokio::test]
+async fn conflict_error_does_not_leak_raw_db_message() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let spec = minimal_json_spec(&proxy_id);
+
+    // First submit succeeds.
+    let (s1, _) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        s1,
+        reqwest::StatusCode::CREATED,
+        "first submit must succeed"
+    );
+
+    // Second submit of the same spec must fail with 409 or 422.
+    let (s2, body2) = client.post_json("/api-specs", &spec).await;
+    assert!(
+        s2 == reqwest::StatusCode::CONFLICT || s2 == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "expected 409 or 422 on duplicate submit, got {s2}; body: {body2}"
+    );
+
+    if s2 == reqwest::StatusCode::CONFLICT {
+        // If the DB constraint fired, the error body must NOT contain raw DB internals.
+        let error_str = body2["error"].as_str().unwrap_or("");
+        let body_str = body2.to_string();
+
+        // Must NOT contain SQL/Mongo constraint identifiers.
+        assert!(
+            !body_str.to_lowercase().contains("unique"),
+            "conflict response must not expose 'UNIQUE' constraint name; body: {body2}"
+        );
+        assert!(
+            !body_str.to_lowercase().contains("constraint"),
+            "conflict response must not expose 'constraint'; body: {body2}"
+        );
+        assert!(
+            !body_str.to_lowercase().contains("duplicate key"),
+            "conflict response must not expose 'duplicate key'; body: {body2}"
+        );
+        assert!(
+            !body_str.contains("proxies"),
+            "conflict response must not expose table name 'proxies'; body: {body2}"
+        );
+        assert!(
+            !body_str.contains("api_specs"),
+            "conflict response must not expose table name 'api_specs'; body: {body2}"
+        );
+
+        // The error message should be the generic one.
+        assert!(
+            error_str.contains("conflict") || error_str.contains("Conflict"),
+            "conflict response must contain a generic conflict message; got: {error_str}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn post_body_exceeding_limit_returns_413() {
     let dir = TempDir::new().unwrap();
@@ -920,6 +984,17 @@ async fn list_pagination_with_next_offset() {
     let items = body["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
 
+    // `total` must be an integer equal to the total number of inserted specs.
+    assert!(
+        body["total"].is_number(),
+        "list response must include a `total` integer field; body: {body}"
+    );
+    assert_eq!(
+        body["total"].as_i64().unwrap(),
+        3,
+        "`total` must reflect the count of all matching specs, not just this page"
+    );
+
     // When limit exactly equals count, next_offset should be set
     if body["next_offset"].is_number() {
         assert_eq!(body["next_offset"].as_u64().unwrap(), 2);
@@ -929,6 +1004,12 @@ async fn list_pagination_with_next_offset() {
     assert_eq!(status2, reqwest::StatusCode::OK);
     // Should have the remaining item(s)
     assert!(!body2["items"].as_array().unwrap().is_empty());
+    // total must also be present on subsequent pages and remain consistent.
+    assert_eq!(
+        body2["total"].as_i64().unwrap(),
+        3,
+        "`total` must be consistent across pages"
+    );
 }
 
 // ============================================================================

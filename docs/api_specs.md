@@ -195,6 +195,39 @@ These fields are stored at INSERT time and do not require re-parsing the spec fo
 
 Unknown `sort_by` or `order` values return HTTP 400.
 
+### List response shape
+
+```json
+{
+  "items": [ ... ],
+  "limit": 50,
+  "offset": 0,
+  "next_offset": 50,
+  "total": 327
+}
+```
+
+- `items` — page of spec summaries (no `spec_content` or `resource_hash`).
+- `limit` / `offset` — the pagination parameters that were applied.
+- `next_offset` — set when `items.len() == limit`, indicating there may be more results; `null` on the last page.
+- `total` — count of all rows matching the filter (ignoring `limit`/`offset`). Use this to build "showing 1–50 of 327" pagination UI.
+
+### Tag-name rules
+
+Tag names are extracted from the OpenAPI `tags[].name` array and stored as a JSON text column. The `has_tag` filter uses a SQL `LIKE` pattern that embeds the tag name directly — no SQL `ESCAPE` clause is applied.
+
+To keep the filter correct, tag names must not contain any of the following characters:
+
+| Character | Why forbidden |
+|---|---|
+| `"` | Would close the JSON string literal early, producing false positives |
+| `%` | Would act as a SQL wildcard, matching unrelated tags |
+| `\` | Would act as a SQL escape character and corrupt the pattern |
+
+Tags with forbidden characters are rejected at submit time with HTTP 422 `InvalidTagName`. MongoDB uses native array membership and is not affected by the `LIKE` limitation, but the same character restrictions apply for consistency.
+
+**If you extend this whitelist in `src/admin/api_specs/extractor.rs`, you must also update the `has_tag` query in `src/config/db_loader.rs` to add an `ESCAPE` clause and pre-escape the tag value.**
+
 ```bash
 # Filter examples
 curl "https://gateway/api-specs?spec_version=3.1&sort_by=title&order=asc" \

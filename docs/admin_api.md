@@ -382,6 +382,8 @@ Returns **201** with `{ id, proxy_id, content_hash, spec_version }` on success. 
 
 Returns paginated spec summaries (no spec content). The list includes Tier 1 metadata fields extracted at submit time (`description`, `contact_name`, `contact_email`, `license_name`, `license_identifier`, `tags`, `server_urls`, `operation_count`). The internal `resource_hash` is excluded.
 
+Response shape: `{ "items": [...], "limit": N, "offset": N, "next_offset": N|null, "total": N }`. The `total` field is the count of all matching rows ignoring pagination — use it to render "showing X–Y of Z" in UIs.
+
 Supports filter and sort query parameters: `proxy_id` (exact), `spec_version` (prefix), `title_contains` (case-insensitive substring), `updated_since` (ISO-8601), `has_tag` (exact tag membership), `sort_by` (`updated_at`, `title`, `operation_count`, `created_at`; default `updated_at`), and `order` (`asc`/`desc`; default `desc`). Unknown `sort_by` or `order` values return 400.
 
 ```bash

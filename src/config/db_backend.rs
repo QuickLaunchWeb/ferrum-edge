@@ -460,11 +460,13 @@ pub trait DatabaseBackend: Send + Sync {
     ///
     /// Default sort is `updated_at DESC` (most recent first).
     /// `filter.limit` and `filter.offset` drive pagination.
+    /// The returned [`PaginatedResult`] includes a `total` count of all matching
+    /// rows (ignoring limit/offset) so callers can build "showing X of Y" UI.
     async fn list_api_specs(
         &self,
         namespace: &str,
         filter: &ApiSpecListFilter,
-    ) -> Result<Vec<ApiSpec>, anyhow::Error>;
+    ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error>;
 
     /// Delete an ApiSpec and all resources it owns.
     ///

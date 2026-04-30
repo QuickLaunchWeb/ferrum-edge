@@ -3977,12 +3977,21 @@ impl DatabaseStore {
     }
 
     /// List ApiSpecs in a namespace with optional filtering, sorting, and pagination.
+    ///
+    /// Returns a [`PaginatedResult`] that includes the filtered `total` row count
+    /// (ignoring limit/offset) so callers can build "showing X of Y" UI.
+    /// The count query uses the same WHERE conditions as the data query; both
+    /// are issued against the read pool and run sequentially on a single
+    /// connection from that pool.
     pub async fn list_api_specs(
         &self,
         namespace: &str,
         filter: &crate::config::db_backend::ApiSpecListFilter,
-    ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
-        use crate::config::db_backend::{ApiSpecSortBy, SortOrder};
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
+        use crate::config::db_backend::{ApiSpecSortBy, PaginatedResult, SortOrder};
 
         // Build WHERE clause dynamically.
         // We collect bind values as strings/i64 in order to use sqlx's typed bind API.
@@ -4015,15 +4024,49 @@ impl DatabaseStore {
             // Tags are stored as a JSON text array e.g. `["foo","bar"]`.
             // We match with LIKE `%"tag_name"%` — this correctly handles the JSON
             // quote-wrapping without requiring JSON functions (cross-dialect).
-            // Tags containing '"', '%', or '\' are rejected at extract time via
-            // `ExtractError::InvalidTagName` in extractor.rs, so no escaping is needed
-            // here.  MongoDB uses native array membership and is unaffected.
+            //
+            // SAFETY-CRITICAL CROSS-FILE INVARIANT:
+            // The bare LIKE pattern here has NO ESCAPE clause.  It is safe ONLY
+            // because tag names containing `"`, `%`, or `\` are rejected at
+            // extract time via `ExtractError::InvalidTagName` in
+            // src/admin/api_specs/extractor.rs (tag validation section).
+            // If you ever relax that extractor whitelist, you MUST switch this
+            // query to use `LIKE ... ESCAPE '\\'` and pre-escape the tag value
+            // before binding it — otherwise `%` or `\` in a tag name would turn
+            // into a wildcard or escape token, producing false positives.
+            //
+            // MongoDB uses native array membership (`filter_doc.insert("tags", tag)`)
+            // with a multikey index and is unaffected by this pattern.
             conditions.push(r#"tags LIKE ?"#);
             has_tag_val = Some(format!("%\"{}\"", tag) + "%");
         }
 
         let where_clause = conditions.join(" AND ");
 
+        // --- COUNT query (same WHERE, no ORDER BY / LIMIT / OFFSET) ----------
+        let count_sql = self.q(&format!(
+            "SELECT COUNT(*) AS cnt FROM api_specs WHERE {where_clause}"
+        ));
+        let mut count_query = sqlx::query(&count_sql).bind(namespace);
+        if let Some(ref v) = proxy_id_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = spec_version_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = title_contains_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = updated_since_val {
+            count_query = count_query.bind(v);
+        }
+        if let Some(ref v) = has_tag_val {
+            count_query = count_query.bind(v);
+        }
+        let count_row = count_query.fetch_one(&self.rpool()).await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        // --- Data query (ORDER BY + LIMIT + OFFSET) --------------------------
         // Whitelist the ORDER BY column to prevent injection.
         let order_col = match filter.sort_by {
             ApiSpecSortBy::UpdatedAt => "updated_at",
@@ -4060,13 +4103,16 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = query
             .bind(filter.limit as i64)
             .bind(filter.offset as i64)
-            .fetch_all(&self.pool())
+            .fetch_all(&self.rpool())
             .await?;
         let mut specs = Vec::with_capacity(rows.len());
         for row in &rows {
             specs.push(row_to_api_spec(row)?);
         }
-        Ok(specs)
+        Ok(PaginatedResult {
+            items: specs,
+            total,
+        })
     }
 
     /// Delete an ApiSpec and all resources it owns.
@@ -4583,7 +4629,10 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         namespace: &str,
         filter: &crate::config::db_backend::ApiSpecListFilter,
-    ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
+    ) -> Result<
+        crate::config::db_backend::PaginatedResult<crate::config::types::ApiSpec>,
+        anyhow::Error,
+    > {
         DatabaseStore::list_api_specs(self, namespace, filter).await
     }
 

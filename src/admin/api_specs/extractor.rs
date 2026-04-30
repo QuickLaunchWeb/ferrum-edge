@@ -214,10 +214,18 @@ pub fn extract(
     let tier1 = extract_spec_metadata(&root, &version);
 
     // --- Tag name validation ---------------------------------------------
-    // SQL `has_tag` filter uses LIKE `%"tag_name"%`.  Tag names containing
-    // `"`, `%`, or `\` would cause false positives or break the pattern.
-    // We reject them at extract time rather than escaping at query time;
-    // these characters are not valid in well-formed tag identifiers.
+    // SAFETY-CRITICAL CROSS-FILE INVARIANT:
+    // The SQL `has_tag` filter in src/config/db_loader.rs uses a bare LIKE
+    // pattern (`tags LIKE '%"<tag>"%'`) that embeds tag names directly without
+    // an ESCAPE clause.  Tag names containing `"`, `%`, or `\` would produce
+    // false matches or wildcard matches against the stored JSON-array column.
+    // We reject those characters here to keep the LIKE filter correct.
+    // MongoDB uses native array membership (`filter_doc.insert("tags", tag)`)
+    // and is unaffected, but we still reject these characters for consistency.
+    //
+    // If you change or extend this tag-character whitelist, also update:
+    //   src/config/db_loader.rs  — list_api_specs, has_tag branch (comment there)
+    //   docs/api_specs.md        — "Tag-name rules" section
     for tag in &tier1.tags {
         for ch in ['"', '%', '\\'] {
             if tag.contains(ch) {
@@ -583,20 +591,38 @@ pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> Extract
 ///
 /// Same bundle in → same hash out. Used by [`replace_api_spec_bundle`] to
 /// skip proxy/upstream/plugin writes when only the spec document changed.
-pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> String {
+///
+/// # Errors
+///
+/// Returns an error if any resource in the bundle cannot be serialized to JSON.
+/// In practice this should never happen for a `serde_json::Value`-backed bundle,
+/// but returning `Result` ensures call sites handle the failure as an internal
+/// error rather than silently producing an empty hash that could trigger a false
+/// hash collision.
+pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> Result<String, anyhow::Error> {
     let mut buf = Vec::new();
 
     // Proxy — strip metadata then serialize
-    let proxy_json =
-        strip_metadata(serde_json::to_value(&bundle.proxy).unwrap_or(serde_json::Value::Null));
-    buf.extend_from_slice(&serde_json::to_vec(&proxy_json).unwrap_or_default());
+    let proxy_json = strip_metadata(
+        serde_json::to_value(&bundle.proxy)
+            .map_err(|e| anyhow::anyhow!("failed to serialize proxy for resource hash: {}", e))?,
+    );
+    buf.extend_from_slice(&serde_json::to_vec(&proxy_json).map_err(|e| {
+        anyhow::anyhow!("failed to re-serialize proxy JSON for resource hash: {}", e)
+    })?);
     buf.push(b'|');
 
     // Upstream (optional)
     if let Some(u) = &bundle.upstream {
-        let upstream_json =
-            strip_metadata(serde_json::to_value(u).unwrap_or(serde_json::Value::Null));
-        buf.extend_from_slice(&serde_json::to_vec(&upstream_json).unwrap_or_default());
+        let upstream_json = strip_metadata(serde_json::to_value(u).map_err(|e| {
+            anyhow::anyhow!("failed to serialize upstream for resource hash: {}", e)
+        })?);
+        buf.extend_from_slice(&serde_json::to_vec(&upstream_json).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to re-serialize upstream JSON for resource hash: {}",
+                e
+            )
+        })?);
     }
     buf.push(b'|');
 
@@ -604,12 +630,23 @@ pub fn hash_resource_bundle(bundle: &ExtractedBundle) -> String {
     let mut plugins: Vec<_> = bundle.plugins.iter().collect();
     plugins.sort_by(|a, b| a.id.cmp(&b.id));
     for p in plugins {
-        let pj = strip_metadata(serde_json::to_value(p).unwrap_or(serde_json::Value::Null));
-        buf.extend_from_slice(&serde_json::to_vec(&pj).unwrap_or_default());
+        let pj = strip_metadata(serde_json::to_value(p).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to serialize plugin '{}' for resource hash: {}",
+                p.id,
+                e
+            )
+        })?);
+        buf.extend_from_slice(&serde_json::to_vec(&pj).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to re-serialize plugin JSON for resource hash: {}",
+                e
+            )
+        })?);
         buf.push(b';');
     }
 
-    crate::admin::spec_codec::sha256_hex(&buf)
+    Ok(crate::admin::spec_codec::sha256_hex(&buf))
 }
 
 /// Remove metadata-only fields from a JSON value so they don't affect the hash.

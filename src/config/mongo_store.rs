@@ -2114,7 +2114,7 @@ mod inner {
             &self,
             namespace: &str,
             filter: &ApiSpecListFilter,
-        ) -> Result<Vec<ApiSpec>, anyhow::Error> {
+        ) -> Result<PaginatedResult<ApiSpec>, anyhow::Error> {
             let start = std::time::Instant::now();
 
             // Build filter document
@@ -2139,10 +2139,18 @@ mod inner {
                 filter_doc.insert("updated_at", doc! { "$gte": since.to_rfc3339() });
             }
             if let Some(ref tag) = filter.has_tag {
-                // Native array membership query (multikey index used)
+                // Native array membership query (multikey index used).
+                // Unlike SQL, MongoDB uses a real array field and multikey
+                // index — no LIKE pattern needed, and characters like `"`, `%`,
+                // `\` in tag names are matched literally and do not cause
+                // false positives.
                 filter_doc.insert("tags", tag.as_str());
             }
 
+            // --- COUNT query (same filter, no pagination) --------------------
+            let total = self.api_specs().count_documents(filter_doc.clone()).await? as i64;
+
+            // --- Data query (sort + skip + limit) ----------------------------
             // Sort document
             let sort_field = match filter.sort_by {
                 ApiSpecSortBy::UpdatedAt => "updated_at",
@@ -2171,7 +2179,10 @@ mod inner {
                 specs.push(doc_to_api_spec(doc)?);
             }
             self.check_slow_query("list_api_specs", start);
-            Ok(specs)
+            Ok(PaginatedResult {
+                items: specs,
+                total,
+            })
         }
 
         async fn list_spec_owned_plugin_configs(
