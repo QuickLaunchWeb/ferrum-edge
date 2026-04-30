@@ -358,6 +358,40 @@ fn http2_accepts_matching_host_authority_after_case_and_dot_normalization() {
 }
 
 #[test]
+fn http2_accepts_https_default_port_host_authority_equivalence() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:443"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
+fn http3_accepts_https_default_port_host_authority_equivalence() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example"));
+    let uri: hyper::Uri = "https://api.example:443/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3).is_none());
+}
+
+#[test]
+fn http2_accepts_http_default_port_host_authority_equivalence() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:80"));
+    let uri: hyper::Uri = "http://api.example/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
+fn http2_rejects_non_default_port_host_authority_mismatch() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:8443"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("authority disagree"));
+}
+
+#[test]
 fn http2_rejects_multiple_host_headers_before_routing() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("host", HeaderValue::from_static("api.example"));

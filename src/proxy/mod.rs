@@ -9060,15 +9060,25 @@ pub fn normalize_request_host_for_routing(value: &str) -> Option<String> {
     split_request_authority(value).map(|(host, _)| normalize_authority_host(host))
 }
 
-fn normalize_authority_for_consistency(value: &str) -> Option<String> {
-    split_request_authority(value).map(|(host, port)| match port {
-        Some(port) => {
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<&'static str> {
+    match scheme {
+        Some("http" | "ws") => Some("80"),
+        Some("https" | "wss") => Some("443"),
+        _ => None,
+    }
+}
+
+fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Option<String> {
+    split_request_authority(value).map(|(host, port)| {
+        if let Some(port) = port
+            && Some(port) != default_port_for_scheme(scheme)
+        {
             let mut normalized = normalize_authority_host(host);
             normalized.push(':');
             normalized.push_str(port);
-            normalized
+            return normalized;
         }
-        None => normalize_authority_host(host),
+        normalize_authority_host(host)
     })
 }
 
@@ -9097,12 +9107,14 @@ pub fn check_host_authority_consistency(
     let Ok(host) = host.to_str() else {
         return Some(r#"{"error":"Host header contains invalid characters"}"#);
     };
-    let Some(host) = normalize_authority_for_consistency(host) else {
+    let scheme = uri.scheme_str();
+    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
         return Some(r#"{"error":"Host header contains invalid authority"}"#);
     };
 
     if let Some(authority) = uri.authority() {
-        let Some(authority) = normalize_authority_for_consistency(authority.as_str()) else {
+        let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme)
+        else {
             return Some(r#"{"error":"Request authority contains invalid authority"}"#);
         };
         if host != authority {

@@ -15,7 +15,7 @@ HTTP/3 clients work against any `backend_scheme` — see [docs/http3.md](http3.m
 
 ## Routing Algorithm
 
-When a request arrives, the gateway first validates protocol authority fields, then extracts the **host** and **request path** for routing. HTTP/1 uses `Host`; HTTP/2 and HTTP/3 use `:authority`, and if a `Host` header is also present it must match `:authority` after ASCII case normalization and trailing-dot normalization. Mismatches are rejected before routing so plugins and backends cannot observe different authorities. The comparison is intentionally strict after normalization: `example.com` and `example.com:443` are not treated as equivalent because the frontend validator does not infer a default port from the request scheme.
+When a request arrives, the gateway first validates protocol authority fields, then extracts the **host** and **request path** for routing. HTTP/1 uses `Host`; HTTP/2 and HTTP/3 use `:authority`, and if a `Host` header is also present it must match `:authority` after ASCII case normalization, trailing-dot normalization, and scheme-default port normalization (`http`/`ws`: 80, `https`/`wss`: 443). Mismatches are rejected before routing so plugins and backends cannot observe different authorities.
 
 Host normalization strips a valid port suffix, preserves bracketed IPv6 literals, rejects unbracketed IPv6 literals, strips a DNS trailing dot, and lowercases ASCII hostnames. Invalid authority syntax is rejected instead of being routed ambiguously.
 
