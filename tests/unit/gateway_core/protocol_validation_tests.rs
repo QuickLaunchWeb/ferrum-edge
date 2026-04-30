@@ -423,6 +423,14 @@ fn http2_rejects_unbracketed_ipv6_host_authority() {
 }
 
 #[test]
+fn http2_no_host_no_authority_passes_consistency_check() {
+    let headers = hyper::HeaderMap::new();
+    let uri: hyper::Uri = "/path".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3).is_none());
+}
+
+#[test]
 fn http11_ignores_authority_consistency_helper() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("evil.example"));
@@ -901,11 +909,9 @@ fn host_unbracketed_ipv6_rejected_for_routing() {
 }
 
 #[test]
-fn host_single_dot_becomes_empty() {
-    // Edge case: a bare dot (invalid, but shouldn't panic)
-    let host = ".";
-    let normalized = normalize_request_host_for_routing(host).unwrap();
-    assert_eq!(normalized, "");
+fn host_single_dot_rejected_for_routing() {
+    // A bare dot normalizes to empty, which is not a valid hostname.
+    assert!(normalize_request_host_for_routing(".").is_none());
 }
 
 /// Verify that hyper's HeaderMap normalizes header names to lowercase,

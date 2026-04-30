@@ -6,7 +6,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -48,12 +48,19 @@ pub struct DtlsDemuxSessionSnapshot {
     pub sessions: u64,
 }
 
+struct DtlsDemuxMetricEntry {
+    listener_key: String,
+    listen_port: u16,
+    sessions: Arc<AtomicU64>,
+}
+
 /// Manages the set of active TCP/UDP stream listeners.
 ///
 /// All state is behind a tokio `Mutex` to serialize reconciliation calls.
 /// Reconciliation happens only on config reload — not on the hot request path.
 pub struct StreamListenerManager {
     listeners: tokio::sync::Mutex<std::collections::HashMap<String, ListenerHandle>>,
+    dtls_metrics: arc_swap::ArcSwap<Vec<DtlsDemuxMetricEntry>>,
     bind_addr: IpAddr,
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
@@ -147,6 +154,7 @@ impl StreamListenerManager {
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_addr,
             config,
             dns_cache,
@@ -569,34 +577,41 @@ impl StreamListenerManager {
             );
         }
 
+        let mut dtls_entries: Vec<DtlsDemuxMetricEntry> = listeners
+            .iter()
+            .filter(|(_, h)| h.frontend_tls)
+            .filter_map(|(key, h)| {
+                h.udp_metrics.as_ref().map(|m| DtlsDemuxMetricEntry {
+                    listener_key: key.clone(),
+                    listen_port: h.listen_port,
+                    sessions: m.dtls_demux_sessions.clone(),
+                })
+            })
+            .collect();
+        dtls_entries.sort_by(|a, b| a.listener_key.cmp(&b.listener_key));
+        self.dtls_metrics.store(Arc::new(dtls_entries));
+
         bind_failures
     }
 
     /// Lightweight stream-listener diagnostics included in the admin `/overload`
-    /// response. This keeps protocol-specific counters out of the hot path while
-    /// making DTLS pre-handshake pressure visible to operators.
-    pub async fn overload_snapshot(&self) -> StreamListenerOverloadSnapshot {
-        let listeners = self.listeners.lock().await;
-        let mut dtls_demux_sessions = Vec::new();
+    /// response. Lock-free: reads pre-built metric references from an `ArcSwap`
+    /// updated during reconciliation, so this never contends with config reloads.
+    pub fn overload_snapshot(&self) -> StreamListenerOverloadSnapshot {
+        let entries = self.dtls_metrics.load();
+        let mut dtls_demux_sessions = Vec::with_capacity(entries.len());
         let mut dtls_demux_sessions_total = 0;
 
-        for (listener_key, handle) in listeners.iter() {
-            if !handle.frontend_tls {
-                continue;
-            }
-            let Some(metrics) = &handle.udp_metrics else {
-                continue;
-            };
-            let sessions = metrics.dtls_demux_sessions.load(Ordering::Relaxed);
+        for entry in entries.iter() {
+            let sessions = entry.sessions.load(Ordering::Relaxed);
             dtls_demux_sessions_total += sessions;
             dtls_demux_sessions.push(DtlsDemuxSessionSnapshot {
-                listener_key: listener_key.clone(),
-                listen_port: handle.listen_port,
+                listener_key: entry.listener_key.clone(),
+                listen_port: entry.listen_port,
                 sessions,
             });
         }
 
-        dtls_demux_sessions.sort_by(|a, b| a.listener_key.cmp(&b.listener_key));
         StreamListenerOverloadSnapshot {
             dtls_demux_sessions_total,
             dtls_demux_sessions,

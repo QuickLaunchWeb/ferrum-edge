@@ -9057,7 +9057,9 @@ fn normalize_authority_host(host: &str) -> String {
 /// DNS trailing dots, and lowercases ASCII hostnames. Invalid authority syntax
 /// returns `None` so callers can avoid routing on ambiguous host data.
 pub fn normalize_request_host_for_routing(value: &str) -> Option<String> {
-    split_request_authority(value).map(|(host, _)| normalize_authority_host(host))
+    split_request_authority(value)
+        .map(|(host, _)| normalize_authority_host(host))
+        .filter(|h| !h.is_empty())
 }
 
 fn default_port_for_scheme(scheme: Option<&str>) -> Option<&'static str> {

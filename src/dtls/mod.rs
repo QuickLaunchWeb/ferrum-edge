@@ -868,7 +868,7 @@ impl DtlsServer {
                         }
                     }
                     _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
-                        trace!(client = %peer_addr, "DTLS handshake timed out");
+                        warn!(client = %peer_addr, "DTLS handshake timed out");
                         break;
                     }
                     _ = shutdown_rx.recv() => {
