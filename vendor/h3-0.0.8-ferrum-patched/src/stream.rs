@@ -63,35 +63,6 @@ impl<B> WriteBuf<B>
 where
     B: Buf,
 {
-    /// Convert the pending wire-format frame into Quinn-friendly byte chunks.
-    ///
-    /// The encoded H3 frame header is copied into a small `Bytes`; payloads
-    /// that are already `Bytes` remain zero-copy via `Buf::copy_to_bytes`,
-    /// while non-contiguous `Buf` implementations are safely collapsed into a
-    /// single payload chunk.
-    pub fn into_bytes_chunks(mut self) -> Vec<Bytes> {
-        let has_header = self.len > self.pos;
-        let payload_len = self
-            .frame
-            .as_ref()
-            .and_then(|f| f.payload())
-            .map_or(0, |payload| payload.remaining());
-        let mut chunks = Vec::with_capacity(usize::from(has_header) + usize::from(payload_len > 0));
-
-        if has_header {
-            chunks.push(Bytes::copy_from_slice(&self.buf[self.pos..self.len]));
-            self.pos = self.len;
-        }
-
-        if let Some(payload) = self.frame.as_mut().and_then(|f| f.payload_mut()) {
-            if payload_len > 0 {
-                chunks.push(payload.copy_to_bytes(payload_len));
-            }
-        }
-
-        chunks
-    }
-
     fn encode_stream_type(&mut self, ty: StreamType) {
         let mut buf_mut = &mut self.buf[self.len..];
 
