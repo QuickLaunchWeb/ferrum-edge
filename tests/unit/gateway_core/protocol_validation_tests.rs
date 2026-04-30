@@ -929,6 +929,26 @@ fn host_with_userinfo_rejected_for_routing() {
     assert!(normalize_request_host_for_routing("user@example.com").is_none());
 }
 
+#[test]
+fn host_with_path_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("api.example/foo").is_none());
+}
+
+#[test]
+fn host_with_query_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("api.example?q=1").is_none());
+}
+
+#[test]
+fn host_with_fragment_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("api.example#top").is_none());
+}
+
+#[test]
+fn host_with_backslash_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing(r"api.example\foo").is_none());
+}
+
 /// Verify that hyper's HeaderMap normalizes header names to lowercase,
 /// preventing header name case obfuscation (e.g., "Transfer-Encoding" vs "transfer-encoding").
 #[test]

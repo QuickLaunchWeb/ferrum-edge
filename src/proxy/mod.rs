@@ -9024,6 +9024,13 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+fn is_valid_reg_name(host: &str) -> bool {
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._%~!$&'()*+,;=".contains(&b))
+}
+
 fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
     let value = value.trim();
     if value.is_empty() || value.contains('@') {
@@ -9048,14 +9055,23 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
 
     match value.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => {
-            if !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+            if is_valid_reg_name(host)
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+            {
                 Some((host, Some(port)))
             } else {
                 None
             }
         }
         Some(_) => None,
-        None => Some((value, None)),
+        None => {
+            if is_valid_reg_name(value) {
+                Some((value, None))
+            } else {
+                None
+            }
+        }
     }
 }
 

@@ -578,6 +578,12 @@ impl DtlsServerConn {
     }
 }
 
+impl Drop for DtlsServerConn {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.try_send(());
+    }
+}
+
 impl DtlsServer {
     /// Create a new DTLS server bound to the given address.
     #[allow(dead_code)] // Public helper used by tests and external DTLS backends.
