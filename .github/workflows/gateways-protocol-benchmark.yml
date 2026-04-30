@@ -14,8 +14,8 @@
 #   http1-tls : ferrum, envoy, kong, tyk, krakend
 #   http2     : ferrum, envoy, tyk                             (Kong: no H2 upstream support in
 #                                                               OpenResty; would measure H2→H1.
-#                                                               KrakenD CE: Go H2 client truncates
-#                                                               response bodies in no-op mode)
+#                                                               KrakenD CE: Lura's http.Transport
+#                                                               lacks H2; falls back to H1 upstream)
 #   http3     : ferrum, envoy                                  (Kong: no supported HTTP/3 cfg path;
 #                                                               Tyk/KrakenD: no HTTP/3 at all)
 #   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE: no gRPC)

@@ -118,10 +118,11 @@ supports() {
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
         tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss) return 0 ;;
-        # KrakenD CE HTTP/2: Go HTTP/2 backend client does not proxy
-        # response bodies correctly in no-op mode — RPS is flat across
-        # all payload sizes and latency decreases with payload size,
-        # proving the body is truncated. HTTP/1.1 works correctly.
+        # KrakenD CE HTTP/2: Lura's custom http.Transport doesn't call
+        # http2.ConfigureTransport(), so backend connections fall back
+        # to HTTP/1.1. The H2-only backend (port 3443) rejects the ALPN
+        # mismatch → KrakenD returns 502 for every request. Tyk (also
+        # Go) works because it explicitly enables H2 on its transport.
         krakend:http1-tls) return 0 ;;
         *) return 1 ;;
     esac
