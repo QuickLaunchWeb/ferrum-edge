@@ -9041,7 +9041,8 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
                 None
             }
         }
-        _ => Some((value, None)),
+        Some(_) => None,
+        None => Some((value, None)),
     }
 }
 

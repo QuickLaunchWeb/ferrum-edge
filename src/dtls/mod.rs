@@ -99,7 +99,9 @@ pub struct DtlsServerLimits {
     /// Optional gate checked before allocating per-peer handshake state.
     pub allow_new_session: Option<Arc<dyn Fn() -> bool + Send + Sync + 'static>>,
     /// Optional diagnostic mirror for surfaces that need to report demux state
-    /// outside this server object, such as the admin `/overload` endpoint.
+    /// outside this server object, such as the admin `/overload` endpoint. This
+    /// is eventually consistent with `active_sessions` and is not used for
+    /// admission control.
     pub active_session_mirror: Option<Arc<AtomicU64>>,
 }
 

@@ -379,6 +379,16 @@ fn http2_rejects_invalid_host_authority_port() {
 }
 
 #[test]
+fn http2_rejects_unbracketed_ipv6_host_authority() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("2001:db8::1"));
+    let uri: hyper::Uri = "https://[2001:db8::1]/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid authority"));
+}
+
+#[test]
 fn http11_ignores_authority_consistency_helper() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("evil.example"));
@@ -841,6 +851,19 @@ fn host_ipv6_literal_with_port_preserved_for_routing() {
     let host = "[2001:db8::1]:8443";
     let normalized = normalize_request_host_for_routing(host).unwrap();
     assert_eq!(normalized, "[2001:db8::1]");
+}
+
+#[test]
+fn host_ipv6_literal_without_port_preserved_for_routing() {
+    let host = "[2001:db8::1]";
+    let normalized = normalize_request_host_for_routing(host).unwrap();
+    assert_eq!(normalized, "[2001:db8::1]");
+}
+
+#[test]
+fn host_unbracketed_ipv6_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("2001:db8::1").is_none());
+    assert!(normalize_request_host_for_routing("::1").is_none());
 }
 
 #[test]

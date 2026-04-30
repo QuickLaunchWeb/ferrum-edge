@@ -109,7 +109,9 @@ number of frontend DTLS peers currently tracked by stream listeners, including
 peers that have not finished the DTLS handshake yet. A non-zero or rising value
 with dropped UDP+DTLS traffic usually means clients are slow to complete
 handshakes or a spoofed/high-cardinality ClientHello spray is filling the
-pre-handshake cap.
+pre-handshake cap. The value is a diagnostic mirror of the DTLS demux counter
+and can lag the exact in-server counter by a single increment/decrement window,
+so treat it as operational telemetry rather than an admission-control source.
 
 Mitigation knobs:
 - `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` bounds how long a peer can hold DTLS demux state before completing the handshake.
