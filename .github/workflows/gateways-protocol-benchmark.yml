@@ -12,8 +12,10 @@
 # A gateway only appears in a row if it can speak that protocol on BOTH
 # the client→gateway leg and the gateway→backend leg.
 #   http1-tls : ferrum, envoy, kong, tyk, krakend
-#   http2     : ferrum, envoy, tyk, krakend                    (Kong: no H2 upstream support in
-#                                                               OpenResty; would measure H2→H1)
+#   http2     : ferrum, envoy, tyk                             (Kong: no H2 upstream support in
+#                                                               OpenResty; would measure H2→H1.
+#                                                               KrakenD CE: Go H2 client truncates
+#                                                               response bodies in no-op mode)
 #   http3     : ferrum, envoy                                  (Kong: no supported HTTP/3 cfg path;
 #                                                               Tyk/KrakenD: no HTTP/3 at all)
 #   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE: no gRPC)
@@ -190,7 +192,7 @@ jobs:
           #   KONG_PROXY_LISTEN doesn't accept http3/quic suffixes.
           case "${{ matrix.protocol }}" in
             http1-tls) all="ferrum envoy kong tyk krakend" ;;
-            http2)     all="ferrum envoy tyk krakend" ;;
+            http2)     all="ferrum envoy tyk" ;;
             wss)       all="ferrum envoy kong tyk" ;;
             grpcs)     all="ferrum envoy kong tyk" ;;
             http3)     all="ferrum envoy" ;;

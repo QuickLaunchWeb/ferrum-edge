@@ -118,7 +118,11 @@ supports() {
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
         tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss) return 0 ;;
-        krakend:http1-tls|krakend:http2) return 0 ;;
+        # KrakenD CE HTTP/2: Go HTTP/2 backend client does not proxy
+        # response bodies correctly in no-op mode — RPS is flat across
+        # all payload sizes and latency decreases with payload size,
+        # proving the body is truncated. HTTP/1.1 works correctly.
+        krakend:http1-tls) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -438,6 +442,7 @@ PYEOF
         -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
         -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
         -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_UPSTREAM_KEEPALIVE_MAX_REQUESTS=10000" \
         "${extra_env[@]}" \
         -v "$cfg_dst:/kong/kong.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
