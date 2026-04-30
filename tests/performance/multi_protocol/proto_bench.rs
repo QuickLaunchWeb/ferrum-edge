@@ -472,12 +472,18 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                 while let Ok(Some(chunk)) = stream.recv_data().await {
                                     body_bytes += chunk.remaining();
                                 }
-                                let latency = start.elapsed().as_micros() as u64;
-                                metrics.record(latency, body_bytes);
+                                if body_bytes == 0 && payload.len() > 0 {
+                                    eprintln!("  h3 short response: got 0 bytes, expected {}", payload.len());
+                                    metrics.record_error();
+                                } else {
+                                    let latency = start.elapsed().as_micros() as u64;
+                                    metrics.record(latency, body_bytes);
+                                }
                             }
                             Err(e) => {
-                                eprintln!("  h3 recv_response error: {e}");
+                                eprintln!("  h3 recv_response error: Remote reset: {e}");
                                 metrics.record_error();
+                                break;
                             }
                         }
                     }
