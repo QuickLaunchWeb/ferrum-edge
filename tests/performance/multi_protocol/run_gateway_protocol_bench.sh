@@ -752,6 +752,15 @@ PYEOF
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
+
+    # Surface proto_bench stderr (error detail lines) if non-empty.
+    local err_file="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"
+    if [ -s "$err_file" ]; then
+        local err_lines
+        err_lines=$(wc -l < "$err_file")
+        echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
+        head -10 "$err_file" | sed 's/^/[bench]     /'
+    fi
 }
 
 # ── Orchestration ───────────────────────────────────────────────────────────

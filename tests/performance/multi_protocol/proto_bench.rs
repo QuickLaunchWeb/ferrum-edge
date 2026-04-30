@@ -827,14 +827,13 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
-                        Ok(Err(_)) => {
+                        Ok(Err(e)) => {
+                            eprintln!("[tcp-tls] read error after {} requests: {e}", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }
                         Err(_) => {
-                            // Read timeout — no bytes flowing. Record as an
-                            // error and bail so the bench doesn't wallclock
-                            // itself into oblivion on a wedged connection.
+                            eprintln!("[tcp-tls] read timeout (5s) after {} requests", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }
@@ -859,7 +858,8 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            eprintln!("[tcp] i/o error after {} requests: {e}", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }
