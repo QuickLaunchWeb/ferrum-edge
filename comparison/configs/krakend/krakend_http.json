@@ -4,6 +4,11 @@
   "name": "Ferrum Benchmark - KrakenD HTTP",
   "port": 8000,
   "timeout": "5s",
+  "extra_config": {
+    "router": {
+      "max_payload_size": 10485760
+    }
+  },
   "cache_ttl": "0s",
   "max_idle_connections": 250,
   "max_idle_connections_per_host": 250,
@@ -29,6 +34,7 @@
       "endpoint": "/api/echo",
       "method": "POST",
       "output_encoding": "no-op",
+      "input_headers": ["*"],
       "backend": [
         {
           "host": ["http://BACKEND_HOST:3001"],
