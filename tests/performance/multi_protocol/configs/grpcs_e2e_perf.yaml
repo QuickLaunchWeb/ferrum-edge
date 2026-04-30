@@ -27,7 +27,6 @@ proxies:
     pool_http2_adaptive_window: true
     pool_http2_max_frame_size: 1048576
     pool_http2_max_concurrent_streams: 1000
-    pool_http2_connections_per_host: 16
     plugins: []
 
   - id: "grpcs-e2e-health"
