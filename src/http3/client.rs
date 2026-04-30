@@ -762,7 +762,8 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
     ) -> Result<(), anyhow::Error> {
-        let conns_per_backend = Self::warmup_shard_indices(proxy, self.connections_per_backend).end;
+        let conns_per_backend =
+            Self::warmup_shard_indices(proxy, self.connections_per_backend).len();
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
 
         let primary_key = Self::pool_key(proxy, 0);
