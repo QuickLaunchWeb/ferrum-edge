@@ -39,6 +39,7 @@ pub mod grpc_proxy;
 pub mod headers;
 pub mod http2_pool;
 pub mod sni;
+pub mod stream_error;
 pub mod stream_listener;
 pub mod tcp_proxy;
 pub mod udp_batch;
@@ -3094,12 +3095,34 @@ async fn handle_websocket_request_authenticated(
         {
             Ok(stream) => break stream,
             Err(e) => {
-                let ws_error_class = retry::classify_boxed_error(e.as_ref());
+                // `connect_websocket_backend` covers more than TCP+TLS setup:
+                // `connect_async_tls_with_config` ALSO sends the WebSocket
+                // upgrade request and reads the backend's response. A failure
+                // here can be either pre-wire (DNS / TCP connect / TLS
+                // handshake — request bytes never crossed) or post-wire (the
+                // backend received the upgrade request and rejected it with a
+                // protocol error / non-101 response). Use the setup-phase
+                // classifier so handshake-time rustls errors stay pre-wire
+                // (`TlsError`), then gate the retry decision and the
+                // circuit-breaker connect-flag on the unified
+                // `request_reached_wire` boundary so genuinely post-wire
+                // failures (ProtocolError, RequestError surfaced from
+                // tungstenite::Error::Http / Protocol) do NOT replay under
+                // `retry_on_connect_failure` and do NOT charge passive
+                // health as a connect-class failure.
+                let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
+                let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
 
-                // Check if we should retry this connection failure
+                // Retry only on PRE-WIRE failures (DNS / TCP refused / TLS
+                // handshake / port exhaustion). A backend that got the
+                // upgrade request and chose to reject it must not be
+                // retried under retry_on_connect_failure — that bypasses
+                // retry_on_methods and would also lie in transaction logs.
                 let should_retry_ws = if let Some(retry_config) = &proxy.retry {
-                    ws_attempt < retry_config.max_retries && retry_config.retry_on_connect_failure
+                    ws_attempt < retry_config.max_retries
+                        && retry_config.retry_on_connect_failure
+                        && ws_is_pre_wire
                 } else {
                     false
                 };
@@ -3120,7 +3143,16 @@ async fn handle_websocket_request_authenticated(
                         }
                     };
 
-                    // Record circuit breaker failure for current target
+                    // Record circuit breaker failure for current target.
+                    // The second argument is the "is_connect_error" flag
+                    // that drives passive-health connect-class accounting
+                    // — pass `ws_is_pre_wire` so a backend-side upgrade
+                    // rejection (post-wire) doesn't charge the breaker as
+                    // a connect failure. (We're inside the
+                    // `should_retry_ws` branch so `ws_is_pre_wire == true`
+                    // here by construction, but using the same predicate
+                    // value keeps the invariant readable and survives a
+                    // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb_key = current_target
                             .as_ref()
@@ -3130,7 +3162,7 @@ async fn handle_websocket_request_authenticated(
                             cb_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, ws_is_pre_wire);
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
@@ -3176,11 +3208,17 @@ async fn handle_websocket_request_authenticated(
                     continue;
                 }
 
-                // No retry — return error
+                // No retry — return error. Use the unified
+                // `error_class_log_kind` so the `error_kind` field matches
+                // the per-protocol log labels emitted everywhere else
+                // (operators grep one set of strings); a backend that
+                // rejected the upgrade will now log
+                // `error_kind=protocol_error` or `request_error` rather
+                // than the misleading hardcoded `connect_failure`.
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %current_backend_url,
-                    error_kind = "connect_failure",
+                    error_kind = retry::error_class_log_kind(ws_error_class),
                     error_class = %ws_error_class,
                     error = %e,
                     "WebSocket backend connection failed"
@@ -3215,8 +3253,8 @@ async fn handle_websocket_request_authenticated(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ws_err_method.to_string(),
                             request_path: ctx.path.clone(),
-                            matched_proxy_id: Some(proxy.id.clone()),
-                            matched_proxy_name: proxy.name.clone(),
+                            proxy_id: Some(proxy.id.clone()),
+                            proxy_name: proxy.name.clone(),
                             backend_target_url: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
@@ -3281,8 +3319,8 @@ async fn handle_websocket_request_authenticated(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ws_method.to_string(),
         request_path: ctx.path.clone(),
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
+        proxy_id: Some(proxy.id.clone()),
+        proxy_name: proxy.name.clone(),
         backend_target_url: Some(strip_query_params(&current_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
         response_status_code: ws_status_code,
@@ -4788,8 +4826,8 @@ pub async fn log_rejected_request(
         consumer_username: ctx.effective_identity().map(str::to_owned),
         http_method: ctx.method.clone(),
         request_path: ctx.path.clone(),
-        matched_proxy_id: proxy.map(|p| p.id.clone()),
-        matched_proxy_name: proxy.and_then(|p| p.name.clone()),
+        proxy_id: proxy.map(|p| p.id.clone()),
+        proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
             // Host-only proxies (listen_path None) have no prefix to strip.
             let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
@@ -6256,15 +6294,23 @@ async fn handle_proxy_request_inner(
             let mut grpc_current_cb_key = cb_target_key.clone();
 
             loop {
-                // Classify the error and determine if retryable
-                let is_connection_error = matches!(
-                    &grpc_result,
-                    Err(GrpcProxyError::BackendUnavailable(_))
-                        | Err(GrpcProxyError::BackendTimeout {
-                            kind: grpc_proxy::GrpcTimeoutKind::Connect,
-                            ..
-                        })
-                );
+                // Classify the error and determine if retryable. Narrow to
+                // the connect-class kinds via `is_connect_class()` so
+                // `retry_on_connect_failure` cannot replay non-idempotent
+                // gRPC POSTs after a `BackendRequest` failure (post-wire,
+                // emitted from `send_request().await` after the H2 stream
+                // has been opened — request bytes may already be on the
+                // wire). The wildcard `BackendUnavailable { .. }` matcher
+                // previously here let post-wire errors bypass
+                // `retry_on_methods`.
+                let is_connection_error = match &grpc_result {
+                    Err(GrpcProxyError::BackendUnavailable { kind, .. }) => kind.is_connect_class(),
+                    Err(GrpcProxyError::BackendTimeout {
+                        kind: grpc_proxy::GrpcTimeoutKind::Connect,
+                        ..
+                    }) => true,
+                    _ => false,
+                };
                 if grpc_attempt >= retry_config.max_retries
                     || !is_connection_error
                     || !retry_config.retry_on_connect_failure
@@ -6459,8 +6505,8 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
-                        matched_proxy_id: Some(proxy.id.clone()),
-                        matched_proxy_name: proxy.name.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: final_status,
@@ -6761,8 +6807,8 @@ async fn handle_proxy_request_inner(
                         consumer_username: ctx.effective_identity().map(str::to_owned),
                         http_method: method,
                         request_path: path,
-                        matched_proxy_id: Some(proxy.id.clone()),
-                        matched_proxy_name: proxy.name.clone(),
+                        proxy_id: Some(proxy.id.clone()),
+                        proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: response_status,
@@ -6836,7 +6882,7 @@ async fn handle_proxy_request_inner(
                     state.overload.record_port_exhaustion();
                 }
                 let (grpc_code, original_msg) = match &e {
-                    GrpcProxyError::BackendUnavailable(m) => {
+                    GrpcProxyError::BackendUnavailable { message: m, .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                     GrpcProxyError::BackendTimeout { message: m, .. } => {
@@ -6892,8 +6938,8 @@ async fn handle_proxy_request_inner(
                             consumer_username: ctx.effective_identity().map(str::to_owned),
                             http_method: ctx.method.clone(),
                             request_path: ctx.path.clone(),
-                            matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
-                            matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
+                            proxy_id: proxy_ref.map(|p| p.id.clone()),
+                            proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target_url: proxy_ref.map(|p| {
                                 let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
                                 let url = build_backend_url(p, &ctx.path, "", strip_len);
@@ -7383,8 +7429,8 @@ async fn handle_proxy_request_inner(
                 consumer_username: ctx.effective_identity().map(str::to_owned),
                 http_method: method,
                 request_path: path,
-                matched_proxy_id: Some(proxy.id.clone()),
-                matched_proxy_name: proxy.name.clone(),
+                proxy_id: Some(proxy.id.clone()),
+                proxy_name: proxy.name.clone(),
                 backend_target_url: Some(strip_query_params(&backend_url).to_string()),
                 backend_resolved_ip,
                 response_status_code: response_status,

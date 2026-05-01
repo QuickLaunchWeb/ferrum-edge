@@ -233,7 +233,7 @@ Splunk will parse each object in the JSON array as a separate event. All `Transa
 **Example Splunk search:**
 ```
 sourcetype="ferrum_edge_logs" response_status_code>=500
-| stats count by matched_proxy_name, error_class
+| stats count by proxy_name, error_class
 ```
 
 > **Note:** If you use the standard HEC endpoint (`/services/collector/event`) instead of `/services/collector/raw`, Splunk expects each event wrapped in `{"event": ...}` — which `http_logging` does not produce. Always use the `/raw` endpoint.
@@ -659,8 +659,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `consumer_username` | String or null | Authenticated identity used for policy/logging: mapped Consumer username when present, otherwise external `authenticated_identity`; null if unauthenticated |
 | `http_method` | String | HTTP method (e.g., `GET`, `POST`) |
 | `request_path` | String | Request path (query string stripped) |
-| `matched_proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
-| `matched_proxy_name` | String or null | Proxy name (null if unnamed or unmatched) |
+| `proxy_id` | String or null | Proxy ID that matched the route (null for unmatched) |
+| `proxy_name` | String or null | Proxy name (null if unnamed or unmatched) |
 | `backend_target_url` | String or null | Backend URL (`host:port/path`); null for rejected requests |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
@@ -684,7 +684,24 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 
 **`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome.
 
-**`error_class` values:** `ConnectionFailed`, `Timeout`, `BadGateway`, `ServiceUnavailable`. Only set when the gateway itself could not communicate with the backend. Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.
+**`error_class` values** (serialized as `snake_case` strings — see [docs/error_classification.md](error_classification.md) for the canonical taxonomy and per-protocol semantics):
+
+- `connection_refused` — TCP connect refused / firewall RST during connect
+- `connection_timeout` — TCP connect did not complete before the timeout
+- `connection_reset` — mid-stream RST received after the connection was established (post-wire)
+- `connection_closed` — peer FIN / broken pipe / aborted connection (post-wire)
+- `dns_lookup_error` — backend hostname could not be resolved
+- `tls_error` — TLS or DTLS handshake failed (certificate, ALPN, alert)
+- `read_write_timeout` — backend read or write exceeded the configured watermark
+- `protocol_error` — HTTP/2 or HTTP/3 protocol-level error after a stream is opened (RST_STREAM, GOAWAY, RFC 6455 WS protocol violation)
+- `response_body_too_large` / `request_body_too_large` — body exceeded the configured maximum
+- `connection_pool_error` — could not acquire/create an HTTP client from the pool
+- `port_exhaustion` — EADDRNOTAVAIL — all ephemeral ports in use
+- `client_disconnect` — client gave up before the gateway could complete the response
+- `graceful_remote_close` — peer closed cleanly (HTTP/3 `H3_NO_ERROR`, RFC 6455 Close frame); informational, not a transport failure
+- `request_error` — catch-all for unclassified gateway-side rejections
+
+Only set when the gateway itself could not communicate with the backend (or when a streaming body fails after headers — that goes on `body_error_class`). Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.
 
 #### StreamTransactionSummary Fields (TCP / UDP / DTLS)
 
@@ -719,8 +736,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
   "consumer_username": "api-service-a",
   "http_method": "POST",
   "request_path": "/api/v1/users",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440001",
-  "matched_proxy_name": "users-api",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
+  "proxy_name": "users-api",
   "backend_target_url": "10.0.2.10:8080/api/v1/users",
   "backend_resolved_ip": "10.0.2.10",
   "response_status_code": 201,
@@ -745,8 +762,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
   "consumer_username": null,
   "http_method": "GET",
   "request_path": "/api/v1/events",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440002",
-  "matched_proxy_name": "sse-events",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440002",
+  "proxy_name": "sse-events",
   "backend_target_url": "10.0.2.15:8080/api/v1/events",
   "backend_resolved_ip": "10.0.2.15",
   "response_status_code": 200,
@@ -774,8 +791,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
   "consumer_username": "mobile-app",
   "http_method": "GET",
   "request_path": "/api/v2/feed",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440003",
-  "matched_proxy_name": "feed-api",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440003",
+  "proxy_name": "feed-api",
   "backend_target_url": "10.0.2.20:8080/api/v2/feed",
   "backend_resolved_ip": "10.0.2.20",
   "response_status_code": 200,
@@ -802,8 +819,8 @@ HTTP/3 uses the same `TransactionSummary` as HTTP/1.1 and HTTP/2. The frontend a
   "consumer_username": "grpc-client",
   "http_method": "POST",
   "request_path": "/myapp.UserService/GetUser",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440004",
-  "matched_proxy_name": "grpc-users",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440004",
+  "proxy_name": "grpc-users",
   "backend_target_url": "10.0.2.30:50051/myapp.UserService/GetUser",
   "backend_resolved_ip": "10.0.2.30",
   "response_status_code": 200,
@@ -834,8 +851,8 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
   "consumer_username": "ws-user",
   "http_method": "GET",
   "request_path": "/ws/chat",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440005",
-  "matched_proxy_name": "ws-chat",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
+  "proxy_name": "ws-chat",
   "backend_target_url": "10.0.2.40:8080/ws/chat",
   "backend_resolved_ip": "10.0.2.40",
   "response_status_code": 101,
@@ -862,8 +879,8 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "consumer_username": null,
   "http_method": "GET",
   "request_path": "/ws/chat",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440005",
-  "matched_proxy_name": "ws-chat",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440005",
+  "proxy_name": "ws-chat",
   "backend_target_url": "10.0.2.40:8080/ws/chat",
   "response_status_code": 502,
   "latency_total_ms": 5012.30,
@@ -874,7 +891,7 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "latency_plugin_external_io_ms": 0.0,
   "latency_gateway_overhead_ms": 5011.85,
   "request_user_agent": "Mozilla/5.0",
-  "error_class": "ConnectionFailed",
+  "error_class": "connection_refused",
   "metadata": {"rejection_phase": "websocket_backend_error"}
 }
 ```
@@ -888,8 +905,8 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
   "consumer_username": null,
   "http_method": "GET",
   "request_path": "/api/v1/secrets",
-  "matched_proxy_id": "550e8400-e29b-41d4-a716-446655440001",
-  "matched_proxy_name": "users-api",
+  "proxy_id": "550e8400-e29b-41d4-a716-446655440001",
+  "proxy_name": "users-api",
   "backend_target_url": null,
   "response_status_code": 401,
   "latency_total_ms": 0.15,
@@ -934,13 +951,13 @@ Rejected requests have `backend_target_url: null` (no backend was contacted), la
   "proxy_name": "tcp-database",
   "client_ip": "10.0.1.80",
   "backend_target": "db-primary.internal:5432",
-  "protocol": "tcp_tls",
+  "protocol": "tcps",
   "listen_port": 5432,
   "duration_ms": 5002.0,
   "bytes_sent": 0,
   "bytes_received": 0,
   "connection_error": "DNS resolution failed for db-primary.internal: NXDOMAIN",
-  "error_class": "ConnectionTimeout",
+  "error_class": "dns_lookup_error",
   "timestamp_connected": "2026-03-31T14:24:00.000+00:00",
   "timestamp_disconnected": "2026-03-31T14:24:05.002+00:00"
 }
