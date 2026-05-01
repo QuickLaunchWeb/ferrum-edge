@@ -158,13 +158,6 @@ impl Http2PoolManager {
         .await
     }
 
-    fn remaining_connect_timeout(
-        connect_started: Instant,
-        connect_timeout: Duration,
-    ) -> Option<Duration> {
-        connect_timeout.checked_sub(connect_started.elapsed())
-    }
-
     fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> Http2PoolError {
         Http2PoolError::BackendTimeout {
             message: format!(
@@ -295,7 +288,8 @@ impl Http2PoolManager {
             }
         })?;
 
-        let Some(remaining) = Self::remaining_connect_timeout(connect_started, connect_timeout)
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
         else {
             return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
         };
@@ -323,7 +317,8 @@ impl Http2PoolManager {
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
 
-        let Some(remaining) = Self::remaining_connect_timeout(connect_started, connect_timeout)
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
         else {
             return Err(Self::backend_connect_timeout_error(
                 proxy,

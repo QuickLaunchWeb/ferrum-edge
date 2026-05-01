@@ -5,7 +5,7 @@ use dashmap::mapref::entry::Entry;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, watch};
 
 use crate::config::PoolConfig;
@@ -20,6 +20,19 @@ fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Remaining slice of a backend connect budget after `connect_started`.
+///
+/// Returns `None` once the budget is exhausted, so each handshake stage
+/// (TCP → TLS → H2/H3) shares one end-to-end deadline rather than restarting
+/// the timer per phase. Pool-specific code converts `None` into its own
+/// `BackendTimeout` error variant.
+pub fn remaining_connect_timeout(
+    connect_started: Instant,
+    connect_timeout: Duration,
+) -> Option<Duration> {
+    connect_timeout.checked_sub(connect_started.elapsed())
 }
 
 #[async_trait]

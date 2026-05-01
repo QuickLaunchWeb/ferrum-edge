@@ -9025,10 +9025,14 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
 }
 
 fn is_valid_reg_name(host: &str) -> bool {
+    // RFC 3986 reg-name minus comma. Comma is technically a sub-delim, but it
+    // is also the HTTP list separator (Content-Length, TE, etc.), so accepting
+    // it inside a hostname invites parser-differential mistakes between routing
+    // and any code that splits authority-derived strings on commas later.
     !host.is_empty()
         && host
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._%~!$&'()*+,;=".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"-._%~!$&'()*+;=".contains(&b))
 }
 
 fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -9174,9 +9178,10 @@ pub fn check_host_authority_consistency(
 ///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
 ///    confusion between the proxy and backend.
 ///
-/// 4. **TE header validation** (HTTP/2 only): RFC 9113 §8.2.2 — the only permitted
-///    value is "trailers"; any other value is a protocol violation that could be used
-///    to confuse HTTP/2-unaware intermediaries.
+/// 4. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
+///    the only permitted value is "trailers"; any other value (or an empty list element
+///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
+///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,

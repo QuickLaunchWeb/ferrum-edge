@@ -945,6 +945,14 @@ fn host_with_fragment_rejected_for_routing() {
 }
 
 #[test]
+fn host_with_comma_rejected_for_routing() {
+    // Comma is the HTTP list separator. Accepting it in a hostname would let a
+    // single Host header smuggle multiple authority-shaped values past anything
+    // downstream that splits on commas (logs, plugin matchers, etc.).
+    assert!(normalize_request_host_for_routing("api.example,evil.example").is_none());
+}
+
+#[test]
 fn host_with_backslash_rejected_for_routing() {
     assert!(normalize_request_host_for_routing(r"api.example\foo").is_none());
 }
