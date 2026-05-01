@@ -1298,7 +1298,7 @@ impl EnvConfig {
             http3_send_window: u64 = "FERRUM_HTTP3_SEND_WINDOW" => crate::http3::config::H3_SEND_WINDOW_DEFAULT;
             http3_connections_per_backend: usize = "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND" => 4usize, max(1usize);
             http3_pool_idle_timeout_seconds: u64 = "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS" => 120u64;
-            http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::proxy::body::COALESCE_MIN_FLOOR, crate::proxy::body::COALESCE_MAX_CAP);
+            http3_coalesce_max_bytes: usize = "FERRUM_HTTP3_COALESCE_MAX_BYTES" => crate::http3::config::H3_COALESCE_MAX_DEFAULT, clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, crate::http3::config::H3_COALESCE_MAX_CAP);
             http3_flush_interval_micros: u64 = "FERRUM_HTTP3_FLUSH_INTERVAL_MICROS" => 200u64, clamp(crate::http3::config::H3_FLUSH_INTERVAL_MIN_MICROS, crate::http3::config::H3_FLUSH_INTERVAL_MAX_MICROS);
             http3_request_body_channel_capacity: usize = "FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY" => 32usize, clamp(1usize, 1024usize);
             h3_request_body_drain_ms: u64 = "FERRUM_H3_REQUEST_BODY_DRAIN_MS" => 50u64, clamp(0u64, 1000u64);
@@ -1492,7 +1492,7 @@ impl EnvConfig {
                     crate::http3::config::H3_COALESCE_MAX_DEFAULT
                 })?;
             let clamped = raw.clamp(
-                crate::proxy::body::COALESCE_MIN_FLOOR,
+                crate::http3::config::H3_COALESCE_MIN_FLOOR,
                 http3_coalesce_max_bytes,
             );
             if raw > http3_coalesce_max_bytes {

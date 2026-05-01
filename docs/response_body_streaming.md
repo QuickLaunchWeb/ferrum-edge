@@ -89,23 +89,16 @@ The coalescing logic — buffer accumulation, large-frame pass-through, opportun
 
 This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually.
 
-#### Operator-Tunable Bounds (Shared Across Protocols)
+#### Operator-Tunable Knobs
 
-Two `pub const` bounds in `src/proxy/body.rs` clamp every coalesce-related env var to a sane range. They are shared so a single audit covers H1/H2/H3:
+Each protocol has its own coalesce knob with bounds tuned for its native framing characteristics. The bounds intentionally differ — H3 chunks are QUIC-packet-sized (~1.5 KiB) so a 1 KiB floor is meaningful; H2 inbound DATA frames are typically ≥ 16 KiB (RFC 9113 default) so a smaller floor would just disable coalescing.
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `body::COALESCE_MIN_FLOOR` | `1024` (1 KiB) | Lower bound for any coalesce target / capacity. Below this, the buffer pass-through fast-path triggers on every frame and coalescing has no effect. |
-| `body::COALESCE_MAX_CAP` | `1_048_576` (1 MiB) | Upper bound for any coalesce buffer capacity. Caps per-stream memory regardless of env-var input. |
-
-Per-protocol knobs that clamp through these bounds:
-
-| Env Var | Default | Path |
-|---------|---------|------|
-| `FERRUM_H2_COALESCE_TARGET_BYTES` | `131_072` (128 KiB) | Direct H2 pool, gRPC pool |
-| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32_768` (32 KiB) | H3 native + cross-protocol bridge |
-| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32_768` (32 KiB) | H3 native + cross-protocol bridge |
-| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | H3 time-based flush deadline |
+| Env Var | Default | Clamp Range | Path |
+|---------|---------|-------------|------|
+| `FERRUM_H2_COALESCE_TARGET_BYTES` | `131_072` (128 KiB) | `[16 KiB, 1 MiB]` | Direct H2 pool, gRPC pool |
+| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32_768` (32 KiB) | `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]` | H3 native + cross-protocol bridge |
+| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32_768` (32 KiB) | same as above | H3 native + cross-protocol bridge |
+| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | `[50 µs, 100 ms]` | H3 time-based flush deadline |
 
 The H1/H2-via-reqwest path uses a fixed 128 KiB target (`COALESCE_TARGET` in `body.rs`) — there is no env-var knob for it because `Pending` opportunistically flushes the buffer on every poll-wakeup gap, so SSE / trickle-style backends are not held back regardless of target size.
 

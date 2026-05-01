@@ -854,28 +854,9 @@ where
     }
 }
 
-/// Default flush target for the protocol-agnostic [`Coalescing`] adapter when
-/// no explicit target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path). Picked
-/// to match the H2/gRPC `FERRUM_H2_COALESCE_TARGET_BYTES` default and the H3
-/// configurable buffer cap so write granularity is uniform across protocols.
+/// Default flush target for the [`Coalescing`] adapter when no explicit
+/// target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path).
 const COALESCE_TARGET: usize = 128 * 1024;
-
-/// Absolute lower bound for any operator-tunable coalesce knob (target /
-/// buffer capacity). Values below this erase the benefit of coalescing
-/// entirely — at this size the inner source rarely yields anything smaller,
-/// so the buffer pass-through fast-path triggers on every frame.
-///
-/// Shared by all protocols that expose configurable coalescing
-/// (`FERRUM_H2_COALESCE_TARGET_BYTES`, `FERRUM_HTTP3_COALESCE_MIN_BYTES`,
-/// `FERRUM_HTTP3_COALESCE_MAX_BYTES`).
-pub const COALESCE_MIN_FLOOR: usize = 1024;
-
-/// Absolute upper bound for any operator-tunable coalesce knob. Bounds the
-/// per-stream coalescing buffer regardless of configuration so a typo in an
-/// env var cannot pin pathological amounts of memory per concurrent stream.
-///
-/// Shared by all protocols that expose configurable coalescing.
-pub const COALESCE_MAX_CAP: usize = 1_048_576;
 
 pub(crate) trait FrameSource {
     fn poll_frame(
@@ -1388,8 +1369,12 @@ pub(crate) fn coalescing_h3_body(
     flush_interval: Duration,
 ) -> ProxyBody {
     let source = H3FrameSource::new(recv_stream);
-    let buffer_capacity = coalesce_max_bytes.clamp(COALESCE_MIN_FLOOR, COALESCE_MAX_CAP);
-    let target_bytes = coalesce_min_bytes.clamp(COALESCE_MIN_FLOOR, buffer_capacity);
+    let buffer_capacity = coalesce_max_bytes.clamp(
+        crate::http3::config::H3_COALESCE_MIN_FLOOR,
+        crate::http3::config::H3_COALESCE_MAX_CAP,
+    );
+    let target_bytes =
+        coalesce_min_bytes.clamp(crate::http3::config::H3_COALESCE_MIN_FLOOR, buffer_capacity);
     let body = Coalescing::with_flush_after_and_capacity(
         source,
         target_bytes,

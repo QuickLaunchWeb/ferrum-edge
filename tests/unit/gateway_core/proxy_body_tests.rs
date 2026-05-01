@@ -283,37 +283,6 @@ fn test_streaming_metrics_release_acquire_coherence() {
     assert!(!metrics.completed());
 }
 
-// ── Protocol-agnostic coalesce bounds ──────────────────────────────────
-//
-// `COALESCE_MIN_FLOOR` and `COALESCE_MAX_CAP` are the shared bounds for
-// every protocol's coalescing knob (H2 direct pool, H3 native, future H1
-// reqwest knob). Locking the values here protects against an accidental
-// rename / change that would silently shift the legal range for
-// `FERRUM_HTTP3_COALESCE_*_BYTES` and `FERRUM_H2_COALESCE_TARGET_BYTES`.
-#[test]
-fn test_coalesce_min_floor_value_is_1024() {
-    assert_eq!(ferrum_edge::proxy::body::COALESCE_MIN_FLOOR, 1024);
-}
-
-#[test]
-fn test_coalesce_max_cap_value_is_1_mib() {
-    assert_eq!(
-        ferrum_edge::proxy::body::COALESCE_MAX_CAP,
-        1024 * 1024,
-        "1 MiB upper bound caps per-stream memory regardless of env-var input"
-    );
-}
-
-#[test]
-fn test_coalesce_floor_below_cap() {
-    // Sanity: floor must be strictly less than cap, otherwise the clamp
-    // collapses and operator tuning of FERRUM_HTTP3_COALESCE_*_BYTES has no
-    // effect. Use `const { ... }` so this is also a compile-time guard.
-    const _: () = assert!(
-        ferrum_edge::proxy::body::COALESCE_MIN_FLOOR < ferrum_edge::proxy::body::COALESCE_MAX_CAP
-    );
-}
-
 // ── ProxyBody::into_tracked ────────────────────────────────────────────
 //
 // Verifies that the unified `Stream → Tracked` wrapper preserves the
