@@ -1,26 +1,34 @@
 _format_version: "3.0"
-# Upstream TLS CA trust anchor. run_gateway_protocol_bench.sh::start_kong
-# reads proto_backend's generated self-signed cert and substitutes the PEM
-# content into the placeholder below. The cert carries basicConstraints
-# CA:TRUE so Kong's declarative ca_certificates entity accepts it.
-ca_certificates:
-  - id: "00000000-0000-0000-0000-000000000001"
-    cert: |
-      __BENCH_CA_PEM__
-
 
 # Kong DB-less declarative configuration — gRPC end-to-end TLS.
 # Client grpcs → Kong (TLS termination, ALPN h2) → grpcs upstream on 50053.
 # Every hop encrypted. KONG_PROXY_LISTEN must include http2 for ALPN h2 accept.
+#
+# ── Why this config doesn't use per-service `ca_certificates` ────────────
+# Kong's per-service `tls_verify: true` + `ca_certificates: [...]` pattern
+# triggers the same per-request SSL_CTX swap that wrecked HTTP/1.1 TLS
+# throughput (see http1_tls.yaml). For grpcs, that combination also caused
+# Kong to fail to start in CI ("kong failed to start, skipping" run
+# 25197898901, job 73882497826), so the bench was scoring zero for Kong
+# on grpcs entirely.
+#
+# Trust + verify are imposed GLOBALLY via the harness env vars:
+#   KONG_NGINX_PROXY_GRPC_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem
+#   KONG_NGINX_PROXY_GRPC_SSL_VERIFY=on
+# These produce the `grpc_ssl_trusted_certificate` and `grpc_ssl_verify`
+# directives (nginx grpc module's analogues of `proxy_ssl_*`) in the
+# rendered nginx-kong.conf at config-load time, keeping the upstream
+# SSL_CTX static so the H2/grpc connection pool can reuse sockets.
+#
+# `host: localhost` matches the cert's DNS:localhost SAN so nginx's
+# upstream-name verification passes (cert also has IP:127.0.0.1 but
+# classic nginx verifies against DNS SANs only).
 
 services:
   - name: grpc-service
-    host: 127.0.0.1
+    host: localhost
     port: 50053
     protocol: grpcs
-    tls_verify: true
-    ca_certificates:
-      - "00000000-0000-0000-0000-000000000001"
     connect_timeout: 5000
     read_timeout: 30000
     write_timeout: 30000

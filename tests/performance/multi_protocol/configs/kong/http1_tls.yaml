@@ -1,40 +1,40 @@
 _format_version: "3.0"
-# Upstream TLS CA trust anchor. run_gateway_protocol_bench.sh::start_kong
-# reads proto_backend's generated self-signed cert and substitutes the PEM
-# content into the placeholder below. The cert carries basicConstraints
-# CA:TRUE so Kong's declarative ca_certificates entity accepts it.
-ca_certificates:
-  - id: "00000000-0000-0000-0000-000000000001"
-    cert: |
-      __BENCH_CA_PEM__
-
 
 # Kong DB-less declarative configuration — HTTP/1.1 end-to-end TLS.
 # Client HTTPS → Kong → HTTPS upstream on 3447. Every hop encrypted.
 # Listener is configured via KONG_PROXY_LISTEN env var in harness script.
 #
-# Without an explicit upstream entity, Kong's default HTTP/1.1 keepalive
-# pool is tiny (or absent when the service points at an IP literal),
-# causing a fresh TLS handshake per request (~460ms floor, ~435 RPS at
-# 10KB, 99% overhead vs direct). The upstream below enables a 512-slot
-# keepalive pool so connections are reused across requests.
-
-upstreams:
-  - name: echo-upstream
-    targets:
-      - target: "127.0.0.1:3447"
-        weight: 100
-    # Kong upstream keepalive pool settings for HTTP/1.1 connection reuse
-    keepalive_pool_size: 512
-    keepalive_idle_timeout: 120
+# ── Why this config doesn't use per-service `ca_certificates` ────────────
+# Kong's per-service `tls_verify: true` + `ca_certificates: [...]` pattern
+# wires the upstream trust store via Lua at the rewrite/access phase. That
+# rebuilds the upstream SSL_CTX per request, which prevents OpenResty's
+# upstream keepalive pool from matching connections by SSL identity, so
+# every request triggers a fresh backend TLS handshake (~450 RPS ceiling
+# at concurrency 100, vs 9-10K RPS when the SSL_CTX is static).
+#
+# Instead we set a GLOBAL static trust + verify via nginx env vars in the
+# harness:
+#   KONG_NGINX_PROXY_PROXY_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem
+#   KONG_NGINX_PROXY_PROXY_SSL_VERIFY=on
+# These produce the `proxy_ssl_trusted_certificate` and `proxy_ssl_verify`
+# directives in nginx-kong.conf at config-load time, so SSL_CTX stays
+# stable across requests and the keepalive pool actually reuses sockets.
+#
+# `host: localhost` (not 127.0.0.1) matters — nginx's `proxy_ssl_verify`
+# matches the upstream's connect hostname against cert SANs, and the
+# bench cert presents `DNS:localhost` + `IP:127.0.0.1`. Classic nginx's
+# verifier checks DNS SANs against the connect target string, so we
+# need a hostname for the SAN match to succeed. `localhost` resolves
+# to 127.0.0.1 the same.
+#
+# Kong's upstream keepalive for HTTP/1.1 is also tuned via global env
+# vars (KONG_UPSTREAM_KEEPALIVE_*) — see the harness for the values.
 
 services:
   - name: echo-service
-    host: echo-upstream
+    host: localhost
+    port: 3447
     protocol: https
-    tls_verify: true
-    ca_certificates:
-      - "00000000-0000-0000-0000-000000000001"
     connect_timeout: 5000
     read_timeout: 30000
     write_timeout: 30000

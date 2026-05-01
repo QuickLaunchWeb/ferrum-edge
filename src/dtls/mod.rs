@@ -851,6 +851,15 @@ impl DtlsServer {
                     .unwrap_or(Duration::from_secs(60));
 
                 tokio::select! {
+                    // Biased so wire/app data drains before a queued shutdown
+                    // fires. Without this, dropping a `DtlsServerConn` races
+                    // the `try_send(())` shutdown signal against an
+                    // already-queued `app_in_rx` send (e.g., the final reply
+                    // a forwarder pushed right before releasing the conn) and
+                    // the random select ordering loses the reply ~50% of the
+                    // time. Shutdown still fires once data drains because the
+                    // remaining arms become Pending.
+                    biased;
                     // Incoming UDP packet from this client (demuxed by the server)
                     Some(data) = incoming_rx.recv() => {
                         if let Err(e) = dtls.handle_packet(&data) {

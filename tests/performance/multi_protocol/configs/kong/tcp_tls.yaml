@@ -1,13 +1,4 @@
 _format_version: "3.0"
-# Upstream TLS CA trust anchor. run_gateway_protocol_bench.sh::start_kong
-# reads proto_backend's generated self-signed cert and substitutes the PEM
-# content into the placeholder below. The cert carries basicConstraints
-# CA:TRUE so Kong's declarative ca_certificates entity accepts it.
-ca_certificates:
-  - id: "00000000-0000-0000-0000-000000000001"
-    cert: |
-      __BENCH_CA_PEM__
-
 
 # Kong DB-less declarative configuration — TCP end-to-end TLS stream proxy.
 # Client TLS → Kong (terminate + re-originate TLS) → TCP+TLS upstream on 3444.
@@ -16,15 +7,30 @@ ca_certificates:
 # terminate and re-encrypt.
 #
 # Stream routes require KONG_STREAM_LISTEN=127.0.0.1:5001 ssl env var.
+#
+# ── Why this config doesn't use per-service `ca_certificates` ────────────
+# Kong's per-service `tls_verify: true` + `ca_certificates: [...]` pattern
+# triggers the same per-request SSL_CTX swap that wrecked HTTP/1.1 TLS
+# throughput (see http1_tls.yaml). For tcp-tls, that combination also
+# caused Kong to fail to start in CI ("kong failed to start, skipping"
+# run 25197898901, job 73882497823) — Kong's stream-subsystem schema
+# doesn't accept the same per-service ca_certificates pattern in 3.10.
+#
+# Trust + verify are imposed GLOBALLY via the harness env vars (stream
+# subsystem variant):
+#   KONG_NGINX_STREAM_PROXY_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem
+#   KONG_NGINX_STREAM_PROXY_SSL_VERIFY=on
+# These produce the stream-block `proxy_ssl_trusted_certificate` and
+# `proxy_ssl_verify` directives at config-load time so the upstream
+# SSL_CTX is static.
+#
+# `host: localhost` matches the cert's DNS:localhost SAN.
 
 services:
   - name: tcp-service
-    host: 127.0.0.1
+    host: localhost
     port: 3444
     protocol: tls
-    tls_verify: true
-    ca_certificates:
-      - "00000000-0000-0000-0000-000000000001"
     connect_timeout: 5000
     read_timeout: 300000
     write_timeout: 300000
