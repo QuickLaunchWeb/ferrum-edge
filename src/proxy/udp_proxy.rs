@@ -1808,9 +1808,14 @@ async fn handle_dtls_client_inner(
                 // doesn't implement std::error::Error directly — render the
                 // chain into the message so log lines and source-walking
                 // consumers still see the underlying cause.
-                return Err(StreamSetupError::new(
+                //
+                // `with_colon_detail` joins as `"{prefix}: {detail}"`,
+                // matching the legacy `anyhow!("{}: {}", STREAM_ERR_..., e)`
+                // wording byte-for-byte so exact-match log pipelines keyed
+                // on the old token keep working.
+                return Err(StreamSetupError::with_colon_detail(
                     StreamSetupKind::BackendDtlsHandshake,
-                    format!(": {e:#}"),
+                    format!("{e:#}"),
                 )
                 .into());
             }
@@ -2267,10 +2272,12 @@ async fn create_session(
                     // dtls::DtlsConnection::connect returns anyhow::Error,
                     // which doesn't implement std::error::Error directly —
                     // render the chain into the message so consumers still
-                    // see the underlying cause.
-                    return Err(StreamSetupError::new(
+                    // see the underlying cause. See the sibling DTLS site
+                    // above for the `with_colon_detail` rationale (legacy
+                    // `"{prefix}: {err}"` wording stability).
+                    return Err(StreamSetupError::with_colon_detail(
                         StreamSetupKind::BackendDtlsHandshake,
-                        format!(": {e:#}"),
+                        format!("{e:#}"),
                     )
                     .into());
                 }

@@ -181,12 +181,38 @@ pub struct StreamSetupError {
 }
 
 impl StreamSetupError {
-    /// Build an error whose Display is `"{prefix} {detail}"` — the canonical
-    /// shape used at every legacy `anyhow!()` construction site.
+    /// Build an error whose Display is `"{prefix} {detail}"` (single-space
+    /// separator) — the canonical shape used at construction sites whose
+    /// legacy wording was `"{prefix} from {addr}: {err}"`,
+    /// `"{prefix} to {addr}: {err}"`, `"Connection {prefix}"`,
+    /// `"{prefix} for upstream {id}"`, etc. The caller's detail string
+    /// owns whatever connector word follows the prefix.
+    ///
+    /// For sites whose legacy emit was `"{prefix}: {detail}"` (no
+    /// connector word — bare colon-and-space), use
+    /// [`Self::with_colon_detail`] instead so the byte-for-byte log
+    /// wording is preserved.
     pub fn new(kind: StreamSetupKind, detail: impl fmt::Display) -> Self {
         Self {
             kind,
             message: format!("{} {}", kind.prefix(), detail),
+            source: None,
+        }
+    }
+
+    /// Build an error whose Display is `"{prefix}: {detail}"` (colon +
+    /// single-space separator).
+    ///
+    /// Used at construction sites whose legacy `anyhow!()` emit was
+    /// `"{}: {}"` directly — currently the two backend DTLS handshake
+    /// sites in [`crate::proxy::udp_proxy`]. Calling [`Self::new`] there
+    /// with a leading `":"` in the detail produced a stray space before
+    /// the colon (`"Backend DTLS handshake failed : ..."`) which broke
+    /// exact-match log pipelines keyed on the legacy wording.
+    pub fn with_colon_detail(kind: StreamSetupKind, detail: impl fmt::Display) -> Self {
+        Self {
+            kind,
+            message: format!("{}: {}", kind.prefix(), detail),
             source: None,
         }
     }
@@ -326,6 +352,55 @@ mod tests {
             "expected legacy prefix in {displayed:?}"
         );
         assert!(displayed.contains("invalid certificate"));
+    }
+
+    #[test]
+    fn display_byte_for_byte_matches_legacy_wording() {
+        // Lock the EXACT wording each constructor produces so log pipelines
+        // keyed on the legacy `anyhow!()` strings keep matching:
+        //
+        //   `anyhow!("{} from {}: {}", STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED, addr, e)`
+        //   → `StreamSetupError::new(FrontendTlsHandshake, "from <addr>: <err>")`
+        //   produces `"Frontend TLS handshake failed from <addr>: <err>"`.
+        //
+        //   `anyhow!("{}: {}", STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, e)`
+        //   → `StreamSetupError::with_colon_detail(BackendDtlsHandshake, "<err>")`
+        //   produces `"Backend DTLS handshake failed: <err>"`.
+        //
+        // Without `with_colon_detail`, passing `format!(": {e}")` to `new`
+        // would produce a stray space (`"... failed : ..."`) and break
+        // exact-match log pipelines.
+        let frontend = StreamSetupError::new(
+            StreamSetupKind::FrontendTlsHandshake,
+            "from 1.2.3.4:5678: bad cert",
+        );
+        assert_eq!(
+            format!("{frontend}"),
+            "Frontend TLS handshake failed from 1.2.3.4:5678: bad cert"
+        );
+
+        let backend_tcp = StreamSetupError::new(
+            StreamSetupKind::BackendTlsHandshake,
+            "to 10.0.0.1:443: alert: bad_certificate",
+        );
+        assert_eq!(
+            format!("{backend_tcp}"),
+            "Backend TLS handshake failed to 10.0.0.1:443: alert: bad_certificate"
+        );
+
+        let backend_dtls = StreamSetupError::with_colon_detail(
+            StreamSetupKind::BackendDtlsHandshake,
+            "alert: bad_certificate",
+        );
+        assert_eq!(
+            format!("{backend_dtls}"),
+            "Backend DTLS handshake failed: alert: bad_certificate"
+        );
+        // Critical: NO stray space before the colon.
+        assert!(
+            !format!("{backend_dtls}").contains("failed :"),
+            "DTLS legacy wording must use ': ' (no preceding space)"
+        );
     }
 
     #[test]
