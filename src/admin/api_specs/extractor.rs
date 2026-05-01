@@ -19,8 +19,6 @@
 pub use crate::config::types::SpecFormat;
 use crate::config::types::validate_resource_id;
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
-use regex::Regex;
-use std::sync::LazyLock;
 
 /// HTTP method keys counted when computing `operation_count`.
 const HTTP_METHODS: &[&str] = &[
@@ -118,12 +116,43 @@ pub enum ExtractError {
 }
 
 // ---------------------------------------------------------------------------
-// Regex for OpenAPI 3.x version strings
+// OpenAPI 3.x version-string matcher
 // ---------------------------------------------------------------------------
 
-/// Matches `3.MINOR.PATCH` with an optional pre-release suffix like `-rc1`.
-static OPENAPI3_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^3\.\d+\.\d+(-.+)?$").expect("invalid openapi3 version regex"));
+/// Returns `true` iff `s` is `3.MINOR.PATCH` (decimal digits) with an optional
+/// non-empty pre-release suffix like `-rc1`.
+///
+/// Hand-written rather than backed by a `regex::Regex` to avoid `.expect()`
+/// in production code (CLAUDE.md "no expect/unwrap" rule). Equivalent to the
+/// regex `^3\.\d+\.\d+(-.+)?$`.
+fn is_openapi3_version(s: &str) -> bool {
+    // Must start with "3."
+    let Some(rest) = s.strip_prefix("3.") else {
+        return false;
+    };
+    // First component (MINOR): one or more ASCII digits, terminated by '.'
+    let Some(dot_idx) = rest.find('.') else {
+        return false;
+    };
+    let minor = &rest[..dot_idx];
+    if minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let after_minor = &rest[dot_idx + 1..];
+    // Second component (PATCH): one or more ASCII digits, optionally followed
+    // by '-<suffix>' where <suffix> is non-empty.
+    let patch_end = after_minor.find('-').unwrap_or(after_minor.len());
+    let patch = &after_minor[..patch_end];
+    if patch.is_empty() || !patch.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if patch_end == after_minor.len() {
+        // No suffix.
+        return true;
+    }
+    // Suffix present (after the '-'): must be non-empty.
+    !after_minor[patch_end + 1..].is_empty()
+}
 
 /// Plugin config keys that are forbidden inside a plugin's `config` value.
 /// The walk is recursive; finding any of these keys at any depth is an error.
@@ -707,7 +736,7 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
     // OpenAPI 3.x
     if let Some(oa) = root.get("openapi")
         && let Some(s) = oa.as_str()
-        && OPENAPI3_VERSION_RE.is_match(s)
+        && is_openapi3_version(s)
     {
         return Ok(s.to_string());
     }
@@ -799,6 +828,75 @@ mod tests {
     /// Minimal proxy JSON suitable for embedding in a spec.
     fn minimal_proxy() -> &'static str {
         r#"{"id": "my-proxy", "backend_host": "api.example.com", "backend_port": 443}"#
+    }
+
+    // -----------------------------------------------------------------------
+    // is_openapi3_version — parity with the prior `^3\.\d+\.\d+(-.+)?$` regex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_openapi3_version_accepts_canonical_releases() {
+        for v in [
+            "3.0.0",
+            "3.0.3",
+            "3.1.0",
+            "3.1.5",
+            "3.2.0",
+            "3.10.99",
+            "3.0.123456",
+        ] {
+            assert!(is_openapi3_version(v), "must accept {v}");
+        }
+    }
+
+    #[test]
+    fn is_openapi3_version_accepts_prerelease_suffix() {
+        for v in [
+            "3.2.0-rc1",
+            "3.1.0-alpha",
+            "3.0.0-beta.2",
+            "3.2.0-rc1.with.dots",
+        ] {
+            assert!(is_openapi3_version(v), "must accept {v}");
+        }
+    }
+
+    #[test]
+    fn is_openapi3_version_rejects_non_threes() {
+        for v in ["2.0.0", "4.0.0", "30.0.0", "3", "3.0", "3.", ""] {
+            assert!(!is_openapi3_version(v), "must reject {v:?}");
+        }
+    }
+
+    #[test]
+    fn is_openapi3_version_rejects_non_digit_components() {
+        for v in [
+            "3.x.0",
+            "3.0.x",
+            "3.0a.0",
+            "3.0.0a",
+            "3..0",
+            "3.0.",
+            "3.0.0-",      // empty suffix
+            "3.0.0-\u{0}", // suffix with non-empty contents is fine; empty is not
+            "3.-1.0",      // leading dash → minor empty
+        ] {
+            // The "3.0.0-\u{0}" case has a non-empty suffix, so it should be ACCEPTED.
+            // Special-case it.
+            if v == "3.0.0-\u{0}" {
+                assert!(is_openapi3_version(v), "must accept non-empty suffix {v:?}");
+            } else {
+                assert!(!is_openapi3_version(v), "must reject {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn is_openapi3_version_rejects_leading_or_trailing_whitespace() {
+        // The original regex was anchored (^...$) — no whitespace allowed.
+        for v in [" 3.0.0", "3.0.0 ", "\t3.0.0", "3.0.0\n"] {
+            assert!(!is_openapi3_version(v), "must reject {v:?}");
+        }
     }
 
     // -----------------------------------------------------------------------

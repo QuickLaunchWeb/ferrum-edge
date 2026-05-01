@@ -3629,6 +3629,79 @@ async fn post_unicode_in_metadata_round_trips() {
 }
 
 // ============================================================================
+// Decompression bomb defence — end-to-end
+// ============================================================================
+
+/// A corrupted or adversarially-tampered DB row whose `spec_content` is a
+/// "gzip bomb" (small compressed bytes that decompress to many MiB) must NOT
+/// crash the admin server or exhaust memory on GET.
+///
+/// `decompress_gzip_capped` enforces a `2 * admin_spec_max_body_size_mib * MiB`
+/// cap; the GET handler surfaces overflow as a 500 with a generic
+/// "spec content corrupt or oversized" message.
+#[tokio::test]
+async fn get_with_bomb_ratio_spec_content_returns_500() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    // admin_spec_max_body_size_mib = 1 → decompress cap = 2 MiB.
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 1)).await;
+    let client = AdminClient::new(base);
+
+    // POST a normal spec to create a row we can tamper with.
+    let proxy_id = uid("proxy");
+    let listen_path = format!("/{proxy_id}");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "bomb test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        }
+    });
+    let (s1, b1) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED, "POST: {b1}");
+    let spec_id = b1["id"].as_str().unwrap().to_string();
+
+    // Build a bomb: gzip-compress 8 MiB of zeros.  The compressed output is
+    // ~8 KiB; decompressed it's 8 MiB, which exceeds the 2 MiB cap.
+    let zeros = vec![0u8; 8 * 1024 * 1024];
+    let bomb = ferrum_edge::admin::spec_codec::compress_gzip(&zeros).expect("gzip ok");
+    assert!(
+        bomb.len() < 100 * 1024,
+        "bomb must compress to <100 KiB to actually be a bomb (got {} bytes)",
+        bomb.len()
+    );
+
+    // Overwrite the stored spec_content via a raw SQL UPDATE.  This simulates
+    // a corrupted DB row or an attacker who somehow modified storage.
+    sqlx::query("UPDATE api_specs SET spec_content = ? WHERE id = ?")
+        .bind(bomb.as_slice())
+        .bind(&spec_id)
+        .execute(&store.pool())
+        .await
+        .expect("update bomb spec_content");
+
+    // GET — must NOT OOM the server.  Returns a 500 with a generic error body
+    // (the redacted message; raw decompression error is logged at error level).
+    let (status, body) = client.get_json(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "GET on a bomb-ratio row must return 500; body: {body}"
+    );
+
+    // Sanity: server is still alive (subsequent request returns normally).
+    let (status_after, _body) = client.get_json("/api-specs").await;
+    assert_eq!(
+        status_after,
+        reqwest::StatusCode::OK,
+        "server must remain responsive after rejecting the bomb"
+    );
+}
+
+// ============================================================================
 // Fix 1 — Timestamp stamping (server-side overrides operator-supplied values)
 // ============================================================================
 
