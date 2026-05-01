@@ -255,7 +255,6 @@ start_ferrum() {
         http3)
             extra_env+=(
                 -e "FERRUM_ENABLE_HTTP3=true"
-                -e "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND=8"
             )
             ;;
     esac
