@@ -221,7 +221,8 @@ To keep the filter correct, tag names must not contain any of the following char
 | Character | Why forbidden |
 |---|---|
 | `"` | Would close the JSON string literal early, producing false positives |
-| `%` | Would act as a SQL wildcard, matching unrelated tags |
+| `%` | SQL `LIKE` multi-character wildcard — would match unrelated tags |
+| `_` | SQL `LIKE` single-character wildcard — `?has_tag=api_v1` would falsely match `apixv1` |
 | `\` | Would act as a SQL escape character and corrupt the pattern |
 
 Tags with forbidden characters are rejected at submit time with HTTP 422 `InvalidTagName`. MongoDB uses native array membership and is not affected by the `LIKE` limitation, but the same character restrictions apply for consistency.

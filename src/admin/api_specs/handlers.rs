@@ -304,11 +304,16 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
     for entry in accept.split(',') {
         // Split type/subtype from parameters.
         let mut parts = entry.splitn(2, ';');
-        let media_type = parts.next().unwrap_or("").trim();
+        let media_type_raw = parts.next().unwrap_or("").trim();
         let params = parts.next().unwrap_or("");
         let q = parse_quality(params);
 
-        match media_type {
+        // RFC 7231 §3.1.1.1: media type tokens (type/subtype) are
+        // case-insensitive. Normalize before matching so that headers like
+        // `Accept: Application/JSON` are recognized.
+        let media_type = media_type_raw.to_ascii_lowercase();
+
+        match media_type.as_str() {
             "*/*" | "application/*" => {
                 if best_wildcard.map_or(true, |prev| q > prev) {
                     best_wildcard = Some(q);
@@ -435,6 +440,29 @@ mod negotiate_accept_tests {
             negotiate_accept(&h2, SpecFormat::Json),
             SpecFormat::Yaml,
             "highest-quality type must win"
+        );
+    }
+
+    /// RFC 7231 §3.1.1.1 says media type tokens are case-insensitive.
+    /// Standards-compliant clients may send mixed-case tokens; we must
+    /// normalize before matching.
+    #[test]
+    fn negotiate_accept_is_case_insensitive() {
+        // Mixed-case JSON
+        let h = headers_with_accept("Application/JSON");
+        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Json);
+        // Upper-case YAML variant
+        let h = headers_with_accept("APPLICATION/X-YAML");
+        assert_eq!(negotiate_accept(&h, SpecFormat::Json), SpecFormat::Yaml);
+        // Mixed-case wildcard
+        let h = headers_with_accept("Application/*");
+        assert_eq!(negotiate_accept(&h, SpecFormat::Yaml), SpecFormat::Yaml);
+        // Mixed-case quality parameter still parses
+        let h = headers_with_accept("application/yaml;Q=0.5, Application/JSON;q=1.0");
+        assert_eq!(
+            negotiate_accept(&h, SpecFormat::Yaml),
+            SpecFormat::Json,
+            "case-insensitive parsing must coexist with quality ordering"
         );
     }
 

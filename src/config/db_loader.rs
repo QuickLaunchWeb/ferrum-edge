@@ -4027,13 +4027,16 @@ impl DatabaseStore {
             //
             // SAFETY-CRITICAL CROSS-FILE INVARIANT:
             // The bare LIKE pattern here has NO ESCAPE clause.  It is safe ONLY
-            // because tag names containing `"`, `%`, or `\` are rejected at
-            // extract time via `ExtractError::InvalidTagName` in
+            // because tag names containing `"`, `%`, `_`, or `\` are rejected
+            // at extract time via `ExtractError::InvalidTagName` in
             // src/admin/api_specs/extractor.rs (tag validation section).
+            // Note: `_` is the SQL LIKE single-character wildcard — without
+            // rejecting it, `?has_tag=api_v1` would falsely match `apixv1`.
             // If you ever relax that extractor whitelist, you MUST switch this
             // query to use `LIKE ... ESCAPE '\\'` and pre-escape the tag value
-            // before binding it — otherwise `%` or `\` in a tag name would turn
-            // into a wildcard or escape token, producing false positives.
+            // before binding it — otherwise `%`, `_`, or `\` in a tag name
+            // would turn into a wildcard or escape token, producing false
+            // positives.
             //
             // MongoDB uses native array membership (`filter_doc.insert("tags", tag)`)
             // with a multikey index and is unaffected by this pattern.

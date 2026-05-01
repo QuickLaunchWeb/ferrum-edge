@@ -106,12 +106,14 @@ pub enum ExtractError {
         spec_upstream_id: String,
     },
     /// Tag name contains a character that would cause false LIKE matches in the
-    /// SQL `has_tag` filter (`"`, `%`, or `\`).  Tag names with these characters
-    /// are rejected at extraction time rather than escaping them at query time,
-    /// because tag names are short identifiers and these characters have no
-    /// legitimate use in them.  See `db_loader.rs` `list_api_specs` `has_tag`
-    /// branch for the matching LIKE pattern.
-    #[error("tag '{name}' contains forbidden character '{char}' (\", %, or \\\\)")]
+    /// SQL `has_tag` filter (`"`, `%`, `_`, or `\`).  Tag names with these
+    /// characters are rejected at extraction time rather than escaping them at
+    /// query time, because tag names are short identifiers and these characters
+    /// have no legitimate use in them.  Note that `_` is also a single-character
+    /// SQL LIKE wildcard, so `?has_tag=api_v1` would otherwise falsely match
+    /// `apixv1`. See `db_loader.rs` `list_api_specs` `has_tag` branch for the
+    /// matching LIKE pattern.
+    #[error("tag '{name}' contains forbidden character '{char}' (\", %, _, or \\\\)")]
     InvalidTagName { name: String, char: char },
 }
 
@@ -217,8 +219,10 @@ pub fn extract(
     // SAFETY-CRITICAL CROSS-FILE INVARIANT:
     // The SQL `has_tag` filter in src/config/db_loader.rs uses a bare LIKE
     // pattern (`tags LIKE '%"<tag>"%'`) that embeds tag names directly without
-    // an ESCAPE clause.  Tag names containing `"`, `%`, or `\` would produce
-    // false matches or wildcard matches against the stored JSON-array column.
+    // an ESCAPE clause.  Tag names containing `"`, `%`, `_`, or `\` would
+    // produce false matches or wildcard matches against the stored JSON-array
+    // column.  In particular, `_` is the SQL LIKE single-character wildcard:
+    // without rejecting it, `?has_tag=api_v1` would falsely match `apixv1`.
     // We reject those characters here to keep the LIKE filter correct.
     // MongoDB uses native array membership (`filter_doc.insert("tags", tag)`)
     // and is unaffected, but we still reject these characters for consistency.
@@ -227,7 +231,7 @@ pub fn extract(
     //   src/config/db_loader.rs  — list_api_specs, has_tag branch (comment there)
     //   docs/api_specs.md        — "Tag-name rules" section
     for tag in &tier1.tags {
-        for ch in ['"', '%', '\\'] {
+        for ch in ['"', '%', '_', '\\'] {
             if tag.contains(ch) {
                 return Err(ExtractError::InvalidTagName {
                     name: tag.clone(),
@@ -1692,13 +1696,26 @@ x-ferrum-proxy:
         );
     }
 
+    /// `_` is the SQL LIKE single-character wildcard — without rejecting it,
+    /// `?has_tag=api_v1` would falsely match `apixv1`.
+    #[test]
+    fn test_tag_with_underscore_rejected() {
+        let spec = spec_with_tag("api_v1");
+        let err = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidTagName { name, char: '_' } if name == "api_v1"),
+            "expected InvalidTagName for '_'; got: {err}"
+        );
+    }
+
     #[test]
     fn test_tag_with_normal_chars_accepted() {
-        let spec = spec_with_tag("my-tag_v1.0");
-        // Must not error.
+        let spec = spec_with_tag("my-tag-v1.0");
+        // Must not error. Note: `_` is NOT in the allowed set (see
+        // test_tag_with_underscore_rejected).
         let (_, meta) = extract(spec.as_bytes(), Some(SpecFormat::Json), "ferrum")
             .expect("tag with normal chars must be accepted");
-        assert!(meta.tags.contains(&"my-tag_v1.0".to_string()));
+        assert!(meta.tags.contains(&"my-tag-v1.0".to_string()));
     }
 
     // -----------------------------------------------------------------------
