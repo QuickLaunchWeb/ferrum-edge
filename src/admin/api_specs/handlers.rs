@@ -343,25 +343,151 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
         }
     }
 
-    // Determine the best-quality format.
-    // Wildcard and "exact stored" both map to `stored`; they are treated
-    // together as the same outcome.
-    let stored_quality = best_stored.or(best_wildcard).unwrap_or(0);
-    let json_quality = best_json.unwrap_or(0);
-    let yaml_quality = best_yaml.unwrap_or(0);
+    // Compute effective per-format quality, honoring RFC 7231 §5.3.2:
+    //   - An explicit `q=0` for a media range means the client refuses that
+    //     representation; the wildcard fallback does NOT override it.
+    //   - An absent media range falls back to the wildcard quality if any.
+    //   - The exact-stored bucket is treated like an explicit listing of the
+    //     stored format.
+    let wildcard_q = best_wildcard.unwrap_or(0);
 
-    // If no explicit preference was found, default to stored format.
-    if json_quality == 0 && yaml_quality == 0 && stored_quality == 0 {
+    // For each format: explicit value (incl. q=0) wins; otherwise inherit wildcard.
+    let json_explicit = best_json.or(if stored == SpecFormat::Json {
+        best_stored
+    } else {
+        None
+    });
+    let yaml_explicit = best_yaml.or(if stored == SpecFormat::Yaml {
+        best_stored
+    } else {
+        None
+    });
+
+    let json_q = json_explicit.unwrap_or(wildcard_q);
+    let yaml_q = yaml_explicit.unwrap_or(wildcard_q);
+
+    // Did the client mention any of OUR buckets at all? (json/yaml/wildcard
+    // /exact-stored). If not, we default to stored as before — RFC permits
+    // serving any representation when no Accept rules match.
+    let saw_relevant = best_json.is_some()
+        || best_yaml.is_some()
+        || best_wildcard.is_some()
+        || best_stored.is_some();
+    if !saw_relevant {
         return stored;
     }
 
-    if json_quality >= yaml_quality && json_quality >= stored_quality {
+    // If the client mentioned our buckets but every effective quality is 0,
+    // they have explicitly rejected every representation we can serve. Signal
+    // this by returning the stored format — but the caller is expected to
+    // detect "all q=0" and translate to 406 Not Acceptable. Today the caller
+    // only wires 406 on conversion failure; an explicit 406-on-q=0 path lives
+    // in the public wrapper below.
+    //
+    // Pick the highest non-zero effective quality. Ties go to stored.
+    if json_q == 0 && yaml_q == 0 {
+        // Neither format is acceptable. The public wrapper interprets this
+        // by returning None instead.
+        return stored; // sentinel; the wrapper detects this case via accept_acceptable.
+    }
+
+    if json_q > yaml_q {
         SpecFormat::Json
-    } else if yaml_quality >= json_quality && yaml_quality >= stored_quality {
+    } else if yaml_q > json_q {
         SpecFormat::Yaml
     } else {
+        // Equal qualities — prefer stored.
         stored
     }
+}
+
+/// Returns `None` when the client's `Accept` header explicitly rejects every
+/// representation the server can serve (all relevant buckets at `q=0`). The
+/// caller should respond with 406 Not Acceptable in that case.
+///
+/// Returns `Some(format)` otherwise — either the negotiated format, or the
+/// stored format as a default when no relevant `Accept` entries were sent.
+pub(super) fn negotiate_accept_or_406(
+    headers: &hyper::HeaderMap,
+    stored: SpecFormat,
+) -> Option<SpecFormat> {
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if accept.is_empty() {
+        return Some(stored);
+    }
+
+    // Re-parse here to detect the "all explicit q=0" case without
+    // duplicating the arithmetic in `negotiate_accept`. Cheap (single
+    // pass over a short string).
+    let mut saw_relevant = false;
+    let mut json_explicit: Option<u32> = None;
+    let mut yaml_explicit: Option<u32> = None;
+    let mut wildcard_q: Option<u32> = None;
+    let mut stored_explicit: Option<u32> = None;
+
+    fn parse_quality(params: &str) -> u32 {
+        for param in params.split(';') {
+            let p = param.trim();
+            if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+                if let Ok(f) = rest.parse::<f64>() {
+                    return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
+                }
+            }
+        }
+        1000
+    }
+
+    for entry in accept.split(',') {
+        let mut parts = entry.splitn(2, ';');
+        let mt = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let q = parse_quality(parts.next().unwrap_or(""));
+        match mt.as_str() {
+            "*/*" | "application/*" => {
+                saw_relevant = true;
+                wildcard_q = Some(wildcard_q.map_or(q, |p| p.max(q)));
+            }
+            "application/json" => {
+                saw_relevant = true;
+                json_explicit = Some(json_explicit.map_or(q, |p| p.max(q)));
+                if stored == SpecFormat::Json {
+                    stored_explicit = Some(stored_explicit.map_or(q, |p| p.max(q)));
+                }
+            }
+            "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
+                saw_relevant = true;
+                yaml_explicit = Some(yaml_explicit.map_or(q, |p| p.max(q)));
+                if stored == SpecFormat::Yaml {
+                    stored_explicit = Some(stored_explicit.map_or(q, |p| p.max(q)));
+                }
+            }
+            _ => {} // unknown — ignored for relevance accounting
+        }
+    }
+
+    if !saw_relevant {
+        // No relevant Accept entries (e.g. `Accept: text/plain`). Default to
+        // stored format — preserves backward-compatible behavior.
+        return Some(stored);
+    }
+
+    // Effective q per format: explicit wins (including explicit q=0), else
+    // fall back to wildcard.
+    let wq = wildcard_q.unwrap_or(0);
+    let json_q = json_explicit.unwrap_or(wq);
+    let yaml_q = yaml_explicit.unwrap_or(wq);
+    let _ = stored_explicit; // tracked only for parity with negotiate_accept
+
+    if json_q == 0 && yaml_q == 0 {
+        // Every representation the server can serve has been explicitly
+        // rejected. RFC 7231: respond with 406 Not Acceptable.
+        return None;
+    }
+
+    Some(negotiate_accept(headers, stored))
 }
 
 #[cfg(test)]
@@ -479,6 +605,55 @@ mod negotiate_accept_tests {
             negotiate_accept(&h, SpecFormat::Yaml),
             SpecFormat::Yaml,
             "empty Accept must return stored format"
+        );
+    }
+
+    /// `Accept: application/json;q=0` explicitly refuses JSON. With no other
+    /// acceptable format mentioned, RFC 7231 says respond 406 — encoded by
+    /// `negotiate_accept_or_406` returning `None`.
+    #[test]
+    fn negotiate_accept_or_406_explicit_q0_returns_none() {
+        let h = headers_with_accept("application/json;q=0");
+        assert_eq!(
+            negotiate_accept_or_406(&h, SpecFormat::Json),
+            None,
+            "explicit q=0 on stored format with no fallback must yield None (→ 406)"
+        );
+        // `Accept: */*;q=0` rejects every representation.
+        let h = headers_with_accept("*/*;q=0");
+        assert_eq!(
+            negotiate_accept_or_406(&h, SpecFormat::Yaml),
+            None,
+            "wildcard q=0 must yield None (→ 406)"
+        );
+    }
+
+    /// q=0 on one format must NOT poison the other format's wildcard fallback.
+    #[test]
+    fn negotiate_accept_or_406_q0_one_format_serves_the_other() {
+        let h = headers_with_accept("application/json;q=0, application/yaml;q=1");
+        assert_eq!(
+            negotiate_accept_or_406(&h, SpecFormat::Json),
+            Some(SpecFormat::Yaml),
+            "explicit q=0 on JSON must not block YAML"
+        );
+    }
+
+    /// Empty / missing Accept and unknown-only Accept fall back to stored —
+    /// this is RFC-permitted default behavior, not a 406 case.
+    #[test]
+    fn negotiate_accept_or_406_default_to_stored_when_no_relevant_entries() {
+        let empty = hyper::HeaderMap::new();
+        assert_eq!(
+            negotiate_accept_or_406(&empty, SpecFormat::Yaml),
+            Some(SpecFormat::Yaml),
+            "missing Accept must default to stored"
+        );
+        let h = headers_with_accept("text/plain");
+        assert_eq!(
+            negotiate_accept_or_406(&h, SpecFormat::Json),
+            Some(SpecFormat::Json),
+            "Accept with only unrelated types must default to stored"
         );
     }
 }
@@ -714,63 +889,78 @@ async fn assign_ids_for_put(
             .push_back(ep);
     }
 
-    // Count how many extracted (empty-id) plugins share each plugin_name, so
-    // we can detect the ambiguous case: same name, different configs, both
-    // without explicit IDs.  Use owned `String` keys so the map does not hold
-    // borrows on bundle.plugins across the later mutable loop.
-    let mut extracted_name_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for pc in &bundle.plugins {
-        if pc.id.is_empty() {
-            *extracted_name_counts
-                .entry(pc.plugin_name.clone())
-                .or_default() += 1;
-        }
-    }
-
     // Snapshot proxy_id before the mutable plugin loop to avoid split borrows.
     let proxy_id_snap = bundle.proxy.id.clone();
 
-    // Assign plugin IDs (Fix 5 canonical matching).
-    for pc in &mut bundle.plugins {
+    // Assign plugin IDs in two passes (Fix 5 canonical matching, refined to
+    // tolerate one unmatched duplicate per name — see PR review at HEAD
+    // cf7ebc9).
+    //
+    // Pass 1: try to canonically match each empty-id plugin to a stored
+    // spec-owned plugin. Buffer the assignments. Track which names have
+    // multiple UNMATCHED entries — those are the genuinely ambiguous cases.
+    //
+    // Pass 2: walk the buffered assignments; for unmatched entries, mint a
+    // UUID when the name has only one unmatched entry (an unambiguous "new
+    // instance" addition), or reject when the same name has multiple
+    // unmatched entries with different configs (the original Fix 5 case —
+    // operator must use explicit IDs to disambiguate).
+    let mut assigned_ids: Vec<Option<String>> = Vec::with_capacity(bundle.plugins.len());
+    let mut unmatched_name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+
+    for pc in &bundle.plugins {
         if !pc.id.is_empty() {
-            // Operator supplied an explicit ID — leave as-is.
-            pc.proxy_id = Some(proxy_id_snap.clone());
+            // Operator supplied an explicit ID — keep as-is.
+            assigned_ids.push(Some(pc.id.clone()));
             continue;
         }
-
         let key = plugin_canonical_key(pc);
         if let Some(q) = canonical_to_existing.get_mut(&key) {
             if let Some(matched) = q.pop_front() {
-                // Exact canonical match — reuse the stored ID.
-                pc.id = matched.id.clone();
-                pc.proxy_id = Some(proxy_id_snap.clone());
+                assigned_ids.push(Some(matched.id.clone()));
                 continue;
             }
         }
+        // Unmatched — record for the name-ambiguity check.
+        assigned_ids.push(None);
+        *unmatched_name_counts
+            .entry(pc.plugin_name.clone())
+            .or_default() += 1;
+    }
 
-        // No exact canonical match. If this plugin_name has more than one
-        // extracted instance without explicit IDs, we cannot safely assign
-        // an existing ID without risking config-identity swaps. Reject with a
-        // structured error so operators learn to use explicit IDs.
-        if *extracted_name_counts.get(&pc.plugin_name).unwrap_or(&0) > 1 {
-            return Err(ApiSpecError::ValidationFailures {
-                spec_version: spec_version.to_string(),
-                failures: vec![ValidationFailure {
-                    resource_type: "plugin",
-                    id: proxy_id_snap.clone(),
-                    errors: vec![format!(
-                        "duplicate plugin_name '{}' on PUT requires explicit ids to disambiguate; \
-                         set a non-empty 'id' on each instance",
-                        pc.plugin_name
-                    )],
-                }],
-            });
-        }
-
-        // New plugin or config genuinely changed — mint a fresh UUID.
-        pc.id = Uuid::new_v4().to_string();
+    for (pc, slot) in bundle.plugins.iter_mut().zip(assigned_ids.iter()) {
         pc.proxy_id = Some(proxy_id_snap.clone());
+        match slot {
+            Some(id) => {
+                // Either operator-supplied or canonical-matched.
+                pc.id = id.clone();
+            }
+            None => {
+                // Unmatched. If this name has more than one unmatched entry,
+                // we genuinely can't tell them apart — reject. If it's the
+                // sole unmatched instance for that name (the others matched
+                // canonically), it's an unambiguous addition: mint a UUID.
+                let n = *unmatched_name_counts.get(&pc.plugin_name).unwrap_or(&0);
+                if n > 1 {
+                    return Err(ApiSpecError::ValidationFailures {
+                        spec_version: spec_version.to_string(),
+                        failures: vec![ValidationFailure {
+                            resource_type: "plugin",
+                            id: proxy_id_snap.clone(),
+                            errors: vec![format!(
+                                "duplicate plugin_name '{}' on PUT with no canonical match \
+                                 requires explicit ids to disambiguate; set a non-empty 'id' \
+                                 on each instance whose config differs from any stored entry",
+                                pc.plugin_name
+                            )],
+                        }],
+                    });
+                }
+                // Sole unmatched instance for this name — new plugin.
+                pc.id = Uuid::new_v4().to_string();
+            }
+        }
     }
 
     // Re-link proxy.upstream_id.
@@ -1352,8 +1542,20 @@ fn spec_content_response(
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
     }
 
-    // Content negotiation
-    let target_fmt = negotiate_accept(request_headers, spec.spec_format);
+    // Content negotiation. RFC 7231: if the client explicitly sets q=0 on
+    // every format we can serve, we must respond with 406 Not Acceptable
+    // rather than serve a representation they have refused.
+    let target_fmt = match negotiate_accept_or_406(request_headers, spec.spec_format) {
+        Some(fmt) => fmt,
+        None => {
+            return json_resp(
+                StatusCode::NOT_ACCEPTABLE,
+                &json!({
+                    "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
+                }),
+            );
+        }
+    };
     let (body_bytes, ct) = if target_fmt == spec.spec_format {
         (raw, content_type_for_format(spec.spec_format))
     } else {

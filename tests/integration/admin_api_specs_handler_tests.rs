@@ -3351,6 +3351,66 @@ async fn put_with_two_id_less_same_name_plugins_different_configs_returns_422() 
     );
 }
 
+/// PUT with two id-less plugins sharing a `plugin_name`, where ONE matches the
+/// existing stored config canonically and the OTHER is a brand-new instance:
+/// the matched one reuses the stored id, the new one mints a UUID, and the
+/// PUT succeeds. Round-5 Fix 5 incorrectly rejected this as ambiguous; the
+/// reviewer flagged it as P1 at HEAD cf7ebc9.
+#[tokio::test]
+async fn put_adds_second_same_name_plugin_when_one_matches_canonically() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let listen_path = format!("/{proxy_id}");
+
+    // POST with a single cors plugin (config A).
+    let spec_v1 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Append duplicate test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [
+            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}}
+        ]
+    });
+    let (s1, b1) = client.post_json("/api-specs", &spec_v1).await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED, "POST: {b1}");
+    let spec_id = b1["id"].as_str().unwrap().to_string();
+
+    // PUT with two cors plugins: one identical to existing (canonical match),
+    // one new (unmatched). The new fix must mint a UUID for the unmatched one
+    // rather than rejecting both because of the name duplicate.
+    let spec_v2 = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Append duplicate test v2", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": listen_path
+        },
+        "x-ferrum-plugins": [
+            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["a.example"]}},
+            {"id": "", "plugin_name": "cors", "config": {"allow_origins": ["b.example"]}}
+        ]
+    });
+    let (s2, b2) = client
+        .put_json(&format!("/api-specs/{spec_id}"), &spec_v2)
+        .await;
+    assert_eq!(
+        s2,
+        reqwest::StatusCode::OK,
+        "PUT must succeed: one duplicate matched, one new — unambiguous; body: {b2}"
+    );
+}
+
 // ============================================================================
 // Fix 1 — Timestamp stamping (server-side overrides operator-supplied values)
 // ============================================================================
