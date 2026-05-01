@@ -36,6 +36,27 @@ Ferrum Edge accepts specs as JSON or YAML. The format is resolved in this order:
 
 The autodetection heuristic is best-effort; the full parser produces a precise error if the bytes are actually invalid.
 
+### YAML type-coercion caution
+
+YAML's implicit type coercion can produce surprising results when the gateway serialises the document to JSON for internal processing:
+
+| YAML literal | JSON value | Why it matters |
+|---|---|---|
+| `010` | `8` | Octal integer — YAML 1.1 treats leading-zero integers as octal |
+| `1:30` | `90` | Sexagesimal integer — YAML 1.1 treats `N:M` as `N*60 + M` |
+| `yes`, `no`, `on`, `off`, `true`, `false` | boolean | YAML 1.1 boolean aliases; `yes` becomes JSON `true` |
+
+**Recommendation**: quote strings that look like numbers or boolean words in YAML specs to preserve them as strings:
+
+```yaml
+info:
+  version: "010"   # → JSON string "010", not integer 8
+x-ferrum-proxy:
+  backend_port: 443  # numeric — no quotes needed
+```
+
+Port numbers and version strings are the most common sources of accidental coercion. When in doubt, use `"..."` quoting.
+
 ## Ferrum extension contract
 
 The following canonical example shows all supported extension fields:

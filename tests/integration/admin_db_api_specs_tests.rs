@@ -9,6 +9,34 @@
 //! called from the proxy runtime, polling loops, or gRPC distribution paths.
 //! Each test verifies only the admin-layer operations; no test wires
 //! `list_api_specs` / `get_api_spec` into `GatewayConfig` loading.
+//!
+//! # Database coverage notes (PR review item 11)
+//!
+//! The tests here exercise the `sqlx::Any` dialect path shared by SQLite,
+//! PostgreSQL, and MySQL.  Dialect-specific behaviour is covered as follows:
+//!
+//! - **SQLite**: all tests here run against SQLite.  SQLite uses the same
+//!   query templates as Postgres/MySQL (the `q()` helper adjusts placeholders
+//!   from `?` to `$N` for Postgres at runtime).
+//!
+//! - **PostgreSQL**: `RETURNING` clauses and JSONB indexes are used only in
+//!   non-api-specs paths.  The api-specs queries (`list_api_specs`,
+//!   `submit_api_spec_bundle`, `replace_api_spec_bundle`, `delete_api_spec`)
+//!   use plain SQL that is identical across all three SQL dialects.  Postgres-
+//!   specific end-to-end coverage runs in functional tests when a `POSTGRES_URL`
+//!   environment variable is configured.
+//!
+//! - **MySQL**: follows the same pattern.  The `V001SqlBuilder` dialect
+//!   differences (VARCHAR vs TEXT, TINYINT vs INTEGER) do not affect query
+//!   semantics; they are covered by `sql_dialect.rs` unit tests.
+//!
+//! - **MongoDB**: `MongoStore` methods (`submit_api_spec_bundle`,
+//!   `replace_api_spec_bundle`, `delete_api_spec`, `list_api_specs`) are
+//!   byte-for-byte mirrors of their SQL counterparts where possible, diverging
+//!   only for native array membership queries (`has_tag`) and transaction style
+//!   (replica-set vs best-effort).  A future `#[ignore]` test file with a
+//!   `MONGO_URL` env-gated harness would close this gap.  See Round 8 P2
+//!   documenting comment for context on why this is deferred.
 
 use ferrum_edge::{
     ExtractedBundle, GatewayConfig,

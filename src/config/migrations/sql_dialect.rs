@@ -420,10 +420,17 @@ impl V001SqlBuilder {
         //
         // FK: proxy_id → proxies(id) ON DELETE CASCADE so deleting the proxy
         //     (e.g., when a spec is purged) automatically removes the spec row.
-        // The api_spec_id back-links on proxies/upstreams/plugin_configs use
-        // ON DELETE SET NULL (deferred to Wave 2 ALTER or inline on fresh
-        // schema) so destroying a spec record doesn't cascade-wipe its
-        // generated resources unless the caller requests it explicitly.
+        //
+        // The api_spec_id columns on proxies, upstreams, and plugin_configs are
+        // deliberately UNCONSTRAINED (no FK, no ON DELETE SET NULL).  Application
+        // code in `delete_api_spec` (db_loader.rs and mongo_store.rs) handles
+        // cleanup of spec-owned resources.  FK constraints were intentionally
+        // omitted to:
+        //   1. Keep MongoDB and SQL semantics identical without a Mongo FK concept.
+        //   2. Avoid cross-table creation-ordering complexity on MySQL (which would
+        //      require api_specs to exist before inserting proxies that reference it).
+        // Manual DB operations that delete from api_specs directly must also clean
+        // dependent rows by hand (WHERE api_spec_id = '<deleted-spec-id>').
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (

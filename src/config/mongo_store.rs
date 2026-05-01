@@ -2011,7 +2011,24 @@ mod inner {
 
                 session.commit_transaction().await?;
             } else {
-                // No replica set: best-effort delete then re-insert.
+                // No replica set: best-effort delete then re-insert with
+                // compensating rollback on re-insert failure.
+                //
+                // PARTIAL-STATE WINDOW: after the deletes below succeed and
+                // before all re-inserts complete, the spec's proxy/upstream/
+                // plugins temporarily do not exist.  Traffic to those routes
+                // will see 404 / no-route until the re-insert finishes or the
+                // next polling cycle picks up the inconsistency.  The unavoidable
+                // window is documented in docs/api_specs.md §Atomicity.  To
+                // eliminate this risk, configure FERRUM_MONGO_REPLICA_SET.
+                //
+                // "Rollback" here means: if a re-insert fails partway through,
+                // we attempt to delete any documents that WERE successfully
+                // inserted so we don't leave a partial new state.  The old data
+                // is already gone at this point; the compensating deletes at
+                // least leave the spec empty rather than half-populated.
+                // Operators should re-submit the spec to recover.
+
                 // Delete leaf-first, log any failure but proceed.
                 if let Err(e) = self
                     .plugin_configs()
@@ -2054,23 +2071,57 @@ mod inner {
                 }
 
                 // Re-insert new bundle with manual associations preserved.
-                if let Some(u) = &effective_bundle.upstream {
-                    let mut doc = upstream_to_doc(u)?;
-                    doc.insert("api_spec_id", spec.id.as_str());
-                    self.upstreams().insert_one(doc).await?;
+                // Track inserted IDs so we can compensate on partial failure.
+                let mut inserted_upstream_id: Option<String> = None;
+                let mut inserted_proxy_id: Option<String> = None;
+                let mut inserted_plugin_ids: Vec<String> = Vec::new();
+                let mut inserted_spec_id: Option<&str> = None;
+
+                let insert_result: Result<(), anyhow::Error> = async {
+                    if let Some(u) = &effective_bundle.upstream {
+                        let mut doc = upstream_to_doc(u)?;
+                        doc.insert("api_spec_id", spec.id.as_str());
+                        self.upstreams().insert_one(doc).await?;
+                        inserted_upstream_id = Some(u.id.clone());
+                    }
+                    {
+                        let mut doc = proxy_to_doc(&effective_bundle.proxy)?;
+                        doc.insert("api_spec_id", spec.id.as_str());
+                        self.proxies().insert_one(doc).await?;
+                        inserted_proxy_id = Some(effective_bundle.proxy.id.clone());
+                    }
+                    for pc in &effective_bundle.plugins {
+                        let mut doc = plugin_config_to_doc(pc)?;
+                        doc.insert("api_spec_id", spec.id.as_str());
+                        self.plugin_configs().insert_one(doc).await?;
+                        inserted_plugin_ids.push(pc.id.clone());
+                    }
+                    let spec_doc = api_spec_to_doc(spec)?;
+                    self.api_specs().insert_one(spec_doc).await?;
+                    inserted_spec_id = Some(spec.id.as_str());
+                    Ok(())
                 }
-                {
-                    let mut doc = proxy_to_doc(&effective_bundle.proxy)?;
-                    doc.insert("api_spec_id", spec.id.as_str());
-                    self.proxies().insert_one(doc).await?;
+                .await;
+
+                if let Err(e) = insert_result {
+                    // Re-insert failed partway through.  Attempt to undo whatever
+                    // DID get inserted so we leave an empty state rather than a
+                    // partial one.  Old data is already gone; re-submit to recover.
+                    warn!(
+                        "replace_api_spec_bundle: re-insert failed for spec {}; \
+                         attempting compensating rollback of partial inserts. \
+                         Re-submit the spec to restore it. Error: {}",
+                        spec.id, e
+                    );
+                    self.compensate_bundle_insert(
+                        &inserted_upstream_id,
+                        &inserted_proxy_id,
+                        &inserted_plugin_ids,
+                        inserted_spec_id,
+                    )
+                    .await;
+                    return Err(e);
                 }
-                for pc in &effective_bundle.plugins {
-                    let mut doc = plugin_config_to_doc(pc)?;
-                    doc.insert("api_spec_id", spec.id.as_str());
-                    self.plugin_configs().insert_one(doc).await?;
-                }
-                let spec_doc = api_spec_to_doc(spec)?;
-                self.api_specs().insert_one(spec_doc).await?;
             }
 
             Ok(())

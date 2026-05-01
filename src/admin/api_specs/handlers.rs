@@ -690,7 +690,10 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
                 .map(|s| s.into_bytes())
                 .map_err(|e| format!("YAML serialization error: {e}"))
         }
-        _ => unreachable!("same format handled above"),
+        _ => Err(format!(
+            "unsupported format conversion {:?} → {:?}",
+            from, to
+        )),
     }
 }
 
@@ -883,10 +886,8 @@ async fn assign_ids_for_put(
         std::collections::VecDeque<&crate::config::types::PluginConfig>,
     > = std::collections::HashMap::new();
     for ep in &existing_plugins {
-        canonical_to_existing
-            .entry(plugin_canonical_key(ep))
-            .or_default()
-            .push_back(ep);
+        let key = plugin_canonical_key(ep).map_err(|e| e)?;
+        canonical_to_existing.entry(key).or_default().push_back(ep);
     }
 
     // Snapshot proxy_id before the mutable plugin loop to avoid split borrows.
@@ -915,7 +916,7 @@ async fn assign_ids_for_put(
             assigned_ids.push(Some(pc.id.clone()));
             continue;
         }
-        let key = plugin_canonical_key(pc);
+        let key = plugin_canonical_key(pc)?;
         if let Some(q) = canonical_to_existing.get_mut(&key) {
             if let Some(matched) = q.pop_front() {
                 assigned_ids.push(Some(matched.id.clone()));
@@ -1036,6 +1037,14 @@ async fn assign_ids_for_put(
     Ok(())
 }
 
+/// Maximum recursion depth for [`sort_json_keys`].
+///
+/// Matches [`MAX_FORBIDDEN_KEY_SCAN_DEPTH`] in `extractor.rs` (32).  Plugin
+/// configs nested deeper than this are rejected rather than allowing unbounded
+/// stack growth.  A depth-32 config is already far beyond anything a real plugin
+/// would use.
+const MAX_SORT_JSON_DEPTH: usize = 32;
+
 /// Compute the canonical matching key for a plugin during PUT id-assignment.
 ///
 /// The key is `(plugin_name, sorted-keys config JSON, priority_override)`.
@@ -1043,35 +1052,58 @@ async fn assign_ids_for_put(
 /// with the same key-value pairs but different insertion order compare equal,
 /// which is necessary for idempotent re-submission of specs produced by
 /// different tooling.
-fn plugin_canonical_key(pc: &crate::config::types::PluginConfig) -> (String, String, Option<u16>) {
-    let canonical_config = sort_json_keys(&pc.config);
-    // Serializing a serde_json::Value should never fail; if it somehow does,
-    // panic loudly in dev so the bug is caught — a silent empty string would
-    // cause two different plugins to collide on the same canonical key, silently
-    // re-assigning IDs during PUT and serving the wrong plugin config.
-    let config_str = serde_json::to_string(&canonical_config)
-        .expect("serializing a serde_json::Value should never fail");
-    (pc.plugin_name.clone(), config_str, pc.priority_override)
+///
+/// Returns `Err` if the config is nested more than [`MAX_SORT_JSON_DEPTH`]
+/// levels or if JSON serialisation fails (neither should happen in practice;
+/// both are treated as internal errors by the caller so the PUT returns 500
+/// rather than silently assigning wrong IDs).
+fn plugin_canonical_key(
+    pc: &crate::config::types::PluginConfig,
+) -> Result<(String, String, Option<u16>), ApiSpecError> {
+    let canonical_config = sort_json_keys(&pc.config, MAX_SORT_JSON_DEPTH).map_err(|e| {
+        ApiSpecError::Internal(format!(
+            "plugin '{}': failed to compute canonical key: {}",
+            pc.plugin_name, e
+        ))
+    })?;
+    let config_str = serde_json::to_string(&canonical_config).map_err(|e| {
+        ApiSpecError::Internal(format!(
+            "plugin '{}': failed to serialise canonical config: {}",
+            pc.plugin_name, e
+        ))
+    })?;
+    Ok((pc.plugin_name.clone(), config_str, pc.priority_override))
 }
 
 /// Recursively sort all JSON object keys so that canonical comparison is
 /// key-order-independent. Arrays are left in their original order (order
 /// matters for arrays). Uses a `BTreeMap` round-trip for objects.
-fn sort_json_keys(v: &serde_json::Value) -> serde_json::Value {
+///
+/// `depth_remaining` is decremented on each recursive call. Returns `Err` when
+/// it reaches zero rather than continuing to recurse (stack-overflow defence).
+fn sort_json_keys(
+    v: &serde_json::Value,
+    depth_remaining: usize,
+) -> Result<serde_json::Value, &'static str> {
+    if depth_remaining == 0 {
+        return Err("config nested too deeply (>32 levels) for canonical hash");
+    }
     match v {
         serde_json::Value::Object(map) => {
-            let sorted: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .collect::<std::collections::BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(k, val)| (k.clone(), sort_json_keys(val)))
-                .collect();
-            serde_json::Value::Object(sorted)
+            let mut sorted = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map.iter().collect::<std::collections::BTreeMap<_, _>>() {
+                sorted.insert(k.clone(), sort_json_keys(val, depth_remaining - 1)?);
+            }
+            Ok(serde_json::Value::Object(sorted))
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(sort_json_keys).collect())
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                out.push(sort_json_keys(item, depth_remaining - 1)?);
+            }
+            Ok(serde_json::Value::Array(out))
         }
-        other => other.clone(),
+        other => Ok(other.clone()),
     }
 }
 
@@ -1604,9 +1636,14 @@ fn spec_content_response(
         .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
+            // Response builder failed (only possible if a header value is invalid,
+            // which cannot happen with our static header strings + well-formed hash).
+            // Emit a 500 so the client never receives a 200 with an error body.
+            let mut resp = Response::new(Full::new(Bytes::from_static(
+                b"{\"error\":\"Internal server error\"}",
+            )));
+            *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            resp
         })
 }
 
@@ -1634,9 +1671,15 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         let key = parts.next().unwrap_or("");
-        let val = parts.next().unwrap_or("");
-        // URL-decode the value (simple percent-decoding for common chars)
-        let val = percent_decode(val);
+        let raw_val = parts.next().unwrap_or("");
+        // URL-decode the value (simple percent-decoding for common chars).
+        // Invalid UTF-8 sequences in percent-encoded bytes are rejected with 400
+        // to prevent bypassing downstream character-validation checks (e.g. the
+        // `title_contains` wildcard rejection below).
+        let val = match percent_decode(raw_val) {
+            Ok(v) => v,
+            Err(e) => return Err(e),
+        };
 
         match key {
             "limit" => {
@@ -1653,6 +1696,25 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 filter.spec_version_prefix = Some(val);
             }
             "title_contains" if !val.is_empty() => {
+                // SAFETY-CRITICAL CROSS-FILE INVARIANT:
+                // The SQL list_api_specs implementation in src/config/db_loader.rs
+                // builds `LOWER(title) LIKE ?` with a `%…%` wrapper and NO ESCAPE
+                // clause.  Characters that are LIKE wildcards (`%`, `_`) or the
+                // escape character (`\`) would turn into wildcards or escape tokens,
+                // producing false positives (e.g. `_` matches any single character).
+                // We reject those characters here rather than escaping them so the
+                // invariant is easy to audit: "the LIKE pattern is safe because input
+                // can never contain wildcards".  Update db_loader.rs if you change
+                // this check.
+                for ch in ['%', '_', '\\'] {
+                    if val.contains(ch) {
+                        return Err(ApiSpecError::BadRequest(format!(
+                            "title_contains must not contain SQL LIKE wildcard or escape \
+                             characters ('{}' is forbidden); use plain text only",
+                            ch
+                        )));
+                    }
+                }
                 filter.title_contains = Some(val);
             }
             "updated_since" if !val.is_empty() => {
@@ -1699,8 +1761,15 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
 }
 
 /// Simple percent-decode for query parameter values.
-/// Only decodes `%XX` sequences; `+` is NOT decoded as space (RFC 3986 query semantics).
-fn percent_decode(s: &str) -> String {
+///
+/// Only decodes `%XX` sequences; `+` is NOT decoded as space (RFC 3986 query
+/// semantics).
+///
+/// Returns `Err` if the decoded byte sequence is not valid UTF-8.  Callers
+/// should surface this as a 400 response — invalid percent-encoding could
+/// otherwise bypass character-validation checks (e.g. `title_contains` wildcard
+/// rejection) by encoding the forbidden bytes.
+fn percent_decode(s: &str) -> Result<String, ApiSpecError> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1719,7 +1788,12 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).map_err(|_| {
+        ApiSpecError::BadRequest(
+            "invalid percent-encoding in query parameter: byte sequence is not valid UTF-8"
+                .to_string(),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2372,5 +2446,102 @@ mod tests {
         let uri: hyper::Uri = "/api-specs?limit=9999".parse().unwrap();
         let f = parse_list_filter(&uri).expect("parse failed");
         assert_eq!(f.limit, 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 5 — sort_json_keys depth limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sort_json_keys_depth_limit() {
+        // Build a 50-level-deep nested object.  sort_json_keys caps at
+        // MAX_SORT_JSON_DEPTH (32), so the call must return Err.
+        let mut inner = serde_json::json!({"leaf": "value"});
+        for _ in 0..50 {
+            inner = serde_json::json!({"nested": inner});
+        }
+        let result = sort_json_keys(&inner, MAX_SORT_JSON_DEPTH);
+        assert!(
+            result.is_err(),
+            "sort_json_keys must reject configs nested deeper than MAX_SORT_JSON_DEPTH ({})",
+            MAX_SORT_JSON_DEPTH
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 8 — title_contains wildcard rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_with_title_contains_wildcard_returns_400_percent() {
+        let uri: hyper::Uri = "/api-specs?title_contains=foo%25bar".parse().unwrap();
+        let err = parse_list_filter(&uri).unwrap_err();
+        assert!(
+            matches!(err, ApiSpecError::BadRequest(_)),
+            "percent-sign in title_contains must return 400; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_with_title_contains_wildcard_returns_400_underscore() {
+        // `_` is a SQL single-char wildcard; literal underscore must be rejected.
+        let uri: hyper::Uri = "/api-specs?title_contains=foo_bar".parse().unwrap();
+        let err = parse_list_filter(&uri).unwrap_err();
+        assert!(
+            matches!(err, ApiSpecError::BadRequest(_)),
+            "underscore in title_contains must return 400; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_with_title_contains_wildcard_returns_400_backslash() {
+        // URL-encode the backslash (%5C) so the URI parses.
+        let uri: hyper::Uri = "/api-specs?title_contains=foo%5Cbar".parse().unwrap();
+        let err = parse_list_filter(&uri).unwrap_err();
+        assert!(
+            matches!(err, ApiSpecError::BadRequest(_)),
+            "backslash in title_contains must return 400; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_with_title_contains_plain_text_is_allowed() {
+        let uri: hyper::Uri = "/api-specs?title_contains=MyApi".parse().unwrap();
+        let f = parse_list_filter(&uri).expect("plain text must be allowed");
+        assert_eq!(
+            f.title_contains.as_deref(),
+            Some("MyApi"),
+            "plain title_contains must be accepted unchanged"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 10 — percent_decode rejects invalid UTF-8
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_with_invalid_percent_encoding_returns_400() {
+        // %80 is an invalid UTF-8 lead byte (continuation byte without start byte).
+        let uri: hyper::Uri = "/api-specs?title_contains=%80invalid".parse().unwrap();
+        let err = parse_list_filter(&uri).unwrap_err();
+        assert!(
+            matches!(err, ApiSpecError::BadRequest(_)),
+            "invalid percent-encoding must return 400; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn percent_decode_valid_ascii_sequence() {
+        // %41 = 'A', %42 = 'B' — valid UTF-8, must decode correctly.
+        assert_eq!(percent_decode("%41%42C").unwrap(), "ABC");
+    }
+
+    #[test]
+    fn percent_decode_invalid_utf8_returns_err() {
+        // %ED%A0%80 is a surrogate code point — invalid UTF-8.
+        assert!(
+            percent_decode("%ED%A0%80").is_err(),
+            "invalid UTF-8 byte sequence must be rejected"
+        );
     }
 }

@@ -489,29 +489,33 @@ pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> Extract
         .map(|s| truncate_utf8(s, 4096));
 
     // contact.name / email
+    // contact_name  → 256 bytes (human names are short)
+    // contact_email → 320 bytes (RFC 5321 maximum email address length)
     let contact = info.and_then(|i| i.get("contact"));
     let contact_name = contact
         .and_then(|c| c.get("name"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| truncate_utf8(s, 256));
     let contact_email = contact
         .and_then(|c| c.get("email"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| truncate_utf8(s, 320));
 
     // license.name / identifier-or-url
+    // license_name       → 256 bytes
+    // license_identifier → 128 bytes (SPDX identifiers are short)
     let license = info.and_then(|i| i.get("license"));
     let license_name = license
         .and_then(|l| l.get("name"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| truncate_utf8(s, 256));
     let license_identifier = license
         .and_then(|l| {
             // 3.1+ uses `identifier`; fallback to `url`
             l.get("identifier").or_else(|| l.get("url"))
         })
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| truncate_utf8(s, 128));
 
     // tags — top-level `tags[].name` (both 2.0 and 3.x)
     let mut tags: Vec<String> = root
@@ -529,6 +533,13 @@ pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> Extract
     tags.dedup();
 
     // server_urls
+    // Each URL is truncated at 2048 bytes; the list is capped at 32 entries.
+    // An unbounded list would allow an operator to store megabytes of URL data
+    // in the metadata columns without triggering the body-size limit (which only
+    // caps the raw spec document).
+    const MAX_SERVER_URL_BYTES: usize = 2048;
+    const MAX_SERVER_URLS: usize = 32;
+
     let server_urls = if version == "2.0" {
         // Swagger 2.0: construct from schemes[] + host + basePath
         let host = root.get("host").and_then(|v| v.as_str()).unwrap_or("");
@@ -546,22 +557,39 @@ pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> Extract
             } else {
                 schemes
                     .iter()
-                    .map(|scheme| format!("{scheme}://{host}{base_path}"))
+                    .map(|scheme| {
+                        truncate_utf8(
+                            &format!("{scheme}://{host}{base_path}"),
+                            MAX_SERVER_URL_BYTES,
+                        )
+                    })
+                    .take(MAX_SERVER_URLS)
                     .collect()
             }
         }
     } else {
         // OpenAPI 3.x: servers[].url
-        root.get("servers")
+        let raw: Vec<String> = root
+            .get("servers")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|e| e.get("url"))
                     .filter_map(|v| v.as_str())
-                    .map(str::to_string)
+                    .map(|s| truncate_utf8(s, MAX_SERVER_URL_BYTES))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if raw.len() > MAX_SERVER_URLS {
+            tracing::debug!(
+                "extract_spec_metadata: server_urls has {} entries; truncating to {}",
+                raw.len(),
+                MAX_SERVER_URLS
+            );
+            raw.into_iter().take(MAX_SERVER_URLS).collect()
+        } else {
+            raw
+        }
     };
 
     // operation_count — count HTTP method keys across all paths.*
@@ -1765,6 +1793,154 @@ x-ferrum-proxy:
             256,
             "info_version must be truncated to 256 bytes; got {} bytes",
             iv.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 4 — Tier 1 metadata field truncation tests
+    // -----------------------------------------------------------------------
+
+    fn spec_with_info_contact_license(
+        contact_name: &str,
+        contact_email: &str,
+        license_name: &str,
+        license_id: &str,
+    ) -> String {
+        format!(
+            r#"{{
+                "swagger": "2.0",
+                "info": {{
+                    "title": "T", "version": "1",
+                    "contact": {{"name": "{contact_name}", "email": "{contact_email}"}},
+                    "license": {{"name": "{license_name}", "identifier": "{license_id}"}}
+                }},
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        )
+    }
+
+    #[test]
+    fn test_contact_name_truncated() {
+        let long_name: String = "N".repeat(512);
+        let spec = spec_with_info_contact_license(&long_name, "a@b.com", "MIT", "MIT");
+        let meta = extract_spec_metadata(
+            &serde_json::from_str::<serde_json::Value>(&spec).unwrap(),
+            "2.0",
+        );
+        let name = meta.contact_name.expect("contact_name must be present");
+        assert_eq!(
+            name.len(),
+            256,
+            "contact_name must be truncated to 256 bytes; got {}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn test_contact_email_truncated() {
+        let long_email: String = "e".repeat(500) + "@example.com";
+        let spec = spec_with_info_contact_license("Alice", &long_email, "MIT", "MIT");
+        let meta = extract_spec_metadata(
+            &serde_json::from_str::<serde_json::Value>(&spec).unwrap(),
+            "2.0",
+        );
+        let email = meta.contact_email.expect("contact_email must be present");
+        assert_eq!(
+            email.len(),
+            320,
+            "contact_email must be truncated to 320 bytes; got {}",
+            email.len()
+        );
+    }
+
+    #[test]
+    fn test_license_name_truncated() {
+        let long_name: String = "L".repeat(512);
+        let spec = spec_with_info_contact_license("Alice", "a@b.com", &long_name, "MIT");
+        let meta = extract_spec_metadata(
+            &serde_json::from_str::<serde_json::Value>(&spec).unwrap(),
+            "2.0",
+        );
+        let lname = meta.license_name.expect("license_name must be present");
+        assert_eq!(
+            lname.len(),
+            256,
+            "license_name must be truncated to 256 bytes; got {}",
+            lname.len()
+        );
+    }
+
+    #[test]
+    fn test_license_identifier_truncated() {
+        let long_id: String = "X".repeat(512);
+        let spec = spec_with_info_contact_license("Alice", "a@b.com", "MIT", &long_id);
+        let meta = extract_spec_metadata(
+            &serde_json::from_str::<serde_json::Value>(&spec).unwrap(),
+            "2.0",
+        );
+        let lid = meta
+            .license_identifier
+            .expect("license_identifier must be present");
+        assert_eq!(
+            lid.len(),
+            128,
+            "license_identifier must be truncated to 128 bytes; got {}",
+            lid.len()
+        );
+    }
+
+    #[test]
+    fn test_server_url_individual_truncated() {
+        // A single very long server URL must be truncated at 2048 bytes.
+        let long_url: String = format!("https://example.com/{}", "p".repeat(4000));
+        let spec = format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "T", "version": "1"}},
+                "servers": [{{"url": "{long_url}"}}],
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let meta = extract_spec_metadata(
+            &serde_json::from_str::<serde_json::Value>(&spec).unwrap(),
+            "3.1.0",
+        );
+        assert_eq!(meta.server_urls.len(), 1, "must have one server URL");
+        assert_eq!(
+            meta.server_urls[0].len(),
+            2048,
+            "server URL must be truncated to 2048 bytes; got {}",
+            meta.server_urls[0].len()
+        );
+    }
+
+    #[test]
+    fn test_server_urls_cardinality_capped() {
+        // Build 50 distinct server URLs — only the first 32 should survive.
+        let urls: String = (0..50)
+            .map(|i| format!("{{\"url\": \"https://server-{i}.example.com\"}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let spec = format!(
+            r#"{{
+                "openapi": "3.1.0",
+                "info": {{"title": "T", "version": "1"}},
+                "servers": [{urls}],
+                "x-ferrum-proxy": {}
+            }}"#,
+            minimal_proxy()
+        );
+        let meta = extract_spec_metadata(
+            &serde_json::from_str::<serde_json::Value>(&spec).unwrap(),
+            "3.1.0",
+        );
+        assert_eq!(
+            meta.server_urls.len(),
+            32,
+            "server_urls must be capped at 32 entries; got {}",
+            meta.server_urls.len()
         );
     }
 }

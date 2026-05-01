@@ -3415,6 +3415,223 @@ async fn put_adds_second_same_name_plugin_when_one_matches_canonically() {
 // Fix 1 — Timestamp stamping (server-side overrides operator-supplied values)
 // ============================================================================
 
+// ============================================================================
+// Item 8 — title_contains wildcard rejection (handler-level round-trip)
+// ============================================================================
+
+#[tokio::test]
+async fn list_with_title_contains_wildcard_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // `%` is a SQL LIKE wildcard — must be rejected with 400.
+    let (status, body) = client.get_json("/api-specs?title_contains=foo%25bar").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "percent in title_contains must return 400; body: {body}"
+    );
+
+    // `_` is also a SQL single-char wildcard — must be rejected.
+    let (status2, body2) = client.get_json("/api-specs?title_contains=foo_bar").await;
+    assert_eq!(
+        status2,
+        reqwest::StatusCode::BAD_REQUEST,
+        "underscore in title_contains must return 400; body: {body2}"
+    );
+
+    // Plain text must be accepted (returns 200 with empty list).
+    let (status3, _body3) = client.get_json("/api-specs?title_contains=MyAPI").await;
+    assert_eq!(
+        status3,
+        reqwest::StatusCode::OK,
+        "plain text in title_contains must return 200"
+    );
+}
+
+// ============================================================================
+// Item 10 — percent_decode: invalid UTF-8 sequence returns 400
+// ============================================================================
+
+#[tokio::test]
+async fn list_with_invalid_percent_encoding_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // %80 is an invalid UTF-8 continuation byte without a start byte.
+    let (status, body) = client
+        .get_json("/api-specs?title_contains=%80invalid")
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid percent-encoding must return 400; body: {body}"
+    );
+}
+
+// ============================================================================
+// Test coverage gap — concurrent POST with same proxy_id
+// ============================================================================
+
+/// Two concurrent POST requests referencing the same proxy_id race the unique
+/// constraint check.  Exactly one must succeed (201) and the other must be
+/// rejected (409 Conflict or 422 from listen_path uniqueness).
+#[tokio::test]
+async fn concurrent_handler_post_same_proxy_id_one_succeeds_one_409() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+
+    let proxy_id = uid("proxy");
+    let spec = minimal_json_spec(&proxy_id);
+
+    // Spawn two concurrent POST requests; both claim the same proxy_id / listen_path.
+    let client_a = AdminClient::new(base.clone());
+    let client_b = AdminClient::new(base.clone());
+    let spec_a = spec.clone();
+    let spec_b = spec.clone();
+
+    let (ra, rb) = tokio::join!(
+        client_a.post_json("/api-specs", &spec_a),
+        client_b.post_json("/api-specs", &spec_b),
+    );
+
+    let (status_a, body_a) = ra;
+    let (status_b, body_b) = rb;
+
+    let statuses = [status_a, status_b];
+    let bodies = [&body_a, &body_b];
+
+    // Exactly one must be 201 and the other a conflict/uniqueness error.
+    let created_count = statuses
+        .iter()
+        .filter(|&&s| s == reqwest::StatusCode::CREATED)
+        .count();
+    let conflict_count = statuses
+        .iter()
+        .filter(|&&s| {
+            s == reqwest::StatusCode::CONFLICT || s == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        })
+        .count();
+
+    assert_eq!(
+        created_count, 1,
+        "exactly one POST must return 201; statuses: {:?}, bodies: {:?}",
+        statuses, bodies
+    );
+    assert_eq!(
+        conflict_count, 1,
+        "exactly one POST must return 409 or 422; statuses: {:?}, bodies: {:?}",
+        statuses, bodies
+    );
+}
+
+// ============================================================================
+// Test coverage gap — YAML body with JSON Content-Type → 400
+// ============================================================================
+
+/// Sending a YAML body with `Content-Type: application/json` must be rejected
+/// with 400 because the explicit Content-Type forces JSON parsing, which fails
+/// on a YAML document.
+#[tokio::test]
+async fn post_yaml_body_with_json_content_type_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    // Valid YAML but invalid JSON body.
+    let yaml_body = minimal_yaml_spec(&proxy_id);
+
+    let (status, body) = client
+        .post_raw("/api-specs", yaml_body.into_bytes(), "application/json")
+        .await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "YAML body with JSON Content-Type must return 400; body: {body}"
+    );
+    // The error code must identify the JSON parse failure.
+    assert_eq!(
+        body["code"].as_str(),
+        Some("InvalidJson"),
+        "error code must be InvalidJson; body: {body}"
+    );
+}
+
+// ============================================================================
+// Test coverage gap — Unicode/emoji metadata round-trip
+// ============================================================================
+
+/// Submit a spec whose `info.title`, `info.description`, and `x-ferrum-proxy.name`
+/// contain multi-byte UTF-8 characters (including emoji).  The metadata must
+/// survive the round-trip (POST → GET list) byte-for-byte.
+#[tokio::test]
+async fn post_unicode_in_metadata_round_trips() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    // Emoji in title; multi-byte chars in description.
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "API 🚀 Unicode Test Ünïcödé",
+            "version": "1.0.0",
+            "description": "描述 — description with CJK and accents: café, naïve, résumé"
+        },
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        }
+    });
+
+    let (post_status, post_body) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(
+        post_status,
+        reqwest::StatusCode::CREATED,
+        "POST must succeed; body: {post_body}"
+    );
+    let spec_id = post_body["id"].as_str().unwrap().to_string();
+
+    // Retrieve via list and check that the title and description round-tripped.
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+
+    let items = list_body["items"].as_array().expect("items must be array");
+    let found = items
+        .iter()
+        .find(|item| item["id"].as_str() == Some(&spec_id));
+    let found = found.expect("submitted spec must appear in list");
+
+    assert_eq!(
+        found["title"].as_str(),
+        Some("API 🚀 Unicode Test Ünïcödé"),
+        "title must round-trip with emoji intact; got: {}",
+        found["title"]
+    );
+    assert_eq!(
+        found["description"].as_str(),
+        Some("描述 — description with CJK and accents: café, naïve, résumé"),
+        "description must round-trip with CJK chars intact; got: {}",
+        found["description"]
+    );
+}
+
+// ============================================================================
+// Fix 1 — Timestamp stamping (server-side overrides operator-supplied values)
+// ============================================================================
+
 /// POST a spec, then PUT with an artificially-old updated_at embedded in the
 /// x-ferrum-proxy extension.  The server must overwrite it with a fresh
 /// server-side timestamp, so the incremental polling delta path can see the
