@@ -13,16 +13,26 @@ ca_certificates:
 # Client HTTPS → Kong → HTTPS upstream on 3447. Every hop encrypted.
 # Listener is configured via KONG_PROXY_LISTEN env var in harness script.
 #
-# Kong's upstream keepalive for HTTP/1.1 is controlled by global env vars
-# (KONG_UPSTREAM_KEEPALIVE_*), not per-upstream config fields. The harness
-# sets KONG_UPSTREAM_KEEPALIVE_MAX_REQUESTS=10000 to prevent connection
-# churn during the benchmark (default 100 forces a new TLS handshake
-# every 100 requests).
+# An explicit upstream entity is required for nginx to pool upstream
+# connections (keepalive). Without it, proxy_pass to a raw IP literal
+# opens a fresh TCP+TLS connection per request (~450ms handshake
+# overhead, capping throughput at ~444 RPS regardless of payload).
+#
+# Target uses `localhost` (not `127.0.0.1`) because Kong's upstream
+# TLS verifier checks the target hostname against the cert's SANs.
+# The benchmark cert has DNS:localhost + IP:127.0.0.1, and Kong's
+# SNI matching works reliably with DNS SANs. This is the same pattern
+# the working WSS config uses (host: localhost).
+
+upstreams:
+  - name: echo-upstream
+    targets:
+      - target: "localhost:3447"
+        weight: 100
 
 services:
   - name: echo-service
-    host: 127.0.0.1
-    port: 3447
+    host: echo-upstream
     protocol: https
     tls_verify: true
     ca_certificates:
