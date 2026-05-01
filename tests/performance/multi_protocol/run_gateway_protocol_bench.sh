@@ -443,6 +443,7 @@ PYEOF
         -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
         -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
         -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=256" \
         -e "KONG_UPSTREAM_KEEPALIVE_MAX_REQUESTS=10000" \
         "${extra_env[@]}" \
         -v "$cfg_dst:/kong/kong.yaml:ro" \

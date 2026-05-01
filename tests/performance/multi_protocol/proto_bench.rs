@@ -204,10 +204,12 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
             }
 
             let mut send_req = connect_h1(addr, &tls_connector).await?;
+            let mut reconnects: u64 = 0;
 
             while Instant::now() < deadline {
                 // Reconnect if the connection was closed
                 if send_req.is_closed() {
+                    reconnects += 1;
                     send_req = connect_h1(addr, &tls_connector).await?;
                 }
 
@@ -242,6 +244,12 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                         break;
                     }
                 }
+            }
+            if reconnects > 0 {
+                eprintln!(
+                    "[http1] task reconnected {reconnects} times over {} requests",
+                    metrics.total_requests
+                );
             }
             Ok(metrics)
         }));
@@ -813,15 +821,16 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                     Ok(())
                 });
 
-                // Read with a short per-attempt timeout so a stalled backend
-                // or partial echo cannot wedge the task indefinitely. 5s is
-                // generous — a healthy 5 MiB read at concurrency 25 completes
-                // in <250ms on localhost, so any stall beyond that is a real
-                // failure that should be surfaced, not papered over.
+                // Read with a per-attempt timeout so a stalled backend or
+                // partial echo cannot wedge the task indefinitely. 15s is
+                // generous — well above the observed CI-runner worst case
+                // (~5-8s under heavy scheduler contention at 200 concurrent
+                // TLS connections on shared runners). The previous 5s caused
+                // false-positive errors on every run.
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    let read_timeout = Duration::from_secs(5);
+                    let read_timeout = Duration::from_secs(15);
                     match tokio::time::timeout(read_timeout, rd.read_exact(&mut buf)).await {
                         Ok(Ok(_)) => {
                             let latency = start.elapsed().as_micros() as u64;
@@ -833,7 +842,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             break;
                         }
                         Err(_) => {
-                            eprintln!("[tcp-tls] read timeout (5s) after {} requests", metrics.total_requests);
+                            eprintln!("[tcp-tls] read timeout (15s) after {} requests", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }
