@@ -282,3 +282,90 @@ fn test_streaming_metrics_release_acquire_coherence() {
     // fresh StreamingMetrics must return the initial values.
     assert!(!metrics.completed());
 }
+
+// ── Protocol-agnostic coalesce bounds ──────────────────────────────────
+//
+// `COALESCE_MIN_FLOOR` and `COALESCE_MAX_CAP` are the shared bounds for
+// every protocol's coalescing knob (H2 direct pool, H3 native, future H1
+// reqwest knob). Locking the values here protects against an accidental
+// rename / change that would silently shift the legal range for
+// `FERRUM_HTTP3_COALESCE_*_BYTES` and `FERRUM_H2_COALESCE_TARGET_BYTES`.
+#[test]
+fn test_coalesce_min_floor_value_is_1024() {
+    assert_eq!(ferrum_edge::proxy::body::COALESCE_MIN_FLOOR, 1024);
+}
+
+#[test]
+fn test_coalesce_max_cap_value_is_1_mib() {
+    assert_eq!(
+        ferrum_edge::proxy::body::COALESCE_MAX_CAP,
+        1024 * 1024,
+        "1 MiB upper bound caps per-stream memory regardless of env-var input"
+    );
+}
+
+#[test]
+fn test_coalesce_floor_below_cap() {
+    // Sanity: floor must be strictly less than cap, otherwise the clamp
+    // collapses and operator tuning of FERRUM_HTTP3_COALESCE_*_BYTES has no
+    // effect. Use `const { ... }` so this is also a compile-time guard.
+    const _: () = assert!(
+        ferrum_edge::proxy::body::COALESCE_MIN_FLOOR < ferrum_edge::proxy::body::COALESCE_MAX_CAP
+    );
+}
+
+// ── ProxyBody::into_tracked ────────────────────────────────────────────
+//
+// Verifies that the unified `Stream → Tracked` wrapper preserves the
+// `Full` short-circuit (no-op for buffered bodies), drives the metrics
+// to a completed state when the underlying stream ends, and lets a
+// pre-attached logger survive the kind swap.
+#[tokio::test]
+async fn test_into_tracked_full_body_is_noop_and_returns_inert_metrics() {
+    use http_body_util::BodyExt;
+
+    let baseline = Instant::now();
+    let body = ProxyBody::full(Bytes::from("hello"));
+    let (mut wrapped, metrics) = body.into_tracked(baseline);
+
+    // Full body should still produce its bytes — kind unchanged.
+    let mut collected = Vec::new();
+    while let Some(frame) = wrapped.frame().await {
+        let frame = frame.unwrap();
+        if let Some(data) = frame.data_ref() {
+            collected.extend_from_slice(data);
+        }
+    }
+    assert_eq!(&collected[..], b"hello");
+
+    // Metrics never observed a streaming frame, so they remain at their
+    // initial values — `completed()` is false because Full short-circuits
+    // out of TrackedBody's poll path.
+    assert!(metrics.last_frame_elapsed_ms().is_none());
+    assert!(!metrics.completed());
+}
+
+#[tokio::test]
+async fn test_into_tracked_empty_body_remains_empty() {
+    use http_body_util::BodyExt;
+
+    let baseline = Instant::now();
+    let body = ProxyBody::empty();
+    let (wrapped, _metrics) = body.into_tracked(baseline);
+    let collected = wrapped.collect().await.unwrap();
+    assert!(collected.to_bytes().is_empty());
+}
+
+#[test]
+fn test_into_tracked_returns_metrics_independent_of_body_kind() {
+    // Even for `Full` (no-op path), `into_tracked` must hand back a fresh
+    // `Arc<StreamingMetrics>` so the deferred-task spawn site can read
+    // them unconditionally without unwrap or branch.
+    let baseline = Instant::now();
+    let body = ProxyBody::full(Bytes::from("data"));
+    let (_wrapped, metrics) = body.into_tracked(baseline);
+
+    // The metrics object exists and is usable — Arc strong count = 1
+    // because the no-op path doesn't share metrics with a TrackedBody.
+    assert_eq!(Arc::strong_count(&metrics), 1);
+}

@@ -77,7 +77,37 @@ This optimization **only activates when no plugins require response body bufferi
 
 ### Response Body Coalescing
 
-For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses coalescing adapters that accumulate small backend chunks into 128 KB frames before yielding to hyper's HTTP encoder. `CoalescingBody` handles reqwest-backed HTTP/1.1 responses, while `CoalescingH2Body` handles hyper HTTP/2 `Incoming` bodies (gRPC streaming and HTTP/2 direct pool paths). This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually. The H2 adapter is trailer-safe — gRPC trailers are stashed while buffered data is flushed, then returned on the next poll.
+For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses a **single protocol-agnostic coalescing adapter** that accumulates small backend chunks into larger frames before yielding to the protocol writer. `Coalescing<S: FrameSource>` in `src/proxy/body.rs` is generic over a `FrameSource` trait with three production implementations:
+
+| Source | Used for | Builder |
+|--------|----------|---------|
+| `ReqwestFrameSource` | reqwest streams (HTTP/1.1, HTTP/2-via-reqwest, H3-frontend → non-H3-backend bridge) | `coalescing_body`, `size_limited_streaming_body` |
+| `Incoming` (hyper) | direct HTTP/2 pool, gRPC pool | `coalescing_h2_body` |
+| `H3FrameSource` | native H3 backend pool | `coalescing_h3_body` |
+
+The coalescing logic — buffer accumulation, large-frame pass-through, opportunistic flush on `Pending`, optional time-based flush, trailer/error stashing — lives entirely in the generic adapter. There is no per-protocol coalescer to keep in sync. The H2/H3 adapters are trailer-safe: gRPC trailers (`grpc-status`, `grpc-message`) and h3 trailers are stashed while buffered data is flushed, then returned on the next poll.
+
+This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually.
+
+#### Operator-Tunable Bounds (Shared Across Protocols)
+
+Two `pub const` bounds in `src/proxy/body.rs` clamp every coalesce-related env var to a sane range. They are shared so a single audit covers H1/H2/H3:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `body::COALESCE_MIN_FLOOR` | `1024` (1 KiB) | Lower bound for any coalesce target / capacity. Below this, the buffer pass-through fast-path triggers on every frame and coalescing has no effect. |
+| `body::COALESCE_MAX_CAP` | `1_048_576` (1 MiB) | Upper bound for any coalesce buffer capacity. Caps per-stream memory regardless of env-var input. |
+
+Per-protocol knobs that clamp through these bounds:
+
+| Env Var | Default | Path |
+|---------|---------|------|
+| `FERRUM_H2_COALESCE_TARGET_BYTES` | `131_072` (128 KiB) | Direct H2 pool, gRPC pool |
+| `FERRUM_HTTP3_COALESCE_MIN_BYTES` | `32_768` (32 KiB) | H3 native + cross-protocol bridge |
+| `FERRUM_HTTP3_COALESCE_MAX_BYTES` | `32_768` (32 KiB) | H3 native + cross-protocol bridge |
+| `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | `200` | H3 time-based flush deadline |
+
+The H1/H2-via-reqwest path uses a fixed 128 KiB target (`COALESCE_TARGET` in `body.rs`) — there is no env-var knob for it because `Pending` opportunistically flushes the buffer on every poll-wakeup gap, so SSE / trickle-style backends are not held back regardless of target size.
 
 ### Decision Flow
 
@@ -206,7 +236,7 @@ See [docs/size_limits.md](size_limits.md) for the full size limit enforcement ar
 
 ### HTTP/1.1 and HTTP/2
 
-Both protocols support streaming. By default, streaming responses use `ProxyBody::Stream` — a zero-overhead passthrough with no per-frame tracking. When `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`, the gateway uses `ProxyBody::Tracked` instead, which wraps the byte stream with lightweight completion tracking via `StreamingMetrics` (one atomic store per frame, plus one deferred `tokio::spawn` per streaming request).
+Both protocols support streaming. By default, streaming responses use `ProxyBody::Stream` — a zero-overhead passthrough with no per-frame tracking. When `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`, the gateway calls `base_body.into_tracked(backend_start)` on the same base body the regular streaming path produces — so the tracked path inherits coalescing, the small-response eager buffer cutoff, and any `SizeLimitedStreamingResponse` wrapping. There is no separate "tracked + coalesced" or "tracked + size-limited" constructor; tracking is a transformation applied on top of whatever streaming dispatch the regular path picked. Per-frame cost: one atomic store via `StreamingMetrics`, plus one deferred `tokio::spawn` per streaming request.
 
 ### HTTP/3 (QUIC)
 
@@ -255,12 +285,14 @@ Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
-- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses
-- `body::coalescing_h2_body(body, content_length, coalesce_target)` — Create a streaming body with H2 DATA frame coalescing. Used for gRPC streaming and HTTP/2 direct pool. Trailer-safe: stashes gRPC trailers while flushing buffered data
-- `body::coalescing_h3_body(recv_stream, content_length, coalesce_target)` — Create a streaming body that bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`
-- `body::direct_streaming_h3_body(recv_stream, content_length)` — Zero-overhead passthrough for H3 response data. Used when no coalescing/size limits apply
-- `body::size_limited_streaming_body(response, max_bytes, content_length)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and Content-Length is absent
-- `ProxyBody::streaming_tracked(response, baseline)` — Create a streaming body with completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`
+- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses. Builds `Coalescing<ReqwestFrameSource>`.
+- `body::direct_streaming_body(response, content_length)` — Zero-overhead passthrough for reqwest streams. Used when both `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES=0` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`.
+- `body::size_limited_streaming_body(response, max_bytes, content_length)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and Content-Length is absent.
+- `body::coalescing_h2_body(body, content_length, coalesce_target)` — H2 DATA frame coalescing for gRPC streaming and HTTP/2 direct pool. Builds `Coalescing<Incoming>`. Trailer-safe.
+- `body::direct_streaming_h2_body(body, content_length)` — Zero-overhead H2 passthrough; used for the large-response bypass and the H2 fast path.
+- `body::coalescing_h3_body(recv_stream, content_length, coalesce_min, coalesce_max, flush_interval)` — Bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Builds `Coalescing<H3FrameSource>`. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`.
+- `body::direct_streaming_h3_body(recv_stream, content_length)` — Zero-overhead passthrough for H3 response data. Used when no coalescing/size limits apply.
+- `ProxyBody::into_tracked(self, baseline)` — Wrap any streaming `ProxyBody` (returned by any of the builders above) in completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`. No-op on `Full` or already-`Tracked` bodies. Use this so the tracked path picks up the same coalescing / size-limit / SSE-bypass behaviour as the default streaming path — there is no separate "tracked" body builder.
 
 ## When to Use Buffer Mode
 

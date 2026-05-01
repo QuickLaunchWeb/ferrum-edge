@@ -28,13 +28,11 @@ const _: () = assert!(H3_SEND_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
 /// See `FERRUM_HTTP3_COALESCE_MAX_BYTES` for runtime tuning.
 pub const H3_COALESCE_MAX_DEFAULT: usize = 32_768;
 
-/// Absolute upper bound operators may set via `FERRUM_HTTP3_COALESCE_MAX_BYTES`.
-/// Bounds per-stream memory regardless of configuration.
-pub const H3_COALESCE_MAX_CAP: usize = 1_048_576;
-
-/// Absolute lower bound for both MIN and MAX coalesce bytes. Values below this
-/// erase the benefit of coalescing entirely.
-pub const H3_COALESCE_MIN_FLOOR: usize = 1024;
+// `H3_COALESCE_MAX_CAP` and `H3_COALESCE_MIN_FLOOR` were renamed to
+// `crate::proxy::body::COALESCE_MAX_CAP` and
+// `crate::proxy::body::COALESCE_MIN_FLOOR` so the bounds can be reused by
+// every protocol that exposes configurable coalescing (H2 direct pool,
+// H3 native, future H1 reqwest knob). The values are unchanged.
 
 /// Floor for the H3 response streaming flush interval in microseconds.
 /// Values below this would cause the select-loop to flush on almost every poll
