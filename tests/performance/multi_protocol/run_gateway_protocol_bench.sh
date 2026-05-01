@@ -118,7 +118,12 @@ supports() {
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
         kong:http1-tls|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
         tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss) return 0 ;;
-        krakend:http1-tls|krakend:http2) return 0 ;;
+        # KrakenD CE HTTP/2: Lura's custom http.Transport doesn't call
+        # http2.ConfigureTransport(), so backend connections fall back
+        # to HTTP/1.1. The H2-only backend (port 3443) rejects the ALPN
+        # mismatch → KrakenD returns 502 for every request. Tyk (also
+        # Go) works because it explicitly enables H2 on its transport.
+        krakend:http1-tls) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -292,6 +297,7 @@ start_ferrum() {
         -e "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true" \
         -e "FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576" \
         -e "FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
+        -e "FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=16" \
         -e "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000" \
         -e "FERRUM_UDP_MAX_SESSIONS=10000" \
         -e "FERRUM_UDP_RECVMMSG_BATCH_SIZE=64" \
@@ -363,35 +369,12 @@ start_kong() {
     local cfg_dst="$SCRIPT_DIR/kong_runtime.yaml"
     echo "[kong] starting..."
 
-    # Template the benchmark CA cert into the declarative config.
-    #
-    # With `tls_verify: true` on a Kong service, nginx's upstream TLS
-    # verifier requires a trust anchor that Kong considers valid — which
-    # means a `ca_certificates` entity in the declarative config, NOT
-    # just `KONG_LUA_SSL_TRUSTED_CERTIFICATE` (that only scopes cosocket
-    # Lua callouts, not `proxy_pass` upstream handshakes). Per-config
-    # `ca_certificates` entries require the cert content inline, so we
-    # read cert.pem at start-up and substitute it into the config file
-    # written to $SCRIPT_DIR/kong_runtime.yaml (the running config
-    # Kong mounts).
-    #
-    # The CA cert (ca.pem) carries `basicConstraints: CA:TRUE` so Kong
-    # accepts it as a CA entity.
-    python3 - "$cfg_src" "$cfg_dst" "$CERT_DIR/ca.pem" <<'PYEOF'
-import sys, pathlib
-src, dst, cert_path = sys.argv[1], sys.argv[2], sys.argv[3]
-cert = pathlib.Path(cert_path).read_text().rstrip()
-# The placeholder line in the checked-in YAML is `      __BENCH_CA_PEM__`
-# (6-space indent, inside the `cert: |` block scalar so the file parses
-# as valid YAML pre-render). When substituting, the first cert line
-# inherits the placeholder's leading whitespace; subsequent lines need
-# their own matching 6-space prefix so they stay inside the block
-# scalar.
-cert_lines = cert.splitlines()
-replacement = cert_lines[0] + '\n' + '\n'.join('      ' + l for l in cert_lines[1:])
-text = pathlib.Path(src).read_text().replace('__BENCH_CA_PEM__', replacement)
-pathlib.Path(dst).write_text(text)
-PYEOF
+    # No CA-into-YAML templating — the upstream trust anchor is now imposed
+    # globally via nginx env vars below (KONG_NGINX_*_PROXY_SSL_*), not via
+    # per-service `ca_certificates` entities. The declarative configs in
+    # configs/kong/ are checked in as-is. See configs/kong/http1_tls.yaml
+    # rationale comment for why this matters for upstream pool reuse.
+    cp "$cfg_src" "$cfg_dst"
 
     local proxy_listen_env
     local stream_listen_env=""
@@ -436,7 +419,35 @@ PYEOF
         -e "KONG_STREAM_SSL_CERT=/certs/cert.pem" \
         -e "KONG_STREAM_SSL_CERT_KEY=/certs/key.pem" \
         -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
-        -e "KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        `# NB: don't also set KONG_NGINX_STREAM_LUA_SSL_TRUSTED_CERTIFICATE.` \
+        `# Kong 3.10 propagates the global KONG_LUA_SSL_TRUSTED_CERTIFICATE` \
+        `# directive into BOTH http{} and stream{} blocks; the stream-` \
+        `# specific env var would emit a second lua_ssl_trusted_certificate` \
+        `# line in nginx-kong-stream.conf and nginx aborts with` \
+        `# "directive is duplicate" — visible only when KONG_STREAM_LISTEN` \
+        `# is set (i.e. tcp-tls / udp), which is why the dup hid until now.` \
+        -e "KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=256" \
+        -e "KONG_UPSTREAM_KEEPALIVE_MAX_REQUESTS=10000" \
+        `# ── Static upstream TLS trust + verify (global) ──────────────` \
+        `# Set via nginx-directive injection so the upstream SSL_CTX is` \
+        `# built once at config-load. Per-service ca_certificates +` \
+        `# tls_verify rebuilds the SSL_CTX per request via Lua, which` \
+        `# defeats OpenResty's keepalive pool match (~450 RPS ceiling` \
+        `# on H1-TLS at concurrency 100 vs ~10K with static trust).` \
+        `# Three variants cover all three nginx upstream paths:` \
+        `#   PROXY_PROXY_SSL_*  → http proxy_pass (HTTP/1.1, HTTPS)` \
+        `#   PROXY_GRPC_SSL_*   → http grpc_pass  (gRPC)` \
+        `#   STREAM_PROXY_SSL_* → stream proxy    (TCP+TLS)` \
+        `# See configs/kong/*.yaml rationale comments for full context.` \
+        -e "KONG_NGINX_PROXY_PROXY_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_NGINX_PROXY_PROXY_SSL_VERIFY=on" \
+        -e "KONG_NGINX_PROXY_PROXY_SSL_VERIFY_DEPTH=2" \
+        -e "KONG_NGINX_PROXY_GRPC_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_NGINX_PROXY_GRPC_SSL_VERIFY=on" \
+        -e "KONG_NGINX_PROXY_GRPC_SSL_VERIFY_DEPTH=2" \
+        -e "KONG_NGINX_STREAM_PROXY_SSL_TRUSTED_CERTIFICATE=/certs/ca.pem" \
+        -e "KONG_NGINX_STREAM_PROXY_SSL_VERIFY=on" \
+        -e "KONG_NGINX_STREAM_PROXY_SSL_VERIFY_DEPTH=2" \
         "${extra_env[@]}" \
         -v "$cfg_dst:/kong/kong.yaml:ro" \
         -v "$CERT_DIR:/certs:ro" \
@@ -751,6 +762,15 @@ PYEOF
     local rps
     rps=$(python3 -c "import json; print(f\"{json.load(open('$out'))['rps']:,.0f}\")" 2>/dev/null || echo "?")
     echo "[bench]   → RPS=$rps"
+
+    # Surface proto_bench stderr (error detail lines) if non-empty.
+    local err_file="$OUTPUT_DIR/${gateway}_${PROTOCOL}_${payload}.err"
+    if [ -s "$err_file" ]; then
+        local err_lines
+        err_lines=$(wc -l < "$err_file")
+        echo "[bench]   ⚠ ${err_lines} error lines in stderr (first 10):"
+        head -10 "$err_file" | sed 's/^/[bench]     /'
+    fi
 }
 
 # ── Orchestration ───────────────────────────────────────────────────────────
@@ -766,6 +786,15 @@ main() {
         for size in $PAYLOAD_SIZES; do
             run_bench "direct" "$size" "direct"
         done
+        # Restart backend so gateways get a clean server with no leftover
+        # session state. DTLS in particular accumulates per-client state
+        # machines that linger for 60s after the direct test ends; those
+        # zombie sessions contend for CPU and cause ferrum's backend DTLS
+        # handshake to stall on the first gateway run.
+        echo "[main] restarting backend (clean slate for gateway tests)..."
+        [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
+        sleep 1
+        start_backend
     fi
 
     for gw in $GATEWAYS; do

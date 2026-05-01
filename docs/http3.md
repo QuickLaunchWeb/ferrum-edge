@@ -14,6 +14,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [WebSocket over HTTP/3 — not supported](#websocket-over-http3--not-supported)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
+- [Flow-control window tuning](#flow-control-window-tuning)
 - [Environment variables](#environment-variables)
 
 ## Listener and enablement
@@ -202,6 +203,10 @@ The H3 listener enforces its own per-header and total-header size limits:
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | Max bytes across all headers combined |
 
 These are enforced separately from hyper's built-in validation because the H3 listener parses headers via the `h3` crate, not via hyper. The `Host` value used for routing is extracted from an already-validated header, so separate host-length validation is unnecessary.
+
+## Flow-control window tuning
+
+The default QUIC flow-control windows are moderate by design: 8 MiB per stream, 32 MiB receive budget per connection, and 8 MiB send budget per connection. The connection-level receive window is the aggregate governor, so active per-stream receive windows cannot exceed the connection receive budget in total. Memory budget per QUIC connection scales with `FERRUM_HTTP3_RECEIVE_WINDOW + FERRUM_HTTP3_SEND_WINDOW`; raise these values only after benchmarking a workload that benefits from larger windows. Explicit env values continue to override these defaults.
 
 ## Environment variables
 

@@ -193,6 +193,7 @@ start_gateway() {
         FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=true
         FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=1048576
         FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
+        FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=16
         # Server-side HTTP/2 tuning
         FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS=1000
         # gRPC pool tuning (documented 3.8% throughput improvement)

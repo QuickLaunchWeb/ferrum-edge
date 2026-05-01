@@ -204,10 +204,12 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
             }
 
             let mut send_req = connect_h1(addr, &tls_connector).await?;
+            let mut reconnects: u64 = 0;
 
             while Instant::now() < deadline {
                 // Reconnect if the connection was closed
                 if send_req.is_closed() {
+                    reconnects += 1;
                     send_req = connect_h1(addr, &tls_connector).await?;
                 }
 
@@ -242,6 +244,12 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                         break;
                     }
                 }
+            }
+            if reconnects > 0 {
+                eprintln!(
+                    "[http1] task reconnected {reconnects} times over {} requests",
+                    metrics.total_requests
+                );
             }
             Ok(metrics)
         }));
@@ -467,17 +475,51 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                         }
                         let _ = stream.finish().await;
                         match stream.recv_response().await {
-                            Ok(_resp) => {
+                            Ok(resp) => {
+                                let expected_len = resp
+                                    .headers()
+                                    .get("content-length")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.parse::<usize>().ok());
                                 let mut body_bytes = 0usize;
-                                while let Ok(Some(chunk)) = stream.recv_data().await {
-                                    body_bytes += chunk.remaining();
+                                let mut recv_err: Option<String> = None;
+                                loop {
+                                    match stream.recv_data().await {
+                                        Ok(Some(chunk)) => body_bytes += chunk.remaining(),
+                                        Ok(None) => break,
+                                        Err(e) => {
+                                            recv_err = Some(e.to_string());
+                                            break;
+                                        }
+                                    }
                                 }
-                                let latency = start.elapsed().as_micros() as u64;
-                                metrics.record(latency, body_bytes);
+                                if let Some(e) = recv_err {
+                                    let expected = expected_len.unwrap_or(payload.len());
+                                    eprintln!(
+                                        "  h3 recv_data error after {} bytes (expected {}): {}",
+                                        body_bytes, expected, e
+                                    );
+                                    metrics.record_error();
+                                } else if let Some(cl) = expected_len {
+                                    if body_bytes != cl {
+                                        eprintln!(
+                                            "  h3 truncated response: got {} bytes, content-length {}",
+                                            body_bytes, cl
+                                        );
+                                        metrics.record_error();
+                                    } else {
+                                        let latency = start.elapsed().as_micros() as u64;
+                                        metrics.record(latency, body_bytes);
+                                    }
+                                } else {
+                                    let latency = start.elapsed().as_micros() as u64;
+                                    metrics.record(latency, body_bytes);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("  h3 recv_response error: {e}");
                                 metrics.record_error();
+                                break;
                             }
                         }
                     }
@@ -779,28 +821,28 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                     Ok(())
                 });
 
-                // Read with a short per-attempt timeout so a stalled backend
-                // or partial echo cannot wedge the task indefinitely. 5s is
-                // generous — a healthy 5 MiB read at concurrency 25 completes
-                // in <250ms on localhost, so any stall beyond that is a real
-                // failure that should be surfaced, not papered over.
+                // Read with a per-attempt timeout so a stalled backend or
+                // partial echo cannot wedge the task indefinitely. 15s is
+                // generous — well above the observed CI-runner worst case
+                // (~5-8s under heavy scheduler contention at 200 concurrent
+                // TLS connections on shared runners). The previous 5s caused
+                // false-positive errors on every run.
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    let read_timeout = Duration::from_secs(5);
+                    let read_timeout = Duration::from_secs(15);
                     match tokio::time::timeout(read_timeout, rd.read_exact(&mut buf)).await {
                         Ok(Ok(_)) => {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
-                        Ok(Err(_)) => {
+                        Ok(Err(e)) => {
+                            eprintln!("[tcp-tls] read error after {} requests: {e}", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }
                         Err(_) => {
-                            // Read timeout — no bytes flowing. Record as an
-                            // error and bail so the bench doesn't wallclock
-                            // itself into oblivion on a wedged connection.
+                            eprintln!("[tcp-tls] read timeout (15s) after {} requests", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }
@@ -825,7 +867,8 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            eprintln!("[tcp] i/o error after {} requests: {e}", metrics.total_requests);
                             metrics.record_error();
                             break;
                         }

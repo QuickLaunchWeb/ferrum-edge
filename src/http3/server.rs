@@ -192,14 +192,14 @@ pub async fn start_http3_listener_with_signal(
     transport_config.max_concurrent_bidi_streams(h3_config.max_concurrent_streams.into());
 
     // QUIC flow-control tuning — larger windows improve throughput on modern networks.
-    transport_config.stream_receive_window(
-        quinn::VarInt::from_u64(h3_config.stream_receive_window)
-            .unwrap_or(quinn::VarInt::from_u32(8_388_608)),
-    );
-    transport_config.receive_window(
-        quinn::VarInt::from_u64(h3_config.receive_window)
-            .unwrap_or(quinn::VarInt::from_u32(33_554_432)),
-    );
+    transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.stream_receive_window,
+        crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    ));
+    transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+        h3_config.receive_window,
+        crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+    ));
     transport_config.send_window(h3_config.send_window);
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));

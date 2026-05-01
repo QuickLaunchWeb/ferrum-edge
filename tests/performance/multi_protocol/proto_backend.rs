@@ -410,6 +410,7 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
                         }
                         let resp = http::Response::builder()
                             .status(StatusCode::OK)
+                            .header("content-length", body_data.len().to_string())
                             .body(())
                             .unwrap();
                         let _ = stream.send_response(resp).await;

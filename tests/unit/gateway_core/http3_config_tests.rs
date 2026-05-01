@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use ferrum_edge::config::EnvConfig;
-use ferrum_edge::http3::config::Http3ServerConfig;
+use ferrum_edge::http3::config::{
+    H3_RECEIVE_WINDOW_DEFAULT, H3_SEND_WINDOW_DEFAULT, H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+    Http3ServerConfig,
+};
 
 #[test]
 fn test_http3_server_config_default_values() {
@@ -9,9 +12,12 @@ fn test_http3_server_config_default_values() {
 
     assert_eq!(config.max_concurrent_streams, 1000);
     assert_eq!(config.idle_timeout, Duration::from_secs(30));
-    assert_eq!(config.stream_receive_window, 8_388_608); // 8 MiB
-    assert_eq!(config.receive_window, 33_554_432); // 32 MiB
-    assert_eq!(config.send_window, 8_388_608); // 8 MiB
+    assert_eq!(
+        config.stream_receive_window,
+        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+    );
+    assert_eq!(config.receive_window, H3_RECEIVE_WINDOW_DEFAULT);
+    assert_eq!(config.send_window, H3_SEND_WINDOW_DEFAULT);
     assert_eq!(config.initial_mtu, 1500);
 }
 
@@ -34,9 +40,12 @@ fn test_http3_server_config_from_env_config_defaults() {
 
     assert_eq!(config.max_concurrent_streams, 1000);
     assert_eq!(config.idle_timeout, Duration::from_secs(30));
-    assert_eq!(config.stream_receive_window, 8_388_608);
-    assert_eq!(config.receive_window, 33_554_432);
-    assert_eq!(config.send_window, 8_388_608);
+    assert_eq!(
+        config.stream_receive_window,
+        H3_STREAM_RECEIVE_WINDOW_DEFAULT
+    );
+    assert_eq!(config.receive_window, H3_RECEIVE_WINDOW_DEFAULT);
+    assert_eq!(config.send_window, H3_SEND_WINDOW_DEFAULT);
 }
 
 #[test]

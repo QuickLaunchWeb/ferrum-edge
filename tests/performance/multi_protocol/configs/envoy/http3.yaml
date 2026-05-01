@@ -15,6 +15,7 @@ static_resources:
           address: 127.0.0.1
           port_value: 8443
           protocol: UDP
+      per_connection_buffer_limit_bytes: 10485760
       udp_listener_config:
         quic_options: {}
         downstream_socket_config:
@@ -36,7 +37,11 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_h3
                 codec_type: HTTP3
-                http3_protocol_options: {}
+                http3_protocol_options:
+                  quic_protocol_options:
+                    max_concurrent_streams: { value: 1000 }
+                    initial_stream_window_size: { value: 8388608 }
+                    initial_connection_window_size: { value: 25165824 }
                 route_config:
                   name: local_route
                   virtual_hosts:
@@ -56,13 +61,18 @@ static_resources:
   clusters:
     - name: backend_h3
       connect_timeout: 5s
+      per_connection_buffer_limit_bytes: 10485760
       type: STATIC
       lb_policy: ROUND_ROBIN
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
           explicit_http_config:
-            http3_protocol_options: {}
+            http3_protocol_options:
+              quic_protocol_options:
+                max_concurrent_streams: { value: 1000 }
+                initial_stream_window_size: { value: 8388608 }
+                initial_connection_window_size: { value: 25165824 }
       transport_socket:
         name: envoy.transport_sockets.quic
         typed_config:

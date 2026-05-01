@@ -4,6 +4,25 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 
+/// Default HTTP/3 per-stream receive window. Larger than quinn's baseline
+/// while keeping the aggregate connection budget modest by default.
+pub const H3_STREAM_RECEIVE_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+
+/// Default HTTP/3 connection-level receive window. This aggregate connection
+/// budget bounds the sum of active per-stream receive windows.
+pub const H3_RECEIVE_WINDOW_DEFAULT: u64 = 32 * 1024 * 1024;
+
+/// Default HTTP/3 send window. This bounds unacknowledged outbound data per
+/// QUIC connection.
+pub const H3_SEND_WINDOW_DEFAULT: u64 = 8 * 1024 * 1024;
+
+/// Largest value encodable as a QUIC variable-length integer.
+pub const QUIC_VARINT_MAX_U64: u64 = (1 << 62) - 1;
+
+const _: () = assert!(H3_STREAM_RECEIVE_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
+const _: () = assert!(H3_RECEIVE_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
+const _: () = assert!(H3_SEND_WINDOW_DEFAULT <= QUIC_VARINT_MAX_U64);
+
 /// Default value for the H3 response streaming coalesce-buffer initial capacity
 /// and MIN upper bound (when `FERRUM_HTTP3_COALESCE_MAX_BYTES` is unset).
 /// See `FERRUM_HTTP3_COALESCE_MAX_BYTES` for runtime tuning.
@@ -54,6 +73,16 @@ where
 {
     let chunk_len = chunk.remaining();
     chunk.copy_to_bytes(chunk_len)
+}
+
+/// Convert an operator-supplied QUIC flow-control window into a VarInt,
+/// falling back to the compiled default if the supplied value exceeds QUIC's
+/// legal varint range.
+pub(crate) fn quic_varint_or_default(value: u64, default_value: u64) -> quinn::VarInt {
+    quinn::VarInt::from_u64(value).unwrap_or_else(|_| {
+        debug_assert!(default_value <= QUIC_VARINT_MAX_U64);
+        quinn::VarInt::from_u64(default_value).unwrap_or(quinn::VarInt::MAX)
+    })
 }
 
 /// HTTP/3 server configuration
@@ -115,9 +144,9 @@ impl Default for Http3ServerConfig {
         Self {
             max_concurrent_streams: 1000,
             idle_timeout: Duration::from_secs(30),
-            stream_receive_window: 8_388_608, // 8 MiB
-            receive_window: 33_554_432,       // 32 MiB
-            send_window: 8_388_608,           // 8 MiB
+            stream_receive_window: H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+            receive_window: H3_RECEIVE_WINDOW_DEFAULT,
+            send_window: H3_SEND_WINDOW_DEFAULT,
             initial_mtu: 1500,
         }
     }
@@ -127,7 +156,10 @@ impl Default for Http3ServerConfig {
 mod tests {
     use bytes::{Buf, Bytes};
 
-    use super::{copy_remaining_response_chunk, should_direct_send_response_chunk};
+    use super::{
+        H3_RECEIVE_WINDOW_DEFAULT, copy_remaining_response_chunk, quic_varint_or_default,
+        should_direct_send_response_chunk,
+    };
 
     #[test]
     fn direct_send_requires_empty_buffer_and_large_chunk() {
@@ -145,5 +177,23 @@ mod tests {
 
         assert_eq!(&copied[..], b"hello, h3");
         assert!(!chunk.has_remaining());
+    }
+
+    #[test]
+    fn quic_varint_falls_back_when_value_exceeds_quic_range() {
+        assert_eq!(
+            quic_varint_or_default(u64::MAX, H3_RECEIVE_WINDOW_DEFAULT),
+            quinn::VarInt::from_u64(H3_RECEIVE_WINDOW_DEFAULT).unwrap()
+        );
+    }
+
+    #[test]
+    fn quic_varint_fallback_does_not_truncate_large_defaults() {
+        let default_above_u32 = u64::from(u32::MAX) + 1;
+
+        assert_eq!(
+            quic_varint_or_default(u64::MAX, default_above_u32),
+            quinn::VarInt::from_u64(default_above_u32).unwrap()
+        );
     }
 }

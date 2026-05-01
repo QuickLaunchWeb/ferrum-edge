@@ -207,8 +207,8 @@ pub fn make_h3_server_config(
 
 /// Create a `quinn::ClientConfig` that skips server certificate verification.
 ///
-/// Applies optimized QUIC transport settings (8 MiB stream window, 32 MiB
-/// connection window, 8 MiB send window) to match the gateway's tuned defaults
+/// Applies QUIC transport settings (8 MiB stream window, 32 MiB connection
+/// window, 8 MiB send window) to match the gateway's defaults
 /// and ensure the bench client is not the bottleneck.
 pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
     let mut tls_cfg = rustls::ClientConfig::builder()

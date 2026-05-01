@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Buf;
+use futures_util::StreamExt as _;
 use http::Request;
 use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
@@ -688,6 +689,19 @@ impl Http3ConnectionPool {
         key
     }
 
+    /// Return the shard indices startup warmup should attempt for a proxy.
+    #[doc(hidden)]
+    pub fn warmup_shard_indices(
+        proxy: &Proxy,
+        default_connections_per_backend: usize,
+    ) -> std::ops::Range<usize> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(default_connections_per_backend)
+            .max(1);
+        0..conns_per_backend
+    }
+
     async fn create_or_get_proxy_sender(
         &self,
         key: String,
@@ -736,23 +750,60 @@ impl Http3ConnectionPool {
             .await
     }
 
-    /// Pre-establish a QUIC connection and cache it in the pool (shard 0 only).
+    /// Pre-establish configured QUIC connections and cache them in the pool.
     ///
     /// Used at startup to warm the connection pool so the first request to each
-    /// H3 backend does not pay the QUIC + TLS 1.3 handshake cost.
+    /// H3 backend does not pay the QUIC + TLS 1.3 handshake cost. Shard 0 is
+    /// the capability probe and must succeed; additional shards are best-effort
+    /// so one slow parallel connection does not mark an H3-capable backend
+    /// unsupported.
     pub async fn warmup_connection(
         &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
     ) -> Result<(), anyhow::Error> {
-        let key = Self::pool_key(proxy, 0);
-        if self.pool.cached(&key).is_some() {
+        let conns_per_backend =
+            Self::warmup_shard_indices(proxy, self.connections_per_backend).len();
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+
+        let primary_key = Self::pool_key(proxy, 0);
+        if self.pool.cached(&primary_key).is_none() {
+            let _ = self
+                .create_or_get_proxy_sender(
+                    primary_key,
+                    proxy,
+                    tls_config.clone(),
+                    h3_config.clone(),
+                )
+                .await?;
+        }
+
+        if conns_per_backend == 1 {
             return Ok(());
         }
-        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let _ = self
-            .create_or_get_proxy_sender(key, proxy, tls_config.clone(), h3_config)
-            .await?;
+
+        futures_util::stream::iter(1..conns_per_backend)
+            .for_each_concurrent(conns_per_backend.min(8), |index| {
+                let tls_config = tls_config.clone();
+                let h3_config = h3_config.clone();
+                async move {
+                    let key = Self::pool_key(proxy, index);
+                    if self.pool.cached(&key).is_some() {
+                        return;
+                    }
+
+                    if let Err(err) = self
+                        .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
+                        .await
+                    {
+                        debug!(
+                            "HTTP/3 pool warmup: optional shard {} of {} failed for {}:{}: {}",
+                            index, conns_per_backend, proxy.backend_host, proxy.backend_port, err
+                        );
+                    }
+                }
+            })
+            .await;
         Ok(())
     }
 
@@ -1019,14 +1070,14 @@ impl Http3ConnectionPool {
 
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(cfg.stream_receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(cfg.receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
-        );
+        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.stream_receive_window,
+            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        ));
+        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.receive_window,
+            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        ));
         transport_config.send_window(cfg.send_window);
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
@@ -1095,14 +1146,14 @@ impl Http3ConnectionPool {
 
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(cfg.stream_receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(cfg.receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
-        );
+        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.stream_receive_window,
+            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        ));
+        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.receive_window,
+            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        ));
         transport_config.send_window(cfg.send_window);
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
@@ -2116,14 +2167,14 @@ impl Http3Client {
         // Apply QUIC transport tuning for the client side
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.initial_mtu(cfg.initial_mtu);
-        transport_config.stream_receive_window(
-            quinn::VarInt::from_u64(cfg.stream_receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
-        );
-        transport_config.receive_window(
-            quinn::VarInt::from_u64(cfg.receive_window)
-                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
-        );
+        transport_config.stream_receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.stream_receive_window,
+            crate::http3::config::H3_STREAM_RECEIVE_WINDOW_DEFAULT,
+        ));
+        transport_config.receive_window(crate::http3::config::quic_varint_or_default(
+            cfg.receive_window,
+            crate::http3::config::H3_RECEIVE_WINDOW_DEFAULT,
+        ));
         transport_config.send_window(cfg.send_window);
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
