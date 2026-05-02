@@ -7,7 +7,7 @@
 
 use bytes::{Bytes, BytesMut};
 use http_body::Frame;
-use http_body_util::{Full, StreamBody};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -277,71 +278,54 @@ impl ProxyBody {
         }
     }
 
-    /// Create a streaming body with lightweight completion tracking.
+    /// Wrap a streaming body in lightweight completion tracking.
     ///
-    /// Returns the body and a shared `Arc<StreamingMetrics>` that a deferred
-    /// task can read to get the final transfer time after `read_timeout + buffer`.
-    pub fn streaming_tracked(
-        response: reqwest::Response,
-        baseline: Instant,
-    ) -> (Self, Arc<StreamingMetrics>) {
-        use futures_util::StreamExt;
-
+    /// Returns the tracked body and a shared `Arc<StreamingMetrics>` that a
+    /// deferred task can read to get the final transfer time after
+    /// `read_timeout + buffer`. Cost per frame: one `Instant::now()` + one
+    /// atomic store.
+    ///
+    /// Composes with the protocol-agnostic body builders
+    /// (`coalescing_body`, `direct_streaming_body`,
+    /// `size_limited_streaming_body`, `coalescing_h2_body`,
+    /// `direct_streaming_h2_body`, `coalescing_h3_body`,
+    /// `direct_streaming_h3_body`) — pick the right base body for the
+    /// dispatch path, then call `into_tracked()` so the tracked path inherits
+    /// the same coalescing / size-limit / fast-path behaviour as the default
+    /// streaming path. No-op (returns unchanged kind) on `Full` or
+    /// already-tracked bodies; in those cases the returned `metrics` are
+    /// inert.
+    pub fn into_tracked(mut self, baseline: Instant) -> (Self, Arc<StreamingMetrics>) {
         let metrics = Arc::new(StreamingMetrics::new(baseline));
-
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map(Frame::data)
-                .map_err(|e| Box::new(e) as ProxyBodyError)
-        });
-        let inner = Box::pin(StreamBody::new(stream));
-        let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
-        (
-            Self {
-                kind: ProxyBodyKind::Tracked(tracked),
-                _request_guard: None,
-                logger: None,
-                bytes_streamed: AtomicU64::new(0),
-                polled: AtomicBool::new(false),
-            },
-            metrics,
-        )
-    }
-
-    /// Create a streaming body with both completion tracking and frame-by-frame
-    /// size enforcement. Used when `enable_streaming_latency_tracking=true` AND
-    /// `max_response_body_size_bytes > 0` AND Content-Length is absent.
-    pub fn streaming_tracked_with_size_limit(
-        response: reqwest::Response,
-        baseline: Instant,
-        max_bytes: usize,
-    ) -> (Self, Arc<StreamingMetrics>) {
-        use futures_util::StreamExt;
-
-        let metrics = Arc::new(StreamingMetrics::new(baseline));
-
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map(Frame::data)
-                .map_err(|e| Box::new(e) as ProxyBodyError)
-        });
-        let limited = SizeLimitedStreamingResponse {
-            inner: stream,
-            max_bytes,
-            bytes_seen: 0,
+        // `ProxyBody: Drop` blocks destructuring, so swap the kind out via
+        // `mem::replace` (cheap — `Full(Full::default())` allocates nothing).
+        let placeholder = ProxyBodyKind::Full(Full::default());
+        let prev = std::mem::replace(&mut self.kind, placeholder);
+        self.kind = match prev {
+            ProxyBodyKind::Stream(body) => {
+                ProxyBodyKind::Tracked(TrackedBody::new(body, Arc::clone(&metrics)))
+            }
+            other => {
+                // Latent-trap diagnostic: production callers should only
+                // reach here from `ResponseBody::Streaming` arms (which
+                // produce `Stream` variants). If a future refactor passes
+                // a `Full` or already-`Tracked` body here, the returned
+                // metrics stay inert — the deferred log task will then
+                // warn "Streaming response incomplete" after
+                // `read_timeout + 5s`. Surfacing it as a debug line makes
+                // that failure mode trivial to diagnose.
+                debug!(
+                    kind = match &other {
+                        ProxyBodyKind::Full(_) => "Full",
+                        ProxyBodyKind::Tracked(_) => "Tracked",
+                        ProxyBodyKind::Stream(_) => "Stream",
+                    },
+                    "ProxyBody::into_tracked called on non-Stream body — returning unchanged with inert metrics"
+                );
+                other
+            }
         };
-        let inner = Box::pin(StreamBody::new(limited));
-        let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
-        (
-            Self {
-                kind: ProxyBodyKind::Tracked(tracked),
-                _request_guard: None,
-                logger: None,
-                bytes_streamed: AtomicU64::new(0),
-                polled: AtomicBool::new(false),
-            },
-            metrics,
-        )
+        (self, metrics)
     }
 }
 
@@ -889,7 +873,10 @@ where
     }
 }
 
+/// Default flush target for the [`Coalescing`] adapter when no explicit
+/// target is supplied (HTTP/1.1 + HTTP/2-via-reqwest path).
 const COALESCE_TARGET: usize = 128 * 1024;
+
 pub(crate) trait FrameSource {
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -1721,6 +1708,77 @@ mod tests {
             }
             other => panic!("expected timer-driven flush, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn into_tracked_swaps_stream_kind_to_tracked_and_drives_metrics() {
+        use std::time::Instant;
+
+        // Build a streaming ProxyBody from a coalescing source over the
+        // shared MockSource — this is the same path the production
+        // reqwest dispatch takes (`coalescing_body` → `Coalescing<S>`).
+        let mock = MockSource::new(vec![
+            MockStep::Frame(Ok(Frame::data(Bytes::from("alpha")))),
+            MockStep::Frame(Ok(Frame::data(Bytes::from("beta")))),
+            MockStep::End,
+        ]);
+        let inner = Coalescing::new(mock, COALESCE_TARGET, None);
+        let base = ProxyBody::streaming(Box::pin(inner));
+        assert!(matches!(base.kind, ProxyBodyKind::Stream(_)));
+
+        let baseline = Instant::now();
+        let (mut tracked, metrics) = base.into_tracked(baseline);
+
+        // Kind transitioned Stream → Tracked.
+        assert!(matches!(tracked.kind, ProxyBodyKind::Tracked(_)));
+
+        // Drive the body to completion via repeated polls.
+        let mut frames: Vec<Bytes> = Vec::new();
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            match Pin::new(&mut tracked).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        frames.push(data.clone());
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => panic!("unexpected error: {e:?}"),
+                Poll::Ready(None) => break,
+                Poll::Pending => panic!("MockSource never returns Pending here"),
+            }
+        }
+
+        // Coalescer batched both data frames into a single buffered output.
+        assert_eq!(frames.len(), 1, "coalescer should fold both frames");
+        assert_eq!(&frames[0][..], b"alphabeta");
+
+        // Metrics observed completion via TrackedBody's poll_frame.
+        assert!(metrics.completed());
+        assert!(metrics.last_frame_elapsed_ms().is_some());
+    }
+
+    #[test]
+    fn into_tracked_on_already_tracked_body_is_noop() {
+        use std::time::Instant;
+
+        // First wrap: Stream → Tracked drives the original metrics.
+        let mock = MockSource::new(vec![MockStep::End]);
+        let inner = Coalescing::new(mock, COALESCE_TARGET, None);
+        let base = ProxyBody::streaming(Box::pin(inner));
+
+        let baseline_a = Instant::now();
+        let (tracked, metrics_a) = base.into_tracked(baseline_a);
+        assert!(matches!(tracked.kind, ProxyBodyKind::Tracked(_)));
+
+        // Second wrap: Tracked → Tracked must be a no-op. The kind stays
+        // `Tracked` (the inner `TrackedBody` keeps reporting into
+        // `metrics_a`); the freshly-allocated `metrics_b` is inert.
+        let baseline_b = Instant::now();
+        let (rewrapped, metrics_b) = tracked.into_tracked(baseline_b);
+        assert!(matches!(rewrapped.kind, ProxyBodyKind::Tracked(_)));
+        assert!(!Arc::ptr_eq(&metrics_a, &metrics_b));
+        assert_eq!(Arc::strong_count(&metrics_b), 1);
     }
 
     #[test]

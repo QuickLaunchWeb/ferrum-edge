@@ -289,6 +289,7 @@ async fn test_http3_proxy_state_creation() {
             None,
             300,
             300, // tcp_half_close_max_wait_seconds
+            10,  // frontend_tls_handshake_timeout_seconds
             10_000,
             10,
             None,
@@ -524,6 +525,7 @@ async fn test_http3_full_integration() {
             None,
             300,
             300, // tcp_half_close_max_wait_seconds
+            10,  // frontend_tls_handshake_timeout_seconds
             10_000,
             10,
             None,

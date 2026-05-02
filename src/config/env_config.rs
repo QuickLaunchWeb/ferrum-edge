@@ -464,6 +464,10 @@ pub struct EnvConfig {
     /// by closing connections that take too long to send complete request headers.
     /// 0 = disabled (no timeout). Default: 10 seconds.
     pub http_header_read_timeout_seconds: u64,
+    /// Frontend TLS handshake timeout in seconds. Applies before HTTP header
+    /// parsing, so slow TLS handshakes cannot hold connection slots forever.
+    /// 0 = disabled (no timeout). Default: 10 seconds.
+    pub frontend_tls_handshake_timeout_seconds: u64,
 
     // DNS
     pub dns_overrides: HashMap<String, String>,
@@ -1048,6 +1052,7 @@ impl Default for EnvConfig {
             websocket_tunnel_mode: false,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
+            frontend_tls_handshake_timeout_seconds: 10,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
             dns_resolver_hosts_file: None,
@@ -1289,6 +1294,7 @@ impl EnvConfig {
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
+            frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
         }
 
         env_config! {
@@ -1615,6 +1621,7 @@ impl EnvConfig {
             websocket_tunnel_mode,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
+            frontend_tls_handshake_timeout_seconds,
             dns_overrides,
             dns_resolver_address,
             dns_resolver_hosts_file,

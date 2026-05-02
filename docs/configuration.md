@@ -24,6 +24,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_KEY_PATH` | If HTTPS | — | PEM private key for the gateway's frontend TLS certificate |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | No | `10` | Seconds allowed for frontend TLS/DTLS handshakes before HTTP header parsing or stream proxy handling begins. `0` disables |
 
 ### Admin API
 
@@ -242,6 +243,7 @@ See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | No | — | PEM CA certificate for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` | No | `16384` | Maximum plaintext payload bytes per DTLS record |
 | `FERRUM_DTLS_RECORD_OVERHEAD_BYTES` | No | `64` | DTLS record overhead budget for per-session output buffers |
+| `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | No | `10` | Shared frontend TCP+TLS and UDP+DTLS handshake timeout. DTLS peers still in handshake count against `FERRUM_UDP_MAX_SESSIONS` until this deadline releases them |
 
 See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 

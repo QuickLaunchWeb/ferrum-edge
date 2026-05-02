@@ -15,7 +15,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
@@ -106,6 +106,7 @@ impl Http2PoolManager {
         let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
         let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let connect_started = Instant::now();
 
         let tcp = tokio::time::timeout(
             connect_timeout,
@@ -146,8 +147,28 @@ impl Http2PoolManager {
             Self::set_tcp_keepalive(&tcp, pool_config.tcp_keepalive_seconds);
         }
 
-        self.create_tls_connection(tcp, host, proxy, &pool_config)
-            .await
+        self.create_tls_connection(
+            tcp,
+            host,
+            proxy,
+            &pool_config,
+            connect_started,
+            connect_timeout,
+        )
+        .await
+    }
+
+    fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> Http2PoolError {
+        Http2PoolError::BackendTimeout {
+            message: format!(
+                "Connect timeout after {}ms during {} to {}:{}",
+                proxy.backend_connect_timeout_ms, phase, proxy.backend_host, proxy.backend_port
+            ),
+            source: Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("backend {phase} timed out"),
+            )),
+        }
     }
 
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
@@ -252,6 +273,8 @@ impl Http2PoolManager {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
+        connect_started: Instant,
+        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
@@ -265,12 +288,19 @@ impl Http2PoolManager {
             }
         })?;
 
-        let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-            Http2PoolError::BackendUnavailable {
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
+        };
+
+        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "TLS handshake"))?
+            .map_err(|e| Http2PoolError::BackendUnavailable {
                 message: format!("TLS handshake failed: {}", e),
                 source: Some(BackendUnavailableSource::Tls(e)),
-            }
-        })?;
+            })?;
 
         // Inspect negotiated ALPN. rustls 0.22+ exposes the chosen protocol
         // on the client session; `get_ref().1` is the `ClientConnection`.
@@ -287,14 +317,22 @@ impl Http2PoolManager {
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) =
-            builder
-                .handshake(io)
-                .await
-                .map_err(|e| Http2PoolError::BackendUnavailable {
-                    message: format!("h2 handshake failed: {}", e),
-                    source: Some(BackendUnavailableSource::Hyper(e)),
-                })?;
+        let Some(remaining) =
+            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        else {
+            return Err(Self::backend_connect_timeout_error(
+                proxy,
+                "HTTP/2 handshake",
+            ));
+        };
+
+        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
+            .await
+            .map_err(|_| Self::backend_connect_timeout_error(proxy, "HTTP/2 handshake"))?
+            .map_err(|e| Http2PoolError::BackendUnavailable {
+                message: format!("h2 handshake failed: {}", e),
+                source: Some(BackendUnavailableSource::Hyper(e)),
+            })?;
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {

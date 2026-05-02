@@ -20,8 +20,12 @@ use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{self, BufReader};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use tracing::{info, warn};
 use x509_parser::prelude::*;
 
@@ -30,6 +34,48 @@ use rustls::pki_types::CertificateRevocationListDer;
 
 /// Loaded CRL data shared across all TLS surfaces. Empty when no CRL file is configured.
 pub type CrlList = Arc<Vec<CertificateRevocationListDer<'static>>>;
+
+/// Accept a frontend TLS stream, optionally bounding the handshake duration.
+///
+/// The HTTP header read timeout starts only after TLS negotiation succeeds, so
+/// TLS-capable listener surfaces must enforce this earlier deadline separately.
+pub async fn accept_with_optional_timeout<S>(
+    acceptor: &TlsAcceptor,
+    stream: S,
+    timeout_secs: u64,
+    peer: &SocketAddr,
+) -> io::Result<TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let accept_fut = acceptor.accept(stream);
+    let result = if timeout_secs > 0 {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), accept_fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    "Frontend TLS handshake timed out from {} after {}s",
+                    peer.ip(),
+                    timeout_secs
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "frontend TLS handshake timed out",
+                ));
+            }
+        }
+    } else {
+        accept_fut.await
+    };
+
+    match result {
+        Ok(stream) => Ok(stream),
+        Err(e) => {
+            warn!("Frontend TLS handshake failed from {}: {}", peer.ip(), e);
+            Err(e)
+        }
+    }
+}
 
 /// Load Certificate Revocation Lists from a PEM file.
 ///
@@ -726,6 +772,34 @@ mod tests {
             .with_no_client_auth()
     }
 
+    fn new_test_server_config() -> rustls::ServerConfig {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign cert");
+
+        let cert_pem = cert.pem();
+        let mut cert_reader = cert_pem.as_bytes();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+            .filter_map(Result::ok)
+            .collect();
+        let key_pem = key_pair.serialize_pem();
+        let mut key_reader = key_pem.as_bytes();
+        let private_key = rustls_pemfile::private_key(&mut key_reader)
+            .expect("read private key")
+            .expect("private key present");
+
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)
+        .expect("server cert")
+    }
+
     #[test]
     fn apply_client_session_resumption_compiles_and_runs() {
         let mut config = new_test_client_config();
@@ -743,6 +817,33 @@ mod tests {
         };
         let mut config = new_test_client_config();
         apply_client_session_resumption(&mut config, Some(&policy));
+    }
+
+    #[tokio::test]
+    async fn accept_with_optional_timeout_times_out_idle_peer() {
+        use tokio::io::AsyncWriteExt;
+
+        let acceptor = TlsAcceptor::from(Arc::new(new_test_server_config()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect to listener");
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let (stream, peer) = listener.accept().await.expect("accept TCP");
+        let err = accept_with_optional_timeout(&acceptor, stream, 1, &peer)
+            .await
+            .expect_err("idle peer should hit TLS handshake timeout");
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        client.await.expect("client task");
     }
 
     #[test]
