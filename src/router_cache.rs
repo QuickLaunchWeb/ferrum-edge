@@ -308,14 +308,16 @@ impl RouterCache {
     /// Regex routes are compiled at build time, not per-request.
     ///
     /// `max_cache_entries == 0` is the documented "auto" sentinel
-    /// (`FERRUM_ROUTER_CACHE_MAX_ENTRIES=0`) and is resolved here to
-    /// `max(10_000, proxies.len() * 3)` so direct callers that bypass the env-var
-    /// resolution in `ProxyState::new` still get a usable cache. Without this,
+    /// (`FERRUM_ROUTER_CACHE_MAX_ENTRIES=0`) and is resolved here to the
+    /// same bounded auto value as `ProxyState::new`: `proxies.len() * 3`
+    /// clamped to `[10_000, 1_000_000]`. That keeps direct callers aligned
+    /// with production env-var resolution while still getting a usable cache.
+    /// Without this,
     /// `frequency_aware_evict`'s `max_entries / 4 == 0` short-circuit would leave
     /// the cache unbounded under load.
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
         let max_cache_entries = if max_cache_entries == 0 {
-            let resolved = (config.proxies.len() * 3).max(10_000);
+            let resolved = resolve_auto_router_cache_entries(config.proxies.len());
             debug!(
                 "Router cache max_entries=0 resolved to auto value {} (proxies={})",
                 resolved,
@@ -1143,6 +1145,10 @@ fn is_regex_proxy(proxy: &Proxy) -> bool {
         .is_some_and(|p| p.starts_with('~'))
 }
 
+fn resolve_auto_router_cache_entries(proxy_count: usize) -> usize {
+    proxy_count.saturating_mul(3).clamp(10_000, 1_000_000)
+}
+
 /// Evict entries from a DashMap using frequency-guided sampling.
 ///
 /// Samples a bounded number of entries, estimates each entry's access frequency
@@ -1580,6 +1586,12 @@ mod tests {
             max_entries, 15_000,
             "max_entries should be max(10_000, proxies*3) = 15_000"
         );
+    }
+
+    #[test]
+    fn auto_max_entries_caps_at_production_ceiling() {
+        assert_eq!(resolve_auto_router_cache_entries(333_334), 1_000_000);
+        assert_eq!(resolve_auto_router_cache_entries(usize::MAX), 1_000_000);
     }
 
     #[test]
