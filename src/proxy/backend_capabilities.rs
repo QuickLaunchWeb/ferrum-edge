@@ -644,15 +644,27 @@ mod tests {
 
         // Simulate a request-path H3 failure that downgrades H3 + stamps the error.
         registry.mark_h3_unsupported(&proxy, None);
-        let downgraded = registry.get(&proxy, None).expect("entry must exist");
+
+        // Stamp a known-old `last_probe_at_unix_secs` into the downgraded
+        // record so we can later assert the refresh advanced past it.
+        // `now_unix_secs()` resolves to whole seconds, so two calls within
+        // the same test run typically collapse to the same value — the
+        // explicit `STALE_TS = 1` sentinel makes the timestamp-advance
+        // invariant testable without sleeping for a full second.
+        const STALE_TS: u64 = 1;
+        let mut downgraded = (*registry.get(&proxy, None).expect("entry")).clone();
         assert!(
             downgraded.last_probe_error.is_some(),
             "precondition: downgrade must have stamped last_probe_error"
         );
+        downgraded.last_probe_at_unix_secs = STALE_TS;
+        registry.upsert(key.clone(), downgraded);
 
         // Simulate a successful periodic refresh: the refresh code
         // builds a fresh `BackendCapabilityRecord::default()` (whose
-        // `last_probe_error` is already None) and upserts it whole.
+        // `last_probe_error` is already None and whose
+        // `last_probe_at_unix_secs` comes from `now_unix_secs()`) and
+        // upserts it whole.
         let mut refreshed = BackendCapabilityRecord::default();
         refreshed.plain_http.h3 = ProtocolSupport::Supported;
         refreshed.plain_http.h2_tls = ProtocolSupport::Supported;
@@ -662,6 +674,16 @@ mod tests {
         assert!(
             fetched.last_probe_error.is_none(),
             "successful refresh must clear stale last_probe_error from prior downgrade"
+        );
+        // Timestamp-freshness invariant: a future refactor that mutates
+        // the existing record in place to clear the error string but
+        // forgets to update the timestamp (or vice versa) must fail this
+        // test. `> STALE_TS` is sufficient — `now_unix_secs()` is
+        // guaranteed to exceed `1` for any reasonable wall clock.
+        assert!(
+            fetched.last_probe_at_unix_secs > STALE_TS,
+            "successful refresh must advance last_probe_at_unix_secs (was {STALE_TS}, now {})",
+            fetched.last_probe_at_unix_secs,
         );
         assert_eq!(fetched.plain_http.h3, ProtocolSupport::Supported);
         assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Supported);
@@ -685,8 +707,14 @@ mod tests {
         registry.upsert(key.clone(), prior);
 
         registry.mark_h2_tls_unsupported(&proxy, None);
-        let downgraded = registry.get(&proxy, None).expect("entry must exist");
+
+        // See `successful_refresh_clears_last_probe_error_after_h3_downgrade`
+        // for the rationale behind the stale-timestamp sentinel.
+        const STALE_TS: u64 = 1;
+        let mut downgraded = (*registry.get(&proxy, None).expect("entry")).clone();
         assert!(downgraded.last_probe_error.is_some());
+        downgraded.last_probe_at_unix_secs = STALE_TS;
+        registry.upsert(key.clone(), downgraded);
 
         let mut refreshed = BackendCapabilityRecord::default();
         refreshed.plain_http.h2_tls = ProtocolSupport::Supported;
@@ -697,6 +725,11 @@ mod tests {
         assert!(
             fetched.last_probe_error.is_none(),
             "successful refresh must clear stale last_probe_error from prior H2 downgrade"
+        );
+        assert!(
+            fetched.last_probe_at_unix_secs > STALE_TS,
+            "successful refresh must advance last_probe_at_unix_secs (was {STALE_TS}, now {})",
+            fetched.last_probe_at_unix_secs,
         );
         assert_eq!(fetched.plain_http.h2_tls, ProtocolSupport::Supported);
         assert_eq!(fetched.grpc_transport.h2_tls, ProtocolSupport::Supported);
