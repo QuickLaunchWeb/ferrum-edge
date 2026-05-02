@@ -62,8 +62,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
 | `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
 | `FERRUM_DB_READ_REPLICA_URL` | Yes | Yes | No | No; use MongoDB `readPreference` |
-| `FERRUM_DB_TLS_*` legacy TLS fields | Yes | Yes | Ignored | Yes; mapped to MongoDB driver `TlsOptions` |
-| `FERRUM_DB_SSL_*` native SQL SSL fields | Yes | Yes | Ignored | Ignored; use `FERRUM_DB_TLS_*` or MongoDB URI TLS options |
+| `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | No; rejected by config validation | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
 
@@ -71,17 +70,12 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_DB_TLS_ENABLED` | No | `false` | Enable TLS for database connections |
-| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database TLS verification |
+| `FERRUM_DB_TLS_MODE` | No | — | Database TLS policy. PostgreSQL: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; MySQL: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`; MongoDB: `disable`, `require`, `verify-full` |
+| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database server verification |
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS |
-| `FERRUM_DB_TLS_INSECURE` | No | `false` | Skip certificate verification for database TLS (testing only) |
-| `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode. PostgreSQL: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; MySQL: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
-| `FERRUM_DB_SSL_ROOT_CERT` | No | — | Path to CA certificate for database server verification |
-| `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
-| `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
 
-See [database_tls.md](database_tls.md) for detailed configuration examples and SSL mode descriptions.
+See [database_tls.md](database_tls.md) for detailed configuration examples and TLS mode descriptions.
 
 ### Database Pool
 
@@ -99,7 +93,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 
 ### MongoDB
 
-These settings only apply when `FERRUM_DB_TYPE=mongodb`. The `FERRUM_DB_SSL_*` and `FERRUM_DB_POOL_*` settings are SQL-only and ignored for MongoDB.
+These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` settings are SQL-only and ignored for MongoDB.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|

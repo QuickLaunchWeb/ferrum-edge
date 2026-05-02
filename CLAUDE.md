@@ -458,7 +458,7 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 **Incremental polling** (`FERRUM_DB_POLL_INTERVAL`, default 30s): startup = full `SELECT *`; subsequent = indexed `updated_at > ?` + lightweight `SELECT id` deletion diff. 1s safety margin. Validated before apply; known IDs unchanged on reject. Auto-fallback to full reload on failure. **CP broadcasts deltas** via tokio `broadcast` (capacity = `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging DPs auto-get a full snapshot.
 
-**Failover**: `FERRUM_DB_FAILOVER_URLS` (same `FERRUM_DB_TYPE`); `FERRUM_DB_READ_REPLICA_URL` offloads polling (writes always primary). **MongoDB** (`docs/mongodb.md`): `readPreference` in URL replaces read-replica var; replica sets handle failover natively (list members in `FERRUM_DB_URL`); pool via driver (`maxPoolSize`/`minPoolSize` in URL) — `FERRUM_DB_POOL_*` ignored.
+**Failover**: `FERRUM_DB_FAILOVER_URLS` (same `FERRUM_DB_TYPE`); `FERRUM_DB_READ_REPLICA_URL` offloads polling (writes always primary). **Database TLS**: canonical envs are `FERRUM_DB_TLS_MODE` (`disable`/`allow`/`prefer`/`require`/`verify-ca`/`verify-full`) plus `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH`; MySQL rejects `allow`, MongoDB env mode supports only `disable`/`require`/`verify-full`, and SQLite rejects DB TLS settings. **MongoDB** (`docs/mongodb.md`): `readPreference` in URL replaces read-replica var; replica sets handle failover natively (list members in `FERRUM_DB_URL`); pool via driver (`maxPoolSize`/`minPoolSize` in URL) — `FERRUM_DB_POOL_*` ignored.
 
 ### Dependency Version Sync
 
@@ -484,7 +484,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)
-- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_POOL_MAX_CONNECTIONS` (32, bump for large CP)
+- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_TLS_MODE` + DB TLS cert paths; `FERRUM_DB_POOL_MAX_CONNECTIONS` (32, bump for large CP)
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)

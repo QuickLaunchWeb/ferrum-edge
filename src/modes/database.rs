@@ -62,11 +62,11 @@ pub async fn run(
                 env_config.mongo_auth_mechanism.as_deref(),
                 env_config.mongo_server_selection_timeout_seconds,
                 env_config.mongo_connect_timeout_seconds,
-                env_config.db_tls_enabled,
+                env_config.db_tls_enabled(),
                 env_config.db_tls_ca_cert_path.as_deref(),
                 env_config.db_tls_client_cert_path.as_deref(),
                 env_config.db_tls_client_key_path.as_deref(),
-                env_config.db_tls_insecure,
+                env_config.db_tls_allows_invalid_certificates(),
                 &failover_urls,
             )
             .await?;
@@ -91,11 +91,11 @@ pub async fn run(
                 db_type,
                 &effective_url,
                 &failover_urls,
-                env_config.db_tls_enabled,
-                env_config.db_tls_ca_cert_path.as_deref(),
-                env_config.db_tls_client_cert_path.as_deref(),
-                env_config.db_tls_client_key_path.as_deref(),
-                env_config.db_tls_insecure,
+                false,
+                None,
+                None,
+                None,
+                false,
                 pool_config.clone(),
             )
             .await
@@ -125,11 +125,11 @@ pub async fn run(
                             db_type,
                             &effective_url,
                             &failover_urls,
-                            env_config.db_tls_enabled,
-                            env_config.db_tls_ca_cert_path.as_deref(),
-                            env_config.db_tls_client_cert_path.as_deref(),
-                            env_config.db_tls_client_key_path.as_deref(),
-                            env_config.db_tls_insecure,
+                            false,
+                            None,
+                            None,
+                            None,
+                            false,
                             pool_config,
                         )?
                     } else {
@@ -144,14 +144,7 @@ pub async fn run(
             // Connect read replica for config polling (reduces primary load)
             if let Some(ref replica_url) = effective_replica_url {
                 match store
-                    .connect_read_replica(
-                        replica_url,
-                        env_config.db_tls_enabled,
-                        env_config.db_tls_ca_cert_path.as_deref(),
-                        env_config.db_tls_client_cert_path.as_deref(),
-                        env_config.db_tls_client_key_path.as_deref(),
-                        env_config.db_tls_insecure,
-                    )
+                    .connect_read_replica(replica_url, false, None, None, None, false)
                     .await
                 {
                     Ok(()) => info!("Read replica connected for config polling"),
@@ -712,11 +705,12 @@ pub async fn run(
     let dns_cache_for_poll = dns_cache.clone();
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
-    let db_tls_enabled = env_config.db_tls_enabled;
+    let mongo_tls_enabled = db_type == "mongodb" && env_config.db_tls_enabled();
     let db_tls_ca_cert = env_config.db_tls_ca_cert_path.clone();
     let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
     let db_tls_client_key = env_config.db_tls_client_key_path.clone();
-    let db_tls_insecure = env_config.db_tls_insecure;
+    let mongo_tls_allow_invalid =
+        db_type == "mongodb" && env_config.db_tls_allows_invalid_certificates();
     let poll_namespace = env_config.namespace.clone();
 
     let db_poll_handle = tokio::spawn(async move {
@@ -762,11 +756,11 @@ pub async fn run(
                             );
                             if let Err(e) = db_poll.reconnect(
                                 &db_url_for_reconnect,
-                                db_tls_enabled,
+                                mongo_tls_enabled,
                                 db_tls_ca_cert.as_deref(),
                                 db_tls_client_cert.as_deref(),
                                 db_tls_client_key.as_deref(),
-                                db_tls_insecure,
+                                mongo_tls_allow_invalid,
                             ).await {
                                 error!(
                                     "Failed to reconnect database pool after DNS change for '{}': {}",
@@ -799,11 +793,11 @@ pub async fn run(
                             );
                             if let Err(e) = db_poll.reconnect_read_replica(
                                 replica_url,
-                                db_tls_enabled,
+                                mongo_tls_enabled,
                                 db_tls_ca_cert.as_deref(),
                                 db_tls_client_cert.as_deref(),
                                 db_tls_client_key.as_deref(),
-                                db_tls_insecure,
+                                mongo_tls_allow_invalid,
                             ).await {
                                 error!(
                                     "Failed to reconnect read replica pool after DNS change for '{}': {}",
@@ -892,11 +886,11 @@ pub async fn run(
                                         // try failover URLs before giving up.
                                         match db_poll.try_failover_reconnect(
                                             &db_url_for_reconnect,
-                                            db_tls_enabled,
+                                            mongo_tls_enabled,
                                             db_tls_ca_cert.as_deref(),
                                             db_tls_client_cert.as_deref(),
                                             db_tls_client_key.as_deref(),
-                                            db_tls_insecure,
+                                            mongo_tls_allow_invalid,
                                         ).await {
                                             Ok(_url) => {
                                                 // Reconnected to a failover DB — try full reload

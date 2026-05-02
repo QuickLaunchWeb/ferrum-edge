@@ -75,6 +75,63 @@ impl std::fmt::Display for BackendAllowIps {
     }
 }
 
+/// Database TLS policy shared by SQL backends and MongoDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbTlsMode {
+    Disable,
+    Allow,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl DbTlsMode {
+    fn postgres_value(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Allow => "allow",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+
+    fn mysql_value(self) -> Option<&'static str> {
+        match self {
+            Self::Disable => Some("DISABLED"),
+            Self::Prefer => Some("PREFERRED"),
+            Self::Require => Some("REQUIRED"),
+            Self::VerifyCa => Some("VERIFY_CA"),
+            Self::VerifyFull => Some("VERIFY_IDENTITY"),
+            // Validation rejects PostgreSQL-only `allow` for MySQL.
+            Self::Allow => None,
+        }
+    }
+
+    pub fn enables_tls(self) -> bool {
+        !matches!(self, Self::Disable)
+    }
+
+    pub fn allows_invalid_certificates(self) -> bool {
+        matches!(self, Self::Require)
+    }
+}
+
+impl std::fmt::Display for DbTlsMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Disable => "disable",
+            Self::Allow => "allow",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        })
+    }
+}
+
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
@@ -232,23 +289,10 @@ pub struct EnvConfig {
     pub db_type: Option<String>,
     pub db_url: Option<String>,
     pub db_poll_interval: u64,
-    pub db_tls_enabled: bool,
+    pub db_tls_mode: Option<DbTlsMode>,
     pub db_tls_ca_cert_path: Option<String>,
     pub db_tls_client_cert_path: Option<String>,
     pub db_tls_client_key_path: Option<String>,
-    pub db_tls_insecure: bool,
-
-    // SQL database TLS/SSL. MongoDB ignores these and uses `FERRUM_DB_TLS_*`
-    // or MongoDB URI TLS options instead.
-    /// SSL mode for database connections (e.g., disable, prefer, require, verify-ca, verify-full;
-    /// PostgreSQL also supports allow)
-    pub db_ssl_mode: Option<String>,
-    /// Path to CA certificate for database server verification
-    pub db_ssl_root_cert: Option<String>,
-    /// Path to client certificate for database mTLS
-    pub db_ssl_client_cert: Option<String>,
-    /// Path to client private key for database mTLS
-    pub db_ssl_client_key: Option<String>,
 
     // File mode
     pub file_config_path: Option<String>,
@@ -954,15 +998,10 @@ impl Default for EnvConfig {
             db_type: None,
             db_url: None,
             db_poll_interval: 30,
-            db_tls_enabled: false,
+            db_tls_mode: None,
             db_tls_ca_cert_path: None,
             db_tls_client_cert_path: None,
             db_tls_client_key_path: None,
-            db_tls_insecure: false,
-            db_ssl_mode: None,
-            db_ssl_root_cert: None,
-            db_ssl_client_cert: None,
-            db_ssl_client_key: None,
             file_config_path: None,
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
@@ -1191,15 +1230,10 @@ impl EnvConfig {
             db_type: Option<String> = "FERRUM_DB_TYPE";
             db_url: Option<String> = "FERRUM_DB_URL";
             db_poll_interval: u64 = "FERRUM_DB_POLL_INTERVAL" => 30u64;
-            db_tls_enabled: bool = "FERRUM_DB_TLS_ENABLED" => false;
+            db_tls_mode: Option<DbTlsMode> = "FERRUM_DB_TLS_MODE";
             db_tls_ca_cert_path: Option<String> = "FERRUM_DB_TLS_CA_CERT_PATH";
             db_tls_client_cert_path: Option<String> = "FERRUM_DB_TLS_CLIENT_CERT_PATH";
             db_tls_client_key_path: Option<String> = "FERRUM_DB_TLS_CLIENT_KEY_PATH";
-            db_tls_insecure: bool = "FERRUM_DB_TLS_INSECURE" => false;
-            db_ssl_mode: Option<String> = "FERRUM_DB_SSL_MODE";
-            db_ssl_root_cert: Option<String> = "FERRUM_DB_SSL_ROOT_CERT";
-            db_ssl_client_cert: Option<String> = "FERRUM_DB_SSL_CLIENT_CERT";
-            db_ssl_client_key: Option<String> = "FERRUM_DB_SSL_CLIENT_KEY";
             file_config_path: Option<String> = "FERRUM_FILE_CONFIG_PATH";
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
@@ -1531,15 +1565,10 @@ impl EnvConfig {
             db_type,
             db_url,
             db_poll_interval,
-            db_tls_enabled,
+            db_tls_mode,
             db_tls_ca_cert_path,
             db_tls_client_cert_path,
             db_tls_client_key_path,
-            db_tls_insecure,
-            db_ssl_mode,
-            db_ssl_root_cert,
-            db_ssl_client_cert,
-            db_ssl_client_key,
             file_config_path,
             db_config_backup_path,
             db_failover_urls,
@@ -1787,229 +1816,167 @@ impl EnvConfig {
         ports
     }
 
-    /// Returns the database URL with TLS/SSL query parameters appended based on
-    /// the SQL-only `FERRUM_DB_SSL_*` environment variables. For PostgreSQL and
-    /// MySQL, the SSL settings are translated into the appropriate connection
-    /// string parameters. SQLite URLs are returned unchanged (no network TLS).
-    /// MongoDB URLs are returned unchanged because MongoDB uses `FERRUM_DB_TLS_*`
-    /// or MongoDB URI TLS options.
-    pub fn effective_db_url(&self) -> Option<String> {
-        let base_url = self.db_url.as_ref()?;
-        let db_type = self.db_type.as_deref().unwrap_or("");
+    fn append_db_tls_params_to_url(&self, base_url: &str, db_type: &str) -> String {
+        let Some(mode) = self.db_tls_mode else {
+            return base_url.to_string();
+        };
 
-        // SQLite has no network TLS
-        if db_type == "sqlite" {
-            return Some(base_url.clone());
-        }
-
-        let has_ssl_params = self.db_ssl_mode.is_some()
-            || self.db_ssl_root_cert.is_some()
-            || self.db_ssl_client_cert.is_some()
-            || self.db_ssl_client_key.is_some();
-
-        if !has_ssl_params {
-            return Some(base_url.clone());
-        }
-
-        let mut params: Vec<String> = Vec::new();
-
-        match db_type {
-            "postgres" => {
-                if let Some(ref mode) = self.db_ssl_mode {
-                    params.push(format!("sslmode={}", mode));
-                }
-                if let Some(ref cert) = self.db_ssl_root_cert {
-                    params.push(format!("sslrootcert={}", cert));
-                }
-                if let Some(ref cert) = self.db_ssl_client_cert {
-                    params.push(format!("sslcert={}", cert));
-                }
-                if let Some(ref key) = self.db_ssl_client_key {
-                    params.push(format!("sslkey={}", key));
-                }
-            }
-            "mysql" => {
-                if let Some(ref mode) = self.db_ssl_mode {
-                    // MySQL uses uppercase mode values
-                    let mysql_mode = match mode.as_str() {
-                        "disable" => "DISABLED",
-                        "prefer" => "PREFERRED",
-                        "require" => "REQUIRED",
-                        "verify-ca" => "VERIFY_CA",
-                        "verify-full" => "VERIFY_IDENTITY",
-                        other => other,
-                    };
-                    params.push(format!("ssl-mode={}", mysql_mode));
-                }
-                if let Some(ref cert) = self.db_ssl_root_cert {
-                    params.push(format!("ssl-ca={}", cert));
-                }
-                if let Some(ref cert) = self.db_ssl_client_cert {
-                    params.push(format!("ssl-cert={}", cert));
-                }
-                if let Some(ref key) = self.db_ssl_client_key {
-                    params.push(format!("ssl-key={}", key));
-                }
-            }
-            _ => {
-                return Some(base_url.clone());
-            }
-        }
+        let Some(params) = self.db_tls_params(db_type, mode) else {
+            return base_url.to_string();
+        };
 
         if params.is_empty() {
-            return Some(base_url.clone());
+            return base_url.to_string();
         }
 
         let separator = if base_url.contains('?') { "&" } else { "?" };
-        Some(format!("{}{}{}", base_url, separator, params.join("&")))
+        format!("{}{}{}", base_url, separator, params.join("&"))
     }
 
-    /// Returns the read replica URL with TLS/SSL query parameters appended,
+    fn db_tls_params(&self, db_type: &str, mode: DbTlsMode) -> Option<Vec<String>> {
+        let mut params = Vec::new();
+
+        match db_type {
+            "postgres" => {
+                params.push(format!("sslmode={}", mode.postgres_value()));
+                if mode.enables_tls() {
+                    if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
+                        && let Some(ref cert) = self.db_tls_ca_cert_path
+                    {
+                        params.push(format!("sslrootcert={}", cert));
+                    }
+                    if let Some(ref cert) = self.db_tls_client_cert_path {
+                        params.push(format!("sslcert={}", cert));
+                    }
+                    if let Some(ref key) = self.db_tls_client_key_path {
+                        params.push(format!("sslkey={}", key));
+                    }
+                }
+            }
+            "mysql" => {
+                let mysql_mode = mode.mysql_value()?;
+                params.push(format!("ssl-mode={}", mysql_mode));
+                if mode.enables_tls() {
+                    if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
+                        && let Some(ref cert) = self.db_tls_ca_cert_path
+                    {
+                        params.push(format!("ssl-ca={}", cert));
+                    }
+                    if let Some(ref cert) = self.db_tls_client_cert_path {
+                        params.push(format!("ssl-cert={}", cert));
+                    }
+                    if let Some(ref key) = self.db_tls_client_key_path {
+                        params.push(format!("ssl-key={}", key));
+                    }
+                }
+            }
+            _ => return None,
+        }
+
+        Some(params)
+    }
+
+    pub fn db_tls_enabled(&self) -> bool {
+        self.db_tls_mode.is_some_and(DbTlsMode::enables_tls)
+    }
+
+    pub fn db_tls_allows_invalid_certificates(&self) -> bool {
+        self.db_tls_mode
+            .is_some_and(DbTlsMode::allows_invalid_certificates)
+    }
+
+    /// Returns the database URL with canonical `FERRUM_DB_TLS_*` query
+    /// parameters appended for PostgreSQL and MySQL. SQLite and MongoDB URLs are
+    /// returned unchanged: SQLite has no network TLS, and MongoDB uses driver
+    /// `TlsOptions` or MongoDB URI TLS options.
+    pub fn effective_db_url(&self) -> Option<String> {
+        let base_url = self.db_url.as_ref()?;
+        let db_type = self.db_type.as_deref().unwrap_or("");
+        Some(self.append_db_tls_params_to_url(base_url, db_type))
+    }
+
+    /// Returns the read replica URL with database TLS query parameters appended,
     /// using the same logic as `effective_db_url()`.
     pub fn effective_db_read_replica_url(&self) -> Option<String> {
         let base_url = self.db_read_replica_url.as_ref()?;
         let db_type = self.db_type.as_deref().unwrap_or("");
-
-        // SQLite has no network TLS
-        if db_type == "sqlite" {
-            return Some(base_url.clone());
-        }
-
-        let has_ssl_params = self.db_ssl_mode.is_some()
-            || self.db_ssl_root_cert.is_some()
-            || self.db_ssl_client_cert.is_some()
-            || self.db_ssl_client_key.is_some();
-
-        if !has_ssl_params {
-            return Some(base_url.clone());
-        }
-
-        let mut params: Vec<String> = Vec::new();
-
-        match db_type {
-            "postgres" => {
-                if let Some(ref mode) = self.db_ssl_mode {
-                    params.push(format!("sslmode={}", mode));
-                }
-                if let Some(ref cert) = self.db_ssl_root_cert {
-                    params.push(format!("sslrootcert={}", cert));
-                }
-                if let Some(ref cert) = self.db_ssl_client_cert {
-                    params.push(format!("sslcert={}", cert));
-                }
-                if let Some(ref key) = self.db_ssl_client_key {
-                    params.push(format!("sslkey={}", key));
-                }
-            }
-            "mysql" => {
-                if let Some(ref mode) = self.db_ssl_mode {
-                    let mysql_mode = match mode.as_str() {
-                        "disable" => "DISABLED",
-                        "prefer" => "PREFERRED",
-                        "require" => "REQUIRED",
-                        "verify-ca" => "VERIFY_CA",
-                        "verify-full" => "VERIFY_IDENTITY",
-                        other => other,
-                    };
-                    params.push(format!("ssl-mode={}", mysql_mode));
-                }
-                if let Some(ref cert) = self.db_ssl_root_cert {
-                    params.push(format!("ssl-ca={}", cert));
-                }
-                if let Some(ref cert) = self.db_ssl_client_cert {
-                    params.push(format!("ssl-cert={}", cert));
-                }
-                if let Some(ref key) = self.db_ssl_client_key {
-                    params.push(format!("ssl-key={}", key));
-                }
-            }
-            _ => {
-                return Some(base_url.clone());
-            }
-        }
-
-        if params.is_empty() {
-            return Some(base_url.clone());
-        }
-
-        let separator = if base_url.contains('?') { "&" } else { "?" };
-        Some(format!("{}{}{}", base_url, separator, params.join("&")))
+        Some(self.append_db_tls_params_to_url(base_url, db_type))
     }
 
-    /// Returns the failover database URLs with TLS/SSL query parameters appended,
+    /// Returns the failover database URLs with database TLS query parameters appended,
     /// using the same logic as `effective_db_url()`.
     pub fn effective_db_failover_urls(&self) -> Vec<String> {
         let db_type = self.db_type.as_deref().unwrap_or("");
 
         self.db_failover_urls
             .iter()
-            .map(|base_url| {
-                // SQLite has no network TLS
-                if db_type == "sqlite" {
-                    return base_url.clone();
-                }
-
-                let has_ssl_params = self.db_ssl_mode.is_some()
-                    || self.db_ssl_root_cert.is_some()
-                    || self.db_ssl_client_cert.is_some()
-                    || self.db_ssl_client_key.is_some();
-
-                if !has_ssl_params {
-                    return base_url.clone();
-                }
-
-                let mut params: Vec<String> = Vec::new();
-
-                match db_type {
-                    "postgres" => {
-                        if let Some(ref mode) = self.db_ssl_mode {
-                            params.push(format!("sslmode={}", mode));
-                        }
-                        if let Some(ref cert) = self.db_ssl_root_cert {
-                            params.push(format!("sslrootcert={}", cert));
-                        }
-                        if let Some(ref cert) = self.db_ssl_client_cert {
-                            params.push(format!("sslcert={}", cert));
-                        }
-                        if let Some(ref key) = self.db_ssl_client_key {
-                            params.push(format!("sslkey={}", key));
-                        }
-                    }
-                    "mysql" => {
-                        if let Some(ref mode) = self.db_ssl_mode {
-                            let mysql_mode = match mode.as_str() {
-                                "disable" => "DISABLED",
-                                "prefer" => "PREFERRED",
-                                "require" => "REQUIRED",
-                                "verify-ca" => "VERIFY_CA",
-                                "verify-full" => "VERIFY_IDENTITY",
-                                other => other,
-                            };
-                            params.push(format!("ssl-mode={}", mysql_mode));
-                        }
-                        if let Some(ref cert) = self.db_ssl_root_cert {
-                            params.push(format!("ssl-ca={}", cert));
-                        }
-                        if let Some(ref cert) = self.db_ssl_client_cert {
-                            params.push(format!("ssl-cert={}", cert));
-                        }
-                        if let Some(ref key) = self.db_ssl_client_key {
-                            params.push(format!("ssl-key={}", key));
-                        }
-                    }
-                    _ => {
-                        return base_url.clone();
-                    }
-                }
-
-                if params.is_empty() {
-                    return base_url.clone();
-                }
-
-                let separator = if base_url.contains('?') { "&" } else { "?" };
-                format!("{}{}{}", base_url, separator, params.join("&"))
-            })
+            .map(|base_url| self.append_db_tls_params_to_url(base_url, db_type))
             .collect()
+    }
+
+    fn validate_db_tls_config(&self) -> Result<(), String> {
+        let Some(db_type) = self.db_type.as_deref() else {
+            return Ok(());
+        };
+
+        let has_tls_material = self.db_tls_ca_cert_path.is_some()
+            || self.db_tls_client_cert_path.is_some()
+            || self.db_tls_client_key_path.is_some();
+
+        let Some(mode) = self.db_tls_mode else {
+            if has_tls_material {
+                return Err(
+                    "FERRUM_DB_TLS_MODE is required when database TLS certificate paths are set"
+                        .into(),
+                );
+            }
+            return Ok(());
+        };
+
+        if matches!(mode, DbTlsMode::Disable) && has_tls_material {
+            return Err(
+                "FERRUM_DB_TLS_* certificate paths cannot be set when FERRUM_DB_TLS_MODE=disable"
+                    .into(),
+            );
+        }
+
+        match db_type {
+            "postgres" => {}
+            "mysql" => {
+                if matches!(mode, DbTlsMode::Allow) {
+                    return Err(
+                        "FERRUM_DB_TLS_MODE=allow is PostgreSQL-only; MySQL supports disable, prefer, require, verify-ca, verify-full"
+                            .into(),
+                    );
+                }
+            }
+            "mongodb" => {
+                if matches!(
+                    mode,
+                    DbTlsMode::Allow | DbTlsMode::Prefer | DbTlsMode::VerifyCa
+                ) {
+                    return Err(
+                        "MongoDB supports FERRUM_DB_TLS_MODE values: disable, require, verify-full. Use MongoDB URI TLS options for more specialized policies"
+                            .into(),
+                    );
+                }
+            }
+            "sqlite" => {
+                return Err("Database TLS settings are not valid when FERRUM_DB_TYPE=sqlite; SQLite has no network TLS".into());
+            }
+            _ => {}
+        }
+
+        if self.db_tls_ca_cert_path.is_some()
+            && !matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
+        {
+            return Err(
+                "FERRUM_DB_TLS_CA_CERT_PATH requires FERRUM_DB_TLS_MODE=verify-ca or verify-full"
+                    .into(),
+            );
+        }
+
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -2069,6 +2036,8 @@ impl EnvConfig {
                 }
             }
         }
+
+        self.validate_db_tls_config()?;
 
         // Validate namespace
         crate::config::types::validate_namespace(&self.namespace)

@@ -88,32 +88,28 @@ impl DbTlsTestHarness {
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
         let mut extra_env = Vec::new();
         if self.db_type != "sqlite" {
-            extra_env.push(("FERRUM_DB_SSL_MODE".to_string(), ssl_mode.to_string()));
-            extra_env.push(("FERRUM_DB_SSL_ROOT_CERT".to_string(), ca_cert_path));
+            extra_env.push(("FERRUM_DB_TLS_MODE".to_string(), ssl_mode.to_string()));
+            extra_env.push(("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path));
         }
         self.start_gateway_with_envs(db_url, extra_env).await
     }
 
-    /// Start the gateway with the legacy TLS approach, with retry for ephemeral port races.
-    async fn start_gateway_legacy_tls(
+    /// Start the gateway with canonical database TLS settings, with retry for ephemeral port races.
+    async fn start_gateway_tls_mode(
         &mut self,
         db_url: &str,
         cert_dir: &str,
         insecure: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
-        self.start_gateway_with_envs(
-            db_url,
-            vec![
-                ("FERRUM_DB_TLS_ENABLED".to_string(), "true".to_string()),
-                ("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path),
-                (
-                    "FERRUM_DB_TLS_INSECURE".to_string(),
-                    if insecure { "true" } else { "false" }.to_string(),
-                ),
-            ],
-        )
-        .await
+        let mut envs = vec![(
+            "FERRUM_DB_TLS_MODE".to_string(),
+            if insecure { "require" } else { "verify-full" }.to_string(),
+        )];
+        if !insecure {
+            envs.push(("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path));
+        }
+        self.start_gateway_with_envs(db_url, envs).await
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
@@ -477,7 +473,7 @@ async fn run_crud_and_proxy_tests(
 #[tokio::test]
 #[ignore]
 async fn test_postgresql_tls_verify_full() {
-    println!("\n=== PostgreSQL TLS (verify-full via FERRUM_DB_SSL_*) ===\n");
+    println!("\n=== PostgreSQL TLS (verify-full via FERRUM_DB_TLS_MODE) ===\n");
 
     if !is_container_running("ferrum-test-pg-tls") {
         println!("SKIPPED: ferrum-test-pg-tls container not running.");
@@ -572,8 +568,8 @@ async fn test_postgresql_tls_require() {
 
 #[tokio::test]
 #[ignore]
-async fn test_postgresql_tls_legacy_insecure() {
-    println!("\n=== PostgreSQL TLS (legacy FERRUM_DB_TLS_* with insecure=true) ===\n");
+async fn test_postgresql_tls_require_mode() {
+    println!("\n=== PostgreSQL TLS (require via FERRUM_DB_TLS_MODE) ===\n");
 
     if !is_container_running("ferrum-test-pg-tls") {
         println!("SKIPPED: ferrum-test-pg-tls container not running.");
@@ -595,15 +591,15 @@ async fn test_postgresql_tls_legacy_insecure() {
     let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
 
     harness
-        .start_gateway_legacy_tls(db_url, &cert_dir(), true)
+        .start_gateway_tls_mode(db_url, &cert_dir(), true)
         .await
-        .expect("Failed to start gateway with PostgreSQL legacy TLS");
+        .expect("Failed to start gateway with PostgreSQL require TLS mode");
 
     let token = harness.generate_token().unwrap();
     let auth = format!("Bearer {}", token);
 
     run_crud_and_proxy_tests(
-        "PostgreSQL/legacy-insecure",
+        "PostgreSQL/require",
         &harness.admin_base_url,
         &harness.proxy_base_url,
         &auth,
@@ -611,7 +607,7 @@ async fn test_postgresql_tls_legacy_insecure() {
     )
     .await;
 
-    println!("\n=== PostgreSQL TLS (legacy insecure) PASSED ===\n");
+    println!("\n=== PostgreSQL TLS (require mode) PASSED ===\n");
 }
 
 // ============================================================================
@@ -621,7 +617,7 @@ async fn test_postgresql_tls_legacy_insecure() {
 #[tokio::test]
 #[ignore]
 async fn test_mysql_tls_verify_identity() {
-    println!("\n=== MySQL TLS (verify-full → VERIFY_IDENTITY via FERRUM_DB_SSL_*) ===\n");
+    println!("\n=== MySQL TLS (verify-full -> VERIFY_IDENTITY via FERRUM_DB_TLS_MODE) ===\n");
 
     if !is_container_running("ferrum-test-mysql-tls") {
         println!("SKIPPED: ferrum-test-mysql-tls container not running.");
@@ -672,7 +668,7 @@ async fn test_mysql_tls_verify_identity() {
 #[tokio::test]
 #[ignore]
 async fn test_mysql_tls_required() {
-    println!("\n=== MySQL TLS (require → REQUIRED via FERRUM_DB_SSL_*) ===\n");
+    println!("\n=== MySQL TLS (require -> REQUIRED via FERRUM_DB_TLS_MODE) ===\n");
 
     if !is_container_running("ferrum-test-mysql-tls") {
         println!("SKIPPED: ferrum-test-mysql-tls container not running.");
@@ -715,8 +711,8 @@ async fn test_mysql_tls_required() {
 
 #[tokio::test]
 #[ignore]
-async fn test_mysql_tls_legacy_insecure() {
-    println!("\n=== MySQL TLS (legacy FERRUM_DB_TLS_* with insecure=true) ===\n");
+async fn test_mysql_tls_require_mode() {
+    println!("\n=== MySQL TLS (require via FERRUM_DB_TLS_MODE) ===\n");
 
     if !is_container_running("ferrum-test-mysql-tls") {
         println!("SKIPPED: ferrum-test-mysql-tls container not running.");
@@ -738,15 +734,15 @@ async fn test_mysql_tls_legacy_insecure() {
     let db_url = "mysql://ferrum:test-password@localhost:13306/ferrum";
 
     harness
-        .start_gateway_legacy_tls(db_url, &cert_dir(), true)
+        .start_gateway_tls_mode(db_url, &cert_dir(), true)
         .await
-        .expect("Failed to start gateway with MySQL legacy TLS");
+        .expect("Failed to start gateway with MySQL require TLS mode");
 
     let token = harness.generate_token().unwrap();
     let auth = format!("Bearer {}", token);
 
     run_crud_and_proxy_tests(
-        "MySQL/legacy-insecure",
+        "MySQL/require",
         &harness.admin_base_url,
         &harness.proxy_base_url,
         &auth,
@@ -754,17 +750,17 @@ async fn test_mysql_tls_legacy_insecure() {
     )
     .await;
 
-    println!("\n=== MySQL TLS (legacy insecure) PASSED ===\n");
+    println!("\n=== MySQL TLS (require mode) PASSED ===\n");
 }
 
 // ============================================================================
-// SQLite Test (no network TLS — verifies TLS params are harmlessly ignored)
+// SQLite Test (no network TLS)
 // ============================================================================
 
 #[tokio::test]
 #[ignore]
-async fn test_sqlite_ignores_tls_settings() {
-    println!("\n=== SQLite (TLS settings are harmlessly ignored) ===\n");
+async fn test_sqlite_without_tls_settings() {
+    println!("\n=== SQLite (no database TLS settings) ===\n");
 
     let mut harness = DbTlsTestHarness::new("sqlite")
         .await
@@ -780,26 +776,17 @@ async fn test_sqlite_ignores_tls_settings() {
     let db_path = harness.temp_dir.path().join("test.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    // Start with SSL env vars set — they should be ignored for SQLite
+    // SQLite has no network TLS; the gateway should start without DB TLS settings.
     harness
-        .start_gateway_with_envs(
-            &db_url,
-            vec![
-                ("FERRUM_DB_SSL_MODE".to_string(), "verify-full".to_string()),
-                (
-                    "FERRUM_DB_SSL_ROOT_CERT".to_string(),
-                    "/nonexistent/ca.crt".to_string(),
-                ),
-            ],
-        )
+        .start_gateway_with_envs(&db_url, Vec::new())
         .await
-        .expect("Gateway should start fine even with SSL vars set for SQLite");
+        .expect("Gateway should start fine with SQLite and no DB TLS settings");
 
     let token = harness.generate_token().unwrap();
     let auth = format!("Bearer {}", token);
 
     run_crud_and_proxy_tests(
-        "SQLite/tls-ignored",
+        "SQLite/no-tls",
         &harness.admin_base_url,
         &harness.proxy_base_url,
         &auth,
@@ -807,7 +794,7 @@ async fn test_sqlite_ignores_tls_settings() {
     )
     .await;
 
-    println!("\n=== SQLite (TLS ignored) PASSED ===\n");
+    println!("\n=== SQLite (no database TLS settings) PASSED ===\n");
 }
 
 // ============================================================================

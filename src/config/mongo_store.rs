@@ -61,12 +61,11 @@ mod inner {
         /// `mongodb://[username:password@]host[:port]/[database][?options]`
         ///
         /// **TLS/mTLS configuration**: When `tls_enabled` is true, TLS is configured
-        /// programmatically via `TlsOptions` using the existing `FERRUM_DB_TLS_*`
-        /// env vars:
+        /// programmatically via `TlsOptions` using the canonical database TLS env vars:
         /// - `FERRUM_DB_TLS_CA_CERT_PATH` → `TlsOptions::ca_file_path`
         /// - `FERRUM_DB_TLS_CLIENT_CERT_PATH` → Combined with key into a temp PEM
         ///   for `TlsOptions::cert_key_file_path` (MongoDB requires a single file)
-        /// - `FERRUM_DB_TLS_INSECURE` → `TlsOptions::allow_invalid_certificates`
+        /// - `FERRUM_DB_TLS_MODE=require` → `TlsOptions::allow_invalid_certificates`
         ///
         /// TLS can also be configured directly via connection string options
         /// (`tls=true&tlsCAFile=...`), which takes precedence over the programmatic
@@ -106,7 +105,7 @@ mod inner {
                 Some(Duration::from_secs(server_selection_timeout_secs));
             client_options.connect_timeout = Some(Duration::from_secs(connect_timeout_secs));
 
-            // Configure TLS via the existing FERRUM_DB_TLS_* env vars.
+            // Configure TLS via the canonical database TLS env vars.
             // Only set programmatic TLS if the connection string doesn't already
             // include TLS options (connection string takes precedence).
             if tls_enabled && client_options.tls.is_none() {

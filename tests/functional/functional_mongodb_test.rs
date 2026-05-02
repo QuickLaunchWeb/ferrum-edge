@@ -206,8 +206,9 @@ impl MongoTestHarness {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let binary_path = find_binary()?;
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
-
-        let child = Command::new(binary_path)
+        let tls_mode = if insecure { "require" } else { "verify-full" };
+        let mut command = Command::new(binary_path);
+        command
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
@@ -218,12 +219,12 @@ impl MongoTestHarness {
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
-            .env("FERRUM_DB_TLS_ENABLED", "true")
-            .env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path)
-            .env(
-                "FERRUM_DB_TLS_INSECURE",
-                if insecure { "true" } else { "false" },
-            )
+            .env("FERRUM_DB_TLS_MODE", tls_mode);
+        if !insecure {
+            command.env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path);
+        }
+
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -294,7 +295,7 @@ impl MongoTestHarness {
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
-            .env("FERRUM_DB_TLS_ENABLED", "true")
+            .env("FERRUM_DB_TLS_MODE", "verify-full")
             .env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path)
             .env("FERRUM_DB_TLS_CLIENT_CERT_PATH", &client_cert_path)
             .env("FERRUM_DB_TLS_CLIENT_KEY_PATH", &client_key_path)

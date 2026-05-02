@@ -54,15 +54,10 @@ fn create_test_env_config() -> EnvConfig {
         db_type: Some("sqlite".into()),
         db_url: None,
         db_poll_interval: 5,
-        db_tls_enabled: false,
+        db_tls_mode: None,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,
         db_tls_client_key_path: None,
-        db_tls_insecure: false,
-        db_ssl_mode: None,
-        db_ssl_root_cert: None,
-        db_ssl_client_cert: None,
-        db_ssl_client_key: None,
         file_config_path: Some("/tmp/test-config.json".into()),
         db_config_backup_path: None,
         db_failover_urls: Vec::new(),
@@ -360,8 +355,8 @@ async fn test_cp_dp_grpc_config_sync() {
 
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_database_connection_with_tls_config() {
-    println!("Starting database connection test with TLS config...");
+async fn test_database_connection_with_sqlite_config() {
+    println!("Starting database connection test with SQLite config...");
 
     let temp_dir = std::env::temp_dir();
     let db_path = temp_dir.join(format!("ferrum_test_tls_{}.db", uuid::Uuid::new_v4()));
@@ -412,58 +407,10 @@ async fn test_database_connection_with_tls_config() {
     assert_eq!(config.proxies[0].id, "db-test-proxy");
     println!("Config loading verification: PASSED");
 
-    // Test 4: Test TLS config parameters (they should be accepted even if not used for SQLite)
-    println!("Test 4: Database connection with TLS parameters (SQLite ignores TLS)...");
-    let db_with_tls = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        true,
-        Some("/path/to/ca.pem"),
-        Some("/path/to/client.pem"),
-        Some("/path/to/client-key.pem"),
-        false,
-        DbPoolConfig::default(),
-    )
-    .await
-    .expect("Failed to connect with TLS parameters");
-
-    let config = db_with_tls
-        .load_full_config("ferrum")
-        .await
-        .expect("Failed to load config with TLS params");
-    assert_eq!(
-        config.proxies.len(),
-        1,
-        "Should still have the created proxy"
-    );
-    println!("TLS parameters acceptance: PASSED");
-
-    // Test 5: Test TLS insecure mode
-    println!("Test 5: Database connection with TLS insecure mode...");
-    let db_insecure = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        true,
-        None,
-        None,
-        None,
-        true,
-        DbPoolConfig::default(),
-    )
-    .await
-    .expect("Failed to connect with TLS insecure");
-
-    let config = db_insecure
-        .load_full_config("ferrum")
-        .await
-        .expect("Failed to load config with insecure TLS");
-    assert_eq!(config.proxies.len(), 1);
-    println!("TLS insecure mode: PASSED");
-
     // Clean up
     let _ = fs::remove_file(&db_path);
 
-    println!("Database connection with TLS config test PASSED");
+    println!("Database connection with SQLite config test PASSED");
 }
 
 #[ignore]
@@ -473,10 +420,10 @@ async fn test_env_config_tls_fields() {
 
     let config = create_test_env_config();
 
-    // Verify all TLS fields are present
+    // Verify all database TLS fields are present
     assert!(
-        !config.db_tls_enabled,
-        "db_tls_enabled should default to false"
+        config.db_tls_mode.is_none(),
+        "db_tls_mode should default to None"
     );
     assert!(
         config.db_tls_ca_cert_path.is_none(),
@@ -490,11 +437,6 @@ async fn test_env_config_tls_fields() {
         config.db_tls_client_key_path.is_none(),
         "db_tls_client_key_path should be None"
     );
-    assert!(
-        !config.db_tls_insecure,
-        "db_tls_insecure should default to false"
-    );
-
     println!("All TLS fields present in EnvConfig");
     println!("EnvConfig TLS fields test PASSED");
 }
