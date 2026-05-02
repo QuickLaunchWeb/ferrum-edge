@@ -77,7 +77,17 @@ This optimization **only activates when no plugins require response body bufferi
 
 ### Response Body Coalescing
 
-For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses coalescing adapters that accumulate small backend chunks into 128 KB frames before yielding to hyper's HTTP encoder. `CoalescingBody` handles reqwest-backed HTTP/1.1 responses, while `CoalescingH2Body` handles hyper HTTP/2 `Incoming` bodies (gRPC streaming and HTTP/2 direct pool paths). This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually. The H2 adapter is trailer-safe — gRPC trailers are stashed while buffered data is flushed, then returned on the next poll.
+For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses coalescing adapters that accumulate small backend chunks into larger frames before yielding to hyper's HTTP encoder. `CoalescingBody` handles reqwest-backed HTTP/1.1 responses, while `CoalescingH2Body` handles hyper HTTP/2 `Incoming` bodies (gRPC streaming and HTTP/2 direct pool paths). This reduces the number of write syscalls by ~8-16x for large responses compared to forwarding each small chunk individually. The H2 adapter is trailer-safe: gRPC trailers are stashed while buffered data is flushed, then returned on the next poll.
+
+Direct HTTP/2 responses have a narrow large-response bypass to avoid a copy when coalescing cannot help:
+
+- `Content-Length` must be present, so the gateway can make the decision once before streaming.
+- The response must fit within `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, or that limit must be disabled.
+- The body must be at least 512 KiB. At that size, direct-H2 backend frames are already large enough that coalescing adds a copy before the existing large-frame fast path returns the original frame.
+
+Unknown-size responses keep the coalescer because it is also the streaming size-enforcement path when `Content-Length` is absent. Small and mid-sized known responses below 512 KiB also keep the coalescer because they may arrive as multiple smaller backend DATA frames where write amortization still helps.
+
+gRPC streaming responses intentionally stay on `CoalescingH2Body`; preserving trailers and large-payload batching matters more there.
 
 ### Decision Flow
 

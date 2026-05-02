@@ -203,7 +203,6 @@ start_gateway() {
         FERRUM_HTTP3_STREAM_RECEIVE_WINDOW=8388608
         FERRUM_HTTP3_RECEIVE_WINDOW=33554432
         FERRUM_HTTP3_SEND_WINDOW=8388608
-        FERRUM_HTTP3_CONNECTIONS_PER_BACKEND=8
         FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS=120
         # UDP tuning
         FERRUM_UDP_MAX_SESSIONS=10000
@@ -223,6 +222,12 @@ start_gateway() {
     # Append extra env vars (space separated KEY=VALUE pairs)
     if [ -n "$extra_env" ]; then
         for kv in $extra_env; do
+            env_cmd+=("$kv")
+        done
+    fi
+    # Optional caller-supplied env var injection for one-off tuning experiments.
+    if [ -n "${FERRUM_EXTRA_ENV:-}" ]; then
+        for kv in $FERRUM_EXTRA_ENV; do
             env_cmd+=("$kv")
         done
     fi
