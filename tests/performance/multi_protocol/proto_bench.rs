@@ -135,6 +135,78 @@ async fn collect_results(
     combined
 }
 
+fn record_http_echo_result(
+    metrics: &mut BenchMetrics,
+    protocol: &str,
+    status: http::StatusCode,
+    body_len: usize,
+    expected_len: usize,
+    body_matches: bool,
+    latency_us: u64,
+) -> bool {
+    if status != http::StatusCode::OK {
+        eprintln!("  {protocol} unexpected status {status} (body {body_len} bytes)");
+        metrics.record_error();
+        return false;
+    }
+
+    record_echo_match(
+        metrics,
+        protocol,
+        body_len,
+        expected_len,
+        body_matches,
+        latency_us,
+    )
+}
+
+fn record_echo_result(
+    metrics: &mut BenchMetrics,
+    protocol: &str,
+    actual: &[u8],
+    expected: &[u8],
+    latency_us: u64,
+) -> bool {
+    record_echo_match(
+        metrics,
+        protocol,
+        actual.len(),
+        expected.len(),
+        actual == expected,
+        latency_us,
+    )
+}
+
+fn record_echo_match(
+    metrics: &mut BenchMetrics,
+    protocol: &str,
+    body_len: usize,
+    expected_len: usize,
+    body_matches: bool,
+    latency_us: u64,
+) -> bool {
+    if body_len != expected_len {
+        eprintln!(
+            "  {protocol} echo length mismatch: got {body_len} bytes, expected {expected_len}"
+        );
+        metrics.record_error();
+        return false;
+    }
+    if !body_matches {
+        eprintln!("  {protocol} echo payload mismatch: {body_len} bytes had wrong content");
+        metrics.record_error();
+        return false;
+    }
+    metrics.record(latency_us, body_len);
+    true
+}
+
+fn make_payload(size: usize) -> Vec<u8> {
+    (0..size)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(0xAB))
+        .collect()
+}
+
 // ── HTTP/1.1 ─────────────────────────────────────────────────────────────────
 
 async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
@@ -163,7 +235,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let protocol_label = if is_tls { "HTTP/1.1+TLS" } else { "HTTP/1.1" };
-    let payload = Bytes::from(vec![0xABu8; args.payload_size]);
+    let payload = Bytes::from(make_payload(args.payload_size));
 
     let mut handles = Vec::new();
     for _ in 0..args.concurrency {
@@ -221,11 +293,22 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                 match send_req.send_request(req).await {
                     Ok(resp) => {
                         use http_body_util::BodyExt;
+                        let status = resp.status();
                         match resp.into_body().collect().await {
                             Ok(body) => {
                                 let bytes = body.to_bytes();
                                 let latency = start.elapsed().as_micros() as u64;
-                                metrics.record(latency, bytes.len());
+                                if !record_http_echo_result(
+                                    &mut metrics,
+                                    protocol_label,
+                                    status,
+                                    bytes.len(),
+                                    payload.len(),
+                                    bytes.as_ref() == payload.as_ref(),
+                                    latency,
+                                ) {
+                                    break;
+                                }
                             }
                             Err(_) => metrics.record_error(),
                         }
@@ -360,7 +443,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         senders.push(send_req);
     }
 
-    let payload = Bytes::from(vec![0xABu8; args.payload_size]);
+    let payload = Bytes::from(make_payload(args.payload_size));
 
     // Distribute concurrent tasks across the connection pool.
     // hyper's http2 SendRequest is Clone and supports concurrent streams.
@@ -377,14 +460,27 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
-                    Ok(resp) => match resp.into_body().collect().await {
-                        Ok(body) => {
-                            let bytes = body.to_bytes();
-                            let latency = start.elapsed().as_micros() as u64;
-                            metrics.record(latency, bytes.len());
+                    Ok(resp) => {
+                        let status = resp.status();
+                        match resp.into_body().collect().await {
+                            Ok(body) => {
+                                let bytes = body.to_bytes();
+                                let latency = start.elapsed().as_micros() as u64;
+                                if !record_http_echo_result(
+                                    &mut metrics,
+                                    "HTTP/2",
+                                    status,
+                                    bytes.len(),
+                                    payload.len(),
+                                    bytes.as_ref() == payload.as_ref(),
+                                    latency,
+                                ) {
+                                    break;
+                                }
+                            }
+                            Err(_) => metrics.record_error(),
                         }
-                        Err(_) => metrics.record_error(),
-                    },
+                    }
                     Err(_) => {
                         metrics.record_error();
                         break;
@@ -449,7 +545,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         senders.push(send_req);
     }
 
-    let payload = Bytes::from(vec![0xABu8; args.payload_size]);
+    let payload = Bytes::from(make_payload(args.payload_size));
 
     // Distribute concurrent tasks across the connection pool
     let mut handles = Vec::new();
@@ -476,16 +572,27 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                         let _ = stream.finish().await;
                         match stream.recv_response().await {
                             Ok(resp) => {
-                                let expected_len = resp
-                                    .headers()
-                                    .get("content-length")
-                                    .and_then(|v| v.to_str().ok())
-                                    .and_then(|v| v.parse::<usize>().ok());
+                                let status = resp.status();
                                 let mut body_bytes = 0usize;
+                                let mut body_matches = true;
                                 let mut recv_err: Option<String> = None;
                                 loop {
                                     match stream.recv_data().await {
-                                        Ok(Some(chunk)) => body_bytes += chunk.remaining(),
+                                        Ok(Some(mut chunk)) => {
+                                            let chunk_len = chunk.remaining();
+                                            if body_matches {
+                                                if body_bytes + chunk_len > payload.len() {
+                                                    body_matches = false;
+                                                } else {
+                                                    let chunk_bytes =
+                                                        chunk.copy_to_bytes(chunk_len);
+                                                    let expected = &payload
+                                                        [body_bytes..body_bytes + chunk_len];
+                                                    body_matches = chunk_bytes.as_ref() == expected;
+                                                }
+                                            }
+                                            body_bytes += chunk_len;
+                                        }
                                         Ok(None) => break,
                                         Err(e) => {
                                             recv_err = Some(e.to_string());
@@ -494,26 +601,31 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(e) = recv_err {
-                                    let expected = expected_len.unwrap_or(payload.len());
                                     eprintln!(
                                         "  h3 recv_data error after {} bytes (expected {}): {}",
-                                        body_bytes, expected, e
+                                        body_bytes,
+                                        payload.len(),
+                                        e
                                     );
+                                    // Treat H3 receive errors like H1/H2
+                                    // connection-level failures: retire this
+                                    // worker because the pooled QUIC connection
+                                    // may be wedged.
                                     metrics.record_error();
-                                } else if let Some(cl) = expected_len {
-                                    if body_bytes != cl {
-                                        eprintln!(
-                                            "  h3 truncated response: got {} bytes, content-length {}",
-                                            body_bytes, cl
-                                        );
-                                        metrics.record_error();
-                                    } else {
-                                        let latency = start.elapsed().as_micros() as u64;
-                                        metrics.record(latency, body_bytes);
-                                    }
+                                    break;
                                 } else {
                                     let latency = start.elapsed().as_micros() as u64;
-                                    metrics.record(latency, body_bytes);
+                                    if !record_http_echo_result(
+                                        &mut metrics,
+                                        "HTTP/3",
+                                        status,
+                                        body_bytes,
+                                        payload.len(),
+                                        body_matches,
+                                        latency,
+                                    ) {
+                                        break;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -548,7 +660,7 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = Vec::new();
-    let payload = vec![0xABu8; args.payload_size];
+    let payload = make_payload(args.payload_size);
 
     // For wss://, plug our insecure rustls ClientConfig so tungstenite doesn't
     // reject proto_backend's self-signed cert. For ws://, pass None so the
@@ -610,7 +722,21 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
                 let echoed_len = match tokio::time::timeout(read_timeout, async {
                     loop {
                         match read.next().await {
-                            Some(Ok(Message::Binary(data))) => break Ok(data.len()),
+                            Some(Ok(Message::Binary(data))) => {
+                                let len = data.len();
+                                if len != payload.len() {
+                                    break Err(format!(
+                                        "echo length mismatch: got {len} bytes, expected {}",
+                                        payload.len()
+                                    ));
+                                }
+                                if data.as_slice() != payload.as_slice() {
+                                    break Err(format!(
+                                        "echo payload mismatch: {len} bytes had wrong content"
+                                    ));
+                                }
+                                break Ok(len);
+                            }
                             Some(Ok(Message::Text(data))) => {
                                 break Err(format!(
                                     "unexpected text frame of {} bytes",
@@ -636,18 +762,9 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
                     )),
                 };
                 match echoed_len {
-                    Ok(len) if len == payload.len() => {
+                    Ok(len) => {
                         let latency = start.elapsed().as_micros() as u64;
                         metrics.record(latency, len);
-                    }
-                    Ok(len) => {
-                        eprintln!(
-                            "  ws echo length mismatch: got {} bytes, expected {}",
-                            len,
-                            payload.len()
-                        );
-                        metrics.record_error();
-                        break;
                     }
                     Err(e) => {
                         eprintln!("  ws echo error: {e}");
@@ -672,7 +789,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     use bench_proto::bench_service_client::BenchServiceClient;
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let payload = vec![0xABu8; args.payload_size];
+    let payload = make_payload(args.payload_size);
 
     // gRPC TLS requires explicit trust configuration — tonic 0.14 has no
     // "accept invalid certs" toggle, so without --ca-cert the handshake
@@ -754,8 +871,10 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                 match client.unary_echo(req).await {
                     Ok(resp) => {
                         let latency = start.elapsed().as_micros() as u64;
-                        let bytes = resp.into_inner().payload.len();
-                        metrics.record(latency, bytes);
+                        let response = resp.into_inner().payload;
+                        if !record_echo_result(&mut metrics, "gRPC", &response, &payload, latency) {
+                            break;
+                        }
                     }
                     Err(_) => {
                         metrics.record_error();
@@ -780,7 +899,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid TCP target address")?;
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = Vec::new();
-    let payload = vec![0xABu8; args.payload_size];
+    let payload = make_payload(args.payload_size);
     let use_tls = args.tls;
 
     let tls_cfg = if use_tls {
@@ -879,7 +998,10 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                     match tokio::time::timeout(read_timeout, rd.read_exact(&mut buf)).await {
                         Ok(Ok(_)) => {
                             let latency = start.elapsed().as_micros() as u64;
-                            metrics.record(latency, buf.len());
+                            if !record_echo_result(&mut metrics, "TCP+TLS", &buf, &payload, latency)
+                            {
+                                break;
+                            }
                         }
                         Ok(Err(e)) => {
                             eprintln!(
@@ -915,7 +1037,9 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                     match res {
                         Ok(_) => {
                             let latency = start.elapsed().as_micros() as u64;
-                            metrics.record(latency, buf.len());
+                            if !record_echo_result(&mut metrics, "TCP", &buf, &payload, latency) {
+                                break;
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -945,7 +1069,7 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     let addr: SocketAddr = args.target.parse().context("invalid UDP target address")?;
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = Vec::new();
-    let payload = vec![0xABu8; args.payload_size];
+    let payload = make_payload(args.payload_size);
     let use_dtls = args.tls;
 
     // Generate one cert for all DTLS connections (key gen is CPU-intensive)
@@ -1039,7 +1163,7 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                 }
 
                 // Connected — run echo benchmark using Sans-IO loop
-                while Instant::now() < deadline {
+                'benchmark: while Instant::now() < deadline {
                     let start = Instant::now();
                     dtls.send_application_data(&payload).map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
 
@@ -1085,7 +1209,15 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                                 Output::Timeout(t) => { next_timeout = Some(t); break; }
                                 Output::ApplicationData(d) => {
                                     let latency = start.elapsed().as_micros() as u64;
-                                    metrics.record(latency, d.len());
+                                    if !record_echo_result(
+                                        &mut metrics,
+                                        "UDP+DTLS",
+                                        d,
+                                        &payload,
+                                        latency,
+                                    ) {
+                                        break 'benchmark;
+                                    }
                                     got_reply = true;
                                     break;
                                 }
@@ -1117,7 +1249,15 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     match tokio::time::timeout(recv_timeout, sock.recv(&mut buf)).await {
                         Ok(Ok(n)) => {
                             let latency = start.elapsed().as_micros() as u64;
-                            metrics.record(latency, n);
+                            if !record_echo_result(
+                                &mut metrics,
+                                "UDP",
+                                &buf[..n],
+                                &payload,
+                                latency,
+                            ) {
+                                break;
+                            }
                         }
                         Ok(Err(_)) => {
                             metrics.record_error();
