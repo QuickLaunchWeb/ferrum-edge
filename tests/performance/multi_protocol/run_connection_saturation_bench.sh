@@ -269,16 +269,23 @@ start_redis_for_tyk() {
     REDIS_CID=$(docker run -d --rm --network host "$REDIS_IMAGE" redis-server --bind 127.0.0.1 --port 6379)
     for i in $(seq 1 20); do
         if docker exec "$REDIS_CID" redis-cli ping 2>/dev/null | grep -q PONG; then
-            return
+            return 0
         fi
         sleep 0.5
     done
     echo "[redis] failed to start" >&2
-    exit 1
+    # Return — don't `exit 1` — so the failure flows through start_tyk →
+    # start_gateway and the main loop records tyk as startup_failed and
+    # continues with krakend. Bailing out of the whole script here used
+    # to bypass the per-gateway ledger and lose later gateways' results.
+    return 1
 }
 
 start_tyk() {
-    start_redis_for_tyk
+    if ! start_redis_for_tyk; then
+        echo "[tyk] redis dependency failed to start; skipping tyk" >&2
+        return 1
+    fi
     local apps_dir="$SCRIPT_DIR/configs/tyk/apps_http1_tls"
     local tyk_conf="$SCRIPT_DIR/configs/tyk/tyk.conf"
     echo "[tyk] starting..."
@@ -394,8 +401,13 @@ record_startup_failed() {
 build_binaries
 start_backend
 
-# Wipe any prior markers from a previous run sharing the output dir.
-rm -f "$OUTPUT_DIR"/*.marker 2>/dev/null || true
+# Wipe any prior per-(gateway, N) outputs from a previous run sharing the
+# output dir. Without this, the summary block at the end runs `*.json` glob
+# over OUTPUT_DIR and would pull in stale results from earlier runs — last_ok
+# / first_break would silently mix old + new data and the markdown table
+# would show ghost rows. This includes summary.json (regenerated below),
+# the per-(gateway, N) JSON, the .stderr sidecar, and the marker files.
+rm -f "$OUTPUT_DIR"/*.json "$OUTPUT_DIR"/*.stderr "$OUTPUT_DIR"/*.marker 2>/dev/null || true
 
 for gw in $GATEWAYS; do
     echo

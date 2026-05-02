@@ -1616,14 +1616,28 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
                         use http_body_util::BodyExt;
                         let status = resp.status();
                         match resp.into_body().collect().await {
-                            Ok(_) if status == http::StatusCode::OK => {
-                                let elapsed = req_start.elapsed().as_micros() as u64;
-                                let _ = heartbeat_hist.lock().map(|mut h| {
-                                    let _ = h.record(elapsed);
-                                });
-                                counters
-                                    .heartbeats_succeeded
-                                    .fetch_add(1, Ordering::Relaxed);
+                            Ok(body) if status == http::StatusCode::OK => {
+                                // Mirror the throughput-bench echo validation:
+                                // a misrouted gateway, a degraded handler that
+                                // 200s with an empty/mock body, or a stale
+                                // health-check responder would all otherwise
+                                // count as healthy heartbeats. Comparing bytes
+                                // is the cheapest way to confirm /echo is
+                                // genuinely round-tripping the payload.
+                                let bytes = body.to_bytes();
+                                if bytes.as_ref() == payload.as_ref() {
+                                    let elapsed = req_start.elapsed().as_micros() as u64;
+                                    let _ = heartbeat_hist.lock().map(|mut h| {
+                                        let _ = h.record(elapsed);
+                                    });
+                                    counters
+                                        .heartbeats_succeeded
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    counters
+                                        .heartbeats_failed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             _ => {
                                 counters.heartbeats_failed.fetch_add(1, Ordering::Relaxed);
