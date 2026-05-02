@@ -422,3 +422,55 @@ sudo apt-get install protobuf-compiler
 3. Create a gateway config in `configs/<protocol>_perf.yaml`
 4. Add `test_<protocol>()` and `stop_gateway` call in `run_protocol_test.sh`
 5. (Optional) Add an Envoy config in `configs/envoy/<protocol>.yaml` and register in `envoy_compare_protocol()`
+
+## Connection Saturation Benchmark
+
+A separate benchmark mode that finds the **breaking point** — the smallest N at which a gateway can no longer sustain N concurrent long-lived connections — for ferrum-edge, envoy, kong, tyk, and krakend. Distinct from the throughput benchmark above: that one fixes concurrency at 100 and measures RPS; this one ramps concurrency until the gateway falls over.
+
+```bash
+cd tests/performance/multi_protocol
+
+# Run all five gateways at default ramp (1K → 5K → 10K → 25K → 50K)
+./run_connection_saturation_bench.sh
+
+# Subset
+./run_connection_saturation_bench.sh \
+    --gateways "ferrum envoy" \
+    --connection-levels "1000 5000 10000"
+
+# Stop ramping a gateway as soon as it breaks (faster overall run)
+./run_connection_saturation_bench.sh --stop-at-first-break
+```
+
+In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.github/workflows/connection-saturation-benchmark.yml`) — that path applies the host-level sysctl/ulimit tuning required for the headline numbers.
+
+### What "breaking point" means here
+
+`proto_bench saturate --connections N` opens N HTTP/1.1+TLS keep-alive connections to the gateway, ramps them up over `--ramp-seconds`, and holds them open for `--hold-seconds` while each connection sends one tiny POST `/echo` per `--heartbeat-interval-ms`. A run is **`ok`** if all three of:
+
+- `connect_success_rate ≥ 99%`,
+- `heartbeat_success_rate ≥ 99%`, and
+- `peak_alive_connections ≥ 99% × N`
+
+are true. Otherwise it's **`broken`**. The runner script ramps N upward and records the largest `ok` and the smallest `broken`.
+
+### Failure-mode classification
+
+The JSON output breaks connect failures into `refused / timeout / reset / tls_error / other` because **how** a gateway breaks tells you why:
+
+| Failure mode | Typical cause |
+|--------------|---------------|
+| `reset` | nginx-style `worker_connections` exhaustion (Kong default = 16K) |
+| `refused` | FD ceiling hit, accept queue full |
+| `timeout` | gateway is up but accept loop is starved (CPU pegged) |
+| `tls_error` | TLS handshake memory pressure or session cache exhaustion |
+| `disconnects_during_hold` | gateway accepted but later RST'd under load (e.g. shutdown_drain triggered by overload manager) |
+
+### Methodology + caveats
+
+- **Default-config gateways**. Each gateway is started with the minimum env vars required to make it function (TLS certs, basic routing). `worker_connections`, `max_concurrent_conns`, etc. are left at their out-of-the-box defaults. This measures what an operator gets from `docker run`. A separate "tuned" run could be wired up later.
+- **Universal protocol = HTTP/1.1+TLS**. All five gateways speak this end-to-end with matched configs, so it's the apples-to-apples comparison. Other protocols would force per-gateway exclusions (KrakenD CE has no gRPC; Kong has no H2 upstream; etc. — see `run_gateway_protocol_bench.sh` for the full matrix).
+- **All gateways run in Docker with `--ulimit nofile=1048576:1048576`** so no gateway gets a per-container FD-cap advantage. The host-side ulimit/sysctl tuning is applied by the CI workflow before launching anything.
+- **macOS hosts hit ~12K FD ceiling and aren't suitable for headline numbers**. The benchmark runs locally for development and at small N (≤4K), but the comparison numbers should always come from the Linux CI workflow.
+- **Heartbeat is intentionally low-rate** (default 1 req/sec/conn). The point is to test connection capacity, not RPS — a high heartbeat rate would conflate the two and give a different (RPS-bound) breaking point.
+- **Connect attempts are spread over `--ramp-seconds`** so the *client* doesn't SYN-flood itself. With N=50K and ramp=30s that's ~1666 connects/sec, well within typical client capacity given proper ulimit.

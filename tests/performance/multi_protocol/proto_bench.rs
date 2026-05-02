@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -46,6 +47,15 @@ enum Protocol {
     Tcp(BenchArgs),
     /// UDP load test
     Udp(BenchArgs),
+    /// Concurrent-connection saturation test (HTTP/1.1, plain or TLS)
+    ///
+    /// Holds N long-lived keep-alive connections against the target,
+    /// each sending a small heartbeat request at a configurable interval.
+    /// Reports connect/heartbeat success rates, peak alive connections, and
+    /// a per-class failure breakdown so the caller can locate the breaking
+    /// point. Use `run_connection_saturation_bench.sh` to ramp N across
+    /// multiple invocations and find the ceiling.
+    Saturate(SaturateArgs),
 }
 
 #[derive(Parser, Clone)]
@@ -83,6 +93,41 @@ struct BenchArgs {
     json: bool,
 }
 
+#[derive(Parser, Clone)]
+struct SaturateArgs {
+    /// Target URL (http:// or https://) — HTTP/1.1 only
+    #[arg(long)]
+    target: String,
+
+    /// Target number of concurrent connections to hold open
+    #[arg(long, default_value = "10000")]
+    connections: u64,
+
+    /// Seconds to spread connection attempts over (avoids client-side SYN flood)
+    #[arg(long, default_value = "30")]
+    ramp_seconds: u64,
+
+    /// Seconds to hold connections open after the ramp completes
+    #[arg(long, default_value = "30")]
+    hold_seconds: u64,
+
+    /// Per-connection heartbeat interval in milliseconds (one small request per interval)
+    #[arg(long, default_value = "1000")]
+    heartbeat_interval_ms: u64,
+
+    /// Heartbeat payload size in bytes
+    #[arg(long, default_value = "64")]
+    payload_size: usize,
+
+    /// Per-attempt connect timeout in milliseconds
+    #[arg(long, default_value = "10000")]
+    connect_timeout_ms: u64,
+
+    /// Output JSON instead of human-readable text
+    #[arg(long, default_value = "false")]
+    json: bool,
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -100,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         Protocol::Grpc(args) => run_grpc(&args).await,
         Protocol::Tcp(args) => run_tcp(&args).await,
         Protocol::Udp(args) => run_udp(&args).await,
+        Protocol::Saturate(args) => run_saturate(&args).await,
     }
 }
 
@@ -1278,5 +1324,430 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     let combined = collect_results(handles).await;
     let proto_name = if args.tls { "UDP+DTLS" } else { "UDP" };
     print_results(&combined, proto_name, args);
+    Ok(())
+}
+
+// ── Saturation (concurrent-connection breaking-point test) ───────────────────
+//
+// The shape of this test is deliberately different from the per-protocol
+// throughput benches above. Throughput benches keep N connections busy and
+// measure RPS. Saturation opens N keep-alive connections, sends one tiny
+// heartbeat per connection per `heartbeat_interval_ms`, and watches for the
+// gateway to start refusing connects, RST'ing established conns, or stalling
+// the request loop. The metric of interest is "max N before breakage", not
+// "RPS at fixed N".
+//
+// Connect failures are classified into refused / timeout / reset / TLS / other
+// because the failure mode is itself the answer when comparing gateways:
+// a Kong/nginx that exhausts `worker_connections` typically RSTs new connects;
+// an Envoy at FD ceiling typically returns ECONNREFUSED; a TLS-terminating
+// gateway that runs out of session memory tends to fail mid-handshake.
+//
+// `run_connection_saturation_bench.sh` invokes this with a series of N values
+// (1K, 5K, 10K, ...) and walks the JSON breakdown to find the first N at
+// which connect_success_rate drops below a threshold.
+
+#[derive(Default)]
+struct SaturateCounters {
+    connect_attempts: AtomicU64,
+    connect_successes: AtomicU64,
+    connect_refused: AtomicU64,
+    connect_timeout: AtomicU64,
+    connect_reset: AtomicU64,
+    connect_tls_error: AtomicU64,
+    connect_other: AtomicU64,
+    alive: AtomicI64,
+    peak_alive: AtomicU64,
+    heartbeats_attempted: AtomicU64,
+    heartbeats_succeeded: AtomicU64,
+    heartbeats_failed: AtomicU64,
+    disconnects_during_hold: AtomicU64,
+}
+
+#[derive(serde::Serialize)]
+struct SaturateReport {
+    target: String,
+    target_connections: u64,
+    ramp_seconds: u64,
+    hold_seconds: u64,
+    heartbeat_interval_ms: u64,
+    payload_size: usize,
+    connect_attempts: u64,
+    connect_successes: u64,
+    connect_success_rate: f64,
+    connect_refused: u64,
+    connect_timeout: u64,
+    connect_reset: u64,
+    connect_tls_error: u64,
+    connect_other: u64,
+    peak_alive_connections: u64,
+    alive_at_end: i64,
+    heartbeats_attempted: u64,
+    heartbeats_succeeded: u64,
+    heartbeats_failed: u64,
+    heartbeat_success_rate: f64,
+    disconnects_during_hold: u64,
+    p50_connect_us: u64,
+    p99_connect_us: u64,
+    p50_heartbeat_us: u64,
+    p99_heartbeat_us: u64,
+    /// "ok" if connect & heartbeat success ≥ 99% AND alive_at_end ≥ 99% of target;
+    /// "broken" otherwise. Caller (run_connection_saturation_bench.sh) uses this
+    /// as the binary "did this N succeed?" signal.
+    verdict: &'static str,
+}
+
+fn classify_connect_error(err: &anyhow::Error) -> &'static str {
+    let msg = format!("{err:?}").to_ascii_lowercase();
+    // Order matters — TLS errors often also mention "reset"/"closed" in source chains.
+    if msg.contains("invalid certificate")
+        || msg.contains("tls")
+        || msg.contains("handshake")
+        || msg.contains("certificateverify")
+        || msg.contains("badcertificate")
+    {
+        "tls"
+    } else if msg.contains("connection refused") || msg.contains("econnrefused") {
+        "refused"
+    } else if msg.contains("timed out") || msg.contains("deadline") || msg.contains("timeout") {
+        "timeout"
+    } else if msg.contains("connection reset") || msg.contains("econnreset") {
+        "reset"
+    } else {
+        "other"
+    }
+}
+
+async fn connect_h1_saturate(
+    addr: SocketAddr,
+    tls: &Option<(
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    )>,
+) -> anyhow::Result<hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>> {
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let _ = tcp.set_nodelay(true);
+    if let Some((connector, server_name)) = tls {
+        let tls_stream = connector.connect(server_name.clone(), tcp).await?;
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(sr)
+    } else {
+        let io = hyper_util::rt::TokioIo::new(tcp);
+        let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(sr)
+    }
+}
+
+async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
+    use hdrhistogram::Histogram;
+    use std::sync::Mutex;
+
+    let is_tls = args.target.starts_with("https://");
+    let url: http::Uri = args.target.parse().context("invalid target URL")?;
+    let host = url.host().context("no host in URL")?.to_string();
+    let port = url.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .context("invalid address")?;
+    let path = url.path().to_string();
+    let authority = format!("{host}:{port}");
+
+    let tls_connector = if is_tls {
+        let mut tls_cfg = tls_utils::make_client_tls_config_insecure();
+        tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Some((
+            tokio_rustls::TlsConnector::from(Arc::new(tls_cfg)),
+            rustls::pki_types::ServerName::try_from(host.clone())
+                .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?,
+        ))
+    } else {
+        None
+    };
+
+    let payload = Bytes::from(make_payload(args.payload_size));
+    let counters = Arc::new(SaturateCounters::default());
+    let connect_hist = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_max(60_000_000, 3).context("histogram alloc")?,
+    ));
+    let heartbeat_hist = Arc::new(Mutex::new(
+        Histogram::<u64>::new_with_max(60_000_000, 3).context("histogram alloc")?,
+    ));
+
+    let connect_timeout = Duration::from_millis(args.connect_timeout_ms);
+    let heartbeat_interval = Duration::from_millis(args.heartbeat_interval_ms);
+    let ramp = Duration::from_secs(args.ramp_seconds.max(1));
+    let hold = Duration::from_secs(args.hold_seconds);
+    let test_start = Instant::now();
+    let hold_until = test_start + ramp + hold;
+
+    if !args.json {
+        eprintln!(
+            "[saturate] target={} N={} ramp={}s hold={}s heartbeat={}ms{}",
+            args.target,
+            args.connections,
+            args.ramp_seconds,
+            args.hold_seconds,
+            args.heartbeat_interval_ms,
+            if is_tls { " (TLS)" } else { "" },
+        );
+    }
+
+    // Spread connection attempts evenly over the ramp window. With N=50K and
+    // ramp=30s that's ~1666 connects/sec — high but well within typical
+    // client-side capacity given proper ulimit.
+    let inter_connect = if args.connections > 1 {
+        ramp / (args.connections as u32)
+    } else {
+        Duration::from_millis(0)
+    };
+
+    let mut handles = Vec::with_capacity(args.connections as usize);
+    for i in 0..args.connections {
+        let counters = counters.clone();
+        let connect_hist = connect_hist.clone();
+        let heartbeat_hist = heartbeat_hist.clone();
+        let tls_connector = tls_connector.clone();
+        let payload = payload.clone();
+        let path = path.clone();
+        let authority = authority.clone();
+        let stagger = inter_connect.saturating_mul(i as u32);
+
+        handles.push(tokio::spawn(async move {
+            // Stagger so we don't all SYN at once.
+            tokio::time::sleep(stagger).await;
+
+            counters.connect_attempts.fetch_add(1, Ordering::Relaxed);
+            let connect_start = Instant::now();
+            let connect_result =
+                tokio::time::timeout(connect_timeout, connect_h1_saturate(addr, &tls_connector))
+                    .await;
+
+            let mut send_req = match connect_result {
+                Ok(Ok(s)) => {
+                    let elapsed = connect_start.elapsed().as_micros() as u64;
+                    let _ = connect_hist.lock().map(|mut h| {
+                        let _ = h.record(elapsed);
+                    });
+                    counters.connect_successes.fetch_add(1, Ordering::Relaxed);
+                    let now_alive = counters.alive.fetch_add(1, Ordering::Relaxed) + 1;
+                    if now_alive > 0 {
+                        let prev = counters.peak_alive.load(Ordering::Relaxed);
+                        if (now_alive as u64) > prev {
+                            counters
+                                .peak_alive
+                                .fetch_max(now_alive as u64, Ordering::Relaxed);
+                        }
+                    }
+                    s
+                }
+                Ok(Err(e)) => {
+                    match classify_connect_error(&e) {
+                        "refused" => &counters.connect_refused,
+                        "timeout" => &counters.connect_timeout,
+                        "reset" => &counters.connect_reset,
+                        "tls" => &counters.connect_tls_error,
+                        _ => &counters.connect_other,
+                    }
+                    .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(_) => {
+                    counters.connect_timeout.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // Heartbeat loop: one small POST per `heartbeat_interval_ms` until hold
+            // window elapses. We send POST not GET because all the bench backends
+            // expect /echo to receive a body matching the configured payload size.
+            let mut next_beat = Instant::now();
+            let task_lost = loop {
+                let now = Instant::now();
+                if now >= hold_until {
+                    break false;
+                }
+                if now < next_beat {
+                    tokio::time::sleep(next_beat - now).await;
+                    continue;
+                }
+                next_beat += heartbeat_interval;
+
+                if send_req.is_closed() {
+                    break true;
+                }
+
+                counters
+                    .heartbeats_attempted
+                    .fetch_add(1, Ordering::Relaxed);
+                let req_start = Instant::now();
+                let req = match hyper::Request::post(&path)
+                    .header("host", &authority)
+                    .body(http_body_util::Full::new(payload.clone()))
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        counters.heartbeats_failed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+
+                match send_req.send_request(req).await {
+                    Ok(resp) => {
+                        use http_body_util::BodyExt;
+                        let status = resp.status();
+                        match resp.into_body().collect().await {
+                            Ok(_) if status == http::StatusCode::OK => {
+                                let elapsed = req_start.elapsed().as_micros() as u64;
+                                let _ = heartbeat_hist.lock().map(|mut h| {
+                                    let _ = h.record(elapsed);
+                                });
+                                counters
+                                    .heartbeats_succeeded
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => {
+                                counters.heartbeats_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        counters.heartbeats_failed.fetch_add(1, Ordering::Relaxed);
+                        // Connection broken mid-hold — task is done.
+                        break true;
+                    }
+                }
+            };
+
+            counters.alive.fetch_sub(1, Ordering::Relaxed);
+            if task_lost {
+                counters
+                    .disconnects_during_hold
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    // Wait for ramp + hold + small grace.
+    let total = ramp + hold + Duration::from_secs(2);
+    let _ = tokio::time::timeout(total + Duration::from_secs(15), async {
+        for h in handles {
+            let _ = h.await;
+        }
+    })
+    .await;
+
+    // Snapshot and report.
+    let connect_attempts = counters.connect_attempts.load(Ordering::Relaxed);
+    let connect_successes = counters.connect_successes.load(Ordering::Relaxed);
+    let heartbeats_attempted = counters.heartbeats_attempted.load(Ordering::Relaxed);
+    let heartbeats_succeeded = counters.heartbeats_succeeded.load(Ordering::Relaxed);
+    let peak_alive = counters.peak_alive.load(Ordering::Relaxed);
+    let alive_at_end = counters.alive.load(Ordering::Relaxed);
+
+    let connect_success_rate = if connect_attempts > 0 {
+        connect_successes as f64 / connect_attempts as f64
+    } else {
+        0.0
+    };
+    let heartbeat_success_rate = if heartbeats_attempted > 0 {
+        heartbeats_succeeded as f64 / heartbeats_attempted as f64
+    } else {
+        0.0
+    };
+
+    let (p50_connect, p99_connect) = connect_hist
+        .lock()
+        .map(|h| (h.value_at_quantile(0.50), h.value_at_quantile(0.99)))
+        .unwrap_or((0, 0));
+    let (p50_heartbeat, p99_heartbeat) = heartbeat_hist
+        .lock()
+        .map(|h| (h.value_at_quantile(0.50), h.value_at_quantile(0.99)))
+        .unwrap_or((0, 0));
+
+    // Verdict: a level is "ok" only if essentially every connection both
+    // established AND survived the hold window. Tightening below 99% lets a
+    // gateway look healthy while quietly RST'ing 5–10% of conns under load —
+    // exactly the breakage we want to detect.
+    let verdict = if connect_success_rate >= 0.99
+        && heartbeat_success_rate >= 0.99
+        && peak_alive >= ((args.connections as f64) * 0.99) as u64
+    {
+        "ok"
+    } else {
+        "broken"
+    };
+
+    let report = SaturateReport {
+        target: args.target.clone(),
+        target_connections: args.connections,
+        ramp_seconds: args.ramp_seconds,
+        hold_seconds: args.hold_seconds,
+        heartbeat_interval_ms: args.heartbeat_interval_ms,
+        payload_size: args.payload_size,
+        connect_attempts,
+        connect_successes,
+        connect_success_rate,
+        connect_refused: counters.connect_refused.load(Ordering::Relaxed),
+        connect_timeout: counters.connect_timeout.load(Ordering::Relaxed),
+        connect_reset: counters.connect_reset.load(Ordering::Relaxed),
+        connect_tls_error: counters.connect_tls_error.load(Ordering::Relaxed),
+        connect_other: counters.connect_other.load(Ordering::Relaxed),
+        peak_alive_connections: peak_alive,
+        alive_at_end,
+        heartbeats_attempted,
+        heartbeats_succeeded,
+        heartbeats_failed: counters.heartbeats_failed.load(Ordering::Relaxed),
+        heartbeat_success_rate,
+        disconnects_during_hold: counters.disconnects_during_hold.load(Ordering::Relaxed),
+        p50_connect_us: p50_connect,
+        p99_connect_us: p99_connect,
+        p50_heartbeat_us: p50_heartbeat,
+        p99_heartbeat_us: p99_heartbeat,
+        verdict,
+    };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        let pct_connect = connect_success_rate * 100.0;
+        let pct_heartbeat = heartbeat_success_rate * 100.0;
+        println!(
+            "saturate {} N={} ramp={}s hold={}s\n  connect: {}/{} ({:.2}%) — refused={} timeout={} reset={} tls={} other={}\n  peak_alive={} alive_at_end={} disconnects_during_hold={}\n  heartbeats: {}/{} ({:.2}%)\n  connect p50={}us p99={}us  heartbeat p50={}us p99={}us\n  verdict: {}",
+            args.target,
+            args.connections,
+            args.ramp_seconds,
+            args.hold_seconds,
+            connect_successes,
+            connect_attempts,
+            pct_connect,
+            report.connect_refused,
+            report.connect_timeout,
+            report.connect_reset,
+            report.connect_tls_error,
+            report.connect_other,
+            peak_alive,
+            alive_at_end,
+            report.disconnects_during_hold,
+            heartbeats_succeeded,
+            heartbeats_attempted,
+            pct_heartbeat,
+            p50_connect,
+            p99_connect,
+            p50_heartbeat,
+            p99_heartbeat,
+            verdict,
+        );
+    }
+
     Ok(())
 }

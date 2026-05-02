@@ -1,0 +1,253 @@
+# On-demand concurrent-connection saturation benchmark.
+#
+# Finds the "breaking point" — the smallest N at which each gateway can no
+# longer sustain N long-lived HTTP/1.1+TLS connections — for ferrum-edge,
+# envoy, kong, tyk, and krakend. Distinct from the throughput benchmark in
+# `gateways-protocol-benchmark.yml`: here we ramp connection count, not RPS.
+#
+# All gateways run in Docker with --network host and matched `--ulimit
+# nofile=1048576:1048576` so no gateway has a per-container FD-cap advantage.
+# The host gets sysctl tuning (somaxconn, ip_local_port_range, syn_backlog)
+# and `ulimit -n 1048576` so the test client and gateway both have headroom
+# beyond the highest configured N.
+#
+# GitHub-hosted ubuntu-latest runners (4 vCPU / 16 GB RAM) can comfortably
+# handle N up to ~50K. For larger N values use a paid larger runner — see
+# the `runner` input below.
+#
+# Usage: Actions → "Connection Saturation Benchmark" → Run workflow.
+
+name: Connection Saturation Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateways:
+        description: "Space-separated subset (default: all five)"
+        required: false
+        default: "ferrum envoy kong tyk krakend"
+        type: string
+      connection_levels:
+        description: "Space-separated N values to ramp through"
+        required: false
+        default: "1000 5000 10000 25000 50000"
+        type: string
+      ramp_seconds:
+        description: "Seconds to spread connection attempts over"
+        required: false
+        default: "30"
+        type: string
+      hold_seconds:
+        description: "Seconds to hold connections open after ramp"
+        required: false
+        default: "30"
+        type: string
+      heartbeat_interval_ms:
+        description: "Per-connection heartbeat interval (ms)"
+        required: false
+        default: "1000"
+        type: string
+      runner:
+        description: "GitHub runner label (ubuntu-latest is fine up to ~50K conn)"
+        required: false
+        default: "ubuntu-latest"
+        type: string
+      stop_at_first_break:
+        description: "Skip higher N values once a gateway breaks"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  saturation:
+    name: Connection Saturation
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-connection-saturation"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler lsof jq
+
+      # ── Host tuning ─────────────────────────────────────────────────────────
+      # GitHub-hosted ubuntu runners: hard FD limit is 1048576 by default; we
+      # raise the soft limit to match. sysctl values default lower than what
+      # 50K simultaneous connects need (somaxconn=4096, syn_backlog=128 on
+      # some images) — bump them so we measure the *gateway's* breaking point,
+      # not the kernel's accept queue overflowing first.
+      - name: Tune host for high connection counts
+        run: |
+          echo "── before tuning ──"
+          echo "soft FD: $(ulimit -Sn)  hard FD: $(ulimit -Hn)"
+          sudo sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
+            net.ipv4.ip_local_port_range fs.file-max 2>&1 | grep -v ^$ || true
+
+          # Persistent tunings via sysctl. Done with sudo so the values
+          # actually take effect — `ulimit` itself runs in-process and is
+          # re-applied per `bash -lc` step below.
+          sudo sysctl -w fs.file-max=2097152
+          sudo sysctl -w net.core.somaxconn=65535
+          sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+
+          # /etc/security/limits.conf for new shells (the bench script uses
+          # bash -lc, so the inline `ulimit -n` in the run step is what
+          # actually matters — but set this too for completeness).
+          echo "* soft nofile 1048576" | sudo tee -a /etc/security/limits.conf
+          echo "* hard nofile 1048576" | sudo tee -a /etc/security/limits.conf
+
+          echo "── after tuning ──"
+          sudo sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
+            net.ipv4.ip_local_port_range fs.file-max
+
+      - name: Pre-pull gateway images
+        run: |
+          # Pre-pulling lets the per-gateway lifecycle inside the bench script
+          # avoid counting docker-pull time against startup readiness.
+          docker pull envoyproxy/envoy:v1.33.5 &
+          docker pull kong/kong-gateway:3.10.0.0 &
+          docker pull tykio/tyk-gateway:v5.3.0 &
+          docker pull krakend:2.13.2 &
+          docker pull redis:7.4.1-alpine &
+          wait
+
+      - name: Build ferrum-edge release binary + bench tools
+        run: |
+          # Bench harness binaries (proto_bench, proto_backend) — built native
+          # in the bench dir.
+          ( cd tests/performance/multi_protocol && cargo build --release )
+          # Ferrum docker image — same Dockerfile used in production CI.
+          docker build -t ferrum-edge:bench -f Dockerfile .
+
+      - name: Run connection saturation benchmark
+        run: |
+          set -euo pipefail
+          # Soft-raise the FD limit for THIS shell — the bench script's child
+          # processes (proto_bench client, proto_backend) inherit it.
+          ulimit -n 1048576
+          ulimit -Sn
+
+          ./tests/performance/multi_protocol/run_connection_saturation_bench.sh \
+            --gateways "${{ inputs.gateways }}" \
+            --connection-levels "${{ inputs.connection_levels }}" \
+            --ramp-seconds "${{ inputs.ramp_seconds }}" \
+            --hold-seconds "${{ inputs.hold_seconds }}" \
+            --heartbeat-interval-ms "${{ inputs.heartbeat_interval_ms }}" \
+            --output-dir "$GITHUB_WORKSPACE/saturation-results" \
+            $( [ "${{ inputs.stop_at_first_break }}" = "true" ] && echo "--stop-at-first-break" ) \
+            --skip-build
+
+      - name: Generate markdown summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 <<'PYEOF'
+          import json
+          import os
+          import pathlib
+
+          results_dir = pathlib.Path("saturation-results")
+          summary_path = results_dir / "summary.json"
+          out_lines = []
+
+          out_lines.append("# Connection Saturation Benchmark\n")
+          out_lines.append(f"**Runner:** `${{ inputs.runner }}`")
+          out_lines.append(f"**Connection levels:** `${{ inputs.connection_levels }}`")
+          out_lines.append(f"**Ramp / hold:** `${{ inputs.ramp_seconds }}s` / `${{ inputs.hold_seconds }}s`")
+          out_lines.append(f"**Heartbeat:** `${{ inputs.heartbeat_interval_ms }}ms` per connection")
+          out_lines.append("")
+          out_lines.append("Each gateway was run in Docker with `--ulimit nofile=1048576:1048576`. "
+                           "Host got `ulimit -n 1048576`, `somaxconn=65535`, "
+                           "`tcp_max_syn_backlog=65535`, port range `1024-65535`. "
+                           "All five gateways exposed only HTTP/1.1+TLS for an apples-to-apples "
+                           "comparison (the universal supported protocol).")
+          out_lines.append("")
+
+          if summary_path.exists():
+              summary = json.loads(summary_path.read_text())
+              out_lines.append("## Breaking points\n")
+              out_lines.append("| Gateway | Last OK N | First Break N |")
+              out_lines.append("|---------|-----------|---------------|")
+              for gw, info in summary.get("results", {}).items():
+                  out_lines.append(
+                      f"| `{gw}` | {info.get('last_ok', '?')} | {info.get('first_break', 'none')} |"
+                  )
+              out_lines.append("")
+
+          # Per-(gateway, N) breakdown with failure-mode classification.
+          out_lines.append("## Per-level detail\n")
+          out_lines.append("| Gateway | N | Verdict | Connect % | Heartbeat % | Peak Alive | Refused | Timeout | Reset | TLS | Other | Disc/Hold |")
+          out_lines.append("|---------|---|---------|-----------|-------------|------------|---------|---------|-------|-----|-------|-----------|")
+
+          rows = []
+          for f in sorted(results_dir.glob("*.json")):
+              if f.name == "summary.json":
+                  continue
+              try:
+                  d = json.loads(f.read_text())
+              except Exception:
+                  continue
+              gw = f.stem.rsplit("_", 1)[0]
+              n = d.get("target_connections", "?")
+              rows.append((gw, int(n) if isinstance(n, int) else 0, d))
+
+          rows.sort(key=lambda r: (r[0], r[1]))
+          for gw, _n, d in rows:
+              cs = d.get("connect_success_rate", 0) * 100
+              hb = d.get("heartbeat_success_rate", 0) * 100
+              out_lines.append(
+                  f"| `{gw}` | {d.get('target_connections', '?')} | **{d.get('verdict', '?')}** | "
+                  f"{cs:.2f} | {hb:.2f} | {d.get('peak_alive_connections', '?')} | "
+                  f"{d.get('connect_refused', 0)} | {d.get('connect_timeout', 0)} | "
+                  f"{d.get('connect_reset', 0)} | {d.get('connect_tls_error', 0)} | "
+                  f"{d.get('connect_other', 0)} | {d.get('disconnects_during_hold', 0)} |"
+              )
+
+          out_lines.append("")
+          out_lines.append("## How to read this")
+          out_lines.append("- **Last OK N**: largest tested N where ≥99% of conns established AND held + ≥99% of heartbeats succeeded.")
+          out_lines.append("- **First Break N**: smallest tested N that failed any of those checks.")
+          out_lines.append("- **Refused / Reset / Timeout / TLS**: classifies *how* the gateway broke. nginx-style worker_connections exhaustion typically RSTs new connects (Reset). FD-ceiling hits typically Refuse. Memory pressure during TLS handshake typically shows up as TLS errors.")
+          out_lines.append("- **Disc/Hold**: connections that established but were dropped mid-hold (RST or graceful close from the gateway under load).")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          with open(summary_file, "a") as f:
+              f.write("\n".join(out_lines) + "\n")
+          for line in out_lines:
+              print(line)
+          PYEOF
+
+      - name: Upload saturation results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: connection-saturation-${{ github.sha }}
+          path: saturation-results/
+          retention-days: 90
