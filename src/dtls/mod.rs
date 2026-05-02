@@ -839,6 +839,17 @@ impl DtlsServer {
             }
 
             loop {
+                // Check the handshake deadline at the top of each iteration so
+                // a sustained datagram flood cannot starve the timeout arm in
+                // the biased select below.
+                if !connected
+                    && let Some(deadline) = handshake_deadline
+                    && Instant::now() >= deadline
+                {
+                    warn!(client = %peer_addr, "DTLS handshake timed out");
+                    break;
+                }
+
                 let handshake_sleep_dur = if connected {
                     Duration::from_secs(60)
                 } else {
