@@ -225,6 +225,12 @@ start_gateway() {
             env_cmd+=("$kv")
         done
     fi
+    # Optional caller-supplied env var injection for one-off tuning experiments.
+    if [ -n "${FERRUM_EXTRA_ENV:-}" ]; then
+        for kv in $FERRUM_EXTRA_ENV; do
+            env_cmd+=("$kv")
+        done
+    fi
 
     "${env_cmd[@]}" ./target/release/ferrum-edge > "$SCRIPT_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
