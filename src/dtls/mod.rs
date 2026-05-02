@@ -862,16 +862,16 @@ impl DtlsServer {
                     .unwrap_or(Duration::from_secs(60));
 
                 tokio::select! {
-                    // Branch order is intentional under `biased`:
-                    //   1. `app_in_rx` — drain queued outbound replies first,
-                    //      preserving the original race fix where dropping a
-                    //      `DtlsServerConn` races a final reply against the
-                    //      `try_send(())` shutdown signal.
-                    //   2. `shutdown_rx` — pre-empts the `incoming_rx` branch
-                    //      so a peer that floods datagrams cannot indefinitely
-                    //      starve session shutdown and leak slot/metrics.
-                    //   3. `incoming_rx` — normal peer traffic.
-                    //   4. Retransmit / handshake-deadline timers.
+                    // `biased` guarantees reply-before-shutdown atomicity:
+                    // dropping a `DtlsServerConn` races `try_send(())`
+                    // against an already-queued reply in `app_in_rx`; random
+                    // branch ordering loses the reply ~50% of the time.
+                    //
+                    // Timeout enforcement does NOT depend on branch order —
+                    // the top-of-loop `Instant::now() >= deadline` check
+                    // fires even when `incoming_rx` is continuously ready.
+                    //
+                    // Order: app replies → shutdown → peer data → timers.
                     biased;
                     // 1. Application data to send back to this client
                     Some(data) = app_in_rx.recv(), if connected => {

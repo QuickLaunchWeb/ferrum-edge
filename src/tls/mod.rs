@@ -55,7 +55,8 @@ where
             Err(_) => {
                 warn!(
                     "Frontend TLS handshake timed out from {} after {}s",
-                    peer, timeout_secs
+                    peer.ip(),
+                    timeout_secs
                 );
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -70,7 +71,7 @@ where
     match result {
         Ok(stream) => Ok(stream),
         Err(e) => {
-            warn!("Frontend TLS handshake failed from {}: {}", peer, e);
+            warn!("Frontend TLS handshake failed from {}: {}", peer.ip(), e);
             Err(e)
         }
     }
