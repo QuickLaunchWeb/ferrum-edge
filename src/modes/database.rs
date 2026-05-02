@@ -39,11 +39,16 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
+        .map_err(anyhow::Error::msg)?
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
-    let failover_urls = env_config.effective_db_failover_urls();
+    let failover_urls = env_config
+        .effective_db_failover_urls()
+        .map_err(anyhow::Error::msg)?;
     let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 
-    let effective_replica_url = env_config.effective_db_read_replica_url();
+    let effective_replica_url = env_config
+        .effective_db_read_replica_url()
+        .map_err(anyhow::Error::msg)?;
 
     // Tracks whether the initial connect succeeded. When `true`, the gateway
     // started via `FERRUM_DB_CONFIG_BACKUP_PATH` because every configured DB
@@ -66,7 +71,7 @@ pub async fn run(
                 env_config.db_tls_ca_cert_path.as_deref(),
                 env_config.db_tls_client_cert_path.as_deref(),
                 env_config.db_tls_client_key_path.as_deref(),
-                env_config.mongodb_db_tls_allows_invalid_certificates(),
+                env_config.mongodb_tls_allows_invalid_certs(),
                 &failover_urls,
             )
             .await?;

@@ -1990,7 +1990,7 @@ fn test_effective_db_url_no_tls_params() {
 
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "postgres://localhost/ferrum"
             );
         },
@@ -2013,7 +2013,7 @@ fn test_effective_db_url_postgres_tls_mode() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "postgres://localhost/ferrum?sslmode=require"
             );
         },
@@ -2036,7 +2036,7 @@ fn test_effective_db_url_postgres_disable_tls_mode() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "postgres://localhost/ferrum?sslmode=disable"
             );
         },
@@ -2065,7 +2065,7 @@ fn test_effective_db_url_postgres_all_tls_params() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "postgres://user:pass@db.example.com/ferrum?sslmode=verify-full&sslrootcert=/certs/ca.pem&sslcert=/certs/client.pem&sslkey=/certs/client-key.pem"
             );
         },
@@ -2091,7 +2091,7 @@ fn test_effective_db_url_postgres_existing_query_params() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "postgres://localhost/ferrum?connect_timeout=10&sslmode=require"
             );
         },
@@ -2114,7 +2114,7 @@ fn test_effective_db_url_mysql_tls_mode_mapping() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "mysql://localhost/ferrum?ssl-mode=REQUIRED"
             );
         },
@@ -2137,7 +2137,7 @@ fn test_effective_db_url_mysql_disable_tls_mode() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "mysql://localhost/ferrum?ssl-mode=DISABLED"
             );
         },
@@ -2161,7 +2161,7 @@ fn test_effective_db_url_mysql_verify_ca() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "mysql://localhost/ferrum?ssl-mode=VERIFY_CA&ssl-ca=/certs/ca.pem"
             );
         },
@@ -2187,7 +2187,7 @@ fn test_effective_db_url_mysql_all_tls_params() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "mysql://user:pass@db.example.com/ferrum?ssl-mode=VERIFY_IDENTITY&ssl-ca=/certs/ca.pem&ssl-cert=/certs/client.pem&ssl-key=/certs/client-key.pem"
             );
         },
@@ -2233,7 +2233,7 @@ fn test_env_config_db_tls_accepts_sqlite_disable_mode_as_noop() {
             assert_eq!(config.db_tls_mode, Some(DbTlsMode::Disable));
             assert!(!config.db_tls_enabled());
             assert_eq!(
-                config.effective_db_url().unwrap(),
+                config.effective_db_url().unwrap().unwrap(),
                 "sqlite://ferrum.db?mode=rwc"
             );
         },
@@ -2282,6 +2282,28 @@ fn test_env_config_db_tls_rejects_mysql_allow_mode() {
 }
 
 #[test]
+fn test_effective_db_url_mysql_allow_returns_error_if_validation_bypassed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
+        ],
+        || {
+            let mut config = EnvConfig::from_env().unwrap();
+            config.db_tls_mode = Some(DbTlsMode::Allow);
+
+            let err = config.effective_db_url().unwrap_err();
+            assert!(err.contains("PostgreSQL-only"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_tls_rejects_mongodb_unsupported_mode() {
     with_env_vars(
         &[
@@ -2297,6 +2319,28 @@ fn test_env_config_db_tls_rejects_mongodb_unsupported_mode() {
         || {
             let err = EnvConfig::from_env().unwrap_err();
             assert!(err.contains("disable, require, verify-full"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_accepts_mongodb_require_as_insecure_tls() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb://localhost:27017/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "require"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_tls_mode, Some(DbTlsMode::Require));
+            assert!(config.db_tls_enabled());
+            assert!(config.mongodb_tls_allows_invalid_certs());
         },
     );
 }
@@ -2319,7 +2363,7 @@ fn test_env_config_db_tls_accepts_mongodb_verify_full() {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.db_tls_mode, Some(DbTlsMode::VerifyFull));
             assert!(config.db_tls_enabled());
-            assert!(!config.mongodb_db_tls_allows_invalid_certificates());
+            assert!(!config.mongodb_tls_allows_invalid_certs());
         },
     );
 }
@@ -2475,7 +2519,7 @@ fn test_effective_db_url_none_when_no_db_url() {
         || {
             remove_var("FERRUM_DB_URL");
             let config = EnvConfig::from_env().unwrap();
-            assert!(config.effective_db_url().is_none());
+            assert!(config.effective_db_url().unwrap().is_none());
         },
     );
 }
@@ -2499,7 +2543,7 @@ fn test_db_failover_urls_empty_by_default() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.db_failover_urls.is_empty());
-            assert!(config.effective_db_failover_urls().is_empty());
+            assert!(config.effective_db_failover_urls().unwrap().is_empty());
         },
     );
 }
@@ -2566,7 +2610,7 @@ fn test_db_failover_urls_with_tls_params() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let effective = config.effective_db_failover_urls();
+            let effective = config.effective_db_failover_urls().unwrap();
             assert_eq!(effective.len(), 1);
             assert!(effective[0].contains("sslmode=verify-full"));
         },
@@ -2592,7 +2636,7 @@ fn test_db_read_replica_url_none_by_default() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.db_read_replica_url.is_none());
-            assert!(config.effective_db_read_replica_url().is_none());
+            assert!(config.effective_db_read_replica_url().unwrap().is_none());
         },
     );
 }
@@ -2617,7 +2661,7 @@ fn test_db_read_replica_url_parsed() {
                 Some("postgres://replica/ferrum")
             );
             assert_eq!(
-                config.effective_db_read_replica_url().as_deref(),
+                config.effective_db_read_replica_url().unwrap().as_deref(),
                 Some("postgres://replica/ferrum")
             );
         },
@@ -2641,7 +2685,7 @@ fn test_db_read_replica_url_with_tls_params() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let effective = config.effective_db_read_replica_url().unwrap();
+            let effective = config.effective_db_read_replica_url().unwrap().unwrap();
             assert!(effective.contains("sslmode=verify-ca"));
             assert!(effective.contains("sslrootcert=/path/to/ca.pem"));
         },
@@ -2664,7 +2708,7 @@ fn test_db_read_replica_url_mysql_tls_mode_translation() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let effective = config.effective_db_read_replica_url().unwrap();
+            let effective = config.effective_db_read_replica_url().unwrap().unwrap();
             assert!(effective.contains("ssl-mode=VERIFY_IDENTITY"));
         },
     );
@@ -2685,7 +2729,7 @@ fn test_db_read_replica_url_sqlite_no_tls() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            let effective = config.effective_db_read_replica_url().unwrap();
+            let effective = config.effective_db_read_replica_url().unwrap().unwrap();
             // SQLite should not get SSL params
             assert_eq!(effective, "sqlite://replica.db");
         },

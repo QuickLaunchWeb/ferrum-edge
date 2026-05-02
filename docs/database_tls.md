@@ -339,6 +339,8 @@ export FERRUM_DB_URL="sqlite:///data/ferrum.db?mode=rwc"
 | `verify-ca`   | Yes        | Yes   | No      | Yes       | Yes                  | No                | SQL databases with trusted CA but dynamic hostnames |
 | `verify-full` | Yes        | Yes   | Yes     | Yes       | Yes                  | Yes               | **Production (recommended)** |
 
+`require` has the same security posture across supported network databases: it requires encryption but skips server certificate and hostname verification. For MongoDB specifically, Ferrum implements this as the driver's `allow_invalid_certificates=true` TLS option. Use `verify-full` for production.
+
 ## Managed Database Services
 
 Most managed database services (AWS RDS, Azure Database, Google Cloud SQL) provide TLS by default. Use the CA certificate bundle provided by the cloud provider.
@@ -464,7 +466,7 @@ PostgreSQL requires the server key file to have `chmod 600` and be owned by the 
 
 ### Connection works without TLS env vars
 
-If the database URL already contains TLS parameters (for example, `?sslmode=require`), avoid also setting `FERRUM_DB_TLS_MODE` for that connection. The env-derived parameters are appended to SQL URLs and duplicate driver options can conflict.
+If the database URL already contains TLS parameters (for example, `?sslmode=require`), avoid also setting `FERRUM_DB_TLS_MODE` for that connection. The gateway logs a startup warning when it detects both sources. Env-derived parameters are appended to SQL URLs and duplicate driver options can conflict; for MongoDB, URI TLS options take precedence over env-derived `FERRUM_DB_TLS_*` settings.
 
 ## Failover and Read Replica URLs
 
