@@ -48,6 +48,27 @@ fn write_http2_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) 
             .unwrap_or_default(),
     );
     buf.push('|');
+    // The client *key* path is part of connection identity for the same
+    // reason as the cert path: two proxies that share `client_cert_path`
+    // but use different `client_key_path` produce different rustls client
+    // configs and must not share an HTTP/2 connection. Mirrors the H3
+    // pool key (`src/http3/client.rs::write_pool_key_with_host`) and the
+    // backend capability registry key
+    // (`src/proxy/backend_capabilities.rs::write_capability_key`).
+    //
+    // Env-fallback for the key path is handled inside the rustls config
+    // builder (`BackendTlsConfigBuilder::load_client_auth`) — `EnvConfig`
+    // is global per gateway instance, so any proxy that omits both
+    // `proxy.resolved_tls.client_cert_path` and `client_key_path` shares
+    // the same effective env fallback and is correctly equal-keyed here.
+    buf.push_str(
+        proxy
+            .resolved_tls
+            .client_key_path
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    buf.push('|');
     buf.push(if proxy.resolved_tls.verify_server_cert {
         '1'
     } else {
@@ -1188,6 +1209,141 @@ mod tests {
         assert_eq!(
             classify_http2_pool_error(&err),
             crate::retry::ErrorClass::ConnectionRefused
+        );
+    }
+
+    /// Build a minimal `Proxy` for pool-key testing. The non-TLS fields are
+    /// fixed; only `resolved_tls` varies between the per-test fixtures so the
+    /// assertion isolates the segment we care about.
+    fn proxy_for_pool_key(
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
+    ) -> crate::config::types::Proxy {
+        use crate::config::types::{
+            AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy,
+        };
+        use chrono::Utc;
+        Proxy {
+            id: "test".into(),
+            namespace: crate::config::types::default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/test".to_string()),
+            backend_scheme: Some(BackendScheme::Https),
+            dispatch_kind: DispatchKind::from(BackendScheme::Https),
+            backend_host: "backend.example.com".into(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5000,
+            backend_read_timeout_ms: 30000,
+            backend_write_timeout_ms: 30000,
+            backend_tls_client_cert_path: client_cert_path.map(str::to_string),
+            backend_tls_client_key_path: client_key_path.map(str::to_string),
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig {
+                client_cert_path: client_cert_path.map(str::to_string),
+                client_key_path: client_key_path.map(str::to_string),
+                server_ca_cert_path: None,
+                verify_server_cert: true,
+            },
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            pool_tcp_keepalive_seconds: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: Default::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Two proxies sharing the same `client_cert_path` but with distinct
+    /// `client_key_path` values must NOT collide on the same H2 pool entry.
+    /// Without `client_key_path` in the key, the second proxy silently reuses
+    /// the first proxy's rustls client config (wrong private key for the
+    /// handshake). Mirrors the H3 pool key contract in
+    /// `src/http3/client.rs::write_pool_key_with_host`.
+    #[test]
+    fn h2_pool_key_distinguishes_client_key_path() {
+        let proxy_a = proxy_for_pool_key(Some("/etc/certs/shared.pem"), Some("/etc/keys/k1.pem"));
+        let proxy_b = proxy_for_pool_key(Some("/etc/certs/shared.pem"), Some("/etc/keys/k2.pem"));
+
+        let mut key_a = String::new();
+        write_http2_pool_key(
+            &mut key_a,
+            &proxy_a.backend_host,
+            proxy_a.backend_port,
+            &proxy_a,
+        );
+        let mut key_b = String::new();
+        write_http2_pool_key(
+            &mut key_b,
+            &proxy_b.backend_host,
+            proxy_b.backend_port,
+            &proxy_b,
+        );
+
+        assert_ne!(
+            key_a, key_b,
+            "H2 pool key must differentiate proxies with the same cert but \
+             different client key paths — got identical key {:?}",
+            key_a
+        );
+    }
+
+    /// Backwards-compat: when neither cert nor key is set, the new key-path
+    /// segment is the empty string and non-mTLS proxies still share the same
+    /// pool entry. Guards against accidentally fragmenting the pool for the
+    /// most common (no-mTLS) configuration.
+    #[test]
+    fn h2_pool_key_unchanged_when_no_mtls_configured() {
+        let proxy_a = proxy_for_pool_key(None, None);
+        let proxy_b = proxy_for_pool_key(None, None);
+
+        let mut key_a = String::new();
+        write_http2_pool_key(
+            &mut key_a,
+            &proxy_a.backend_host,
+            proxy_a.backend_port,
+            &proxy_a,
+        );
+        let mut key_b = String::new();
+        write_http2_pool_key(
+            &mut key_b,
+            &proxy_b.backend_host,
+            proxy_b.backend_port,
+            &proxy_b,
+        );
+
+        assert_eq!(
+            key_a, key_b,
+            "Two no-mTLS H2 proxies must share a pool entry — fragmentation \
+             would destroy connection reuse"
         );
     }
 }

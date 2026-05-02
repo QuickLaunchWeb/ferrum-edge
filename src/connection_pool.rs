@@ -161,6 +161,27 @@ impl PoolManager for ReqwestPoolManager {
                 .unwrap_or_default(),
         );
         buf.push('|');
+        // The client *key* path is part of connection identity for the same
+        // reason as the cert path: two proxies that share `client_cert_path`
+        // but use different `client_key_path` produce different rustls client
+        // configs. Without this segment they collide on the same pool entry
+        // and the second proxy's handshake silently uses the first proxy's
+        // private key. Mirrors the H3 pool key
+        // (`src/http3/client.rs::write_pool_key_with_host`) and the backend
+        // capability registry key
+        // (`src/proxy/backend_capabilities.rs::write_capability_key`).
+        buf.push_str(
+            proxy
+                .resolved_tls
+                .client_key_path
+                .as_deref()
+                .or(self
+                    .global_env_config
+                    .backend_tls_client_key_path
+                    .as_deref())
+                .unwrap_or_default(),
+        );
+        buf.push('|');
         let verify = proxy.resolved_tls.verify_server_cert && !self.global_env_config.tls_no_verify;
         buf.push(if verify { '1' } else { '0' });
     }
@@ -221,8 +242,8 @@ impl ConnectionPool {
     /// `warmup_connection_pools` composes this with the per-target
     /// `host:port` to dedup reqwest HEAD warmup tasks. Including the
     /// pool key (which carries the TLS-aware client identity:
-    /// `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{verify}`) in
-    /// the dedup means proxies that share `(scheme, host, port)` but
+    /// `{dest}|{proto}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{verify}`)
+    /// in the dedup means proxies that share `(scheme, host, port)` but
     /// have divergent TLS configs each get their own warmup task —
     /// matching the fact that they end up with separate
     /// `reqwest::Client`s at runtime.
@@ -318,5 +339,214 @@ impl std::fmt::Display for PoolStats {
             writeln!(f, "    {}: {}", host, count)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for the private `ReqwestPoolManager::build_key` helper.
+    //!
+    //! `build_key` is a `PoolManager` trait impl on a private struct, so it
+    //! cannot be exercised from `tests/`. The cases below pin the
+    //! connection-identity contract documented in CLAUDE.md ("Connection
+    //! Pool Keys"): every TLS field that affects the rustls handshake — and
+    //! in particular `client_key_path` — must produce a distinct key.
+    use super::*;
+    use crate::config::EnvConfig;
+    use crate::config::types::{
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, default_namespace,
+    };
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::pool::PoolManager;
+    use chrono::Utc;
+
+    fn proxy_for_pool_key(client_cert_path: Option<&str>, client_key_path: Option<&str>) -> Proxy {
+        Proxy {
+            id: "test".into(),
+            namespace: default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/test".to_string()),
+            backend_scheme: Some(BackendScheme::Https),
+            dispatch_kind: DispatchKind::from(BackendScheme::Https),
+            backend_host: "backend.example.com".into(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5000,
+            backend_read_timeout_ms: 30000,
+            backend_write_timeout_ms: 30000,
+            backend_tls_client_cert_path: client_cert_path.map(str::to_string),
+            backend_tls_client_key_path: client_key_path.map(str::to_string),
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig {
+                client_cert_path: client_cert_path.map(str::to_string),
+                client_key_path: client_key_path.map(str::to_string),
+                server_ca_cert_path: None,
+                verify_server_cert: true,
+            },
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            pool_tcp_keepalive_seconds: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: Default::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn manager_with_env(env_config: EnvConfig) -> ReqwestPoolManager {
+        ReqwestPoolManager {
+            global_config: PoolConfig::default(),
+            global_env_config: env_config,
+            dns_cache: DnsCache::new(DnsConfig::default()),
+            tls_policy: None,
+            crls: Arc::new(Vec::new()),
+            backend_h3_tls_configs: BackendTlsConfigCache::new(),
+        }
+    }
+
+    /// Two proxies sharing the same `client_cert_path` but with distinct
+    /// `client_key_path` values must NOT collide on the same reqwest pool
+    /// entry. Without `client_key_path` in the key, the second proxy
+    /// silently reuses the first proxy's reqwest::Client (wrong private
+    /// key for the rustls handshake). Mirrors the H3 pool key contract in
+    /// `src/http3/client.rs::write_pool_key_with_host`.
+    #[test]
+    fn http1_pool_key_distinguishes_client_key_path() {
+        let manager = manager_with_env(EnvConfig::default());
+        let proxy_a = proxy_for_pool_key(Some("/etc/certs/shared.pem"), Some("/etc/keys/k1.pem"));
+        let proxy_b = proxy_for_pool_key(Some("/etc/certs/shared.pem"), Some("/etc/keys/k2.pem"));
+
+        let mut key_a = String::new();
+        manager.build_key(
+            &proxy_a,
+            &proxy_a.backend_host,
+            proxy_a.backend_port,
+            0,
+            &mut key_a,
+        );
+        let mut key_b = String::new();
+        manager.build_key(
+            &proxy_b,
+            &proxy_b.backend_host,
+            proxy_b.backend_port,
+            0,
+            &mut key_b,
+        );
+
+        assert_ne!(
+            key_a, key_b,
+            "HTTP/1.1 pool key must differentiate proxies with the same cert \
+             but different client key paths — got identical key {:?}",
+            key_a
+        );
+    }
+
+    /// Env-fallback parity with the cert path: when a proxy leaves
+    /// `client_key_path` unset and only the global env var differs, the keys
+    /// must split. The HTTP/1.1 builder threads `EnvConfig::backend_tls_client_key_path`
+    /// through `build_key` for exactly this reason — same as the cert path.
+    /// Two managers with different env keys but otherwise-identical state
+    /// must produce distinct pool keys for the same proxy.
+    #[test]
+    fn http1_pool_key_distinguishes_env_client_key_path() {
+        let env_a = EnvConfig {
+            backend_tls_client_cert_path: Some("/etc/certs/shared.pem".into()),
+            backend_tls_client_key_path: Some("/etc/keys/k1.pem".into()),
+            ..EnvConfig::default()
+        };
+        let env_b = EnvConfig {
+            backend_tls_client_cert_path: Some("/etc/certs/shared.pem".into()),
+            backend_tls_client_key_path: Some("/etc/keys/k2.pem".into()),
+            ..EnvConfig::default()
+        };
+
+        let manager_a = manager_with_env(env_a);
+        let manager_b = manager_with_env(env_b);
+        let proxy = proxy_for_pool_key(None, None);
+
+        let mut key_a = String::new();
+        manager_a.build_key(
+            &proxy,
+            &proxy.backend_host,
+            proxy.backend_port,
+            0,
+            &mut key_a,
+        );
+        let mut key_b = String::new();
+        manager_b.build_key(
+            &proxy,
+            &proxy.backend_host,
+            proxy.backend_port,
+            0,
+            &mut key_b,
+        );
+
+        assert_ne!(
+            key_a, key_b,
+            "HTTP/1.1 pool key must include the env-fallback client_key_path \
+             — got identical key {:?}",
+            key_a
+        );
+    }
+
+    /// Backwards-compat: when neither proxy nor env sets a cert/key path,
+    /// the new key-path segment is the empty string and non-mTLS proxies
+    /// still share the same pool entry. Guards against accidentally
+    /// fragmenting the pool for the most common (no-mTLS) configuration.
+    #[test]
+    fn http1_pool_key_unchanged_when_no_mtls_configured() {
+        let manager = manager_with_env(EnvConfig::default());
+        let proxy_a = proxy_for_pool_key(None, None);
+        let proxy_b = proxy_for_pool_key(None, None);
+
+        let mut key_a = String::new();
+        manager.build_key(
+            &proxy_a,
+            &proxy_a.backend_host,
+            proxy_a.backend_port,
+            0,
+            &mut key_a,
+        );
+        let mut key_b = String::new();
+        manager.build_key(
+            &proxy_b,
+            &proxy_b.backend_host,
+            proxy_b.backend_port,
+            0,
+            &mut key_b,
+        );
+
+        assert_eq!(
+            key_a, key_b,
+            "Two no-mTLS HTTP/1.1 proxies must share a pool entry — \
+             fragmentation would destroy connection reuse"
+        );
     }
 }

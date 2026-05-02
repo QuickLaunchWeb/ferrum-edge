@@ -122,17 +122,17 @@ async fn connection_pool_key_direct_backend_format() {
     let pool = pool_with_defaults();
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
-    // Direct backend: d=host:port|protocol|dns|ca|mtls|verify
+    // Direct backend: d=host:port|protocol|dns|ca|mtls_cert|mtls_key|verify
     assert!(
         key.starts_with("d=backend.example.com:8080|"),
         "key should start with d= prefix: {key}"
     );
     // BackendScheme::Http = 0
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
-    // No DNS override, no CA, no mTLS, verify=true (1)
+    // No DNS override, no CA, no mTLS cert, no mTLS key, verify=true (1)
     assert!(
-        key.ends_with("|||1"),
-        "key should end with empty dns/ca/mtls and verify=1: {key}"
+        key.ends_with("||||1"),
+        "key should end with empty dns/ca/mtls_cert/mtls_key and verify=1: {key}"
     );
 }
 
@@ -222,9 +222,10 @@ async fn connection_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
+    // Shape: dest|proto|dns|ca|mtls_cert|mtls_key|verify = 7 fields → 6 pipes.
     assert_eq!(
-        pipe_count, 5,
-        "6 fields need 5 pipe delimiters, got {pipe_count} in key: {key}"
+        pipe_count, 6,
+        "7 fields need 6 pipe delimiters, got {pipe_count} in key: {key}"
     );
 }
 
@@ -374,9 +375,9 @@ async fn connection_pool_key_policy_fields_do_not_fragment() {
 fn h2_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
-    // Format: host|port|dns|ca|mtls|verify
+    // Format: host|port|dns|ca|mtls_cert|mtls_key|verify
     assert_eq!(
-        key, "backend.example.com|8080||||1",
+        key, "backend.example.com|8080|||||1",
         "basic H2 key format mismatch"
     );
 }
@@ -470,9 +471,10 @@ fn h2_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
+    // Shape: host|port|dns|ca|mtls_cert|mtls_key|verify = 7 fields → 6 pipes.
     assert_eq!(
-        pipe_count, 5,
-        "6 fields need 5 pipe delimiters in H2 key, got {pipe_count}: {key}"
+        pipe_count, 6,
+        "7 fields need 6 pipe delimiters in H2 key, got {pipe_count}: {key}"
     );
 }
 
@@ -621,7 +623,9 @@ async fn connection_pool_key_no_upstream_vs_upstream_namespace_collision() {
 
 #[tokio::test]
 async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
-    // Both pools must use | as delimiter for IPv6 safety
+    // Both pools must use | as delimiter for IPv6 safety, and (post-fix
+    // for the client_key_path collision) both share the same 7-field shape:
+    //   {dest|host}|...|mtls_cert|mtls_key|verify = 7 fields → 6 pipes.
     let pool = pool_with_defaults();
     let proxy = minimal_proxy();
 
@@ -631,7 +635,7 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
     // Neither should contain field-level colons (only in host:port which is expected)
     for key in [&conn_key, &h2_key] {
         let pipe_count = key.chars().filter(|c| *c == '|').count();
-        assert_eq!(pipe_count, 5, "key should use | as delimiter: {key}");
+        assert_eq!(pipe_count, 6, "key should use | as delimiter: {key}");
     }
 }
 
