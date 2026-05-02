@@ -25,6 +25,7 @@ mod functional_logging_plugins_test;
 mod functional_logging_test;
 mod functional_migrate_mode_test;
 mod functional_mongodb_test;
+mod functional_mtls_acl_test;
 mod functional_mtls_test;
 mod functional_namespace_test;
 mod functional_otel_ldap_test;
