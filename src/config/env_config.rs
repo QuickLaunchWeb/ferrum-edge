@@ -239,7 +239,8 @@ pub struct EnvConfig {
     pub db_tls_insecure: bool,
 
     // Database TLS/SSL
-    /// SSL mode for database connections (e.g., disable, prefer, require, verify-ca, verify-full)
+    /// SSL mode for database connections (e.g., disable, prefer, require, verify-ca, verify-full;
+    /// PostgreSQL also supports allow)
     pub db_ssl_mode: Option<String>,
     /// Path to CA certificate for database server verification
     pub db_ssl_root_cert: Option<String>,
@@ -964,7 +965,7 @@ impl Default for EnvConfig {
             db_failover_urls: Vec::new(),
             db_read_replica_url: None,
             db_slow_query_threshold_ms: None,
-            db_pool_max_connections: 10,
+            db_pool_max_connections: 32,
             db_pool_min_connections: 1,
             db_pool_acquire_timeout_seconds: 30,
             db_pool_idle_timeout_seconds: 600,
@@ -1200,7 +1201,7 @@ impl EnvConfig {
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
             db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
-            db_pool_max_connections: u32 = "FERRUM_DB_POOL_MAX_CONNECTIONS" => 10u32, max(1u32);
+            db_pool_max_connections: u32 = "FERRUM_DB_POOL_MAX_CONNECTIONS" => 32u32, max(1u32);
             db_pool_min_connections: u32 = "FERRUM_DB_POOL_MIN_CONNECTIONS" => 1u32;
             db_pool_acquire_timeout_seconds: u64 = "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS" => 30u64;
             db_pool_idle_timeout_seconds: u64 = "FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS" => 600u64;

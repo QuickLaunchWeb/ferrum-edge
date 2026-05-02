@@ -108,7 +108,7 @@ pub struct DbPoolConfig {
 impl Default for DbPoolConfig {
     fn default() -> Self {
         Self {
-            max_connections: 10,
+            max_connections: 32,
             min_connections: 1,
             acquire_timeout_seconds: 30,
             idle_timeout_seconds: 600,

@@ -64,7 +64,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
 | `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS |
 | `FERRUM_DB_TLS_INSECURE` | No | `false` | Skip certificate verification for database TLS (testing only) |
-| `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode. PostgreSQL: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; MySQL: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
 | `FERRUM_DB_SSL_ROOT_CERT` | No | — | Path to CA certificate for database server verification |
 | `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
 | `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
@@ -77,7 +77,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_DB_POOL_MAX_CONNECTIONS` | No | `10` | Maximum SQL pool connections |
+| `FERRUM_DB_POOL_MAX_CONNECTIONS` | No | `32` | Maximum SQL pool connections |
 | `FERRUM_DB_POOL_MIN_CONNECTIONS` | No | `1` | Minimum idle SQL pool connections |
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | No | `30` | Max wait for a pool connection |
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |

@@ -6,7 +6,7 @@ Ferrum Edge supports TLS-encrypted connections to PostgreSQL, MySQL, and MongoDB
 
 | Database   | TLS Support | SSL Mode Values                                         | mTLS (Client Certs) |
 |------------|-------------|---------------------------------------------------------|----------------------|
-| PostgreSQL | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
+| PostgreSQL | Yes         | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
 | MySQL      | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
 | MongoDB    | Yes         | Via `FERRUM_DB_TLS_*` env vars or connection string options | Yes                  |
 | SQLite     | N/A         | All SSL settings silently ignored                       | N/A                  |
@@ -26,6 +26,8 @@ Uses `FERRUM_DB_SSL_*` environment variables that map directly to database drive
 | `FERRUM_DB_SSL_CLIENT_CERT`| Path to client certificate for mutual TLS                        | `/etc/ferrum/certs/client.crt` |
 | `FERRUM_DB_SSL_CLIENT_KEY` | Path to client private key for mutual TLS                        | `/etc/ferrum/certs/client.key` |
 
+When `FERRUM_DB_SSL_MODE` and `FERRUM_DB_TLS_ENABLED` are both unset, Ferrum does not append database TLS parameters. SQLx then uses its driver default for PostgreSQL/MySQL: opportunistic TLS (`prefer`/`PREFERRED`) with no certificate or hostname verification and plaintext fallback if TLS cannot be negotiated. Set `FERRUM_DB_SSL_MODE=verify-full` plus the right CA path for production network databases.
+
 These variables are appended to the `FERRUM_DB_URL` connection string as query parameters. The gateway automatically translates them into the correct format for each database:
 
 **PostgreSQL** — appended as `sslmode=X&sslrootcert=Y&sslcert=Z&sslkey=W`
@@ -36,6 +38,19 @@ These variables are appended to the `FERRUM_DB_URL` connection string as query p
 - `require` → `REQUIRED`
 - `verify-ca` → `VERIFY_CA`
 - `verify-full` → `VERIFY_IDENTITY`
+
+`FERRUM_DB_SSL_MODE` supports the following backend-specific values:
+
+| Ferrum value | PostgreSQL query parameter | MySQL query parameter | Encryption | CA validation | Hostname validation | Under-the-hood behavior |
+|--------------|----------------------------|-----------------------|------------|---------------|---------------------|-------------------------|
+| `disable` | `sslmode=disable` | `ssl-mode=DISABLED` | No | No | No | Opens only plaintext connections. Use only for local development or trusted local sockets. |
+| `allow` | `sslmode=allow` | N/A | Maybe | No | No | PostgreSQL-only. Tries plaintext first, then retries TLS if plaintext fails. Not a production-safe setting. |
+| `prefer` | `sslmode=prefer` | `ssl-mode=PREFERRED` | Maybe | No | No | Tries TLS first, but may fall back to plaintext when the server does not support TLS. This is driver-default behavior when no mode is set. |
+| `require` | `sslmode=require` | `ssl-mode=REQUIRED` | Yes | No | No | Requires an encrypted connection but does not verify the server certificate or hostname. Useful only when another control plane already authenticates the database endpoint. |
+| `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | Yes | Yes | No | Requires TLS and verifies that the certificate chains to the configured CA, but does not verify the requested hostname. |
+| `verify-full` | `sslmode=verify-full` | `ssl-mode=VERIFY_IDENTITY` | Yes | Yes | Yes | Requires TLS, validates the CA chain, and verifies the requested hostname. This is the recommended production mode. |
+
+SQLite ignores all `FERRUM_DB_SSL_*` variables. MongoDB does not use `FERRUM_DB_SSL_MODE`; configure MongoDB TLS with `FERRUM_DB_TLS_*` variables or connection string options.
 
 ### Approach 2: Legacy TLS Configuration
 
@@ -333,13 +348,14 @@ export FERRUM_DB_URL="sqlite:///data/ferrum.db?mode=rwc"
 
 ## SSL Mode Reference
 
-| Mode          | Encrypted | Server Cert Verified | Hostname Verified | Use Case                         |
-|---------------|-----------|----------------------|-------------------|----------------------------------|
-| `disable`     | No        | No                   | No                | Development only                 |
-| `prefer`      | Maybe     | No                   | No                | Development (uses TLS if server supports it) |
-| `require`     | Yes       | No                   | No                | Private networks, testing        |
-| `verify-ca`   | Yes       | Yes                  | No                | Trusted CA, dynamic hostnames    |
-| `verify-full` | Yes       | Yes                  | Yes               | **Production (recommended)**     |
+| Mode          | PostgreSQL | MySQL | Encrypted | Server Cert Verified | Hostname Verified | Use Case                         |
+|---------------|------------|-------|-----------|----------------------|-------------------|----------------------------------|
+| `disable`     | Yes        | Yes   | No        | No                   | No                | Development only                 |
+| `allow`       | Yes        | No    | Maybe     | No                   | No                | PostgreSQL-only compatibility mode |
+| `prefer`      | Yes        | Yes   | Maybe     | No                   | No                | Development (uses TLS if server supports it) |
+| `require`     | Yes        | Yes   | Yes       | No                   | No                | Private networks, testing        |
+| `verify-ca`   | Yes        | Yes   | Yes       | Yes                  | No                | Trusted CA, dynamic hostnames    |
+| `verify-full` | Yes        | Yes   | Yes       | Yes                  | Yes               | **Production (recommended)**     |
 
 ## Managed Database Services
 

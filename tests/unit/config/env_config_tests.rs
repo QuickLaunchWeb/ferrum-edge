@@ -2558,7 +2558,7 @@ fn test_env_config_db_pool_defaults() {
             remove_var("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS");
 
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.db_pool_max_connections, 10);
+            assert_eq!(config.db_pool_max_connections, 32);
             assert_eq!(config.db_pool_min_connections, 1);
             assert_eq!(config.db_pool_acquire_timeout_seconds, 30);
             assert_eq!(config.db_pool_idle_timeout_seconds, 600);

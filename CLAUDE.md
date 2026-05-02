@@ -62,7 +62,7 @@ PRs: format check → tests (parallel) → lint → perf regression → build 5 
 
 **Admin JWT asymmetry (intentional)**: the admin API only *validates* JWTs — it never mints them (operators pre-sign tokens externally). DB/CP require `FERRUM_ADMIN_JWT_SECRET` (≥32 chars) because their R/W admin API needs a stable, known secret so operator-minted tokens stay valid across instances and restarts. File mode is read-only, so it generates a random secret at startup — externally crafted tokens can never validate.
 
-**`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 10). Do not remove. Response includes `database.pool` stats when connected.
+**`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 32). Do not remove. Response includes `database.pool` stats when connected.
 
 **`GET /cluster`** (JWT-auth): CP returns connected DPs (from `DpNodeRegistry`, auto-removed on stream drop via `TrackedStream`); DP returns CP connection state (from `DpCpConnectionState`, primary vs fallback, `last_config_received_at`).
 
@@ -484,7 +484,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)
-- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_POOL_MAX_CONNECTIONS` (10, bump for CP)
+- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_POOL_MAX_CONNECTIONS` (32, bump for large CP)
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)
