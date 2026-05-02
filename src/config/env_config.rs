@@ -98,15 +98,16 @@ impl DbTlsMode {
         }
     }
 
-    fn mysql_value(self) -> Option<&'static str> {
+    fn mysql_value(self) -> &'static str {
         match self {
-            Self::Disable => Some("DISABLED"),
-            Self::Prefer => Some("PREFERRED"),
-            Self::Require => Some("REQUIRED"),
-            Self::VerifyCa => Some("VERIFY_CA"),
-            Self::VerifyFull => Some("VERIFY_IDENTITY"),
-            // Validation rejects PostgreSQL-only `allow` for MySQL.
-            Self::Allow => None,
+            Self::Disable => "DISABLED",
+            Self::Prefer => "PREFERRED",
+            Self::Require => "REQUIRED",
+            Self::VerifyCa => "VERIFY_CA",
+            Self::VerifyFull => "VERIFY_IDENTITY",
+            Self::Allow => unreachable!(
+                "FERRUM_DB_TLS_MODE=allow is PostgreSQL-only and must be rejected before MySQL TLS URL construction"
+            ),
         }
     }
 
@@ -1861,7 +1862,7 @@ impl EnvConfig {
                 }
             }
             "mysql" => {
-                let mysql_mode = mode.mysql_value()?;
+                let mysql_mode = mode.mysql_value();
                 params.push(format!("ssl-mode={}", mysql_mode));
                 if mode.enables_tls() {
                     if matches!(mode, DbTlsMode::VerifyCa | DbTlsMode::VerifyFull)
