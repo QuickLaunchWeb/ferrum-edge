@@ -65,7 +65,7 @@ pub struct PoolConfig {
     /// Maximum HTTP/2 frame payload size in bytes.
     /// Larger frames reduce per-frame overhead but increase head-of-line
     /// blocking risk.  Must be between 16_384 (spec minimum) and 1_048_576 (1 MiB).
-    /// Default: 65_535.
+    /// Default: 1_048_576 (1 MiB).
     pub http2_max_frame_size: u32,
 
     /// Maximum number of concurrent HTTP/2 streams the gateway will open
