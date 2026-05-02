@@ -742,7 +742,20 @@ mod inner {
 
         async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            let doc = proxy_to_doc(proxy)?;
+            // Preserve api_spec_id: the incoming Proxy from the admin CRUD
+            // endpoint has api_spec_id: None, but the stored document may
+            // carry an ownership tag from a spec import.  Read it before
+            // replace_one overwrites the document.  SQL is safe because its
+            // UPDATE statement explicitly excludes api_spec_id.
+            let existing_spec_id: Option<String> = self
+                .proxies()
+                .find_one(doc! { "_id": &proxy.id })
+                .await?
+                .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
+            let mut doc = proxy_to_doc(proxy)?;
+            if let Some(sid) = existing_spec_id {
+                doc.insert("api_spec_id", sid);
+            }
             self.proxies()
                 .replace_one(doc! { "_id": &proxy.id }, doc)
                 .await?;
@@ -960,7 +973,16 @@ mod inner {
 
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            let doc = plugin_config_to_doc(pc)?;
+            // Preserve api_spec_id (same rationale as update_proxy above).
+            let existing_spec_id: Option<String> = self
+                .plugin_configs()
+                .find_one(doc! { "_id": &pc.id })
+                .await?
+                .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
+            let mut doc = plugin_config_to_doc(pc)?;
+            if let Some(sid) = existing_spec_id {
+                doc.insert("api_spec_id", sid);
+            }
             self.plugin_configs()
                 .replace_one(doc! { "_id": &pc.id }, doc)
                 .await?;
@@ -1030,7 +1052,16 @@ mod inner {
 
         async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            let doc = upstream_to_doc(upstream)?;
+            // Preserve api_spec_id (same rationale as update_proxy above).
+            let existing_spec_id: Option<String> = self
+                .upstreams()
+                .find_one(doc! { "_id": &upstream.id })
+                .await?
+                .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
+            let mut doc = upstream_to_doc(upstream)?;
+            if let Some(sid) = existing_spec_id {
+                doc.insert("api_spec_id", sid);
+            }
             self.upstreams()
                 .replace_one(doc! { "_id": &upstream.id }, doc)
                 .await?;
@@ -1401,7 +1432,10 @@ mod inner {
             self.plugin_configs().delete_many(ns_filter.clone()).await?;
             self.proxies().delete_many(ns_filter.clone()).await?;
             self.consumers().delete_many(ns_filter.clone()).await?;
-            self.upstreams().delete_many(ns_filter).await?;
+            self.upstreams().delete_many(ns_filter.clone()).await?;
+            // Clear api_specs so restore doesn't leave orphaned spec metadata
+            // pointing to proxies that no longer exist.
+            self.api_specs().delete_many(ns_filter).await?;
             info!("All MongoDB resources deleted (namespace='{}')", namespace);
             Ok(())
         }

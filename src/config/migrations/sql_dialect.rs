@@ -462,7 +462,7 @@ impl V001SqlBuilder {
                 CONSTRAINT fk_api_specs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
             )
             "#
-        } else {
+        } else if self.is_sqlite() {
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (
                 id TEXT PRIMARY KEY,
@@ -471,6 +471,34 @@ impl V001SqlBuilder {
                 spec_version TEXT NOT NULL,
                 spec_format TEXT NOT NULL,
                 spec_content BLOB NOT NULL,
+                content_encoding TEXT NOT NULL DEFAULT 'gzip',
+                uncompressed_size BIGINT NOT NULL,
+                content_hash TEXT NOT NULL,
+                title TEXT,
+                info_version TEXT,
+                description TEXT,
+                contact_name TEXT,
+                contact_email TEXT,
+                license_name TEXT,
+                license_identifier TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                server_urls TEXT NOT NULL DEFAULT '[]',
+                operation_count INTEGER NOT NULL DEFAULT 0,
+                resource_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        } else {
+            // PostgreSQL: BYTEA for binary data (BLOB is not a native PG type).
+            r#"
+            CREATE TABLE IF NOT EXISTS api_specs (
+                id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                spec_version TEXT NOT NULL,
+                spec_format TEXT NOT NULL,
+                spec_content BYTEA NOT NULL,
                 content_encoding TEXT NOT NULL DEFAULT 'gzip',
                 uncompressed_size BIGINT NOT NULL,
                 content_hash TEXT NOT NULL,

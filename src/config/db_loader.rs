@@ -2950,6 +2950,14 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
+        // Delete api_specs BEFORE proxies: the FK cascade (proxy_id → proxies ON
+        // DELETE CASCADE) would handle it, but explicit deletion is clearer and
+        // matches the Mongo path.  Also ensures cleanup even if FK enforcement is
+        // disabled (e.g. SQLite PRAGMA foreign_keys=OFF in recovery scenarios).
+        sqlx::query(&self.q("DELETE FROM api_specs WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ?"))
             .bind(namespace)
             .execute(&mut *tx)
