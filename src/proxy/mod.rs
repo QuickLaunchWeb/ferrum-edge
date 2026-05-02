@@ -492,11 +492,10 @@ pub(crate) fn should_stream_response_body(
 ///
 /// Bypass is safe when:
 ///   * `content-length` is known (we can size-check up-front), AND
-///   * it already fits inside one coalesce target OR it is ≥ 512 KiB
-///     (backend is already emitting large H2 frames — `http2_max_frame_size`
-///     is 1 MiB in our build — so coalescing just adds a
-///     `BytesMut::extend_from_slice` copy that the large-frame bypass at
-///     `body.rs:~1184` would skip anyway), AND
+///   * it is ≥ 512 KiB (backend is already emitting large H2 frames —
+///     `http2_max_frame_size` is 1 MiB in our build — so coalescing just
+///     adds a `BytesMut::extend_from_slice` copy that the large-frame
+///     bypass at `body.rs:~1184` would skip anyway), AND
 ///   * the size fits within `max_response_body_size_bytes` (or the limit
 ///     is disabled). Outside that window we keep the coalescer so any
 ///     upstream size enforcement still wraps the body.
@@ -505,14 +504,12 @@ pub(crate) fn should_stream_response_body(
 /// documents a +35 % gRPC large-payload win from coalescing, so that path
 /// deliberately stays on `CoalescingH2Body`.
 ///
-/// Middle-sized known responses retain the coalescer: they may arrive as
-/// multiple smaller backend frames where downstream write amortisation still
-/// helps. Responses that fit within one target or exceed the large-frame
-/// threshold bypass the copy.
-pub(crate) fn should_bypass_h2_coalesce_for_response(
+/// Threshold is 512 KiB: below that the coalescer's per-frame amortisation
+/// dominates; above that the backend's own frame size already matches or
+/// exceeds the coalesce target of 128 KiB so coalescing is a net copy.
+pub(crate) fn should_bypass_h2_coalesce_for_large_response(
     content_length: Option<u64>,
     max_response_body_size_bytes: usize,
-    h2_coalesce_target_bytes: usize,
 ) -> bool {
     /// Responses smaller than this retain the coalescer — per-frame
     /// writer amortisation still helps the downstream H2 send path.
@@ -523,8 +520,7 @@ pub(crate) fn should_bypass_h2_coalesce_for_response(
     };
     let within_limit =
         max_response_body_size_bytes == 0 || len <= max_response_body_size_bytes as u64;
-    let already_within_one_coalesce_frame = len <= h2_coalesce_target_bytes as u64;
-    within_limit && (already_within_one_coalesce_frame || len >= LARGE_H2_BYPASS_THRESHOLD)
+    len >= LARGE_H2_BYPASS_THRESHOLD && within_limit
 }
 
 fn warn_if_h3_backend_tls_policy_incompatible(
@@ -7656,25 +7652,30 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            // Plain-HTTPS direct-H2 known-size fast path.
+            // Plain-HTTPS direct-H2 large-response fast path.
             //
-            // Responses that already fit in one coalesce target do not need
-            // a BytesMut staging copy. Large responses (>= 512 KiB) also
-            // bypass because backend H2 frames are already large enough that
-            // coalescing only adds a copy before the large-frame bypass in
-            // `body.rs` would return the original frame anyway.
+            // The backend's H2 writer already emits `http2_max_frame_size`
+            // chunks (default 1 MiB). For small/medium responses the
+            // coalescer usefully amortises the per-frame write cost on
+            // the downstream client side; but for large responses
+            // (>= 512 KiB) the backend frames are already big enough that
+            // coalescing them into 128 KiB target chunks just adds a
+            // `BytesMut::extend_from_slice` copy before the pre-existing
+            // large-frame bypass at `body.rs:~1184` would skip it anyway.
+            // That copy was the remaining gap for 5 MB HTTP/2 throughput
+            // (81 RPS vs direct 232 RPS).
             //
             // Decision made ONCE per response using `content-length` — we
-            // only bypass when the size is known. Unknown CL keeps the
-            // coalescer because it may also be the size-enforcement path.
+            // only bypass when the size is known AND large. Unknown CL
+            // keeps the coalescer (we cannot be sure frames are already
+            // 1 MiB when the backend is chunked).
             //
             // gRPC still uses the coalescing path (see gRPC streaming
             // response at ~line 5905) because gRPC's +35 % large-payload
             // win is documented in CLAUDE.md and depends on coalescing.
-            let use_passthrough = should_bypass_h2_coalesce_for_response(
+            let use_passthrough = should_bypass_h2_coalesce_for_large_response(
                 cl,
                 state.max_response_body_size_bytes,
-                state.h2_coalesce_target_bytes,
             );
 
             if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
@@ -10723,7 +10724,7 @@ mod tests {
         );
     }
 
-    // ── Fix 5: `should_bypass_h2_coalesce_for_response` ───────────
+    // ── Fix 5: `should_bypass_h2_coalesce_for_large_response` ───────────
     // Validates the per-response decision that steers plain-HTTPS
     // direct-H2 responses away from `CoalescingH2Body` when the
     // backend is already emitting large frames (response >= 512 KiB).
@@ -10731,52 +10732,32 @@ mod tests {
     #[test]
     fn h2_coalesce_bypass_skips_large_known_length_when_unlimited() {
         // 1 MiB response, no cap → bypass.
-        assert!(super::should_bypass_h2_coalesce_for_response(
+        assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(1_048_576),
             0,
-            131_072,
         ));
     }
 
     #[test]
     fn h2_coalesce_bypass_skips_exactly_at_threshold() {
         // Threshold is 512 KiB; exactly 512 KiB should qualify (>=, not >).
-        assert!(super::should_bypass_h2_coalesce_for_response(
+        assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(512 * 1024),
             0,
-            131_072,
         ));
     }
 
     #[test]
-    fn h2_coalesce_bypass_skips_one_coalesce_frame_response() {
-        // A response that already fits within one coalesce target can stream direct.
-        assert!(super::should_bypass_h2_coalesce_for_response(
+    fn h2_coalesce_bypass_keeps_coalescer_for_small_response() {
+        // Under 512 KiB → coalescer still wins.
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(64 * 1024),
             0,
-            131_072,
         ));
-        // 256 KiB is above one target but still under the large-frame threshold.
-        assert!(!super::should_bypass_h2_coalesce_for_response(
+        // 256 KiB is still under threshold.
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(256 * 1024),
             0,
-            131_072,
-        ));
-    }
-
-    #[test]
-    fn h2_coalesce_bypass_boundary_at_coalesce_target() {
-        // Exactly one coalesce target → bypass (no benefit from staging).
-        assert!(super::should_bypass_h2_coalesce_for_response(
-            Some(131_072),
-            0,
-            131_072,
-        ));
-        // One byte over → mid-band, keep coalescer.
-        assert!(!super::should_bypass_h2_coalesce_for_response(
-            Some(131_073),
-            0,
-            131_072,
         ));
     }
 
@@ -10785,16 +10766,15 @@ mod tests {
         // Chunked / unknown length → keep coalescer. We cannot assume
         // frames are already large when the backend has not told us
         // the total size.
-        assert!(!super::should_bypass_h2_coalesce_for_response(
-            None, 0, 131_072
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
+            None, 0
         ));
         // Same with a size limit configured — unknown length still
         // retains the coalescer, which is the size-enforcement
         // pathway when CL is absent.
-        assert!(!super::should_bypass_h2_coalesce_for_response(
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
             None,
             10 * 1024 * 1024,
-            131_072,
         ));
     }
 
@@ -10805,10 +10785,9 @@ mod tests {
         // the body itself is larger than the threshold. (The upstream
         // admission check should reject CL > limit earlier, but the
         // decision layer is defensive.)
-        assert!(!super::should_bypass_h2_coalesce_for_response(
+        assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(5 * 1024 * 1024),
             2 * 1024 * 1024,
-            131_072,
         ));
     }
 
@@ -10816,10 +10795,9 @@ mod tests {
     fn h2_coalesce_bypass_allows_response_exactly_at_size_limit() {
         // Limit is 1 MiB, response is exactly 1 MiB — inclusive, so
         // bypass is allowed.
-        assert!(super::should_bypass_h2_coalesce_for_response(
+        assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(1024 * 1024),
             1024 * 1024,
-            131_072,
         ));
     }
 
