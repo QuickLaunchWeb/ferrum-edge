@@ -1253,6 +1253,7 @@ impl ProxyState {
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.tcp_half_close_max_wait_seconds,
+            env_config_arc.frontend_tls_handshake_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
             tls_policy_arc.clone(),
@@ -4683,16 +4684,14 @@ async fn handle_tls_connection(
     set_tcp_keepalive(&stream);
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(stream) => {
-            info!("TLS connection established from {}", remote_addr.ip());
-            stream
-        }
-        Err(e) => {
-            warn!("TLS handshake failed from {}: {}", remote_addr.ip(), e);
-            return Err(e.into());
-        }
-    };
+    let tls_stream = crate::tls::accept_with_optional_timeout(
+        &acceptor,
+        stream,
+        state.env_config.frontend_tls_handshake_timeout_seconds,
+        &remote_addr,
+    )
+    .await?;
+    info!("TLS connection established from {}", remote_addr.ip());
 
     // Extract peer certificate and chain before wrapping the stream.
     // This is the only point where the ServerConnection is accessible — once
@@ -5380,6 +5379,14 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    if let Some(error_body) =
+        check_host_authority_consistency(req.headers(), req.uri(), req.version())
+    {
+        warn!("Rejected request: {}", error_body);
+        record_request(&state, 400);
+        return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
+    }
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     // TRACE echoes request headers (including cookies and auth tokens) in the
     // response body, which can be exploited to steal credentials.
@@ -5523,17 +5530,23 @@ async fn handle_proxy_request_inner(
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
     // (exposed via req.uri().authority()). Strip port if present and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let request_host: Option<String> = ctx
+    let raw_host = ctx
         .raw_header_get("host")
-        .or_else(|| req.uri().authority().map(|a| a.as_str()))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
-            // DNS treats "example.com." and "example.com" as identical, so routing
-            // must normalize to prevent host-matching bypasses.
-            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
-            normalized.to_lowercase()
-        });
+        .or_else(|| req.uri().authority().map(|a| a.as_str()));
+    let request_host: Option<String> = match raw_host {
+        Some(h) => match normalize_request_host_for_routing(h) {
+            Some(normalized) => Some(normalized),
+            None => {
+                warn!("Rejected request: malformed Host/authority value");
+                record_request(&state, 400);
+                return Ok(build_response(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request contains malformed Host or authority"}"#,
+                ));
+            }
+        },
+        None => None,
+    };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
@@ -9058,6 +9071,192 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+fn is_valid_reg_name(host: &str) -> bool {
+    // RFC 3986 reg-name minus comma. Comma is technically a sub-delim, but it
+    // is also the HTTP list separator (Content-Length, TE, etc.), so accepting
+    // it inside a hostname invites parser-differential mistakes between routing
+    // and any code that splits authority-derived strings on commas later.
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._%~!$&'()*+;=".contains(&b))
+}
+
+/// RFC 3986 IP-literal contents validator: accept IPv6address or IPvFuture
+/// inside `[...]`. Without this, `Host: []` and `Host: [not-an-ip]` would
+/// normalize to opaque strings and fall through to the catch-all routing
+/// tier — bypassing host-scoped routes for a malformed authority.
+fn is_valid_ip_literal_contents(content: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    if content.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    // IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+    //
+    // Note: this validator accepts comma in the `addr` segment because RFC 3986
+    // lists comma as a sub-delim. `is_valid_reg_name` rejects comma instead, to
+    // avoid the HTTP list-separator parser-differential. The asymmetry is
+    // intentional and safe here because IPvFuture content is always wrapped in
+    // `[...]` — downstream code that splits an authority string on commas will
+    // treat the bracketed segment as opaque, so a comma inside cannot be
+    // smuggled out as a second list element the way it could in a bare host.
+    let rest = match content.as_bytes().first() {
+        Some(b'v') | Some(b'V') => &content[1..],
+        _ => return false,
+    };
+    let Some((hex, addr)) = rest.split_once('.') else {
+        return false;
+    };
+    !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && !addr.is_empty()
+        && addr
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b))
+}
+
+/// Validate an authority port suffix: ASCII digits only and within `u16` range.
+///
+/// Without the range check, values like `host:9999999999` parse as a valid
+/// authority because the only previous gate was `is_ascii_digit()`. The TCP
+/// port space is `0..=65535`; anything larger is broken-client territory and
+/// should be rejected at admission so it never reaches routing or backend
+/// dispatch where the same string would be re-parsed and fail with a
+/// less-specific error.
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
+}
+
+fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('@') {
+        return None;
+    }
+
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        // Reject brackets that don't enclose a valid IPv6address/IPvFuture.
+        // RFC 3986 §3.2.2: bracketed authorities exist solely to disambiguate
+        // IP-literal hosts from port colons; opaque content like `[]` or
+        // `[not-an-ip]` is malformed authority syntax.
+        if !is_valid_ip_literal_contents(&value[1..end]) {
+            return None;
+        }
+        let host = &value[..=end];
+        let suffix = &value[end + 1..];
+        if suffix.is_empty() {
+            return Some((host, None));
+        }
+        if let Some(port) = suffix.strip_prefix(':')
+            && is_valid_port(port)
+        {
+            return Some((host, Some(port)));
+        }
+        return None;
+    }
+
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            if is_valid_reg_name(host) && is_valid_port(port) {
+                Some((host, Some(port)))
+            } else {
+                None
+            }
+        }
+        Some(_) => None,
+        None => {
+            if is_valid_reg_name(value) {
+                Some((value, None))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn normalize_authority_host(host: &str) -> String {
+    let normalized = host.strip_suffix('.').unwrap_or(host);
+    normalized.to_ascii_lowercase()
+}
+
+/// Normalize a Host/authority value for host-based routing.
+///
+/// This removes a valid port suffix, preserves bracketed IPv6 literals, strips
+/// DNS trailing dots, and lowercases ASCII hostnames. Invalid authority syntax
+/// returns `None` so callers can avoid routing on ambiguous host data.
+pub fn normalize_request_host_for_routing(value: &str) -> Option<String> {
+    split_request_authority(value)
+        .map(|(host, _)| normalize_authority_host(host))
+        .filter(|h| !h.is_empty())
+}
+
+fn default_port_for_scheme(scheme: Option<&str>) -> Option<&'static str> {
+    match scheme {
+        Some("http" | "ws") => Some("80"),
+        Some("https" | "wss") => Some("443"),
+        _ => None,
+    }
+}
+
+fn normalize_authority_for_consistency(value: &str, scheme: Option<&str>) -> Option<String> {
+    split_request_authority(value).map(|(host, port)| {
+        if let Some(port) = port
+            && Some(port) != default_port_for_scheme(scheme)
+        {
+            let mut normalized = normalize_authority_host(host);
+            normalized.push(':');
+            normalized.push_str(port);
+            return normalized;
+        }
+        normalize_authority_host(host)
+    })
+}
+
+/// Validate HTTP/2 and HTTP/3 `Host`/`:authority` consistency before routing.
+///
+/// RFC 9113 states that `Host` and `:authority` are not permitted to disagree;
+/// RFC 9114 says that if both are present, they must contain the same value.
+/// Rejecting disagreement here prevents routing/plugin decisions from keying on
+/// one authority while a backend sees another during H2/H3-to-H1 translation.
+pub fn check_host_authority_consistency(
+    headers: &hyper::HeaderMap,
+    uri: &hyper::Uri,
+    version: hyper::Version,
+) -> Option<&'static str> {
+    if version != hyper::Version::HTTP_2 && version != hyper::Version::HTTP_3 {
+        return None;
+    }
+
+    let mut host_values = headers.get_all("host").iter();
+    let host = host_values.next();
+    if host_values.next().is_some() {
+        return Some(r#"{"error":"Request contains multiple Host headers"}"#);
+    }
+
+    let host = host?;
+    let Ok(host) = host.to_str() else {
+        return Some(r#"{"error":"Host header contains invalid characters"}"#);
+    };
+    let scheme = uri.scheme_str();
+    let Some(host) = normalize_authority_for_consistency(host, scheme) else {
+        return Some(r#"{"error":"Host header contains invalid authority"}"#);
+    };
+
+    if let Some(authority) = uri.authority() {
+        let Some(authority) = normalize_authority_for_consistency(authority.as_str(), scheme)
+        else {
+            return Some(r#"{"error":"Request authority contains invalid authority"}"#);
+        };
+        if host != authority {
+            return Some(r#"{"error":"Host header and request authority disagree"}"#);
+        }
+    }
+
+    None
+}
+
 /// Validate protocol-level header constraints to block smuggling and desync attacks.
 ///
 /// Returns an error message string if the request violates protocol rules, `None` if valid.
@@ -9076,9 +9275,10 @@ fn trim_ows(bytes: &[u8]) -> &[u8] {
 ///    duplicate Host headers MUST be rejected with 400 to prevent host-header routing
 ///    confusion between the proxy and backend.
 ///
-/// 4. **TE header validation** (HTTP/2 only): RFC 9113 §8.2.2 — the only permitted
-///    value is "trailers"; any other value is a protocol violation that could be used
-///    to confuse HTTP/2-unaware intermediaries.
+/// 4. **TE header validation** (HTTP/2 and HTTP/3): RFC 9113 §8.2.2 and RFC 9114 §4.2 —
+///    the only permitted value is "trailers"; any other value (or an empty list element
+///    such as `,trailers` / `trailers,`) is a protocol violation that could be used to
+///    confuse intermediaries that translate H2/H3 to HTTP/1.x.
 pub fn check_protocol_headers(
     headers: &hyper::HeaderMap,
     version: hyper::Version,
@@ -9115,7 +9315,9 @@ pub fn check_protocol_headers(
             for token in val.as_bytes().split(|&b| b == b',') {
                 let trimmed = trim_ows(token);
                 if trimmed.is_empty() {
-                    continue;
+                    return Some(
+                        r#"{"error":"Content-Length header contains invalid empty value"}"#,
+                    );
                 }
                 // 2a. Must be ASCII digits only (no signs, decimals, hex, or garbage)
                 if !trimmed.iter().all(|&b| b.is_ascii_digit()) {
@@ -9156,10 +9358,15 @@ pub fn check_protocol_headers(
             if let Ok(te_str) = te_val.to_str() {
                 for token in te_str.split(',') {
                     let trimmed = token.trim();
-                    if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
+                    if trimmed.is_empty() {
+                        return Some(r#"{"error":"TE header contains invalid empty value"}"#);
+                    }
+                    if !trimmed.eq_ignore_ascii_case("trailers") {
                         return Some(r#"{"error":"TE header must be 'trailers' or absent"}"#);
                     }
                 }
+            } else {
+                return Some(r#"{"error":"TE header contains invalid characters"}"#);
             }
         }
     }

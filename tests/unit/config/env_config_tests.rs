@@ -855,6 +855,7 @@ fn test_env_config_request_limits_defaults() {
             assert_eq!(config.max_grpc_recv_size_bytes, 4_194_304);
             assert_eq!(config.max_websocket_frame_size_bytes, 16_777_216);
             assert_eq!(config.http_header_read_timeout_seconds, 10);
+            assert_eq!(config.frontend_tls_handshake_timeout_seconds, 10);
             assert!(config.add_via_header);
             assert_eq!(config.via_pseudonym, "ferrum-edge");
             assert!(!config.add_forwarded_header);
@@ -1534,6 +1535,57 @@ fn test_env_config_http_header_read_timeout_disabled() {
             assert_eq!(
                 config.http_header_read_timeout_seconds, 0,
                 "0 should disable the header read timeout"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_frontend_tls_handshake_timeout_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_handshake_timeout_seconds, 10,
+                "frontend_tls_handshake_timeout_seconds should default to 10"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_frontend_tls_handshake_timeout_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "30"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.frontend_tls_handshake_timeout_seconds, 30);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_frontend_tls_handshake_timeout_disabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.frontend_tls_handshake_timeout_seconds, 0,
+                "0 should disable the frontend TLS handshake timeout"
             );
         },
     );

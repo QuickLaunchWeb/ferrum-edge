@@ -565,8 +565,9 @@ async fn handle_h3_request(
     }
 
     // Protocol-level header validation (HTTP/3-applicable subset).
-    // HTTP/3 has no Transfer-Encoding or Host header concerns (uses :authority),
-    // but multiple Content-Length with mismatched values is still a protocol violation.
+    // HTTP/3 carries authority in `:authority`, but a Host field can still be
+    // present during translation. Validate both before routing so backend
+    // dispatch cannot key on a different authority than route/plugin checks.
     if let Some(error_body) =
         crate::proxy::check_protocol_headers(req.headers(), http::Version::HTTP_3)
     {
@@ -579,6 +580,24 @@ async fn handle_h3_request(
             error_body,
             crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
             "Protocol header violation",
+        )
+        .await?;
+        return Ok(());
+    }
+    if let Some(error_body) = crate::proxy::check_host_authority_consistency(
+        req.headers(),
+        req.uri(),
+        http::Version::HTTP_3,
+    ) {
+        warn!("Rejected HTTP/3 request: {}", error_body);
+        record_request(&state, 400);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            StatusCode::BAD_REQUEST,
+            error_body,
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            "Host and authority mismatch",
         )
         .await?;
         return Ok(());
@@ -738,19 +757,31 @@ async fn handle_h3_request(
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
     // Also check the host header as a fallback. Strip port and lowercase.
     // Uses raw_header_get() to avoid materializing the full HashMap.
-    let request_host: Option<String> = req
+    let raw_host = req
         .uri()
         .authority()
         .map(|a| a.as_str())
-        .or_else(|| ctx.raw_header_get("host"))
-        .map(|h| {
-            let without_port = h.split(':').next().unwrap_or(h);
-            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
-            // DNS treats "example.com." and "example.com" as identical, so routing
-            // must normalize to prevent host-matching bypasses.
-            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
-            normalized.to_lowercase()
-        });
+        .or_else(|| ctx.raw_header_get("host"));
+    let request_host: Option<String> = match raw_host {
+        Some(h) => match crate::proxy::normalize_request_host_for_routing(h) {
+            Some(normalized) => Some(normalized),
+            None => {
+                warn!("Rejected HTTP/3 request: malformed Host/authority value");
+                record_request(&state, 400);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"Request contains malformed Host or authority"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    "Malformed Host or authority",
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
 
     // Route: host + longest prefix match via router cache
     let route_match = state

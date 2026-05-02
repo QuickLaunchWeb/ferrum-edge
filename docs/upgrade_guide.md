@@ -89,6 +89,28 @@ Validate:
 - **Admin API**: test CRUD operations against the staging instance
 - **Logs**: check for warnings or errors at `FERRUM_LOG_LEVEL=info`
 
+### Protocol Hardening Checks
+
+Recent proxy-boundary hardening intentionally rejects several malformed request
+forms that older builds could tolerate:
+
+- `Content-Length` lists with empty elements, such as `42,`, `,42`, or `4,,2`
+- HTTP/2 or HTTP/3 `TE` lists with empty elements or values other than `trailers`
+- HTTP/2 or HTTP/3 requests whose `Host` header disagrees with `:authority`
+- unbracketed IPv6 literals in `Host` or `:authority`; use `[2001:db8::1]` form
+- TLS or DTLS clients that do not complete the frontend handshake within `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` (default 10s)
+
+During staged validation, scan access/error logs for unexpected 400s or frontend
+TLS/DTLS handshake timeout warnings. Legacy clients that emit these malformed
+headers should be fixed rather than allowlisted, since the stricter behavior
+prevents request-smuggling and authority-confusion parser differentials.
+
+The per-proxy `backend_connect_timeout_ms` budget also now covers the full
+backend connection setup pipeline for direct TLS/H2/gRPC/H3 paths, including
+TLS and HTTP/2 or HTTP/3 handshakes. Operators who previously sized this field
+assuming it applied only to the TCP SYN phase should validate cold-connection
+latency during rollout.
+
 #### 4. Cut Over Production
 
 Once validation passes, stop the old binary and start the new one against the production database. The new binary will run any pending migrations automatically on startup (or you can run them explicitly first with `FERRUM_MODE=migrate`).

@@ -497,6 +497,9 @@ pub struct TcpListenerConfig {
     /// Applies even when the session idle timeout is disabled, so a stuck
     /// peer cannot wedge the relay task forever. `0` disables the cap.
     pub tcp_half_close_max_wait_seconds: u64,
+    /// Frontend TLS handshake timeout in seconds for TCP+TLS stream listeners.
+    /// `0` disables the timeout.
+    pub frontend_tls_handshake_timeout_seconds: u64,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
@@ -545,6 +548,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
         tls_policy,
         crls,
@@ -692,6 +696,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds,
+                        frontend_tls_handshake_timeout_seconds,
                         &cb_cache,
                         &plugins,
                         &mut stream_ctx,
@@ -917,6 +922,7 @@ async fn handle_tcp_connection(
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
@@ -949,6 +955,7 @@ async fn handle_tcp_connection(
         cached_backend_tls,
         global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
+        frontend_tls_handshake_timeout_seconds,
         circuit_breaker_cache,
         start,
         &mut backend_info,
@@ -983,6 +990,7 @@ async fn handle_tcp_connection_inner(
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
+    frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     start: Instant,
     backend_info: &mut TcpBackendInfo,
@@ -1454,21 +1462,27 @@ async fn handle_tcp_connection_inner(
     let mut used_splice = false;
     let copy_result = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        let tls_stream = match acceptor.accept(client_stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                // Frontend TLS failures are client-side — do not penalise the backend CB.
-                // The typed `StreamSetupError` carries the kind so
-                // `pre_copy_disconnect_cause` reads `Frontend` directly from
-                // `StreamSetupKind::FrontendTlsHandshake`, no string match.
-                return Err(StreamSetupError::with_source(
-                    StreamSetupKind::FrontendTlsHandshake,
-                    format!("from {remote_addr}: {e}"),
-                    e,
-                )
-                .into());
-            }
-        };
+        // Frontend TLS failures are client-side — do not penalise the backend CB.
+        // The typed `StreamSetupError` carries the kind so
+        // `pre_copy_disconnect_cause` reads `Frontend` directly from
+        // `StreamSetupKind::FrontendTlsHandshake`, no string match. The accept
+        // helper bounds the handshake under the configured timeout so a stalled
+        // peer cannot wedge a frontend slot indefinitely.
+        let tls_stream = crate::tls::accept_with_optional_timeout(
+            &acceptor,
+            client_stream,
+            frontend_tls_handshake_timeout_seconds,
+            &remote_addr,
+        )
+        .await
+        .map_err(|e| -> anyhow::Error {
+            StreamSetupError::with_source(
+                StreamSetupKind::FrontendTlsHandshake,
+                format!("from {remote_addr}: {e}"),
+                e,
+            )
+            .into()
+        })?;
 
         // Extract peer certificate DER from TLS handshake for plugin use.
         let peer_chain_der = tls_stream.get_ref().1.peer_certificates().map(|certs| {
@@ -1821,6 +1835,7 @@ async fn connect_backend_tls_cached(
     tcp_fastopen: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
+    let connect_started = Instant::now();
     let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
 
     let tls_config = cached_tls
@@ -1833,19 +1848,38 @@ async fn connect_backend_tls_cached(
 
     // Typed `StreamSetupError::BackendTlsHandshake` lets cause mappers read
     // the side directly from the kind — no substring match against the
-    // legacy `STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED` prefix.
-    let tls_stream =
-        connector
-            .connect(server_name, tcp_stream)
-            .await
-            .map_err(|e| -> anyhow::Error {
-                StreamSetupError::with_source(
-                    StreamSetupKind::BackendTlsHandshake,
-                    format!("to {addr}: {e}"),
-                    e,
-                )
-                .into()
-            })?;
+    // legacy `STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED` prefix. Both timeout
+    // arms below funnel through the same kind so a handshake-budget
+    // exhaustion classifies identically to a handshake-error failure.
+    let remaining = crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
+        .ok_or_else(|| -> anyhow::Error {
+            StreamSetupError::new(
+                StreamSetupKind::BackendTlsHandshake,
+                format!("to {addr}: connect budget exhausted before TLS handshake started"),
+            )
+            .into()
+        })?;
+
+    let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp_stream))
+        .await
+        .map_err(|_| -> anyhow::Error {
+            StreamSetupError::new(
+                StreamSetupKind::BackendTlsHandshake,
+                format!(
+                    "to {addr}: handshake timeout after {}ms",
+                    connect_timeout.as_millis()
+                ),
+            )
+            .into()
+        })?
+        .map_err(|e| -> anyhow::Error {
+            StreamSetupError::with_source(
+                StreamSetupKind::BackendTlsHandshake,
+                format!("to {addr}: {e}"),
+                e,
+            )
+            .into()
+        })?;
 
     Ok(tls_stream)
 }

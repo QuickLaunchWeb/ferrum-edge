@@ -1,5 +1,6 @@
 use ferrum_edge::proxy::{
-    build_forwarded_value, check_protocol_headers, is_h2_websocket_connect, is_valid_websocket_key,
+    build_forwarded_value, check_host_authority_consistency, check_protocol_headers,
+    is_h2_websocket_connect, is_valid_websocket_key, normalize_request_host_for_routing,
 };
 use hyper::header::HeaderValue;
 
@@ -164,6 +165,33 @@ fn allows_comma_separated_with_ows() {
     assert!(check_protocol_headers(&headers, hyper::Version::HTTP_11).is_none());
 }
 
+#[test]
+fn rejects_empty_content_length_token_trailing_comma() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42,"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_11);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn rejects_empty_content_length_token_leading_comma_on_http2() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static(",42"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn rejects_empty_content_length_token_middle_comma_on_http3() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-length", HeaderValue::from_static("42,,42"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
 // --- Multiple Host headers (HTTP/1.1) ---
 
 #[test]
@@ -185,7 +213,8 @@ fn http11_allows_single_host() {
 
 #[test]
 fn http2_allows_multiple_host_headers() {
-    // HTTP/2 uses :authority, not Host — multiple Host headers are not a routing concern
+    // The framing-only validator does not inspect :authority. The separate
+    // authority-consistency gate rejects this before routing.
     let mut headers = hyper::HeaderMap::new();
     headers.append("host", HeaderValue::from_static("a.com"));
     headers.append("host", HeaderValue::from_static("b.com"));
@@ -224,6 +253,24 @@ fn http2_rejects_te_gzip() {
     let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
     assert!(result.is_some());
     assert!(result.unwrap().contains("TE header"));
+}
+
+#[test]
+fn http2_rejects_empty_te_token_trailing_comma() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("te", HeaderValue::from_static("trailers,"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
+}
+
+#[test]
+fn http3_rejects_empty_te_token_leading_comma() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("te", HeaderValue::from_static(",trailers"));
+    let result = check_protocol_headers(&headers, hyper::Version::HTTP_3);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid empty value"));
 }
 
 #[test]
@@ -278,6 +325,117 @@ fn clean_http2_request_passes() {
     headers.insert("content-length", HeaderValue::from_static("100"));
     headers.insert("te", HeaderValue::from_static("trailers"));
     assert!(check_protocol_headers(&headers, hyper::Version::HTTP_2).is_none());
+}
+
+// --- Host / :authority consistency (HTTP/2 and HTTP/3) ---
+
+#[test]
+fn http2_rejects_host_authority_mismatch() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("authority disagree"));
+}
+
+#[test]
+fn http3_rejects_host_authority_mismatch() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("authority disagree"));
+}
+
+#[test]
+fn http2_accepts_matching_host_authority_after_case_and_dot_normalization() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("API.EXAMPLE.:8443"));
+    let uri: hyper::Uri = "https://api.example:8443/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
+fn http2_accepts_https_default_port_host_authority_equivalence() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:443"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
+fn http3_accepts_https_default_port_host_authority_equivalence() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example"));
+    let uri: hyper::Uri = "https://api.example:443/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3).is_none());
+}
+
+#[test]
+fn http2_accepts_http_default_port_host_authority_equivalence() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:80"));
+    let uri: hyper::Uri = "http://api.example/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+}
+
+#[test]
+fn http2_rejects_non_default_port_host_authority_mismatch() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:8443"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("authority disagree"));
+}
+
+#[test]
+fn http2_rejects_multiple_host_headers_before_routing() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("host", HeaderValue::from_static("api.example"));
+    headers.append("host", HeaderValue::from_static("evil.example"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("multiple Host"));
+}
+
+#[test]
+fn http2_rejects_invalid_host_authority_port() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("api.example:notaport"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid authority"));
+}
+
+#[test]
+fn http2_rejects_unbracketed_ipv6_host_authority() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("2001:db8::1"));
+    let uri: hyper::Uri = "https://[2001:db8::1]/".parse().unwrap();
+    let result = check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2);
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("invalid authority"));
+}
+
+#[test]
+fn http2_no_host_no_authority_passes_consistency_check() {
+    let headers = hyper::HeaderMap::new();
+    let uri: hyper::Uri = "/path".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_2).is_none());
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_3).is_none());
+}
+
+#[test]
+fn http11_ignores_authority_consistency_helper() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+    let uri: hyper::Uri = "https://api.example/".parse().unwrap();
+    assert!(check_host_authority_consistency(&headers, &uri, hyper::Version::HTTP_11).is_none());
 }
 
 #[test]
@@ -712,46 +870,159 @@ fn h1_connect_is_not_ws() {
 #[test]
 fn host_trailing_dot_stripped_for_routing() {
     let host_with_dot = "example.com.";
-    let normalized = host_with_dot
-        .split(':')
-        .next()
-        .unwrap_or(host_with_dot)
-        .strip_suffix('.')
-        .unwrap_or(host_with_dot)
-        .to_lowercase();
+    let normalized = normalize_request_host_for_routing(host_with_dot).unwrap();
     assert_eq!(normalized, "example.com");
 }
 
 #[test]
 fn host_without_trailing_dot_unchanged() {
     let host = "example.com";
-    let normalized = host
-        .split(':')
-        .next()
-        .unwrap_or(host)
-        .strip_suffix('.')
-        .unwrap_or(host)
-        .to_lowercase();
+    let normalized = normalize_request_host_for_routing(host).unwrap();
     assert_eq!(normalized, "example.com");
 }
 
 #[test]
 fn host_with_port_and_trailing_dot_normalized() {
     let host = "example.com.:8080";
-    let without_port = host.split(':').next().unwrap_or(host);
-    let normalized = without_port
-        .strip_suffix('.')
-        .unwrap_or(without_port)
-        .to_lowercase();
+    let normalized = normalize_request_host_for_routing(host).unwrap();
     assert_eq!(normalized, "example.com");
 }
 
 #[test]
-fn host_single_dot_becomes_empty() {
-    // Edge case: a bare dot (invalid, but shouldn't panic)
-    let host = ".";
-    let normalized = host.strip_suffix('.').unwrap_or(host).to_lowercase();
-    assert_eq!(normalized, "");
+fn host_ipv6_literal_with_port_preserved_for_routing() {
+    let host = "[2001:db8::1]:8443";
+    let normalized = normalize_request_host_for_routing(host).unwrap();
+    assert_eq!(normalized, "[2001:db8::1]");
+}
+
+#[test]
+fn host_ipv6_literal_without_port_preserved_for_routing() {
+    let host = "[2001:db8::1]";
+    let normalized = normalize_request_host_for_routing(host).unwrap();
+    assert_eq!(normalized, "[2001:db8::1]");
+}
+
+#[test]
+fn host_unbracketed_ipv6_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("2001:db8::1").is_none());
+    assert!(normalize_request_host_for_routing("::1").is_none());
+}
+
+#[test]
+fn host_single_dot_rejected_for_routing() {
+    // A bare dot normalizes to empty, which is not a valid hostname.
+    assert!(normalize_request_host_for_routing(".").is_none());
+}
+
+#[test]
+fn host_trailing_colon_no_port_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("example.com:").is_none());
+}
+
+#[test]
+fn host_non_numeric_port_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("example.com:notaport").is_none());
+}
+
+#[test]
+fn host_port_above_u16_max_rejected_for_routing() {
+    // Ports above 65535 are not a valid TCP port. Without the range check,
+    // digit-only validation accepts them and lets a malformed authority reach
+    // routing/backend dispatch.
+    assert!(normalize_request_host_for_routing("example.com:65536").is_none());
+    assert!(normalize_request_host_for_routing("example.com:9999999999").is_none());
+    assert!(normalize_request_host_for_routing("[2001:db8::1]:65536").is_none());
+}
+
+#[test]
+fn host_port_at_u16_max_accepted_for_routing() {
+    // 65535 is the maximum valid TCP port.
+    assert_eq!(
+        normalize_request_host_for_routing("example.com:65535"),
+        Some("example.com".to_string())
+    );
+    assert_eq!(
+        normalize_request_host_for_routing("[2001:db8::1]:65535"),
+        Some("[2001:db8::1]".to_string())
+    );
+}
+
+#[test]
+fn host_with_userinfo_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("user@example.com").is_none());
+}
+
+#[test]
+fn host_with_path_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("api.example/foo").is_none());
+}
+
+#[test]
+fn host_with_query_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("api.example?q=1").is_none());
+}
+
+#[test]
+fn host_with_fragment_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing("api.example#top").is_none());
+}
+
+#[test]
+fn host_with_comma_rejected_for_routing() {
+    // Comma is the HTTP list separator. Accepting it in a hostname would let a
+    // single Host header smuggle multiple authority-shaped values past anything
+    // downstream that splits on commas (logs, plugin matchers, etc.).
+    assert!(normalize_request_host_for_routing("api.example,evil.example").is_none());
+}
+
+#[test]
+fn host_with_backslash_rejected_for_routing() {
+    assert!(normalize_request_host_for_routing(r"api.example\foo").is_none());
+}
+
+#[test]
+fn host_empty_brackets_rejected_for_routing() {
+    // RFC 3986: bracketed authority must contain IPv6address or IPvFuture.
+    // `[]` is malformed authority syntax — without validation it would
+    // normalize to `[]` and bypass host-scoped routes via the catch-all tier.
+    assert!(normalize_request_host_for_routing("[]").is_none());
+    assert!(normalize_request_host_for_routing("[]:8443").is_none());
+}
+
+#[test]
+fn host_brackets_around_non_ip_rejected_for_routing() {
+    // `[not-an-ip]` and similar opaque bracket contents are not valid
+    // IPv6address/IPvFuture and must not be routable.
+    assert!(normalize_request_host_for_routing("[not-an-ip]").is_none());
+    assert!(normalize_request_host_for_routing("[example.com]").is_none());
+    assert!(normalize_request_host_for_routing("[evil.example]:443").is_none());
+}
+
+#[test]
+fn host_brackets_around_ipv4_rejected_for_routing() {
+    // RFC 3986 reserves brackets exclusively for IPv6address / IPvFuture,
+    // not IPv4. `[127.0.0.1]` is malformed.
+    assert!(normalize_request_host_for_routing("[127.0.0.1]").is_none());
+}
+
+#[test]
+fn host_brackets_around_ipv6_accepted_for_routing() {
+    // Valid IPv6 literals must still be accepted after the new validator.
+    assert_eq!(
+        normalize_request_host_for_routing("[::1]"),
+        Some("[::1]".to_string())
+    );
+    assert_eq!(
+        normalize_request_host_for_routing("[2001:db8::1]:8443"),
+        Some("[2001:db8::1]".to_string())
+    );
+}
+
+#[test]
+fn host_brackets_around_ipvfuture_accepted_for_routing() {
+    // RFC 3986 IPvFuture: "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" ).
+    assert!(normalize_request_host_for_routing("[v1.fe80::a:b]").is_some());
+    assert!(normalize_request_host_for_routing("[v7.example-future]").is_some());
 }
 
 /// Verify that hyper's HeaderMap normalizes header names to lowercase,
