@@ -30,8 +30,8 @@ pub fn generate_self_signed_certs(dir: &Path) -> anyhow::Result<(PathBuf, PathBu
     let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .context("generating CA key pair")?;
 
-    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())
-        .context("creating CA cert params")?;
+    let mut ca_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).context("creating CA cert params")?;
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.distinguished_name = rcgen::DistinguishedName::new();
     ca_params

@@ -16,6 +16,14 @@ _format_version: "3.0"
 # IP:127.0.0.1, but using `127.0.0.1` here triggers "certificate host
 # mismatch" 502s on every WS upgrade. `localhost` matches the DNS SAN
 # and, with `--network host`, resolves to the backend on the runner.
+#
+# Kong's native WebSocket proxy path applies default message-size limits:
+# client-originated messages are capped at 1 MiB, while this benchmark sweeps
+# up to 5 MiB binary echo frames. The first-party websocket-size-limit plugin
+# can raise this, but it is enterprise-only and the CI image runs without a
+# Kong license. Use the OSS pre-function plugin at ws_handshake to call the
+# same PDK payload-size setters so the row measures proxy throughput instead
+# of the default protective close(1009) path.
 
 services:
   - name: ws-service
@@ -51,3 +59,12 @@ services:
           - http
           - https
         strip_path: false
+
+plugins:
+  - name: pre-function
+    service: ws-service
+    config:
+      ws_handshake:
+        - |
+          kong.websocket.client.set_max_payload_size(8388608)
+          kong.websocket.upstream.set_max_payload_size(8388608)
