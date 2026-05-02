@@ -3940,7 +3940,8 @@ impl DatabaseStore {
             crate::config::types::SpecFormat::Yaml => "yaml",
         };
         sqlx::query(&self.q("UPDATE api_specs SET \
-             proxy_id = ?, spec_content = ?, content_hash = ?, uncompressed_size = ?, \
+             proxy_id = ?, spec_content = ?, content_encoding = ?, content_hash = ?, \
+             uncompressed_size = ?, \
              spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
              description = ?, contact_name = ?, contact_email = ?, \
              license_name = ?, license_identifier = ?, \
@@ -3949,6 +3950,7 @@ impl DatabaseStore {
              WHERE namespace = ? AND id = ?"))
         .bind(&spec.proxy_id)
         .bind(&spec.spec_content)
+        .bind(&spec.content_encoding)
         .bind(&spec.content_hash)
         .bind(spec.uncompressed_size as i64)
         .bind(spec_format_str)
@@ -4077,6 +4079,11 @@ impl DatabaseStore {
         // Build WHERE clause dynamically.
         // We collect bind values as strings/i64 in order to use sqlx's typed bind API.
         // All column references are whitelisted — no user input goes into the SQL template.
+        //
+        // Note: the COUNT and data queries run sequentially without a shared
+        // transaction, so `total` can be stale relative to `items` if a
+        // concurrent write lands between them.  Standard pagination trade-off;
+        // wrapping both in a transaction would serialize all list calls.
         let mut conditions: Vec<&'static str> = vec!["namespace = ?"];
         let mut proxy_id_val: Option<String> = None;
         let mut spec_version_val: Option<String> = None;

@@ -522,15 +522,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    // Walk char boundaries; keep the last one that fits within max_bytes.
-    let mut last_boundary = 0usize;
-    for (i, _) in s.char_indices() {
-        if i > max_bytes {
-            break;
-        }
-        last_boundary = i;
-    }
-    s[..last_boundary].to_string()
+    s[..s.floor_char_boundary(max_bytes)].to_string()
 }
 
 /// Extract Tier 1 metadata from the parsed spec root value.

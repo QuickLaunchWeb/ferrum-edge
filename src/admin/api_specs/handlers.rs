@@ -424,8 +424,6 @@ pub(super) fn negotiate_accept_or_406(
     let mut json_explicit: Option<u32> = None;
     let mut yaml_explicit: Option<u32> = None;
     let mut wildcard_q: Option<u32> = None;
-    // tracked only for parity with negotiate_accept; prefix suppresses unused-variable lint
-    let mut _stored_explicit: Option<u32> = None;
 
     for entry in accept.split(',') {
         let mut parts = entry.splitn(2, ';');
@@ -439,16 +437,10 @@ pub(super) fn negotiate_accept_or_406(
             "application/json" => {
                 saw_relevant = true;
                 json_explicit = Some(json_explicit.map_or(q, |p| p.max(q)));
-                if stored == SpecFormat::Json {
-                    _stored_explicit = Some(_stored_explicit.map_or(q, |p| p.max(q)));
-                }
             }
             "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
                 saw_relevant = true;
                 yaml_explicit = Some(yaml_explicit.map_or(q, |p| p.max(q)));
-                if stored == SpecFormat::Yaml {
-                    _stored_explicit = Some(_stored_explicit.map_or(q, |p| p.max(q)));
-                }
             }
             _ => {} // unknown — ignored for relevance accounting
         }

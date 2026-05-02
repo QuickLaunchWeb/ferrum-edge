@@ -743,22 +743,35 @@ mod inner {
         async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             // Preserve api_spec_id: the incoming Proxy from the admin CRUD
-            // endpoint has api_spec_id: None, but the stored document may
-            // carry an ownership tag from a spec import.  Read it before
-            // replace_one overwrites the document.  SQL is safe because its
-            // UPDATE statement explicitly excludes api_spec_id.
-            let existing_spec_id: Option<String> = self
-                .proxies()
-                .find_one(doc! { "_id": &proxy.id })
-                .await?
-                .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
-            let mut doc = proxy_to_doc(proxy)?;
-            if let Some(sid) = existing_spec_id {
-                doc.insert("api_spec_id", sid);
-            }
+            // endpoint has api_spec_id: None (stripped in normalize()), but
+            // the stored document may carry an ownership tag from a spec
+            // import.  SQL is safe because its UPDATE excludes api_spec_id.
+            //
+            // We replace_one first (which clears api_spec_id), then
+            // atomically restore it from the api_specs collection (the
+            // source of truth for ownership).  This avoids a TOCTOU race
+            // where a concurrent replace_api_spec_bundle could change
+            // ownership between a find_one read and the replace_one write.
+            let doc = proxy_to_doc(proxy)?;
             self.proxies()
                 .replace_one(doc! { "_id": &proxy.id }, doc)
                 .await?;
+            // Restore api_spec_id from the authoritative api_specs row.
+            if let Ok(Some(spec_doc)) = self
+                .api_specs()
+                .find_one(doc! { "proxy_id": &proxy.id })
+                .await
+            {
+                if let Ok(sid) = spec_doc.get_str("_id") {
+                    let _ = self
+                        .proxies()
+                        .update_one(
+                            doc! { "_id": &proxy.id },
+                            doc! { "$set": { "api_spec_id": sid } },
+                        )
+                        .await;
+                }
+            }
             // Clean up orphaned proxy_group plugin configs (update may remove associations)
             self.cleanup_orphaned_proxy_group_plugins().await?;
             self.check_slow_query("update_proxy", start);
@@ -794,13 +807,10 @@ mod inner {
                         Ok(Some(doc)) => doc.get_str("_id").ok().map(str::to_string),
                         _ => None,
                     };
-                match self.api_specs().delete_many(doc! { "proxy_id": id }).await {
-                    Ok(r) if r.deleted_count > 1 => {
-                        warn!(
-                            "delete_proxy: deleted {} api_specs rows for proxy {} (expected 0 or 1)",
-                            r.deleted_count, id
-                        );
-                    }
+                // Unique index on (namespace, proxy_id) guarantees at most one
+                // match — delete_one surfaces a surprising multi-match as a
+                // no-delete rather than silently cleaning up.
+                match self.api_specs().delete_one(doc! { "proxy_id": id }).await {
                     Ok(_) => {}
                     Err(e) => {
                         warn!(
@@ -973,19 +983,26 @@ mod inner {
 
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            // Preserve api_spec_id (same rationale as update_proxy above).
+            // Preserve api_spec_id (same rationale as update_proxy).
+            // Replace first, then restore from the authoritative source.
+            let doc = plugin_config_to_doc(pc)?;
             let existing_spec_id: Option<String> = self
                 .plugin_configs()
                 .find_one(doc! { "_id": &pc.id })
                 .await?
                 .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
-            let mut doc = plugin_config_to_doc(pc)?;
-            if let Some(sid) = existing_spec_id {
-                doc.insert("api_spec_id", sid);
-            }
             self.plugin_configs()
                 .replace_one(doc! { "_id": &pc.id }, doc)
                 .await?;
+            if let Some(sid) = existing_spec_id {
+                let _ = self
+                    .plugin_configs()
+                    .update_one(
+                        doc! { "_id": &pc.id },
+                        doc! { "$set": { "api_spec_id": &sid } },
+                    )
+                    .await;
+            }
             self.check_slow_query("update_plugin_config", start);
             Ok(())
         }
@@ -1052,19 +1069,25 @@ mod inner {
 
         async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
-            // Preserve api_spec_id (same rationale as update_proxy above).
+            // Preserve api_spec_id (same rationale as update_proxy).
+            let doc = upstream_to_doc(upstream)?;
             let existing_spec_id: Option<String> = self
                 .upstreams()
                 .find_one(doc! { "_id": &upstream.id })
                 .await?
                 .and_then(|d| d.get_str("api_spec_id").ok().map(str::to_string));
-            let mut doc = upstream_to_doc(upstream)?;
-            if let Some(sid) = existing_spec_id {
-                doc.insert("api_spec_id", sid);
-            }
             self.upstreams()
                 .replace_one(doc! { "_id": &upstream.id }, doc)
                 .await?;
+            if let Some(sid) = existing_spec_id {
+                let _ = self
+                    .upstreams()
+                    .update_one(
+                        doc! { "_id": &upstream.id },
+                        doc! { "$set": { "api_spec_id": &sid } },
+                    )
+                    .await;
+            }
             self.check_slow_query("update_upstream", start);
             Ok(())
         }
