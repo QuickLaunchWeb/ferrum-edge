@@ -610,12 +610,37 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
 ///
 /// RFC 6455 §4.1 requires the key to be exactly 16 bytes of random data,
 /// base64-encoded to 24 characters (16 bytes → 22 base64 chars + 2 padding `=`).
+///
+/// Leading/trailing ASCII whitespace is trimmed before validation. RFC 9110 §5.5
+/// already requires header parsers to strip optional whitespace (OWS), but cross-hop
+/// normalization is not guaranteed to be consistent, so we trim defensively here.
+/// `ws_accept_from_key` performs the same trim so admission and accept-key derivation
+/// stay byte-for-byte aligned.
 pub fn is_valid_websocket_key(key: &str) -> bool {
     use base64::Engine;
+    let key = key.trim();
     key.len() == 24
         && base64::engine::general_purpose::STANDARD
             .decode(key)
             .is_ok_and(|bytes| bytes.len() == 16)
+}
+
+/// Derive the `Sec-WebSocket-Accept` response header value from a raw
+/// `Sec-WebSocket-Key` request header.
+///
+/// RFC 6455 §4.2.2 specifies that the Accept value is computed over the EXACT
+/// base64-encoded key the client sent. Any leading/trailing whitespace in the
+/// raw header value would otherwise leak into the SHA-1 input and produce an
+/// Accept value the client rejects, so we trim before hashing.
+/// `is_valid_websocket_key` performs the same trim so admission and derivation
+/// agree on what counts as the "key bytes".
+///
+/// An empty / missing key (`""`) is passed through to `derive_accept_key`
+/// unchanged to preserve the prior fallback behavior — admission already
+/// rejects requests without a key, so this branch is only reachable in
+/// pathological / mock cases.
+pub fn ws_accept_from_key(raw: &str) -> String {
+    derive_accept_key(raw.trim().as_bytes())
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`.
@@ -3353,13 +3378,12 @@ async fn handle_websocket_request_authenticated(
             .header("connection", "upgrade")
             .header(
                 "sec-websocket-accept",
-                derive_accept_key(
+                ws_accept_from_key(
                     parts
                         .headers
                         .get("sec-websocket-key")
                         .and_then(|k| k.to_str().ok())
-                        .unwrap_or("")
-                        .as_bytes(),
+                        .unwrap_or(""),
                 ),
             )
     };

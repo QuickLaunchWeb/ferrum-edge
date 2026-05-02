@@ -1,6 +1,7 @@
 use ferrum_edge::proxy::{
     build_forwarded_value, check_host_authority_consistency, check_protocol_headers,
     is_h2_websocket_connect, is_valid_websocket_key, normalize_request_host_for_routing,
+    ws_accept_from_key,
 };
 use hyper::header::HeaderValue;
 
@@ -596,6 +597,87 @@ fn invalid_websocket_key_17_bytes() {
     // Actually base64 of 17 bytes = 24 chars. Let me use a real 17-byte value.
     // b"\x00" * 17 = "AAAAAAAAAAAAAAAAAAAAAAA=" (23 chars + padding)
     assert!(!is_valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAAA="));
+}
+
+#[test]
+fn valid_websocket_key_with_trailing_whitespace_is_accepted() {
+    // RFC 9110 §5.5 requires header parsers to strip OWS, but cross-hop
+    // normalization is not guaranteed. The validator must trim defensively
+    // so a legitimate whitespace-padded key is still accepted.
+    assert!(is_valid_websocket_key("dGhlIHNhbXBsZSBub25jZQ==  "));
+    assert!(is_valid_websocket_key("dGhlIHNhbXBsZSBub25jZQ==\t"));
+}
+
+#[test]
+fn valid_websocket_key_with_leading_whitespace_is_accepted() {
+    assert!(is_valid_websocket_key("  dGhlIHNhbXBsZSBub25jZQ=="));
+}
+
+#[test]
+fn valid_websocket_key_with_surrounding_whitespace_is_accepted() {
+    assert!(is_valid_websocket_key(" dGhlIHNhbXBsZSBub25jZQ== "));
+}
+
+// ============================================================================
+// ws_accept_from_key tests (RFC 6455 §4.2.2)
+// ============================================================================
+
+/// RFC 6455 §4.2.2 example: SHA-1(key + GUID) base64-encoded.
+/// `derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==")` == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+const RFC6455_EXAMPLE_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+const RFC6455_EXAMPLE_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+#[test]
+fn ws_accept_from_key_rfc6455_example() {
+    // Sanity-check the helper against the RFC 6455 §1.3 reference vector.
+    assert_eq!(
+        ws_accept_from_key(RFC6455_EXAMPLE_KEY),
+        RFC6455_EXAMPLE_ACCEPT
+    );
+}
+
+#[test]
+fn ws_accept_from_key_trims_trailing_whitespace() {
+    // RFC 6455 §4.2.2: Accept value is computed over the EXACT base64 key.
+    // A non-trimmed input would silently emit an Accept hash the client rejects.
+    // Trailing whitespace must produce the same Accept value as the untrimmed key.
+    let key_with_ws = format!("{RFC6455_EXAMPLE_KEY}  ");
+    assert_eq!(
+        ws_accept_from_key(&key_with_ws),
+        ws_accept_from_key(RFC6455_EXAMPLE_KEY),
+    );
+    assert_eq!(ws_accept_from_key(&key_with_ws), RFC6455_EXAMPLE_ACCEPT);
+}
+
+#[test]
+fn ws_accept_from_key_trims_leading_whitespace() {
+    let key_with_ws = format!("  {RFC6455_EXAMPLE_KEY}");
+    assert_eq!(ws_accept_from_key(&key_with_ws), RFC6455_EXAMPLE_ACCEPT);
+}
+
+#[test]
+fn ws_accept_from_key_trims_tabs_and_mixed_whitespace() {
+    let key_with_ws = format!(" \t{RFC6455_EXAMPLE_KEY}\t ");
+    assert_eq!(ws_accept_from_key(&key_with_ws), RFC6455_EXAMPLE_ACCEPT);
+}
+
+#[test]
+fn ws_accept_from_key_empty_preserves_fallback_semantics() {
+    // The accept-key derivation site falls back to "" when the
+    // sec-websocket-key header is missing/unreadable (admission already
+    // rejects malformed requests, so this branch is only reachable in
+    // pathological / mock cases). The helper must keep that semantics.
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    assert_eq!(ws_accept_from_key(""), derive_accept_key(b""));
+}
+
+#[test]
+fn ws_accept_from_key_whitespace_only_matches_empty_fallback() {
+    // A whitespace-only header should reduce to the empty-key fallback —
+    // not produce a SHA-1 over literal whitespace bytes.
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    assert_eq!(ws_accept_from_key("   "), derive_accept_key(b""));
+    assert_eq!(ws_accept_from_key("   "), ws_accept_from_key(""));
 }
 
 // ============================================================================
