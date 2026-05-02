@@ -197,13 +197,22 @@ impl AuthTestHarness {
     }
 }
 
-/// Simple echo HTTP server that returns request info
+/// Simple echo HTTP server that returns request info.
+///
+/// Prefer [`start_echo_backend_on`] for new tests so callers can pass a
+/// pre-bound listener and avoid the bind-drop-rebind race that triggers
+/// intermittent EADDRINUSE under parallel functional runs.
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    Ok(start_echo_backend_on(listener))
+}
 
-    let handle = tokio::spawn(async move {
+/// Like [`start_echo_backend`] but accepts a caller-owned listener so the
+/// port stays bound continuously (no drop+rebind window).
+fn start_echo_backend_on(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -236,9 +245,7 @@ async fn start_echo_backend(
                 let _ = writer.write_all(response.as_bytes()).await;
             });
         }
-    });
-
-    Ok(handle)
+    })
 }
 
 /// Helper: create a consumer via admin API
@@ -1871,14 +1878,13 @@ async fn test_basic_auth_plus_acl() {
         .await
         .expect("Failed to create test harness");
 
+    // Pre-bound listener stays owned across the handoff to start_echo_backend_on
+    // — avoids the bind-drop-rebind window that races with other parallel tests.
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port)
-        .await
-        .expect("Failed to start echo backend");
+    let _backend = start_echo_backend_on(backend_listener);
 
     let client = reqwest::Client::new();
     let admin_token = harness.generate_admin_token().unwrap();
@@ -2037,14 +2043,12 @@ async fn test_jwt_auth_plus_acl() {
         .await
         .expect("Failed to create test harness");
 
+    // See test_basic_auth_plus_acl for the rationale on holding the listener.
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port)
-        .await
-        .expect("Failed to start echo backend");
+    let _backend = start_echo_backend_on(backend_listener);
 
     let client = reqwest::Client::new();
     let admin_token = harness.generate_admin_token().unwrap();
@@ -2214,14 +2218,12 @@ async fn test_hmac_auth_plus_acl() {
         .await
         .expect("Failed to create test harness");
 
+    // See test_basic_auth_plus_acl for the rationale on holding the listener.
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port)
-        .await
-        .expect("Failed to start echo backend");
+    let _backend = start_echo_backend_on(backend_listener);
 
     let client = reqwest::Client::new();
     let admin_token = harness.generate_admin_token().unwrap();
