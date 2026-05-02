@@ -306,7 +306,25 @@ impl RouterCache {
     /// Routes are partitioned by host tier and pre-sorted by listen_path length
     /// descending so the first `starts_with` match is always the longest prefix match.
     /// Regex routes are compiled at build time, not per-request.
+    ///
+    /// `max_cache_entries == 0` is the documented "auto" sentinel
+    /// (`FERRUM_ROUTER_CACHE_MAX_ENTRIES=0`) and is resolved here to
+    /// `max(10_000, proxies.len() * 3)` so direct callers that bypass the env-var
+    /// resolution in `ProxyState::new` still get a usable cache. Without this,
+    /// `frequency_aware_evict`'s `max_entries / 4 == 0` short-circuit would leave
+    /// the cache unbounded under load.
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
+        let max_cache_entries = if max_cache_entries == 0 {
+            let resolved = (config.proxies.len() * 3).max(10_000);
+            debug!(
+                "Router cache max_entries=0 resolved to auto value {} (proxies={})",
+                resolved,
+                config.proxies.len()
+            );
+            resolved
+        } else {
+            max_cache_entries
+        };
         let table = Self::build_route_table(config);
         // Sketch width: 2x cache capacity, clamped to [1024, 65536], power of two.
         let sketch_width = (max_cache_entries * 2).clamp(1024, 65536);
@@ -1460,5 +1478,116 @@ mod tests {
     fn eviction_empty_cached_host_never_matches() {
         assert!(!host_matches_for_eviction("api.example.com", ""));
         assert!(!host_matches_for_eviction("*.example.com", ""));
+    }
+
+    // ── RouterCache::new auto-resolution tests ──────────────────────────
+    //
+    // FERRUM_ROUTER_CACHE_MAX_ENTRIES=0 is the documented "auto" sentinel.
+    // The production caller in `ProxyState::new` resolves it before calling
+    // `RouterCache::new`, but we also harden `new` itself so direct callers
+    // (tests, future refactors) can't end up with an effectively unbounded
+    // cache — `frequency_aware_evict` returns 0 when `max_entries / 4 == 0`.
+
+    fn minimal_proxy_for_routing(id: &str, listen_path: &str) -> Proxy {
+        use crate::config::types::{
+            AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+        };
+        let now = chrono::Utc::now();
+        Proxy {
+            id: id.to_string(),
+            namespace: crate::config::types::default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some(listen_path.to_string()),
+            backend_scheme: Some(BackendScheme::Http),
+            dispatch_kind: DispatchKind::from(BackendScheme::Http),
+            backend_host: "backend.test".to_string(),
+            backend_port: 80,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5_000,
+            backend_read_timeout_ms: 30_000,
+            backend_write_timeout_ms: 30_000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig::default_verify(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn config_with_n_proxies(n: usize) -> GatewayConfig {
+        let proxies = (0..n)
+            .map(|i| minimal_proxy_for_routing(&format!("p{i}"), &format!("/p{i}")))
+            .collect();
+        GatewayConfig {
+            proxies,
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn new_resolves_zero_max_entries_to_auto_floor() {
+        // 5 proxies × 3 = 15, well below the 10_000 floor — must clamp up.
+        let config = config_with_n_proxies(5);
+        let cache = RouterCache::new(&config, 0);
+        let max_entries = cache.cache_stats().4;
+        assert!(
+            max_entries >= 10_000,
+            "max_entries should be at least 10_000 when caller passes 0, got {}",
+            max_entries
+        );
+    }
+
+    #[test]
+    fn new_resolves_zero_max_entries_scales_with_proxies() {
+        // 5_000 proxies × 3 = 15_000, exceeds the 10_000 floor.
+        let config = config_with_n_proxies(5_000);
+        let cache = RouterCache::new(&config, 0);
+        let max_entries = cache.cache_stats().4;
+        assert_eq!(
+            max_entries, 15_000,
+            "max_entries should be max(10_000, proxies*3) = 15_000"
+        );
+    }
+
+    #[test]
+    fn new_keeps_explicit_nonzero_max_entries() {
+        // Explicit values must NOT be overridden by auto-resolution, even when
+        // they are well below the auto floor.
+        let config = config_with_n_proxies(5);
+        let cache = RouterCache::new(&config, 5_000);
+        assert_eq!(cache.cache_stats().4, 5_000);
     }
 }
