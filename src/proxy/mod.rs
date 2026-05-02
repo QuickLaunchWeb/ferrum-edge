@@ -10765,6 +10765,22 @@ mod tests {
     }
 
     #[test]
+    fn h2_coalesce_bypass_boundary_at_coalesce_target() {
+        // Exactly one coalesce target → bypass (no benefit from staging).
+        assert!(super::should_bypass_h2_coalesce_for_response(
+            Some(131_072),
+            0,
+            131_072,
+        ));
+        // One byte over → mid-band, keep coalescer.
+        assert!(!super::should_bypass_h2_coalesce_for_response(
+            Some(131_073),
+            0,
+            131_072,
+        ));
+    }
+
+    #[test]
     fn h2_coalesce_bypass_requires_known_content_length() {
         // Chunked / unknown length → keep coalescer. We cannot assume
         // frames are already large when the backend has not told us
