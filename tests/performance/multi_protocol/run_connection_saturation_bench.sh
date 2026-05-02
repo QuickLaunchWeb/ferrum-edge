@@ -43,6 +43,20 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
+# ── Portable `timeout` command (GNU coreutils) ──────────────────────────────
+# Bound each saturate run so a hung proto_bench (stuck socket/task or a
+# gateway that never accepts) doesn't block the whole matrix until the
+# job-level timeout fires. macOS/BSD ships without `timeout`; Homebrew
+# installs it as `gtimeout`. Mirrors the helper in run_gateway_protocol_bench.sh.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    TIMEOUT_CMD=""
+    echo "[warn] Neither 'timeout' nor 'gtimeout' found — saturate runs will have no per-N kill-switch" >&2
+fi
+
 # ── Defaults ─────────────────────────────────────────────────────────────────
 GATEWAYS="ferrum envoy kong tyk krakend"
 CONNECTION_LEVELS="1000 5000 10000 25000 50000"
@@ -320,18 +334,35 @@ run_saturate() {
     local out="$OUTPUT_DIR/${gw}_${n}.json"
     echo "[bench] $gw N=$n → $out"
 
-    # Total budget: ramp + hold + slack. Cap at hard timeout to avoid hanging
-    # on a hung gateway.
+    # Per-run wallclock budget: ramp + hold + slack. The slack covers TLS
+    # handshake completion at the tail of the ramp plus the small amount of
+    # post-hold reporting work proto_bench does. If proto_bench overshoots
+    # this (stuck socket, gateway never accepts, infinite loop in a worker
+    # task), $TIMEOUT_CMD kills it — the empty-output branch below then
+    # writes a "broken" stub so the per-(gateway, N) ledger reflects the
+    # failure instead of the matrix stalling.
     local timeout_s=$((RAMP_SECONDS + HOLD_SECONDS + 60))
 
-    "$SCRIPT_DIR/target/release/proto_bench" saturate \
-        --target "$TARGET_URL" \
-        --connections "$n" \
-        --ramp-seconds "$RAMP_SECONDS" \
-        --hold-seconds "$HOLD_SECONDS" \
-        --heartbeat-interval-ms "$HEARTBEAT_MS" \
-        --connect-timeout-ms 10000 \
-        --json > "$out" 2> "$out.stderr" || true
+    if [ -n "$TIMEOUT_CMD" ]; then
+        $TIMEOUT_CMD --kill-after=10s "${timeout_s}s" \
+            "$SCRIPT_DIR/target/release/proto_bench" saturate \
+            --target "$TARGET_URL" \
+            --connections "$n" \
+            --ramp-seconds "$RAMP_SECONDS" \
+            --hold-seconds "$HOLD_SECONDS" \
+            --heartbeat-interval-ms "$HEARTBEAT_MS" \
+            --connect-timeout-ms 10000 \
+            --json > "$out" 2> "$out.stderr" || true
+    else
+        "$SCRIPT_DIR/target/release/proto_bench" saturate \
+            --target "$TARGET_URL" \
+            --connections "$n" \
+            --ramp-seconds "$RAMP_SECONDS" \
+            --hold-seconds "$HOLD_SECONDS" \
+            --heartbeat-interval-ms "$HEARTBEAT_MS" \
+            --connect-timeout-ms 10000 \
+            --json > "$out" 2> "$out.stderr" || true
+    fi
 
     if [ ! -s "$out" ]; then
         echo "[bench] empty output for $gw N=$n (proto_bench may have crashed)" >&2
