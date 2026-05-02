@@ -218,7 +218,19 @@ pub fn extract(
         SpecFormat::Yaml => {
             let yv: serde_yaml::Value = serde_yaml::from_slice(body)
                 .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
-            serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?
+            let val =
+                serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
+            // serde_yaml 0.9 does not cap alias/anchor expansion.  A small
+            // YAML doc using nested aliases can expand to billions of Value
+            // nodes despite the HTTP body-size limit.  Walk the tree with a
+            // budget to reject alias bombs before doing any real work.
+            let mut budget = MAX_YAML_EXPANDED_NODES;
+            if !count_value_nodes(&val, &mut budget) {
+                return Err(ExtractError::InvalidYaml(
+                    "YAML alias expansion exceeds node limit; reduce anchor nesting".to_string(),
+                ));
+            }
+            val
         }
     };
 
@@ -742,6 +754,44 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
     }
 
     Err(ExtractError::UnknownVersion)
+}
+
+// ---------------------------------------------------------------------------
+// YAML alias-bomb defence
+// ---------------------------------------------------------------------------
+
+/// Maximum number of `serde_json::Value` nodes allowed after YAML → JSON
+/// conversion.  500k nodes is generous for any real OpenAPI spec (the largest
+/// public specs top out around 50k nodes) while still capping the memory cost
+/// of alias expansion to a few hundred MB.
+const MAX_YAML_EXPANDED_NODES: usize = 500_000;
+
+/// Walk a `serde_json::Value` tree, decrementing `budget` for each node
+/// visited.  Returns `false` (reject) when the budget hits zero.
+fn count_value_nodes(val: &serde_json::Value, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if !count_value_nodes(item, budget) {
+                    return false;
+                }
+            }
+            true
+        }
+        serde_json::Value::Object(map) => {
+            for (_, v) in map {
+                if !count_value_nodes(v, budget) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => true,
+    }
 }
 
 /// Maximum recursion depth for [`find_forbidden_key`].
@@ -2039,6 +2089,48 @@ x-ferrum-proxy:
             32,
             "server_urls must be capped at 32 entries; got {}",
             meta.server_urls.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // YAML alias-bomb defence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn count_value_nodes_within_budget() {
+        let val: serde_json::Value = serde_json::from_str(r#"{"a": [1, 2, {"b": 3}]}"#).unwrap();
+        let mut budget: usize = 100;
+        assert!(count_value_nodes(&val, &mut budget));
+        // root object + "a" array + 1 + 2 + inner object + 3 = 6 nodes
+        assert_eq!(budget, 94);
+    }
+
+    #[test]
+    fn count_value_nodes_exceeds_budget() {
+        let val: serde_json::Value = serde_json::from_str(r#"[1, 2, 3, 4, 5]"#).unwrap();
+        let mut budget: usize = 3;
+        assert!(!count_value_nodes(&val, &mut budget));
+    }
+
+    #[test]
+    fn yaml_alias_bomb_rejected() {
+        // Build a YAML doc with deeply nested anchors that expands
+        // exponentially.  serde_yaml 0.9 may catch this at its own
+        // repetition limit; our node counter is defence-in-depth.
+        let yaml = b"a: &a [1,2,3,4,5,6,7,8]\n\
+                      b: &b [*a,*a,*a,*a,*a,*a,*a,*a]\n\
+                      c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n\
+                      d: &d [*c,*c,*c,*c,*c,*c,*c,*c]\n\
+                      e: &e [*d,*d,*d,*d,*d,*d,*d,*d]\n\
+                      f: &f [*e,*e,*e,*e,*e,*e,*e,*e]\n\
+                      g: &g [*f,*f,*f,*f,*f,*f,*f,*f]\n\
+                      openapi: '3.0.0'\n\
+                      info: {title: bomb, version: '1.0'}\n\
+                      x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
+        let result = extract(yaml, Some(SpecFormat::Yaml), "default");
+        assert!(
+            result.is_err(),
+            "alias bomb must be rejected by serde_yaml repetition limit or node counter"
         );
     }
 }

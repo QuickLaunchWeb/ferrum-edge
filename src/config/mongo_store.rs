@@ -771,8 +771,16 @@ mod inner {
             let result = self.proxies().delete_one(doc! { "_id": id }).await?;
             // Mirror SQL's ON DELETE CASCADE: remove any api_specs row that references
             // this proxy. In SQL this is handled by the FK constraint; Mongo has no FK
-            // so we do it explicitly. Log if the count is unexpected but don't fail.
+            // so we do it explicitly. Also cascade-delete spec-owned upstreams (tagged
+            // with the same api_spec_id) to mirror the SQL delete_api_spec cascade.
             if result.deleted_count > 0 {
+                // Capture the spec ID before deleting the api_specs row so we can
+                // clean up spec-owned upstreams afterwards.
+                let spec_id: Option<String> =
+                    match self.api_specs().find_one(doc! { "proxy_id": id }).await {
+                        Ok(Some(doc)) => doc.get_str("_id").ok().map(str::to_string),
+                        _ => None,
+                    };
                 match self.api_specs().delete_many(doc! { "proxy_id": id }).await {
                     Ok(r) if r.deleted_count > 1 => {
                         warn!(
@@ -785,6 +793,21 @@ mod inner {
                         warn!(
                             "delete_proxy: failed to delete api_specs for proxy {}: {}",
                             id, e
+                        );
+                    }
+                }
+                // Cascade-delete spec-owned upstreams.  Without this, upstreams
+                // tagged with the deleted spec's api_spec_id but no longer
+                // referenced via proxy.upstream_id would be orphaned.
+                if let Some(ref sid) = spec_id {
+                    if let Err(e) = self
+                        .upstreams()
+                        .delete_many(doc! { "api_spec_id": sid })
+                        .await
+                    {
+                        warn!(
+                            "delete_proxy: failed to delete spec-owned upstreams for spec {}: {}",
+                            sid, e
                         );
                     }
                 }
@@ -2250,9 +2273,10 @@ mod inner {
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 match doc_to_plugin_config(doc) {
-                    Ok(mut pc) => {
-                        // Strip api_spec_id: admin-only metadata, not for runtime.
-                        pc.api_spec_id = None;
+                    Ok(pc) => {
+                        // Preserve api_spec_id: this is an admin-read path used
+                        // by the PUT handler for ownership resolution.  Runtime
+                        // paths strip via strip_api_spec_id_from_runtime_config.
                         configs.push(pc);
                     }
                     Err(e) => {

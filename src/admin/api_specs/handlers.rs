@@ -83,7 +83,6 @@ fn classify_db_error_str(msg: &str) -> ApiSpecError {
     if lower.contains("unique constraint")
         || lower.contains("duplicate key")
         || lower.contains("duplicate entry")
-        || lower.contains("duplicate")
     {
         ApiSpecError::Conflict(msg.to_string())
     } else if msg.contains("MongoDB document limit") {
@@ -1558,12 +1557,12 @@ fn spec_content_response(
     // ETag
     let etag = format!("\"{}\"", spec.content_hash);
 
-    // If-None-Match check
-    if let Some(inm) = request_headers
+    // If-None-Match check (RFC 7232 §3.2: may be comma-separated list)
+    let etag_matches = request_headers
         .get("if-none-match")
         .and_then(|v| v.to_str().ok())
-        && (inm == etag || inm == "*")
-    {
+        .is_some_and(|inm| inm == "*" || inm.split(',').any(|entry| entry.trim() == etag));
+    if etag_matches {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", etag)
@@ -1688,6 +1687,18 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 filter.proxy_id = Some(val);
             }
             "spec_version" if !val.is_empty() => {
+                // Same LIKE wildcard defence as title_contains — the SQL
+                // list_api_specs builds `spec_version LIKE ?` with a suffix
+                // wildcard and no ESCAPE clause.
+                for ch in ['%', '_', '\\'] {
+                    if val.contains(ch) {
+                        return Err(ApiSpecError::BadRequest(format!(
+                            "spec_version must not contain SQL LIKE wildcard or escape \
+                             characters ('{}' is forbidden); use plain text only",
+                            ch
+                        )));
+                    }
+                }
                 filter.spec_version_prefix = Some(val);
             }
             "title_contains" if !val.is_empty() => {
