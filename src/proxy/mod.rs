@@ -611,14 +611,16 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
 /// RFC 6455 §4.1 requires the key to be exactly 16 bytes of random data,
 /// base64-encoded to 24 characters (16 bytes → 22 base64 chars + 2 padding `=`).
 ///
-/// Leading/trailing ASCII whitespace is trimmed before validation. RFC 9110 §5.5
-/// already requires header parsers to strip optional whitespace (OWS), but cross-hop
+/// Leading/trailing OWS (RFC 9110 §5.5: ASCII space + horizontal tab) is trimmed
+/// before validation. Header parsers are required to strip OWS, but cross-hop
 /// normalization is not guaranteed to be consistent, so we trim defensively here.
-/// `ws_accept_from_key` performs the same trim so admission and accept-key derivation
-/// stay byte-for-byte aligned.
+/// `str::trim_ascii` is used (vs. `str::trim`) because OWS is strictly ASCII —
+/// avoiding the Unicode-boundary scan is both faster and more spec-precise.
+/// `ws_accept_from_key` performs the same trim so admission and accept-key
+/// derivation stay byte-for-byte aligned.
 pub fn is_valid_websocket_key(key: &str) -> bool {
     use base64::Engine;
-    let key = key.trim();
+    let key = key.trim_ascii();
     key.len() == 24
         && base64::engine::general_purpose::STANDARD
             .decode(key)
@@ -632,15 +634,17 @@ pub fn is_valid_websocket_key(key: &str) -> bool {
 /// base64-encoded key the client sent. Any leading/trailing whitespace in the
 /// raw header value would otherwise leak into the SHA-1 input and produce an
 /// Accept value the client rejects, so we trim before hashing.
-/// `is_valid_websocket_key` performs the same trim so admission and derivation
-/// agree on what counts as the "key bytes".
+/// `str::trim_ascii` is used (vs. `str::trim`) because RFC 9110 §5.5 OWS is
+/// strictly ASCII — avoiding the Unicode-boundary scan is both faster and more
+/// spec-precise. `is_valid_websocket_key` performs the same trim so admission
+/// and derivation agree on what counts as the "key bytes".
 ///
 /// An empty / missing key (`""`) is passed through to `derive_accept_key`
 /// unchanged to preserve the prior fallback behavior — admission already
 /// rejects requests without a key, so this branch is only reachable in
 /// pathological / mock cases.
 pub fn ws_accept_from_key(raw: &str) -> String {
-    derive_accept_key(raw.trim().as_bytes())
+    derive_accept_key(raw.trim_ascii().as_bytes())
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`.
