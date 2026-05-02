@@ -3473,6 +3473,44 @@ async fn list_with_invalid_percent_encoding_returns_400() {
     );
 }
 
+/// `?has_tag=` accepts arbitrary input AT QUERY TIME — and the SQL `has_tag`
+/// filter embeds it directly into a `LIKE '%"<input>"%'` pattern with no
+/// `ESCAPE` clause. SQL `LIKE` treats `%` as a multi-char wildcard and `_`
+/// as a single-char wildcard, so a client sending `?has_tag=%25` (URL-decoded
+/// `%`) or `?has_tag=_` would inject wildcards and turn the advertised
+/// exact-membership filter into a multi-row pattern match.
+///
+/// We reject the same character set we reject at ingest (`"`, `%`, `_`, `\`)
+/// in the query parser, returning 400 with a clear message.
+#[tokio::test]
+async fn list_with_has_tag_wildcard_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    // Each forbidden char must be rejected. Percent-encoded forms decode
+    // BEFORE the reject check (validated by `percent_decode` running first).
+    for (label, query) in [
+        ("percent literal", "/api-specs?has_tag=%25"), // %25 → '%'
+        ("underscore", "/api-specs?has_tag=api_v1"),
+        ("quote literal", "/api-specs?has_tag=foo%22bar"), // %22 → '"'
+        ("backslash literal", "/api-specs?has_tag=foo%5Cbar"), // %5C → '\'
+    ] {
+        let (status, body) = client.get_json(query).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{label} ({query}) must return 400; body: {body}"
+        );
+        let err = body["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("forbidden character") && err.contains("has_tag"),
+            "{label}: error must cite the rejection rule; got: {err}"
+        );
+    }
+}
+
 // ============================================================================
 // Test coverage gap — concurrent POST with same proxy_id
 // ============================================================================

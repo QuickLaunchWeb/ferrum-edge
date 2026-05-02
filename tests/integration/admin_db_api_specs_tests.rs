@@ -229,15 +229,23 @@ async fn submit_bundle_happy_path_all_resources_tagged() {
         "spec_content bytes must round-trip"
     );
 
-    // --- Verify proxy exists ---
+    // --- Verify proxy exists, and the admin GET path PRESERVES api_spec_id ---
+    // Hot-path isolation means the GATEWAY RUNTIME must never see api_spec_id
+    // (enforced by `strip_api_spec_id_from_runtime_config` in
+    // `load_full_config` / `load_incremental_config`). The admin GET/list
+    // path, by contrast, must return the owning spec id so admin clients can
+    // distinguish spec-owned from hand-added resources per the OpenAPI
+    // schema. `get_proxy` is on the admin path and must preserve it.
     let proxy_row = store
         .get_proxy(&proxy_id)
         .await
         .expect("get_proxy failed")
         .expect("proxy not found");
     assert_eq!(
-        proxy_row.api_spec_id, None,
-        "get_proxy does not load api_spec_id (hot-path isolation)"
+        proxy_row.api_spec_id.as_deref(),
+        Some(spec_id.as_str()),
+        "get_proxy (admin path) must preserve api_spec_id; runtime stripping happens \
+         in load_full_config / load_incremental_config, not in the row mapper"
     );
 
     // --- Verify get_api_spec_by_proxy ---

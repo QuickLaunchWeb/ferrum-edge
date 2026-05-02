@@ -1720,6 +1720,29 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 // Silently ignore unparseable values (best-effort).
             }
             "has_tag" if !val.is_empty() => {
+                // SAFETY-CRITICAL CROSS-FILE INVARIANT (mirrors the ingest-time
+                // rejection in src/admin/api_specs/extractor.rs and the
+                // SAFETY-CRITICAL comment near the SQL `has_tag` LIKE branch in
+                // src/config/db_loader.rs::list_api_specs):
+                //
+                // The SQL `has_tag` filter embeds the user-supplied tag into a
+                // bare `LIKE` pattern with no `ESCAPE` clause. We reject the
+                // tag NAMES at extraction time so the stored data is wildcard-
+                // free, but we ALSO have to validate the QUERY parameter here
+                // — otherwise a client sending `?has_tag=%25` (URL-decoded `%`)
+                // or `?has_tag=_` would inject a SQL LIKE wildcard at query
+                // time and turn the advertised exact-membership filter into a
+                // multi-row pattern match.
+                //
+                // Apply the identical character whitelist used by
+                // `ExtractError::InvalidTagName`.
+                if let Some(c) = val.chars().find(|c| matches!(c, '"' | '%' | '_' | '\\')) {
+                    return Err(ApiSpecError::BadRequest(format!(
+                        "has_tag value contains forbidden character '{}'; tag names \
+                         cannot contain '\"', '%', '_', or '\\\\'",
+                        c
+                    )));
+                }
                 filter.has_tag = Some(val);
             }
             "sort_by" if !val.is_empty() => {

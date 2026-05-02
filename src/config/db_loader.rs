@@ -579,6 +579,15 @@ impl DatabaseStore {
             .validate_plugin_file_dependencies(ValidationAction::Warn)
             .run()?;
 
+        // Hot-path isolation: strip api_spec_id from runtime config. The row
+        // mappers preserve api_spec_id so admin GET/list paths can serialise
+        // it; here we ensure the gateway's in-memory `GatewayConfig` does
+        // not carry the ownership tag (the runtime never reads it, and CP
+        // gRPC broadcasts must not leak it to DPs). Mirrors the strip done
+        // by Mongo's `load_full_config`. See the cross-backend invariant
+        // test `runtime_load_strips_api_spec_id_from_resources`.
+        strip_api_spec_id_from_runtime_config(&mut config);
+
         self.check_slow_query("load_full_config", start);
         Ok(config)
     }
@@ -2243,7 +2252,7 @@ impl DatabaseStore {
             diff_removed(known_plugin_config_ids, &current_plugin_config_ids);
         let removed_upstream_ids = diff_removed(known_upstream_ids, &current_upstream_ids);
 
-        let result = IncrementalResult {
+        let mut result = IncrementalResult {
             added_or_modified_proxies: changed_proxies,
             removed_proxy_ids,
             added_or_modified_consumers: changed_consumers,
@@ -2254,6 +2263,19 @@ impl DatabaseStore {
             removed_upstream_ids,
             poll_timestamp,
         };
+
+        // Hot-path isolation: strip api_spec_id from every loaded resource
+        // before the polling loop applies the delta. Mirrors the
+        // load_full_config strip and matches the Mongo incremental path.
+        for p in &mut result.added_or_modified_proxies {
+            p.api_spec_id = None;
+        }
+        for u in &mut result.added_or_modified_upstreams {
+            u.api_spec_id = None;
+        }
+        for pc in &mut result.added_or_modified_plugin_configs {
+            pc.api_spec_id = None;
+        }
 
         if result.is_empty() {
             debug!("Incremental poll: no changes detected");
@@ -4934,9 +4956,17 @@ fn row_to_proxy(
             .try_get::<f64, _>("udp_max_response_amplification_factor")
             .ok()
             .map(|v| v as f32),
-        // api_spec_id is admin-only metadata; the gateway runtime does not
-        // load or use it — db_loader.rs is the runtime path.
-        api_spec_id: None,
+        // api_spec_id: PRESERVE here. This row mapper is shared between
+        // admin GET/list paths (which need the real owning spec id to
+        // serialise per the OpenAPI schema) and the runtime config loader
+        // (which must NOT see it). The runtime callers
+        // `load_full_config` / `load_incremental_config` strip it
+        // explicitly via `strip_api_spec_id_from_runtime_config(&mut cfg)`
+        // before returning — see Wave 1A's hot-path isolation invariant.
+        api_spec_id: row
+            .try_get::<Option<String>, _>("api_spec_id")
+            .ok()
+            .flatten(),
         resolved_tls: Default::default(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
@@ -5032,9 +5062,13 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
             .ok()
             .flatten()
             .map(|v| v as u16),
-        // api_spec_id is admin-only metadata; the gateway runtime does not
-        // load or use it — db_loader.rs is the runtime path.
-        api_spec_id: None,
+        // See row_to_proxy for the rationale: preserve here so admin reads
+        // get the real owning spec id; runtime callers strip via
+        // strip_api_spec_id_from_runtime_config.
+        api_spec_id: row
+            .try_get::<Option<String>, _>("api_spec_id")
+            .ok()
+            .flatten(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
@@ -5127,12 +5161,42 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert,
         backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
-        // api_spec_id is admin-only metadata; the gateway runtime does not
-        // load or use it — db_loader.rs is the runtime path.
-        api_spec_id: None,
+        // See row_to_proxy for the rationale: preserve here so admin reads
+        // get the real owning spec id; runtime callers strip via
+        // strip_api_spec_id_from_runtime_config.
+        api_spec_id: row
+            .try_get::<Option<String>, _>("api_spec_id")
+            .ok()
+            .flatten(),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })
+}
+
+/// Strip `api_spec_id` from every resource in a `GatewayConfig` so the
+/// gateway runtime never observes the ownership tag.
+///
+/// The row mappers (`row_to_proxy`, `row_to_upstream`, `row_to_plugin_config`)
+/// PRESERVE `api_spec_id` so admin GET/list paths can serialise it per the
+/// OpenAPI schema. The runtime callers (`load_full_config`,
+/// `load_incremental_config`) call this helper before returning to enforce
+/// the hot-path isolation invariant: api_specs is admin-only metadata,
+/// CP gRPC broadcasts must not leak ownership tags to DPs, and the
+/// polling delta path keys off resource fields that should not include
+/// admin metadata.
+///
+/// Mirror of the Mongo path's strip in `MongoStore::load_full_config` /
+/// `MongoStore::load_incremental_config`.
+pub(crate) fn strip_api_spec_id_from_runtime_config(config: &mut GatewayConfig) {
+    for p in &mut config.proxies {
+        p.api_spec_id = None;
+    }
+    for u in &mut config.upstreams {
+        u.api_spec_id = None;
+    }
+    for pc in &mut config.plugin_configs {
+        pc.api_spec_id = None;
+    }
 }
 
 /// Parse an api_specs row into an [`ApiSpec`] struct.
