@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tracing::debug;
 
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -304,7 +305,25 @@ impl ProxyBody {
             ProxyBodyKind::Stream(body) => {
                 ProxyBodyKind::Tracked(TrackedBody::new(body, Arc::clone(&metrics)))
             }
-            other => other,
+            other => {
+                // Latent-trap diagnostic: production callers should only
+                // reach here from `ResponseBody::Streaming` arms (which
+                // produce `Stream` variants). If a future refactor passes
+                // a `Full` or already-`Tracked` body here, the returned
+                // metrics stay inert — the deferred log task will then
+                // warn "Streaming response incomplete" after
+                // `read_timeout + 5s`. Surfacing it as a debug line makes
+                // that failure mode trivial to diagnose.
+                debug!(
+                    kind = match &other {
+                        ProxyBodyKind::Full(_) => "Full",
+                        ProxyBodyKind::Tracked(_) => "Tracked",
+                        ProxyBodyKind::Stream(_) => "Stream",
+                    },
+                    "ProxyBody::into_tracked called on non-Stream body — returning unchanged with inert metrics"
+                );
+                other
+            }
         };
         (self, metrics)
     }
@@ -1737,6 +1756,29 @@ mod tests {
         // Metrics observed completion via TrackedBody's poll_frame.
         assert!(metrics.completed());
         assert!(metrics.last_frame_elapsed_ms().is_some());
+    }
+
+    #[test]
+    fn into_tracked_on_already_tracked_body_is_noop() {
+        use std::time::Instant;
+
+        // First wrap: Stream → Tracked drives the original metrics.
+        let mock = MockSource::new(vec![MockStep::End]);
+        let inner = Coalescing::new(mock, COALESCE_TARGET, None);
+        let base = ProxyBody::streaming(Box::pin(inner));
+
+        let baseline_a = Instant::now();
+        let (tracked, metrics_a) = base.into_tracked(baseline_a);
+        assert!(matches!(tracked.kind, ProxyBodyKind::Tracked(_)));
+
+        // Second wrap: Tracked → Tracked must be a no-op. The kind stays
+        // `Tracked` (the inner `TrackedBody` keeps reporting into
+        // `metrics_a`); the freshly-allocated `metrics_b` is inert.
+        let baseline_b = Instant::now();
+        let (rewrapped, metrics_b) = tracked.into_tracked(baseline_b);
+        assert!(matches!(rewrapped.kind, ProxyBodyKind::Tracked(_)));
+        assert!(!Arc::ptr_eq(&metrics_a, &metrics_b));
+        assert_eq!(Arc::strong_count(&metrics_b), 1);
     }
 
     #[test]
