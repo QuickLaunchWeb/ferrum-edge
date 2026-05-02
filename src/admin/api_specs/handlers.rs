@@ -903,11 +903,11 @@ async fn assign_ids_for_put(
             continue;
         }
         let key = plugin_canonical_key(pc)?;
-        if let Some(q) = canonical_to_existing.get_mut(&key) {
-            if let Some(matched) = q.pop_front() {
-                assigned_ids.push(Some(matched.id.clone()));
-                continue;
-            }
+        if let Some(q) = canonical_to_existing.get_mut(&key)
+            && let Some(matched) = q.pop_front()
+        {
+            assigned_ids.push(Some(matched.id.clone()));
+            continue;
         }
         // Unmatched — record for the name-ambiguity check.
         assigned_ids.push(None);

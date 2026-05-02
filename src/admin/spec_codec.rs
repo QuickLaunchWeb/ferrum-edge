@@ -146,7 +146,7 @@ mod tests {
         let compressed = compress_gzip(&input).expect("compress failed");
 
         // Cap at 1 MiB — the decompressed output (4 MiB) exceeds the cap.
-        let cap = 1 * 1024 * 1024;
+        let cap = 1024 * 1024;
         let result = decompress_gzip_capped(&compressed, cap);
         assert!(
             result.is_err(),
