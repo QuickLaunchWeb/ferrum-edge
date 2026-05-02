@@ -1880,7 +1880,7 @@ impl EnvConfig {
         self.db_tls_mode.is_some_and(DbTlsMode::enables_tls)
     }
 
-    pub fn db_tls_allows_invalid_certificates(&self) -> bool {
+    pub fn mongodb_db_tls_allows_invalid_certificates(&self) -> bool {
         self.db_tls_mode
             .is_some_and(DbTlsMode::allows_invalid_certificates)
     }

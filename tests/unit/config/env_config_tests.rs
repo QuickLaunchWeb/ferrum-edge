@@ -1969,6 +1969,29 @@ fn test_effective_db_url_postgres_tls_mode() {
 }
 
 #[test]
+fn test_effective_db_url_postgres_disable_tls_mode() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "postgres://localhost/ferrum?sslmode=disable"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_effective_db_url_postgres_all_tls_params() {
     with_env_vars(
         &[
@@ -2041,6 +2064,29 @@ fn test_effective_db_url_mysql_tls_mode_mapping() {
             assert_eq!(
                 config.effective_db_url().unwrap(),
                 "mysql://localhost/ferrum?ssl-mode=REQUIRED"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_effective_db_url_mysql_disable_tls_mode() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "mysql://localhost/ferrum?ssl-mode=DISABLED"
             );
         },
     );
@@ -2195,7 +2241,7 @@ fn test_env_config_db_tls_accepts_mongodb_verify_full() {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.db_tls_mode, Some(DbTlsMode::VerifyFull));
             assert!(config.db_tls_enabled());
-            assert!(!config.db_tls_allows_invalid_certificates());
+            assert!(!config.mongodb_db_tls_allows_invalid_certificates());
         },
     );
 }

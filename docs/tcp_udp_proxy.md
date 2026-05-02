@@ -477,6 +477,6 @@ Stream proxy connections track:
 - **Connection-phase retries only**: TCP/UDP connections support retries during the connection phase (before data transfer starts). On connect failure, the gateway selects a different load-balanced target and retries with backoff. Once bytes have been forwarded, retries are not possible — the stream cannot be replayed.
 - **UDP max datagram**: Limited to 65,535 bytes per datagram (UDP protocol limit)
 - **Session isolation**: UDP sessions are keyed by source address — NAT'd clients sharing an IP:port will share a session
-- **DTLS key types**: DTLS supports ECDSA P-256 and P-384 certificates — RSA keys are not supported by the underlying `dimpl` library
+- **DTLS key types**: DTLS supports ECDSA P-256 and P-384 certificates — RSA and Ed25519 keys are not supported by the underlying `dimpl` library
 - **DTLS protocol version**: Both DTLS 1.2 and DTLS 1.3 (RFC 9147) are supported. Version is auto-negotiated — the highest mutually supported version is used.
 - **DTLS cert separation**: Frontend DTLS uses separate cert/key from TLS (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` env vars, not the gateway's TLS cert)

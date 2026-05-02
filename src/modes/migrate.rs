@@ -65,7 +65,7 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
             env_config.db_tls_ca_cert_path.as_deref(),
             env_config.db_tls_client_cert_path.as_deref(),
             env_config.db_tls_client_key_path.as_deref(),
-            env_config.db_tls_allows_invalid_certificates(),
+            env_config.mongodb_db_tls_allows_invalid_certificates(),
         )
         .await?;
         use crate::config::db_backend::DatabaseBackend;
