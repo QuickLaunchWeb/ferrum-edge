@@ -107,6 +107,12 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_title ON api_specs (namespace, title)",
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_operation_count ON api_specs (namespace, operation_count)",
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_created_at ON api_specs (namespace, created_at)",
+            // Back-link indexes: replace_api_spec_bundle and delete_api_spec
+            // run WHERE api_spec_id = ? against these tables. Without indexes,
+            // those queries are full-table scans that grow with overall config
+            // volume, not spec count.
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
         ];
 
         for idx_sql in indexes {
@@ -453,8 +459,8 @@ impl V001SqlBuilder {
                 contact_email TEXT,
                 license_name TEXT,
                 license_identifier TEXT,
-                tags TEXT NOT NULL DEFAULT '[]',
-                server_urls TEXT NOT NULL DEFAULT '[]',
+                tags VARCHAR(8192) NOT NULL DEFAULT '[]',
+                server_urls VARCHAR(8192) NOT NULL DEFAULT '[]',
                 operation_count INTEGER NOT NULL DEFAULT 0,
                 resource_hash VARCHAR(64) NOT NULL DEFAULT '',
                 created_at VARCHAR(50) NOT NULL,

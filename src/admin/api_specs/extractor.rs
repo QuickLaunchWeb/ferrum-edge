@@ -840,8 +840,13 @@ fn find_forbidden_key_depth(value: &serde_json::Value, depth: usize) -> Option<&
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
-                // Check the key itself.
-                if let Some(found) = FORBIDDEN_CONFIG_KEYS.iter().find(|&&k| k == key.as_str()) {
+                // Case-insensitive + trimmed match so variants like "JWT",
+                // "jwt ", or NBSP-prefixed keys don't bypass the check.
+                let trimmed = key.trim();
+                if let Some(found) = FORBIDDEN_CONFIG_KEYS
+                    .iter()
+                    .find(|&&k| k.eq_ignore_ascii_case(trimmed))
+                {
                     return Some(found);
                 }
                 // Recurse into the child value.

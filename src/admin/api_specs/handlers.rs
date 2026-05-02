@@ -1549,11 +1549,17 @@ fn spec_content_response(
     // ETag
     let etag = format!("\"{}\"", spec.content_hash);
 
-    // If-None-Match check (RFC 7232 §3.2: may be comma-separated list)
+    // If-None-Match check (RFC 9110 §13.1.2: comma-separated list, W/ prefix)
     let etag_matches = request_headers
         .get("if-none-match")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|inm| inm == "*" || inm.split(',').any(|entry| entry.trim() == etag));
+        .is_some_and(|inm| {
+            inm == "*"
+                || inm.split(',').any(|entry| {
+                    let tag = entry.trim().strip_prefix("W/").unwrap_or(entry.trim());
+                    tag == etag
+                })
+        });
     if etag_matches {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
@@ -1622,6 +1628,7 @@ fn spec_content_response(
         .header("Content-Length", len.to_string())
         .header("ETag", etag)
         .header("Cache-Control", "no-store")
+        .header("Vary", "Accept")
         .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap_or_else(|_| {

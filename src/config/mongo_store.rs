@@ -1836,6 +1836,14 @@ mod inner {
         //
         // IMPORTANT: Do NOT call these from db_loader polling loops,
         // GatewayConfig loading, or gRPC distribution paths.
+        //
+        // BSON 16 MiB size check: the pre-flight check measures only the
+        // api_specs document (which contains the gzip-compressed spec
+        // content).  Bundle-side documents (proxy, upstream, plugin_configs)
+        // are assumed individually small — a single Proxy/Upstream/
+        // PluginConfig serializes to a few KB of BSON at most.  If a future
+        // change embeds large binary payloads in those types, add per-doc
+        // size checks here.
         // -------------------------------------------------------------------
 
         async fn submit_api_spec_bundle(
@@ -2548,6 +2556,12 @@ mod inner {
         /// of a replica set in `db_type_str` by using the suffix `"+rs"` whenever
         /// the caller passes a non-`None` `replica_set` argument. This avoids an
         /// extra server round-trip on every method call.
+        /// Detection is env-var-based only (`FERRUM_MONGO_REPLICA_SET`).  A
+        /// user pointing at an actual replica set without setting the env var
+        /// silently falls into the compensating-delete path.  A startup
+        /// `hello` probe could detect the mismatch and warn, but the env var
+        /// is the documented contract and false-negative is safe (just slower
+        /// and less atomic).
         fn replica_set_configured(&self) -> bool {
             self.db_type_str.ends_with("+rs")
         }
