@@ -89,7 +89,9 @@ impl DbTlsTestHarness {
         let mut extra_env = Vec::new();
         if self.db_type != "sqlite" {
             extra_env.push(("FERRUM_DB_TLS_MODE".to_string(), ssl_mode.to_string()));
-            extra_env.push(("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path));
+            if matches!(ssl_mode, "verify-ca" | "verify-full") {
+                extra_env.push(("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path));
+            }
         }
         self.start_gateway_with_envs(db_url, extra_env).await
     }
