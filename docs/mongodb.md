@@ -87,8 +87,8 @@ These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Slow query warning threshold (same as SQL) |
 | `FERRUM_DB_TLS_MODE` | MongoDB TLS policy: `disable`, `require`, or `verify-full` (see [TLS](#tls)) |
 | `FERRUM_DB_TLS_CA_CERT_PATH` | CA certificate for server verification |
-| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mTLS |
-| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mTLS |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_KEY_PATH` |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
 
 ### SQL-Only Settings (Ignored for MongoDB)
 

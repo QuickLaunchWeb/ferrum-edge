@@ -2390,6 +2390,48 @@ fn test_env_config_db_tls_ca_requires_mode() {
 }
 
 #[test]
+fn test_env_config_db_tls_rejects_client_cert_without_key() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "verify-full"),
+            ("FERRUM_DB_TLS_CLIENT_CERT_PATH", "/certs/client.pem"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_DB_TLS_CLIENT_KEY_PATH is missing"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_client_key_without_cert() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mysql"),
+            ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "verify-full"),
+            ("FERRUM_DB_TLS_CLIENT_KEY_PATH", "/certs/client-key.pem"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_DB_TLS_CLIENT_CERT_PATH is missing"));
+        },
+    );
+}
+
+#[test]
 fn test_plugin_http_slow_threshold_default() {
     with_env_vars(
         &[

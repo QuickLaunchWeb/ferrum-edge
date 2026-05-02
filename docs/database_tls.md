@@ -24,6 +24,8 @@ Ferrum Edge uses one database TLS env family for every database backend that has
 
 When `FERRUM_DB_TLS_MODE` is unset, Ferrum does not add or force database TLS settings. For production network databases, set `FERRUM_DB_TLS_MODE=verify-full` and provide the CA bundle needed to validate the database server certificate.
 
+Database mTLS requires both `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH`; setting only one is rejected at startup.
+
 For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`, `FERRUM_DB_READ_REPLICA_URL`, and each URL in `FERRUM_DB_FAILOVER_URLS`. For MongoDB, Ferrum configures the MongoDB driver `TlsOptions`; MongoDB URI TLS options can also be used directly.
 
 `FERRUM_DB_TLS_MODE` supports the following backend-specific values:

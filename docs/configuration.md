@@ -75,8 +75,8 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 |---|---|---|---|
 | `FERRUM_DB_TLS_MODE` | No | — | Database TLS policy. PostgreSQL: `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`; MySQL: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`; MongoDB: `disable`, `require`, `verify-full` |
 | `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database server verification |
-| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
-| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_KEY_PATH` |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
 
 See [database_tls.md](database_tls.md) for detailed configuration examples and TLS mode descriptions.
 
