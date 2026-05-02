@@ -292,6 +292,23 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes
 pub type H3RequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
 
+/// Build a typed `io::Error` of kind `TimedOut` for an H3 backend-connect
+/// budget exhaustion. The shared classifier ([`classify_http3_error`])
+/// downcasts to `std::io::Error` first and maps `ErrorKind::TimedOut` to
+/// `ConnectionTimeout` — without the typed wrapper, the message-based
+/// fallback matches `"handshake"` before `"timeout"` and misclassifies
+/// these errors as `TlsError`. Mirrors the H2/gRPC pool pattern where
+/// `BackendTimeout` carries an `io::Error::TimedOut` source.
+fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str) -> anyhow::Error {
+    anyhow::Error::from(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "HTTP/3 backend connect timeout after {}ms during {} to {}:{} for proxy {}",
+            proxy.backend_connect_timeout_ms, phase, host, port, proxy.id
+        ),
+    ))
+}
+
 async fn timeout_backend_connect<F>(
     future: F,
     connect_timeout: Duration,
@@ -305,16 +322,7 @@ where
 {
     tokio::time::timeout(connect_timeout, future)
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "HTTP/3 backend connect timeout after {}ms during {} to {}:{} for proxy {}",
-                proxy.backend_connect_timeout_ms,
-                phase,
-                host,
-                port,
-                proxy.id
-            )
-        })?
+        .map_err(|_| h3_backend_connect_timeout(proxy, host, port, phase))?
         .map_err(|e| anyhow::anyhow!("{} connection failed: {}", phase, e))
 }
 
@@ -330,28 +338,13 @@ async fn timeout_backend_handshake<F, D>(
 where
     F: Future<Output = Result<(D, H3SendRequest), h3::error::ConnectionError>>,
 {
-    let remaining = connect_timeout.checked_sub(connect_started.elapsed()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "HTTP/3 backend connect timeout before {} handshake completed to {}:{} for proxy {}",
-            phase,
-            host,
-            port,
-            proxy.id
-        )
-    })?;
+    let remaining = connect_timeout
+        .checked_sub(connect_started.elapsed())
+        .ok_or_else(|| h3_backend_connect_timeout(proxy, host, port, phase))?;
 
     tokio::time::timeout(remaining, future)
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "HTTP/3 backend connect timeout after {}ms during {} handshake to {}:{} for proxy {}",
-                proxy.backend_connect_timeout_ms,
-                phase,
-                host,
-                port,
-                proxy.id
-            )
-        })?
+        .map_err(|_| h3_backend_connect_timeout(proxy, host, port, phase))?
         .map_err(|e| anyhow::anyhow!("{} handshake failed: {}", phase, e))
 }
 
@@ -2533,6 +2526,28 @@ mod h3_pool_error_tests {
             classify_http3_error(err.as_ref()),
             crate::retry::ErrorClass::ProtocolError,
             "RESET_STREAM is application-layer (stream abort), not connection reset"
+        );
+    }
+
+    #[test]
+    fn classify_http3_error_treats_backend_connect_timeout_as_connection_timeout() {
+        // Regression (Codex P3): the H3 backend-connect timeout helpers
+        // emit a typed `io::Error::TimedOut` so the unified classifier's
+        // typed walker maps them to `ConnectionTimeout`. A previous version
+        // used `anyhow::anyhow!("...handshake...")` which fell through to
+        // the substring fallback where "handshake" matched before "timeout"
+        // and the error was misclassified as `TlsError` — diverging from
+        // H2/gRPC/TCP which all classify the same `backend_connect_timeout_ms`
+        // budget exhaustion as `ConnectionTimeout`.
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP/3 backend connect timeout after 5000ms during HTTP/3 handshake to 127.0.0.1:443 for proxy test",
+        );
+        let err: anyhow::Error = anyhow::Error::from(io_err);
+        assert_eq!(
+            classify_http3_error(err.as_ref()),
+            crate::retry::ErrorClass::ConnectionTimeout,
+            "backend connect timeout must classify as ConnectionTimeout regardless of phase substring"
         );
     }
 

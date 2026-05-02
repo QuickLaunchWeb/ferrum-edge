@@ -9083,6 +9083,33 @@ fn is_valid_reg_name(host: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-._%~!$&'()*+;=".contains(&b))
 }
 
+/// RFC 3986 IP-literal contents validator: accept IPv6address or IPvFuture
+/// inside `[...]`. Without this, `Host: []` and `Host: [not-an-ip]` would
+/// normalize to opaque strings and fall through to the catch-all routing
+/// tier — bypassing host-scoped routes for a malformed authority.
+fn is_valid_ip_literal_contents(content: &str) -> bool {
+    if content.is_empty() {
+        return false;
+    }
+    if content.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    // IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+    let rest = match content.as_bytes().first() {
+        Some(b'v') | Some(b'V') => &content[1..],
+        _ => return false,
+    };
+    let Some((hex, addr)) = rest.split_once('.') else {
+        return false;
+    };
+    !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && !addr.is_empty()
+        && addr
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b))
+}
+
 fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
     let value = value.trim();
     if value.is_empty() || value.contains('@') {
@@ -9091,6 +9118,13 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
 
     if value.starts_with('[') {
         let end = value.find(']')?;
+        // Reject brackets that don't enclose a valid IPv6address/IPvFuture.
+        // RFC 3986 §3.2.2: bracketed authorities exist solely to disambiguate
+        // IP-literal hosts from port colons; opaque content like `[]` or
+        // `[not-an-ip]` is malformed authority syntax.
+        if !is_valid_ip_literal_contents(&value[1..end]) {
+            return None;
+        }
         let host = &value[..=end];
         let suffix = &value[end + 1..];
         if suffix.is_empty() {

@@ -957,6 +957,51 @@ fn host_with_backslash_rejected_for_routing() {
     assert!(normalize_request_host_for_routing(r"api.example\foo").is_none());
 }
 
+#[test]
+fn host_empty_brackets_rejected_for_routing() {
+    // RFC 3986: bracketed authority must contain IPv6address or IPvFuture.
+    // `[]` is malformed authority syntax — without validation it would
+    // normalize to `[]` and bypass host-scoped routes via the catch-all tier.
+    assert!(normalize_request_host_for_routing("[]").is_none());
+    assert!(normalize_request_host_for_routing("[]:8443").is_none());
+}
+
+#[test]
+fn host_brackets_around_non_ip_rejected_for_routing() {
+    // `[not-an-ip]` and similar opaque bracket contents are not valid
+    // IPv6address/IPvFuture and must not be routable.
+    assert!(normalize_request_host_for_routing("[not-an-ip]").is_none());
+    assert!(normalize_request_host_for_routing("[example.com]").is_none());
+    assert!(normalize_request_host_for_routing("[evil.example]:443").is_none());
+}
+
+#[test]
+fn host_brackets_around_ipv4_rejected_for_routing() {
+    // RFC 3986 reserves brackets exclusively for IPv6address / IPvFuture,
+    // not IPv4. `[127.0.0.1]` is malformed.
+    assert!(normalize_request_host_for_routing("[127.0.0.1]").is_none());
+}
+
+#[test]
+fn host_brackets_around_ipv6_accepted_for_routing() {
+    // Valid IPv6 literals must still be accepted after the new validator.
+    assert_eq!(
+        normalize_request_host_for_routing("[::1]"),
+        Some("[::1]".to_string())
+    );
+    assert_eq!(
+        normalize_request_host_for_routing("[2001:db8::1]:8443"),
+        Some("[2001:db8::1]".to_string())
+    );
+}
+
+#[test]
+fn host_brackets_around_ipvfuture_accepted_for_routing() {
+    // RFC 3986 IPvFuture: "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" ).
+    assert!(normalize_request_host_for_routing("[v1.fe80::a:b]").is_some());
+    assert!(normalize_request_host_for_routing("[v7.example-future]").is_some());
+}
+
 /// Verify that hyper's HeaderMap normalizes header names to lowercase,
 /// preventing header name case obfuscation (e.g., "Transfer-Encoding" vs "transfer-encoding").
 #[test]
