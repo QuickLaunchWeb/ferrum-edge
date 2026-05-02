@@ -183,6 +183,44 @@ All resources created by a spec submission are tagged with `api_spec_id = <spec 
 
 **MongoDB without a replica set**: atomicity is limited to single-document operations. Multi-resource submissions use a best-effort approach with compensating deletes on failure. In the event of an infrastructure fault mid-submission, orphaned resources are possible. Use a MongoDB replica set for production deployments that require atomic multi-document writes.
 
+### Detecting and cleaning up orphans (MongoDB non-RS)
+
+If a non-RS deployment experiences a partial failure, the following queries identify orphaned documents. Run them in `mongosh` against the gateway database.
+
+**Specs pointing to non-existent proxies** (the spec row survived but the proxy was never created or was already deleted):
+
+```js
+db.api_specs.aggregate([
+  { $lookup: { from: "proxies", localField: "proxy_id", foreignField: "_id", as: "p" } },
+  { $match: { p: { $size: 0 } } },
+  { $project: { _id: 1, namespace: 1, proxy_id: 1 } }
+])
+// To delete: db.api_specs.deleteMany({ _id: { $in: [<ids from above>] } })
+```
+
+**Resources tagged with a non-existent spec** (the resource was created but the spec row was lost):
+
+```js
+// Proxies
+db.proxies.aggregate([
+  { $match: { api_spec_id: { $ne: null } } },
+  { $lookup: { from: "api_specs", localField: "api_spec_id", foreignField: "_id", as: "s" } },
+  { $match: { s: { $size: 0 } } },
+  { $project: { _id: 1, namespace: 1, api_spec_id: 1 } }
+])
+
+// Same pattern for plugin_configs and upstreams — replace the collection name.
+```
+
+Orphaned resources with dangling `api_spec_id` tags are inert — they function as normal config entries and do not affect the gateway runtime. Cleanup is optional but recommended to keep the admin API consistent. To clear the tag without deleting the resource:
+
+```js
+db.proxies.updateMany(
+  { api_spec_id: "<orphaned-spec-id>" },
+  { $unset: { api_spec_id: "" } }
+)
+```
+
 ## Listable metadata
 
 At submit time, the gateway extracts the following fields from the spec document and stores them as indexed columns on the `api_specs` row. They appear in every `GET /api-specs` list item and can be used as search filters.
