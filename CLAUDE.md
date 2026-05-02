@@ -268,6 +268,7 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 - No `format!()` in hot loops — pool keys use `write!()` into thread-local `String` buffers (zero-alloc on cache hits, 99%+).
 - `Arc` shared read-only data — `LoadBalancer.targets: Vec<Arc<UpstreamTarget>>`, selection = atomic increment (~5ns) not clone (~200-500ns).
 - Streaming by default — buffer only when a plugin requires it. Small-response eager buffer via `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (64 KiB) when CL known — single `bytes().await` beats coalescing adapter for JSON. SSE always streams. `SizeLimitedStreamingResponse` enforces limit frame-by-frame when CL absent.
+- `ProxyBody`-backed response coalescing uses one generic `Coalescing<S: FrameSource>` adapter in `src/proxy/body.rs` with three pluggable sources (`ReqwestFrameSource` for H1/H2-via-reqwest, `Incoming` for direct H2 / gRPC pool, `H3FrameSource` for native H3). Each path calls a thin builder (`coalescing_body`, `coalescing_h2_body`, `coalescing_h3_body`) over the shared adapter — there is no separate H1/H2/H3 `ProxyBody` coalescer to keep in sync. The H3 frontend cross-protocol bridge is separate (`src/http3/cross_protocol.rs`) because it writes directly to QUIC streams, but it shares the H3 coalescing knobs. Per-protocol bounds differ because native frame sizes differ: `FERRUM_HTTP3_COALESCE_MIN/MAX_BYTES` clamp to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]` (H3 framing is QUIC-packet-sized), `FERRUM_H2_COALESCE_TARGET_BYTES` clamps to `[16 KiB, 1 MiB]` (matches RFC 9113 default frame size). Latency-tracked H1/H2 paths inherit the same coalescing by composing `base_body.into_tracked(baseline)` over the regular streaming dispatch — no parallel "tracked" body builders.
 - Skip plugin phases when empty — guard with `plugins.is_empty()`.
 - **Every `reqwest::Client::builder()` must call `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`**. No production path should fall back to system DNS.
 
@@ -275,8 +276,8 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 - **HTTP/1.1**: hyper → reqwest via `ConnectionPool`. Streaming default.
 - **HTTP/2**: hyper (ALPN) → reqwest or `Http2ConnectionPool` (sharded H2 senders). Streaming default.
-- **HTTP/3**: quinn/h3 → `Http3ConnectionPool`. Streaming via `CoalescingH3Body`/`DirectH3Body`.
-- **gRPC**: hyper (content-type) → `GrpcConnectionPool` (sharded H2). Request + response streaming via `CoalescingH2Body`.
+- **HTTP/3**: quinn/h3 → `Http3ConnectionPool`. Streaming via `coalescing_h3_body` (shared `Coalescing<H3FrameSource>`) / `direct_streaming_h3_body`.
+- **gRPC**: hyper (content-type) → `GrpcConnectionPool` (sharded H2). Request + response streaming via `coalescing_h2_body` (shared `Coalescing<Incoming>`).
 - **WebSocket**: hyper upgrade or H2 Ext CONNECT → direct TCP upgrade; persistent, frame-by-frame.
 - **TCP**: `TcpListener` → `TcpStream::connect`; 1:1. `splice(2)` on Linux (plain + kTLS) else `copy_bidirectional`.
 - **UDP**: `UdpSocket` → per-session socket, session-keyed. GSO-batched send on Linux.
@@ -290,7 +291,7 @@ Dispatch in `src/proxy/mod.rs`: `detect_http_flavor(&req) -> HttpFlavor::{Plain,
 
 **QUIC connection migration**: `http3/server.rs` compares `remote_address()` per request (zero-alloc integer compare). `Arc<str>` re-created only on actual change. Fixes a security issue where migrated clients bypassed per-IP rate limits — do NOT revert to once-per-connection cache.
 
-**gRPC proxy**: hyper H2 direct (not reqwest) to preserve trailers. `GrpcBody::Buffered | Streaming` sum type; streaming forwards `Incoming` frame-by-frame when no body plugins + no retries, bounded by H2 window. Response in `CoalescingH2Body` (128 KB, trailer-safe) when streaming — up to +35% at 5MB.
+**gRPC proxy**: hyper H2 direct (not reqwest) to preserve trailers. `GrpcBody::Buffered | Streaming` sum type; streaming forwards `Incoming` frame-by-frame when no body plugins + no retries, bounded by H2 window. Response wrapped in `coalescing_h2_body` (`Coalescing<Incoming>`, 128 KB target, trailer-safe — stashes gRPC trailers while flushing buffered data) when streaming — up to +35% at 5MB.
 
 ### Connection Pool Keys
 
@@ -401,7 +402,7 @@ Rules: never merge active+passive maps (cross-proxy contamination); never key pa
 
 **Routing**: NEVER O(n) linear scan for prefix routes; NEVER sequential per-pattern regex; router cache must scale with proxy count.
 
-**Protocol gotchas**: don't replace reqwest with H3 pool for H3 frontend→backend (~10x regression on small payloads); keep hyper HTTP/1 `.writev(true)` on BOTH cleartext and TLS server builders (H1-TLS bulk local bench +3-5% RPS); gRPC `Proxy.clone()` is expensive — extract fields into param structs (see `TcpConnParams`); H2 flow control 8 MiB stream / 32 MiB conn for gRPC; `recvmmsg` for UDP frontend recv (reply handlers skip it intentionally); QUIC coalesce 8-32 KB + 2ms flush; `CoalescingH2Body` 128 KB chunks (+35% gRPC at large payloads) — trailer-safe, do NOT revert; direct-H2 plain responses bypass `CoalescingH2Body` only when `Content-Length` is known, within the max response limit, and >= 512 KiB; small/mid-sized and unknown-size responses stay coalesced; Linux `splice(2)` for TCP plain-to-plain via `bidirectional_splice()`; **NEVER splice TLS without kTLS**.
+**Protocol gotchas**: don't replace reqwest with H3 pool for H3 frontend→backend (~10x regression on small payloads); keep hyper HTTP/1 `.writev(true)` on BOTH cleartext and TLS server builders (H1-TLS bulk local bench +3-5% RPS); gRPC `Proxy.clone()` is expensive — extract fields into param structs (see `TcpConnParams`); H2 flow control 8 MiB stream / 32 MiB conn for gRPC; `recvmmsg` for UDP frontend recv (reply handlers skip it intentionally); QUIC coalesce 8-32 KB + 2ms flush; gRPC response coalescer (`coalescing_h2_body` over the shared `Coalescing<Incoming>`) keeps 128 KB chunks (+35% gRPC at large payloads) — trailer-safe, do NOT revert; direct-H2 plain responses bypass `coalescing_h2_body` (use `direct_streaming_h2_body`) only when `Content-Length` is known, within the max response limit, and >= 512 KiB; small/mid-sized and unknown-size responses stay coalesced; Linux `splice(2)` for TCP plain-to-plain via `bidirectional_splice()`; **NEVER splice TLS without kTLS**.
 
 **Active Pingora-inspired optimizations**: frequency-aware router cache eviction (Count-Min Sketch); `IP_BIND_ADDRESS_NO_PORT`; `TCP_FASTOPEN`; thread-local Date header cache; TLS handshake offload runtime; RED probabilistic shedding; UDP jitter-adaptive buffers; `lazy_timeout`; cacheability predictor LRU; `TCP_INFO` BDP sizing; **kTLS** (per-cipher probe, `zeroize` on drop — never consume TLS stream before confirming kernel install); **io_uring splice** (Linux 5.6+, warns if `FERRUM_BLOCKING_THREADS < 1024`); **UDP GSO** (GRO infra-only, needs recvmmsg-primary rewrite); `IP(v6)_PKTINFO` reply-source selection (GSO-combined `sendmsg`, pins `UdpSession.local_addr` via `OnceLock`); `SO_BUSY_POLL`; `HealthBitset` zero-alloc LB selection with FxHash-style hashing.
 

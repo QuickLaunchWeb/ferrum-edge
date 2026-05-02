@@ -7577,64 +7577,23 @@ async fn handle_proxy_request_inner(
     // supplementary log with accurate backend_total_ms.
     // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
-        ResponseBody::Streaming(resp) if state.env_config.enable_streaming_latency_tracking => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
-            // When size limits are configured and Content-Length is absent, apply
-            // size-limited streaming before latency tracking to prevent unbounded
-            // transfer for chunked/unknown-length responses.
-            let (tracked_body, metrics) = if state.max_response_body_size_bytes > 0 && cl.is_none()
-            {
-                ProxyBody::streaming_tracked_with_size_limit(
-                    resp,
-                    backend_start,
-                    state.max_response_body_size_bytes,
-                )
-            } else {
-                ProxyBody::streaming_tracked(resp, backend_start)
-            };
-
-            // Spawn a lightweight deferred task to log the final streaming latency.
-            // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
-            // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
-            if proxy.backend_read_timeout_ms > 0 {
-                let deferred_proxy_id = proxy.id.clone();
-                let deferred_backend_url = strip_query_params(&backend_url).to_string();
-                let read_timeout_ms = proxy.backend_read_timeout_ms;
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000))
-                        .await;
-                    let completed = metrics.completed();
-                    let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                    if completed {
-                        debug!(
-                            proxy_id = %deferred_proxy_id,
-                            backend_url = %deferred_backend_url,
-                            backend_total_ms = total_ms,
-                            "Streaming response completed"
-                        );
-                    } else {
-                        warn!(
-                            proxy_id = %deferred_proxy_id,
-                            backend_url = %deferred_backend_url,
-                            backend_last_frame_ms = total_ms,
-                            "Streaming response incomplete (client disconnect or timeout)"
-                        );
-                    }
-                });
-            }
-
-            tracked_body
-        }
         ResponseBody::Streaming(resp) => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
+            // Build the base body from the shared protocol-agnostic builders
+            // first, THEN optionally wrap it in latency tracking via
+            // `into_tracked`. This guarantees the tracked path inherits the
+            // same coalescing / size-limit / fast-path behaviour as the
+            // default streaming path — we have one source of truth for body
+            // construction across the H1/H2-via-reqwest hot paths.
+            //
             // Fast path: skip coalescing when no plugins need body buffering,
             // no size limits apply, and response buffer cutoff is disabled.
             // This eliminates per-frame BytesMut buffering and branch overhead.
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+            let base = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
                 crate::proxy::body::direct_streaming_body(resp, cl)
             } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                 // No Content-Length — enforce size limit while streaming instead
@@ -7646,6 +7605,46 @@ async fn handle_proxy_request_inner(
                 )
             } else {
                 crate::proxy::body::coalescing_body(resp, cl)
+            };
+
+            if state.env_config.enable_streaming_latency_tracking {
+                let (tracked_body, metrics) = base.into_tracked(backend_start);
+
+                // Spawn a lightweight deferred task to log the final streaming latency.
+                // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
+                // Skipped when read timeout is disabled (0) — no meaningful deadline to check.
+                if proxy.backend_read_timeout_ms > 0 {
+                    let deferred_proxy_id = proxy.id.clone();
+                    let deferred_backend_url = strip_query_params(&backend_url).to_string();
+                    let read_timeout_ms = proxy.backend_read_timeout_ms;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            read_timeout_ms + 5_000,
+                        ))
+                        .await;
+                        let completed = metrics.completed();
+                        let total_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+                        if completed {
+                            debug!(
+                                proxy_id = %deferred_proxy_id,
+                                backend_url = %deferred_backend_url,
+                                backend_total_ms = total_ms,
+                                "Streaming response completed"
+                            );
+                        } else {
+                            warn!(
+                                proxy_id = %deferred_proxy_id,
+                                backend_url = %deferred_backend_url,
+                                backend_last_frame_ms = total_ms,
+                                "Streaming response incomplete (client disconnect or timeout)"
+                            );
+                        }
+                    });
+                }
+
+                tracked_body
+            } else {
+                base
             }
         }
         ResponseBody::StreamingH2(resp) => {
