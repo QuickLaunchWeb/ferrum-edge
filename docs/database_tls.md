@@ -13,11 +13,11 @@ Ferrum Edge supports TLS-encrypted connections to PostgreSQL, MySQL, and MongoDB
 
 ## Configuration Approaches
 
-Ferrum Edge provides two approaches for configuring database TLS. **The native SQL parameter approach is recommended.**
+Ferrum Edge provides two approaches for configuring database TLS. For PostgreSQL/MySQL, the native SQL parameter approach is recommended. For MongoDB, use `FERRUM_DB_TLS_*` or MongoDB connection string TLS options.
 
-### Approach 1: Native SQL Parameters (Recommended)
+### Approach 1: Native SQL Parameters (Recommended for PostgreSQL/MySQL)
 
-Uses `FERRUM_DB_SSL_*` environment variables that map directly to database driver parameters.
+Uses SQL-only `FERRUM_DB_SSL_*` environment variables that map directly to PostgreSQL/MySQL driver parameters. SQLite and MongoDB ignore these variables.
 
 | Environment Variable       | Description                                                      | Example                     |
 |---------------------------|------------------------------------------------------------------|-----------------------------|
@@ -52,7 +52,7 @@ These variables are appended to the `FERRUM_DB_URL` connection string as query p
 
 SQLite ignores all `FERRUM_DB_SSL_*` variables. MongoDB does not use `FERRUM_DB_SSL_MODE`; configure MongoDB TLS with `FERRUM_DB_TLS_*` variables or connection string options.
 
-### Approach 2: Legacy TLS Configuration
+### Approach 2: Legacy TLS Configuration (SQL + MongoDB)
 
 Uses `FERRUM_DB_TLS_*` environment variables that configure TLS at the connection builder level.
 

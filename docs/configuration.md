@@ -55,6 +55,18 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling (SQL only). For MongoDB, use `readPreference` in the connection string |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | No | — | Log database queries slower than this threshold |
 
+#### Database Backend Applicability
+
+| Setting family | PostgreSQL | MySQL | SQLite | MongoDB |
+|---|---|---|---|---|
+| Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
+| `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
+| `FERRUM_DB_READ_REPLICA_URL` | Yes | Yes | No | No; use MongoDB `readPreference` |
+| `FERRUM_DB_TLS_*` legacy TLS fields | Yes | Yes | Ignored | Yes; mapped to MongoDB driver `TlsOptions` |
+| `FERRUM_DB_SSL_*` native SQL SSL fields | Yes | Yes | Ignored | Ignored; use `FERRUM_DB_TLS_*` or MongoDB URI TLS options |
+| `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
+| `FERRUM_MONGO_*` fields | No | No | No | Yes |
+
 ### Database TLS
 
 | Variable | Required | Default | Description |

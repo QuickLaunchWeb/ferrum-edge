@@ -57,6 +57,22 @@ For production with authentication, always use `?authSource=admin` (or your auth
 | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | `30` | How long the driver waits to find a suitable server |
 | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | `10` | TCP connection timeout per server |
 
+### MongoDB Driver Runtime Options
+
+MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI. `FERRUM_DB_POOL_*` is not read on the MongoDB code path.
+
+| Concern | Configure with | Notes |
+|---|---|---|
+| Max pool size | `maxPoolSize` URI option | MongoDB equivalent of pool capacity. Example: `?maxPoolSize=100` |
+| Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
+| Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
+| Pool checkout wait | `waitQueueTimeoutMS` URI option | Driver-side wait for an available connection. |
+| Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
+| TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
+| Read/write splitting | `readPreference` URI option | Use `secondaryPreferred` to offload config polling reads. |
+| TLS | `FERRUM_DB_TLS_*` or URI options such as `tls=true`, `tlsCAFile`, `tlsCertificateKeyFile` | `FERRUM_DB_SSL_*` is SQL-only and ignored. |
+| App name | `FERRUM_MONGO_APP_NAME` or `appName` URI option | Helps identify Ferrum connections in MongoDB server diagnostics. The env var overrides the URI value when set. |
+
 ### Shared Settings (SQL + MongoDB)
 
 These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:

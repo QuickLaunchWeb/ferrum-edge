@@ -238,7 +238,8 @@ pub struct EnvConfig {
     pub db_tls_client_key_path: Option<String>,
     pub db_tls_insecure: bool,
 
-    // Database TLS/SSL
+    // SQL database TLS/SSL. MongoDB ignores these and uses `FERRUM_DB_TLS_*`
+    // or MongoDB URI TLS options instead.
     /// SSL mode for database connections (e.g., disable, prefer, require, verify-ca, verify-full;
     /// PostgreSQL also supports allow)
     pub db_ssl_mode: Option<String>,
@@ -264,10 +265,11 @@ pub struct EnvConfig {
     /// order. All URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
     pub db_failover_urls: Vec<String>,
 
-    /// Connection URL for a read replica database. When set, the polling loop
-    /// reads config from this replica instead of the primary, reducing load on
-    /// the primary. Writes (Admin API CRUD) always go to the primary. Falls
-    /// back to primary if the replica is unreachable.
+    /// Connection URL for a SQL read replica database. When set, the polling
+    /// loop reads config from this replica instead of the primary, reducing
+    /// load on the primary. Writes (Admin API CRUD) always go to the primary.
+    /// Falls back to primary if the replica is unreachable. MongoDB uses
+    /// `readPreference` in `FERRUM_DB_URL` instead.
     pub db_read_replica_url: Option<String>,
 
     /// Threshold in milliseconds for logging slow database queries.
@@ -275,27 +277,28 @@ pub struct EnvConfig {
     /// the operation name and elapsed time. Default: disabled (None).
     pub db_slow_query_threshold_ms: Option<u64>,
 
-    // Database connection pool tuning
-    /// Maximum number of connections in the database pool. Default: 10.
+    // SQL database connection pool tuning. MongoDB manages its own driver pool;
+    // tune it with URI options such as maxPoolSize and minPoolSize.
+    /// Maximum number of connections in the SQL database pool. Default: 32.
     /// Increase for CP mode with many DPs or high admin API concurrency.
     pub db_pool_max_connections: u32,
-    /// Minimum number of idle connections maintained in the pool. Default: 1.
+    /// Minimum number of idle connections maintained in the SQL pool. Default: 1.
     /// Higher values reduce cold-start latency at the cost of holding open
     /// connections. Set to 0 to allow the pool to shrink to zero idle.
     pub db_pool_min_connections: u32,
-    /// Maximum time (seconds) to wait for a connection from the pool before
+    /// Maximum time (seconds) to wait for a connection from the SQL pool before
     /// returning an error. Default: 30. Prevents unbounded waits when the
     /// pool is exhausted under load.
     pub db_pool_acquire_timeout_seconds: u64,
-    /// Maximum time (seconds) a connection can sit idle before being closed.
+    /// Maximum time (seconds) a SQL connection can sit idle before being closed.
     /// Default: 600 (10 minutes). Keeps the pool from holding stale connections.
     pub db_pool_idle_timeout_seconds: u64,
-    /// Maximum lifetime (seconds) of a connection before it is closed and
+    /// Maximum lifetime (seconds) of a SQL connection before it is closed and
     /// replaced. Default: 300 (5 minutes). Forces DNS re-resolution and
     /// prevents stale server-side state. Defence-in-depth alongside the
     /// explicit DnsCache-based reconnect.
     pub db_pool_max_lifetime_seconds: u64,
-    /// Maximum time (seconds) to wait for a new TCP connection to the database.
+    /// Maximum time (seconds) to wait for a new SQL TCP connection to the database.
     /// Default: 10. Separate from `acquire_timeout_seconds` (which covers
     /// waiting for a pool slot + connecting). 0 = disabled (falls back to OS
     /// TCP timeout, which can be 60–120s).
@@ -1785,9 +1788,11 @@ impl EnvConfig {
     }
 
     /// Returns the database URL with TLS/SSL query parameters appended based on
-    /// the `FERRUM_DB_SSL_*` environment variables. For PostgreSQL and MySQL, the
-    /// SSL settings are translated into the appropriate connection string parameters.
-    /// SQLite URLs are returned unchanged (no network TLS).
+    /// the SQL-only `FERRUM_DB_SSL_*` environment variables. For PostgreSQL and
+    /// MySQL, the SSL settings are translated into the appropriate connection
+    /// string parameters. SQLite URLs are returned unchanged (no network TLS).
+    /// MongoDB URLs are returned unchanged because MongoDB uses `FERRUM_DB_TLS_*`
+    /// or MongoDB URI TLS options.
     pub fn effective_db_url(&self) -> Option<String> {
         let base_url = self.db_url.as_ref()?;
         let db_type = self.db_type.as_deref().unwrap_or("");
