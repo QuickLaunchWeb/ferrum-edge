@@ -543,8 +543,8 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
 
 async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::Connector;
+    use tokio_tungstenite::tungstenite::Message;
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = Vec::new();
@@ -569,6 +569,9 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
         None
     };
 
+    // Keep this below the harness wall-clock kill switch. The current matrix
+    // tops out at 5 MiB payloads; tune if substantially larger frames are added.
+    let read_timeout = Duration::from_secs(30);
     for _ in 0..args.concurrency {
         let target = args.target.clone();
         let payload = payload.clone();
@@ -601,13 +604,53 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
                     metrics.record_error();
                     break;
                 }
-                match read.next().await {
-                    Some(Ok(msg)) => {
+                // Only count full binary echoes as successes. Gateway close
+                // frames, such as Kong's default 1009 payload-limit close, are
+                // failures for this echo benchmark.
+                let echoed_len = match tokio::time::timeout(read_timeout, async {
+                    loop {
+                        match read.next().await {
+                            Some(Ok(Message::Binary(data))) => break Ok(data.len()),
+                            Some(Ok(Message::Text(data))) => {
+                                break Err(format!(
+                                    "unexpected text frame of {} bytes",
+                                    data.len()
+                                ));
+                            }
+                            Some(Ok(Message::Close(frame))) => {
+                                break Err(format!("close frame received: {frame:?}"));
+                            }
+                            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                            Some(Ok(other)) => break Err(format!("unexpected frame: {other:?}")),
+                            Some(Err(e)) => break Err(e.to_string()),
+                            None => break Err("connection closed before echo".to_string()),
+                        }
+                    }
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(format!(
+                        "timed out waiting {}s for echo",
+                        read_timeout.as_secs()
+                    )),
+                };
+                match echoed_len {
+                    Ok(len) if len == payload.len() => {
                         let latency = start.elapsed().as_micros() as u64;
-                        let len = msg.into_data().len();
                         metrics.record(latency, len);
                     }
-                    _ => {
+                    Ok(len) => {
+                        eprintln!(
+                            "  ws echo length mismatch: got {} bytes, expected {}",
+                            len,
+                            payload.len()
+                        );
+                        metrics.record_error();
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("  ws echo error: {e}");
                         metrics.record_error();
                         break;
                     }
@@ -636,16 +679,18 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     // against the self-signed benchmark backend would fail and every bench
     // would emit rps=0. Read the CA once here and reuse for every channel.
     let is_tls = args.target.starts_with("https://");
-    let ca_pem = if is_tls {
-        let ca_path = args.ca_cert.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("gRPC over TLS requires --ca-cert <path-to-pem>")
-        })?;
-        Some(std::fs::read(ca_path).with_context(|| {
-            format!("reading gRPC CA certificate from {}", ca_path.display())
-        })?)
-    } else {
-        None
-    };
+    let ca_pem =
+        if is_tls {
+            let ca_path = args
+                .ca_cert
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("gRPC over TLS requires --ca-cert <path-to-pem>"))?;
+            Some(std::fs::read(ca_path).with_context(|| {
+                format!("reading gRPC CA certificate from {}", ca_path.display())
+            })?)
+        } else {
+            None
+        };
 
     // gRPC uses HTTP/2 multiplexing. Share a pool of channels across tasks
     // (~10 streams per channel) instead of one channel per task.
@@ -674,9 +719,9 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                 // Benchmark certs are issued for "localhost"; force SNI/name
                 // check to match regardless of the numeric host in the URI.
                 .domain_name("localhost");
-            endpoint = endpoint.tls_config(tls).map_err(|e| {
-                anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target)
-            })?;
+            endpoint = endpoint
+                .tls_config(tls)
+                .map_err(|e| anyhow::anyhow!("gRPC TLS config for {}: {e}", args.target))?;
         }
 
         let channel = endpoint
@@ -837,12 +882,18 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                             metrics.record(latency, buf.len());
                         }
                         Ok(Err(e)) => {
-                            eprintln!("[tcp-tls] read error after {} requests: {e}", metrics.total_requests);
+                            eprintln!(
+                                "[tcp-tls] read error after {} requests: {e}",
+                                metrics.total_requests
+                            );
                             metrics.record_error();
                             break;
                         }
                         Err(_) => {
-                            eprintln!("[tcp-tls] read timeout (15s) after {} requests", metrics.total_requests);
+                            eprintln!(
+                                "[tcp-tls] read timeout (15s) after {} requests",
+                                metrics.total_requests
+                            );
                             metrics.record_error();
                             break;
                         }
@@ -858,17 +909,19 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    let res = tokio::try_join!(
-                        async { wr.write_all(&payload).await },
-                        async { rd.read_exact(&mut buf).await.map(|_| ()) },
-                    );
+                    let res = tokio::try_join!(async { wr.write_all(&payload).await }, async {
+                        rd.read_exact(&mut buf).await.map(|_| ())
+                    },);
                     match res {
                         Ok(_) => {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, buf.len());
                         }
                         Err(e) => {
-                            eprintln!("[tcp] i/o error after {} requests: {e}", metrics.total_requests);
+                            eprintln!(
+                                "[tcp] i/o error after {} requests: {e}",
+                                metrics.total_requests
+                            );
                             metrics.record_error();
                             break;
                         }

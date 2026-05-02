@@ -3,6 +3,14 @@
 #
 # HTTP/3 downstream is production-ready per Envoy docs; upstream HTTP/3 is alpha.
 # We terminate HTTP/3 at the gateway and use HTTP/3 upstream via explicit config.
+#
+# This benchmark intentionally drives up to 100 concurrent POST/echo streams
+# with payloads as large as 5 MiB. Envoy's QUIC connection window tops out at
+# 24 MiB, and the H3 upstream pool will otherwise concentrate too many large
+# streams onto one backend QUIC connection. Keep the per-stream window high,
+# but cap upstream concurrent streams so Envoy fans out across backend
+# connections; the larger buffer limit avoids H3_NO_ERROR resets from the
+# synthetic in-flight body volume.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 15000 }
@@ -15,7 +23,7 @@ static_resources:
           address: 127.0.0.1
           port_value: 8443
           protocol: UDP
-      per_connection_buffer_limit_bytes: 10485760
+      per_connection_buffer_limit_bytes: 134217728
       udp_listener_config:
         quic_options: {}
         downstream_socket_config:
@@ -61,7 +69,7 @@ static_resources:
   clusters:
     - name: backend_h3
       connect_timeout: 5s
-      per_connection_buffer_limit_bytes: 10485760
+      per_connection_buffer_limit_bytes: 134217728
       type: STATIC
       lb_policy: ROUND_ROBIN
       typed_extension_protocol_options:
@@ -70,7 +78,7 @@ static_resources:
           explicit_http_config:
             http3_protocol_options:
               quic_protocol_options:
-                max_concurrent_streams: { value: 1000 }
+                max_concurrent_streams: { value: 16 }
                 initial_stream_window_size: { value: 8388608 }
                 initial_connection_window_size: { value: 25165824 }
       transport_socket:
