@@ -446,13 +446,14 @@ In CI, this runs as the on-demand `Connection Saturation Benchmark` workflow (`.
 
 ### What "breaking point" means here
 
-`proto_bench saturate --connections N` opens N HTTP/1.1+TLS keep-alive connections to the gateway, ramps them up over `--ramp-seconds`, and holds them open for `--hold-seconds` while each connection sends one tiny POST `/echo` per `--heartbeat-interval-ms`. A run is **`ok`** if all three of:
+`proto_bench saturate --connections N` opens N HTTP/1.1+TLS keep-alive connections to the gateway, ramps them up over `--ramp-seconds`, and holds them open for `--hold-seconds` while each connection sends one tiny POST `/echo` per `--heartbeat-interval-ms`. A run is **`ok`** only if all four of:
 
 - `connect_success_rate ≥ 99%`,
-- `heartbeat_success_rate ≥ 99%`, and
-- `peak_alive_connections ≥ 99% × N`
+- `heartbeat_success_rate ≥ 99%`,
+- `peak_alive_connections ≥ 99% × N`, and
+- `survivorship_rate ≥ 99%` — i.e., ≥99% of connections that established also lasted the entire hold window without being dropped.
 
-are true. Otherwise it's **`broken`**. The runner script ramps N upward and records the largest `ok` and the smallest `broken`.
+are true. Otherwise it's **`broken`**. The runner script ramps N upward and records the largest `ok` and the smallest `broken`. The survivorship gate is what catches the "gateway accepts N conns, processes one heartbeat each, RSTs them all" case — without it, peak-alive + heartbeat-success can both be transiently satisfied while the gateway sheds every connection.
 
 ### Failure-mode classification
 

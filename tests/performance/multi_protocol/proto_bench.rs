@@ -1391,9 +1391,22 @@ struct SaturateReport {
     p99_connect_us: u64,
     p50_heartbeat_us: u64,
     p99_heartbeat_us: u64,
-    /// "ok" if connect & heartbeat success ≥ 99% AND alive_at_end ≥ 99% of target;
-    /// "broken" otherwise. Caller (run_connection_saturation_bench.sh) uses this
-    /// as the binary "did this N succeed?" signal.
+    /// (connect_successes - disconnects_during_hold) / connect_successes.
+    /// 1.0 if every established connection survived the entire hold window.
+    /// Required by the verdict because `peak_alive` + heartbeat success rate
+    /// can BOTH be satisfied transiently while the gateway RSTs every conn
+    /// after a single heartbeat — the case sustained-capacity benchmarks
+    /// must catch.
+    survivorship_rate: f64,
+    /// heartbeats_attempted / expected_heartbeats_min. Diagnostic-only — not
+    /// gating the verdict (timing variance during ramp can knock it under
+    /// 1.0 even on healthy runs). Operators read this to spot cases where
+    /// the gateway is up but starving the request loop.
+    heartbeat_coverage: f64,
+    /// "ok" if connect_success_rate ≥ 99% AND heartbeat_success_rate ≥ 99%
+    /// AND peak_alive ≥ 99% × N AND survivorship_rate ≥ 99%; "broken"
+    /// otherwise. Caller (run_connection_saturation_bench.sh) uses this as
+    /// the binary "did this N succeed?" signal.
     verdict: &'static str,
 }
 
@@ -1650,6 +1663,7 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     let heartbeats_succeeded = counters.heartbeats_succeeded.load(Ordering::Relaxed);
     let peak_alive = counters.peak_alive.load(Ordering::Relaxed);
     let alive_at_end = counters.alive.load(Ordering::Relaxed);
+    let disconnects_during_hold = counters.disconnects_during_hold.load(Ordering::Relaxed);
 
     let connect_success_rate = if connect_attempts > 0 {
         connect_successes as f64 / connect_attempts as f64
@@ -1662,6 +1676,35 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
         0.0
     };
 
+    // Survivorship: of the connections that established, how many made it
+    // through the hold window without being dropped? Without this signal,
+    // a gateway that accepts N conns + processes one heartbeat each + then
+    // RSTs them all gets connect_success=100% AND heartbeat_success=100%
+    // (over a tiny denominator), which the older verdict scored "ok".
+    let survivorship_rate = if connect_successes > 0 {
+        let survived = connect_successes.saturating_sub(disconnects_during_hold);
+        survived as f64 / connect_successes as f64
+    } else {
+        0.0
+    };
+
+    // Diagnostic: how close did we get to the heartbeat volume that a
+    // healthy run *should* produce? Lower bound assumes every conn opened
+    // at the END of ramp (worst stagger), so each gets only `hold_seconds /
+    // heartbeat_interval` beats. Real coverage on a healthy run will be
+    // somewhat higher than this floor because early-ramp conns get more
+    // beats. Not gating — operators eyeball this to spot starved request
+    // loops.
+    let expected_heartbeats_per_conn = (args.hold_seconds * 1_000)
+        .checked_div(args.heartbeat_interval_ms)
+        .unwrap_or(0);
+    let expected_heartbeats_min = connect_successes * expected_heartbeats_per_conn;
+    let heartbeat_coverage = if expected_heartbeats_min > 0 {
+        heartbeats_attempted as f64 / expected_heartbeats_min as f64
+    } else {
+        1.0
+    };
+
     let (p50_connect, p99_connect) = connect_hist
         .lock()
         .map(|h| (h.value_at_quantile(0.50), h.value_at_quantile(0.99)))
@@ -1672,12 +1715,13 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
         .unwrap_or((0, 0));
 
     // Verdict: a level is "ok" only if essentially every connection both
-    // established AND survived the hold window. Tightening below 99% lets a
-    // gateway look healthy while quietly RST'ing 5–10% of conns under load —
-    // exactly the breakage we want to detect.
+    // established AND survived the entire hold window. Tightening below 99%
+    // lets a gateway look healthy while quietly RST'ing 5–10% of conns
+    // under load — exactly the breakage we want to detect.
     let verdict = if connect_success_rate >= 0.99
         && heartbeat_success_rate >= 0.99
         && peak_alive >= ((args.connections as f64) * 0.99) as u64
+        && survivorship_rate >= 0.99
     {
         "ok"
     } else {
@@ -1705,11 +1749,13 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
         heartbeats_succeeded,
         heartbeats_failed: counters.heartbeats_failed.load(Ordering::Relaxed),
         heartbeat_success_rate,
-        disconnects_during_hold: counters.disconnects_during_hold.load(Ordering::Relaxed),
+        disconnects_during_hold,
         p50_connect_us: p50_connect,
         p99_connect_us: p99_connect,
         p50_heartbeat_us: p50_heartbeat,
         p99_heartbeat_us: p99_heartbeat,
+        survivorship_rate,
+        heartbeat_coverage,
         verdict,
     };
 
@@ -1721,8 +1767,10 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     } else {
         let pct_connect = connect_success_rate * 100.0;
         let pct_heartbeat = heartbeat_success_rate * 100.0;
+        let pct_survive = survivorship_rate * 100.0;
+        let pct_coverage = heartbeat_coverage * 100.0;
         println!(
-            "saturate {} N={} ramp={}s hold={}s\n  connect: {}/{} ({:.2}%) — refused={} timeout={} reset={} tls={} other={}\n  peak_alive={} alive_at_end={} disconnects_during_hold={}\n  heartbeats: {}/{} ({:.2}%)\n  connect p50={}us p99={}us  heartbeat p50={}us p99={}us\n  verdict: {}",
+            "saturate {} N={} ramp={}s hold={}s\n  connect: {}/{} ({:.2}%) — refused={} timeout={} reset={} tls={} other={}\n  peak_alive={} alive_at_end={} disconnects_during_hold={} survivorship={:.2}%\n  heartbeats: {}/{} ({:.2}%) coverage={:.2}%\n  connect p50={}us p99={}us  heartbeat p50={}us p99={}us\n  verdict: {}",
             args.target,
             args.connections,
             args.ramp_seconds,
@@ -1737,10 +1785,12 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
             report.connect_other,
             peak_alive,
             alive_at_end,
-            report.disconnects_during_hold,
+            disconnects_during_hold,
+            pct_survive,
             heartbeats_succeeded,
             heartbeats_attempted,
             pct_heartbeat,
+            pct_coverage,
             p50_connect,
             p99_connect,
             p50_heartbeat,

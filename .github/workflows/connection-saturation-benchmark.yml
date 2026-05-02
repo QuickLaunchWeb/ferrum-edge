@@ -203,8 +203,8 @@ jobs:
 
           # Per-(gateway, N) breakdown with failure-mode classification.
           out_lines.append("## Per-level detail\n")
-          out_lines.append("| Gateway | N | Verdict | Connect % | Heartbeat % | Peak Alive | Refused | Timeout | Reset | TLS | Other | Disc/Hold |")
-          out_lines.append("|---------|---|---------|-----------|-------------|------------|---------|---------|-------|-----|-------|-----------|")
+          out_lines.append("| Gateway | N | Verdict | Connect % | Heartbeat % | Survivorship % | Coverage % | Peak Alive | Refused | Timeout | Reset | TLS | Other | Disc/Hold |")
+          out_lines.append("|---------|---|---------|-----------|-------------|----------------|------------|------------|---------|---------|-------|-----|-------|-----------|")
 
           rows = []
           for f in sorted(results_dir.glob("*.json")):
@@ -222,9 +222,12 @@ jobs:
           for gw, _n, d in rows:
               cs = d.get("connect_success_rate", 0) * 100
               hb = d.get("heartbeat_success_rate", 0) * 100
+              sv = d.get("survivorship_rate", 0) * 100
+              cv = d.get("heartbeat_coverage", 0) * 100
               out_lines.append(
                   f"| `{gw}` | {d.get('target_connections', '?')} | **{d.get('verdict', '?')}** | "
-                  f"{cs:.2f} | {hb:.2f} | {d.get('peak_alive_connections', '?')} | "
+                  f"{cs:.2f} | {hb:.2f} | {sv:.2f} | {cv:.2f} | "
+                  f"{d.get('peak_alive_connections', '?')} | "
                   f"{d.get('connect_refused', 0)} | {d.get('connect_timeout', 0)} | "
                   f"{d.get('connect_reset', 0)} | {d.get('connect_tls_error', 0)} | "
                   f"{d.get('connect_other', 0)} | {d.get('disconnects_during_hold', 0)} |"
@@ -232,8 +235,10 @@ jobs:
 
           out_lines.append("")
           out_lines.append("## How to read this")
-          out_lines.append("- **Last OK N**: largest tested N where ≥99% of conns established AND held + ≥99% of heartbeats succeeded.")
+          out_lines.append("- **Last OK N**: largest tested N where ≥99% of conns established, ≥99% survived the full hold window, and ≥99% of heartbeats succeeded.")
           out_lines.append("- **First Break N**: smallest tested N that failed any of those checks.")
+          out_lines.append("- **Survivorship %**: of the connections that established, how many lasted the entire hold window without being dropped. The gate that catches gateways which accept connections then RST them under load — peak-alive alone misses this.")
+          out_lines.append("- **Coverage %**: heartbeats actually attempted vs. the worst-case lower bound (every conn opening at end-of-ramp). Diagnostic only — does not gate the verdict. Healthy runs are typically >100% (early-ramp conns get extra beats); values well below 100% indicate a starved request loop.")
           out_lines.append("- **Refused / Reset / Timeout / TLS**: classifies *how* the gateway broke. nginx-style worker_connections exhaustion typically RSTs new connects (Reset). FD-ceiling hits typically Refuse. Memory pressure during TLS handshake typically shows up as TLS errors.")
           out_lines.append("- **Disc/Hold**: connections that established but were dropped mid-hold (RST or graceful close from the gateway under load).")
 

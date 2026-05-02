@@ -375,6 +375,12 @@ for gw in $GATEWAYS; do
     if ! start_gateway "$gw"; then
         echo "[skip] $gw failed to start" >&2
         record_startup_failed "$gw"
+        # A timed-out wait_for_gateway can leave a partially-started container
+        # holding $GATEWAY_HTTPS_PORT (or 6379, in tyk's case) — without
+        # explicit cleanup, the next gateway in the loop hits a port conflict
+        # and gets misreported as startup_failed too. The trap-on-EXIT cleanup
+        # only fires at the very end, which is too late for the cohort.
+        stop_gateway
         continue
     fi
 
