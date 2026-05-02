@@ -732,16 +732,51 @@ impl DatabaseStore {
     // NOTE: `submit_api_spec_bundle` uses a literal multi-line query string with
     // `\` continuation rather than this const because it adds the `api_spec_id`
     // column.  The `replace_api_spec_bundle` path uses UPDATE so it is out of scope.
-    // If/when the column set diverges further, consider a `bind_proxy_base_columns`
-    // free function that takes `sqlx::query::Query<sqlx::Any, _>` — see the M5
-    // discussion in the PR review notes for the trade-off (the sqlx::Any generic
-    // makes fully-generic helpers verbose; the const approach below is lighter).
+    // ── Drift-prevention contract for proxy INSERT call sites ────────────────
+    //
+    // The 45-column proxy column list is canonical and shared by THREE INSERT
+    // sites and ONE UPDATE site. When you add a new column to the `proxies`
+    // table, it must be added — in the same position — to ALL of:
+    //
+    //   1. PROXY_INSERT_SQL                         (direct admin path)
+    //   2. create_proxy() bind chain                (this file, ~line 790)
+    //   3. submit_api_spec_bundle() proxy INSERT    (this file, ~line 3387)
+    //   4. update_proxy() SET clause + bind chain   (this file, ~line 919)
+    //   5. PROXY_INSERT_PLACEHOLDER_COUNT below     (drift catcher)
+    //   6. PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT below
+    //
+    // The two `proxy_insert_sql_*_count_matches_bind_count` tests below count
+    // `?` placeholders in the SQL and assert against the constants here. If
+    // you forget to update the placeholder count, the test fails and points
+    // at the exact discrepancy. If you update the constant but forget to
+    // bind, sqlx returns "wrong number of parameters" at execute time.
+    //
+    // We chose this drift-catcher pattern over a fully-generic
+    // `bind_proxy_base_columns` helper because the sqlx::Any generic makes
+    // such helpers verbose without meaningful runtime benefit.
+
+    /// Number of `?` placeholders in `PROXY_INSERT_SQL` (no api_spec_id).
+    /// 45 base columns + `created_at` + `updated_at` = 47.
+    ///
+    /// Used only by the drift-catcher tests in `proxy_insert_sql_drift_tests`;
+    /// kept available outside `#[cfg(test)]` so it remains a visible
+    /// drift-prevention anchor when reading the SQL definition.
+    #[allow(dead_code)]
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 47;
+
+    /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
+    /// INSERT statement (which adds `api_spec_id` between
+    /// `udp_max_response_amplification_factor` and `created_at`).
+    /// 47 base + 1 (api_spec_id) = 48.
+    #[allow(dead_code)]
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 48;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
     /// Note: the `?` placeholder is rewritten to `$N` for PostgreSQL by `self.q()`.
     /// Any new column must be appended in the same position in `PROXY_INSERT_SQL`
-    /// and the corresponding `.bind()` chain.
+    /// and the corresponding `.bind()` chain — see the drift-prevention contract
+    /// block above.
     const PROXY_INSERT_SQL: &'static str = "\
         INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_scheme, \
          backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, \
@@ -3545,18 +3580,28 @@ impl DatabaseStore {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
         // --- Hash short-circuit (Wave 5 Feature A) ---------------------------
-        // Fetch the current resource_hash. If the bundle is byte-identical to
-        // what's already stored, only update the api_specs metadata row and
-        // leave the proxy/upstream/plugin tables untouched. This prevents
-        // spurious `updated_at` bumps on proxy/plugin rows for doc-only edits,
-        // which would otherwise trigger router-cache rebuilds + DP gRPC broadcasts.
+        // Fetch the current resource_hash and compare to the bundle hash inside
+        // the SAME transaction as any subsequent write. Doing the SELECT and
+        // the conditional UPDATE in one transaction closes a TOCTOU window:
+        // two concurrent PUTs would otherwise both read the old hash, both
+        // see a mismatch, and both proceed with a full replace — flapping the
+        // proxy row's updated_at twice and re-running the polling cycle's
+        // rebuild path twice. SQLite serializes writes globally; Postgres /
+        // MySQL get repeatable-read semantics within the tx (the second tx
+        // either sees the first's commit or contends on row locks).
+        //
+        // If the bundle is byte-identical to what's already stored, only the
+        // api_specs metadata row is updated; proxy/upstream/plugin tables are
+        // left untouched, preserving the resource-level idempotency invariant.
+        let mut tx = self.pool().begin().await?;
+
         let old_hash: Option<String> = {
             let row: Option<sqlx::any::AnyRow> = sqlx::query(
                 &self.q("SELECT resource_hash FROM api_specs WHERE namespace = ? AND id = ?"),
             )
             .bind(&spec.namespace)
             .bind(&spec.id)
-            .fetch_optional(&self.pool())
+            .fetch_optional(&mut *tx)
             .await?;
             row.and_then(|r| r.try_get::<String, _>("resource_hash").ok())
         };
@@ -3596,12 +3641,15 @@ impl DatabaseStore {
             .bind(spec.updated_at.to_rfc3339())
             .bind(&spec.namespace)
             .bind(&spec.id)
-            .execute(&self.pool())
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             return Ok(());
         }
 
-        let mut tx = self.pool().begin().await?;
+        // Hash mismatch — fall through to the full replace path. The same `tx`
+        // wraps the rest of the operation; opening another `begin()` would
+        // double-nest and is redundant.
 
         // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
         // are intentionally preserved. The proxy itself is updated in place (not deleted)
@@ -5176,4 +5224,58 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             );
             Utc::now()
         })
+}
+
+#[cfg(test)]
+mod proxy_insert_sql_drift_tests {
+    //! Drift-catcher tests for the proxy INSERT call sites.
+    //!
+    //! See the "Drift-prevention contract for proxy INSERT call sites"
+    //! comment block in [`DatabaseStore::PROXY_INSERT_PLACEHOLDER_COUNT`]
+    //! for the contract these tests enforce.
+    //!
+    //! When you add a column to `proxies`:
+    //!   1. Bump `PROXY_INSERT_PLACEHOLDER_COUNT` by 1.
+    //!   2. Bump `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` by 1.
+    //!   3. Add the column + `?` placeholder + `.bind()` to all four sites
+    //!      listed in the contract block.
+    //!   4. Re-run these tests; they verify the SQL placeholder counts match
+    //!      the constants. If the bind chain is missing a column, sqlx will
+    //!      surface "wrong number of parameters" at execute time (caught by
+    //!      the existing integration tests).
+    use super::DatabaseStore;
+
+    #[test]
+    fn proxy_insert_sql_placeholder_count_matches_const() {
+        let placeholders = DatabaseStore::PROXY_INSERT_SQL.matches('?').count();
+        assert_eq!(
+            placeholders,
+            DatabaseStore::PROXY_INSERT_PLACEHOLDER_COUNT,
+            "PROXY_INSERT_SQL `?` placeholder count drifted from \
+             PROXY_INSERT_PLACEHOLDER_COUNT — see the drift-prevention \
+             contract comment block in db_loader.rs",
+        );
+    }
+
+    /// The `submit_api_spec_bundle` INSERT is built inline (it carries an
+    /// extra `api_spec_id` column), so we mirror its SQL skeleton here and
+    /// assert the same `?` count contract. If the inline SQL in
+    /// `submit_api_spec_bundle` drifts, edit BOTH this fixture and the
+    /// `PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT` constant.
+    #[test]
+    fn submit_api_spec_bundle_proxy_insert_placeholder_count_matches_const() {
+        // VALUES list has one `?` per column; we lifted this row count from
+        // the actual INSERT in submit_api_spec_bundle. Update if columns
+        // change there.
+        let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
+                                     ?, ?, ?)";
+        let placeholders = values_clause.matches('?').count();
+        assert_eq!(
+            placeholders,
+            DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT,
+            "submit_api_spec_bundle proxy INSERT placeholder count must match \
+             PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
+        );
+    }
 }

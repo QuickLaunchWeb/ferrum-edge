@@ -267,6 +267,24 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 /// - `application/yaml` / `text/yaml` etc. and stored is JSON → Yaml (convert)
 /// - Unknown accept types                       → stored format (best-effort)
 ///
+/// Quality weight for a media range, parsed from `;q=N.NNN`.
+/// Returns a value in `[0, 1000]` (1000 = q=1.0, default).
+///
+/// Module-level so both `negotiate_accept` and `negotiate_accept_or_406`
+/// share the same parser (avoids duplication).
+fn parse_accept_quality(params: &str) -> u32 {
+    for param in params.split(';') {
+        let p = param.trim();
+        if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
+            // Parse up to 3 decimal places; clamp to [0, 1000].
+            if let Ok(f) = rest.parse::<f64>() {
+                return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
+            }
+        }
+    }
+    1000 // default q=1.0
+}
+
 /// Uses a small media-range parser: splits on `,`, strips `q=` quality
 /// parameters, trims whitespace, and compares exact tokens.  Wildcards
 /// (`*/*`, `application/*`) accept the stored format.  Highest-quality
@@ -281,21 +299,6 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
         return stored;
     }
 
-    /// Quality weight for a media range, parsed from `;q=N.NNN`.
-    /// Returns a value in `[0, 1000]` (1000 = q=1.0, default).
-    fn parse_quality(params: &str) -> u32 {
-        for param in params.split(';') {
-            let p = param.trim();
-            if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                // Parse up to 3 decimal places; clamp to [0, 1000].
-                if let Ok(f) = rest.parse::<f64>() {
-                    return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
-                }
-            }
-        }
-        1000 // default q=1.0
-    }
-
     let mut best_json: Option<u32> = None;
     let mut best_yaml: Option<u32> = None;
     let mut best_wildcard: Option<u32> = None;
@@ -306,7 +309,7 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
         let mut parts = entry.splitn(2, ';');
         let media_type_raw = parts.next().unwrap_or("").trim();
         let params = parts.next().unwrap_or("");
-        let q = parse_quality(params);
+        let q = parse_accept_quality(params);
 
         // RFC 7231 §3.1.1.1: media type tokens (type/subtype) are
         // case-insensitive. Normalize before matching so that headers like
@@ -429,22 +432,10 @@ pub(super) fn negotiate_accept_or_406(
     let mut wildcard_q: Option<u32> = None;
     let mut stored_explicit: Option<u32> = None;
 
-    fn parse_quality(params: &str) -> u32 {
-        for param in params.split(';') {
-            let p = param.trim();
-            if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-                if let Ok(f) = rest.parse::<f64>() {
-                    return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
-                }
-            }
-        }
-        1000
-    }
-
     for entry in accept.split(',') {
         let mut parts = entry.splitn(2, ';');
         let mt = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-        let q = parse_quality(parts.next().unwrap_or(""));
+        let q = parse_accept_quality(parts.next().unwrap_or(""));
         match mt.as_str() {
             "*/*" | "application/*" => {
                 saw_relevant = true;
@@ -886,7 +877,7 @@ async fn assign_ids_for_put(
         std::collections::VecDeque<&crate::config::types::PluginConfig>,
     > = std::collections::HashMap::new();
     for ep in &existing_plugins {
-        let key = plugin_canonical_key(ep).map_err(|e| e)?;
+        let key = plugin_canonical_key(ep)?;
         canonical_to_existing.entry(key).or_default().push_back(ep);
     }
 
@@ -1895,21 +1886,14 @@ pub async fn handle_post_api_spec(
         "spec_version": spec.spec_version,
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::CREATED)
-        .header("Content-Type", "application/json")
-        .header("X-Content-Type-Options", "nosniff")
-        .header("Cache-Control", "no-store")
-        .header("X-Frame-Options", "DENY")
-        .header("Location", format!("/api-specs/{}", spec_id))
-        .body(Full::new(Bytes::from(
-            serde_json::to_string(&resp_body).unwrap_or_default(),
-        )))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        }))
+    // Build the body + standard headers via the shared `json_resp` helper, then
+    // inject the `Location` header. This keeps body-serialisation and header
+    // policy consistent with every other JSON response in this module.
+    let mut resp = json_resp(StatusCode::CREATED, &resp_body);
+    if let Ok(hv) = hyper::header::HeaderValue::from_str(&format!("/api-specs/{}", spec_id)) {
+        resp.headers_mut().insert("Location", hv);
+    }
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
