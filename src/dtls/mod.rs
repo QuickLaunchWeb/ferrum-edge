@@ -862,23 +862,18 @@ impl DtlsServer {
                     .unwrap_or(Duration::from_secs(60));
 
                 tokio::select! {
-                    // Biased so wire/app data drains before a queued shutdown
-                    // fires. Without this, dropping a `DtlsServerConn` races
-                    // the `try_send(())` shutdown signal against an
-                    // already-queued `app_in_rx` send (e.g., the final reply
-                    // a forwarder pushed right before releasing the conn) and
-                    // the random select ordering loses the reply ~50% of the
-                    // time. Shutdown still fires once data drains because the
-                    // remaining arms become Pending.
+                    // Branch order is intentional under `biased`:
+                    //   1. `app_in_rx` — drain queued outbound replies first,
+                    //      preserving the original race fix where dropping a
+                    //      `DtlsServerConn` races a final reply against the
+                    //      `try_send(())` shutdown signal.
+                    //   2. `shutdown_rx` — pre-empts the `incoming_rx` branch
+                    //      so a peer that floods datagrams cannot indefinitely
+                    //      starve session shutdown and leak slot/metrics.
+                    //   3. `incoming_rx` — normal peer traffic.
+                    //   4. Retransmit / handshake-deadline timers.
                     biased;
-                    // Incoming UDP packet from this client (demuxed by the server)
-                    Some(data) = incoming_rx.recv() => {
-                        if let Err(e) = dtls.handle_packet(&data) {
-                            trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
-                            break;
-                        }
-                    }
-                    // Application data to send back to this client
+                    // 1. Application data to send back to this client
                     Some(data) = app_in_rx.recv(), if connected => {
                         if data.len() > dtls_buf_config().max_plaintext {
                             warn!(
@@ -894,7 +889,19 @@ impl DtlsServer {
                             break;
                         }
                     }
-                    // Timer fired
+                    // 2. Shutdown signal (positioned above incoming_rx to
+                    //    avoid starvation under sustained datagram floods).
+                    _ = shutdown_rx.recv() => {
+                        break;
+                    }
+                    // 3. Incoming UDP packet from this client (demuxed by the server)
+                    Some(data) = incoming_rx.recv() => {
+                        if let Err(e) = dtls.handle_packet(&data) {
+                            trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
+                            break;
+                        }
+                    }
+                    // 4a. DTLS retransmit timer
                     _ = tokio::time::sleep(sleep_dur) => {
                         if let Some(t) = next_timeout
                             && Instant::now() >= t
@@ -906,11 +913,10 @@ impl DtlsServer {
                             next_timeout = None;
                         }
                     }
+                    // 4b. Handshake deadline (top-of-loop check is primary; this
+                    //     is defense in depth).
                     _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
                         warn!(client = %peer_addr, "DTLS handshake timed out");
-                        break;
-                    }
-                    _ = shutdown_rx.recv() => {
                         break;
                     }
                 }
