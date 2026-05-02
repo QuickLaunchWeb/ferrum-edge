@@ -91,6 +91,18 @@ The H3 frontend → non-H3 backend cross-protocol bridge is the exception becaus
 
 This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually.
 
+#### Direct HTTP/2 Large-Response Bypass
+
+Direct HTTP/2 responses have a narrow large-response bypass — `direct_streaming_h2_body` is used in place of `coalescing_h2_body` — to avoid a copy when coalescing cannot help:
+
+- `Content-Length` must be present, so the gateway can make the decision once before streaming.
+- The response must fit within `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, or that limit must be disabled.
+- The body must be at least 512 KiB. At that size, direct-H2 backend frames are already large enough that coalescing adds a copy before the existing large-frame fast path returns the original frame.
+
+Unknown-size responses keep the coalescer because it is also the streaming size-enforcement path when `Content-Length` is absent. Small and mid-sized known responses below 512 KiB also keep the coalescer because they may arrive as multiple smaller backend DATA frames where write amortization still helps.
+
+gRPC streaming responses intentionally stay on `coalescing_h2_body`; preserving trailers and large-payload batching matters more there.
+
 #### Operator-Tunable Knobs
 
 Each protocol has its own coalesce knob with bounds tuned for its native framing characteristics. The bounds intentionally differ — H3 chunks are QUIC-packet-sized (~1.5 KiB) so a 1 KiB floor is meaningful; H2 inbound DATA frames are typically ≥ 16 KiB (RFC 9113 default) so a smaller floor would just disable coalescing.

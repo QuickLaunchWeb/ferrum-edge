@@ -2880,6 +2880,7 @@ async fn handle_connection(
     {
         let mut http1 = builder.http1();
         http1.max_buf_size(state.max_header_size_bytes);
+        http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
@@ -4716,6 +4717,7 @@ async fn handle_tls_connection(
     {
         let mut http1 = builder.http1();
         http1.max_buf_size(state.max_header_size_bytes);
+        http1.writev(true);
         // Slowloris protection: close connections that take too long to send headers.
         if state.env_config.http_header_read_timeout_seconds > 0 {
             http1.timer(hyper_util::rt::TokioTimer::new());
@@ -10731,7 +10733,7 @@ mod tests {
         // 1 MiB response, no cap → bypass.
         assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(1_048_576),
-            0
+            0,
         ));
     }
 
@@ -10740,7 +10742,7 @@ mod tests {
         // Threshold is 512 KiB; exactly 512 KiB should qualify (>=, not >).
         assert!(super::should_bypass_h2_coalesce_for_large_response(
             Some(512 * 1024),
-            0
+            0,
         ));
     }
 
@@ -10749,12 +10751,12 @@ mod tests {
         // Under 512 KiB → coalescer still wins.
         assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(64 * 1024),
-            0
+            0,
         ));
         // 256 KiB is still under threshold.
         assert!(!super::should_bypass_h2_coalesce_for_large_response(
             Some(256 * 1024),
-            0
+            0,
         ));
     }
 
