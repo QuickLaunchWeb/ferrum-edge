@@ -840,8 +840,8 @@ impl DtlsServer {
 
             loop {
                 // Check the handshake deadline at the top of each iteration so
-                // a sustained datagram flood cannot starve the timeout arm in
-                // the biased select below.
+                // a sustained datagram flood cannot starve the timeout arm
+                // in the select below.
                 if !connected
                     && let Some(deadline) = handshake_deadline
                     && Instant::now() >= deadline
@@ -862,18 +862,7 @@ impl DtlsServer {
                     .unwrap_or(Duration::from_secs(60));
 
                 tokio::select! {
-                    // `biased` guarantees reply-before-shutdown atomicity:
-                    // dropping a `DtlsServerConn` races `try_send(())`
-                    // against an already-queued reply in `app_in_rx`; random
-                    // branch ordering loses the reply ~50% of the time.
-                    //
-                    // Timeout enforcement does NOT depend on branch order —
-                    // the top-of-loop `Instant::now() >= deadline` check
-                    // fires even when `incoming_rx` is continuously ready.
-                    //
-                    // Order: app replies → shutdown → peer data → timers.
-                    biased;
-                    // 1. Application data to send back to this client
+                    // Application data to send back to this client
                     Some(data) = app_in_rx.recv(), if connected => {
                         if data.len() > dtls_buf_config().max_plaintext {
                             warn!(
@@ -889,19 +878,27 @@ impl DtlsServer {
                             break;
                         }
                     }
-                    // 2. Shutdown signal (positioned above incoming_rx to
-                    //    avoid starvation under sustained datagram floods).
+                    // Shutdown signal — drain any queued replies before
+                    // exiting so a final reply pushed right before
+                    // `DtlsServerConn::Drop` is not lost.
                     _ = shutdown_rx.recv() => {
+                        while let Ok(data) = app_in_rx.try_recv() {
+                            if connected
+                                && data.len() <= dtls_buf_config().max_plaintext
+                            {
+                                let _ = dtls.send_application_data(&data);
+                            }
+                        }
                         break;
                     }
-                    // 3. Incoming UDP packet from this client (demuxed by the server)
+                    // Incoming UDP packet from this client (demuxed by the server)
                     Some(data) = incoming_rx.recv() => {
                         if let Err(e) = dtls.handle_packet(&data) {
                             trace!(client = %peer_addr, "DTLS handle_packet error: {}", e);
                             break;
                         }
                     }
-                    // 4a. DTLS retransmit timer
+                    // DTLS retransmit timer
                     _ = tokio::time::sleep(sleep_dur) => {
                         if let Some(t) = next_timeout
                             && Instant::now() >= t
@@ -913,8 +910,8 @@ impl DtlsServer {
                             next_timeout = None;
                         }
                     }
-                    // 4b. Handshake deadline (top-of-loop check is primary; this
-                    //     is defense in depth).
+                    // Handshake deadline (top-of-loop check is primary;
+                    // this is defense in depth).
                     _ = tokio::time::sleep(handshake_sleep_dur), if !connected && handshake_deadline.is_some() => {
                         warn!(client = %peer_addr, "DTLS handshake timed out");
                         break;
@@ -988,6 +985,17 @@ impl DtlsServer {
                             // KeyingMaterial or future variants — continue draining
                         }
                     }
+                }
+            }
+
+            // Flush any DTLS-buffered data produced by the shutdown
+            // handler's reply drain so it reaches the wire.
+            for _ in 0..MAX_OUTPUTS_PER_DRAIN {
+                match dtls.poll_output(&mut out_buf) {
+                    Output::Packet(data) => {
+                        let _ = socket.send_to(data, peer_addr).await;
+                    }
+                    _ => break,
                 }
             }
         });
