@@ -9094,6 +9094,14 @@ fn is_valid_ip_literal_contents(content: &str) -> bool {
         return true;
     }
     // IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+    //
+    // Note: this validator accepts comma in the `addr` segment because RFC 3986
+    // lists comma as a sub-delim. `is_valid_reg_name` rejects comma instead, to
+    // avoid the HTTP list-separator parser-differential. The asymmetry is
+    // intentional and safe here because IPvFuture content is always wrapped in
+    // `[...]` — downstream code that splits an authority string on commas will
+    // treat the bracketed segment as opaque, so a comma inside cannot be
+    // smuggled out as a second list element the way it could in a bare host.
     let rest = match content.as_bytes().first() {
         Some(b'v') | Some(b'V') => &content[1..],
         _ => return false,
@@ -9107,6 +9115,18 @@ fn is_valid_ip_literal_contents(content: &str) -> bool {
         && addr
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b))
+}
+
+/// Validate an authority port suffix: ASCII digits only and within `u16` range.
+///
+/// Without the range check, values like `host:9999999999` parse as a valid
+/// authority because the only previous gate was `is_ascii_digit()`. The TCP
+/// port space is `0..=65535`; anything larger is broken-client territory and
+/// should be rejected at admission so it never reaches routing or backend
+/// dispatch where the same string would be re-parsed and fail with a
+/// less-specific error.
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -9130,8 +9150,7 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
             return Some((host, None));
         }
         if let Some(port) = suffix.strip_prefix(':')
-            && !port.is_empty()
-            && port.bytes().all(|b| b.is_ascii_digit())
+            && is_valid_port(port)
         {
             return Some((host, Some(port)));
         }
@@ -9140,10 +9159,7 @@ fn split_request_authority(value: &str) -> Option<(&str, Option<&str>)> {
 
     match value.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') => {
-            if is_valid_reg_name(host)
-                && !port.is_empty()
-                && port.bytes().all(|b| b.is_ascii_digit())
-            {
+            if is_valid_reg_name(host) && is_valid_port(port) {
                 Some((host, Some(port)))
             } else {
                 None

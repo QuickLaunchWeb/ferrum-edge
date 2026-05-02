@@ -721,6 +721,16 @@ impl DtlsServer {
     }
 
     /// Spawn a driver task for a new client session.
+    ///
+    /// Admission ordering is intentional and not jointly atomic:
+    ///   1. `allow_new_session` is a *soft* gate (e.g. an overload-state flag).
+    ///      It is read once before the cap check, so a brief burst between the
+    ///      gate read and the CAS below can let a few sessions in past the
+    ///      gate's intent. This is acceptable because the gate's job is
+    ///      coarse-grained backpressure, not exact admission.
+    ///   2. `max_sessions` is the *hard* cap, enforced via a CAS loop on
+    ///      `active_sessions`. This is the authoritative bound — even if the
+    ///      soft gate races, the hard cap cannot be exceeded.
     fn spawn_session(&self, peer_addr: SocketAddr, initial_packet: Vec<u8>) {
         if let Some(ref allow) = self.limits.allow_new_session
             && !allow()

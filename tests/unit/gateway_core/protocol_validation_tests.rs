@@ -925,6 +925,29 @@ fn host_non_numeric_port_rejected_for_routing() {
 }
 
 #[test]
+fn host_port_above_u16_max_rejected_for_routing() {
+    // Ports above 65535 are not a valid TCP port. Without the range check,
+    // digit-only validation accepts them and lets a malformed authority reach
+    // routing/backend dispatch.
+    assert!(normalize_request_host_for_routing("example.com:65536").is_none());
+    assert!(normalize_request_host_for_routing("example.com:9999999999").is_none());
+    assert!(normalize_request_host_for_routing("[2001:db8::1]:65536").is_none());
+}
+
+#[test]
+fn host_port_at_u16_max_accepted_for_routing() {
+    // 65535 is the maximum valid TCP port.
+    assert_eq!(
+        normalize_request_host_for_routing("example.com:65535"),
+        Some("example.com".to_string())
+    );
+    assert_eq!(
+        normalize_request_host_for_routing("[2001:db8::1]:65535"),
+        Some("[2001:db8::1]".to_string())
+    );
+}
+
+#[test]
 fn host_with_userinfo_rejected_for_routing() {
     assert!(normalize_request_host_for_routing("user@example.com").is_none());
 }
