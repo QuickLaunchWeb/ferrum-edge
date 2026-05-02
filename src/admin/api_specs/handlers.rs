@@ -275,11 +275,11 @@ pub(super) fn parse_content_type(headers: &hyper::HeaderMap) -> Option<SpecForma
 fn parse_accept_quality(params: &str) -> u32 {
     for param in params.split(';') {
         let p = param.trim();
-        if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")) {
-            // Parse up to 3 decimal places; clamp to [0, 1000].
-            if let Ok(f) = rest.parse::<f64>() {
-                return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
-            }
+        // Parse up to 3 decimal places; clamp to [0, 1000].
+        if let Some(rest) = p.strip_prefix("q=").or_else(|| p.strip_prefix("Q="))
+            && let Ok(f) = rest.parse::<f64>()
+        {
+            return (f * 1000.0).round().clamp(0.0, 1000.0) as u32;
         }
     }
     1000 // default q=1.0
@@ -317,30 +317,25 @@ pub(super) fn negotiate_accept(headers: &hyper::HeaderMap, stored: SpecFormat) -
         let media_type = media_type_raw.to_ascii_lowercase();
 
         match media_type.as_str() {
-            "*/*" | "application/*" => {
-                if best_wildcard.map_or(true, |prev| q > prev) {
-                    best_wildcard = Some(q);
-                }
+            "*/*" | "application/*" if best_wildcard.is_none_or(|prev| q > prev) => {
+                best_wildcard = Some(q);
             }
-            "application/json" => {
-                if best_json.map_or(true, |prev| q > prev) {
-                    best_json = Some(q);
-                }
+            "application/json" if best_json.is_none_or(|prev| q > prev) => {
+                best_json = Some(q);
             }
-            "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
-                if best_yaml.map_or(true, |prev| q > prev) {
-                    best_yaml = Some(q);
-                }
+            "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml"
+                if best_yaml.is_none_or(|prev| q > prev) =>
+            {
+                best_yaml = Some(q);
             }
             m if m
                 == match stored {
                     SpecFormat::Json => "application/json",
                     SpecFormat::Yaml => "application/yaml",
-                } =>
-            {
-                if best_stored.map_or(true, |prev| q > prev) {
-                    best_stored = Some(q);
                 }
+                && best_stored.is_none_or(|prev| q > prev) =>
+            {
+                best_stored = Some(q);
             }
             _ => {} // unknown media type — ignored
         }
@@ -430,7 +425,8 @@ pub(super) fn negotiate_accept_or_406(
     let mut json_explicit: Option<u32> = None;
     let mut yaml_explicit: Option<u32> = None;
     let mut wildcard_q: Option<u32> = None;
-    let mut stored_explicit: Option<u32> = None;
+    // tracked only for parity with negotiate_accept; prefix suppresses unused-variable lint
+    let mut _stored_explicit: Option<u32> = None;
 
     for entry in accept.split(',') {
         let mut parts = entry.splitn(2, ';');
@@ -445,14 +441,14 @@ pub(super) fn negotiate_accept_or_406(
                 saw_relevant = true;
                 json_explicit = Some(json_explicit.map_or(q, |p| p.max(q)));
                 if stored == SpecFormat::Json {
-                    stored_explicit = Some(stored_explicit.map_or(q, |p| p.max(q)));
+                    _stored_explicit = Some(_stored_explicit.map_or(q, |p| p.max(q)));
                 }
             }
             "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => {
                 saw_relevant = true;
                 yaml_explicit = Some(yaml_explicit.map_or(q, |p| p.max(q)));
                 if stored == SpecFormat::Yaml {
-                    stored_explicit = Some(stored_explicit.map_or(q, |p| p.max(q)));
+                    _stored_explicit = Some(_stored_explicit.map_or(q, |p| p.max(q)));
                 }
             }
             _ => {} // unknown — ignored for relevance accounting
@@ -470,7 +466,6 @@ pub(super) fn negotiate_accept_or_406(
     let wq = wildcard_q.unwrap_or(0);
     let json_q = json_explicit.unwrap_or(wq);
     let yaml_q = yaml_explicit.unwrap_or(wq);
-    let _ = stored_explicit; // tracked only for parity with negotiate_accept
 
     if json_q == 0 && yaml_q == 0 {
         // Every representation the server can serve has been explicitly
@@ -737,10 +732,10 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
     }
 
     // Upstream
-    if let Some(ref mut u) = bundle.upstream {
-        if u.id.is_empty() {
-            u.id = Uuid::new_v4().to_string();
-        }
+    if let Some(ref mut u) = bundle.upstream
+        && u.id.is_empty()
+    {
+        u.id = Uuid::new_v4().to_string();
     }
 
     // Plugins — assign IDs then re-link proxy_id
@@ -752,10 +747,10 @@ fn assign_ids_for_post(bundle: &mut ExtractedBundle) {
     }
 
     // Re-link proxy.upstream_id
-    if let Some(ref u) = bundle.upstream {
-        if bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty() {
-            bundle.proxy.upstream_id = Some(u.id.clone());
-        }
+    if let Some(ref u) = bundle.upstream
+        && bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty()
+    {
+        bundle.proxy.upstream_id = Some(u.id.clone());
     }
 
     // Stamp server-side timestamps (Fix 1). Mirrors handle_write's convention:
@@ -850,15 +845,15 @@ async fn assign_ids_for_put(
     };
 
     // Upstream ID: reuse existing if empty.
-    if let Some(ref mut u) = bundle.upstream {
-        if u.id.is_empty() {
-            let reuse_id = existing_proxy
-                .as_ref()
-                .and_then(|p| p.upstream_id.as_deref())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            u.id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        }
+    if let Some(ref mut u) = bundle.upstream
+        && u.id.is_empty()
+    {
+        let reuse_id = existing_proxy
+            .as_ref()
+            .and_then(|p| p.upstream_id.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        u.id = reuse_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     }
 
     // Load existing spec-owned plugins for canonical-tuple matching (Fix 5).
@@ -956,10 +951,10 @@ async fn assign_ids_for_put(
     }
 
     // Re-link proxy.upstream_id.
-    if let Some(ref u) = bundle.upstream {
-        if bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty() {
-            bundle.proxy.upstream_id = Some(u.id.clone());
-        }
+    if let Some(ref u) = bundle.upstream
+        && bundle.proxy.upstream_id.as_deref().unwrap_or("").is_empty()
+    {
+        bundle.proxy.upstream_id = Some(u.id.clone());
     }
 
     // Stamp server-side timestamps (Fix 1). Mirrors handle_write's convention:
@@ -1107,23 +1102,36 @@ struct ValidatedBundle {
     metadata: crate::admin::api_specs::SpecMetadata,
 }
 
+/// Context for the PUT path: existing resource IDs and the stored proxy row.
+///
+/// Passed as a single value to [`validate_bundle`] so the function stays under
+/// the 7-argument clippy limit while keeping all PUT-specific fields together.
+struct PutContext<'a> {
+    /// ID of the proxy being replaced (excluded from uniqueness checks).
+    proxy_id: &'a str,
+    /// ID of the upstream currently owned by the spec (excluded from name checks).
+    upstream_id: Option<&'a str>,
+    /// Stored proxy row; used to detect port / transport changes for the OS probe.
+    proxy: Option<&'a crate::config::types::Proxy>,
+}
+
 /// Validate an already-extracted and ID-assigned bundle.
 ///
-/// `existing_proxy_id` — when `Some`, the uniqueness checks exclude this proxy
-/// (PUT path). `existing_upstream_id` — analogous for upstream name check.
-/// `existing_proxy` — the stored proxy row for PUT requests; used to detect
-/// listen_port / transport changes so the OS-level port-availability probe is
-/// only fired when the port or transport actually changed.
+/// `put_ctx` — `Some` on the PUT path; carries the existing resource IDs so
+/// uniqueness checks exclude the resource being replaced, and the stored proxy
+/// row so the OS port-availability probe fires only when needed. `None` on POST.
 async fn validate_bundle(
     mut bundle: ExtractedBundle,
     metadata: crate::admin::api_specs::SpecMetadata,
     namespace: &str,
     db: &dyn DatabaseBackend,
     state: &AdminState,
-    existing_proxy_id: Option<&str>,
-    existing_upstream_id: Option<&str>,
-    existing_proxy: Option<&crate::config::types::Proxy>,
+    put_ctx: Option<PutContext<'_>>,
 ) -> Result<ValidatedBundle, ApiSpecError> {
+    let existing_proxy_id: Option<&str> = put_ctx.as_ref().map(|c| c.proxy_id);
+    let existing_upstream_id: Option<&str> = put_ctx.as_ref().and_then(|c| c.upstream_id);
+    let existing_proxy: Option<&crate::config::types::Proxy> =
+        put_ctx.as_ref().and_then(|c| c.proxy);
     // ID assignment (minting UUIDs for empty IDs) is the caller's responsibility
     // (assign_ids_for_post / assign_ids_for_put) and happens BEFORE this
     // function is called. By the time we arrive here, all resource IDs are
@@ -1389,22 +1397,21 @@ async fn validate_bundle(
                         .unwrap_or(false);
                     let should_probe =
                         existing_proxy.is_none() || port_changed || transport_changed;
-                    if should_probe {
-                        if let Err(error) = crate::admin::crud::check_port_available(
+                    if should_probe
+                        && let Err(error) = crate::admin::crud::check_port_available(
                             port,
                             vctx.stream_bind_address,
                             proxy.dispatch_kind.is_udp(),
                         )
                         .await
-                        {
-                            failures.push(ValidationFailure {
-                                resource_type: "proxy",
-                                id: proxy.id.clone(),
-                                errors: vec![format!(
-                                    "listen_port {port} is not available on the host: {error}"
-                                )],
-                            });
-                        }
+                    {
+                        failures.push(ValidationFailure {
+                            resource_type: "proxy",
+                            id: proxy.id.clone(),
+                            errors: vec![format!(
+                                "listen_port {port} is not available on the host: {error}"
+                            )],
+                        });
                     }
                 }
             }
@@ -1447,22 +1454,22 @@ async fn validate_bundle(
             }
         }
 
-        if let Some(ref upstream) = bundle.upstream {
-            if let Some(ref name) = upstream.name {
-                // On PUT, exclude the spec's current upstream so a spec that
-                // keeps the same upstream name doesn't collide with itself.
-                match db
-                    .check_upstream_name_unique(namespace, name, existing_upstream_id)
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => failures.push(ValidationFailure {
-                        resource_type: "upstream",
-                        id: upstream.id.clone(),
-                        errors: vec![format!("An upstream with name '{}' already exists", name)],
-                    }),
-                    Err(e) => return Err(classify_db_error(e)),
-                }
+        if let Some(ref upstream) = bundle.upstream
+            && let Some(ref name) = upstream.name
+        {
+            // On PUT, exclude the spec's current upstream so a spec that
+            // keeps the same upstream name doesn't collide with itself.
+            match db
+                .check_upstream_name_unique(namespace, name, existing_upstream_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => failures.push(ValidationFailure {
+                    resource_type: "upstream",
+                    id: upstream.id.clone(),
+                    errors: vec![format!("An upstream with name '{}' already exists", name)],
+                }),
+                Err(e) => return Err(classify_db_error(e)),
             }
         }
     }
@@ -1667,10 +1674,7 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
         // Invalid UTF-8 sequences in percent-encoded bytes are rejected with 400
         // to prevent bypassing downstream character-validation checks (e.g. the
         // `title_contains` wildcard rejection below).
-        let val = match percent_decode(raw_val) {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
+        let val = percent_decode(raw_val)?;
 
         match key {
             "limit" => {
@@ -1849,9 +1853,7 @@ pub async fn handle_post_api_spec(
         namespace,
         db.as_ref(),
         state,
-        None,
-        None,
-        None,
+        None, // POST: no existing resource context
     )
     .await
     {
@@ -1989,9 +1991,11 @@ pub async fn handle_put_api_spec(
         namespace,
         db.as_ref(),
         state,
-        Some(&existing_spec.proxy_id),
-        existing_upstream_id,
-        existing_proxy_row.as_ref(),
+        Some(PutContext {
+            proxy_id: &existing_spec.proxy_id,
+            upstream_id: existing_upstream_id,
+            proxy: existing_proxy_row.as_ref(),
+        }),
     )
     .await
     {

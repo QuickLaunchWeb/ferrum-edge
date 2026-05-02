@@ -294,13 +294,13 @@ pub fn extract(
     // Empty id → leave empty; the route handler (assign_ids_for_post /
     // assign_ids_for_put) is responsible for assigning or reusing IDs so that
     // PUT idempotency works correctly.
-    if !proxy.id.is_empty() {
-        if let Err(e) = validate_resource_id(&proxy.id) {
-            return Err(ExtractError::MalformedExtension {
-                which: "x-ferrum-proxy",
-                error: format!("invalid id: {}", e),
-            });
-        }
+    if !proxy.id.is_empty()
+        && let Err(e) = validate_resource_id(&proxy.id)
+    {
+        return Err(ExtractError::MalformedExtension {
+            which: "x-ferrum-proxy",
+            error: format!("invalid id: {}", e),
+        });
     }
 
     // --- x-ferrum-upstream (optional) ------------------------------------
@@ -315,13 +315,13 @@ pub fn extract(
 
         // --- ID validation for upstream (BEFORE auto-linking) ---------------
         // Empty id → leave empty; handler assigns / reuses IDs.
-        if !up.id.is_empty() {
-            if let Err(e) = validate_resource_id(&up.id) {
-                return Err(ExtractError::MalformedExtension {
-                    which: "x-ferrum-upstream",
-                    error: format!("invalid id: {}", e),
-                });
-            }
+        if !up.id.is_empty()
+            && let Err(e) = validate_resource_id(&up.id)
+        {
+            return Err(ExtractError::MalformedExtension {
+                which: "x-ferrum-upstream",
+                error: format!("invalid id: {}", e),
+            });
         }
 
         Some(up)
@@ -377,13 +377,13 @@ pub fn extract(
 
             // --- ID validation for plugin (BEFORE auto-linking) -------------
             // Empty id → leave empty; handler assigns / reuses IDs.
-            if !pc.id.is_empty() {
-                if let Err(e) = validate_resource_id(&pc.id) {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "x-ferrum-plugins",
-                        error: format!("invalid id: {}", e),
-                    });
-                }
+            if !pc.id.is_empty()
+                && let Err(e) = validate_resource_id(&pc.id)
+            {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-plugins",
+                    error: format!("invalid id: {}", e),
+                });
             }
 
             // Scope must be proxy (or absent/defaulted to proxy).

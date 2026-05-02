@@ -37,8 +37,7 @@ pub fn decompress_gzip_capped(input: &[u8], max_output: usize) -> std::io::Resul
     let mut buf = Vec::new();
     decoder.take(max_output as u64 + 1).read_to_end(&mut buf)?;
     if buf.len() > max_output {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             "decompressed size exceeds max_output cap",
         ));
     }
