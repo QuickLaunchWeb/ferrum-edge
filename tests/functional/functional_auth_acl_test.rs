@@ -1760,3 +1760,643 @@ async fn test_auth_acl_comprehensive() {
 
     println!("\n=== All Auth/ACL Tests Passed ===\n");
 }
+
+// ============================================================================
+// Per-auth-type ACL pairings
+//
+// `test_auth_acl_comprehensive` exercises key_auth + ACL and multi-auth + ACL.
+// The tests below verify that allow/deny lists on the access_control plugin
+// fire correctly when the authenticating plugin is basic_auth, jwt_auth, or
+// hmac_auth. Each test stands alone so a regression in one auth type does not
+// silently mask another (the comprehensive test bails on the first assert).
+// ============================================================================
+
+/// Parameters for [`setup_auth_plus_acl_proxy`]. Bundled into a struct so the
+/// helper stays under clippy's `too_many_arguments` threshold and so the
+/// per-test call sites read like a config block rather than a long positional
+/// argument list.
+struct AuthAclProxySetup<'a> {
+    proxy_id: &'a str,
+    listen_path: &'a str,
+    backend_port: u16,
+    auth_plugin_id: &'a str,
+    auth_plugin: serde_json::Value,
+    acl_plugin_id: &'a str,
+    acl_config: serde_json::Value,
+}
+
+/// Helper: configure a single proxy that authenticates via `auth_plugin_id` and
+/// then runs `access_control` with the supplied config. Used by the per-auth
+/// ACL tests below.
+async fn setup_auth_plus_acl_proxy(
+    client: &reqwest::Client,
+    admin_url: &str,
+    auth_header: &str,
+    setup: AuthAclProxySetup<'_>,
+) {
+    let AuthAclProxySetup {
+        proxy_id,
+        listen_path,
+        backend_port,
+        auth_plugin_id,
+        auth_plugin,
+        acl_plugin_id,
+        acl_config,
+    } = setup;
+
+    // Bare proxy (FK target for plugin_configs.proxy_id)
+    create_proxy(
+        client,
+        admin_url,
+        auth_header,
+        &json!({
+            "id": proxy_id,
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+        }),
+    )
+    .await
+    .unwrap();
+
+    create_plugin_config(client, admin_url, auth_header, &auth_plugin)
+        .await
+        .unwrap();
+
+    create_plugin_config(
+        client,
+        admin_url,
+        auth_header,
+        &json!({
+            "id": acl_plugin_id,
+            "plugin_name": "access_control",
+            "scope": "proxy",
+            "proxy_id": proxy_id,
+            "enabled": true,
+            "config": acl_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    update_proxy(
+        client,
+        admin_url,
+        auth_header,
+        &json!({
+            "id": proxy_id,
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "auth_mode": "single",
+            "plugins": [
+                {"plugin_config_id": auth_plugin_id},
+                {"plugin_config_id": acl_plugin_id}
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_basic_auth_plus_acl() {
+    let harness = AuthTestHarness::new()
+        .await
+        .expect("Failed to create test harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port)
+        .await
+        .expect("Failed to start echo backend");
+
+    let client = reqwest::Client::new();
+    let admin_token = harness.generate_admin_token().unwrap();
+    let auth_header = format!("Bearer {}", admin_token);
+    let admin_url = &harness.admin_base_url;
+    let proxy_url = &harness.proxy_base_url;
+
+    // Two consumers: alice (allowed) and dave (blocked)
+    create_consumer(&client, admin_url, &auth_header, "ba-alice", "ba-alice")
+        .await
+        .unwrap();
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "ba-alice",
+        "basicauth",
+        &json!({"password": "alice-basic-pass"}),
+    )
+    .await
+    .unwrap();
+
+    create_consumer(&client, admin_url, &auth_header, "ba-dave", "ba-dave")
+        .await
+        .unwrap();
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "ba-dave",
+        "basicauth",
+        &json!({"password": "dave-basic-pass"}),
+    )
+    .await
+    .unwrap();
+
+    // Allow-list proxy: only alice may pass
+    setup_auth_plus_acl_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        AuthAclProxySetup {
+            proxy_id: "proxy-basic-allow",
+            listen_path: "/basic-acl-allow",
+            backend_port,
+            auth_plugin_id: "plugin-basic-allow-auth",
+            auth_plugin: json!({
+                "id": "plugin-basic-allow-auth",
+                "plugin_name": "basic_auth",
+                "scope": "proxy",
+                "proxy_id": "proxy-basic-allow",
+                "enabled": true,
+                "config": {}
+            }),
+            acl_plugin_id: "plugin-basic-allow-acl",
+            acl_config: json!({"allowed_consumers": ["ba-alice"]}),
+        },
+    )
+    .await;
+
+    // Deny-list proxy: dave is rejected, others pass
+    setup_auth_plus_acl_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        AuthAclProxySetup {
+            proxy_id: "proxy-basic-deny",
+            listen_path: "/basic-acl-deny",
+            backend_port,
+            auth_plugin_id: "plugin-basic-deny-auth",
+            auth_plugin: json!({
+                "id": "plugin-basic-deny-auth",
+                "plugin_name": "basic_auth",
+                "scope": "proxy",
+                "proxy_id": "proxy-basic-deny",
+                "enabled": true,
+                "config": {}
+            }),
+            acl_plugin_id: "plugin-basic-deny-acl",
+            acl_config: json!({"disallowed_consumers": ["ba-dave"]}),
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let alice_cred = base64::engine::general_purpose::STANDARD.encode("ba-alice:alice-basic-pass");
+    let dave_cred = base64::engine::general_purpose::STANDARD.encode("ba-dave:dave-basic-pass");
+
+    // Allow list: alice → 200
+    let resp = client
+        .get(format!("{}/basic-acl-allow", proxy_url))
+        .header("Authorization", format!("Basic {}", alice_cred))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "alice should be allowed: {}",
+        resp.status()
+    );
+
+    // Allow list: dave authenticates but is not in allow list → 403
+    let resp = client
+        .get(format!("{}/basic-acl-allow", proxy_url))
+        .header("Authorization", format!("Basic {}", dave_cred))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "dave should be blocked by allow list (got {})",
+        resp.status()
+    );
+
+    // Allow list: missing creds → 401 (auth fires before ACL)
+    let resp = client
+        .get(format!("{}/basic-acl-allow", proxy_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "missing creds should be 401");
+
+    // Deny list: dave → 403, alice → 200
+    let resp = client
+        .get(format!("{}/basic-acl-deny", proxy_url))
+        .header("Authorization", format!("Basic {}", dave_cred))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "dave should be blocked by deny list (got {})",
+        resp.status()
+    );
+
+    let resp = client
+        .get(format!("{}/basic-acl-deny", proxy_url))
+        .header("Authorization", format!("Basic {}", alice_cred))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "alice should pass deny list: {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_jwt_auth_plus_acl() {
+    let harness = AuthTestHarness::new()
+        .await
+        .expect("Failed to create test harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port)
+        .await
+        .expect("Failed to start echo backend");
+
+    let client = reqwest::Client::new();
+    let admin_token = harness.generate_admin_token().unwrap();
+    let auth_header = format!("Bearer {}", admin_token);
+    let admin_url = &harness.admin_base_url;
+    let proxy_url = &harness.proxy_base_url;
+
+    create_consumer(&client, admin_url, &auth_header, "jwt-alice", "jwt-alice")
+        .await
+        .unwrap();
+    let alice_secret = "jwt-alice-shared-hmac-secret-2026";
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "jwt-alice",
+        "jwt",
+        &json!({"secret": alice_secret}),
+    )
+    .await
+    .unwrap();
+
+    create_consumer(&client, admin_url, &auth_header, "jwt-eve", "jwt-eve")
+        .await
+        .unwrap();
+    let eve_secret = "jwt-eve-shared-hmac-secret-2026-aaa";
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "jwt-eve",
+        "jwt",
+        &json!({"secret": eve_secret}),
+    )
+    .await
+    .unwrap();
+
+    setup_auth_plus_acl_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        AuthAclProxySetup {
+            proxy_id: "proxy-jwt-allow",
+            listen_path: "/jwt-acl-allow",
+            backend_port,
+            auth_plugin_id: "plugin-jwt-allow-auth",
+            auth_plugin: json!({
+                "id": "plugin-jwt-allow-auth",
+                "plugin_name": "jwt_auth",
+                "scope": "proxy",
+                "proxy_id": "proxy-jwt-allow",
+                "enabled": true,
+                "config": {
+                    "token_lookup": "header:Authorization",
+                    "consumer_claim_field": "sub"
+                }
+            }),
+            acl_plugin_id: "plugin-jwt-allow-acl",
+            acl_config: json!({"allowed_consumers": ["jwt-alice"]}),
+        },
+    )
+    .await;
+
+    setup_auth_plus_acl_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        AuthAclProxySetup {
+            proxy_id: "proxy-jwt-deny",
+            listen_path: "/jwt-acl-deny",
+            backend_port,
+            auth_plugin_id: "plugin-jwt-deny-auth",
+            auth_plugin: json!({
+                "id": "plugin-jwt-deny-auth",
+                "plugin_name": "jwt_auth",
+                "scope": "proxy",
+                "proxy_id": "proxy-jwt-deny",
+                "enabled": true,
+                "config": {
+                    "token_lookup": "header:Authorization",
+                    "consumer_claim_field": "sub"
+                }
+            }),
+            acl_plugin_id: "plugin-jwt-deny-acl",
+            acl_config: json!({"disallowed_consumers": ["jwt-eve"]}),
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let alice_token = generate_consumer_jwt("jwt-alice", alice_secret, 3600);
+    let eve_token = generate_consumer_jwt("jwt-eve", eve_secret, 3600);
+
+    // Allow list — alice OK, eve forbidden
+    let resp = client
+        .get(format!("{}/jwt-acl-allow", proxy_url))
+        .header("Authorization", format!("Bearer {}", alice_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "alice should be allowed: {}",
+        resp.status()
+    );
+
+    let resp = client
+        .get(format!("{}/jwt-acl-allow", proxy_url))
+        .header("Authorization", format!("Bearer {}", eve_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "eve should be blocked by allow list (got {})",
+        resp.status()
+    );
+
+    // Allow list — bogus signature must still return 401, not 403
+    let bogus = generate_consumer_jwt("jwt-alice", "totally-wrong-secret-xxx", 3600);
+    let resp = client
+        .get(format!("{}/jwt-acl-allow", proxy_url))
+        .header("Authorization", format!("Bearer {}", bogus))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "invalid JWT must surface as 401 before ACL fires (got {})",
+        resp.status()
+    );
+
+    // Deny list — eve forbidden, alice OK
+    let resp = client
+        .get(format!("{}/jwt-acl-deny", proxy_url))
+        .header("Authorization", format!("Bearer {}", eve_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "eve should be blocked by deny list (got {})",
+        resp.status()
+    );
+
+    let resp = client
+        .get(format!("{}/jwt-acl-deny", proxy_url))
+        .header("Authorization", format!("Bearer {}", alice_token))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "alice should pass deny list: {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_hmac_auth_plus_acl() {
+    let harness = AuthTestHarness::new()
+        .await
+        .expect("Failed to create test harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind backend");
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port)
+        .await
+        .expect("Failed to start echo backend");
+
+    let client = reqwest::Client::new();
+    let admin_token = harness.generate_admin_token().unwrap();
+    let auth_header = format!("Bearer {}", admin_token);
+    let admin_url = &harness.admin_base_url;
+    let proxy_url = &harness.proxy_base_url;
+
+    let alice_hmac = "hmac-alice-shared-secret-aaa";
+    let mallory_hmac = "hmac-mallory-shared-secret-zzz";
+
+    create_consumer(&client, admin_url, &auth_header, "hmac-alice", "hmac-alice")
+        .await
+        .unwrap();
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "hmac-alice",
+        "hmac_auth",
+        &json!({"secret": alice_hmac}),
+    )
+    .await
+    .unwrap();
+
+    create_consumer(
+        &client,
+        admin_url,
+        &auth_header,
+        "hmac-mallory",
+        "hmac-mallory",
+    )
+    .await
+    .unwrap();
+    add_credential(
+        &client,
+        admin_url,
+        &auth_header,
+        "hmac-mallory",
+        "hmac_auth",
+        &json!({"secret": mallory_hmac}),
+    )
+    .await
+    .unwrap();
+
+    setup_auth_plus_acl_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        AuthAclProxySetup {
+            proxy_id: "proxy-hmac-allow",
+            listen_path: "/hmac-acl-allow",
+            backend_port,
+            auth_plugin_id: "plugin-hmac-allow-auth",
+            auth_plugin: json!({
+                "id": "plugin-hmac-allow-auth",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "proxy-hmac-allow",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            }),
+            acl_plugin_id: "plugin-hmac-allow-acl",
+            acl_config: json!({"allowed_consumers": ["hmac-alice"]}),
+        },
+    )
+    .await;
+
+    setup_auth_plus_acl_proxy(
+        &client,
+        admin_url,
+        &auth_header,
+        AuthAclProxySetup {
+            proxy_id: "proxy-hmac-deny",
+            listen_path: "/hmac-acl-deny",
+            backend_port,
+            auth_plugin_id: "plugin-hmac-deny-auth",
+            auth_plugin: json!({
+                "id": "plugin-hmac-deny-auth",
+                "plugin_name": "hmac_auth",
+                "scope": "proxy",
+                "proxy_id": "proxy-hmac-deny",
+                "enabled": true,
+                "config": {"clock_skew_seconds": 300}
+            }),
+            acl_plugin_id: "plugin-hmac-deny-acl",
+            acl_config: json!({"disallowed_consumers": ["hmac-mallory"]}),
+        },
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    fn signed_request(path: &str, username: &str, secret: &str) -> (String, String) {
+        let date = Utc::now().to_rfc2822();
+        let signature = generate_hmac_signature("GET", path, &date, secret);
+        let header = format!(
+            "hmac username=\"{}\", algorithm=\"hmac-sha256\", signature=\"{}\"",
+            username, signature
+        );
+        (header, date)
+    }
+
+    // Allow list — alice OK, mallory blocked
+    let (header, date) = signed_request("/hmac-acl-allow", "hmac-alice", alice_hmac);
+    let resp = client
+        .get(format!("{}/hmac-acl-allow", proxy_url))
+        .header("Authorization", header)
+        .header("Date", date)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "alice should be allowed: {}",
+        resp.status()
+    );
+
+    let (header, date) = signed_request("/hmac-acl-allow", "hmac-mallory", mallory_hmac);
+    let resp = client
+        .get(format!("{}/hmac-acl-allow", proxy_url))
+        .header("Authorization", header)
+        .header("Date", date)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "mallory should be blocked by allow list (got {})",
+        resp.status()
+    );
+
+    // Allow list — bad signature still returns 401, not 403
+    let (header, date) = signed_request("/hmac-acl-allow", "hmac-alice", "totally-wrong-secret");
+    let resp = client
+        .get(format!("{}/hmac-acl-allow", proxy_url))
+        .header("Authorization", header)
+        .header("Date", date)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "bad HMAC signature must surface as 401 before ACL fires (got {})",
+        resp.status()
+    );
+
+    // Deny list — mallory blocked, alice OK
+    let (header, date) = signed_request("/hmac-acl-deny", "hmac-mallory", mallory_hmac);
+    let resp = client
+        .get(format!("{}/hmac-acl-deny", proxy_url))
+        .header("Authorization", header)
+        .header("Date", date)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "mallory should be blocked by deny list (got {})",
+        resp.status()
+    );
+
+    let (header, date) = signed_request("/hmac-acl-deny", "hmac-alice", alice_hmac);
+    let resp = client
+        .get(format!("{}/hmac-acl-deny", proxy_url))
+        .header("Authorization", header)
+        .header("Date", date)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "alice should pass deny list: {}",
+        resp.status()
+    );
+}
