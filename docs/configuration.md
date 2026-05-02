@@ -2,6 +2,8 @@
 
 Ferrum Edge is configured primarily through environment variables. An optional `ferrum.conf` file can provide defaults.
 
+This page is the canonical human-readable reference for `FERRUM_*` variables and built-in defaults. Runtime behavior is defined in [`src/config/env_config.rs`](../src/config/env_config.rs); the root `ferrum.conf` is an editable operator template that mirrors this reference with concise comments and example values. When variables or defaults change, update the code, this reference, and then `ferrum.conf` so the template stays in sync without becoming the primary reference.
+
 ## Environment Variables
 
 ### Core Settings

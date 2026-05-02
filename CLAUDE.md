@@ -444,7 +444,7 @@ Graceful degradation pattern (`geo_restriction` example): constructor logs `warn
 
 1. Struct in `src/config/types.rs` with `#[serde(default)]`
 2. Env-driven → `src/config/env_config.rs`
-3. **Update `ferrum.conf`** — every new `FERRUM_*` needs commented default + comment. Conf and env vars MUST stay in sync.
+3. **Update config docs** — `docs/configuration.md` is the canonical human-readable `FERRUM_*` reference; `ferrum.conf` is the editable operator template. Every new `FERRUM_*` needs a table entry in `docs/configuration.md` and a concise commented default in `ferrum.conf`; both MUST stay in sync with `env_config.rs`.
 4. SQL storage → migration in `src/config/migrations/` + row parsing in `db_loader.rs`
 5. MongoDB auto-persists via serde BSON — only add indexes in `MongoStore::run_migrations()` if queried
 6. Unit tests in `tests/unit/config/`; update `openapi.yaml` if admin-exposed
@@ -477,7 +477,7 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 
 ## Key Environment Variables
 
-Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common essentials below.
+Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/config/env_config.rs`. Editable template: `ferrum.conf`. Most-common essentials below.
 
 - `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`migrate`
 - `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads

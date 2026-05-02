@@ -251,12 +251,17 @@ export FERRUM_DB_TLS_CA_CERT_PATH=/path/to/ca.pem
 # Client certificate authentication (mTLS)
 export FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.crt
 export FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client.key
-
-# Skip server cert verification (testing only)
-# export FERRUM_DB_TLS_MODE=require
 ```
 
 **Note:** MongoDB requires client cert + key in a single PEM file. When separate `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` are provided, the gateway automatically combines them into a temporary PEM file at startup.
+
+#### Encrypted Only (No Server Certificate Verification)
+
+```bash
+export FERRUM_DB_TLS_MODE=require
+```
+
+`require` still enables TLS, but intentionally skips CA and hostname verification. Use it only for testing or separately authenticated private networks; production MongoDB deployments should use `verify-full`.
 
 ### Using Connection String Options
 
