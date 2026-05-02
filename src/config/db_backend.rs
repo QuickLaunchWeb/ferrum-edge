@@ -34,7 +34,7 @@ pub enum SortOrder {
 }
 
 /// Filter parameters for `list_api_specs`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ApiSpecListFilter {
     /// Exact match on `proxy_id`.
     pub proxy_id: Option<String>,
@@ -54,6 +54,22 @@ pub struct ApiSpecListFilter {
     pub limit: u32,
     /// Row offset for pagination (default 0).
     pub offset: u32,
+}
+
+impl Default for ApiSpecListFilter {
+    fn default() -> Self {
+        Self {
+            proxy_id: None,
+            spec_version_prefix: None,
+            title_contains: None,
+            updated_since: None,
+            has_tag: None,
+            sort_by: ApiSpecSortBy::default(),
+            order: SortOrder::default(),
+            limit: 50,
+            offset: 0,
+        }
+    }
 }
 
 /// Result of an incremental config poll.

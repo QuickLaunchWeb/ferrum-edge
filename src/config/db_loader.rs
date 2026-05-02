@@ -3638,7 +3638,8 @@ impl DatabaseStore {
                 crate::config::types::SpecFormat::Yaml => "yaml",
             };
             sqlx::query(&self.q("UPDATE api_specs SET \
-                 spec_content = ?, content_hash = ?, uncompressed_size = ?, \
+                 spec_content = ?, content_encoding = ?, content_hash = ?, \
+                 uncompressed_size = ?, resource_hash = ?, \
                  spec_format = ?, spec_version = ?, title = ?, info_version = ?, \
                  description = ?, contact_name = ?, contact_email = ?, \
                  license_name = ?, license_identifier = ?, \
@@ -3646,8 +3647,10 @@ impl DatabaseStore {
                  updated_at = ? \
                  WHERE namespace = ? AND id = ?"))
             .bind(&spec.spec_content)
+            .bind(&spec.content_encoding)
             .bind(&spec.content_hash)
             .bind(spec.uncompressed_size as i64)
+            .bind(&spec.resource_hash)
             .bind(spec_format_str)
             .bind(&spec.spec_version)
             .bind(&spec.title)

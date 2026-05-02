@@ -1648,6 +1648,18 @@ mod inner {
                 )
                 .await?;
 
+            // Sparse index on api_spec_id for cascade queries (delete/replace by
+            // spec ownership).  Most plugin_configs have api_spec_id: null, so
+            // sparse avoids indexing the majority of documents.
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "api_spec_id": 1 })
+                        .options(IndexOptions::builder().sparse(true).build())
+                        .build(),
+                )
+                .await?;
+
             // upstreams indexes — uniqueness scoped to namespace
             self.upstreams()
                 .create_index(
@@ -1669,6 +1681,15 @@ mod inner {
                 .await?;
             self.upstreams()
                 .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                .await?;
+            // Sparse index on api_spec_id — mirrors plugin_configs above.
+            self.upstreams()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "api_spec_id": 1 })
+                        .options(IndexOptions::builder().sparse(true).build())
+                        .build(),
+                )
                 .await?;
             self.upstreams()
                 .create_index(

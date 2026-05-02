@@ -559,6 +559,9 @@ pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> Extract
         .map(|s| truncate_utf8(s, 128));
 
     // tags — top-level `tags[].name` (both 2.0 and 3.x)
+    // Each tag is truncated at 128 bytes; the list is capped at 64 entries.
+    const MAX_TAG_BYTES: usize = 128;
+    const MAX_TAGS: usize = 64;
     let mut tags: Vec<String> = root
         .get("tags")
         .and_then(|v| v.as_array())
@@ -566,12 +569,13 @@ pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> Extract
             arr.iter()
                 .filter_map(|e| e.get("name"))
                 .filter_map(|v| v.as_str())
-                .map(str::to_string)
+                .map(|s| truncate_utf8(s, MAX_TAG_BYTES))
                 .collect()
         })
         .unwrap_or_default();
     tags.sort();
     tags.dedup();
+    tags.truncate(MAX_TAGS);
 
     // server_urls
     // Each URL is truncated at 2048 bytes; the list is capped at 32 entries.

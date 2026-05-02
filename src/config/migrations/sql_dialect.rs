@@ -65,11 +65,12 @@ impl V001SqlBuilder {
             self.create_proxies_sql(),
             self.create_plugin_configs_sql(),
             self.create_proxy_plugins_sql(),
-            // api_specs must come AFTER proxies (FK proxies(id) → api_specs via
-            // the api_spec_id back-link is ON DELETE SET NULL, but the api_specs
-            // table itself FKs proxies ON DELETE CASCADE, so proxies must exist
-            // first). api_specs is admin-only metadata; the gateway runtime never
-            // reads this table.
+            // api_specs must come AFTER proxies (api_specs.proxy_id FKs
+            // proxies(id) ON DELETE CASCADE, so the proxies table must exist
+            // first).  The api_spec_id back-links on proxies/upstreams/
+            // plugin_configs are application-managed (no FK constraint) — see
+            // the comment block in create_api_specs_sql().  api_specs is
+            // admin-only metadata; the gateway runtime never reads this table.
             self.create_api_specs_sql(),
         ] {
             sqlx::query(sql).execute(pool).await?;
@@ -97,7 +98,9 @@ impl V001SqlBuilder {
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
-            "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace ON api_specs (namespace)",
+            // Note: no standalone namespace index on api_specs — the compound
+            // indexes below (namespace + updated_at / spec_version / etc.) all
+            // have namespace as the leading column and serve namespace-only lookups.
             "CREATE INDEX IF NOT EXISTS idx_api_specs_namespace_updated_at ON api_specs (namespace, updated_at)",
             // Wave 5 indexes — for spec_version filter, title sort, operation_count sort, created_at sort
             "CREATE INDEX IF NOT EXISTS idx_api_specs_ns_spec_version ON api_specs (namespace, spec_version)",
