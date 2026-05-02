@@ -1969,7 +1969,13 @@ impl EnvConfig {
                 }
             }
             "sqlite" => {
-                return Err("Database TLS settings are not valid when FERRUM_DB_TYPE=sqlite; SQLite has no network TLS".into());
+                if matches!(mode, DbTlsMode::Disable) {
+                    tracing::debug!(
+                        "FERRUM_DB_TLS_MODE=disable is a no-op when FERRUM_DB_TYPE=sqlite"
+                    );
+                } else {
+                    return Err("Database TLS settings are not valid when FERRUM_DB_TYPE=sqlite; SQLite has no network TLS. Use FERRUM_DB_TLS_MODE=disable only as a no-op, or remove database TLS settings.".into());
+                }
             }
             _ => {}
         }

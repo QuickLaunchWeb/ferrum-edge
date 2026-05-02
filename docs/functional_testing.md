@@ -55,7 +55,7 @@ cargo test --test functional_tests functional_cp_dp -- --ignored --nocapture
 
 ## Database TLS Support
 
-The database layer supports TLS configuration for PostgreSQL, MySQL, and MongoDB connections. SQLite has no network TLS and rejects database TLS env settings.
+The database layer supports TLS configuration for PostgreSQL, MySQL, and MongoDB connections. SQLite has no network TLS; `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op, while certificate paths and other database TLS modes are rejected.
 
 ### Configuration
 
@@ -107,7 +107,8 @@ such as `connect_timeout`.
 - Supports `ssl-ca`, `ssl-cert`, `ssl-key` parameters
 
 **For SQLite:**
-- TLS env settings are rejected because SQLite doesn't use network TLS
+- `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op for shared templates
+- Certificate paths and other TLS modes are rejected because SQLite doesn't use network TLS
 
 #### Mode Changes
 

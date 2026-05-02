@@ -63,7 +63,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | Core `FERRUM_DB_TYPE`, `FERRUM_DB_URL`, `FERRUM_DB_POLL_INTERVAL`, `FERRUM_DB_CONFIG_BACKUP_PATH`, `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Yes | Yes | Yes | Yes |
 | `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
 | `FERRUM_DB_READ_REPLICA_URL` | Yes | Yes | No | No; use MongoDB `readPreference` |
-| `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | No; rejected by config validation | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
+| `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | `disable` only as a no-op; cert paths rejected | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
 

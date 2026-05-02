@@ -9,7 +9,7 @@ Ferrum Edge supports TLS-encrypted connections to PostgreSQL, MySQL, and MongoDB
 | PostgreSQL | Yes         | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes |
 | MySQL      | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes |
 | MongoDB    | Yes         | `disable`, `require`, `verify-full` | Yes |
-| SQLite     | N/A         | Not supported; database TLS settings are rejected | N/A |
+| SQLite     | N/A         | Unset or `disable` only; `disable` is a no-op | N/A |
 
 ## Canonical Environment Variables
 
@@ -30,14 +30,16 @@ For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`
 
 | Ferrum value | PostgreSQL query parameter | MySQL query parameter | MongoDB driver behavior | Encryption | CA validation | Hostname validation | Under-the-hood behavior |
 |--------------|----------------------------|-----------------------|-------------------------|------------|---------------|---------------------|-------------------------|
-| `disable` | `sslmode=disable` | `ssl-mode=DISABLED` | TLS disabled | No | No | No | Opens only plaintext connections. Use only for local development or trusted local sockets. |
+| `disable` | `sslmode=disable` | `ssl-mode=DISABLED` | TLS disabled | No | No | No | Opens only plaintext connections for network databases. For SQLite, this value is accepted as a no-op for templated configs. |
 | `allow` | `sslmode=allow` | N/A | N/A | Maybe | No | No | PostgreSQL-only. Tries plaintext first, then retries TLS if plaintext fails. Not a production-safe setting. |
 | `prefer` | `sslmode=prefer` | `ssl-mode=PREFERRED` | N/A | Maybe | No | No | Tries TLS first, but may fall back to plaintext when the server does not support TLS. |
 | `require` | `sslmode=require` | `ssl-mode=REQUIRED` | TLS enabled with invalid certificates allowed | Yes | No | No | Requires encryption but does not verify the server certificate or hostname. Use only for testing or separately authenticated private networks. |
 | `verify-ca` | `sslmode=verify-ca` | `ssl-mode=VERIFY_CA` | N/A | Yes | Yes | No | Requires TLS and verifies that the certificate chains to the configured CA, but does not verify the requested hostname. |
 | `verify-full` | `sslmode=verify-full` | `ssl-mode=VERIFY_IDENTITY` | TLS enabled with certificate validation | Yes | Yes | Yes | Requires TLS, validates the CA chain, and verifies the requested hostname. This is the recommended production mode. |
 
-SQLite is an embedded, file-based database. Because there is no network connection to secure, database TLS settings are invalid when `FERRUM_DB_TYPE=sqlite`.
+For PostgreSQL, client certificate parameters can be present with `allow` or `prefer`, but those modes may still use plaintext. Client-certificate authentication effectively requires `require`, `verify-ca`, or `verify-full`; use `verify-full` for production.
+
+SQLite is an embedded, file-based database. Because there is no network connection to secure, `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op, while certificate paths and every other TLS mode are rejected when `FERRUM_DB_TYPE=sqlite`.
 
 ## PostgreSQL TLS Setup
 
@@ -96,6 +98,8 @@ export FERRUM_DB_TLS_CLIENT_KEY_PATH=/etc/ferrum/certs/client.key
 ```
 
 Requires PostgreSQL to be configured with `ssl_ca_file` pointing to a CA that signed the client certificate, and `pg_hba.conf` entries using `hostssl ... cert` authentication.
+
+Use `FERRUM_DB_TLS_MODE=require` or stricter for PostgreSQL client-certificate authentication. `allow` and `prefer` can fall back to plaintext, making client certificate parameters inert.
 
 ### Docker Example
 
@@ -308,20 +312,22 @@ docker run -d --name ferrum-edge \
 
 ## SQLite
 
-SQLite is an embedded, file-based database. It does not use network connections, so TLS is not applicable. Ferrum rejects database TLS settings when `FERRUM_DB_TYPE=sqlite`.
+SQLite is an embedded, file-based database. It does not use network connections, so TLS is not applicable. Ferrum accepts `FERRUM_DB_TLS_MODE=disable` as a no-op for templated configs, but rejects database TLS certificate paths and every non-disable TLS mode when `FERRUM_DB_TYPE=sqlite`.
 
 ```bash
 export FERRUM_MODE=database
 export FERRUM_DB_TYPE=sqlite
 export FERRUM_DB_URL="sqlite:///data/ferrum.db?mode=rwc"
-# Do not set FERRUM_DB_TLS_MODE or database TLS certificate paths for SQLite.
+# Optional no-op for shared templates:
+# export FERRUM_DB_TLS_MODE=disable
+# Do not set database TLS certificate paths for SQLite.
 ```
 
 ## TLS Mode Reference
 
 | Mode          | PostgreSQL | MySQL | MongoDB | Encrypted | Server Cert Verified | Hostname Verified | Use Case |
 |---------------|------------|-------|---------|-----------|----------------------|-------------------|----------|
-| `disable`     | Yes        | Yes   | Yes     | No        | No                   | No                | Development only |
+| `disable`     | Yes        | Yes   | Yes     | No        | No                   | No                | Development / SQLite no-op in shared templates |
 | `allow`       | Yes        | No    | No      | Maybe     | No                   | No                | PostgreSQL-only plaintext-first fallback |
 | `prefer`      | Yes        | Yes   | No      | Maybe     | No                   | No                | Opportunistic TLS, not production-safe |
 | `require`     | Yes        | Yes   | Yes     | Yes       | No                   | No                | Testing or separately authenticated private networks |
@@ -414,10 +420,8 @@ cargo test --test functional_tests test_sqlite_without_tls_settings -- --ignored
 |----------------------------------------|------------|-----------------|------------------------------------------------|
 | `test_postgresql_tls_verify_full`      | PostgreSQL | verify-full     | Full cert verification + CRUD + proxy routing   |
 | `test_postgresql_tls_require`          | PostgreSQL | require         | Encrypted connection + CRUD + proxy routing     |
-| `test_postgresql_tls_require_mode`     | PostgreSQL | require         | `FERRUM_DB_TLS_MODE=require` configures encrypted SQL without cert verification |
 | `test_mysql_tls_verify_identity`       | MySQL      | verify-full     | Full cert verification + CRUD + proxy routing   |
 | `test_mysql_tls_required`              | MySQL      | require         | Encrypted connection + CRUD + proxy routing     |
-| `test_mysql_tls_require_mode`          | MySQL      | require         | `FERRUM_DB_TLS_MODE=require` maps to MySQL `REQUIRED` |
 | `test_sqlite_without_tls_settings`     | SQLite     | N/A             | SQLite starts with no database TLS settings     |
 | `test_health_endpoint_shows_db_status` | PostgreSQL | require         | Health endpoint works with TLS database         |
 

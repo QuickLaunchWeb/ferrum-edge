@@ -96,24 +96,6 @@ impl DbTlsTestHarness {
         self.start_gateway_with_envs(db_url, extra_env).await
     }
 
-    /// Start the gateway with canonical database TLS settings, with retry for ephemeral port races.
-    async fn start_gateway_tls_mode(
-        &mut self,
-        db_url: &str,
-        cert_dir: &str,
-        insecure: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let ca_cert_path = format!("{}/ca.crt", cert_dir);
-        let mut envs = vec![(
-            "FERRUM_DB_TLS_MODE".to_string(),
-            if insecure { "require" } else { "verify-full" }.to_string(),
-        )];
-        if !insecure {
-            envs.push(("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path));
-        }
-        self.start_gateway_with_envs(db_url, envs).await
-    }
-
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
         let now = Utc::now();
         let claims = json!({
@@ -568,50 +550,6 @@ async fn test_postgresql_tls_require() {
     println!("\n=== PostgreSQL TLS (require) PASSED ===\n");
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_postgresql_tls_require_mode() {
-    println!("\n=== PostgreSQL TLS (require via FERRUM_DB_TLS_MODE) ===\n");
-
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
-        return;
-    }
-
-    let mut harness = DbTlsTestHarness::new("postgres")
-        .await
-        .expect("Failed to create harness");
-
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend");
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port).await.unwrap();
-
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
-    harness
-        .start_gateway_tls_mode(db_url, &cert_dir(), true)
-        .await
-        .expect("Failed to start gateway with PostgreSQL require TLS mode");
-
-    let token = harness.generate_token().unwrap();
-    let auth = format!("Bearer {}", token);
-
-    run_crud_and_proxy_tests(
-        "PostgreSQL/require",
-        &harness.admin_base_url,
-        &harness.proxy_base_url,
-        &auth,
-        backend_port,
-    )
-    .await;
-
-    println!("\n=== PostgreSQL TLS (require mode) PASSED ===\n");
-}
-
 // ============================================================================
 // MySQL TLS Tests
 // ============================================================================
@@ -709,50 +647,6 @@ async fn test_mysql_tls_required() {
     .await;
 
     println!("\n=== MySQL TLS (required) PASSED ===\n");
-}
-
-#[tokio::test]
-#[ignore]
-async fn test_mysql_tls_require_mode() {
-    println!("\n=== MySQL TLS (require via FERRUM_DB_TLS_MODE) ===\n");
-
-    if !is_container_running("ferrum-test-mysql-tls") {
-        println!("SKIPPED: ferrum-test-mysql-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
-        return;
-    }
-
-    let mut harness = DbTlsTestHarness::new("mysql")
-        .await
-        .expect("Failed to create harness");
-
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind backend");
-    let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let _backend = start_echo_backend(backend_port).await.unwrap();
-
-    let db_url = "mysql://ferrum:test-password@localhost:13306/ferrum";
-
-    harness
-        .start_gateway_tls_mode(db_url, &cert_dir(), true)
-        .await
-        .expect("Failed to start gateway with MySQL require TLS mode");
-
-    let token = harness.generate_token().unwrap();
-    let auth = format!("Bearer {}", token);
-
-    run_crud_and_proxy_tests(
-        "MySQL/require",
-        &harness.admin_base_url,
-        &harness.proxy_base_url,
-        &auth,
-        backend_port,
-    )
-    .await;
-
-    println!("\n=== MySQL TLS (require mode) PASSED ===\n");
 }
 
 // ============================================================================

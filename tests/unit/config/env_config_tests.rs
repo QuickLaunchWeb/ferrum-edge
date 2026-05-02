@@ -2216,7 +2216,7 @@ fn test_env_config_db_tls_rejects_sqlite() {
 }
 
 #[test]
-fn test_env_config_db_tls_rejects_sqlite_disable_mode() {
+fn test_env_config_db_tls_accepts_sqlite_disable_mode_as_noop() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
@@ -2229,8 +2229,34 @@ fn test_env_config_db_tls_rejects_sqlite_disable_mode() {
             ("FERRUM_DB_TLS_MODE", "disable"),
         ],
         || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_tls_mode, Some(DbTlsMode::Disable));
+            assert!(!config.db_tls_enabled());
+            assert_eq!(
+                config.effective_db_url().unwrap(),
+                "sqlite://ferrum.db?mode=rwc"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_sqlite_disable_with_cert_paths() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "sqlite"),
+            ("FERRUM_DB_URL", "sqlite://ferrum.db?mode=rwc"),
+            ("FERRUM_DB_TLS_MODE", "disable"),
+            ("FERRUM_DB_TLS_CA_CERT_PATH", "/certs/ca.pem"),
+        ],
+        || {
             let err = EnvConfig::from_env().unwrap_err();
-            assert!(err.contains("SQLite has no network TLS"));
+            assert!(err.contains("cannot be set when FERRUM_DB_TLS_MODE=disable"));
         },
     );
 }
