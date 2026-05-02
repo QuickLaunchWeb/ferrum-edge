@@ -10,8 +10,10 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 |---|---|---|---|
 | `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (provides defaults; env vars override) |
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
+| `FERRUM_NAMESPACE` | No | `ferrum` | Namespace this gateway loads and manages |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped to avoid backpressure on request threads |
+| `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` | No | `30` | Timeout for each external secret fetch during startup |
 
 ### Proxy Listener
 
@@ -30,10 +32,15 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port. Set to `0` to disable the plaintext admin HTTP listener (TLS-only operation) |
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
+| `FERRUM_ADMIN_ALLOWED_CIDRS` | No | — | Comma-separated CIDRs/IPs allowed to connect to the admin API. Empty permits all |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters |
+| `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
+| `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (`exp - iat`) for externally minted Admin API JWTs |
 | `FERRUM_ADMIN_READ_ONLY` | No | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
+| `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
+| `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Skip Admin API TLS certificate verification (testing only) |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` |
 
 ### Database
@@ -43,10 +50,10 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string. For MongoDB: `mongodb://` or `mongodb+srv://` |
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
-| `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | No | — | Path to externally provided JSON config backup. Used as startup fallback when the database is unreachable. |
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling (SQL only). For MongoDB, use `readPreference` in the connection string |
+| `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | No | — | Log database queries slower than this threshold |
 
 ### Database TLS
 
@@ -63,6 +70,20 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_DB_SSL_CLIENT_KEY` | No | — | Path to client private key for database mTLS |
 
 See [database_tls.md](database_tls.md) for detailed configuration examples and SSL mode descriptions.
+
+### Database Pool
+
+SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver connection-string pool options such as `maxPoolSize` and `minPoolSize`.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_DB_POOL_MAX_CONNECTIONS` | No | `10` | Maximum SQL pool connections |
+| `FERRUM_DB_POOL_MIN_CONNECTIONS` | No | `1` | Minimum idle SQL pool connections |
+| `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | No | `30` | Max wait for a pool connection |
+| `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |
+| `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | No | `300` | Max SQL connection lifetime |
+| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max TCP connect time for new database connections; `0` disables |
+| `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | No | `30` | Per-statement SQL timeout; `0` disables |
 
 ### MongoDB
 
@@ -89,13 +110,28 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | No | `0.0.0.0:50051` in CP mode | gRPC listen address. Port `0` disables plaintext gRPC |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP & DP modes | — | Shared JWT secret for CP/DP gRPC auth (DP generates short-lived JWTs, CP validates). Must be at least 32 characters |
+| `FERRUM_CP_GRPC_TLS_CERT_PATH` | If CP gRPC TLS | — | CP gRPC server TLS certificate |
+| `FERRUM_CP_GRPC_TLS_KEY_PATH` | If CP gRPC TLS | — | CP gRPC server TLS private key |
+| `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | — | CA bundle for verifying DP client certificates (mTLS) |
+| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | No | `128` | CP broadcast channel capacity before lagging DPs receive a full snapshot |
 | `FERRUM_DP_CP_GRPC_URL` | DP mode (unless `_URLS` set) | — | Control Plane gRPC URL |
 | `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over single URL |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |
+| `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | — | CA certificate for verifying the CP server |
+| `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | — | DP client certificate for CP mTLS |
+| `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | — | DP client private key for CP mTLS |
+| `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | `false` | Skip DP gRPC TLS verification (testing only) |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
+
+### Migration
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_MIGRATE_ACTION` | No | `up` | Migration action: `up`, `status`, or `config` |
+| `FERRUM_MIGRATE_DRY_RUN` | No | `false` | Preview migration work without applying changes |
 
 ### Size Limits
 
@@ -106,12 +142,15 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 | `FERRUM_MAX_HEADER_COUNT` | No | `100` | Max number of request headers allowed (0=unlimited) |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | No | `10485760` | Maximum response body size from backends (0=unlimited) |
+| `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` | No | `65536` | Eager-buffer known-size responses at or below this size; `0` always streams |
+| `FERRUM_H2_COALESCE_TARGET_BYTES` | No | `131072` | Target chunk size for HTTP/2 response body coalescing; clamped 16 KiB..1 MiB |
 | `FERRUM_MAX_URL_LENGTH_BYTES` | No | `8192` | Maximum URL length in bytes (path + query string, 0=unlimited) |
 | `FERRUM_MAX_QUERY_PARAMS` | No | `100` | Maximum number of query parameters allowed (0=unlimited) |
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | No | `4194304` | Maximum total received gRPC payload size in bytes (0=unlimited) |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | No | `131072` | WebSocket write buffer size (128 KB). Increase for large WS frames (1 MB+). Only applies when frame-level plugins are active |
 | `FERRUM_WEBSOCKET_TUNNEL_MODE` | No | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Significantly improves throughput for large payloads (9 MB: 25→110 RPS). Trade-off: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is not enforced (no DoS risk — data streams through fixed-size copy buffer) |
+| `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | No | `10` | HTTP/1.1 header read timeout; `0` disables |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
@@ -127,10 +166,14 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
 | `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
 | `FERRUM_DNS_ERROR_TTL` | No | `5` | TTL (seconds) for errors/empty responses |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | No | `10` | Interval (seconds) for retrying failed DNS lookups. `0` = disabled |
+| `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
+| `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
+| `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
@@ -145,12 +188,15 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
 | `FERRUM_TLS_NO_VERIFY` | No | `false` | Disable outbound TLS verification for all connections (testing only) |
+| `FERRUM_TLS_CRL_FILE_PATH` | No | — | PEM CRL bundle for revocation checks across TLS/DTLS surfaces |
 | `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version, inbound + outbound (`1.2` or `1.3`) |
 | `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version, inbound + outbound (`1.2` or `1.3`) |
 | `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites, inbound + outbound (see [TLS Policy Hardening](frontend_tls.md#tls-policy-hardening)) |
 | `FERRUM_TLS_CURVES` | No | `X25519,secp256r1` | Comma-separated key exchange groups, inbound + outbound |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation (inbound only) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | No | `4096` | TLS session resumption cache size (inbound only, TLS 1.2 stateful session IDs) |
+| `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | No | `30` | Warn when configured certificates expire within this many days; `0` disables warnings |
+| `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
 
@@ -171,6 +217,7 @@ These TLS policy settings apply uniformly to both inbound (frontend) and outboun
 | `FERRUM_HTTP3_FLUSH_INTERVAL_MICROS` | No | `200` | Response coalesce time-based flush interval (µs) |
 | `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` | No | `32` | Bounded mpsc capacity for the H3→non-H3 cross-protocol request-body bridge. Bounds in-flight request memory to approximately `capacity × average_h3_chunk_size` during streaming uploads. Range: 1–1024. |
 | `FERRUM_HTTP3_INITIAL_MTU` | No | `1500` | Initial QUIC path MTU (clamped 1200–65527) |
+| `FERRUM_H3_REQUEST_BODY_DRAIN_MS` | No | `50` | Courtesy drain window before STOP_SENDING on small/successful H3 responses |
 
 See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol bridge behavior, and WebSocket-over-H3 rationale.
 
@@ -179,9 +226,16 @@ See [docs/http3.md](http3.md) for the full HTTP/3 dispatch model, cross-protocol
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
-| `FERRUM_DTLS_CERT_PATH` | No | — | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519 only) |
+| `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | No | `300` | Default TCP idle timeout; `0` disables |
+| `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS` | No | `300` | Hard cap for TCP half-close drain; both TCP timeouts `0` enables the fast path |
+| `FERRUM_UDP_MAX_SESSIONS` | No | `10000` | Maximum concurrent UDP sessions per proxy |
+| `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | No | `10` | UDP session cleanup interval |
+| `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | No | `64` | Linux `recvmmsg` receive batch size; clamped 1..1024 |
+| `FERRUM_DTLS_CERT_PATH` | No | — | PEM certificate for frontend DTLS termination (ECDSA P-256 or P-384 only) |
 | `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | No | — | PEM CA certificate for verifying DTLS client certs (frontend mTLS) |
+| `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` | No | `16384` | Maximum plaintext payload bytes per DTLS record |
+| `FERRUM_DTLS_RECORD_OVERHEAD_BYTES` | No | `64` | DTLS record overhead budget for per-session output buffers |
 
 See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 
@@ -190,7 +244,12 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. Existing bcrypt hashes remain valid. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
+| `FERRUM_MAX_CREDENTIALS_PER_TYPE` | No | `2` | Maximum active credential entries per type per consumer |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
+| `FERRUM_BACKEND_ALLOW_IPS` | No | `both` | Backend SSRF policy: `both`, `private`, or `public` |
+| `FERRUM_ADD_VIA_HEADER` | No | `true` | Add `Via` on request and response paths |
+| `FERRUM_VIA_PSEUDONYM` | No | `ferrum-edge` | Pseudonym used in the `Via` header |
+| `FERRUM_ADD_FORWARDED_HEADER` | No | `false` | Add RFC 7239 `Forwarded` alongside `X-Forwarded-*` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
 
 See [client_ip_resolution.md](client_ip_resolution.md) for the security model and deployment examples.
@@ -211,9 +270,19 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
+| `FERRUM_MAX_REQUESTS` | No | `0` | Max concurrent in-flight requests/streams; `0` = unlimited |
+| `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | No | `0` | Per-client-IP concurrent request cap; `0` disables |
+| `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | No | `60` | Cleanup interval for per-IP request counters |
+| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries |
+| `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | No | `200` | Max distinct HTTP status code counter entries |
 | `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores, `1` = single listener. Parallelizes kernel-level connection intake independently of worker threads. Unix only (Linux 3.9+, macOS, BSDs) |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
+| `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | No | `64` | Rapid-reset mitigation threshold for pending accept-reset streams |
+| `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | No | `256` | Rapid-reset mitigation threshold for locally reset streams |
+| `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | No | `20000` | Dedicated cap for upgraded WebSocket connections; `0` disables |
+| `FERRUM_SHUTDOWN_DRAIN_SECONDS` | No | `30` | Graceful shutdown drain period; `0` skips draining |
+| `FERRUM_STATUS_METRICS_WINDOW_SECONDS` | No | `30` | Rate window for admin `/status` metrics |
 
 See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning guidance.
 
@@ -224,6 +293,8 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 | `FERRUM_POOL_WARMUP_ENABLED` | No | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP stream proxies |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | No | `30` | Cleanup sweep interval for all connection pools |
+| `FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS` | No | `86400` | Background interval for reproving backend HTTP/2, HTTP/3, and h2c capabilities |
+| `FERRUM_GRPC_POOL_READY_WAIT_MS` | No | `1` | Time the gRPC pool waits for stream capacity before opening another backend connection |
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | No | `90` | Seconds before idle connections are closed |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | No | `true` | Enable HTTP keep-alive for backend connection reuse |
@@ -240,7 +311,48 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 
 See [connection_pooling.md](connection_pooling.md) for the full configuration reference and pool warmup details.
 
-The full list of 90+ environment variables is defined in `src/config/env_config.rs`.
+### Router Cache
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | No | `0` | Router prefix/negative lookup cache size. `0` auto-scales as `max(10000, proxies × 3)` |
+
+### Overload Management
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_OVERLOAD_CHECK_INTERVAL_MS` | No | `1000` | Resource pressure monitor interval; minimum 100ms |
+| `FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD` | No | `0.80` | FD usage ratio above which keepalive is disabled |
+| `FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD` | No | `0.95` | FD usage ratio above which new connections are rejected |
+| `FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD` | No | `0.85` | Connection usage ratio above which keepalive is disabled |
+| `FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD` | No | `0.95` | Connection usage ratio above which new connections are rejected |
+| `FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD` | No | `0.85` | Request usage ratio above which keepalive is disabled |
+| `FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD` | No | `0.95` | Request usage ratio above which new requests receive 503 |
+| `FERRUM_OVERLOAD_LOOP_WARN_US` | No | `10000` | Event-loop latency warning threshold |
+| `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | No | `500000` | Event-loop latency threshold for rejecting new connections |
+
+### Advanced Performance
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_ADAPTIVE_BUFFER_ENABLED` | No | `true` | Enable adaptive TCP/WebSocket tunnel copy buffer sizing |
+| `FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED` | No | `true` | Enable adaptive UDP batch limit sizing |
+| `FERRUM_ADAPTIVE_BUFFER_EWMA_ALPHA` | No | `300` | EWMA smoothing factor, clamped 1..999 |
+| `FERRUM_ADAPTIVE_BUFFER_MIN_SIZE` | No | `8192` | Adaptive buffer floor in bytes |
+| `FERRUM_ADAPTIVE_BUFFER_MAX_SIZE` | No | `262144` | Adaptive buffer ceiling in bytes |
+| `FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE` | No | `65536` | Initial adaptive buffer size before traffic data exists |
+| `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT` | No | `6000` | Initial adaptive UDP batch limit |
+| `FERRUM_TLS_OFFLOAD_THREADS` | No | `0` | Dedicated TLS handshake offload threads; `0` disables |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | No | `auto` | TCP Fast Open toggle: `auto`, `true`, or `false` |
+| `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | No | `256` | TCP Fast Open server queue length |
+| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS splice acceleration toggle |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | No | `auto` | Linux io_uring splice toggle |
+| `FERRUM_UDP_GRO_ENABLED` | No | `auto` | Linux UDP GRO toggle; currently reserved/no-op |
+| `FERRUM_UDP_GSO_ENABLED` | No | `auto` | Linux UDP GSO send batching toggle |
+| `FERRUM_UDP_PKTINFO_ENABLED` | No | `auto` | Linux IP_PKTINFO/IPV6_PKTINFO reply-source optimization toggle |
+| `FERRUM_SO_BUSY_POLL_US` | No | `0` | Linux SO_BUSY_POLL duration for latency-sensitive UDP sockets |
+
+Core environment parsing lives in `src/config/env_config.rs`; early startup/pool settings use the same `FERRUM_*` names via conf-aware helpers.
 
 ## Configuration File (`ferrum.conf`)
 

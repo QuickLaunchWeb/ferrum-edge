@@ -250,7 +250,7 @@ curl -X POST http://localhost:9000/batch \
   }'
 ```
 
-Once the DB poller picks up the new config (default 30s, or set `FERRUM_DB_POLL_INTERVAL_SECONDS=5` for faster feedback), the route is live:
+Once the DB poller picks up the new config (default 30s, or set `FERRUM_DB_POLL_INTERVAL=5` for faster feedback), the route is live:
 
 ```bash
 curl http://localhost:8000/api/payments/checkout \

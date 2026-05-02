@@ -456,7 +456,7 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 **Transactions**: SQL wraps multi-step CRUD in `sqlx::Transaction`. MongoDB: single-doc atomic; multi-doc requires replica set (`FERRUM_MONGO_REPLICA_SET`), else idempotent with poll-cycle cleanup.
 
-**Incremental polling** (`FERRUM_DB_POLL_INTERVAL_SECONDS`, default 30s): startup = full `SELECT *`; subsequent = indexed `updated_at > ?` + lightweight `SELECT id` deletion diff. 1s safety margin. Validated before apply; known IDs unchanged on reject. Auto-fallback to full reload on failure. **CP broadcasts deltas** via tokio `broadcast` (capacity = `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging DPs auto-get a full snapshot.
+**Incremental polling** (`FERRUM_DB_POLL_INTERVAL`, default 30s): startup = full `SELECT *`; subsequent = indexed `updated_at > ?` + lightweight `SELECT id` deletion diff. 1s safety margin. Validated before apply; known IDs unchanged on reject. Auto-fallback to full reload on failure. **CP broadcasts deltas** via tokio `broadcast` (capacity = `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging DPs auto-get a full snapshot.
 
 **Failover**: `FERRUM_DB_FAILOVER_URLS` (same `FERRUM_DB_TYPE`); `FERRUM_DB_READ_REPLICA_URL` offloads polling (writes always primary). **MongoDB** (`docs/mongodb.md`): `readPreference` in URL replaces read-replica var; replica sets handle failover natively (list members in `FERRUM_DB_URL`); pool via driver (`maxPoolSize`/`minPoolSize` in URL) — `FERRUM_DB_POOL_*` ignored.
 

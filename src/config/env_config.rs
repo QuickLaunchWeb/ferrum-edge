@@ -222,8 +222,8 @@ pub struct EnvConfig {
     /// that don't have `EnvConfig` in scope (e.g., `create_jwt_manager_from_env()`).
     #[allow(dead_code)]
     pub admin_jwt_issuer: String,
-    /// Maximum TTL in seconds for Admin API JWT tokens. Tokens requesting a longer
-    /// lifetime via the /auth endpoint are capped to this value. Default: 3600.
+    /// Maximum accepted TTL in seconds for externally minted Admin API JWT tokens.
+    /// Tokens with `exp - iat` above this value are rejected. Default: 3600.
     /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
     #[allow(dead_code)]
     pub admin_jwt_max_ttl: u64,
@@ -689,7 +689,7 @@ pub struct EnvConfig {
     /// Path to CA certificate (PEM) for verifying DTLS client certificates (mTLS).
     /// When set, the gateway requires and verifies client certificates for frontend
     /// DTLS connections using this trust store. Separate from the TLS client CA used
-    /// for TCP frontend mTLS (`FERRUM_TLS_CLIENT_CA_CERT_PATH`).
+    /// for TCP frontend mTLS (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`).
     pub dtls_client_ca_cert_path: Option<String>,
     /// Maximum plaintext payload bytes per DTLS record. Datagrams exceeding this are
     /// dropped with a warning. Default: 16384 (2^14, per RFC 9147 §4.1). Increase only

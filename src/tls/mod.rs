@@ -11,7 +11,7 @@
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
-//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_CURVES`. Applied to
 //! both inbound listeners and outbound backend connections.
 
 pub mod backend;
