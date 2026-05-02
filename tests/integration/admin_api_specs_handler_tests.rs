@@ -3837,3 +3837,244 @@ async fn put_overwrites_imported_updated_at_so_polling_picks_change() {
         );
     }
 }
+
+// ============================================================================
+// Test coverage gap — DP mode returns 403 on writes
+// ============================================================================
+
+/// DP mode sets `read_only = true` and `mode = "dp"`.  All write endpoints
+/// must return 403.  GET endpoints must still work.
+#[tokio::test]
+async fn dp_mode_blocks_spec_writes_allows_reads() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let mut state = make_admin_state(store, 25);
+    state.read_only = true;
+    state.mode = "dp".to_string();
+
+    let (base, _shutdown) = start_admin(state).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (status, _) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "POST must be 403 in DP mode"
+    );
+
+    let (status, _) = client
+        .put_json("/api-specs/any-id", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "PUT must be 403 in DP mode"
+    );
+
+    let status = client.delete("/api-specs/any-id").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "DELETE must be 403 in DP mode"
+    );
+
+    // GETs should still work (404 because nothing exists, not 403).
+    let (status, _) = client.get_json("/api-specs").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "GET list must succeed in DP mode"
+    );
+
+    let (status, _) = client.get_json("/api-specs/nonexistent").await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::NOT_FOUND,
+        "GET by id must return 404, not 403"
+    );
+}
+
+// ============================================================================
+// Test coverage gap — concurrent POST with overlapping listen_path
+// ============================================================================
+
+/// Sequential POSTs with different proxy IDs but the same listen_path:
+/// the first must succeed, the second must be rejected by the listen_path
+/// uniqueness check.
+#[tokio::test]
+async fn post_overlapping_listen_path_second_rejected() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let listen_path = format!("/{}", uid("shared-path"));
+    let spec_a = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "A", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": uid("proxy-a"),
+            "backend_host": "a.internal",
+            "backend_port": 443,
+            "listen_path": &listen_path
+        }
+    });
+    let spec_b = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "B", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": uid("proxy-b"),
+            "backend_host": "b.internal",
+            "backend_port": 443,
+            "listen_path": &listen_path
+        }
+    });
+
+    let (status_a, _) = client.post_json("/api-specs", &spec_a).await;
+    assert_eq!(
+        status_a,
+        reqwest::StatusCode::CREATED,
+        "first POST must succeed"
+    );
+
+    let (status_b, _) = client.post_json("/api-specs", &spec_b).await;
+    assert!(
+        status_b == reqwest::StatusCode::CONFLICT
+            || status_b == reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "second POST with same listen_path must be rejected; got {status_b}"
+    );
+}
+
+// ============================================================================
+// Test coverage gap — Accept: application/yaml GET
+// ============================================================================
+
+/// GET with `Accept: application/yaml` must return YAML content, not JSON.
+#[tokio::test]
+async fn get_with_accept_yaml_returns_yaml() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (status, body) = client
+        .post_json("/api-specs", &minimal_json_spec(&proxy_id))
+        .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let spec_id = body["id"].as_str().expect("spec id must be present");
+
+    // GET with Accept: application/yaml
+    let (status, bytes, headers) = client
+        .get_raw(
+            &format!("/api-specs/{spec_id}"),
+            Some("application/yaml"),
+            None,
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("yaml"),
+        "Content-Type must be YAML when Accept: application/yaml; got: {ct}"
+    );
+
+    // Body must parse as YAML.
+    let yaml_str = String::from_utf8(bytes).expect("response must be valid UTF-8");
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&yaml_str).expect("response must be valid YAML");
+    assert!(!parsed.is_null(), "parsed YAML must be non-null");
+}
+
+// ============================================================================
+// Test coverage gap — CP→DP distribution excludes api_specs
+// ============================================================================
+
+/// The hot-path isolation invariant: a GatewayConfig loaded from the DB must
+/// NOT contain api_specs data, and api_spec_id must be stripped from all
+/// resources.  This verifies the contract that CP→DP gRPC distribution
+/// (which serializes GatewayConfig) never leaks spec metadata to DPs.
+#[tokio::test]
+async fn loaded_gateway_config_excludes_api_specs_after_submission() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store.clone(), 25)).await;
+    let client = AdminClient::new(base);
+
+    // Submit a spec with proxy + upstream + plugin.
+    let proxy_id = uid("proxy");
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Distribution Test", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": &proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "x-ferrum-upstream": {
+            "id": uid("upstream"),
+            "targets": [{"host": "10.0.0.1", "port": 8080}]
+        },
+        "x-ferrum-plugins": [{
+            "id": uid("plugin"),
+            "plugin_name": "cors",
+            "config": {}
+        }]
+    });
+
+    let (status, _) = client.post_json("/api-specs", &spec).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+
+    // Load the full GatewayConfig as the runtime/gRPC path would.
+    let config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("load_full_config must succeed");
+
+    // The config must contain the proxy (it's a real resource).
+    assert!(
+        config.proxies.iter().any(|p| p.id == proxy_id),
+        "proxy must appear in loaded config"
+    );
+
+    // But api_spec_id must be stripped from every resource.
+    for p in &config.proxies {
+        assert!(
+            p.api_spec_id.is_none(),
+            "proxy {}: api_spec_id must be None in GatewayConfig; got {:?}",
+            p.id,
+            p.api_spec_id
+        );
+    }
+    for u in &config.upstreams {
+        assert!(
+            u.api_spec_id.is_none(),
+            "upstream {}: api_spec_id must be None in GatewayConfig; got {:?}",
+            u.id,
+            u.api_spec_id
+        );
+    }
+    for pc in &config.plugin_configs {
+        assert!(
+            pc.api_spec_id.is_none(),
+            "plugin_config {}: api_spec_id must be None in GatewayConfig; got {:?}",
+            pc.id,
+            pc.api_spec_id
+        );
+    }
+
+    // Serialize config to JSON and verify no "api_specs" key appears.
+    let config_json = serde_json::to_value(&config).expect("config serialization");
+    assert!(
+        config_json.get("api_specs").is_none(),
+        "GatewayConfig JSON must not contain an api_specs key — this would leak to DPs via gRPC"
+    );
+}
