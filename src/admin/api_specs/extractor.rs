@@ -211,28 +211,44 @@ pub fn extract(
     // Parse to serde_json::Value.  serde_yaml accepts JSON as a YAML subset, so
     // a single serde_yaml parse covers both formats.  For JSON we still prefer
     // serde_json so the error messages mention "JSON" rather than "YAML".
-    let root: serde_json::Value = match fmt {
-        SpecFormat::Json => {
-            serde_json::from_slice(body).map_err(|e| ExtractError::InvalidJson(e.to_string()))?
-        }
+    //
+    // Fallback: YAML flow-style documents start with `{` and look like JSON to
+    // autodetect_format, but they use unquoted keys which serde_json rejects.
+    // When JSON parsing fails on autodetected (not declared) input, retry as
+    // YAML before surfacing the error.
+    let (root, parsed_via_yaml): (serde_json::Value, bool) = match fmt {
+        SpecFormat::Json => match serde_json::from_slice(body) {
+            Ok(v) => (v, false),
+            Err(e) if declared_format.is_none() => {
+                // Autodetected as JSON but failed — try YAML (covers flow-style).
+                let yv: serde_yaml::Value = serde_yaml::from_slice(body)
+                    .map_err(|_| ExtractError::InvalidJson(e.to_string()))?;
+                let val = serde_json::to_value(yv)
+                    .map_err(|e2| ExtractError::InvalidYaml(e2.to_string()))?;
+                (val, true)
+            }
+            Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
+        },
         SpecFormat::Yaml => {
             let yv: serde_yaml::Value = serde_yaml::from_slice(body)
                 .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
             let val =
                 serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
-            // serde_yaml 0.9 does not cap alias/anchor expansion.  A small
-            // YAML doc using nested aliases can expand to billions of Value
-            // nodes despite the HTTP body-size limit.  Walk the tree with a
-            // budget to reject alias bombs before doing any real work.
-            let mut budget = MAX_YAML_EXPANDED_NODES;
-            if !count_value_nodes(&val, &mut budget) {
-                return Err(ExtractError::InvalidYaml(
-                    "YAML alias expansion exceeds node limit; reduce anchor nesting".to_string(),
-                ));
-            }
-            val
+            (val, true)
         }
     };
+    // serde_yaml 0.9 does not cap alias/anchor expansion.  A small YAML doc
+    // using nested aliases can expand to billions of Value nodes despite the
+    // HTTP body-size limit.  Walk the tree with a budget to reject bombs.
+    // Applied to both the explicit YAML path and the JSON→YAML fallback.
+    if parsed_via_yaml {
+        let mut budget = MAX_YAML_EXPANDED_NODES;
+        if !count_value_nodes(&root, &mut budget) {
+            return Err(ExtractError::InvalidYaml(
+                "YAML alias expansion exceeds node limit; reduce anchor nesting".to_string(),
+            ));
+        }
+    }
 
     // --- Version detection -----------------------------------------------
     let version = detect_version(&root)?;
@@ -520,7 +536,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 /// Extract Tier 1 metadata from the parsed spec root value.
 ///
 /// Handles both Swagger 2.0 and OpenAPI 3.x.
-pub fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMetadata {
+fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMetadata {
     let info = root.get("info");
 
     // description — truncated to 4096 bytes.

@@ -1821,11 +1821,15 @@ mod inner {
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
             // Pre-flight size check: BSON document limit is 16 MiB.
-            let approx_size = spec.spec_content.len() + 8192;
-            if approx_size > 15 * 1024 * 1024 {
+            // Measure the actual serialized BSON size rather than estimating
+            // with a hardcoded overhead constant.
+            let spec_doc = api_spec_to_doc(spec)?;
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc).unwrap_or_default();
+            if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
-                    "compressed spec exceeds MongoDB document limit (~15 MiB after overhead); \
-                     use a SQL backend for specs larger than ~14 MiB compressed"
+                    "MongoDB document limit exceeded: serialized spec is {} bytes \
+                     (limit ~15 MiB); use a SQL backend for large specs",
+                    bson_bytes.len()
                 );
             }
 
@@ -1947,12 +1951,14 @@ mod inner {
                 }
             }
 
-            // Pre-flight size check.
-            let approx_size = spec.spec_content.len() + 8192;
-            if approx_size > 15 * 1024 * 1024 {
+            // Pre-flight size check: measure actual BSON size.
+            let spec_doc_check = api_spec_to_doc(spec)?;
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc_check).unwrap_or_default();
+            if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
-                    "compressed spec exceeds MongoDB document limit (~15 MiB after overhead); \
-                     use a SQL backend for specs larger than ~14 MiB compressed"
+                    "MongoDB document limit exceeded: serialized spec is {} bytes \
+                     (limit ~15 MiB); use a SQL backend for large specs",
+                    bson_bytes.len()
                 );
             }
 
