@@ -1278,15 +1278,7 @@ mod inner {
         // Connection lifecycle
         // -------------------------------------------------------------------
 
-        async fn reconnect(
-            &self,
-            _db_url: &str,
-            _tls_enabled: bool,
-            _tls_ca_cert_path: Option<&str>,
-            _tls_client_cert_path: Option<&str>,
-            _tls_client_key_path: Option<&str>,
-            _tls_insecure: bool,
-        ) -> Result<(), anyhow::Error> {
+        async fn reconnect(&self, _db_url: &str) -> Result<(), anyhow::Error> {
             // MongoDB driver handles connection pooling and reconnection internally.
             // A full reconnect would require replacing the Client, which is complex
             // for an Arc-shared store. For now, verify the connection is alive.
@@ -1298,60 +1290,22 @@ mod inner {
             Ok(())
         }
 
-        async fn reconnect_read_replica(
-            &self,
-            _replica_url: &str,
-            _tls_enabled: bool,
-            _tls_ca_cert_path: Option<&str>,
-            _tls_client_cert_path: Option<&str>,
-            _tls_client_key_path: Option<&str>,
-            _tls_insecure: bool,
-        ) -> Result<(), anyhow::Error> {
+        async fn reconnect_read_replica(&self, _replica_url: &str) -> Result<(), anyhow::Error> {
             // MongoDB driver handles read preference routing internally via
             // the connection string (e.g., ?readPreference=secondaryPreferred).
             // No separate replica pool needed.
             Ok(())
         }
 
-        async fn try_failover_reconnect(
-            &self,
-            primary_url: &str,
-            tls_enabled: bool,
-            tls_ca_cert_path: Option<&str>,
-            tls_client_cert_path: Option<&str>,
-            tls_client_key_path: Option<&str>,
-            tls_insecure: bool,
-        ) -> Result<String, anyhow::Error> {
+        async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
             // Try primary first
-            if self
-                .reconnect(
-                    primary_url,
-                    tls_enabled,
-                    tls_ca_cert_path,
-                    tls_client_cert_path,
-                    tls_client_key_path,
-                    tls_insecure,
-                )
-                .await
-                .is_ok()
-            {
+            if self.reconnect(primary_url).await.is_ok() {
                 return Ok(primary_url.to_string());
             }
 
             // Try failover URLs
             for (i, url) in self.failover_urls.iter().enumerate() {
-                if self
-                    .reconnect(
-                        url,
-                        tls_enabled,
-                        tls_ca_cert_path,
-                        tls_client_cert_path,
-                        tls_client_key_path,
-                        tls_insecure,
-                    )
-                    .await
-                    .is_ok()
-                {
+                if self.reconnect(url).await.is_ok() {
                     info!(
                         "Reconnected to failover MongoDB #{} ({})",
                         i + 1,

@@ -41,8 +41,6 @@ Located in `tests/functional/functional_cp_dp_test.rs`, this file contains highe
    - Checks db_tls_client_cert_path
    - Checks db_tls_client_key_path
 
-4. **test_grpc_url_construction** - Tests URL construction for PostgreSQL and MySQL with TLS
-
 **Running (Ignored by Default):**
 ```bash
 # Run all functional tests
@@ -92,10 +90,13 @@ pub db_tls_client_cert_path: Option<String>,
 pub db_tls_client_key_path: Option<String>,
 ```
 
-#### DatabaseStore Changes
+#### Database URL Handling
 
-Added to `src/config/db_loader.rs`:
-- SQL URLs are built from the canonical `FERRUM_DB_TLS_MODE` and certificate path fields
+SQL URLs are built by `EnvConfig::effective_db_url()`,
+`effective_db_failover_urls()`, and `effective_db_read_replica_url()` from the
+canonical `FERRUM_DB_TLS_MODE` and certificate path fields. `DatabaseStore`
+consumes those already-effective URLs and only appends pool-level driver options
+such as `connect_timeout`.
 
 **For PostgreSQL:**
 - Uses the `sslmode` parameter (`require`, `verify-ca`, `verify-full`, etc.)

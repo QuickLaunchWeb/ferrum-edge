@@ -309,37 +309,13 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     /// Atomically replace the connection pool with a freshly connected one.
-    async fn reconnect(
-        &self,
-        db_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error>;
+    async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error>;
 
     /// Atomically replace the read replica pool with a freshly connected one.
-    async fn reconnect_read_replica(
-        &self,
-        replica_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error>;
+    async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error>;
 
     /// Try to reconnect to any available database URL (primary first, then failover).
-    async fn try_failover_reconnect(
-        &self,
-        primary_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<String, anyhow::Error>;
+    async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error>;
 
     /// Run schema migrations (SQL) or ensure indexes/collections exist (MongoDB).
     async fn run_migrations(&self) -> Result<(), anyhow::Error>;

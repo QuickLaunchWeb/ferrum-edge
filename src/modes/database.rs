@@ -91,11 +91,6 @@ pub async fn run(
                 db_type,
                 &effective_url,
                 &failover_urls,
-                false,
-                None,
-                None,
-                None,
-                false,
                 pool_config.clone(),
             )
             .await
@@ -121,15 +116,10 @@ pub async fn run(
                         // polling loop's `try_failover_reconnect()` probes them
                         // — a primary that stays down must not prevent
                         // recovery when a configured failover DB is healthy.
-                        DatabaseStore::connect_offline_with_tls_config(
+                        DatabaseStore::connect_offline_with_pool_config(
                             db_type,
                             &effective_url,
                             &failover_urls,
-                            false,
-                            None,
-                            None,
-                            None,
-                            false,
                             pool_config,
                         )?
                     } else {
@@ -143,10 +133,7 @@ pub async fn run(
 
             // Connect read replica for config polling (reduces primary load)
             if let Some(ref replica_url) = effective_replica_url {
-                match store
-                    .connect_read_replica(replica_url, false, None, None, None, false)
-                    .await
-                {
+                match store.connect_read_replica(replica_url).await {
                     Ok(()) => info!("Read replica connected for config polling"),
                     Err(e) => warn!(
                         "Read replica connection failed, polling will use primary: {}",
@@ -705,12 +692,6 @@ pub async fn run(
     let dns_cache_for_poll = dns_cache.clone();
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
-    let mongo_tls_enabled = db_type == "mongodb" && env_config.db_tls_enabled();
-    let db_tls_ca_cert = env_config.db_tls_ca_cert_path.clone();
-    let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
-    let db_tls_client_key = env_config.db_tls_client_key_path.clone();
-    let mongo_tls_allow_invalid =
-        db_type == "mongodb" && env_config.mongodb_db_tls_allows_invalid_certificates();
     let poll_namespace = env_config.namespace.clone();
 
     let db_poll_handle = tokio::spawn(async move {
@@ -754,14 +735,7 @@ pub async fn run(
                                 "Database DNS changed for '{}': {:?} -> {:?}, reconnecting pool",
                                 hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
                             );
-                            if let Err(e) = db_poll.reconnect(
-                                &db_url_for_reconnect,
-                                mongo_tls_enabled,
-                                db_tls_ca_cert.as_deref(),
-                                db_tls_client_cert.as_deref(),
-                                db_tls_client_key.as_deref(),
-                                mongo_tls_allow_invalid,
-                            ).await {
+                            if let Err(e) = db_poll.reconnect(&db_url_for_reconnect).await {
                                 error!(
                                     "Failed to reconnect database pool after DNS change for '{}': {}",
                                     hostname, e
@@ -791,14 +765,7 @@ pub async fn run(
                                 "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting replica pool",
                                 replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
                             );
-                            if let Err(e) = db_poll.reconnect_read_replica(
-                                replica_url,
-                                mongo_tls_enabled,
-                                db_tls_ca_cert.as_deref(),
-                                db_tls_client_cert.as_deref(),
-                                db_tls_client_key.as_deref(),
-                                mongo_tls_allow_invalid,
-                            ).await {
+                            if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
                                 error!(
                                     "Failed to reconnect read replica pool after DNS change for '{}': {}",
                                     replica_hostname, e
@@ -884,14 +851,7 @@ pub async fn run(
                                     Err(e2) => {
                                         // Both incremental and full reload failed —
                                         // try failover URLs before giving up.
-                                        match db_poll.try_failover_reconnect(
-                                            &db_url_for_reconnect,
-                                            mongo_tls_enabled,
-                                            db_tls_ca_cert.as_deref(),
-                                            db_tls_client_cert.as_deref(),
-                                            db_tls_client_key.as_deref(),
-                                            mongo_tls_allow_invalid,
-                                        ).await {
+                                        match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
                                                 // Reconnected to a failover DB — try full reload
                                                 match db_poll.load_full_config(&poll_namespace).await {
