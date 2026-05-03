@@ -151,7 +151,7 @@ impl ServiceDiscoveryManager {
             let _ = entry.value().cancel_tx.send(true);
         }
 
-        // Drain the map and wait/abort each task.
+        // Drain the map and collect entries for joining.
         let entries: Vec<(String, TaskEntry)> = self
             .tasks
             .iter()
@@ -161,11 +161,33 @@ impl ServiceDiscoveryManager {
             .filter_map(|id| self.tasks.remove(&id))
             .collect();
 
-        for (id, entry) in entries {
-            graceful_join_or_abort(entry, &id);
+        // Spawn a single task that awaits all joins with timeout, then logs.
+        if entries.is_empty() {
+            info!("Service discovery: all tasks stopped");
+            return;
         }
-
-        info!("Service discovery: all tasks stopped");
+        tokio::spawn(async move {
+            let timeout = std::time::Duration::from_secs(TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
+            for (id, entry) in entries {
+                let abort_handle = entry.handle.abort_handle();
+                match tokio::time::timeout(timeout, entry.handle).await {
+                    Ok(_) => {
+                        debug!(
+                            "Service discovery: task for upstream {} stopped gracefully",
+                            id
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Service discovery: task for upstream {} did not exit within {}s, aborting",
+                            id, TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                        );
+                        abort_handle.abort();
+                    }
+                }
+            }
+            info!("Service discovery: all tasks stopped");
+        });
     }
 
     fn start_upstream_task(
@@ -410,6 +432,26 @@ async fn run_discovery_loop(
         // Discover targets
         match discoverer.discover().await {
             Ok(discovered) => {
+                // A canceled task may have completed its discover() call after
+                // the cancel signal fired.  Check before publishing so we never
+                // overwrite the new config's LB state with stale data.
+                if *cancel_rx.borrow() {
+                    info!(
+                        "Service discovery: task for upstream {} canceled during discovery, discarding results",
+                        upstream_id,
+                    );
+                    return;
+                }
+                if let Some(ref rx) = shutdown_rx
+                    && *rx.borrow()
+                {
+                    info!(
+                        "Service discovery: shutting down task for upstream {} during discovery, discarding results",
+                        upstream_id,
+                    );
+                    return;
+                }
+
                 // Check if targets changed
                 if !targets_equal(&discovered, &last_discovered) {
                     info!(
