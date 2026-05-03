@@ -499,6 +499,9 @@ impl Http2ConnectionPool {
             // for the first `shard_count` picks per host on this gateway.
             let rr = match self.rr_counters.get(key_buf.as_str()) {
                 Some(existing) => existing.value().clone(),
+                // Cold-path allocation: `to_owned()` runs only on the first
+                // request to a given backend host — subsequent requests find
+                // the existing entry via the `get()` above.
                 None => self
                     .rr_counters
                     .entry(key_buf[..base_len].to_owned())
