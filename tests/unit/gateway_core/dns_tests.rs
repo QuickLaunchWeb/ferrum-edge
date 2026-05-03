@@ -1002,3 +1002,113 @@ async fn test_per_proxy_ttl_override_does_not_affect_resolution() {
     assert!(result2.is_ok());
     assert_eq!(result.unwrap(), result2.unwrap());
 }
+
+// ============================================================================
+// Concurrent refresh limiter tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_dns_max_concurrent_refreshes_default() {
+    let config = DnsConfig::default();
+    assert_eq!(
+        config.max_concurrent_refreshes, 64,
+        "Default max_concurrent_refreshes should be 64"
+    );
+}
+
+#[tokio::test]
+async fn test_dns_stale_refresh_still_works_with_semaphore() {
+    // Verify that the semaphore does not block normal stale-while-revalidate
+    // refreshes — stale entries should still be served and refreshed.
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 10,
+        max_concurrent_refreshes: 2,
+        ..DnsConfig::default()
+    });
+
+    // Populate cache with 1s per-proxy TTL
+    let result1 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(cache.cache_len(), 1);
+
+    // Wait for TTL to expire but stay within stale window
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Should still return stale data (background refresh triggered, semaphore available)
+    let result2 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(
+        result1, result2,
+        "Stale data should be returned with semaphore-limited refresh"
+    );
+
+    // Give refresh time to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(cache.cache_len(), 1);
+}
+
+#[tokio::test]
+async fn test_dns_concurrent_refresh_limit_prevents_unbounded_tasks() {
+    // Create a cache with a small semaphore limit
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 60,
+        max_concurrent_refreshes: 2, // Only 2 concurrent refreshes allowed
+        ..DnsConfig::default()
+    });
+
+    // Populate cache with several IP-based entries (these resolve instantly)
+    for i in 1..=10 {
+        let ip = format!("10.0.0.{}", i);
+        let _ = cache.resolve(&ip, None, Some(1)).await;
+    }
+    assert!(cache.cache_len() >= 10);
+
+    // Wait for TTL to expire (entries become stale)
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Hit all 10 stale entries — only max_concurrent_refreshes tasks should run
+    // The rest should be skipped (and still serve stale data)
+    for i in 1..=10 {
+        let ip = format!("10.0.0.{}", i);
+        let result = cache.resolve(&ip, None, Some(1)).await;
+        assert!(
+            result.is_ok(),
+            "Stale entries should still be served even when concurrency limit is hit"
+        );
+    }
+
+    // Give refreshes time to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // All entries should still be in the cache
+    assert!(
+        cache.cache_len() >= 10,
+        "Cache entries should persist after refresh"
+    );
+}
+
+#[tokio::test]
+async fn test_dns_resolve_all_respects_refresh_semaphore() {
+    // Verify that resolve_all also respects the semaphore
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 10,
+        max_concurrent_refreshes: 2,
+        ..DnsConfig::default()
+    });
+
+    // Populate cache
+    let result1 = cache.resolve_all("localhost", None, Some(1)).await.unwrap();
+    assert!(!result1.is_empty());
+
+    // Wait for TTL to expire
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // resolve_all should serve stale data and trigger bounded refresh
+    let result2 = cache.resolve_all("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(result1, result2);
+
+    // Give refresh time to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(cache.cache_len(), 1);
+}

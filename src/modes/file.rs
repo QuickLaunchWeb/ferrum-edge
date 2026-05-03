@@ -558,6 +558,7 @@ pub async fn serve(
         try_tcp_on_error: env_config.dns_try_tcp_on_error,
         num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
         max_active_requests: env_config.dns_max_active_requests,
+        max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     });
 
