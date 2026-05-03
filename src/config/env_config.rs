@@ -2075,15 +2075,15 @@ impl EnvConfig {
         }
 
         match (&self.db_tls_client_cert_path, &self.db_tls_client_key_path) {
-            (Some(_), None) => {
+            (Some(_), None) if db_type != "mongodb" => {
                 return Err(
-                    "FERRUM_DB_TLS_CLIENT_CERT_PATH is set but FERRUM_DB_TLS_CLIENT_KEY_PATH is missing: database mTLS requires both client cert and key"
+                    "FERRUM_DB_TLS_CLIENT_CERT_PATH is set but FERRUM_DB_TLS_CLIENT_KEY_PATH is missing: SQL database mTLS requires both client cert and key"
                         .into(),
                 );
             }
             (None, Some(_)) => {
                 return Err(
-                    "FERRUM_DB_TLS_CLIENT_KEY_PATH is set but FERRUM_DB_TLS_CLIENT_CERT_PATH is missing: database mTLS requires both client cert and key"
+                    "FERRUM_DB_TLS_CLIENT_KEY_PATH is set but FERRUM_DB_TLS_CLIENT_CERT_PATH is missing: database mTLS requires a client cert when a client key is set"
                         .into(),
                 );
             }

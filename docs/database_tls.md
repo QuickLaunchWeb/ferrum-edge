@@ -24,7 +24,7 @@ Ferrum Edge uses one database TLS env family for every database backend that has
 
 When `FERRUM_DB_TLS_MODE` is unset, Ferrum does not add or force database TLS settings. For production network databases, set `FERRUM_DB_TLS_MODE=verify-full` and provide the CA bundle needed to validate the database server certificate.
 
-Database mTLS requires both `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH`; setting only one is rejected at startup.
+For PostgreSQL and MySQL mTLS, `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` must be set together. For MongoDB, `FERRUM_DB_TLS_CLIENT_CERT_PATH` may point to an already-combined client cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted.
 
 For PostgreSQL and MySQL, Ferrum appends TLS query parameters to `FERRUM_DB_URL`, `FERRUM_DB_READ_REPLICA_URL`, and each URL in `FERRUM_DB_FAILOVER_URLS`. For MongoDB, Ferrum configures the MongoDB driver `TlsOptions`; MongoDB URI TLS options can also be used directly.
 
@@ -255,7 +255,7 @@ export FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.crt
 export FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client.key
 ```
 
-**Note:** MongoDB requires client cert + key in a single PEM file. When separate `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` are provided, the gateway automatically combines them into a temporary PEM file at startup.
+**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` files and the gateway will combine them into a temporary PEM file at startup.
 
 #### Encrypted Only (No Server Certificate Verification)
 

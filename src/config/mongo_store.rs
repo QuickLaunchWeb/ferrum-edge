@@ -63,8 +63,10 @@ mod inner {
         /// **TLS/mTLS configuration**: When `tls_enabled` is true, TLS is configured
         /// programmatically via `TlsOptions` using the canonical database TLS env vars:
         /// - `FERRUM_DB_TLS_CA_CERT_PATH` → `TlsOptions::ca_file_path`
-        /// - `FERRUM_DB_TLS_CLIENT_CERT_PATH` → Combined with key into a temp PEM
-        ///   for `TlsOptions::cert_key_file_path` (MongoDB requires a single file)
+        /// - `FERRUM_DB_TLS_CLIENT_CERT_PATH` → `TlsOptions::cert_key_file_path`
+        ///   when supplied alone as a combined PEM; combined with
+        ///   `FERRUM_DB_TLS_CLIENT_KEY_PATH` into a temp PEM when supplied as
+        ///   separate cert/key files (MongoDB requires a single file)
         /// - `FERRUM_DB_TLS_MODE=require` → `TlsOptions::allow_invalid_certificates`
         ///
         /// TLS can also be configured directly via connection string options

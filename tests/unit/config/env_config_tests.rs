@@ -2369,6 +2369,55 @@ fn test_env_config_db_tls_accepts_mongodb_verify_full() {
 }
 
 #[test]
+fn test_env_config_db_tls_accepts_mongodb_combined_client_pem() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb://localhost:27017/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "verify-full"),
+            (
+                "FERRUM_DB_TLS_CLIENT_CERT_PATH",
+                "/certs/client-combined.pem",
+            ),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_tls_client_cert_path.as_deref(),
+                Some("/certs/client-combined.pem")
+            );
+            assert!(config.db_tls_client_key_path.is_none());
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_tls_rejects_mongodb_client_key_without_cert() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
+            ("FERRUM_DB_TYPE", "mongodb"),
+            ("FERRUM_DB_URL", "mongodb://localhost:27017/ferrum"),
+            ("FERRUM_DB_TLS_MODE", "verify-full"),
+            ("FERRUM_DB_TLS_CLIENT_KEY_PATH", "/certs/client-key.pem"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(err.contains("FERRUM_DB_TLS_CLIENT_CERT_PATH is missing"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_tls_ca_requires_mode() {
     with_env_vars(
         &[

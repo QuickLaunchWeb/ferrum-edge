@@ -87,8 +87,8 @@ These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Slow query warning threshold (same as SQL) |
 | `FERRUM_DB_TLS_MODE` | MongoDB TLS policy: `disable`, `require`, or `verify-full` (see [TLS](#tls)) |
 | `FERRUM_DB_TLS_CA_CERT_PATH` | CA certificate for server verification |
-| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_KEY_PATH` |
-| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mTLS; must be paired with `FERRUM_DB_TLS_CLIENT_CERT_PATH` |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mTLS; may be an already-combined cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mTLS when cert and key are supplied as separate files |
 
 ### SQL-Only Settings (Ignored for MongoDB)
 
@@ -186,7 +186,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key      # mTLS
 
 `FERRUM_DB_TLS_MODE=require` enables encrypted MongoDB connections but allows invalid server certificates. `FERRUM_DB_TLS_MODE=verify-full` enables TLS and validates the server certificate chain, using `FERRUM_DB_TLS_CA_CERT_PATH` when provided.
 
-**Note:** MongoDB requires client cert + key in a single PEM file. When separate files are provided, the gateway automatically combines them into a PID-scoped temp file (`/tmp/ferrum-mongo-client-{pid}.pem`).
+**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate cert/key files and the gateway automatically combines them into a PID-scoped temp file (`/tmp/ferrum-mongo-client-{pid}.pem`).
 
 ### Approach 2: Connection String Options
 
