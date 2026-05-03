@@ -363,17 +363,22 @@ impl HealthChecker {
                 let counter = state.failure_counter.fetch_add(1, Ordering::Relaxed);
                 state.recent_failures.insert(counter, now_ms);
 
-                // Clean old failures outside the window
+                // Clean old failures outside the window and read len() immediately
+                // after retain() to minimise the race window between the two
+                // DashMap operations. Concurrent reporters may insert between
+                // retain and len, so the count can be off by ±1 — acceptable for
+                // health threshold decisions which self-correct on the next tick.
                 let window_start =
                     now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
                 state
                     .recent_failures
                     .retain(|_, &mut ts| ts >= window_start);
+                let failures_in_window = state.recent_failures.len();
 
-                // Hard cap: prevent unbounded memory growth
-                if state.recent_failures.len() > MAX_RECENT_FAILURES_PER_TARGET {
-                    let excess =
-                        state.recent_failures.len() - MAX_RECENT_FAILURES_PER_TARGET;
+                // Hard cap: prevent unbounded memory growth. Snapshot len once
+                // to avoid a second racy read between the guard and the eviction.
+                if failures_in_window > MAX_RECENT_FAILURES_PER_TARGET {
+                    let excess = failures_in_window - MAX_RECENT_FAILURES_PER_TARGET;
                     let mut to_remove: Vec<u64> = state
                         .recent_failures
                         .iter()
@@ -385,7 +390,7 @@ impl HealthChecker {
                     }
                 }
 
-                let failures_in_window = state.recent_failures.len() as u32;
+                let failures_in_window = failures_in_window as u32;
                 if failures_in_window >= config.unhealthy_threshold
                     && !proxy_state.unhealthy.contains_key(buf.as_str())
                 {
