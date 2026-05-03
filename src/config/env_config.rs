@@ -300,7 +300,8 @@ pub struct EnvConfig {
     /// TCP timeout, which can be 60–120s).
     pub db_pool_connect_timeout_seconds: u64,
     /// Maximum execution time (seconds) for any single SQL statement. Default:
-    /// 30. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
+    /// 30, max 3600 (1 hour). Values above 3600 are clamped at parse time with
+    /// a warning. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
     /// max_execution_time` (MySQL) on every new connection. 0 = disabled.
     /// Ignored for SQLite (not supported).
     pub db_pool_statement_timeout_seconds: u64,
@@ -1219,6 +1220,22 @@ impl EnvConfig {
             mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
             mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
         }
+
+        // Clamp statement timeout at parse time so the warning fires once at
+        // startup instead of on every new database connection.
+        const MAX_STATEMENT_TIMEOUT_SECONDS: u64 = 3600;
+        let db_pool_statement_timeout_seconds =
+            if db_pool_statement_timeout_seconds > MAX_STATEMENT_TIMEOUT_SECONDS {
+                tracing::warn!(
+                    configured = db_pool_statement_timeout_seconds,
+                    clamped = MAX_STATEMENT_TIMEOUT_SECONDS,
+                    max = MAX_STATEMENT_TIMEOUT_SECONDS,
+                    "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS exceeds maximum, clamped"
+                );
+                MAX_STATEMENT_TIMEOUT_SECONDS
+            } else {
+                db_pool_statement_timeout_seconds
+            };
 
         env_config! {
             conf = conf, mode = &mode;

@@ -2720,6 +2720,60 @@ fn test_env_config_db_pool_min_connections_zero_allowed() {
 }
 
 #[test]
+fn test_env_config_db_pool_statement_timeout_zero_disables() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_statement_timeout_seconds, 0,
+                "0 should disable statement timeout"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_statement_timeout_at_max() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "3600"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_statement_timeout_seconds, 3600,
+                "3600 should be accepted as-is (at the max boundary)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_statement_timeout_above_max_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "3601"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_statement_timeout_seconds, 3600,
+                "values above 3600 should be clamped to 3600"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_pool_invalid_values_error() {
     with_env_vars(
         &[
