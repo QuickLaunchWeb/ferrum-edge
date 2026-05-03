@@ -686,6 +686,20 @@ pub async fn run(
         .stream_listener_manager
         .wait_until_started(Duration::from_secs(10))
         .await?;
+
+    // Mark the gateway as ready to serve traffic. At this point:
+    //   - Initial full config was loaded from DB (or backup)
+    //   - All caches (router, plugin, consumer, LB, circuit breaker) are built
+    //   - DNS is warmed and connection pools are pre-established
+    //   - All listeners (proxy HTTP/HTTPS/H3, admin, stream) are bound
+    //
+    // This is intentionally set BEFORE the DB polling loop starts. The initial
+    // `load_full_config()` already proved DB connectivity and loaded a complete
+    // config — the polling loop handles ongoing incremental updates, not initial
+    // readiness. `/health` independently validates DB connectivity via a
+    // `SELECT 1` check (cached 15s), so DB failures surface in the health
+    // response regardless of polling state. `db_available` separately gates
+    // admin writes when the DB becomes unreachable during operation.
     startup_ready.store(true, Ordering::Relaxed);
     info!("Gateway startup complete; /health now reports ready");
 
