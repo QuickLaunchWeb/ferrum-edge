@@ -1125,7 +1125,7 @@ impl<S: FrameSource> Coalescing<S> {
 
     fn buffer_data(&mut self, data: &Bytes) {
         self.buffer.extend_from_slice(data);
-        if !self.flush_timer_armed {
+        if self.flush_after.is_some() && !self.flush_timer_armed {
             self.arm_flush_timer();
         }
     }
