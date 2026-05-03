@@ -421,7 +421,8 @@ pub async fn run(
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
             .stream_listener_manager
-            .set_frontend_tls_config(Some(tls_cfg.clone()));
+            .set_frontend_tls_config(Some(tls_cfg.clone()))
+            .await;
     }
 
     // Set DTLS cert/key for UDP proxies with frontend_tls (DTLS termination).
@@ -447,7 +448,8 @@ pub async fn run(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
-            );
+            )
+            .await;
     }
 
     // Start separate listeners for HTTP and HTTPS
