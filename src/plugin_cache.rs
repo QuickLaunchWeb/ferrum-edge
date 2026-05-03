@@ -419,6 +419,33 @@ fn collect_active_jwks_uris(
     uris
 }
 
+/// All plugin-cache state swapped as a single unit so readers never see a
+/// mix of old and new data.  A request that calls `get_plugins()` followed
+/// by `requires_response_body_buffering()` is guaranteed to read values
+/// from the same config generation.
+struct PluginCacheInner {
+    /// proxy_id -> pre-resolved plugin list (global + proxy-scoped, merged).
+    proxy_plugins: ProxyPluginMap,
+    /// Fallback: global plugins only (for proxies with no scoped overrides).
+    global_plugins: PluginList,
+    /// Pre-computed: does any plugin for this proxy require response body buffering?
+    requires_buffering: BufferingMap,
+    /// Whether global-only plugins require response body buffering (fallback).
+    global_requires_buffering: bool,
+    /// Pre-computed: does any plugin for this proxy ever require request body
+    /// buffering?
+    requires_request_buffering: RequestBufferingMap,
+    /// Whether global-only plugins require request body buffering (fallback).
+    global_requires_request_buffering: bool,
+    /// Pre-computed per-protocol plugin lists + phase data (auth plugin lists,
+    /// capability bitsets).
+    protocol_snapshot: ProtocolSnapshot,
+    /// Pre-computed: does any plugin for this proxy require per-frame WebSocket hooks?
+    requires_ws_frame: WsFrameMap,
+    /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
+    global_requires_ws_frame: bool,
+}
+
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
 ///
 /// Plugins are created once at config load time and cached per proxy_id.
@@ -426,35 +453,11 @@ fn collect_active_jwks_uris(
 /// DashMap state must persist across requests. Without caching, a new
 /// rate limiter is created per request and limits are never enforced.
 ///
-/// Rebuilt atomically via ArcSwap on config changes — reads are lock-free.
+/// All mutable state is bundled inside a single `ArcSwap<PluginCacheInner>`
+/// so every config reload swaps all fields atomically — readers see either
+/// the old generation or the new generation, never a mix.
 pub struct PluginCache {
-    /// proxy_id → pre-resolved plugin list (global + proxy-scoped, merged).
-    /// Wrapped in Arc<Vec<...>> so `get_plugins` returns a cheap Arc clone
-    /// instead of cloning the entire Vec on every request.
-    proxy_plugins: ArcSwap<ProxyPluginMap>,
-    /// Fallback: global plugins only (for proxies with no scoped overrides)
-    global_plugins: ArcSwap<PluginList>,
-    /// Pre-computed: does any plugin for this proxy require response body buffering?
-    /// Avoids per-request O(n) scan of plugins at request time.
-    requires_buffering: ArcSwap<BufferingMap>,
-    /// Whether global-only plugins require response body buffering (fallback).
-    global_requires_buffering: ArcSwap<bool>,
-    /// Pre-computed: does any plugin for this proxy ever require request body
-    /// buffering? When false, request bodies can be streamed directly to the
-    /// backend without further per-request checks.
-    requires_request_buffering: ArcSwap<RequestBufferingMap>,
-    /// Whether global-only plugins require request body buffering (fallback).
-    global_requires_request_buffering: ArcSwap<bool>,
-    /// Pre-computed per-protocol plugin lists + phase data (auth plugin lists,
-    /// capability bitsets), bundled in a single ArcSwap for atomic swap.
-    /// Ensures a request always reads a consistent (plugin list, phase data)
-    /// pair from the same config generation — no mixed-generation reads.
-    protocol_snapshot: ArcSwap<ProtocolSnapshot>,
-    /// Pre-computed: does any plugin for this proxy require per-frame WebSocket hooks?
-    /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
-    requires_ws_frame: ArcSwap<WsFrameMap>,
-    /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
-    global_requires_ws_frame: ArcSwap<bool>,
+    inner: ArcSwap<PluginCacheInner>,
     /// Shared HTTP client for plugins that make outbound network calls.
     http_client: PluginHttpClient,
 }
@@ -487,15 +490,17 @@ impl PluginCache {
         ) = Self::build_cache(config, &http_client)?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
         Ok(Self {
-            proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
-            global_plugins: ArcSwap::new(Arc::new(globals)),
-            requires_buffering: ArcSwap::new(Arc::new(buffering_map)),
-            global_requires_buffering: ArcSwap::new(Arc::new(global_needs_buffering)),
-            requires_request_buffering: ArcSwap::new(Arc::new(req_buffering_map)),
-            global_requires_request_buffering: ArcSwap::new(Arc::new(global_needs_req_buffering)),
-            protocol_snapshot: ArcSwap::new(Arc::new(snapshot)),
-            requires_ws_frame: ArcSwap::new(Arc::new(ws_frame_map)),
-            global_requires_ws_frame: ArcSwap::new(Arc::new(global_needs_ws_frame)),
+            inner: ArcSwap::new(Arc::new(PluginCacheInner {
+                proxy_plugins: proxy_map,
+                global_plugins: globals,
+                requires_buffering: buffering_map,
+                global_requires_buffering: global_needs_buffering,
+                requires_request_buffering: req_buffering_map,
+                global_requires_request_buffering: global_needs_req_buffering,
+                protocol_snapshot: snapshot,
+                requires_ws_frame: ws_frame_map,
+                global_requires_ws_frame: global_needs_ws_frame,
+            })),
             http_client,
         })
     }
@@ -523,19 +528,18 @@ impl PluginCache {
         let active_uris = collect_active_jwks_uris(&proxy_map, &globals);
         retain_active_uris(&active_uris);
 
-        self.proxy_plugins.store(Arc::new(proxy_map));
-        self.global_plugins.store(Arc::new(globals));
-        self.requires_buffering.store(Arc::new(buffering_map));
-        self.global_requires_buffering
-            .store(Arc::new(global_needs_buffering));
-        self.requires_request_buffering
-            .store(Arc::new(req_buffering_map));
-        self.global_requires_request_buffering
-            .store(Arc::new(global_needs_req_buffering));
-        self.protocol_snapshot.store(Arc::new(snapshot));
-        self.requires_ws_frame.store(Arc::new(ws_frame_map));
-        self.global_requires_ws_frame
-            .store(Arc::new(global_needs_ws_frame));
+        // Single atomic swap — readers see either the old or new generation.
+        self.inner.store(Arc::new(PluginCacheInner {
+            proxy_plugins: proxy_map,
+            global_plugins: globals,
+            requires_buffering: buffering_map,
+            global_requires_buffering: global_needs_buffering,
+            requires_request_buffering: req_buffering_map,
+            global_requires_request_buffering: global_needs_req_buffering,
+            protocol_snapshot: snapshot,
+            requires_ws_frame: ws_frame_map,
+            global_requires_ws_frame: global_needs_ws_frame,
+        }));
         Ok(())
     }
 
@@ -557,9 +561,9 @@ impl PluginCache {
     ) -> Result<(), String> {
         let mut security_errors: Vec<String> = Vec::new();
 
-        // Load the current state — we'll clone-and-patch it
-        let current_map = self.proxy_plugins.load();
-        let current_globals = self.global_plugins.load();
+        // Load the current snapshot — we clone-and-patch its fields, then
+        // swap the entire inner struct in one atomic store.
+        let current = self.inner.load();
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -582,7 +586,7 @@ impl PluginCache {
             global_plugins.sort_by_key(|p| p.priority());
             Arc::new(global_plugins)
         } else {
-            Arc::clone(current_globals.as_ref())
+            Arc::clone(&current.global_plugins)
         };
 
         // Build index of proxy-scoped plugin configs for efficient lookup
@@ -610,7 +614,7 @@ impl PluginCache {
         let mut group_plugin_instances: HashMap<&str, Arc<dyn Plugin>> = HashMap::new();
 
         // Clone the current map and patch it
-        let mut new_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> = current_map.as_ref().clone();
+        let mut new_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> = current.proxy_plugins.clone();
 
         // Remove deleted proxies
         for id in removed_proxy_ids {
@@ -694,10 +698,9 @@ impl PluginCache {
         }
 
         // Update buffering maps for changed proxies
-        let mut new_buffering: BufferingMap = self.requires_buffering.load().as_ref().clone();
-        let mut new_req_buffering: RequestBufferingMap =
-            self.requires_request_buffering.load().as_ref().clone();
-        let mut new_ws_frame: WsFrameMap = self.requires_ws_frame.load().as_ref().clone();
+        let mut new_buffering: BufferingMap = current.requires_buffering.clone();
+        let mut new_req_buffering: RequestBufferingMap = current.requires_request_buffering.clone();
+        let mut new_ws_frame: WsFrameMap = current.requires_ws_frame.clone();
         for id in removed_proxy_ids {
             new_buffering.remove(id);
             new_req_buffering.remove(id);
@@ -737,8 +740,7 @@ impl PluginCache {
 
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
-        let current_snapshot = self.protocol_snapshot.load();
-        let mut new_proxy_proto = current_snapshot.proxy.clone();
+        let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
         for id in removed_proxy_ids {
             new_proxy_proto.remove(id);
         }
@@ -760,35 +762,44 @@ impl PluginCache {
             }
             g
         } else {
-            current_snapshot.global.clone()
+            current.protocol_snapshot.global.clone()
         };
 
-        // Atomic swap — readers see old or new, never a partial state
-        self.proxy_plugins.store(Arc::new(new_map));
-        self.requires_buffering.store(Arc::new(new_buffering));
-        self.requires_request_buffering
-            .store(Arc::new(new_req_buffering));
-        self.requires_ws_frame.store(Arc::new(new_ws_frame));
-        self.protocol_snapshot.store(Arc::new(ProtocolSnapshot {
-            proxy: new_proxy_proto,
-            global: new_global_proto,
+        let new_global_requires_buffering = if rebuild_globals {
+            new_globals
+                .iter()
+                .any(|p| p.requires_response_body_buffering())
+        } else {
+            current.global_requires_buffering
+        };
+        let new_global_requires_request_buffering = if rebuild_globals {
+            new_globals
+                .iter()
+                .any(|p| p.requires_request_body_buffering())
+        } else {
+            current.global_requires_request_buffering
+        };
+        let new_global_requires_ws_frame = if rebuild_globals {
+            new_globals.iter().any(|p| p.requires_ws_frame_hooks())
+        } else {
+            current.global_requires_ws_frame
+        };
+
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.inner.store(Arc::new(PluginCacheInner {
+            proxy_plugins: new_map,
+            global_plugins: new_globals,
+            requires_buffering: new_buffering,
+            global_requires_buffering: new_global_requires_buffering,
+            requires_request_buffering: new_req_buffering,
+            global_requires_request_buffering: new_global_requires_request_buffering,
+            protocol_snapshot: ProtocolSnapshot {
+                proxy: new_proxy_proto,
+                global: new_global_proto,
+            },
+            requires_ws_frame: new_ws_frame,
+            global_requires_ws_frame: new_global_requires_ws_frame,
         }));
-        if rebuild_globals {
-            self.global_plugins.store(Arc::new(new_globals.clone()));
-            self.global_requires_buffering.store(Arc::new(
-                new_globals
-                    .iter()
-                    .any(|p| p.requires_response_body_buffering()),
-            ));
-            self.global_requires_request_buffering.store(Arc::new(
-                new_globals
-                    .iter()
-                    .any(|p| p.requires_request_body_buffering()),
-            ));
-            self.global_requires_ws_frame.store(Arc::new(
-                new_globals.iter().any(|p| p.requires_ws_frame_hooks()),
-            ));
-        }
 
         Ok(())
     }
@@ -799,13 +810,12 @@ impl PluginCache {
     /// Callers iterate by reference; no Vec clone needed.
     #[allow(dead_code)] // Used by tests for protocol-agnostic plugin inspection
     pub fn get_plugins(&self, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
-        let map = self.proxy_plugins.load();
-        if let Some(plugins) = map.get(proxy_id) {
+        let inner = self.inner.load();
+        if let Some(plugins) = inner.proxy_plugins.get(proxy_id) {
             Arc::clone(plugins)
         } else {
             // Fallback to global-only plugins
-            let globals = self.global_plugins.load();
-            Arc::clone(globals.as_ref())
+            Arc::clone(&inner.global_plugins)
         }
     }
 
@@ -818,15 +828,16 @@ impl PluginCache {
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        let snap = self.protocol_snapshot.load();
-        if let Some(entry) = snap
+        let inner = self.inner.load();
+        if let Some(entry) = inner
+            .protocol_snapshot
             .proxy
             .get(proxy_id)
-            .and_then(|inner| inner.get(&protocol))
+            .and_then(|m| m.get(&protocol))
         {
             return Arc::clone(&entry.plugins);
         }
-        if let Some(entry) = snap.global.get(&protocol) {
+        if let Some(entry) = inner.protocol_snapshot.global.get(&protocol) {
             Arc::clone(&entry.plugins)
         } else {
             Arc::new(Vec::new())
@@ -837,23 +848,24 @@ impl PluginCache {
     /// Returns only plugins where `is_auth_plugin() == true`, pre-filtered at
     /// config reload time — eliminates the per-request `filter().collect()` Vec allocation.
     ///
-    /// Reads from the same `protocol_snapshot` ArcSwap as `get_plugins_for_protocol`
-    /// and `get_capabilities`, ensuring all three always return data from the
-    /// same config generation.
+    /// All reads come from a single `inner.load()` snapshot, ensuring plugins,
+    /// auth lists, capabilities, and buffering flags are always from the same
+    /// config generation.
     pub fn get_auth_plugins(
         &self,
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        let snap = self.protocol_snapshot.load();
-        if let Some(entry) = snap
+        let inner = self.inner.load();
+        if let Some(entry) = inner
+            .protocol_snapshot
             .proxy
             .get(proxy_id)
-            .and_then(|inner| inner.get(&protocol))
+            .and_then(|m| m.get(&protocol))
         {
             return Arc::clone(&entry.phase.auth_plugins);
         }
-        if let Some(entry) = snap.global.get(&protocol) {
+        if let Some(entry) = inner.protocol_snapshot.global.get(&protocol) {
             Arc::clone(&entry.phase.auth_plugins)
         } else {
             Arc::new(Vec::new())
@@ -863,15 +875,16 @@ impl PluginCache {
     /// Get pre-computed capability bitset for a proxy+protocol. Lock-free O(1) lookup.
     /// Replaces per-request `plugins.iter().any(|p| p.some_flag())` scans.
     pub fn get_capabilities(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCapabilities {
-        let snap = self.protocol_snapshot.load();
-        if let Some(entry) = snap
+        let inner = self.inner.load();
+        if let Some(entry) = inner
+            .protocol_snapshot
             .proxy
             .get(proxy_id)
-            .and_then(|inner| inner.get(&protocol))
+            .and_then(|m| m.get(&protocol))
         {
             return entry.phase.capabilities;
         }
-        if let Some(entry) = snap.global.get(&protocol) {
+        if let Some(entry) = inner.protocol_snapshot.global.get(&protocol) {
             entry.phase.capabilities
         } else {
             PluginCapabilities::default()
@@ -881,12 +894,12 @@ impl PluginCache {
     /// Check whether any plugin for this proxy requires response body buffering.
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     pub fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
-        let map = self.requires_buffering.load();
-        if let Some(&needs) = map.get(proxy_id) {
+        let inner = self.inner.load();
+        if let Some(&needs) = inner.requires_buffering.get(proxy_id) {
             needs
         } else {
             // Fallback to global plugins' buffering requirement
-            **self.global_requires_buffering.load()
+            inner.global_requires_buffering
         }
     }
 
@@ -895,12 +908,12 @@ impl PluginCache {
     /// plugin scans entirely when body-aware plugins are absent.
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     pub fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
-        let map = self.requires_request_buffering.load();
-        if let Some(&needs) = map.get(proxy_id) {
+        let inner = self.inner.load();
+        if let Some(&needs) = inner.requires_request_buffering.get(proxy_id) {
             needs
         } else {
             // Fallback to global plugins' request buffering requirement
-            **self.global_requires_request_buffering.load()
+            inner.global_requires_request_buffering
         }
     }
 
@@ -908,11 +921,11 @@ impl PluginCache {
     /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     pub fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
-        let map = self.requires_ws_frame.load();
-        if let Some(&needs) = map.get(proxy_id) {
+        let inner = self.inner.load();
+        if let Some(&needs) = inner.requires_ws_frame.get(proxy_id) {
             needs
         } else {
-            **self.global_requires_ws_frame.load()
+            inner.global_requires_ws_frame
         }
     }
 
@@ -924,10 +937,10 @@ impl PluginCache {
     pub fn collect_warmup_hostnames(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
+        let inner = self.inner.load();
 
         // Collect from global plugins
-        let globals = self.global_plugins.load();
-        for plugin in globals.as_ref().iter() {
+        for plugin in inner.global_plugins.iter() {
             for host in plugin.warmup_hostnames() {
                 if seen.insert(host.clone()) {
                     result.push(host);
@@ -936,8 +949,7 @@ impl PluginCache {
         }
 
         // Collect from per-proxy plugins
-        let proxy_map = self.proxy_plugins.load();
-        for plugins in proxy_map.values() {
+        for plugins in inner.proxy_plugins.values() {
             for plugin in plugins.iter() {
                 for host in plugin.warmup_hostnames() {
                     if seen.insert(host.clone()) {
@@ -954,10 +966,10 @@ impl PluginCache {
     pub fn total_rate_limiter_keys(&self) -> usize {
         let mut total = 0usize;
         let mut seen = std::collections::HashSet::new();
+        let inner = self.inner.load();
 
         // Count from global plugins
-        let globals = self.global_plugins.load();
-        for plugin in globals.as_ref().iter() {
+        for plugin in inner.global_plugins.iter() {
             let ptr = Arc::as_ptr(plugin) as *const () as usize;
             if seen.insert(ptr)
                 && let Some(count) = plugin.tracked_keys_count()
@@ -967,8 +979,7 @@ impl PluginCache {
         }
 
         // Count from per-proxy plugins (deduplicate by pointer identity)
-        let proxy_map = self.proxy_plugins.load();
-        for plugins in proxy_map.values() {
+        for plugins in inner.proxy_plugins.values() {
             for plugin in plugins.iter() {
                 let ptr = Arc::as_ptr(plugin) as *const () as usize;
                 if seen.insert(ptr)
@@ -985,7 +996,7 @@ impl PluginCache {
     /// Number of proxy entries in the cache (for testing).
     #[allow(dead_code)]
     pub fn proxy_count(&self) -> usize {
-        self.proxy_plugins.load().len()
+        self.inner.load().proxy_plugins.len()
     }
 
     #[allow(clippy::type_complexity)]
