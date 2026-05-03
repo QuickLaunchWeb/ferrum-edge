@@ -81,6 +81,11 @@ impl ResourceTable {
     }
 }
 
+/// Upper bound (seconds) for `statement_timeout_seconds`. Values above this
+/// are clamped with a warning. 3600 s = 1 hour, which already far exceeds any
+/// reasonable single-statement budget for a gateway config store.
+const MAX_STATEMENT_TIMEOUT_SECONDS: u64 = 3600;
+
 /// Database connection pool tuning parameters.
 ///
 /// These are exposed via `FERRUM_DB_POOL_*` environment variables and applied
@@ -237,20 +242,31 @@ impl DatabaseStore {
                     }
                     // Set per-statement timeout on network databases to prevent
                     // runaway queries from holding connections indefinitely.
+                    //
+                    // Safety: `statement_timeout_seconds` is a `u64` parsed from
+                    // `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` and clamped to
+                    // `MAX_STATEMENT_TIMEOUT_SECONDS` below, so the `format!()`
+                    // interpolation always produces a plain integer literal.
+                    // `SET` commands do not support `$1`/`?` parameterized
+                    // placeholders in sqlx, hence the string interpolation.
                     if statement_timeout_seconds > 0 {
-                        if is_postgres {
-                            // PostgreSQL statement_timeout is in milliseconds
-                            let sql = format!(
-                                "SET statement_timeout = '{}'",
-                                statement_timeout_seconds * 1000
+                        let clamped = statement_timeout_seconds.min(MAX_STATEMENT_TIMEOUT_SECONDS);
+                        if clamped != statement_timeout_seconds {
+                            tracing::warn!(
+                                configured = statement_timeout_seconds,
+                                clamped = clamped,
+                                max = MAX_STATEMENT_TIMEOUT_SECONDS,
+                                "statement_timeout_seconds exceeds maximum, clamped"
                             );
+                        }
+                        let timeout_ms = clamped * 1000;
+                        if is_postgres {
+                            // PostgreSQL statement_timeout is in milliseconds.
+                            let sql = format!("SET statement_timeout = {timeout_ms}");
                             conn.execute(sql.as_str()).await?;
                         } else if is_mysql {
-                            // MySQL max_execution_time is in milliseconds
-                            let sql = format!(
-                                "SET SESSION max_execution_time = {}",
-                                statement_timeout_seconds * 1000
-                            );
+                            // MySQL max_execution_time is in milliseconds.
+                            let sql = format!("SET SESSION max_execution_time = {timeout_ms}");
                             conn.execute(sql.as_str()).await?;
                         }
                     }
