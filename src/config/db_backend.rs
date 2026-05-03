@@ -309,6 +309,9 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     /// Atomically replace the connection pool with a freshly connected one.
+    ///
+    /// The URL must be the effective URL produced by `EnvConfig`, including any
+    /// database TLS parameters derived from `FERRUM_DB_TLS_MODE`.
     async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error>;
 
     /// Atomically replace the read replica pool with a freshly connected one.

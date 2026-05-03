@@ -83,6 +83,17 @@ mod tests {
             vec!["tls".to_string(), "tlsallowinvalidcertificates".to_string()]
         );
     }
+
+    #[test]
+    fn existing_db_tls_url_params_ignores_unparseable_urls() {
+        assert!(
+            EnvConfig::existing_db_tls_url_params(
+                "mysql://user:pass@[::1/ferrum?ssl-mode=VERIFY_IDENTITY",
+                "mysql",
+            )
+            .is_empty()
+        );
+    }
 }
 
 /// Backend IP allowlist policy for SSRF protection.
@@ -1936,7 +1947,7 @@ impl EnvConfig {
                 db_type,
                 url = %redacted_url,
                 existing_tls_params = %existing_tls_params,
-                "FERRUM_DB_TLS_MODE is set but the database URL already contains TLS query parameters; env-derived TLS parameters will be appended and duplicate driver options can be ambiguous. Remove URL TLS parameters or unset FERRUM_DB_TLS_MODE"
+                "FERRUM_DB_TLS_MODE is set but the database URL already contains potentially TLS-related query parameters; env-derived TLS parameters will be appended and duplicate or overlapping driver options can be ambiguous. Remove URL TLS parameters or unset FERRUM_DB_TLS_MODE"
             ),
             "mongodb" => tracing::warn!(
                 db_type,
