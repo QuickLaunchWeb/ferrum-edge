@@ -1573,9 +1573,10 @@ mod tests {
 
     /// The bitset-path guard (`select_consistent_hash_bitset`) returns `None`
     /// when the healthy bitset is empty, even if the hash_ring is populated.
-    /// This covers the scenario where all targets are marked unhealthy.
+    /// This exercises the internal empty-bitset early-return, NOT the public
+    /// `select()` all-unhealthy fallback (which rebuilds an all-target bitset).
     #[test]
-    fn consistent_hash_all_unhealthy_bitset_returns_fallback() {
+    fn consistent_hash_empty_bitset_guard_returns_none() {
         let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
         let lb = LoadBalancer::new(
             "upstream-ch",
@@ -1655,6 +1656,96 @@ mod tests {
             let again = lb.select("user-123", None).unwrap();
             assert_eq!(first.target.host, again.target.host);
             assert_eq!(first.target.port, again.target.port);
+        }
+    }
+
+    /// Public `select()` with consistent hashing where all targets are marked
+    /// unhealthy via `HealthContext`. The method should rebuild an all-target
+    /// bitset and return `Some(... is_fallback: true)`.
+    #[test]
+    fn consistent_hash_all_unhealthy_select_returns_fallback() {
+        let targets = vec![
+            make_target("10.0.0.1", 8080),
+            make_target("10.0.0.2", 8080),
+            make_target("10.0.0.3", 8080),
+        ];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+
+        // Mark every target as active-unhealthy.
+        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        for t in &targets {
+            active_unhealthy.insert(target_key("upstream-ch", t), 1);
+        }
+        let health = HealthContext {
+            active_unhealthy: &active_unhealthy,
+            proxy_passive: None,
+        };
+
+        let result = lb.select("some-key", Some(&health));
+        let selection = result.expect("all-unhealthy should still return a fallback target");
+        assert!(
+            selection.is_fallback,
+            "selection must be flagged as fallback when all targets are unhealthy"
+        );
+
+        // Determinism: same key always picks the same fallback target.
+        for _ in 0..50 {
+            let again = lb
+                .select("some-key", Some(&health))
+                .expect("fallback must be stable");
+            assert_eq!(selection.target.host, again.target.host);
+            assert_eq!(selection.target.port, again.target.port);
+            assert!(again.is_fallback);
+        }
+    }
+
+    /// Public `select()` with >128 targets exercises the Vec-based fallback
+    /// path for consistent hashing when all targets are unhealthy.
+    #[test]
+    fn consistent_hash_all_unhealthy_vec_fallback_returns_fallback() {
+        let target_count = 130; // exceeds MAX_BITSET_TARGETS (128)
+        let targets: Vec<UpstreamTarget> = (0..target_count)
+            .map(|i| make_target(&format!("10.0.{}.{}", i / 256, i % 256), 8080))
+            .collect();
+        let lb = LoadBalancer::new(
+            "upstream-large",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        assert!(!lb.hash_ring.is_empty());
+
+        // Mark every target as active-unhealthy.
+        let active_unhealthy: DashMap<String, u64> = DashMap::new();
+        for t in &targets {
+            active_unhealthy.insert(target_key("upstream-large", t), 1);
+        }
+        let health = HealthContext {
+            active_unhealthy: &active_unhealthy,
+            proxy_passive: None,
+        };
+
+        let result = lb.select("vec-key", Some(&health));
+        let selection =
+            result.expect("Vec fallback should return a target even when all unhealthy");
+        assert!(
+            selection.is_fallback,
+            "Vec fallback selection must be flagged as fallback"
+        );
+
+        // Determinism across repeated calls.
+        for _ in 0..50 {
+            let again = lb
+                .select("vec-key", Some(&health))
+                .expect("Vec fallback must be stable");
+            assert_eq!(selection.target.host, again.target.host);
+            assert_eq!(selection.target.port, again.target.port);
+            assert!(again.is_fallback);
         }
     }
 }
