@@ -62,6 +62,7 @@ pub async fn run(
             )
             .await?;
             store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+            store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
             store.run_migrations().await?;
@@ -90,6 +91,7 @@ pub async fn run(
             )
             .await?;
             store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+            store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
 
