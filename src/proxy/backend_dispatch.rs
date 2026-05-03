@@ -218,27 +218,34 @@ pub(crate) fn select_upstream_target(
 
 /// Check whether the circuit breaker allows this request to proceed.
 ///
-/// Returns `Ok(cb_target_key)` when the request is allowed, or `Err(())` when
-/// the circuit is open and the request should be rejected with 503.
+/// Returns `Ok((cb_target_key, is_half_open_probe))` when the request is allowed,
+/// or `Err(())` when the circuit is open and the request should be rejected with 503.
+/// The `is_half_open_probe` flag MUST be threaded into every subsequent
+/// `record_success` / `record_failure` call so the half-open in-flight counter
+/// is only decremented for requests that actually hold a probe slot.
 pub(crate) fn check_circuit_breaker(
     proxy: &Proxy,
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
-) -> Result<Option<String>, ()> {
+) -> Result<(Option<String>, bool), ()> {
     let cb_target_key =
         upstream_target.map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
 
-    if let Some(cb_config) = &proxy.circuit_breaker
-        && state
-            .circuit_breaker_cache
-            .can_execute(&proxy.id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
-        return Err(());
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        match state.circuit_breaker_cache.can_execute(
+            &proxy.id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
+            Ok((_cb, is_half_open_probe)) => return Ok((cb_target_key, is_half_open_probe)),
+            Err(_) => {
+                warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
+                return Err(());
+            }
+        }
     }
 
-    Ok(cb_target_key)
+    Ok((cb_target_key, false))
 }
 
 /// Record the outcome of a backend request across all observability systems:
@@ -246,6 +253,7 @@ pub(crate) fn check_circuit_breaker(
 /// - Passive health checks
 /// - Least-latency load balancer (backend TTFB)
 /// - Least-connections load balancer (connection end)
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_backend_outcome(
     state: &ProxyState,
     proxy: &Proxy,
@@ -253,6 +261,7 @@ pub(crate) fn record_backend_outcome(
     final_cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
+    is_half_open_probe: bool,
     backend_elapsed: Duration,
 ) {
     // End connection tracking for least-connections
@@ -300,12 +309,12 @@ pub(crate) fn record_backend_outcome(
             // Connection errors are controlled by trip_on_connection_errors.
             // When disabled, connection errors are neutral — no state mutation.
             if cb.config().trip_on_connection_errors {
-                cb.record_failure(response_status, true);
+                cb.record_failure(response_status, true, is_half_open_probe);
             }
         } else if cb.config().failure_status_codes.contains(&response_status) {
-            cb.record_failure(response_status, false);
+            cb.record_failure(response_status, false, is_half_open_probe);
         } else {
-            cb.record_success();
+            cb.record_success(is_half_open_probe);
         }
     }
 

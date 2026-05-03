@@ -1723,23 +1723,32 @@ async fn handle_dtls_client_inner(
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
     // Circuit breaker check — reject before creating backend connection if open.
+    // When admitted, capture whether this is a half-open probe so downstream
+    // record_failure/record_success calls only decrement the in-flight counter
+    // for actual probe requests.
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    if let Some(ref cb_config) = proxy.circuit_breaker
-        && circuit_breaker_cache
-            .can_execute(proxy_id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(
-            proxy_id = %proxy_id,
-            client = %client_addr,
-            "DTLS session rejected: circuit breaker open"
-        );
-        return Err(
-            StreamSetupError::new(StreamSetupKind::CircuitBreakerOpen, "(DTLS session)").into(),
-        );
+    let mut cb_is_half_open_probe = false;
+    if let Some(ref cb_config) = proxy.circuit_breaker {
+        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+            Ok((_cb, is_half_open_probe)) => {
+                cb_is_half_open_probe = is_half_open_probe;
+            }
+            Err(_) => {
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    "DTLS session rejected: circuit breaker open"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::CircuitBreakerOpen,
+                    "(DTLS session)",
+                )
+                .into());
+            }
+        }
     }
 
     let resolved_ip = match dns_cache
@@ -1758,7 +1767,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -1792,7 +1801,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1804,7 +1813,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect to backend {}: {}",
@@ -1823,7 +1832,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 // dtls::DtlsConnection::connect returns anyhow::Error, which
                 // doesn't implement std::error::Error directly — render the
@@ -1858,7 +1867,7 @@ async fn handle_dtls_client_inner(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
             }
@@ -1870,7 +1879,7 @@ async fn handle_dtls_client_inner(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "Failed to connect to backend {}: {}",
@@ -1884,7 +1893,7 @@ async fn handle_dtls_client_inner(
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
         let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
-        cb.record_success();
+        cb.record_success(cb_is_half_open_probe);
     }
 
     debug!(
@@ -2188,23 +2197,32 @@ async fn create_session(
     let (backend_host, backend_port) = resolve_backend_target(&proxy, lb_cache)?;
 
     // Circuit breaker check — reject before creating backend socket if open.
+    // When admitted, capture whether this is a half-open probe so downstream
+    // record_failure/record_success calls only decrement the in-flight counter
+    // for actual probe requests.
     let cb_target_key = proxy
         .upstream_id
         .as_ref()
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
-    if let Some(ref cb_config) = proxy.circuit_breaker
-        && circuit_breaker_cache
-            .can_execute(proxy_id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(
-            proxy_id = %proxy_id,
-            client = %client_addr,
-            "UDP session rejected: circuit breaker open"
-        );
-        return Err(
-            StreamSetupError::new(StreamSetupKind::CircuitBreakerOpen, "(UDP session)").into(),
-        );
+    let mut cb_is_half_open_probe = false;
+    if let Some(ref cb_config) = proxy.circuit_breaker {
+        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+            Ok((_cb, is_half_open_probe)) => {
+                cb_is_half_open_probe = is_half_open_probe;
+            }
+            Err(_) => {
+                warn!(
+                    proxy_id = %proxy_id,
+                    client = %client_addr,
+                    "UDP session rejected: circuit breaker open"
+                );
+                return Err(StreamSetupError::new(
+                    StreamSetupKind::CircuitBreakerOpen,
+                    "(UDP session)",
+                )
+                .into());
+            }
+        }
     }
 
     // DNS resolve
@@ -2224,7 +2242,7 @@ async fn create_session(
                     cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
             return Err(anyhow::anyhow!(
                 "DNS resolution failed for {}: {}",
@@ -2256,7 +2274,7 @@ async fn create_session(
                             cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_is_half_open_probe);
                     }
                     return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
                 }
@@ -2268,7 +2286,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to connect UDP socket to {}: {}",
@@ -2288,7 +2306,7 @@ async fn create_session(
                             cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_is_half_open_probe);
                     }
                     // dtls::DtlsConnection::connect returns anyhow::Error,
                     // which doesn't implement std::error::Error directly —
@@ -2321,7 +2339,7 @@ async fn create_session(
                             cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_is_half_open_probe);
                     }
                     return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
                 }
@@ -2333,7 +2351,7 @@ async fn create_session(
                         cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
                 return Err(anyhow::anyhow!(
                     "Failed to connect UDP socket to {}: {}",
@@ -2347,7 +2365,7 @@ async fn create_session(
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
         let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
-        cb.record_success();
+        cb.record_success(cb_is_half_open_probe);
     }
 
     let now = coarse_epoch_millis();
