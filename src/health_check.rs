@@ -64,10 +64,8 @@ fn host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
-/// Maximum entries in the recent_failures DashMap per target.
-/// Prevents unbounded memory growth during cascading failure scenarios
-/// where failure rate vastly exceeds the window cleanup rate.
-const MAX_RECENT_FAILURES_PER_TARGET: usize = 1000;
+/// Re-export the cap from types so runtime and validation share one value.
+use crate::config::types::MAX_RECENT_FAILURES_PER_TARGET;
 
 /// Health state for a single target.
 struct TargetHealth {
@@ -363,17 +361,23 @@ impl HealthChecker {
                 let counter = state.failure_counter.fetch_add(1, Ordering::Relaxed);
                 state.recent_failures.insert(counter, now_ms);
 
-                // Clean old failures outside the window
+                // Clean old failures outside the window and read len() immediately
+                // after retain() to minimise the race window between the two
+                // DashMap operations. This is a best-effort snapshot: concurrent
+                // reporters, hard-cap evictions, or recovery clears can skew the
+                // count in either direction. Acceptable for health threshold
+                // decisions which self-correct on subsequent reports and recovery.
                 let window_start =
                     now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
                 state
                     .recent_failures
                     .retain(|_, &mut ts| ts >= window_start);
+                let failures_in_window = state.recent_failures.len();
 
-                // Hard cap: prevent unbounded memory growth
-                if state.recent_failures.len() > MAX_RECENT_FAILURES_PER_TARGET {
-                    let excess =
-                        state.recent_failures.len() - MAX_RECENT_FAILURES_PER_TARGET;
+                // Hard cap: prevent unbounded memory growth. Snapshot len once
+                // to avoid a second racy read between the guard and the eviction.
+                if failures_in_window > MAX_RECENT_FAILURES_PER_TARGET {
+                    let excess = failures_in_window - MAX_RECENT_FAILURES_PER_TARGET;
                     let mut to_remove: Vec<u64> = state
                         .recent_failures
                         .iter()
@@ -385,7 +389,7 @@ impl HealthChecker {
                     }
                 }
 
-                let failures_in_window = state.recent_failures.len() as u32;
+                let failures_in_window = failures_in_window as u32;
                 if failures_in_window >= config.unhealthy_threshold
                     && !proxy_state.unhealthy.contains_key(buf.as_str())
                 {
