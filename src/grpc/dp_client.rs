@@ -228,11 +228,24 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         // race the stream against a timer to periodically retry the primary.
         // The timer is only armed after startup readiness (initial snapshot applied)
         // to avoid disconnecting from the fallback before the DP has any config.
+        //
+        // Known limitation: should_race_primary is evaluated once per connection
+        // attempt, not continuously. If startup_ready flips from false to true
+        // while the fallback stream is running (first snapshot applied mid-stream),
+        // the primary-retry timer is NOT armed until the fallback stream ends
+        // (disconnect or error). This is acceptable: the fallback is actively
+        // serving valid config, and the primary will be retried on the next
+        // reconnect cycle when the outer loop re-evaluates.
+        //
+        // Acquire pairs with the Release store in connect_and_subscribe_with_startup_ready
+        // (and the admin /health endpoint reads with Acquire too). On x86 all loads are
+        // acquire-fenced by the hardware, but on ARM/AArch64 Relaxed could theoretically
+        // delay visibility of the store, so we use Acquire/Release consistently.
         let should_race_primary = is_fallback
             && primary_retry_secs > 0
             && startup_ready
                 .as_ref()
-                .is_none_or(|r| r.load(Ordering::Relaxed));
+                .is_none_or(|r| r.load(Ordering::Acquire));
         let result = if should_race_primary {
             tokio::select! {
                 res = connect_and_subscribe_with_startup_ready(
@@ -585,7 +598,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             // coalesced background refresh for them.
                             proxy_state.refresh_backend_capabilities().await;
                             if let Some(ref startup_ready) = startup_ready {
-                                startup_ready.store(true, Ordering::Relaxed);
+                                startup_ready.store(true, Ordering::Release);
                             }
                             initial_snapshot_applied = true;
                             info!(

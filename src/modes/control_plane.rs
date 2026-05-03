@@ -390,7 +390,7 @@ pub async fn run(
     // Mark CP as ready — same rationale as database mode: the initial
     // `load_full_config()` proved DB connectivity and loaded a complete config.
     // The polling loop handles ongoing incremental updates, not initial readiness.
-    startup_ready.store(true, Ordering::Relaxed);
+    startup_ready.store(true, Ordering::Release);
     info!("Control plane startup complete; /health now reports ready");
 
     // Database polling loop -> push incremental deltas to DPs (with shutdown).

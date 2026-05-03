@@ -1022,7 +1022,7 @@ pub async fn serve(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
-        startup_ready.store(true, Ordering::Relaxed);
+        startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");
         Ok(())
     }

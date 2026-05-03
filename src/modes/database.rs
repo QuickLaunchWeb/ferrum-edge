@@ -701,7 +701,7 @@ pub async fn run(
     // via a `SELECT 1` check (cached 15s), so DB failures surface in the
     // health response regardless of polling state. `db_available` separately
     // gates admin writes when the DB becomes unreachable during operation.
-    startup_ready.store(true, Ordering::Relaxed);
+    startup_ready.store(true, Ordering::Release);
     info!("Gateway startup complete; /health now reports ready");
 
     // Database polling loop (with shutdown) — uses incremental polling

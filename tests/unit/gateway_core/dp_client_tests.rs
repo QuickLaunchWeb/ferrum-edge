@@ -1,5 +1,8 @@
 //! Tests for DP gRPC client public API.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ferrum_edge::grpc::dp_client::{DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt};
 
 #[test]
@@ -56,3 +59,43 @@ fn generate_dp_jwt_wrong_secret_fails_validation() {
     let result = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation);
     assert!(result.is_err());
 }
+
+// --- startup_ready guard for should_race_primary ---
+
+/// Reproduces the exact `is_none_or` + `Acquire` guard used in the reconnect
+/// loop to decide whether the primary-retry timer is armed. The timer must
+/// NOT fire while the DP has never received a config snapshot (i.e.
+/// `startup_ready` is `Some(false)`).
+#[test]
+fn should_race_primary_blocked_until_startup_ready() {
+    // Simulates the three states the reconnect loop can see:
+
+    // 1. None — caller did not pass a startup_ready flag (single-URL path).
+    //    Timer should arm because readiness gating is opt-in.
+    let none_ready: Option<Arc<AtomicBool>> = None;
+    let result = none_ready
+        .as_ref()
+        .is_none_or(|r| r.load(Ordering::Acquire));
+    assert!(result, "None should allow the timer to arm");
+
+    // 2. Some(false) — DP has not yet applied its first snapshot.
+    //    Timer must NOT arm; disconnecting from fallback would leave the DP
+    //    with zero config.
+    let not_ready = Some(Arc::new(AtomicBool::new(false)));
+    let result = not_ready.as_ref().is_none_or(|r| r.load(Ordering::Acquire));
+    assert!(!result, "Some(false) must block the timer");
+
+    // 3. Some(true) — first snapshot applied (possibly on a previous connection).
+    //    Timer should arm; cached config keeps the DP operational.
+    let ready = Some(Arc::new(AtomicBool::new(true)));
+    let result = ready.as_ref().is_none_or(|r| r.load(Ordering::Acquire));
+    assert!(result, "Some(true) should allow the timer to arm");
+}
+
+// Note: memory ordering correctness (Acquire/Release on startup_ready) is a
+// code-review property, not a unit-testable property on most hardware.
+// x86 provides acquire semantics on all loads by default, and thread::spawn +
+// join provides a happens-before edge that masks ordering bugs. A cross-thread
+// test would pass even with Relaxed and therefore proves nothing. The correct
+// ordering is enforced by review: Release in connect_and_subscribe_with_startup_ready,
+// Acquire in the should_race_primary guard and the admin /health endpoint.
