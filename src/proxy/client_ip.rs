@@ -31,7 +31,7 @@
 //! used — which is the secure default for edge deployments.
 
 use std::net::IpAddr;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// A parsed set of trusted proxy CIDRs for efficient IP matching.
 #[derive(Debug, Clone)]
@@ -261,15 +261,13 @@ pub fn resolve_client_ip_parsed(
                 // This is a trusted proxy, keep walking left
             }
             Err(_) => {
-                // Unparseable entry — treat as the client IP (conservative).
-                // An attacker could have inserted garbage, but stopping here
-                // is safer than skipping to an earlier (more attacker-controlled)
-                // entry.
-                debug!(
-                    entry = entry,
-                    "Unparseable X-Forwarded-For entry; treating as client IP"
-                );
-                return entry.to_string();
+                // Unparseable entry — skip it. Returning a raw string where
+                // downstream code expects a valid IP would allow log injection,
+                // rate-limit key pollution, and ACL bypass. Skipping is safe
+                // because infrastructure we control (trusted proxies) appends
+                // valid IPs; garbage can only come from the attacker-controlled
+                // left side of the chain.
+                trace!(entry = entry, "Skipping unparseable X-Forwarded-For entry");
             }
         }
     }

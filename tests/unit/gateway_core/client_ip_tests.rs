@@ -132,12 +132,75 @@ fn all_xff_entries_trusted_falls_back_to_socket() {
 }
 
 #[test]
-fn unparseable_xff_entry_treated_as_client() {
+fn unparseable_xff_entry_is_skipped() {
     let tp = TrustedProxies::parse("10.0.0.0/8");
-    // Garbage in XFF — stop at the unparseable entry
+    // Garbage in left side of XFF — skipped, valid IP returned
     assert_eq!(
         resolve_client_ip("10.0.0.1", Some("unknown, 203.0.113.50"), &tp),
         "203.0.113.50"
+    );
+}
+
+#[test]
+fn unparseable_rightmost_xff_entry_skipped_to_valid_ip() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // Rightmost entry is garbage — skip it, find the valid IP behind it
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("203.0.113.50, not-an-ip"), &tp),
+        "203.0.113.50"
+    );
+}
+
+#[test]
+fn all_unparseable_xff_entries_fall_back_to_socket() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // All XFF entries are garbage — fall back to socket IP
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("garbage, not-an-ip, !!!"), &tp),
+        "10.0.0.1"
+    );
+}
+
+#[test]
+fn mixed_garbage_trusted_and_valid_xff() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // XFF: "203.0.113.50, <script>alert(1)</script>, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 is trusted (skip), script tag is
+    // unparseable (skip), 203.0.113.50 is valid untrusted (return).
+    assert_eq!(
+        resolve_client_ip(
+            "10.0.0.1",
+            Some("203.0.113.50, <script>alert(1)</script>, 10.0.0.2"),
+            &tp
+        ),
+        "203.0.113.50"
+    );
+}
+
+#[test]
+fn garbage_between_trusted_entries_skipped() {
+    let tp = TrustedProxies::parse("10.0.0.0/8, 172.16.0.0/12");
+    // XFF: "198.51.100.1, malicious\ninjection, 172.16.0.1, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 trusted, 172.16.0.1 trusted,
+    // malicious\ninjection skipped, 198.51.100.1 valid untrusted (return).
+    assert_eq!(
+        resolve_client_ip(
+            "10.0.0.1",
+            Some("198.51.100.1, malicious\ninjection, 172.16.0.1, 10.0.0.2"),
+            &tp
+        ),
+        "198.51.100.1"
+    );
+}
+
+#[test]
+fn only_garbage_and_trusted_entries_fall_back_to_socket() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    // XFF: "not-an-ip, also-garbage, 10.0.0.2"
+    // Walk right-to-left: 10.0.0.2 trusted, rest unparseable — socket fallback
+    assert_eq!(
+        resolve_client_ip("10.0.0.1", Some("not-an-ip, also-garbage, 10.0.0.2"), &tp),
+        "10.0.0.1"
     );
 }
 
