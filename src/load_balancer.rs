@@ -206,16 +206,18 @@ const LATENCY_WARMUP_THRESHOLD: u64 = 5;
 const LATENCY_UNSET: u64 = u64::MAX;
 
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
-/// targets during the mixed warm-up phase.  The bias must be large enough to
-/// reliably win the `<` comparison against the warmed minimum EWMA — real
-/// backend latencies live in the millisecond range (thousands of microseconds),
-/// so 1 μs was effectively invisible.  1 ms (1 000 μs) is small enough to not
-/// misroute traffic once the target warms up, but large enough to guarantee
-/// the unsampled target is selected first for probing.
+/// targets during the mixed warm-up phase.
 ///
-/// If the `min_known_ewma` is smaller than this bias the subtraction saturates
-/// to 0, which is safe — 0 < any positive EWMA, so the unsampled target still
-/// wins.
+/// **Behavioral note:** any nonzero bias value (including `1`) produces the
+/// same selection outcome because `saturating_sub(N)` for any `N >= 1` makes
+/// the unsampled target strictly less than the minimum warmed EWMA when
+/// `min_known_ewma > 0`, and saturates to `0` (a tie broken by iteration
+/// order) when `min_known_ewma == 0`.
+///
+/// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
+/// the intended preference gap in human-readable latency units and makes the
+/// warm-up strategy greppable and self-documenting, replacing a bare magic
+/// literal.
 const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
 
 /// Result of a target selection, indicating whether the selection was from
