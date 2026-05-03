@@ -579,6 +579,10 @@ pub async fn run(
         dp_registry: None,
         cp_connection_state: None,
     };
+    // Clone admin_state before the HTTP listener moves it, so we can reuse
+    // the same JwtManager instance for the HTTPS listener (instead of calling
+    // create_jwt_manager_from_env() a second time).
+    let admin_state_for_https = admin_state.clone();
     let admin_shutdown = shutdown_tx.subscribe();
 
     // Admin HTTP listener (disabled when port is 0)
@@ -603,24 +607,6 @@ pub async fn run(
     ) {
         let admin_https_addr: SocketAddr =
             env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_state_for_https = AdminState {
-            db: Some(db.clone()),
-            jwt_manager: create_jwt_manager_from_env()
-                .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
-            cached_config: Some(proxy_state.config.clone()),
-            proxy_state: Some(proxy_state.clone()),
-            mode: "database".into(),
-            read_only: env_config.admin_read_only,
-            startup_ready: Some(startup_ready.clone()),
-            db_available: Some(db_available.clone()),
-            admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
-            reserved_ports: reserved_ports.clone(),
-            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
-            admin_allowed_cidrs: admin_allowed_cidrs.clone(),
-            cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
-            dp_registry: None,
-            cp_connection_state: None,
-        };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
         // Load admin TLS configuration
