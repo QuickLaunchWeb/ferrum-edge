@@ -474,6 +474,26 @@ async fn run_discovery_loop(
                         dns_cache.warmup(hostnames).await;
                     }
 
+                    // Cancellation could have fired during the DNS warmup await.
+                    // Re-check before publishing so we never overwrite the new
+                    // config's LB state with stale data.
+                    if *cancel_rx.borrow() {
+                        debug!(
+                            "Service discovery: task for upstream {} canceled during DNS warmup, discarding results",
+                            upstream_id,
+                        );
+                        return;
+                    }
+                    if let Some(ref rx) = shutdown_rx
+                        && *rx.borrow()
+                    {
+                        debug!(
+                            "Service discovery: shutting down task for upstream {} during DNS warmup, discarding results",
+                            upstream_id,
+                        );
+                        return;
+                    }
+
                     // Update the load balancer cache atomically
                     lb_cache.update_targets(
                         upstream_id,
