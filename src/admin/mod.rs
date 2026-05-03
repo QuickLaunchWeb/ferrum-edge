@@ -488,10 +488,13 @@ pub async fn handle_admin_request(
             health_status["status"] = json!("degraded");
         }
 
+        // Acquire pairs with the Release store in each mode's startup path
+        // (dp_client, file, database, control_plane). On x86 this is free;
+        // on ARM it ensures cross-task visibility of the readiness flip.
         let startup_ready = state
             .startup_ready
             .as_ref()
-            .is_none_or(|flag| flag.load(Ordering::Relaxed));
+            .is_none_or(|flag| flag.load(Ordering::Acquire));
         health_status["ready"] = json!(startup_ready);
 
         // Report cached config availability for resilience visibility

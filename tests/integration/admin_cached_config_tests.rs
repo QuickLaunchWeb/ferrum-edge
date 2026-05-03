@@ -805,7 +805,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
     assert_eq!(body["status"], "starting");
     assert_eq!(body["ready"], false);
 
-    startup_ready.store(true, Ordering::Relaxed);
+    startup_ready.store(true, Ordering::Release);
 
     let resp = client
         .get(format!("{}/health", base_url))

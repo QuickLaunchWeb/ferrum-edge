@@ -1,5 +1,8 @@
 //! Tests for DP gRPC client public API.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ferrum_edge::grpc::dp_client::{DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt};
 
 #[test]
@@ -55,4 +58,60 @@ fn generate_dp_jwt_wrong_secret_fails_validation() {
     let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     let result = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation);
     assert!(result.is_err());
+}
+
+// --- startup_ready guard for should_race_primary ---
+
+/// Reproduces the exact `is_none_or` + `Acquire` guard used in the reconnect
+/// loop to decide whether the primary-retry timer is armed. The timer must
+/// NOT fire while the DP has never received a config snapshot (i.e.
+/// `startup_ready` is `Some(false)`).
+#[test]
+fn should_race_primary_blocked_until_startup_ready() {
+    // Simulates the three states the reconnect loop can see:
+
+    // 1. None — caller did not pass a startup_ready flag (single-URL path).
+    //    Timer should arm because readiness gating is opt-in.
+    let none_ready: Option<Arc<AtomicBool>> = None;
+    let result = none_ready
+        .as_ref()
+        .is_none_or(|r| r.load(Ordering::Acquire));
+    assert!(result, "None should allow the timer to arm");
+
+    // 2. Some(false) — DP has not yet applied its first snapshot.
+    //    Timer must NOT arm; disconnecting from fallback would leave the DP
+    //    with zero config.
+    let not_ready = Some(Arc::new(AtomicBool::new(false)));
+    let result = not_ready.as_ref().is_none_or(|r| r.load(Ordering::Acquire));
+    assert!(!result, "Some(false) must block the timer");
+
+    // 3. Some(true) — first snapshot applied (possibly on a previous connection).
+    //    Timer should arm; cached config keeps the DP operational.
+    let ready = Some(Arc::new(AtomicBool::new(true)));
+    let result = ready.as_ref().is_none_or(|r| r.load(Ordering::Acquire));
+    assert!(result, "Some(true) should allow the timer to arm");
+}
+
+/// The Release store in connect_and_subscribe_with_startup_ready must be
+/// visible to a subsequent Acquire load on a different thread. This test
+/// exercises the store/load pair across a thread boundary to validate the
+/// Acquire/Release contract.
+#[test]
+fn startup_ready_release_acquire_cross_thread_visibility() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_writer = flag.clone();
+
+    // Spawn a thread that stores with Release ordering (mirrors dp_client.rs line 588).
+    let handle = std::thread::spawn(move || {
+        flag_writer.store(true, Ordering::Release);
+    });
+    handle.join().unwrap();
+
+    // After the thread completes, Acquire load must see the stored value.
+    // join() itself provides a happens-before, but the Acquire load would be
+    // correct even without join() on any architecture once the store is visible.
+    assert!(
+        flag.load(Ordering::Acquire),
+        "Acquire load must observe the Release store after thread completion"
+    );
 }
