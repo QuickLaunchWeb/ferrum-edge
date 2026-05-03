@@ -28,8 +28,8 @@ async fn get_index_names(pool: &sqlx::AnyPool) -> Vec<String> {
         .collect()
 }
 
-/// The indexes that V003 creates (also present in V001 for fresh databases).
-const V003_INDEX_NAMES: &[&str] = &[
+/// Compound and junction-table indexes created by V001.
+const EXPECTED_INDEX_NAMES: &[&str] = &[
     "idx_proxy_plugins_plugin_config_id",
     "idx_proxies_ns_updated",
     "idx_consumers_ns_updated",
@@ -44,23 +44,21 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 + V3 should be applied on a fresh database
-    assert_eq!(applied.len(), 2);
+    // Only V1 should be applied on a fresh database
+    assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
-    assert_eq!(applied[1].version, 3);
-    assert_eq!(applied[1].name, "add_missing_indexes");
 
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
     assert!(applied_again.is_empty());
 
-    // Verify that the V003 indexes actually exist in the database
+    // Verify that V001 creates the expected indexes
     let index_names = get_index_names(&pool).await;
-    for expected in V003_INDEX_NAMES {
+    for expected in EXPECTED_INDEX_NAMES {
         assert!(
             index_names.iter().any(|n| n == expected),
-            "Expected index '{}' to exist after fresh migration, found: {:?}",
+            "Expected index '{}' to exist after V001 migration, found: {:?}",
             expected,
             index_names
         );
@@ -108,30 +106,17 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 is bootstrapped (not applied). V3 IS applied (adds missing indexes).
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].version, 3);
-    assert_eq!(applied[0].name, "add_missing_indexes");
+    // V1 is bootstrapped (not applied via run_pending), no other migrations exist.
+    assert!(
+        applied.is_empty(),
+        "No migrations should be newly applied; V1 is bootstrapped"
+    );
 
-    // Check that both V1 (bootstrapped) and V3 (applied) are recorded
+    // Check that V1 (bootstrapped) is recorded
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 2);
+    assert_eq!(status.applied.len(), 1);
     assert_eq!(status.applied[0].version, 1);
-    assert_eq!(status.applied[1].version, 3);
     assert!(status.pending.is_empty());
-
-    // Verify that the V003 indexes actually exist in the database.
-    // This is the critical path: pre-migration databases had the tables but
-    // NOT the indexes, so V003 must create them.
-    let index_names = get_index_names(&pool).await;
-    for expected in V003_INDEX_NAMES {
-        assert!(
-            index_names.iter().any(|n| n == expected),
-            "Expected index '{}' to exist after bootstrap + V003, found: {:?}",
-            expected,
-            index_names
-        );
-    }
 }
 
 #[tokio::test]
@@ -140,17 +125,17 @@ async fn test_migration_status() {
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
-    // Before running: all migrations should be pending
+    // Before running: V1 should be pending
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 2);
+    assert_eq!(status.pending.len(), 1);
 
     // Run migrations
     runner.run_pending().await.unwrap();
 
-    // After running: all migrations should be applied
+    // After running: V1 should be applied
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 2);
+    assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
 }
 
