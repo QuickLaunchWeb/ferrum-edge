@@ -154,7 +154,7 @@ impl MigrationRunner {
             CREATE TABLE IF NOT EXISTS _ferrum_migrations (
                 version INTEGER PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
-                applied_at VARCHAR(50) NOT NULL,
+                applied_at VARCHAR(64) NOT NULL,
                 checksum VARCHAR(255) NOT NULL,
                 execution_time_ms INTEGER NOT NULL
             )
@@ -380,7 +380,7 @@ impl MigrationRunner {
                 plugin_name VARCHAR(255) NOT NULL,
                 version INTEGER NOT NULL,
                 name VARCHAR(255) NOT NULL,
-                applied_at VARCHAR(50) NOT NULL,
+                applied_at VARCHAR(64) NOT NULL,
                 checksum VARCHAR(255) NOT NULL,
                 execution_time_ms INTEGER NOT NULL,
                 PRIMARY KEY (plugin_name, version)

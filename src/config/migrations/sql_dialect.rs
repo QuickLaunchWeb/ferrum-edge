@@ -4,8 +4,10 @@
 //! places:
 //! - strict mode forbids defaults on `TEXT`/`BLOB`, so MySQL uses bounded
 //!   `VARCHAR(N)` columns for primary keys and other fields that need defaults
-//! - timestamp columns stay as `VARCHAR(50)` because sqlx's `Any` driver does
-//!   not round-trip MySQL `DATETIME` values into the string-based config layer
+//! - timestamp columns use `VARCHAR(64)` (not native `DATETIME`) because sqlx's
+//!   `Any` driver does not round-trip MySQL `DATETIME` values into the
+//!   string-based config layer.  RFC 3339 nano-precision timestamps are at most
+//!   35 chars; `VARCHAR(64)` provides comfortable headroom
 //!
 //! The proxy schema also intentionally omits a unique index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
@@ -178,8 +180,8 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path VARCHAR(2048),
                 backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
             )
             "#
         } else {
@@ -215,8 +217,8 @@ impl V001SqlBuilder {
                 custom_id VARCHAR(255),
                 credentials TEXT NOT NULL,
                 acl_groups VARCHAR(8192) NOT NULL DEFAULT '[]',
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
             )
             "#
         } else {
@@ -285,8 +287,8 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
                 CONSTRAINT chk_proxies_backend_port CHECK (backend_port >= 0 AND backend_port <= 65535),
                 CONSTRAINT chk_proxies_listen_port CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
@@ -368,8 +370,8 @@ impl V001SqlBuilder {
                 proxy_id VARCHAR(255),
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
             )
             "#
