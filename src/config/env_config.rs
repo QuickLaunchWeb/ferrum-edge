@@ -460,6 +460,10 @@ pub struct EnvConfig {
     pub dns_num_concurrent_reqs: usize,
     /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub dns_max_active_requests: usize,
+    /// Maximum number of concurrent stale-while-revalidate background refresh
+    /// tasks system-wide. Prevents unbounded task spawning under DNS storms.
+    /// Default: 64.
+    pub dns_max_concurrent_refreshes: usize,
 
     /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
     /// Used by backend proxy connections, service discovery, and plugin HTTP calls.
@@ -1027,6 +1031,7 @@ impl Default for EnvConfig {
             dns_try_tcp_on_error: true,
             dns_num_concurrent_reqs: 3,
             dns_max_active_requests: 512,
+            dns_max_concurrent_refreshes: 64,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1294,6 +1299,7 @@ impl EnvConfig {
             dns_try_tcp_on_error: bool = "FERRUM_DNS_TRY_TCP_ON_ERROR" => true;
             dns_num_concurrent_reqs: usize = "FERRUM_DNS_NUM_CONCURRENT_REQS" => 3usize, clamp(1usize, 10usize);
             dns_max_active_requests: usize = "FERRUM_DNS_MAX_ACTIVE_REQUESTS" => 512usize, clamp(1usize, 4096usize);
+            dns_max_concurrent_refreshes: usize = "FERRUM_DNS_MAX_CONCURRENT_REFRESHES" => 64usize, clamp(1usize, 1000usize);
         }
 
         env_config! {
@@ -1622,6 +1628,7 @@ impl EnvConfig {
             dns_try_tcp_on_error,
             dns_num_concurrent_reqs,
             dns_max_active_requests,
+            dns_max_concurrent_refreshes,
             tls_ca_bundle_path,
             backend_tls_client_cert_path,
             backend_tls_client_key_path,

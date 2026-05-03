@@ -213,6 +213,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         try_tcp_on_error: true,
         num_concurrent_reqs: 3,
         max_active_requests: 512,
+        max_concurrent_refreshes: 64,
     });
     let config = GatewayConfig {
         version: "1".to_string(),

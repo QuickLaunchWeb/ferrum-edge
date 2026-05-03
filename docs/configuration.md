@@ -132,6 +132,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
 | `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | No | `10` | Interval (seconds) for retrying failed DNS lookups. `0` = disabled |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 

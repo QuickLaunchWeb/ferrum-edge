@@ -25,6 +25,7 @@ use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 /// Wait for a shutdown signal on a watch channel.
@@ -100,6 +101,10 @@ pub struct DnsConfig {
     pub num_concurrent_reqs: usize,
     /// Maximum in-flight queries per multiplexed connection. Default: 512.
     pub max_active_requests: usize,
+    /// Maximum number of concurrent stale-while-revalidate background refresh
+    /// tasks system-wide. Prevents unbounded task spawning when many distinct
+    /// hostnames go stale simultaneously. Default: 64.
+    pub max_concurrent_refreshes: usize,
     /// Backend IP allowlist policy for SSRF protection.
     pub backend_allow_ips: crate::config::BackendAllowIps,
 }
@@ -123,6 +128,7 @@ impl Default for DnsConfig {
             try_tcp_on_error: true,
             num_concurrent_reqs: 3,
             max_active_requests: 512,
+            max_concurrent_refreshes: 64,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
         }
     }
@@ -165,6 +171,10 @@ pub struct DnsCache {
     /// Tracks hostnames currently being refreshed in the background
     /// to prevent duplicate refresh tasks under concurrent load.
     refreshing: Arc<DashMap<String, ()>>,
+    /// Bounds the total number of concurrent stale-while-revalidate refresh
+    /// tasks system-wide. Without this, a storm of requests to many distinct
+    /// stale hostnames would spawn unbounded tokio tasks.
+    refresh_semaphore: Arc<Semaphore>,
     /// Threshold above which DNS resolutions are logged as slow. None = disabled.
     slow_threshold: Option<Duration>,
     /// Pre-computed label describing which nameservers are in use (for slow resolution logs).
@@ -202,6 +212,7 @@ impl DnsCache {
             error_ttl: Duration::from_secs(config.error_ttl_seconds),
             max_cache_size: config.max_cache_size,
             refreshing: Arc::new(DashMap::new()),
+            refresh_semaphore: Arc::new(Semaphore::new(config.max_concurrent_refreshes.max(1))),
             slow_threshold: config.slow_threshold_ms.map(Duration::from_millis),
             resolver_label,
             warmup_concurrency: config.warmup_concurrency.max(1),
@@ -268,18 +279,35 @@ impl DnsCache {
                 let host = hostname.to_string();
                 // Deduplicate: only spawn a refresh if one isn't already in progress
                 if self.refreshing.insert(host.clone(), ()).is_none() {
-                    let cache = self.clone();
-                    let ttl = per_proxy_ttl;
-                    tokio::spawn(async move {
-                        if let Err(e) = cache.refresh_entry(&host, ttl).await {
-                            warn!("DNS stale refresh failed for {}: {}", host, e);
+                    // Try to acquire a semaphore permit to bound concurrent refreshes.
+                    // If all permits are taken, skip the refresh — the entry stays
+                    // stale and the next request will retry the semaphore.
+                    match self.refresh_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let cache = self.clone();
+                            let ttl = per_proxy_ttl;
+                            tokio::spawn(async move {
+                                if let Err(e) = cache.refresh_entry(&host, ttl).await {
+                                    warn!("DNS stale refresh failed for {}: {}", host, e);
+                                }
+                                cache.refreshing.remove(&host);
+                                drop(permit);
+                            });
+                            debug!(
+                                "DNS serving stale entry for {} (background refresh triggered)",
+                                hostname
+                            );
                         }
-                        cache.refreshing.remove(&host);
-                    });
-                    debug!(
-                        "DNS serving stale entry for {} (background refresh triggered)",
-                        hostname
-                    );
+                        Err(_) => {
+                            // Concurrency limit reached — remove the dedup entry
+                            // so a future request can retry when a permit frees up.
+                            self.refreshing.remove(&host);
+                            debug!(
+                                "DNS serving stale entry for {} (refresh skipped, concurrency limit reached)",
+                                hostname
+                            );
+                        }
+                    }
                 } else {
                     debug!(
                         "DNS serving stale entry for {} (refresh already in progress)",
@@ -387,14 +415,22 @@ impl DnsCache {
             if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
                 let host = hostname.to_string();
                 if self.refreshing.insert(host.clone(), ()).is_none() {
-                    let cache = self.clone();
-                    let ttl = per_proxy_ttl;
-                    tokio::spawn(async move {
-                        if let Err(e) = cache.refresh_entry(&host, ttl).await {
-                            warn!("DNS stale refresh failed for {}: {}", host, e);
+                    match self.refresh_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let cache = self.clone();
+                            let ttl = per_proxy_ttl;
+                            tokio::spawn(async move {
+                                if let Err(e) = cache.refresh_entry(&host, ttl).await {
+                                    warn!("DNS stale refresh failed for {}: {}", host, e);
+                                }
+                                cache.refreshing.remove(&host);
+                                drop(permit);
+                            });
                         }
-                        cache.refreshing.remove(&host);
-                    });
+                        Err(_) => {
+                            self.refreshing.remove(&host);
+                        }
+                    }
                 }
                 return Ok(entry.addresses.clone());
             }
