@@ -106,7 +106,7 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 is bootstrapped (not applied via run_pending), no other migrations exist.
+    // V1 should NOT be applied (bootstrapped instead) — nothing else pending
     assert!(
         applied.is_empty(),
         "No migrations should be newly applied; V1 is bootstrapped"
@@ -137,6 +137,36 @@ async fn test_migration_status() {
     let status = runner.status().await.unwrap();
     assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
+}
+
+#[tokio::test]
+async fn test_v001_accepts_full_rfc3339_timestamps() {
+    let pool = test_pool().await;
+
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let applied = runner.run_pending().await.unwrap();
+
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].version, 1);
+
+    // Verify the schema accepts a full nanosecond-precision RFC 3339 timestamp
+    // (35 chars, the maximum chrono produces)
+    let long_ts = "2024-01-15T12:34:56.123456789+00:00";
+    sqlx::query(
+        "INSERT INTO proxies (id, name, listen_path, backend_host, backend_port, hosts, created_at, updated_at) VALUES ('ts-test', 'ts', '/ts', 'localhost', 8080, '[]', ?, ?)"
+    )
+    .bind(long_ts)
+    .bind(long_ts)
+    .execute(&pool)
+    .await
+    .expect("INSERT with 35-char RFC 3339 timestamp should succeed");
+
+    let row = sqlx::query("SELECT created_at FROM proxies WHERE id = 'ts-test'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let val: String = sqlx::Row::try_get(&row, "created_at").unwrap();
+    assert_eq!(val, long_ts);
 }
 
 #[tokio::test]
