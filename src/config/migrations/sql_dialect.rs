@@ -10,6 +10,25 @@
 //! The proxy schema also intentionally omits a unique index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
 //! namespace/name and namespace/listen_port constraints belong in V001.
+//!
+//! ## Foreign key constraints
+//!
+//! All four FK constraints are semantically identical across Postgres, MySQL,
+//! and SQLite. The surface syntax differs — MySQL uses explicit
+//! `CONSTRAINT <name> FOREIGN KEY (<col>) REFERENCES ...` while Postgres and
+//! SQLite use inline `<col> TYPE REFERENCES ...` — but the referenced tables,
+//! columns, ON DELETE actions, and nullability match exactly:
+//!
+//! | Table          | Column           | References             | ON DELETE |
+//! |----------------|------------------|------------------------|-----------|
+//! | proxies        | upstream_id      | upstreams(id)          | RESTRICT  |
+//! | plugin_configs | proxy_id         | proxies(id)            | CASCADE   |
+//! | proxy_plugins  | proxy_id         | proxies(id)            | CASCADE   |
+//! | proxy_plugins  | plugin_config_id | plugin_configs(id)     | CASCADE   |
+//!
+//! Named constraints on MySQL (e.g. `fk_proxies_upstream`) are cosmetic; they
+//! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
+//! The inline tests below regression-guard this cross-dialect consistency.
 
 use sqlx::AnyPool;
 
@@ -467,5 +486,80 @@ mod tests {
                 .iter()
                 .any(|sql| sql.contains("WHERE name IS NOT NULL"))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // FK constraint consistency regression tests
+    //
+    // These verify that all three dialects define the same FK references
+    // with the same ON DELETE actions, preventing accidental divergence
+    // when editing one dialect branch but not the others.
+    // ------------------------------------------------------------------
+
+    /// Helper: checks that `sql` contains a REFERENCES clause pointing at
+    /// `target_table(target_col)` with the given `on_delete` action.
+    ///
+    /// Works for both MySQL-style (`FOREIGN KEY (col) REFERENCES t(c)`)
+    /// and inline-style (`col TYPE REFERENCES t(c)`).
+    fn assert_fk_present(sql: &str, target_table: &str, target_col: &str, on_delete: &str) {
+        let needle = format!("REFERENCES {target_table}({target_col}) ON DELETE {on_delete}");
+        assert!(
+            sql.contains(&needle),
+            "expected FK clause '{}' not found in:\n{}",
+            needle,
+            sql
+        );
+    }
+
+    #[test]
+    fn test_fk_proxies_upstream_consistent_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_proxies_sql();
+            assert_fk_present(sql, "upstreams", "id", "RESTRICT");
+        }
+    }
+
+    #[test]
+    fn test_fk_plugin_configs_proxy_consistent_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_plugin_configs_sql();
+            assert_fk_present(sql, "proxies", "id", "CASCADE");
+        }
+    }
+
+    #[test]
+    fn test_fk_proxy_plugins_consistent_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_proxy_plugins_sql();
+            // Both FKs in the junction table must be CASCADE
+            assert_fk_present(sql, "proxies", "id", "CASCADE");
+            assert_fk_present(sql, "plugin_configs", "id", "CASCADE");
+        }
+    }
+
+    #[test]
+    fn test_fk_count_matches_across_dialects() {
+        // Every dialect must define exactly 4 FK references (counted by
+        // occurrences of "REFERENCES" in the combined CREATE TABLE SQL).
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let all_sql = [
+                builder.create_upstreams_sql(),
+                builder.create_consumers_sql(),
+                builder.create_proxies_sql(),
+                builder.create_plugin_configs_sql(),
+                builder.create_proxy_plugins_sql(),
+            ]
+            .join("\n");
+
+            let count = all_sql.matches("REFERENCES").count();
+            assert_eq!(
+                count, 4,
+                "{dialect} dialect has {count} FK REFERENCES clauses, expected 4"
+            );
+        }
     }
 }
