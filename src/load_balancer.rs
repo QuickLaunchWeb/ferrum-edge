@@ -1543,4 +1543,118 @@ mod tests {
         // All 100 hashes should be unique
         assert_eq!(seen.len(), 100);
     }
+
+    // ── Consistent hash empty-ring guards ──────────────────────────────
+
+    fn make_target(host: &str, port: u16) -> UpstreamTarget {
+        UpstreamTarget {
+            host: host.to_string(),
+            port,
+            weight: 1,
+            tags: HashMap::new(),
+            path: None,
+        }
+    }
+
+    /// A consistent-hash LoadBalancer with zero targets must have an empty
+    /// hash_ring, and `select()` must return `None` without panicking.
+    #[test]
+    fn consistent_hash_empty_targets_returns_none() {
+        let lb = LoadBalancer::new(
+            "upstream-empty",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &[],
+            None,
+        );
+        assert!(lb.hash_ring.is_empty());
+        let result = lb.select("any-key", None);
+        assert!(result.is_none());
+    }
+
+    /// The bitset-path guard (`select_consistent_hash_bitset`) returns `None`
+    /// when the healthy bitset is empty, even if the hash_ring is populated.
+    /// This covers the scenario where all targets are marked unhealthy.
+    #[test]
+    fn consistent_hash_all_unhealthy_bitset_returns_fallback() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        assert!(!lb.hash_ring.is_empty());
+
+        // With an empty HealthBitset the internal method returns None.
+        let empty = HealthBitset::empty();
+        let result = lb.select_consistent_hash_bitset("key", &empty);
+        assert!(result.is_none());
+    }
+
+    /// The Vec-fallback guard (`select_consistent_hash_vec`) returns `None`
+    /// when the candidate list is empty.
+    #[test]
+    fn consistent_hash_empty_candidates_vec_returns_none() {
+        let targets = vec![make_target("10.0.0.1", 8080), make_target("10.0.0.2", 8080)];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        let empty_candidates: Vec<(usize, &Arc<UpstreamTarget>)> = vec![];
+        let result = lb.select_consistent_hash_vec("key", &empty_candidates);
+        assert!(result.is_none());
+    }
+
+    /// Non-consistent-hash algorithms have an empty hash_ring by construction.
+    /// Calling `select()` must work without touching the ring.
+    #[test]
+    fn non_consistent_hash_has_empty_ring() {
+        for algo in [
+            LoadBalancerAlgorithm::RoundRobin,
+            LoadBalancerAlgorithm::Random,
+            LoadBalancerAlgorithm::WeightedRoundRobin,
+            LoadBalancerAlgorithm::LeastConnections,
+            LoadBalancerAlgorithm::LeastLatency,
+        ] {
+            let targets = vec![make_target("10.0.0.1", 8080)];
+            let lb = LoadBalancer::new("upstream-rr", algo, &targets, None);
+            assert!(
+                lb.hash_ring.is_empty(),
+                "{:?} should have empty hash_ring",
+                algo
+            );
+            // select() still works for non-consistent-hash algorithms
+            let result = lb.select("ignored", None);
+            assert!(result.is_some());
+        }
+    }
+
+    /// Consistent hash with targets produces a non-empty ring and selects
+    /// deterministically for the same key.
+    #[test]
+    fn consistent_hash_deterministic_selection() {
+        let targets = vec![
+            make_target("10.0.0.1", 8080),
+            make_target("10.0.0.2", 8080),
+            make_target("10.0.0.3", 8080),
+        ];
+        let lb = LoadBalancer::new(
+            "upstream-ch",
+            LoadBalancerAlgorithm::ConsistentHashing,
+            &targets,
+            None,
+        );
+        // 3 targets * 150 vnodes = 450 ring entries
+        assert_eq!(lb.hash_ring.len(), 450);
+
+        // Same key must always select the same target
+        let first = lb.select("user-123", None).unwrap();
+        for _ in 0..100 {
+            let again = lb.select("user-123", None).unwrap();
+            assert_eq!(first.target.host, again.target.host);
+            assert_eq!(first.target.port, again.target.port);
+        }
+    }
 }
