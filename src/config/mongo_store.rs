@@ -599,10 +599,10 @@ mod inner {
 
             // Safety margin: 1 second before `since` to avoid missing boundary writes.
             // The `updated_at` field is stored as an RFC 3339 string (chrono serde),
-            // which is lexicographically sortable, so $gt on strings works correctly.
+            // which is lexicographically sortable, so $gte on strings works correctly.
             let since_with_margin = since - chrono::Duration::seconds(1);
             let since_str = since_with_margin.to_rfc3339();
-            let filter = doc! { "namespace": namespace, "updated_at": { "$gt": &since_str } };
+            let filter = doc! { "namespace": namespace, "updated_at": { "$gte": &since_str } };
 
             // Load changed resources
             let mut added_or_modified_proxies = Vec::new();
