@@ -356,15 +356,15 @@ fn red_probability_at_edge_values() {
             triggered += 1;
         }
     }
-    // prob=1 out of 1000 = 0.1%, expect ~10 out of 10000
+    // prob=1 out of 1024 ~ 0.1%, expect ~10 out of 10000
     assert!(
         triggered < 100,
         "prob=1 should trigger rarely, got {}",
         triggered
     );
 
-    // prob = 999 (just below max): should almost always trigger
-    state.red_drop_probability.store(999, Ordering::Relaxed);
+    // prob = 1023 (just below max): should almost always trigger
+    state.red_drop_probability.store(1023, Ordering::Relaxed);
     let mut triggered = 0;
     for _ in 0..10_000 {
         if state.should_disable_keepalive_red() {
@@ -373,7 +373,7 @@ fn red_probability_at_edge_values() {
     }
     assert!(
         triggered > 9000,
-        "prob=999 should trigger almost always, got {}",
+        "prob=1023 should trigger almost always, got {}",
         triggered
     );
 }
@@ -393,11 +393,11 @@ fn red_zero_probability_never_triggers() {
 #[test]
 fn red_max_probability_always_triggers() {
     let state = Arc::new(OverloadState::new());
-    state.red_drop_probability.store(1000, Ordering::Relaxed);
+    state.red_drop_probability.store(1024, Ordering::Relaxed);
     for _ in 0..1000 {
         assert!(
             state.should_disable_keepalive_red(),
-            "prob=1000 should always trigger"
+            "prob=1024 should always trigger"
         );
     }
 }
@@ -514,7 +514,8 @@ fn port_exhaustion_counter_increments() {
 #[test]
 fn snapshot_includes_red_probability() {
     let state = OverloadState::new();
-    state.red_drop_probability.store(500, Ordering::Relaxed);
+    // 512 out of 1024 = 50%
+    state.red_drop_probability.store(512, Ordering::Relaxed);
     let snap = state.snapshot();
     assert!((snap.red_drop_probability_pct - 50.0).abs() < 0.1);
 }

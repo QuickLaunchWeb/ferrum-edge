@@ -53,7 +53,9 @@ pub struct OverloadState {
     pub drain_complete: tokio::sync::Notify,
 
     // ── RED adaptive load shedding ────────────────────────────────────
-    /// RED (Random Early Detection) drop probability (0-1000 scale, where 1000 = 100%).
+    /// RED (Random Early Detection) drop probability (0-1024 scale, where 1024 = 100%).
+    /// Matches the 10-bit hash range (`>> 54` produces [0, 1023]) so comparisons
+    /// are exact with no precision bias.
     /// When in the pressure zone (between pressure and critical thresholds), responses
     /// are probabilistically marked with Connection: close based on this value.
     /// The hot path reads this with a single AtomicU32::load(Relaxed).
@@ -127,14 +129,16 @@ impl OverloadState {
         if prob == 0 {
             return false;
         }
-        if prob >= 1000 {
+        if prob >= 1024 {
             return true;
         }
         // Monotonic counter ensures each call gets a unique input, producing
         // true per-response probabilistic shedding even when active_connections
         // is stable.
         let counter = self.red_request_counter.fetch_add(1, Ordering::Relaxed);
-        // Golden-ratio hash: multiply and take high bits for 0-1023 range
+        // Golden-ratio hash: multiply and take high bits for 0-1023 range.
+        // Both the hash output and probability scale use [0, 1024) so the
+        // comparison is exact — no precision bias.
         let hash = counter.wrapping_mul(0x9E3779B97F4A7C15) >> 54;
         (hash as u32) < prob
     }
@@ -160,7 +164,7 @@ impl OverloadState {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             active_requests: self.active_requests.load(Ordering::Relaxed),
             red_drop_probability_pct: self.red_drop_probability.load(Ordering::Relaxed) as f64
-                / 10.0,
+                / 10.24,
             port_exhaustion_events: self.port_exhaustion_events.load(Ordering::Relaxed),
             pressure: PressureSnapshot {
                 file_descriptors: FdPressure {
@@ -516,30 +520,30 @@ pub fn start_monitor(
             // and take the max. This gives a smooth ramp from 0% at the pressure
             // threshold to 100% at the critical threshold.
             let fd_red_prob = if fd_ratio >= config.fd_critical_threshold {
-                1000 // 100% drop
+                1024 // 100% drop
             } else if fd_ratio >= config.fd_pressure_threshold {
                 let range = config.fd_critical_threshold - config.fd_pressure_threshold;
                 let position = fd_ratio - config.fd_pressure_threshold;
-                ((position / range) * 1000.0) as u32
+                ((position / range) * 1024.0) as u32
             } else {
                 0
             };
             let conn_red_prob = if conn_ratio >= config.conn_critical_threshold {
-                1000 // 100% drop
+                1024 // 100% drop
             } else if conn_ratio >= config.conn_pressure_threshold {
                 let range = config.conn_critical_threshold - config.conn_pressure_threshold;
                 let position = conn_ratio - config.conn_pressure_threshold;
-                ((position / range) * 1000.0) as u32
+                ((position / range) * 1024.0) as u32
             } else {
                 0
             };
             let req_red_prob = if max_requests > 0 {
                 if req_ratio >= config.req_critical_threshold {
-                    1000
+                    1024
                 } else if req_ratio >= config.req_pressure_threshold {
                     let range = config.req_critical_threshold - config.req_pressure_threshold;
                     let position = req_ratio - config.req_pressure_threshold;
-                    ((position / range) * 1000.0) as u32
+                    ((position / range) * 1024.0) as u32
                 } else {
                     0
                 }
@@ -746,5 +750,48 @@ mod tests {
     fn fd_count_is_nonzero() {
         let count = count_open_fds();
         assert!(count > 0, "Process should have at least some open FDs");
+    }
+
+    /// Verify that the RED shedding rate matches the configured probability
+    /// within tight tolerance. The hash range [0, 1024) and probability scale
+    /// [0, 1024] are aligned, so there should be no systematic bias.
+    #[test]
+    fn red_shedding_precision_no_bias() {
+        let state = OverloadState::new();
+        let samples = 102_400;
+
+        // Test at 50% (prob = 512)
+        state.red_drop_probability.store(512, Ordering::Relaxed);
+        let mut triggered = 0u64;
+        for _ in 0..samples {
+            if state.should_disable_keepalive_red() {
+                triggered += 1;
+            }
+        }
+        let actual_rate = triggered as f64 / samples as f64;
+        let expected_rate = 512.0 / 1024.0;
+        assert!(
+            (actual_rate - expected_rate).abs() < 0.01,
+            "50% probability: expected {:.4}, got {:.4}",
+            expected_rate,
+            actual_rate
+        );
+
+        // Test at ~99.9% (prob = 1023 out of 1024)
+        state.red_drop_probability.store(1023, Ordering::Relaxed);
+        triggered = 0;
+        for _ in 0..samples {
+            if state.should_disable_keepalive_red() {
+                triggered += 1;
+            }
+        }
+        let actual_rate = triggered as f64 / samples as f64;
+        let expected_rate = 1023.0 / 1024.0;
+        assert!(
+            (actual_rate - expected_rate).abs() < 0.01,
+            "99.9% probability: expected {:.4}, got {:.4}",
+            expected_rate,
+            actual_rate
+        );
     }
 }
