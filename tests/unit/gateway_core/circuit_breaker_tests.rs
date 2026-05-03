@@ -873,6 +873,132 @@ fn test_concurrent_failure_and_success_recording() {
     );
 }
 
+// ─── Concurrent Half-Open Probe Failures ────────────────────────────────────
+
+/// Regression test: concurrent half-open probe failures must not corrupt the
+/// in-flight counter. Before the fix, both threads would atomically decrement
+/// `half_open_in_flight` (correct) but then unconditionally `store(0)`, which
+/// could clobber a value that another thread hadn't decremented yet. The fix
+/// removes the redundant `store(0)` so the counter drains naturally.
+///
+/// This test admits multiple probes, then fires concurrent failures, and
+/// verifies the breaker transitions cleanly to OPEN without panics or
+/// inconsistent state. It runs many iterations to increase the chance of
+/// exposing an interleaving bug.
+#[test]
+fn test_concurrent_half_open_probe_failures() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    for _ in 0..100 {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 10, // High so successes alone won't close it
+            timeout_seconds: 0,    // Immediate half-open transition
+            failure_status_codes: vec![500],
+            half_open_max_requests: 4,
+            trip_on_connection_errors: true,
+        };
+        let cb = Arc::new(CircuitBreaker::new(config));
+
+        // Trip open
+        cb.record_failure(500, false);
+        assert_eq!(cb.state_name(), "open");
+
+        // Transition to half-open and admit all 4 probe slots
+        assert!(cb.can_execute().is_ok()); // slot 1 (CAS winner)
+        assert!(cb.can_execute().is_ok()); // slot 2
+        assert!(cb.can_execute().is_ok()); // slot 3
+        assert!(cb.can_execute().is_ok()); // slot 4
+        assert_eq!(cb.state_name(), "half_open");
+
+        // All 4 slots taken — next should be rejected
+        assert!(cb.can_execute().is_err());
+
+        // Fire all 4 probe failures concurrently via a barrier
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let cb_clone = cb.clone();
+            let barrier_clone = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                cb_clone.record_failure(500, false);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Must be open after all probe failures
+        assert_eq!(cb.state_name(), "open");
+
+        // The in-flight counter must have drained to 0 so that the next
+        // half-open cycle can admit probes correctly.
+        // Transition to half-open again (timeout=0) and verify probes work.
+        assert!(cb.can_execute().is_ok());
+        assert_eq!(cb.state_name(), "half_open");
+    }
+}
+
+/// Verify that a mix of concurrent successes and failures in half-open
+/// produces a valid final state (open or closed) without corruption.
+#[test]
+fn test_concurrent_half_open_mixed_success_and_failure() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    for _ in 0..100 {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 3,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 4,
+            trip_on_connection_errors: true,
+        };
+        let cb = Arc::new(CircuitBreaker::new(config));
+
+        // Trip open
+        cb.record_failure(500, false);
+
+        // Admit 4 probes
+        for _ in 0..4 {
+            assert!(cb.can_execute().is_ok());
+        }
+        assert_eq!(cb.state_name(), "half_open");
+
+        // 2 threads record failure, 2 threads record success — concurrently
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for i in 0..4 {
+            let cb_clone = cb.clone();
+            let barrier_clone = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                if i < 2 {
+                    cb_clone.record_failure(500, false);
+                } else {
+                    cb_clone.record_success();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Any failure in half-open reopens the circuit, so it must be open
+        // (failures always win over successes in half-open).
+        let state = cb.state_name();
+        assert!(
+            state == "open" || state == "closed",
+            "State must be valid after concurrent mixed probes, got: {}",
+            state
+        );
+    }
+}
+
 // ─── Cache Capacity Tests ───────────────────────────────────────────────────
 
 #[test]

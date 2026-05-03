@@ -209,7 +209,14 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => {
-                // Decrement in-flight before reopening
+                // Decrement in-flight before reopening. The fetch_update handles
+                // the count correctly even with concurrent probe failures — each
+                // thread atomically decrements once. We intentionally do NOT
+                // follow up with an unconditional store(0): that would race with
+                // concurrent decrements from other probe threads, potentially
+                // clobbering a value that hasn't been decremented yet. The count
+                // reaches 0 naturally as all probes report in, and transitioning
+                // to OPEN prevents new probes from being admitted.
                 let _ = self.half_open_in_flight.fetch_update(
                     Ordering::SeqCst,
                     Ordering::SeqCst,
@@ -218,7 +225,6 @@ impl CircuitBreaker {
                 warn!("Circuit breaker reopening (probe failed)");
                 self.state.store(STATE_OPEN, Ordering::SeqCst);
                 self.success_count.store(0, Ordering::Relaxed);
-                self.half_open_in_flight.store(0, Ordering::Relaxed);
             }
             _ => {}
         }
