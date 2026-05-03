@@ -521,6 +521,10 @@ mod inner {
             self.slow_query_threshold_ms = threshold_ms;
         }
 
+        fn set_full_load_page_size(&mut self, _page_size: u64) {
+            // No-op: MongoDB uses cursor-based loading, not SQL pagination.
+        }
+
         fn set_cert_expiry_warning_days(&mut self, days: u64) {
             self.cert_expiry_warning_days = days;
         }

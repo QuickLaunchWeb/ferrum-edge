@@ -164,6 +164,9 @@ pub struct DatabaseStore {
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
     slow_query_threshold_ms: Option<u64>,
+    /// Maximum rows fetched per query during full config loading.
+    /// Configurable via `FERRUM_DB_FULL_LOAD_PAGE_SIZE`. Default: 10000.
+    full_load_page_size: i64,
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendAllowIps,
     /// Set to `true` when the store was created via
@@ -341,6 +344,7 @@ impl DatabaseStore {
             failover_urls: Vec::new(),
             pool_config,
             slow_query_threshold_ms: None,
+            full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -418,6 +422,7 @@ impl DatabaseStore {
             failover_urls: failover_urls.to_vec(),
             pool_config,
             slow_query_threshold_ms: None,
+            full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -660,7 +665,7 @@ impl DatabaseStore {
                 &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
             )
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -670,10 +675,10 @@ impl DatabaseStore {
                 let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
                 proxies.push(row_to_proxy(&row, id, plugins)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_proxies", start);
@@ -690,7 +695,7 @@ impl DatabaseStore {
                 &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
             )
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -698,10 +703,10 @@ impl DatabaseStore {
             for row in rows {
                 consumers.push(row_to_consumer(&row)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_consumers", start);
@@ -721,7 +726,7 @@ impl DatabaseStore {
                 "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?",
             ))
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -729,10 +734,10 @@ impl DatabaseStore {
             for row in rows {
                 configs.push(row_to_plugin_config(&row)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_plugin_configs", start);
@@ -1242,7 +1247,7 @@ impl DatabaseStore {
                 &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
             )
             .bind(namespace)
-            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(self.full_load_page_size)
             .bind(offset)
             .fetch_all(&self.rpool())
             .await?;
@@ -1250,10 +1255,10 @@ impl DatabaseStore {
             for row in rows {
                 upstreams.push(row_to_upstream(&row)?);
             }
-            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+            if (fetched as i64) < self.full_load_page_size {
                 break;
             }
-            offset += Self::FULL_LOAD_PAGE_SIZE;
+            offset += self.full_load_page_size;
         }
 
         self.check_slow_query("load_upstreams", start);
@@ -2431,11 +2436,10 @@ impl DatabaseStore {
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
 
-    /// Maximum rows fetched per query during full config loading.
-    /// Prevents unbounded `SELECT *` from hitting statement timeouts or causing
-    /// memory spikes at scale (100k+ rows). Raw `AnyRow` buffers are freed
-    /// between chunks, so peak memory is proportional to chunk size, not table size.
-    const FULL_LOAD_PAGE_SIZE: i64 = 5000;
+    /// Fallback page size used only when no runtime override has been set
+    /// via `set_full_load_page_size()`. Matches the default for
+    /// `FERRUM_DB_FULL_LOAD_PAGE_SIZE`.
+    const DEFAULT_FULL_LOAD_PAGE_SIZE: i64 = 10_000;
 
     /// Batch-create multiple proxies, chunked into transactions of
     /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
@@ -3267,6 +3271,10 @@ impl DatabaseBackend for DatabaseStore {
 
     fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
         self.slow_query_threshold_ms = threshold_ms;
+    }
+
+    fn set_full_load_page_size(&mut self, page_size: u64) {
+        self.full_load_page_size = page_size as i64;
     }
 
     fn set_cert_expiry_warning_days(&mut self, days: u64) {

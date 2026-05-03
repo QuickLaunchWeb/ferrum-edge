@@ -119,6 +119,10 @@ pub trait DatabaseBackend: Send + Sync {
     /// Set the slow query threshold (in milliseconds).
     fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>);
 
+    /// Set the maximum rows fetched per query during full config loading.
+    /// Only meaningful for SQL backends; MongoDB uses cursor-based loading.
+    fn set_full_load_page_size(&mut self, page_size: u64);
+
     /// Set the certificate expiry warning threshold (days before expiration).
     fn set_cert_expiry_warning_days(&mut self, days: u64);
 

@@ -3420,3 +3420,69 @@ fn test_tls_early_data_methods_empty_entries_filtered() {
         },
     );
 }
+
+#[test]
+fn test_db_full_load_page_size_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DB_FULL_LOAD_PAGE_SIZE");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_full_load_page_size, 10_000);
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "20000"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_full_load_page_size, 20_000);
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_clamped_to_minimum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "10"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_full_load_page_size, 100,
+                "values below 100 should be clamped to the minimum"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_db_full_load_page_size_clamped_to_maximum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "999999"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_full_load_page_size, 100_000,
+                "values above 100000 should be clamped to the maximum"
+            );
+        },
+    );
+}
