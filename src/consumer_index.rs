@@ -16,7 +16,8 @@ struct ConsumerIndexInner {
     /// mTLS identity index: maps `mtls_auth.identity` -> Consumer for O(1) cert-based auth.
     mtls_index: HashMap<String, Arc<Consumer>>,
     /// Full consumer list for plugins that need iteration (jwt_auth, jwks_auth).
-    all_consumers: Vec<Arc<Consumer>>,
+    /// Wrapped in `Arc` so `consumers()` can return a cheap clone without O(n) Vec cloning.
+    all_consumers: Arc<Vec<Arc<Consumer>>>,
     /// Pre-computed credential counts for auth types that share the identity index.
     jwt_credential_count: usize,
     hmac_credential_count: usize,
@@ -52,7 +53,7 @@ impl ConsumerIndex {
                 basic_index: maps.basic,
                 identity_index: maps.identity,
                 mtls_index: maps.mtls,
-                all_consumers: maps.all,
+                all_consumers: Arc::new(maps.all),
                 jwt_credential_count: maps.jwt_count,
                 hmac_credential_count: maps.hmac_count,
             })),
@@ -67,7 +68,7 @@ impl ConsumerIndex {
             basic_index: maps.basic,
             identity_index: maps.identity,
             mtls_index: maps.mtls,
-            all_consumers: maps.all,
+            all_consumers: Arc::new(maps.all),
             jwt_credential_count: maps.jwt_count,
             hmac_credential_count: maps.hmac_count,
         }));
@@ -98,10 +99,12 @@ impl ConsumerIndex {
     }
 
     /// Returns the full consumer list for custom plugins that need to iterate.
+    ///
+    /// Returns `Arc<Vec<…>>` — cheap pointer clone, no O(n) Vec copy.
     #[allow(dead_code)] // Public API used by custom plugins
-    pub fn consumers(&self) -> Vec<Arc<Consumer>> {
+    pub fn consumers(&self) -> Arc<Vec<Arc<Consumer>>> {
         let inner = self.inner.load();
-        inner.all_consumers.clone()
+        Arc::clone(&inner.all_consumers)
     }
 
     /// Incrementally update the consumer index by applying only the changes.
@@ -120,7 +123,7 @@ impl ConsumerIndex {
         let mut basic = current.basic_index.clone();
         let mut identity = current.identity_index.clone();
         let mut mtls = current.mtls_index.clone();
-        let mut all: Vec<Arc<Consumer>> = current.all_consumers.clone();
+        let mut all: Vec<Arc<Consumer>> = current.all_consumers.as_ref().clone();
 
         // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
         let ids_to_remove: std::collections::HashSet<&str> = removed_ids
@@ -253,7 +256,7 @@ impl ConsumerIndex {
             basic_index: basic,
             identity_index: identity,
             mtls_index: mtls,
-            all_consumers: all,
+            all_consumers: Arc::new(all),
             jwt_credential_count: jwt_count,
             hmac_credential_count: hmac_count,
         }));

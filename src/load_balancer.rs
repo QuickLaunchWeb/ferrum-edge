@@ -228,6 +228,26 @@ pub struct LoadBalancerCacheInner {
     upstreams: HashMap<String, Arc<Upstream>>,
 }
 
+impl LoadBalancerCacheInner {
+    /// Access the balancers map for custom code that needs direct HashMap access.
+    ///
+    /// Prefer the typed accessors [`LoadBalancerCache::get_hash_on_strategy_from`]
+    /// and [`LoadBalancerCache::select_target_from`] when possible — they cover
+    /// the standard hot-path use cases without exposing internal structure.
+    #[allow(dead_code)] // Public API used by custom plugins
+    #[inline]
+    pub fn balancers(&self) -> &HashMap<String, Arc<LoadBalancer>> {
+        &self.balancers
+    }
+
+    /// Access the upstream index for custom code that needs direct lookup.
+    #[allow(dead_code)] // Public API used by custom plugins
+    #[inline]
+    pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
+        &self.upstreams
+    }
+}
+
 /// Load balancer cache, rebuilt atomically on config change.
 ///
 /// Individual `LoadBalancer` instances are wrapped in `Arc` so that
