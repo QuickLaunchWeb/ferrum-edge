@@ -92,26 +92,10 @@ fn should_race_primary_blocked_until_startup_ready() {
     assert!(result, "Some(true) should allow the timer to arm");
 }
 
-/// The Release store in connect_and_subscribe_with_startup_ready must be
-/// visible to a subsequent Acquire load on a different thread. This test
-/// exercises the store/load pair across a thread boundary to validate the
-/// Acquire/Release contract.
-#[test]
-fn startup_ready_release_acquire_cross_thread_visibility() {
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_writer = flag.clone();
-
-    // Spawn a thread that stores with Release ordering (mirrors dp_client.rs line 588).
-    let handle = std::thread::spawn(move || {
-        flag_writer.store(true, Ordering::Release);
-    });
-    handle.join().unwrap();
-
-    // After the thread completes, Acquire load must see the stored value.
-    // join() itself provides a happens-before, but the Acquire load would be
-    // correct even without join() on any architecture once the store is visible.
-    assert!(
-        flag.load(Ordering::Acquire),
-        "Acquire load must observe the Release store after thread completion"
-    );
-}
+// Note: memory ordering correctness (Acquire/Release on startup_ready) is a
+// code-review property, not a unit-testable property on most hardware.
+// x86 provides acquire semantics on all loads by default, and thread::spawn +
+// join provides a happens-before edge that masks ordering bugs. A cross-thread
+// test would pass even with Relaxed and therefore proves nothing. The correct
+// ordering is enforced by review: Release in connect_and_subscribe_with_startup_ready,
+// Acquire in the should_race_primary guard and the admin /health endpoint.

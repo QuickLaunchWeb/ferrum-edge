@@ -229,6 +229,14 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         // The timer is only armed after startup readiness (initial snapshot applied)
         // to avoid disconnecting from the fallback before the DP has any config.
         //
+        // Known limitation: should_race_primary is evaluated once per connection
+        // attempt, not continuously. If startup_ready flips from false to true
+        // while the fallback stream is running (first snapshot applied mid-stream),
+        // the primary-retry timer is NOT armed until the fallback stream ends
+        // (disconnect or error). This is acceptable: the fallback is actively
+        // serving valid config, and the primary will be retried on the next
+        // reconnect cycle when the outer loop re-evaluates.
+        //
         // Acquire pairs with the Release store in connect_and_subscribe_with_startup_ready
         // (and the admin /health endpoint reads with Acquire too). On x86 all loads are
         // acquire-fenced by the hardware, but on ARM/AArch64 Relaxed could theoretically
