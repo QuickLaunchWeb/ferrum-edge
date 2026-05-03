@@ -221,6 +221,14 @@ pub mod _test_support {
         crate::config::db_loader::parse_auth_mode(s)
     }
 
+    pub fn statement_timeout_sql(
+        timeout_seconds: u64,
+        is_postgres: bool,
+        is_mysql: bool,
+    ) -> Option<String> {
+        crate::config::db_loader::statement_timeout_sql(timeout_seconds, is_postgres, is_mysql)
+    }
+
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
     pub const GRPC_FRAME_DATA: u8 = crate::plugins::grpc_web::GRPC_FRAME_DATA;
     pub const GRPC_FRAME_TRAILER: u8 = crate::plugins::grpc_web::GRPC_FRAME_TRAILER;
