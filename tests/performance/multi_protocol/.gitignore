@@ -2,3 +2,6 @@
 certs/
 target/
 *.log
+envoy_runtime.yaml
+kong_runtime.yaml
+krakend_runtime.json
