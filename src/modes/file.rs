@@ -674,7 +674,8 @@ pub async fn serve(
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
             .stream_listener_manager
-            .set_frontend_tls_config(Some(tls_cfg.clone()));
+            .set_frontend_tls_config(Some(tls_cfg.clone()))
+            .await;
     }
 
     if let (Some(cert_path), Some(key_path)) =
@@ -698,7 +699,8 @@ pub async fn serve(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
-            );
+            )
+            .await;
     }
 
     // Listen for SIGHUP — only meaningful for run(); skipped here.
