@@ -1187,27 +1187,29 @@ async fn handle_h3_request(
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
 
-    let cb_target_key = match crate::proxy::backend_dispatch::check_circuit_breaker(
-        &proxy,
-        &state,
-        upstream_target.as_deref(),
-    ) {
-        Ok(key) => key,
-        Err(()) => {
-            record_request(&state, 503);
-            let mut rej_headers = HashMap::new();
-            apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers).await;
-            send_h3_reject_flavor_aware(
-                &mut stream,
-                http_flavor,
-                StatusCode::SERVICE_UNAVAILABLE,
-                br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
-                &rej_headers,
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let (cb_target_key, cb_is_half_open_probe) =
+        match crate::proxy::backend_dispatch::check_circuit_breaker(
+            &proxy,
+            &state,
+            upstream_target.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(()) => {
+                record_request(&state, 503);
+                let mut rej_headers = HashMap::new();
+                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, 503, &mut rej_headers)
+                    .await;
+                send_h3_reject_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    &rej_headers,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
     // Build backend URL — target-aware when upstream is configured.
     // Host-only proxies (listen_path None) have no prefix to strip; use 0.
@@ -1321,6 +1323,7 @@ async fn handle_h3_request(
                 lb_hash_key: lb_hash_key.as_deref(),
                 upstream_target: upstream_target.as_deref(),
                 cb_target_key: cb_target_key.as_deref(),
+                cb_is_half_open_probe,
                 flavor: http_flavor,
                 prebuffered_body: prebuffered,
                 client_ip: &client_ip_owned,
@@ -1479,6 +1482,7 @@ async fn handle_h3_request(
                     cb_target_key.as_deref(),
                     502,
                     true,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
 
@@ -1550,6 +1554,7 @@ async fn handle_h3_request(
                 cb_target_key.as_deref(),
                 502,
                 false,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             record_request(&state, 502);
@@ -1740,6 +1745,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -1991,6 +1997,7 @@ async fn handle_h3_request(
             cb_target_key.as_deref(),
             response_status,
             connection_error,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -2111,7 +2118,11 @@ async fn handle_h3_request(
                         current_cb_target_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(result.status, !result.request_on_wire);
+                    cb.record_failure(
+                        result.status,
+                        !result.request_on_wire,
+                        cb_is_half_open_probe,
+                    );
                 }
 
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -2217,6 +2228,7 @@ async fn handle_h3_request(
             final_cb_target_key.as_deref(),
             response_status,
             !h3_request_on_wire,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 

@@ -3025,6 +3025,7 @@ async fn handle_websocket_request_authenticated(
     start_time: Instant,
     is_h2_websocket: bool,
     is_tls: bool,
+    cb_is_half_open_probe: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -3194,7 +3195,7 @@ async fn handle_websocket_request_authenticated(
                             cb_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire);
+                        cb.record_failure(502, ws_is_pre_wire, cb_is_half_open_probe);
                     }
 
                     let delay = retry::retry_delay(retry_config, ws_attempt);
@@ -6015,9 +6016,9 @@ async fn handle_proxy_request_inner(
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let cb_target_key =
+    let (cb_target_key, cb_is_half_open_probe) =
         match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
-            Ok(key) => key,
+            Ok(result) => result,
             Err(()) => {
                 let reject = finalize_reject_response_with_after_proxy_hooks(
                     &plugins,
@@ -6098,6 +6099,7 @@ async fn handle_proxy_request_inner(
             start_time,
             is_h2_ws,
             is_tls,
+            cb_is_half_open_probe,
         )
         .await;
     }
@@ -6369,7 +6371,7 @@ async fn handle_proxy_request_inner(
                         grpc_current_cb_key.as_deref(),
                         cb_config,
                     );
-                    cb.record_failure(502, true);
+                    cb.record_failure(502, true, cb_is_half_open_probe);
                 }
 
                 let delay = retry::retry_delay(retry_config, grpc_attempt);
@@ -7127,7 +7129,11 @@ async fn handle_proxy_request_inner(
                     current_cb_target_key.as_deref(),
                     cb_config,
                 );
-                cb.record_failure(result.status_code, result.connection_error);
+                cb.record_failure(
+                    result.status_code,
+                    result.connection_error,
+                    cb_is_half_open_probe,
+                );
             }
 
             let delay = retry::retry_delay(retry_config, attempt);
@@ -7282,6 +7288,7 @@ async fn handle_proxy_request_inner(
         final_cb_target_key.as_deref(),
         response_status,
         backend_resp.connection_error,
+        cb_is_half_open_probe,
         backend_start.elapsed(),
     );
 

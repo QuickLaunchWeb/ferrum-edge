@@ -874,6 +874,7 @@ struct TcpConnParams {
 struct TcpConnCbInfo {
     cb_config: Option<crate::config::types::CircuitBreakerConfig>,
     cb_target_key: Option<String>,
+    is_half_open_probe: bool,
 }
 
 /// Backend target info resolved during connection setup, available for logging
@@ -1058,6 +1059,7 @@ async fn handle_tcp_connection_inner(
         let cb_info = TcpConnCbInfo {
             cb_config: proxy.circuit_breaker.clone(),
             cb_target_key,
+            is_half_open_probe: false,
         };
 
         let params = TcpConnParams {
@@ -1157,7 +1159,7 @@ async fn handle_tcp_connection_inner(
                             cb_info.cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, true);
+                        cb.record_failure(502, true, cb_info.is_half_open_probe);
                     }
                 })?;
 
@@ -1221,9 +1223,9 @@ async fn handle_tcp_connection_inner(
                 cb_config,
             );
             if copy_result.first_failure.is_some() {
-                cb.record_failure(502, true);
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
             } else {
-                cb.record_success();
+                cb.record_success(cb_info.is_half_open_probe);
             }
         }
 
@@ -1282,7 +1284,7 @@ async fn handle_tcp_connection_inner(
                              cb_info: &TcpConnCbInfo| {
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_failure(502, true);
+            cb.record_failure(502, true, cb_info.is_half_open_probe);
         }
     };
 
@@ -1303,46 +1305,55 @@ async fn handle_tcp_connection_inner(
     let mut attempt = 0u32;
     let backend_addr = loop {
         // Circuit breaker check — reject before attempting backend connection if open.
-        if let Some(ref cb_config) = current_cb_info.cb_config
-            && circuit_breaker_cache
-                .can_execute(
-                    proxy_id,
-                    current_cb_info.cb_target_key.as_deref(),
-                    cb_config,
-                )
-                .is_err()
-        {
-            if can_retry && attempt < max_retries {
-                // Circuit open on this target — try another
-                if let Some(next) = try_next_target(&params, &current_host, current_port, lb_cache)
-                {
-                    warn!(
-                        proxy_id = %proxy_id,
-                        attempt,
-                        "TCP circuit breaker open for {}:{}, trying {}:{}",
-                        current_host, current_port, next.0, next.1
-                    );
-                    current_host = next.0;
-                    current_port = next.1;
-                    current_cb_info = TcpConnCbInfo {
-                        cb_config: current_cb_info.cb_config.clone(),
-                        cb_target_key: params.upstream_id.as_ref().map(|_| {
-                            crate::circuit_breaker::target_key(&current_host, current_port)
-                        }),
-                    };
-                    // Update backend info to reflect the retry target.
-                    backend_info.backend_target = format!("{}:{}", current_host, current_port);
-                    backend_info.backend_resolved_ip = None;
-                    attempt += 1;
-                    continue;
+        // When admitted, capture whether this is a half-open probe so downstream
+        // record_failure/record_success calls only decrement the in-flight counter
+        // for actual probe requests.
+        if let Some(ref cb_config) = current_cb_info.cb_config {
+            match circuit_breaker_cache.can_execute(
+                proxy_id,
+                current_cb_info.cb_target_key.as_deref(),
+                cb_config,
+            ) {
+                Ok((_cb, is_half_open_probe)) => {
+                    current_cb_info.is_half_open_probe = is_half_open_probe;
+                }
+                Err(_) => {
+                    if can_retry && attempt < max_retries {
+                        // Circuit open on this target — try another
+                        if let Some(next) =
+                            try_next_target(&params, &current_host, current_port, lb_cache)
+                        {
+                            warn!(
+                                proxy_id = %proxy_id,
+                                attempt,
+                                "TCP circuit breaker open for {}:{}, trying {}:{}",
+                                current_host, current_port, next.0, next.1
+                            );
+                            current_host = next.0;
+                            current_port = next.1;
+                            current_cb_info = TcpConnCbInfo {
+                                cb_config: current_cb_info.cb_config.clone(),
+                                cb_target_key: params.upstream_id.as_ref().map(|_| {
+                                    crate::circuit_breaker::target_key(&current_host, current_port)
+                                }),
+                                is_half_open_probe: false,
+                            };
+                            // Update backend info to reflect the retry target.
+                            backend_info.backend_target =
+                                format!("{}:{}", current_host, current_port);
+                            backend_info.backend_resolved_ip = None;
+                            attempt += 1;
+                            continue;
+                        }
+                    }
+                    warn!(proxy_id = %proxy_id, client = %remote_addr, "TCP connection rejected: circuit breaker open");
+                    return Err(StreamSetupError::new(
+                        StreamSetupKind::CircuitBreakerOpen,
+                        format!("for {}:{}", current_host, current_port),
+                    )
+                    .into());
                 }
             }
-            warn!(proxy_id = %proxy_id, client = %remote_addr, "TCP connection rejected: circuit breaker open");
-            return Err(StreamSetupError::new(
-                StreamSetupKind::CircuitBreakerOpen,
-                format!("for {}:{}", current_host, current_port),
-            )
-            .into());
         }
 
         // Resolve backend IP via DNS
@@ -1376,6 +1387,7 @@ async fn handle_tcp_connection_inner(
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
+                        is_half_open_probe: false,
                     };
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target = format!("{}:{}", current_host, current_port);
@@ -1439,6 +1451,7 @@ async fn handle_tcp_connection_inner(
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
                         }),
+                        is_half_open_probe: false,
                     };
                     // Update backend info to reflect the retry target.
                     backend_info.backend_target = format!("{}:{}", current_host, current_port);
@@ -1706,9 +1719,9 @@ async fn handle_tcp_connection_inner(
             cb_config,
         );
         if copy_result.first_failure.is_some() {
-            cb.record_failure(502, true);
+            cb.record_failure(502, true, current_cb_info.is_half_open_probe);
         } else {
-            cb.record_success();
+            cb.record_success(current_cb_info.is_half_open_probe);
         }
     }
 

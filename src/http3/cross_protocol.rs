@@ -161,6 +161,7 @@ where
     pub lb_hash_key: Option<&'a str>,
     pub upstream_target: Option<&'a UpstreamTarget>,
     pub cb_target_key: Option<&'a str>,
+    pub cb_is_half_open_probe: bool,
     pub flavor: HttpFlavor,
     pub prebuffered_body: Option<Vec<u8>>,
     pub client_ip: &'a str,
@@ -188,6 +189,7 @@ fn record_cross_protocol_retry_failure(
     cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
+    is_half_open_probe: bool,
 ) {
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
         state
@@ -199,7 +201,7 @@ fn record_cross_protocol_retry_failure(
         let cb = state
             .circuit_breaker_cache
             .get_or_create(&proxy.id, cb_target_key, cb_config);
-        cb.record_failure(response_status, connection_error);
+        cb.record_failure(response_status, connection_error, is_half_open_probe);
     }
 }
 
@@ -303,6 +305,7 @@ where
         lb_hash_key,
         upstream_target,
         cb_target_key,
+        cb_is_half_open_probe,
         flavor,
         prebuffered_body,
         client_ip,
@@ -363,6 +366,7 @@ where
                 lb_hash_key,
                 upstream_target,
                 cb_target_key,
+                cb_is_half_open_probe,
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
@@ -386,6 +390,7 @@ where
                 lb_hash_key,
                 upstream_target,
                 cb_target_key,
+                cb_is_half_open_probe,
                 prebuffered_body,
                 raw_prebuffered_body_bytes,
                 client_ip,
@@ -554,6 +559,7 @@ async fn dispatch_plain<S>(
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
@@ -579,6 +585,7 @@ where
                 cb_target_key,
                 502,
                 true,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             let mut outcome = write_error(
@@ -677,6 +684,7 @@ where
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 false,
+                                cb_is_half_open_probe,
                             );
                             let delay = crate::retry::retry_delay(retry_config, attempt);
                             tokio::time::sleep(delay).await;
@@ -735,6 +743,7 @@ where
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
+                                cb_is_half_open_probe,
                             );
                             let delay = crate::retry::retry_delay(retry_config, attempt);
                             tokio::time::sleep(delay).await;
@@ -781,6 +790,7 @@ where
                             current_cb_target_key.as_deref(),
                             attempt_result.status_code,
                             attempt_result.connection_error,
+                            cb_is_half_open_probe,
                             backend_start.elapsed(),
                         );
                         let mut outcome = write_error(
@@ -992,6 +1002,7 @@ where
                     current_cb_target_key.as_deref(),
                     413,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 return write_error(
@@ -1028,6 +1039,7 @@ where
                         current_cb_target_key.as_deref(),
                         attempt_result.status_code,
                         attempt_result.connection_error,
+                        cb_is_half_open_probe,
                         backend_start.elapsed(),
                     );
                     let mut outcome = write_error(
@@ -1067,6 +1079,7 @@ where
             current_cb_target_key.as_deref(),
             502,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
         let mut outcome = write_error(
@@ -1099,6 +1112,7 @@ where
             current_cb_target_key.as_deref(),
             reject.status_code,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
         let mut outcome = write_reject_with_headers(
@@ -1142,6 +1156,7 @@ where
                     current_cb_target_key.as_deref(),
                     502,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 let empty_headers = HashMap::new();
@@ -1258,6 +1273,7 @@ where
             current_cb_target_key.as_deref(),
             response_status,
             false,
+            cb_is_half_open_probe,
             backend_start.elapsed(),
         );
 
@@ -1295,6 +1311,7 @@ where
         current_cb_target_key.as_deref(),
         status,
         false,
+        cb_is_half_open_probe,
         backend_start.elapsed(),
     );
 
@@ -1330,6 +1347,7 @@ async fn dispatch_grpc<S>(
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
+    cb_is_half_open_probe: bool,
     prebuffered_body: Option<Vec<u8>>,
     raw_prebuffered_body_bytes: u64,
     client_ip: &str,
@@ -1538,6 +1556,7 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 true,
+                cb_is_half_open_probe,
             );
 
             let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -1628,6 +1647,7 @@ where
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
@@ -1741,6 +1761,7 @@ where
                 current_cb_target_key.as_deref(),
                 response_status,
                 false,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
@@ -1797,6 +1818,7 @@ where
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
                     false,
+                    cb_is_half_open_probe,
                     backend_start.elapsed(),
                 );
                 outcome.backend_target_url = Some(strip_query_from_backend_url(&current_url));
@@ -1836,6 +1858,7 @@ where
                 current_cb_target_key.as_deref(),
                 streaming.status,
                 false,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             Ok(CrossProtocolOutcome {
@@ -1900,6 +1923,7 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 connection_error,
+                cb_is_half_open_probe,
                 backend_start.elapsed(),
             );
             let mut outcome = write_grpc_error(
