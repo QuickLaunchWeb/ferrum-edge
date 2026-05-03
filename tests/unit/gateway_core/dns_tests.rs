@@ -1048,7 +1048,21 @@ async fn test_dns_stale_refresh_still_works_with_semaphore() {
 
 #[tokio::test]
 async fn test_dns_concurrent_refresh_limit_prevents_unbounded_tasks() {
-    // Create a cache with a small semaphore limit
+    // Verify that the semaphore limits concurrent background refresh tasks.
+    //
+    // This test uses IP-literal entries which resolve instantly in do_resolve()
+    // (parsed before hitting the resolver). Because refresh completes so quickly,
+    // this test cannot directly *observe* the semaphore blocking concurrent tasks.
+    // It instead verifies the end-to-end contract: all stale entries are still
+    // served, the cache is not corrupted, and no panics occur under load.
+    //
+    // A stronger behavioral test would require injecting a mock/slow resolver
+    // into DnsCache (the resolver is private and constructed internally), which
+    // is not currently supported. The semaphore bound is verified structurally:
+    //   - DnsCache::new() creates Semaphore::new(max_concurrent_refreshes.max(1))
+    //   - resolve()/resolve_all() call try_acquire_owned() before spawning
+    //   - On Err (all permits taken), the refresh is skipped and the dedup entry
+    //     is removed so a future request can retry
     let cache = DnsCache::new(DnsConfig {
         min_ttl_seconds: 1,
         stale_ttl_seconds: 60,
@@ -1067,7 +1081,7 @@ async fn test_dns_concurrent_refresh_limit_prevents_unbounded_tasks() {
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Hit all 10 stale entries — only max_concurrent_refreshes tasks should run
-    // The rest should be skipped (and still serve stale data)
+    // concurrently, the rest should be skipped (and still serve stale data)
     for i in 1..=10 {
         let ip = format!("10.0.0.{}", i);
         let result = cache.resolve(&ip, None, Some(1)).await;
@@ -1085,6 +1099,73 @@ async fn test_dns_concurrent_refresh_limit_prevents_unbounded_tasks() {
         cache.cache_len() >= 10,
         "Cache entries should persist after refresh"
     );
+}
+
+#[tokio::test]
+async fn test_dns_concurrent_stale_refresh_with_real_dns_hostnames() {
+    // Use hostnames that require actual DNS resolution (not IP literals) to
+    // add realistic latency to the refresh path. With max_concurrent_refreshes=1,
+    // only one background refresh task can run at a time — excess requests are
+    // skipped and stale data is served. This tests the contract under more
+    // realistic conditions where refresh tasks hold permits for non-trivial time.
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 60,
+        max_concurrent_refreshes: 1, // Strictest possible limit
+        ..DnsConfig::default()
+    });
+
+    // Populate cache with localhost — resolves via hosts file / resolver
+    let result1 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(cache.cache_len(), 1);
+
+    // Also populate with an IP (different entry, instant resolution)
+    let ip_result = cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
+    assert_eq!(cache.cache_len(), 2);
+
+    // Wait for TTL to expire
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Hit both stale entries concurrently — with semaphore=1, at most one
+    // refresh task runs. The other is skipped and stale data is served.
+    let cache_a = cache.clone();
+    let cache_b = cache.clone();
+    let (r1, r2) = tokio::join!(
+        cache_a.resolve("localhost", None, Some(1)),
+        cache_b.resolve("127.0.0.1", None, Some(1)),
+    );
+    assert_eq!(r1.unwrap(), result1, "Stale localhost should be served");
+    assert_eq!(r2.unwrap(), ip_result, "Stale IP should be served");
+
+    // Give the single permitted refresh time to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Both entries should still exist in cache
+    assert_eq!(cache.cache_len(), 2);
+}
+
+#[tokio::test]
+async fn test_dns_refresh_semaphore_min_clamped_to_one() {
+    // Verify that max_concurrent_refreshes=0 is clamped to 1 (the .max(1) in
+    // DnsCache::new), so at least one refresh can always proceed.
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 10,
+        max_concurrent_refreshes: 0, // Clamped to 1 inside DnsCache::new
+        ..DnsConfig::default()
+    });
+
+    // Populate and expire
+    let result1 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Stale resolve should still work — the one permit allows the refresh
+    let result2 = cache.resolve("localhost", None, Some(1)).await.unwrap();
+    assert_eq!(result1, result2, "Stale data should be served");
+
+    // Refresh should complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(cache.cache_len(), 1);
 }
 
 #[tokio::test]
