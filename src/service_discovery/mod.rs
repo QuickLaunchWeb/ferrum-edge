@@ -19,6 +19,17 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+/// How long to wait for a task to exit after signaling before falling back to abort.
+const TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 5;
+
+/// A running service discovery task with its cancellation handle.
+struct TaskEntry {
+    /// Per-task cancel signal. Sending `true` tells the loop to exit.
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    /// The spawned task handle — used for join or last-resort abort.
+    handle: JoinHandle<()>,
+}
+
 /// Trait for service discovery providers.
 #[async_trait::async_trait]
 pub trait ServiceDiscoverer: Send + Sync {
@@ -34,7 +45,7 @@ pub trait ServiceDiscoverer: Send + Sync {
 /// task that periodically polls its provider and updates the LoadBalancerCache
 /// when targets change.
 pub struct ServiceDiscoveryManager {
-    tasks: DashMap<String, JoinHandle<()>>,
+    tasks: DashMap<String, TaskEntry>,
     load_balancer_cache: Arc<LoadBalancerCache>,
     dns_cache: DnsCache,
     health_checker: Arc<HealthChecker>,
@@ -83,6 +94,10 @@ impl ServiceDiscoveryManager {
 
     /// Reconcile running tasks with the current config. Stops tasks for removed
     /// upstreams and starts tasks for new/modified upstreams.
+    ///
+    /// Tasks are signaled to stop via their per-task cancel channel and given
+    /// up to [`TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`] to finish their current
+    /// write before a last-resort `abort()`.
     pub fn reconcile(
         &self,
         config: &GatewayConfig,
@@ -100,13 +115,9 @@ impl ServiceDiscoveryManager {
         let current_ids: Vec<String> = self.tasks.iter().map(|e| e.key().clone()).collect();
         for id in &current_ids {
             if !desired.contains(id)
-                && let Some((_, handle)) = self.tasks.remove(id)
+                && let Some((_, entry)) = self.tasks.remove(id)
             {
-                handle.abort();
-                debug!(
-                    "Service discovery: stopped task for removed upstream {}",
-                    id
-                );
+                graceful_stop_task(entry, id);
             }
         }
 
@@ -114,8 +125,8 @@ impl ServiceDiscoveryManager {
         for upstream in &config.upstreams {
             if let Some(sd_config) = &upstream.service_discovery {
                 // Stop existing task if any (config may have changed)
-                if let Some((_, handle)) = self.tasks.remove(&upstream.id) {
-                    handle.abort();
+                if let Some((_, entry)) = self.tasks.remove(&upstream.id) {
+                    graceful_stop_task(entry, &upstream.id);
                 }
                 self.start_upstream_task(
                     &upstream.id,
@@ -129,12 +140,31 @@ impl ServiceDiscoveryManager {
         }
     }
 
-    /// Stop all running service discovery tasks.
+    /// Stop all running service discovery tasks gracefully.
+    ///
+    /// Signals every task via its cancel channel, then drains the map. Each
+    /// task gets up to [`TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`] to exit before
+    /// a last-resort `abort()`.
     pub fn stop(&self) {
+        // Signal all tasks first so they can begin exiting in parallel.
         for entry in self.tasks.iter() {
-            entry.value().abort();
+            let _ = entry.value().cancel_tx.send(true);
         }
-        self.tasks.clear();
+
+        // Drain the map and wait/abort each task.
+        let entries: Vec<(String, TaskEntry)> = self
+            .tasks
+            .iter()
+            .map(|e| e.key().clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|id| self.tasks.remove(&id))
+            .collect();
+
+        for (id, entry) in entries {
+            graceful_join_or_abort(entry, &id);
+        }
+
         info!("Service discovery: all tasks stopped");
     }
 
@@ -224,6 +254,9 @@ impl ServiceDiscoveryManager {
         let dns_cache = self.dns_cache.clone();
         let health_checker = self.health_checker.clone();
 
+        // Per-task cancel channel — signaled on reconcile/stop.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+
         let handle = tokio::spawn(async move {
             run_discovery_loop(
                 &upstream_id_owned,
@@ -234,13 +267,15 @@ impl ServiceDiscoveryManager {
                 hash_on,
                 poll_interval,
                 shutdown_rx,
+                cancel_rx,
                 &dns_cache,
                 &health_checker,
             )
             .await;
         });
 
-        self.tasks.insert(upstream_id.to_string(), handle);
+        self.tasks
+            .insert(upstream_id.to_string(), TaskEntry { cancel_tx, handle });
         info!(
             "Service discovery: started {} task for upstream {} (poll interval: {}s)",
             sd_config.provider.as_str(),
@@ -266,6 +301,57 @@ impl SdProvider {
     }
 }
 
+/// Signal a single task to stop and spawn a background join/abort.
+///
+/// This is used during reconcile where we cannot `.await` (the method is
+/// synchronous). The task is signaled immediately; a detached future handles
+/// the join with a timeout and last-resort abort.
+fn graceful_stop_task(entry: TaskEntry, upstream_id: &str) {
+    let _ = entry.cancel_tx.send(true);
+    graceful_join_or_abort(entry, upstream_id);
+}
+
+/// Wait (blocking-compatible) for a task to finish after its cancel signal
+/// has been sent. If the task does not exit within
+/// [`TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`], abort it as a last resort.
+///
+/// Spawns a detached tokio task so the caller does not need to `.await`.
+fn graceful_join_or_abort(entry: TaskEntry, upstream_id: &str) {
+    let id = upstream_id.to_string();
+    // Grab an AbortHandle before consuming the JoinHandle so we can force-
+    // kill the task if the timeout expires (dropping a JoinHandle merely
+    // detaches the task — it does not abort it).
+    let abort_handle = entry.handle.abort_handle();
+    tokio::spawn(async move {
+        let timeout = std::time::Duration::from_secs(TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS);
+        match tokio::time::timeout(timeout, entry.handle).await {
+            Ok(_) => {
+                debug!(
+                    "Service discovery: task for upstream {} stopped gracefully",
+                    id
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "Service discovery: task for upstream {} did not exit within {}s, aborting",
+                    id, TASK_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
+                );
+                abort_handle.abort();
+            }
+        }
+    });
+}
+
+/// Wait for a cancellation signal on a per-task cancel watch channel.
+async fn wait_for_cancel(mut rx: tokio::sync::watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            // Sender dropped — treat as cancel.
+            return;
+        }
+    }
+}
+
 /// Wait for a shutdown signal on a watch channel.
 async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
     while !*rx.borrow() {
@@ -276,6 +362,9 @@ async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
 }
 
 /// Background discovery loop for a single upstream.
+///
+/// Exits when either the global `shutdown_rx` fires or the per-task
+/// `cancel_rx` is signaled (e.g. during config reconcile).
 #[allow(clippy::too_many_arguments)]
 async fn run_discovery_loop(
     upstream_id: &str,
@@ -286,6 +375,7 @@ async fn run_discovery_loop(
     hash_on: Option<String>,
     poll_interval_seconds: u64,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
     dns_cache: &DnsCache,
     health_checker: &HealthChecker,
 ) {
@@ -293,17 +383,28 @@ async fn run_discovery_loop(
     let mut last_discovered: Vec<UpstreamTarget> = Vec::new();
 
     loop {
-        // Wait for next tick or shutdown
-        if let Some(ref rx) = shutdown_rx {
-            tokio::select! {
-                _ = interval.tick() => {}
-                _ = wait_for_shutdown(rx.clone()) => {
-                    info!("Service discovery: shutting down task for upstream {}", upstream_id);
-                    return;
-                }
+        // Wait for next tick, global shutdown, or per-task cancel.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = wait_for_cancel(cancel_rx.clone()) => {
+                info!(
+                    "Service discovery: task for upstream {} canceled (config reconcile)",
+                    upstream_id,
+                );
+                return;
             }
-        } else {
-            interval.tick().await;
+            _ = async {
+                if let Some(ref rx) = shutdown_rx {
+                    wait_for_shutdown(rx.clone()).await;
+                } else {
+                    // No global shutdown channel — pend forever so the other
+                    // branches drive the select.
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!("Service discovery: shutting down task for upstream {}", upstream_id);
+                return;
+            }
         }
 
         // Discover targets
