@@ -1124,9 +1124,8 @@ impl<S: FrameSource> Coalescing<S> {
     }
 
     fn buffer_data(&mut self, data: &Bytes) {
-        let buffer_was_empty = self.buffer.is_empty();
         self.buffer.extend_from_slice(data);
-        if buffer_was_empty {
+        if !self.flush_timer_armed {
             self.arm_flush_timer();
         }
     }
@@ -1707,6 +1706,60 @@ mod tests {
                 assert_eq!(frame.data_ref().unwrap().as_ref(), b"tail");
             }
             other => panic!("expected timer-driven flush, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coalescing_flush_timer_rearms_after_expiry() {
+        // Simulate: frame A arrives (timer armed), timer fires, buffer flushed,
+        // then frames B+C arrive into a non-empty buffer. The timer must be
+        // re-armed after the first flush so B+C are flushed by the timer
+        // rather than sitting in the buffer indefinitely.
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![
+                // Phase 1: single frame, then source stalls.
+                MockStep::Frame(Ok(Frame::data(Bytes::from("aaa")))),
+                MockStep::Pending,
+                // Phase 2: two frames in rapid succession, then source stalls.
+                MockStep::Frame(Ok(Frame::data(Bytes::from("bbb")))),
+                MockStep::Frame(Ok(Frame::data(Bytes::from("ccc")))),
+                MockStep::Pending,
+            ]),
+            1_000, // high threshold — never hit by these small frames
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Phase 1: poll buffers "aaa", returns Pending (timer not yet expired).
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        // Let the timer fire.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Timer-driven flush of "aaa".
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"aaa");
+            }
+            other => panic!("expected timer-driven flush of phase-1 data, got {other:?}"),
+        }
+
+        // Phase 2: next poll picks up "bbb" and "ccc", then source stalls.
+        // Timer must be re-armed for this new batch.
+        assert!(matches!(body.as_mut().poll_frame(&mut cx), Poll::Pending));
+
+        // Let the re-armed timer fire.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Timer-driven flush of "bbb"+"ccc".
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"bbbccc");
+            }
+            other => panic!("expected timer-driven flush of phase-2 data, got {other:?}"),
         }
     }
 
