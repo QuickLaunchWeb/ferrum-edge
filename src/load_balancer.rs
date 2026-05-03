@@ -205,6 +205,19 @@ const LATENCY_WARMUP_THRESHOLD: u64 = 5;
 /// Sentinel value indicating no latency has been recorded yet.
 const LATENCY_UNSET: u64 = u64::MAX;
 
+/// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
+/// targets during the mixed warm-up phase.  The bias must be large enough to
+/// reliably win the `<` comparison against the warmed minimum EWMA — real
+/// backend latencies live in the millisecond range (thousands of microseconds),
+/// so 1 μs was effectively invisible.  1 ms (1 000 μs) is small enough to not
+/// misroute traffic once the target warms up, but large enough to guarantee
+/// the unsampled target is selected first for probing.
+///
+/// If the `min_known_ewma` is smaller than this bias the subtraction saturates
+/// to 0, which is safe — 0 < any positive EWMA, so the unsampled target still
+/// wins.
+const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
+
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
 #[derive(Debug, Clone)]
@@ -1187,7 +1200,7 @@ impl LoadBalancer {
                     .map(|v| v.load(Ordering::Relaxed))
                     .unwrap_or(LATENCY_UNSET)
             } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(1)
+                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
             } else {
                 LATENCY_UNSET
             };
@@ -1379,7 +1392,7 @@ impl LoadBalancer {
                     .map(|v| v.load(Ordering::Relaxed))
                     .unwrap_or(LATENCY_UNSET)
             } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(1)
+                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
             } else {
                 LATENCY_UNSET
             };
