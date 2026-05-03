@@ -1,6 +1,6 @@
 pub(crate) mod sql_dialect;
 pub mod v001_initial_schema;
-pub mod v002_add_missing_indexes;
+pub mod v003_add_missing_indexes;
 
 use chrono::Utc;
 use sqlx::any::AnyRow;
@@ -142,8 +142,8 @@ impl MigrationRunner {
     fn all_migrations(&self) -> Vec<Box<dyn MigrationEntry>> {
         vec![
             Box::new(MigrationEntryV001(v001_initial_schema::V001InitialSchema)),
-            Box::new(MigrationEntryV002(
-                v002_add_missing_indexes::V002AddMissingIndexes,
+            Box::new(MigrationEntryV003(
+                v003_add_missing_indexes::V003AddMissingIndexes,
             )),
         ]
     }
@@ -613,10 +613,10 @@ impl MigrationEntry for MigrationEntryV001 {
     }
 }
 
-/// Wrapper for V002AddMissingIndexes.
-struct MigrationEntryV002(v002_add_missing_indexes::V002AddMissingIndexes);
+/// Wrapper for V003AddMissingIndexes.
+struct MigrationEntryV003(v003_add_missing_indexes::V003AddMissingIndexes);
 
-impl MigrationEntry for MigrationEntryV002 {
+impl MigrationEntry for MigrationEntryV003 {
     fn version(&self) -> i64 {
         self.0.version()
     }

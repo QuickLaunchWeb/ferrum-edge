@@ -3,7 +3,7 @@ use tracing::info;
 
 use super::Migration;
 
-/// V2: Add missing indexes for pre-migration databases.
+/// V3: Add missing indexes for pre-migration databases.
 ///
 /// Fresh databases already have these indexes from V001 (sql_dialect.rs), but
 /// databases that existed before the migration system was introduced get V001
@@ -14,11 +14,11 @@ use super::Migration;
 /// both fresh databases (idempotent no-op) and pre-migration databases (creates
 /// the missing indexes). MySQL does not reliably support `IF NOT EXISTS` on
 /// `CREATE INDEX`, so we strip it and ignore duplicate-key errors (error 1061).
-pub struct V002AddMissingIndexes;
+pub struct V003AddMissingIndexes;
 
-impl Migration for V002AddMissingIndexes {
+impl Migration for V003AddMissingIndexes {
     fn version(&self) -> i64 {
-        2
+        3
     }
 
     fn name(&self) -> &str {
@@ -26,11 +26,11 @@ impl Migration for V002AddMissingIndexes {
     }
 
     fn checksum(&self) -> &str {
-        "v002_add_missing_indexes"
+        "v003_add_missing_indexes"
     }
 }
 
-impl V002AddMissingIndexes {
+impl V003AddMissingIndexes {
     pub async fn up(&self, pool: &AnyPool, db_type: &str) -> Result<(), anyhow::Error> {
         let indexes = [
             // Junction table: proxy_plugins.plugin_config_id needs an index for
@@ -66,7 +66,7 @@ impl V002AddMissingIndexes {
         }
 
         info!(
-            "V002: Created missing indexes on proxy_plugins, proxies, consumers, plugin_configs, upstreams"
+            "V003: Created missing indexes on proxy_plugins, proxies, consumers, plugin_configs, upstreams"
         );
         Ok(())
     }

@@ -1501,7 +1501,7 @@ mod inner {
                         .build(),
                 )
                 .await?;
-            // Compound indexes for common admin API query patterns (V002)
+            // Compound indexes for common admin API query patterns (V003)
             self.plugin_configs()
                 .create_index(
                     IndexModel::builder()
