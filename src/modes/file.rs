@@ -619,7 +619,7 @@ pub async fn serve(
 
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
-    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
 
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
@@ -987,7 +987,11 @@ pub async fn serve(
     // `tokio::time::timeout(Duration::from_secs(5), bg_drain)` block —
     // mixing them in with listener handles loses that bound and lets a
     // stuck DNS / metrics task wedge shutdown indefinitely.
-    let background_handles: Vec<JoinHandle<()>> = vec![dns_handle, overload_handle, metrics_handle];
+    let mut background_handles: Vec<JoinHandle<()>> =
+        vec![dns_handle, overload_handle, metrics_handle];
+    if let Some(h) = dns_retry_handle {
+        background_handles.push(h);
+    }
 
     // Build `ServeHandles` BEFORE the late-startup `?` calls so that
     // failure to bind stream listeners / receive listener-started
