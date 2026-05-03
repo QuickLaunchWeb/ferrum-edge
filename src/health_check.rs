@@ -489,37 +489,49 @@ impl HealthChecker {
                     timer.tick().await;
                 }
 
+                // Fast path: skip the scan when no proxy has any unhealthy
+                // targets.  DashMap::is_empty() is O(shards) — effectively free
+                // compared to iterating every proxy × every unhealthy entry.
+                let any_unhealthy = passive_health
+                    .iter()
+                    .any(|entry| !entry.value().unhealthy.is_empty());
+                if !any_unhealthy {
+                    continue;
+                }
+
                 let now = now_epoch_ms();
 
-                // Iterate each proxy's passive state
+                // Use retain() to atomically test-and-remove recovered targets
+                // in a single pass — no intermediate Vec allocation, no extra
+                // DashMap lookups for the remove() call.
                 for entry in passive_health.iter() {
                     let proxy_id = entry.key();
                     let proxy_state = entry.value();
 
-                    // Collect keys to recover within this proxy's map
-                    let to_recover: Vec<String> = proxy_state
-                        .unhealthy
-                        .iter()
-                        .filter(|e| {
-                            hp_keys.contains(e.key().as_str())
-                                && now.saturating_sub(*e.value()) >= recovery_ms
-                        })
-                        .map(|e| e.key().clone())
-                        .collect();
-
-                    for hp in &to_recover {
-                        if proxy_state.unhealthy.remove(hp).is_some() {
-                            info!(
-                                "Passive recovery timer: restoring target {} for proxy {} after {}s cooldown",
-                                hp, proxy_id, healthy_after_seconds
-                            );
-                            if let Some(state) = proxy_state.states.get(hp) {
-                                state.consecutive_failures.store(0, Ordering::Relaxed);
-                                state.consecutive_successes.store(0, Ordering::Relaxed);
-                                state.recent_failures.clear();
-                            }
+                    proxy_state.unhealthy.retain(|hp, marked_at| {
+                        // Keep entries that don't belong to this upstream's
+                        // target set — they are managed by another timer.
+                        if !hp_keys.contains(hp.as_str()) {
+                            return true;
                         }
-                    }
+
+                        // Keep entries whose recovery window has not elapsed.
+                        if now.saturating_sub(*marked_at) < recovery_ms {
+                            return true;
+                        }
+
+                        // Recovery window elapsed — remove and reset counters.
+                        info!(
+                            "Passive recovery timer: restoring target {} for proxy {} after {}s cooldown",
+                            hp, proxy_id, healthy_after_seconds
+                        );
+                        if let Some(state) = proxy_state.states.get(hp) {
+                            state.consecutive_failures.store(0, Ordering::Relaxed);
+                            state.consecutive_successes.store(0, Ordering::Relaxed);
+                            state.recent_failures.clear();
+                        }
+                        false // remove from unhealthy map
+                    });
                 }
             }
         })
