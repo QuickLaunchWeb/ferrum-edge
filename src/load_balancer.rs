@@ -220,18 +220,44 @@ pub struct TargetSelection {
     pub is_fallback: bool,
 }
 
+/// All load-balancer state swapped as a single unit so readers never see
+/// new balancer entries paired with a stale upstream index (or vice versa).
+pub struct LoadBalancerCacheInner {
+    balancers: HashMap<String, Arc<LoadBalancer>>,
+    /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
+    upstreams: HashMap<String, Arc<Upstream>>,
+}
+
+impl LoadBalancerCacheInner {
+    /// Access the balancers map for custom code that needs direct HashMap access.
+    ///
+    /// Prefer the typed accessors [`LoadBalancerCache::get_hash_on_strategy_from`]
+    /// and [`LoadBalancerCache::select_target_from`] when possible — they cover
+    /// the standard hot-path use cases without exposing internal structure.
+    #[allow(dead_code)] // Public API used by custom plugins
+    #[inline]
+    pub fn balancers(&self) -> &HashMap<String, Arc<LoadBalancer>> {
+        &self.balancers
+    }
+
+    /// Access the upstream index for custom code that needs direct lookup.
+    #[allow(dead_code)] // Public API used by custom plugins
+    #[inline]
+    pub fn upstreams(&self) -> &HashMap<String, Arc<Upstream>> {
+        &self.upstreams
+    }
+}
+
 /// Load balancer cache, rebuilt atomically on config change.
 ///
 /// Individual `LoadBalancer` instances are wrapped in `Arc` so that
 /// incremental updates can clone the HashMap cheaply (just Arc pointer
 /// copies) and only allocate new `LoadBalancer` instances for changed
-/// upstreams. Unchanged upstreams keep their exact same instance —
+/// upstreams. Unchanged upstreams keep their exact same instance --
 /// round-robin counters, WRR weights, active connection counts, latency
 /// EWMAs, and consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
-    balancers: ArcSwap<HashMap<String, Arc<LoadBalancer>>>,
-    /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
-    upstreams: ArcSwap<HashMap<String, Arc<Upstream>>>,
+    inner: ArcSwap<LoadBalancerCacheInner>,
 }
 
 impl LoadBalancerCache {
@@ -239,16 +265,20 @@ impl LoadBalancerCache {
         let balancers = Self::build_balancers(config);
         let upstreams = Self::build_upstream_index(config);
         Self {
-            balancers: ArcSwap::new(Arc::new(balancers)),
-            upstreams: ArcSwap::new(Arc::new(upstreams)),
+            inner: ArcSwap::new(Arc::new(LoadBalancerCacheInner {
+                balancers,
+                upstreams,
+            })),
         }
     }
 
     pub fn rebuild(&self, config: &GatewayConfig) {
         let balancers = Self::build_balancers(config);
         let upstreams = Self::build_upstream_index(config);
-        self.balancers.store(Arc::new(balancers));
-        self.upstreams.store(Arc::new(upstreams));
+        self.inner.store(Arc::new(LoadBalancerCacheInner {
+            balancers,
+            upstreams,
+        }));
     }
 
     fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
@@ -295,8 +325,10 @@ impl LoadBalancerCache {
             return;
         }
 
-        // Clone the current map — O(n) Arc pointer copies, no LoadBalancer cloning
-        let mut new_balancers = self.balancers.load().as_ref().clone();
+        let current = self.inner.load();
+
+        // Clone the current map -- O(n) Arc pointer copies, no LoadBalancer cloning
+        let mut new_balancers = current.balancers.clone();
 
         // Remove deleted upstreams
         for id in removed_ids {
@@ -319,14 +351,17 @@ impl LoadBalancerCache {
         // Upstream index is cheap to rebuild (just Arc<Upstream> clones)
         let new_upstream_idx = Self::build_upstream_index(full_new_config);
 
-        self.balancers.store(Arc::new(new_balancers));
-        self.upstreams.store(Arc::new(new_upstream_idx));
+        // Single atomic swap
+        self.inner.store(Arc::new(LoadBalancerCacheInner {
+            balancers: new_balancers,
+            upstreams: new_upstream_idx,
+        }));
     }
 
     /// O(1) lookup of an upstream by ID from the pre-built index.
     pub fn get_upstream(&self, upstream_id: &str) -> Option<Arc<Upstream>> {
-        let idx = self.upstreams.load();
-        idx.get(upstream_id).cloned()
+        let inner = self.inner.load();
+        inner.upstreams.get(upstream_id).cloned()
     }
 
     /// Update the targets for a single upstream (used by service discovery).
@@ -341,8 +376,10 @@ impl LoadBalancerCache {
         algorithm: LoadBalancerAlgorithm,
         hash_on: Option<String>,
     ) {
-        // Update the balancer
-        let mut new_balancers = self.balancers.load().as_ref().clone();
+        let current = self.inner.load();
+
+        // Clone-and-patch both maps, then swap as a single unit
+        let mut new_balancers = current.balancers.clone();
         new_balancers.insert(
             upstream_id.to_string(),
             Arc::new(LoadBalancer::new(
@@ -352,23 +389,26 @@ impl LoadBalancerCache {
                 hash_on,
             )),
         );
-        self.balancers.store(Arc::new(new_balancers));
 
-        // Update the upstream index
-        let mut new_upstreams = self.upstreams.load().as_ref().clone();
+        let mut new_upstreams = current.upstreams.clone();
         if let Some(existing) = new_upstreams.get(upstream_id) {
             let mut updated = (**existing).clone();
             updated.targets = new_targets;
             new_upstreams.insert(upstream_id.to_string(), Arc::new(updated));
         }
-        self.upstreams.store(Arc::new(new_upstreams));
+
+        self.inner.store(Arc::new(LoadBalancerCacheInner {
+            balancers: new_balancers,
+            upstreams: new_upstreams,
+        }));
     }
 
     /// Get the pre-parsed hash-on strategy for an upstream.
     /// Returns `HashOnStrategy::Ip` if the upstream is not found.
     pub fn get_hash_on_strategy(&self, upstream_id: &str) -> HashOnStrategy {
-        let balancers = self.balancers.load();
-        balancers
+        let inner = self.inner.load();
+        inner
+            .balancers
             .get(upstream_id)
             .map(|b| b.hash_on_strategy.clone())
             .unwrap_or(HashOnStrategy::Ip)
@@ -388,42 +428,43 @@ impl LoadBalancerCache {
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancers = self.balancers.load();
-        let balancer = balancers.get(upstream_id)?;
+        let inner = self.inner.load();
+        let balancer = inner.balancers.get(upstream_id)?;
         balancer.select(ctx_key, health)
     }
 
     /// Load the balancers map once and return a guard for multiple lookups.
     ///
     /// Use this when you need both `get_hash_on_strategy()` and `select_target()`
-    /// for the same upstream — saves one `ArcSwap::load()` atomic operation per
+    /// for the same upstream -- saves one `ArcSwap::load()` atomic operation per
     /// request by loading the balancers map once and reusing the guard.
     #[inline]
-    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<String, Arc<LoadBalancer>>>> {
-        self.balancers.load()
+    pub fn load(&self) -> arc_swap::Guard<Arc<LoadBalancerCacheInner>> {
+        self.inner.load()
     }
 
-    /// Get the hash-on strategy from a pre-loaded balancers guard.
+    /// Get the hash-on strategy from a pre-loaded snapshot.
     #[inline]
     pub fn get_hash_on_strategy_from(
-        balancers: &HashMap<String, Arc<LoadBalancer>>,
+        snapshot: &LoadBalancerCacheInner,
         upstream_id: &str,
     ) -> HashOnStrategy {
-        balancers
+        snapshot
+            .balancers
             .get(upstream_id)
             .map(|b| b.hash_on_strategy.clone())
             .unwrap_or(HashOnStrategy::Ip)
     }
 
-    /// Select a target from a pre-loaded balancers guard.
+    /// Select a target from a pre-loaded snapshot.
     #[inline]
     pub fn select_target_from(
-        balancers: &HashMap<String, Arc<LoadBalancer>>,
+        snapshot: &LoadBalancerCacheInner,
         upstream_id: &str,
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let balancer = balancers.get(upstream_id)?;
+        let balancer = snapshot.balancers.get(upstream_id)?;
         balancer.select(ctx_key, health)
     }
 
@@ -435,16 +476,16 @@ impl LoadBalancerCache {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let balancers = self.balancers.load();
-        let balancer = balancers.get(upstream_id)?;
+        let inner = self.inner.load();
+        let balancer = inner.balancers.get(upstream_id)?;
         balancer.select_excluding(ctx_key, exclude, health)
     }
 
     /// Snapshot of active connection counts per upstream for metrics.
     pub fn active_connections_snapshot(&self) -> Vec<(String, Vec<(String, i64)>)> {
-        let balancers = self.balancers.load();
+        let inner = self.inner.load();
         let mut result = Vec::new();
-        for (upstream_id, balancer) in balancers.iter() {
+        for (upstream_id, balancer) in inner.balancers.iter() {
             let mut targets = Vec::new();
             for entry in balancer.active_connections.iter() {
                 let count = entry.value().load(Ordering::Relaxed);
@@ -461,14 +502,14 @@ impl LoadBalancerCache {
 
     /// Record that a connection was opened to a target (for least-connections).
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
             let key = balancer.find_target_key(target).unwrap_or("");
             if key.is_empty() {
                 return;
             }
             // Fast path: get() uses a shared read lock. entry() takes a write
-            // lock and clones the key — avoid it when the counter already exists.
+            // lock and clones the key -- avoid it when the counter already exists.
             if let Some(counter) = balancer.active_connections.get(key) {
                 counter.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -483,8 +524,8 @@ impl LoadBalancerCache {
 
     /// Record that a connection was closed to a target (for least-connections).
     pub fn record_connection_end(&self, upstream_id: &str, target: &UpstreamTarget) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
             let key = balancer.find_target_key(target).unwrap_or("");
             if key.is_empty() {
                 return;
@@ -506,10 +547,10 @@ impl LoadBalancerCache {
     /// Called from one of two sources (active takes precedence):
     /// - **Active path**: `health_check.rs` after each successful probe RTT
     /// - **Passive path**: `proxy/mod.rs` after each successful non-5xx backend
-    ///   response (TTFB) — only when no active health checks are configured
+    ///   response (TTFB) -- only when no active health checks are configured
     pub fn record_latency(&self, upstream_id: &str, target: &UpstreamTarget, latency_us: u64) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
             balancer.record_latency(target, latency_us);
         }
     }
@@ -518,8 +559,8 @@ impl LoadBalancerCache {
     /// targets. Called when a target recovers from unhealthy status so it gets a
     /// fair chance at traffic instead of being penalized by a stale high EWMA.
     pub fn reset_recovered_target_latency(&self, upstream_id: &str, target: &UpstreamTarget) {
-        let balancers = self.balancers.load();
-        if let Some(balancer) = balancers.get(upstream_id) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
             balancer.reset_recovered_target_latency(target);
         }
     }
