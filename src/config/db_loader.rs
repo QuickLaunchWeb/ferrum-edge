@@ -1,9 +1,11 @@
 //! Database config loader with incremental polling.
 //!
 //! **Incremental polling strategy** (two-phase):
-//! 1. **Change detection**: Indexed `WHERE updated_at > ?` queries on 4 tables to
+//! 1. **Change detection**: Indexed `WHERE updated_at >= ?` queries on 4 tables to
 //!    fetch only rows modified since the last poll. A 1-second safety margin on the
 //!    timestamp prevents missing boundary writes due to clock skew or in-flight commits.
+//!    The `>=` (inclusive) ensures rows written at exactly the boundary are never missed;
+//!    duplicates from the overlap are harmless because the incremental result is merged by ID.
 //! 2. **Deletion detection**: Lightweight `SELECT id` queries on all 4 tables, diffed
 //!    against the poller's known ID sets to find removed rows.
 //!
@@ -2070,7 +2072,7 @@ impl DatabaseStore {
     ///
     /// This replaces `load_full_config()` for subsequent polls after the initial
     /// full load, reducing DB I/O from 4 full table scans to 4 indexed
-    /// `WHERE updated_at > ?` queries plus 4 lightweight `SELECT id` queries.
+    /// `WHERE updated_at >= ?` queries plus 4 lightweight `SELECT id` queries.
     pub async fn load_incremental_config(
         &self,
         namespace: &str,
@@ -2156,7 +2158,7 @@ impl DatabaseStore {
     ) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
@@ -2260,7 +2262,7 @@ impl DatabaseStore {
     ) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
@@ -2282,7 +2284,7 @@ impl DatabaseStore {
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND updated_at > ?"),
+            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND updated_at >= ?"),
         )
         .bind(namespace)
         .bind(since_str)
@@ -2305,7 +2307,7 @@ impl DatabaseStore {
     ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at >= ?"))
                 .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
