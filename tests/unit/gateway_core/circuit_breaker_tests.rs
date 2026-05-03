@@ -876,21 +876,27 @@ fn test_concurrent_failure_and_success_recording() {
 // ─── Concurrent Half-Open Probe Failures ────────────────────────────────────
 
 /// Regression test: concurrent half-open probe failures must not corrupt the
-/// in-flight counter. Before the fix, both threads would atomically decrement
-/// `half_open_in_flight` (correct) but then unconditionally `store(0)`, which
-/// could clobber a value that another thread hadn't decremented yet. The fix
-/// removes the redundant `store(0)` so the counter drains naturally.
+/// in-flight counter. Before the fix, `record_failure` in the HALF_OPEN branch
+/// would atomically decrement `half_open_in_flight` (correct) but then
+/// unconditionally `store(0)`, racing with concurrent decrements from other
+/// probe threads and potentially clobbering a value that hadn't been
+/// decremented yet. When the breaker later re-entered HALF_OPEN, the counter
+/// started from a non-zero residue and fewer than `half_open_max_requests`
+/// probes could be admitted. The fix removes the redundant `store(0)`.
 ///
-/// This test admits multiple probes, then fires concurrent failures, and
-/// verifies the breaker transitions cleanly to OPEN without panics or
-/// inconsistent state. It runs many iterations to increase the chance of
-/// exposing an interleaving bug.
+/// This test uses barriers to force the interleaving that triggers the bug:
+///   1. Admit all probe slots so `half_open_in_flight == half_open_max_requests`.
+///   2. Fire all probe failures concurrently via a barrier.
+///   3. Assert `half_open_in_flight == 0` after all probes drain.
+///   4. Transition to HALF_OPEN again and verify the full capacity is claimable.
+///
+/// Runs 200 iterations to maximise the chance of hitting a harmful interleaving.
 #[test]
 fn test_concurrent_half_open_probe_failures() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    for _ in 0..100 {
+    for _ in 0..200 {
         let config = CircuitBreakerConfig {
             failure_threshold: 1,
             success_threshold: 10, // High so successes alone won't close it
@@ -911,11 +917,14 @@ fn test_concurrent_half_open_probe_failures() {
         assert!(cb.can_execute().is_ok()); // slot 3
         assert!(cb.can_execute().is_ok()); // slot 4
         assert_eq!(cb.state_name(), "half_open");
+        assert_eq!(cb.half_open_in_flight(), 4);
 
         // All 4 slots taken — next should be rejected
         assert!(cb.can_execute().is_err());
 
-        // Fire all 4 probe failures concurrently via a barrier
+        // Fire all 4 probe failures concurrently via a barrier.
+        // The barrier ensures all threads call record_failure at roughly the
+        // same instant, maximising the window for a store-after-decrement race.
         let barrier = Arc::new(Barrier::new(4));
         let mut handles = Vec::new();
         for _ in 0..4 {
@@ -933,22 +942,49 @@ fn test_concurrent_half_open_probe_failures() {
         // Must be open after all probe failures
         assert_eq!(cb.state_name(), "open");
 
-        // The in-flight counter must have drained to 0 so that the next
-        // half-open cycle can admit probes correctly.
-        // Transition to half-open again (timeout=0) and verify probes work.
-        assert!(cb.can_execute().is_ok());
+        // ── Key assertion: the in-flight counter must have drained to 0. ──
+        // With the old code (unconditional store(0)), a late store could race
+        // with another thread's fetch_sub, leaving the counter at 0 even when
+        // that thread's decrement hadn't been applied yet — or conversely,
+        // a store(0) could run BEFORE another thread's fetch_sub, causing
+        // the counter to wrap around to u32::MAX. Either way, the next
+        // half-open cycle would start from a corrupt value.
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "half_open_in_flight must be 0 after all probes report failure"
+        );
+
+        // ── Verify full capacity in the next half-open cycle. ──
+        // Transition to half-open again (timeout=0).
+        assert!(cb.can_execute().is_ok()); // slot 1 (CAS winner)
         assert_eq!(cb.state_name(), "half_open");
+
+        // Claim the remaining 3 slots — all must succeed if the counter reset
+        // correctly. With the old buggy code, residue in the counter would
+        // cause some of these to be rejected.
+        assert!(cb.can_execute().is_ok()); // slot 2
+        assert!(cb.can_execute().is_ok()); // slot 3
+        assert!(cb.can_execute().is_ok()); // slot 4
+        assert_eq!(cb.half_open_in_flight(), 4);
+
+        // Slot 5 must be rejected — exactly at capacity.
+        assert!(
+            cb.can_execute().is_err(),
+            "Should reject at capacity (half_open_max_requests=4)"
+        );
     }
 }
 
 /// Verify that a mix of concurrent successes and failures in half-open
-/// produces a valid final state (open or closed) without corruption.
+/// produces a valid final state (open or closed) without corruption, and
+/// that the in-flight counter drains to 0 regardless of outcome.
 #[test]
 fn test_concurrent_half_open_mixed_success_and_failure() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    for _ in 0..100 {
+    for _ in 0..200 {
         let config = CircuitBreakerConfig {
             failure_threshold: 1,
             success_threshold: 3,
@@ -967,6 +1003,7 @@ fn test_concurrent_half_open_mixed_success_and_failure() {
             assert!(cb.can_execute().is_ok());
         }
         assert_eq!(cb.state_name(), "half_open");
+        assert_eq!(cb.half_open_in_flight(), 4);
 
         // 2 threads record failure, 2 threads record success — concurrently
         let barrier = Arc::new(Barrier::new(4));
@@ -994,6 +1031,15 @@ fn test_concurrent_half_open_mixed_success_and_failure() {
         assert!(
             state == "open" || state == "closed",
             "State must be valid after concurrent mixed probes, got: {}",
+            state
+        );
+
+        // The in-flight counter must be 0 after all probes have reported,
+        // regardless of whether the final state is open or closed.
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "half_open_in_flight must be 0 after all probes drain (state={})",
             state
         );
     }

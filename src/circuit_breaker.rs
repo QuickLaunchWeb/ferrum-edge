@@ -170,6 +170,17 @@ impl CircuitBreaker {
                     }
                 }
             }
+            STATE_OPEN => {
+                // A concurrent record_failure already reopened the circuit between
+                // our can_execute() and this record_success(). We still own a slot
+                // from when the breaker was HALF_OPEN, so decrement it. The
+                // checked_sub prevents underflow if this is a spurious call.
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |v| v.checked_sub(1),
+                );
+            }
             STATE_CLOSED
                 // Reset failure count on success
                 if self.failure_count.load(Ordering::Relaxed) > 0 =>
@@ -226,6 +237,17 @@ impl CircuitBreaker {
                 self.state.store(STATE_OPEN, Ordering::SeqCst);
                 self.success_count.store(0, Ordering::Relaxed);
             }
+            STATE_OPEN => {
+                // A concurrent record_failure already reopened the circuit between
+                // our can_execute() (when it was HALF_OPEN) and now. We still own
+                // a slot, so decrement it. The checked_sub prevents underflow for
+                // callers arriving from a CLOSED→OPEN path (they never held a slot).
+                let _ = self.half_open_in_flight.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |v| v.checked_sub(1),
+                );
+            }
             _ => {}
         }
     }
@@ -243,6 +265,13 @@ impl CircuitBreaker {
     /// Current success count (for metrics).
     pub fn success_count(&self) -> u32 {
         self.success_count.load(Ordering::Relaxed)
+    }
+
+    /// Current half-open in-flight counter (for testing).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn half_open_in_flight(&self) -> u32 {
+        self.half_open_in_flight.load(Ordering::Acquire)
     }
 
     /// Current state name (for metrics/logging).
