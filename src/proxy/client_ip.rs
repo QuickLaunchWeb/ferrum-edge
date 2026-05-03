@@ -15,8 +15,11 @@
 //! 1. Parse the XFF header into a list of IPs (left-to-right order).
 //! 2. Walk from right to left. While the entry matches a trusted proxy CIDR,
 //!    skip it and continue.
-//! 3. The first non-trusted entry is the real client IP.
-//! 4. If all entries are trusted (or XFF is absent/empty), fall back to the
+//! 3. The first non-trusted, valid entry is the real client IP.
+//! 4. If a malformed (unparseable) entry is encountered after the trusted
+//!    suffix, **stop the walk** and fall back to the socket address. Continuing
+//!    leftward would reach more attacker-controlled entries — fail closed.
+//! 5. If all entries are trusted (or XFF is absent/empty), fall back to the
 //!    TCP socket address.
 //!
 //! # Configuration
@@ -261,15 +264,16 @@ pub fn resolve_client_ip_parsed(
                 // This is a trusted proxy, keep walking left
             }
             Err(_) => {
-                // Unparseable entry — treat as the client IP (conservative).
-                // An attacker could have inserted garbage, but stopping here
-                // is safer than skipping to an earlier (more attacker-controlled)
-                // entry.
+                // Unparseable entry after the trusted suffix — stop the walk.
+                // Entries to the left are MORE attacker-controlled; continuing
+                // would let a spoofed IP feed ACLs, rate limits, and logs.
+                // Fail closed: fall through to the socket address below.
                 debug!(
                     entry = entry,
-                    "Unparseable X-Forwarded-For entry; treating as client IP"
+                    "Malformed X-Forwarded-For entry after trusted suffix; \
+                     falling back to socket address"
                 );
-                return entry.to_string();
+                break;
             }
         }
     }
