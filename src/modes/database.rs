@@ -693,13 +693,23 @@ pub async fn run(
     //   - DNS is warmed and connection pools are pre-established
     //   - All listeners (proxy HTTP/HTTPS/H3, admin, stream) are bound
     //
-    // This is intentionally set BEFORE the DB polling loop starts. The initial
-    // `load_full_config()` already proved DB connectivity and loaded a complete
-    // config — the polling loop handles ongoing incremental updates, not initial
-    // readiness. `/health` independently validates DB connectivity via a
-    // `SELECT 1` check (cached 15s), so DB failures surface in the health
-    // response regardless of polling state. `db_available` separately gates
-    // admin writes when the DB becomes unreachable during operation.
+    // This is intentionally set BEFORE the DB polling loop starts. Two paths
+    // reach this point:
+    //
+    //   1. Normal — `load_full_config()` succeeded, proving DB connectivity
+    //      and loading a complete config.
+    //   2. Backup — `load_full_config()` failed but `FERRUM_DB_CONFIG_BACKUP_PATH`
+    //      was set, so config was restored from the on-disk backup file. The
+    //      gateway is serving stale-but-valid config; `db_available` starts
+    //      `false`, `/health` reports `"degraded"`, and admin writes are
+    //      blocked. The polling loop will retry the DB and flip
+    //      `db_available` back to `true` once it recovers.
+    //
+    // In both cases the polling loop handles *ongoing incremental updates*,
+    // not initial readiness. `/health` independently validates DB connectivity
+    // via a `SELECT 1` check (cached 15s), so DB failures surface in the
+    // health response regardless of polling state. `db_available` separately
+    // gates admin writes when the DB becomes unreachable during operation.
     startup_ready.store(true, Ordering::Relaxed);
     info!("Gateway startup complete; /health now reports ready");
 
