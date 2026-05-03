@@ -1629,6 +1629,171 @@ mod tests {
     //!   unconditionally returns collected `body_bytes` so the outer
     //!   retry loop in `mod.rs` has them.
 
+    // -----------------------------------------------------------------------
+    // GRPC_POOL_KEY_BUF thread-local helper tests
+    //
+    // Mirrors the HTTP/2 pool-key tests in `http2_pool.rs`. The gRPC pool
+    // uses the same thread-local `String` buffer strategy for zero-allocation
+    // cache hits on the proxy hot path.
+    // -----------------------------------------------------------------------
+
+    use super::*;
+    use crate::config::types::{
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+    };
+    use chrono::Utc;
+
+    /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
+    /// gRPC pool path is the realistic codepath (gRPC over TLS).
+    fn grpc_pool_test_proxy() -> Proxy {
+        let now = Utc::now();
+        Proxy {
+            id: "p-grpc".to_string(),
+            namespace: crate::config::types::default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/".to_string()),
+            backend_scheme: Some(BackendScheme::Https),
+            dispatch_kind: DispatchKind::from(BackendScheme::Https),
+            backend_host: "grpc-backend.test".to_string(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5_000,
+            backend_read_timeout_ms: 30_000,
+            backend_write_timeout_ms: 30_000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig::default_verify(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Correctness: the thread-local helper must produce the same byte string
+    /// as `grpc_pool_key_owned()`. If these ever diverge the gRPC pool would
+    /// silently fragment (one allocation path inserts keys, the other looks
+    /// them up -- a mismatch would never hit a cached connection).
+    #[test]
+    fn with_grpc_pool_key_matches_grpc_pool_key_owned() {
+        let proxy = grpc_pool_test_proxy();
+        let owned = grpc_pool_key_owned(&proxy);
+        let from_thread_local = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        assert_eq!(
+            owned, from_thread_local,
+            "thread-local key must equal grpc_pool_key_owned bytes — \
+             divergence would split the cache"
+        );
+    }
+
+    /// Correctness across runs: a second `with_grpc_pool_key` invocation
+    /// against the same `Proxy` must produce the identical key even after
+    /// a different proxy with a longer host grows the buffer. Catches a
+    /// future bug where stale buffer contents leak through if `clear()` is
+    /// dropped from `write_grpc_pool_key`.
+    #[test]
+    fn with_grpc_pool_key_is_idempotent_after_buffer_growth() {
+        let proxy = grpc_pool_test_proxy();
+        let k1 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        // Force the buffer to grow in between by running a different proxy
+        // with a longer host through the helper.
+        let mut other = grpc_pool_test_proxy();
+        other.backend_host =
+            "very-long-grpc-backend-hostname-that-grows-the-buffer.subdomain.example.com"
+                .to_string();
+        let _ = with_grpc_pool_key(&other, |buf| buf.clone());
+        let k2 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        assert_eq!(k1, k2, "same proxy must always yield the same key");
+    }
+
+    /// Reuse: repeated `with_grpc_pool_key` calls on the same thread must
+    /// reuse the underlying heap buffer, not allocate a fresh one each call.
+    /// We capture the heap pointer of the buffer's storage between
+    /// invocations and assert it never moves once the capacity is large
+    /// enough to hold the key. This is the load-bearing assertion for the
+    /// CLAUDE.md "zero-allocation hot path" rule.
+    #[test]
+    fn with_grpc_pool_key_reuses_heap_buffer_across_calls() {
+        let proxy = grpc_pool_test_proxy();
+
+        // Prime the buffer once so the initial capacity is sized to hold
+        // the key. The thread-local was constructed with capacity 128
+        // (well above the typical key length), so this should not realloc.
+        let (first_ptr, first_capacity) =
+            with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+        assert!(
+            first_capacity >= 128,
+            "expected pre-sized capacity (>=128), got {first_capacity}"
+        );
+
+        // Run a tight loop and assert the heap pointer NEVER moves. If the
+        // optimization regresses to per-call `String::with_capacity(...)`,
+        // the pointer would change on every iteration.
+        for i in 0..1024 {
+            let (ptr, cap) =
+                with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            assert_eq!(
+                ptr, first_ptr,
+                "iteration {i}: heap pointer changed (was {first_ptr:#x}, now {ptr:#x}) — \
+                 thread-local buffer was reallocated, defeating the optimization"
+            );
+            assert_eq!(
+                cap, first_capacity,
+                "iteration {i}: capacity changed without a heap move — \
+                 unexpected, would imply ZST or alias chicanery"
+            );
+        }
+    }
+
+    /// Phase-2 (post-await fallback) compatibility: the `debug_assert_eq!`
+    /// in `get_sender`'s error path requires that re-running
+    /// `write_grpc_pool_key` against the same proxy produces a buffer
+    /// whose `len()` equals the `base_len` captured pre-await. If a future
+    /// refactor adds non-deterministic content to the key (e.g. timestamps)
+    /// the assertion would fire under -C debug-assertions=on.
+    #[test]
+    fn with_grpc_pool_key_base_len_is_stable() {
+        let proxy = grpc_pool_test_proxy();
+        let len1 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        let len2 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        assert_eq!(
+            len1, len2,
+            "base_len must be deterministic across calls — \
+             the post-await fallback in get_sender relies on this"
+        );
+    }
+
     /// Fix 3: source-level assertion that the pathological
     /// `unwrap_or(256)` default on buffered body collection is gone.
     ///
