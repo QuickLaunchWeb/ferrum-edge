@@ -1,6 +1,7 @@
 //! Tests for database migration runner
 
 use ferrum_edge::config::migrations::MigrationRunner;
+use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
 /// With SQLite in-memory databases, each connection gets a separate DB,
@@ -14,6 +15,27 @@ async fn test_pool() -> sqlx::AnyPool {
         .await
         .unwrap()
 }
+
+/// Query sqlite_master for all index names in the database.
+async fn get_index_names(pool: &sqlx::AnyPool) -> Vec<String> {
+    let rows: Vec<sqlx::any::AnyRow> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("name").unwrap())
+        .collect()
+}
+
+/// The indexes that V002 creates (also present in V001 for fresh databases).
+const V002_INDEX_NAMES: &[&str] = &[
+    "idx_proxy_plugins_plugin_config_id",
+    "idx_proxies_ns_updated",
+    "idx_consumers_ns_updated",
+    "idx_plugin_configs_ns_updated",
+    "idx_upstreams_ns_updated",
+];
 
 #[tokio::test]
 async fn test_migration_runner_fresh_database() {
@@ -32,6 +54,17 @@ async fn test_migration_runner_fresh_database() {
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
     assert!(applied_again.is_empty());
+
+    // Verify that the V002 indexes actually exist in the database
+    let index_names = get_index_names(&pool).await;
+    for expected in V002_INDEX_NAMES {
+        assert!(
+            index_names.iter().any(|n| n == expected),
+            "Expected index '{}' to exist after fresh migration, found: {:?}",
+            expected,
+            index_names
+        );
+    }
 }
 
 #[tokio::test]
@@ -86,6 +119,19 @@ async fn test_migration_runner_bootstrap_existing_db() {
     assert_eq!(status.applied[0].version, 1);
     assert_eq!(status.applied[1].version, 2);
     assert!(status.pending.is_empty());
+
+    // Verify that the V002 indexes actually exist in the database.
+    // This is the critical path: pre-migration databases had the tables but
+    // NOT the indexes, so V002 must create them.
+    let index_names = get_index_names(&pool).await;
+    for expected in V002_INDEX_NAMES {
+        assert!(
+            index_names.iter().any(|n| n == expected),
+            "Expected index '{}' to exist after bootstrap + V002, found: {:?}",
+            expected,
+            index_names
+        );
+    }
 }
 
 #[tokio::test]

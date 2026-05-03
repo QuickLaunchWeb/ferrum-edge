@@ -12,8 +12,8 @@ use super::Migration;
 ///
 /// All statements use `CREATE INDEX IF NOT EXISTS` so they are safe to run on
 /// both fresh databases (idempotent no-op) and pre-migration databases (creates
-/// the missing indexes). MySQL < 8.0.29 does not support `IF NOT EXISTS`, so we
-/// strip it and ignore duplicate-key errors (error 1061).
+/// the missing indexes). MySQL does not reliably support `IF NOT EXISTS` on
+/// `CREATE INDEX`, so we strip it and ignore duplicate-key errors (error 1061).
 pub struct V002AddMissingIndexes;
 
 impl Migration for V002AddMissingIndexes {
@@ -48,7 +48,7 @@ impl V002AddMissingIndexes {
 
         for idx_sql in indexes {
             if is_mysql {
-                // MySQL < 8.0.29 does not support CREATE INDEX IF NOT EXISTS.
+                // MySQL does not reliably support CREATE INDEX IF NOT EXISTS.
                 // Strip the clause and ignore duplicate-key errors (1061).
                 let mysql_sql = idx_sql.replace("IF NOT EXISTS ", "");
                 match sqlx::query(&mysql_sql).execute(pool).await {

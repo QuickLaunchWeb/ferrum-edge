@@ -113,7 +113,7 @@ impl V001SqlBuilder {
 
     async fn execute_index_sql(&self, pool: &AnyPool, idx_sql: &str) -> Result<(), anyhow::Error> {
         if self.is_mysql() {
-            // MySQL < 8.0.29 does not support CREATE INDEX IF NOT EXISTS, so we
+            // MySQL does not reliably support CREATE INDEX IF NOT EXISTS, so we
             // strip the clause and ignore duplicate-key errors, matching the
             // previous migration behavior.
             let mysql_sql = idx_sql.replace("IF NOT EXISTS ", "");
