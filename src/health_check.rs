@@ -493,9 +493,23 @@ impl HealthChecker {
                     timer.tick().await;
                 }
 
+                // Fast path: skip the scan when no proxy has any unhealthy
+                // targets.  DashMap::is_empty() is O(shards) — effectively free
+                // compared to iterating every proxy × every unhealthy entry.
+                let any_unhealthy = passive_health
+                    .iter()
+                    .any(|entry| !entry.value().unhealthy.is_empty());
+                if !any_unhealthy {
+                    continue;
+                }
+
                 let now = now_epoch_ms();
 
-                // Iterate each proxy's passive state
+                // Read-scan (read locks only) to collect expired keys, then
+                // remove each one individually.  This avoids retain() which
+                // takes shard WRITE locks across the entire map — blocking
+                // hot-path passive health lookups/updates during the failure
+                // scenario where recovery scans are most active.
                 for entry in passive_health.iter() {
                     let proxy_id = entry.key();
                     let proxy_state = entry.value();
@@ -511,6 +525,8 @@ impl HealthChecker {
                         .map(|e| e.key().clone())
                         .collect();
 
+                    // Remove + log + reset outside the iteration (no shard
+                    // locks held during logging or failure-state cleanup).
                     for hp in &to_recover {
                         if proxy_state.unhealthy.remove(hp).is_some() {
                             info!(
