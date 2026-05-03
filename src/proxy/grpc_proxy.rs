@@ -60,9 +60,10 @@ pub enum GrpcBody {
     /// after `send_request()` completes to return a proper gRPC error.
     ///
     /// **Thread-safety of `bytes_seen: usize`**: this counter is only read
-    /// and written inside `poll_frame()`, which requires `Pin<&mut Self>`
-    /// (exclusive access). HTTP body types are polled from a single task,
-    /// so no concurrent access is possible. Cross-task signaling uses the
+    /// and written inside `poll_frame()`, which requires `Pin<&mut Self>`.
+    /// The mutable-borrow requirement guarantees exclusive ownership, making
+    /// concurrent polling structurally impossible regardless of which task
+    /// drives the poll. Cross-task signaling uses the
     /// separate `exceeded: Arc<AtomicBool>` flag. This matches the
     /// `SizeLimitedStreamingResponse` pattern in `body.rs`, which also
     /// uses a plain `usize` for the same reason. Contrast with
