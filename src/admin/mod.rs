@@ -60,11 +60,39 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
-    /// Startup readiness flag flipped by the mode once listeners are bound and
-    /// the gateway has finished its initial loading work.
+    /// Startup readiness flag — flipped once by the mode after the initial config
+    /// is loaded, all caches are built, DNS/pools are warmed, and every listener
+    /// (proxy, admin, stream) is bound and accepting connections.
+    ///
+    /// While `false`, `/health` returns 503 `"starting"`. Once `true`, `/health`
+    /// returns 200 (possibly `"degraded"` if DB is unreachable).
+    ///
+    /// **Intentionally set before the DB polling loop starts** in database and CP
+    /// modes. Two paths apply in database mode:
+    ///
+    ///   1. Normal — `load_full_config()` succeeded, proving DB connectivity.
+    ///   2. Backup — `load_full_config()` failed but `FERRUM_DB_CONFIG_BACKUP_PATH`
+    ///      was set, so config was restored from the on-disk backup. `db_available`
+    ///      starts `false`, `/health` reports `"degraded"`, and admin writes are
+    ///      blocked until the polling loop reconnects to the DB.
+    ///
+    /// CP mode always requires a live DB (no backup path).
+    ///
+    /// The polling loop handles *ongoing incremental updates*, not initial
+    /// readiness. `/health` independently validates DB connectivity via a
+    /// `SELECT 1` check (cached 15 s via `cached_db_health`), so DB failures
+    /// surface in the health response regardless of polling state. Deferring
+    /// readiness until the first poll tick would add an unnecessary
+    /// `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30 s) startup delay.
+    ///
+    /// DP mode differs: it starts with an empty config and defers `startup_ready`
+    /// until the first CP snapshot is applied + backend capabilities are classified.
     pub startup_ready: Option<Arc<AtomicBool>>,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
+    /// This flag is orthogonal to `startup_ready` — a gateway can be ready to
+    /// serve traffic (`startup_ready=true`) while admin writes are blocked
+    /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
