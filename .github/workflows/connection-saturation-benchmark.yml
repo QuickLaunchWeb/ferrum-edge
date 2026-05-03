@@ -6,13 +6,16 @@
 # `gateways-protocol-benchmark.yml`: here we ramp connection count, not RPS.
 #
 # All gateways run in Docker with --network host and matched `--ulimit
-# nofile=1048576:1048576` so no gateway has a per-container FD-cap advantage.
-# The host gets sysctl tuning (somaxconn, ip_local_port_range, syn_backlog)
-# and `ulimit -n 1048576` so the test client and gateway both have headroom
-# beyond the highest configured N.
+# nofile=1048576:1048576` (docker daemon controls per-container caps
+# independently of the calling shell). The host gets sysctl tuning
+# (somaxconn, ip_local_port_range, syn_backlog) via sudo.
 #
-# GitHub-hosted ubuntu-latest runners (4 vCPU / 16 GB RAM) can comfortably
-# handle N up to ~50K. For larger N values use a paid larger runner — see
+# GitHub-hosted ubuntu-latest runners cap both soft and hard FD limits at
+# 65536 and an unprivileged shell can't raise either, so this workflow
+# inspects+validates the host FD ceiling rather than trying to modify it. The
+# practical ceiling for N on ubuntu-latest is ~50K (leaves headroom for the
+# proto_bench client + base FDs); requesting more will fail-fast with an
+# actionable message. For larger N values use a self-hosted runner — see
 # the `runner` input below.
 #
 # Usage: Actions → "Connection Saturation Benchmark" → Run workflow.
@@ -94,34 +97,53 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler lsof jq
 
-      # ── Host tuning ─────────────────────────────────────────────────────────
-      # GitHub-hosted ubuntu runners: hard FD limit is 1048576 by default; we
-      # raise the soft limit to match. sysctl values default lower than what
-      # 50K simultaneous connects need (somaxconn=4096, syn_backlog=128 on
-      # some images) — bump them so we measure the *gateway's* breaking point,
-      # not the kernel's accept queue overflowing first.
-      - name: Tune host for high connection counts
+      # ── Host inspection / sanity ────────────────────────────────────────────
+      # GitHub-hosted ubuntu-latest runners cap both soft and hard FD limits
+      # at 65536 (verified 2026-05-03) and the runner doesn't grant the
+      # capability needed to raise the hard cap from sudo, so an unprivileged
+      # shell can't `ulimit -n` past it. Rather than fight the runner, print
+      # the limits we actually have and fail fast if the requested connection
+      # levels would overrun them — that way the failure mode is "your test
+      # config is too aggressive for this runner" instead of silent FD
+      # exhaustion masquerading as a gateway breaking. For larger N values,
+      # point `runner` at a self-hosted runner where you can raise the cap.
+      - name: Verify host capacity for requested connection levels
         run: |
-          echo "── before tuning ──"
-          echo "soft FD: $(ulimit -Sn)  hard FD: $(ulimit -Hn)"
+          set -euo pipefail
+
+          SOFT_FD=$(ulimit -Sn)
+          HARD_FD=$(ulimit -Hn)
+          HIGHEST_N=$(echo "${{ inputs.connection_levels }}" | tr ' ' '\n' | sort -n | tail -1)
+          # The proto_bench client needs ~1 FD per connection plus ~256 base
+          # FDs (stdio, libs, /proc, etc.). Add 1024 for headroom.
+          REQUIRED_FD=$((HIGHEST_N + 1024))
+
+          echo "── runner FD limits ──"
+          echo "soft FD: $SOFT_FD"
+          echo "hard FD: $HARD_FD"
+          echo "highest N: $HIGHEST_N"
+          echo "required FD (highest N + 1024 headroom): $REQUIRED_FD"
+
+          if [ "$SOFT_FD" -lt "$REQUIRED_FD" ]; then
+            echo "::error::Soft FD limit ($SOFT_FD) is below the required $REQUIRED_FD for the configured connection levels (highest N = $HIGHEST_N). GitHub-hosted ubuntu-latest caps soft and hard FD limits at 65536 and unprivileged shells cannot raise them. Lower connection_levels (recommend ≤ 50000 to leave headroom) or run on a self-hosted runner where you can raise the cap."
+            exit 1
+          fi
+
+      # sysctl tuning IS allowed via sudo on GitHub-hosted runners and
+      # actually takes effect. ulimit modification is not — see the
+      # "Verify host capacity" step above.
+      - name: Tune kernel for high connection counts
+        run: |
+          echo "── sysctl values (before tuning) ──"
           sudo sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
             net.ipv4.ip_local_port_range fs.file-max 2>&1 | grep -v ^$ || true
 
-          # Persistent tunings via sysctl. Done with sudo so the values
-          # actually take effect — `ulimit` itself runs in-process and is
-          # re-applied per `bash -lc` step below.
           sudo sysctl -w fs.file-max=2097152
           sudo sysctl -w net.core.somaxconn=65535
           sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
           sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
           sudo sysctl -w net.ipv4.tcp_tw_reuse=1
           sudo sysctl -w net.ipv4.tcp_fin_timeout=15
-
-          # /etc/security/limits.conf for new shells (the bench script uses
-          # bash -lc, so the inline `ulimit -n` in the run step is what
-          # actually matters — but set this too for completeness).
-          echo "* soft nofile 1048576" | sudo tee -a /etc/security/limits.conf
-          echo "* hard nofile 1048576" | sudo tee -a /etc/security/limits.conf
 
           echo "── after tuning ──"
           sudo sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
@@ -149,9 +171,8 @@ jobs:
       - name: Run connection saturation benchmark
         run: |
           set -euo pipefail
-          # Soft-raise the FD limit for THIS shell — the bench script's child
-          # processes (proto_bench client, proto_backend) inherit it.
-          ulimit -n 1048576
+          # FD limit verified in the precheck step — the runner's hard cap
+          # bounds what we can reach, but it's enough for the requested N.
           ulimit -Sn
 
           ./tests/performance/multi_protocol/run_connection_saturation_bench.sh \
@@ -183,9 +204,11 @@ jobs:
           out_lines.append(f"**Ramp / hold:** `${{ inputs.ramp_seconds }}s` / `${{ inputs.hold_seconds }}s`")
           out_lines.append(f"**Heartbeat:** `${{ inputs.heartbeat_interval_ms }}ms` per connection")
           out_lines.append("")
-          out_lines.append("Each gateway was run in Docker with `--ulimit nofile=1048576:1048576`. "
-                           "Host got `ulimit -n 1048576`, `somaxconn=65535`, "
-                           "`tcp_max_syn_backlog=65535`, port range `1024-65535`. "
+          out_lines.append("Each gateway was run in Docker with `--ulimit nofile=1048576:1048576` "
+                           "(docker daemon controls per-container caps independently of the calling "
+                           "shell). Host kept its 65536 FD cap (GitHub-hosted runner default; "
+                           "unprivileged shells can't raise it) and got `somaxconn=65535`, "
+                           "`tcp_max_syn_backlog=65535`, port range `1024-65535` via sysctl. "
                            "All five gateways exposed only HTTP/1.1+TLS for an apples-to-apples "
                            "comparison (the universal supported protocol).")
           out_lines.append("")
