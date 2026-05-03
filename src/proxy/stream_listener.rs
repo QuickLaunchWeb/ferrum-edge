@@ -189,17 +189,32 @@ impl StreamListenerManager {
 
     /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
     ///
-    /// Call this once the gateway's TLS certificates are loaded, then call
-    /// `reconcile()` to restart any listeners that need frontend TLS.
-    pub fn set_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
+    /// After storing the config, automatically reconciles stream listeners so
+    /// any previously deferred TCP listeners (waiting for TLS) are started.
+    /// This is safe to call before the first `reconcile()` — the reconcile is
+    /// a no-op when there are no stream proxies in the config yet.
+    pub async fn set_frontend_tls_config(&self, tls_config: Option<Arc<rustls::ServerConfig>>) {
+        let is_some = tls_config.is_some();
         self.frontend_tls_config.store(Arc::new(tls_config));
+        // Reconcile to start any listeners that were deferred due to missing TLS config.
+        if is_some {
+            let failures = self.reconcile().await;
+            for (proxy_id, port, err) in &failures {
+                warn!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "Stream listener failed to bind after TLS config loaded: {}",
+                    err
+                );
+            }
+        }
     }
 
     /// Update the DTLS cert/key paths used for UDP stream proxies with `frontend_tls: true`.
     ///
-    /// Call this after loading DTLS certificates, then call `reconcile()` to start
-    /// any deferred DTLS frontend listeners.
-    pub fn set_frontend_dtls_cert_key(
+    /// After storing the config, automatically reconciles stream listeners so
+    /// any previously deferred UDP/DTLS listeners are started.
+    pub async fn set_frontend_dtls_cert_key(
         &self,
         cert_path: String,
         key_path: String,
@@ -209,6 +224,16 @@ impl StreamListenerManager {
             .store(Arc::new(Some((cert_path, key_path))));
         self.frontend_dtls_client_ca_path
             .store(Arc::new(client_ca_cert_path));
+        // Reconcile to start any listeners that were deferred due to missing DTLS config.
+        let failures = self.reconcile().await;
+        for (proxy_id, port, err) in &failures {
+            warn!(
+                proxy_id = %proxy_id,
+                port = port,
+                "Stream listener failed to bind after DTLS config loaded: {}",
+                err
+            );
+        }
     }
 
     /// Reconcile active listeners against the current config.
@@ -341,7 +366,9 @@ impl StreamListenerManager {
 
             // Skip frontend_tls proxies when the required encryption config is not yet loaded.
             // For TCP: needs rustls ServerConfig. For UDP: needs DTLS cert/key paths.
-            // The mode will call reconcile() again after setting the config.
+            // The set_frontend_tls_config() / set_frontend_dtls_cert_key() methods
+            // automatically call reconcile() after storing the config, so deferred
+            // listeners will be started once TLS materials arrive.
             // Passthrough proxies never terminate TLS, so they skip this check entirely.
             if *frontend_tls && !*passthrough {
                 if scheme.is_udp() {
