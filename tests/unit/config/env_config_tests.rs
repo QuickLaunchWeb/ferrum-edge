@@ -3414,3 +3414,21 @@ fn test_db_full_load_page_size_clamped_to_minimum() {
         },
     );
 }
+
+#[test]
+fn test_db_full_load_page_size_clamped_to_maximum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_FULL_LOAD_PAGE_SIZE", "999999"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_full_load_page_size, 100_000,
+                "values above 100000 should be clamped to the maximum"
+            );
+        },
+    );
+}

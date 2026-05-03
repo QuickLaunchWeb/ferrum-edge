@@ -278,7 +278,7 @@ pub struct EnvConfig {
     /// databases. Prevents unbounded `SELECT *` from hitting statement
     /// timeouts or causing memory spikes at scale (100k+ rows). Raw `AnyRow`
     /// buffers are freed between chunks, so peak memory is proportional to
-    /// this value, not table size. Default: 10000. Minimum: 100.
+    /// this value, not table size. Default: 10000. Range: 100..=100000.
     pub db_full_load_page_size: u64,
 
     // Database connection pool tuning
@@ -1213,7 +1213,7 @@ impl EnvConfig {
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
             db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
-            db_full_load_page_size: u64 = "FERRUM_DB_FULL_LOAD_PAGE_SIZE" => 10_000u64, max(100u64);
+            db_full_load_page_size: u64 = "FERRUM_DB_FULL_LOAD_PAGE_SIZE" => 10_000u64, clamp(100u64, 100_000u64);
             db_pool_max_connections: u32 = "FERRUM_DB_POOL_MAX_CONNECTIONS" => 10u32, max(1u32);
             db_pool_min_connections: u32 = "FERRUM_DB_POOL_MIN_CONNECTIONS" => 1u32;
             db_pool_acquire_timeout_seconds: u64 = "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS" => 30u64;
