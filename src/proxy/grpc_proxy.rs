@@ -28,6 +28,7 @@ use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
@@ -137,6 +138,39 @@ impl http_body::Body for GrpcBody {
             GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
         }
     }
+}
+
+thread_local! {
+    /// Reused per-thread buffer for gRPC pool-key construction on the
+    /// request hot path. Mirrors the zero-allocation strategy used by
+    /// `HTTP2_POOL_KEY_BUF` in `http2_pool.rs` so `get_sender()` performs
+    /// zero `String` allocations on cache-hit calls from the same tokio
+    /// worker thread.
+    ///
+    /// The buffer is reset before each lookup. Owned `String` keys are still
+    /// produced via `.clone()` on the cache-miss path (cold start, new
+    /// backends), so the allocation moves off the cache-hit fast path
+    /// entirely.
+    ///
+    /// Cannot be borrowed across `await`. `with_grpc_pool_key` and the
+    /// pre-/post-await scopes in `get_sender` keep every `borrow_mut()`
+    /// inside a synchronous block.
+    static GRPC_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
+}
+
+/// Run `f` against a thread-local buffer pre-populated with the gRPC pool
+/// key for `proxy` (no shard suffix). Callers can append `#<shard>` via
+/// `write_grpc_shard_key_inplace` using `buf.len()` as `base_len`.
+///
+/// The closure must be synchronous -- the underlying `RefCell::borrow_mut`
+/// cannot cross an `.await`. `now_or_never(...)` polling and DashMap
+/// lookups are fine.
+fn with_grpc_pool_key<R>(proxy: &Proxy, f: impl FnOnce(&mut String) -> R) -> R {
+    GRPC_POOL_KEY_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        write_grpc_pool_key(&mut buf, &proxy.backend_host, proxy.backend_port, proxy);
+        f(&mut buf)
+    })
 }
 
 fn write_grpc_pool_key(buf: &mut String, host: &str, port: u16, proxy: &Proxy) {
@@ -267,6 +301,11 @@ impl GrpcConnectionPool {
     ///
     /// Writes the base key (without shard suffix) into `buf`. For shard keys,
     /// `write_shard_key_inplace()` appends `#N` by truncating to the base length.
+    ///
+    /// Not called directly after the thread-local buffer refactor (the free
+    /// function `with_grpc_pool_key` calls `write_grpc_pool_key` instead),
+    /// but retained for parity with the HTTP2 pool's internal API surface.
+    #[allow(dead_code)]
     fn write_pool_key(buf: &mut String, proxy: &Proxy) {
         write_grpc_pool_key(buf, &proxy.backend_host, proxy.backend_port, proxy);
     }
@@ -296,56 +335,90 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        let manager = self.pool.manager();
-        let pool_config = manager.global_pool_config.for_proxy(proxy);
+        let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
-        let mut key_buf = String::with_capacity(128);
-        Self::write_pool_key(&mut key_buf, proxy);
-        let base_len = key_buf.len();
+        // Phase 1 (synchronous): build the pool key in the thread-local
+        // buffer, pick a starting shard via the per-host RR counter, and
+        // probe every shard for an immediately-ready sender. On a cache hit
+        // we return early without ever cloning the key. On a miss we clone
+        // the buffer once into `selected_key` so the await below has an
+        // owned String to hand to `create_or_get_existing_owned`.
+        //
+        // The closure body is synchronous — `now_or_never(sender.ready())`
+        // polls once without yielding, and DashMap lookups never await — so
+        // the `RefCell::borrow_mut()` lifetime stays inside this block.
+        let phase1 = with_grpc_pool_key(proxy, |key_buf| -> GrpcPhase1 {
+            let base_len = key_buf.len();
 
-        // Seed the per-host round-robin counter with a thread-local xorshift
-        // draw so a burst of concurrent gRPC calls on a cold pool fans across
-        // shards from request #1. This matters for gRPC tail latency: under
-        // high concurrency with only 2-4 shards, all requests start by
-        // targeting the same shard if the seed is 0, which creates a queue
-        // behind the first in-flight RPC (p99 = 732 ms at 500 KB payloads).
-        let rr = match self.rr_counters.get(&key_buf) {
-            Some(existing) => existing.value().clone(),
-            None => self
-                .rr_counters
-                .entry(key_buf[..base_len].to_owned())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(crate::proxy::http2_pool::rr_seed())))
-                .clone(),
-        };
-        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+            // Round-robin counter is per-host, but on FIRST access we seed it
+            // with a thread-local PRNG offset so a burst of concurrent
+            // requests on a cold pool does not land all on shard 0 before
+            // the atomic counter wraps around. `AtomicUsize::fetch_add(1,
+            // Relaxed)` is wait-free after the seed — the seed only matters
+            // for the first `shard_count` picks per host on this gateway.
+            let rr = match self.rr_counters.get(key_buf.as_str()) {
+                Some(existing) => existing.value().clone(),
+                // Cold-path allocation: `to_owned()` runs only on the first
+                // request to a given backend host — subsequent requests find
+                // the existing entry via the `get()` above.
+                None => self
+                    .rr_counters
+                    .entry(key_buf[..base_len].to_owned())
+                    .or_insert_with(|| {
+                        Arc::new(AtomicUsize::new(crate::proxy::http2_pool::rr_seed()))
+                    })
+                    .clone(),
+            };
+            let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
-        // Cheap probe pass — any shard whose cached sender is immediately
-        // ready wins. `now_or_never` never awaits, so this is a quick sweep
-        // of the shard ring with no per-shard stall.
-        for offset in 0..shard_count {
-            let shard = (start + offset) % shard_count;
-            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
+            // Cheap probe pass — any shard whose cached sender is
+            // immediately ready wins. `now_or_never` never awaits, so this
+            // is a quick sweep of the shard ring with no per-shard stall.
+            for offset in 0..shard_count {
+                let shard = (start + offset) % shard_count;
+                Self::write_shard_key_inplace(key_buf, base_len, shard);
 
-            if let Some(mut sender) = self.pool.cached(&key_buf) {
-                match futures_util::FutureExt::now_or_never(sender.ready()) {
-                    Some(Ok(())) => return Ok(sender),
-                    Some(Err(_)) => self.pool.invalidate(&key_buf),
-                    // Shard exists but is mid-send. Skip — we would rather
-                    // open a fresh h2 connection (per-key-coalesced via
-                    // `create_or_get_existing_owned`, so concurrent callers
-                    // dedupe onto ONE create future) than stall on
-                    // `timeout(ready())`. The previous 1 ms wait still
-                    // serialized under burst concurrency and was the
-                    // largest contributor to gRPC p99 tail latency for
-                    // 100-concurrent 500 KB / 1 MB payloads.
-                    None => {}
+                if let Some(mut sender) = self.pool.cached(key_buf) {
+                    match futures_util::FutureExt::now_or_never(sender.ready()) {
+                        Some(Ok(())) => return GrpcPhase1::Hit(sender),
+                        Some(Err(_)) => {
+                            self.pool.invalidate(key_buf);
+                        }
+                        // Shard exists but is mid-send. Skip — we would
+                        // rather open a fresh h2 connection (per-key-
+                        // coalesced via `create_or_get_existing_owned`, so
+                        // concurrent callers dedupe onto ONE create future)
+                        // than stall on `timeout(ready())`. The previous
+                        // 1 ms wait still serialized under burst concurrency
+                        // and was the largest contributor to gRPC p99 tail
+                        // latency for 100-concurrent 500 KB / 1 MB payloads.
+                        None => {}
+                    }
                 }
             }
-        }
 
-        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
-        let selected_key = key_buf.clone();
+            Self::write_shard_key_inplace(key_buf, base_len, start);
+            // Single allocation: clone the thread-local buffer into the
+            // owned key that `create_or_get_existing_owned` consumes. This
+            // is the only `String` allocation on the cache-miss path now —
+            // cache hits take the early return above without allocating.
+            GrpcPhase1::Miss {
+                selected_key: key_buf.clone(),
+                base_len,
+                start,
+            }
+        });
+
+        let (selected_key, base_len, start) = match phase1 {
+            GrpcPhase1::Hit(sender) => return Ok(sender),
+            GrpcPhase1::Miss {
+                selected_key,
+                base_len,
+                start,
+            } => (selected_key, base_len, start),
+        };
+
         let manager = Arc::clone(self.pool.manager());
         match self
             .pool
@@ -357,17 +430,44 @@ impl GrpcConnectionPool {
         {
             Ok(sender) => Ok(sender),
             Err(err) => {
-                for offset in 1..shard_count {
-                    let shard = (start + offset) % shard_count;
-                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
-                    if let Some(sender) = self.pool.cached(&key_buf) {
-                        return Ok(sender);
+                // Phase 2 (synchronous re-borrow): rebuild the pool key in
+                // the same thread-local buffer and probe alternative shards.
+                // The proxy outlives this future and is read-only, so the
+                // build is identical to phase 1's prelude.
+                let recovered = with_grpc_pool_key(proxy, |key_buf| {
+                    debug_assert_eq!(key_buf.len(), base_len);
+                    for offset in 1..shard_count {
+                        let shard = (start + offset) % shard_count;
+                        Self::write_shard_key_inplace(key_buf, base_len, shard);
+                        if let Some(sender) = self.pool.cached(key_buf) {
+                            return Some(sender);
+                        }
                     }
+                    None
+                });
+                match recovered {
+                    Some(sender) => Ok(sender),
+                    None => Err(err),
                 }
-                Err(err)
             }
         }
     }
+}
+
+/// Outcome of the synchronous phase-1 sweep in `get_sender`.
+enum GrpcPhase1 {
+    /// A cached sender was immediately ready — short-circuit to the caller
+    /// without cloning the pool key or hitting `create_or_get_existing_owned`.
+    Hit(http2::SendRequest<GrpcBody>),
+    /// No shard was immediately ready. Carry the cloned shard key (with
+    /// `#<start_shard>` appended) plus the unsharded `base_len` and
+    /// `start` so the post-await error fallback can reconstruct shard
+    /// keys without recomputing them.
+    Miss {
+        selected_key: String,
+        base_len: usize,
+        start: usize,
+    },
 }
 
 impl GrpcPoolManager {
@@ -1540,6 +1640,171 @@ mod tests {
     //!   prevents response streaming". The `proxy_grpc_request` wrapper
     //!   unconditionally returns collected `body_bytes` so the outer
     //!   retry loop in `mod.rs` has them.
+
+    // -----------------------------------------------------------------------
+    // GRPC_POOL_KEY_BUF thread-local helper tests
+    //
+    // Mirrors the HTTP/2 pool-key tests in `http2_pool.rs`. The gRPC pool
+    // uses the same thread-local `String` buffer strategy for zero-allocation
+    // cache hits on the proxy hot path.
+    // -----------------------------------------------------------------------
+
+    use super::*;
+    use crate::config::types::{
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+    };
+    use chrono::Utc;
+
+    /// Build a minimal `Proxy` for thread-local key tests. Uses HTTPS so the
+    /// gRPC pool path is the realistic codepath (gRPC over TLS).
+    fn grpc_pool_test_proxy() -> Proxy {
+        let now = Utc::now();
+        Proxy {
+            id: "p-grpc".to_string(),
+            namespace: crate::config::types::default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some("/".to_string()),
+            backend_scheme: Some(BackendScheme::Https),
+            dispatch_kind: DispatchKind::from(BackendScheme::Https),
+            backend_host: "grpc-backend.test".to_string(),
+            backend_port: 443,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5_000,
+            backend_read_timeout_ms: 30_000,
+            backend_write_timeout_ms: 30_000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: BackendTlsConfig::default_verify(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Correctness: the thread-local helper must produce the same byte string
+    /// as `grpc_pool_key_owned()`. If these ever diverge the gRPC pool would
+    /// silently fragment (one allocation path inserts keys, the other looks
+    /// them up -- a mismatch would never hit a cached connection).
+    #[test]
+    fn with_grpc_pool_key_matches_grpc_pool_key_owned() {
+        let proxy = grpc_pool_test_proxy();
+        let owned = grpc_pool_key_owned(&proxy);
+        let from_thread_local = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        assert_eq!(
+            owned, from_thread_local,
+            "thread-local key must equal grpc_pool_key_owned bytes — \
+             divergence would split the cache"
+        );
+    }
+
+    /// Correctness across runs: a second `with_grpc_pool_key` invocation
+    /// against the same `Proxy` must produce the identical key even after
+    /// a different proxy with a longer host grows the buffer. Catches a
+    /// future bug where stale buffer contents leak through if `clear()` is
+    /// dropped from `write_grpc_pool_key`.
+    #[test]
+    fn with_grpc_pool_key_is_idempotent_after_buffer_growth() {
+        let proxy = grpc_pool_test_proxy();
+        let k1 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        // Force the buffer to grow in between by running a different proxy
+        // with a longer host through the helper.
+        let mut other = grpc_pool_test_proxy();
+        other.backend_host =
+            "very-long-grpc-backend-hostname-that-grows-the-buffer.subdomain.example.com"
+                .to_string();
+        let _ = with_grpc_pool_key(&other, |buf| buf.clone());
+        let k2 = with_grpc_pool_key(&proxy, |buf| buf.clone());
+        assert_eq!(k1, k2, "same proxy must always yield the same key");
+    }
+
+    /// Reuse: repeated `with_grpc_pool_key` calls on the same thread must
+    /// reuse the underlying heap buffer, not allocate a fresh one each call.
+    /// We capture the heap pointer of the buffer's storage between
+    /// invocations and assert it never moves once the capacity is large
+    /// enough to hold the key. This is the load-bearing assertion for the
+    /// CLAUDE.md "zero-allocation hot path" rule.
+    #[test]
+    fn with_grpc_pool_key_reuses_heap_buffer_across_calls() {
+        let proxy = grpc_pool_test_proxy();
+
+        // Prime the buffer once so the initial capacity is sized to hold
+        // the key. The thread-local was constructed with capacity 128
+        // (well above the typical key length), so this should not realloc.
+        let (first_ptr, first_capacity) =
+            with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+        assert!(
+            first_capacity >= 128,
+            "expected pre-sized capacity (>=128), got {first_capacity}"
+        );
+
+        // Run a tight loop and assert the heap pointer NEVER moves. If the
+        // optimization regresses to per-call `String::with_capacity(...)`,
+        // the pointer would change on every iteration.
+        for i in 0..1024 {
+            let (ptr, cap) =
+                with_grpc_pool_key(&proxy, |buf| (buf.as_ptr() as usize, buf.capacity()));
+            assert_eq!(
+                ptr, first_ptr,
+                "iteration {i}: heap pointer changed (was {first_ptr:#x}, now {ptr:#x}) — \
+                 thread-local buffer was reallocated, defeating the optimization"
+            );
+            assert_eq!(
+                cap, first_capacity,
+                "iteration {i}: capacity changed without a heap move — \
+                 unexpected, would imply ZST or alias chicanery"
+            );
+        }
+    }
+
+    /// Phase-2 (post-await fallback) compatibility: the `debug_assert_eq!`
+    /// in `get_sender`'s error path requires that re-running
+    /// `write_grpc_pool_key` against the same proxy produces a buffer
+    /// whose `len()` equals the `base_len` captured pre-await. If a future
+    /// refactor adds non-deterministic content to the key (e.g. timestamps)
+    /// the assertion would fire under -C debug-assertions=on.
+    #[test]
+    fn with_grpc_pool_key_base_len_is_stable() {
+        let proxy = grpc_pool_test_proxy();
+        let len1 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        let len2 = with_grpc_pool_key(&proxy, |buf| buf.len());
+        assert_eq!(
+            len1, len2,
+            "base_len must be deterministic across calls — \
+             the post-await fallback in get_sender relies on this"
+        );
+    }
 
     /// Fix 3: source-level assertion that the pathological
     /// `unwrap_or(256)` default on buffered body collection is gone.
