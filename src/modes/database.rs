@@ -348,7 +348,7 @@ pub async fn run(
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Start background task to retry failed DNS lookups
-    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
 
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
@@ -1021,6 +1021,9 @@ pub async fn run(
     // hanging if a task is stuck (e.g., blocked on a DB query or DNS lookup).
     let bg_drain = async {
         let _ = dns_handle.await;
+        if let Some(h) = dns_retry_handle {
+            let _ = h.await;
+        }
         let _ = db_poll_handle.await;
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
