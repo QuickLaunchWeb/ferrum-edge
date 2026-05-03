@@ -64,10 +64,8 @@ fn host_port_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
 
-/// Maximum entries in the recent_failures DashMap per target.
-/// Prevents unbounded memory growth during cascading failure scenarios
-/// where failure rate vastly exceeds the window cleanup rate.
-const MAX_RECENT_FAILURES_PER_TARGET: usize = 1000;
+/// Re-export the cap from types so runtime and validation share one value.
+use crate::config::types::MAX_RECENT_FAILURES_PER_TARGET;
 
 /// Health state for a single target.
 struct TargetHealth {
@@ -365,9 +363,10 @@ impl HealthChecker {
 
                 // Clean old failures outside the window and read len() immediately
                 // after retain() to minimise the race window between the two
-                // DashMap operations. Concurrent reporters may insert between
-                // retain and len, so the count can be off by ±1 — acceptable for
-                // health threshold decisions which self-correct on the next tick.
+                // DashMap operations. This is a best-effort snapshot: concurrent
+                // reporters, hard-cap evictions, or recovery clears can skew the
+                // count in either direction. Acceptable for health threshold
+                // decisions which self-correct on subsequent reports and recovery.
                 let window_start =
                     now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
                 state

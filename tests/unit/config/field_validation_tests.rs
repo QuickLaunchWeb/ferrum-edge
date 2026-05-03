@@ -659,6 +659,38 @@ fn test_upstream_passive_health_check_validated() {
 }
 
 #[test]
+fn test_upstream_passive_health_threshold_above_recent_failures_cap_rejected() {
+    use ferrum_edge::config::types::MAX_RECENT_FAILURES_PER_TARGET;
+
+    let mut upstream = make_upstream("test");
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: MAX_RECENT_FAILURES_PER_TARGET as u32 + 1,
+            ..Default::default()
+        }),
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("health_checks.passive.unhealthy_threshold")),
+        "expected rejection when threshold exceeds recent-failures cap, got: {:?}",
+        errs
+    );
+
+    // Exactly at the cap should be accepted
+    let mut upstream2 = make_upstream("test2");
+    upstream2.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: MAX_RECENT_FAILURES_PER_TARGET as u32,
+            ..Default::default()
+        }),
+    });
+    assert!(upstream2.validate_fields().is_ok());
+}
+
+#[test]
 fn test_upstream_service_discovery_dns_sd_validated() {
     let mut upstream = make_upstream("test");
     upstream.service_discovery = Some(ServiceDiscoveryConfig {
