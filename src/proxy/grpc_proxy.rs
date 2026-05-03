@@ -58,6 +58,17 @@ pub enum GrpcBody {
     /// When `max_bytes > 0`, tracks accumulated bytes and sets the shared
     /// `exceeded` flag if the limit is breached. The caller checks the flag
     /// after `send_request()` completes to return a proper gRPC error.
+    ///
+    /// **Thread-safety of `bytes_seen: usize`**: this counter is only read
+    /// and written inside `poll_frame()`, which requires `Pin<&mut Self>`
+    /// (exclusive access). HTTP body types are polled from a single task,
+    /// so no concurrent access is possible. Cross-task signaling uses the
+    /// separate `exceeded: Arc<AtomicBool>` flag. This matches the
+    /// `SizeLimitedStreamingResponse` pattern in `body.rs`, which also
+    /// uses a plain `usize` for the same reason. Contrast with
+    /// `SizeLimitedIncoming`, which needs `Arc<AtomicU64>` because callers
+    /// observe `bytes_seen` from another task after `into_reqwest_body()`
+    /// moves ownership — `GrpcBody` has no such cross-task read path.
     Streaming {
         incoming: Incoming,
         bytes_seen: usize,
