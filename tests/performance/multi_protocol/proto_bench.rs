@@ -1462,6 +1462,15 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     use hdrhistogram::Histogram;
     use std::sync::Mutex;
 
+    // A zero interval makes `next_beat += 0` produce a busy-spin loop that
+    // pegs CPU until the test deadline, with garbage results. Enforce a
+    // floor here rather than at parse-time because the workflow_dispatch
+    // input is a free-form string — clap defaulting won't catch operators
+    // typing 0.
+    if args.heartbeat_interval_ms == 0 {
+        anyhow::bail!("--heartbeat-interval-ms must be greater than 0");
+    }
+
     let is_tls = args.target.starts_with("https://");
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
     let host = url.host().context("no host in URL")?.to_string();
@@ -1498,7 +1507,15 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     let ramp = Duration::from_secs(args.ramp_seconds.max(1));
     let hold = Duration::from_secs(args.hold_seconds);
     let test_start = Instant::now();
-    let hold_until = test_start + ramp + hold;
+    // Heartbeats only run during the [ramp_end, ramp_end + hold] window.
+    // Without this gating, early-ramp connections would beat for ~ramp+hold
+    // seconds while late-ramp connections beat for ~hold seconds, so total
+    // request load varied with ramp_seconds and shifted the breaking point
+    // independently of connection count. Keeping every connection's beat
+    // window pinned to the same hold-after-ramp interval makes load
+    // comparable across runs that tune ramp.
+    let beat_window_start = test_start + ramp;
+    let hold_until = beat_window_start + hold;
 
     if !args.json {
         eprintln!(
@@ -1520,6 +1537,12 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
     } else {
         Duration::from_millis(0)
     };
+
+    // Capture the scalar args used inside the spawned task as locals — the
+    // task body needs a 'static closure, and `args: &SaturateArgs` doesn't
+    // have a 'static lifetime. Cheap u64 copies, no per-task overhead.
+    let total_connections = args.connections;
+    let heartbeat_interval_ms = args.heartbeat_interval_ms;
 
     let mut handles = Vec::with_capacity(args.connections as usize);
     for i in 0..args.connections {
@@ -1577,9 +1600,24 @@ async fn run_saturate(args: &SaturateArgs) -> anyhow::Result<()> {
                 }
             };
 
-            // Heartbeat loop: one small POST per `heartbeat_interval_ms` until hold
-            // window elapses. We send POST not GET because all the bench backends
-            // expect /echo to receive a body matching the configured payload size.
+            // Hold connection idle until the ramp window completes, then enter
+            // the heartbeat phase. A small per-connection phase offset spreads
+            // the first heartbeat across [beat_window_start, beat_window_start
+            // + heartbeat_interval] so we don't get an N-wide thundering herd
+            // the moment ramp ends.
+            let phase_offset = Duration::from_millis(
+                i.saturating_mul(heartbeat_interval_ms) / total_connections.max(1),
+            );
+            let beat_start = beat_window_start + phase_offset;
+            let now_pre_beat = Instant::now();
+            if now_pre_beat < beat_start {
+                tokio::time::sleep(beat_start - now_pre_beat).await;
+            }
+
+            // Heartbeat loop: one small POST per `heartbeat_interval_ms` until
+            // hold window elapses. We send POST not GET because all the bench
+            // backends expect /echo to receive a body matching the configured
+            // payload size.
             let mut next_beat = Instant::now();
             let task_lost = loop {
                 let now = Instant::now();

@@ -468,6 +468,22 @@ gateway_summary() {
     echo "$last_ok $first_break"
 }
 
+# Build a clean comma-separated JSON array from CONNECTION_LEVELS. A naive
+# `tr ' ' ','` preserves repeated/leading/trailing whitespace as empty fields
+# (e.g. "1000  5000" → "[1000,,5000]"), which is invalid JSON and would crash
+# the CI markdown-summary step at json.loads(). The for-loop relies on the
+# unquoted-expansion + IFS field-splitting to collapse whitespace and skip
+# empty fields cleanly.
+levels_csv=""
+for level in $CONNECTION_LEVELS; do
+    [ -z "$level" ] && continue
+    if [ -z "$levels_csv" ]; then
+        levels_csv="$level"
+    else
+        levels_csv="${levels_csv},${level}"
+    fi
+done
+
 SUMMARY="$OUTPUT_DIR/summary.json"
 {
     echo "{"
@@ -475,7 +491,7 @@ SUMMARY="$OUTPUT_DIR/summary.json"
     echo "  \"ramp_seconds\": $RAMP_SECONDS,"
     echo "  \"hold_seconds\": $HOLD_SECONDS,"
     echo "  \"heartbeat_interval_ms\": $HEARTBEAT_MS,"
-    echo "  \"connection_levels\": [$(echo "$CONNECTION_LEVELS" | tr ' ' ',')],"
+    echo "  \"connection_levels\": [${levels_csv}],"
     echo "  \"results\": {"
     is_first=true
     for gw in $GATEWAYS; do
