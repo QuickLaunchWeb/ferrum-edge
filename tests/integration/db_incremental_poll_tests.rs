@@ -44,8 +44,7 @@ async fn incremental_poll_includes_row_at_exact_boundary() {
     // (`since_safe = since - 1s`), then queries `WHERE updated_at >= since_safe`.
     // We set the row's `updated_at` to `since - 1s` (i.e. exactly `since_safe`).
     let since = Utc::now();
-    let boundary_ts =
-        (since - Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let boundary_ts = (since - Duration::seconds(1)).to_rfc3339();
 
     // Insert a minimal upstream row with `updated_at` at the exact boundary.
     let pool = store.pool();
@@ -88,8 +87,7 @@ async fn incremental_poll_excludes_row_before_boundary() {
 
     let since = Utc::now();
     // Place the row 5 seconds before `since_safe` (i.e. 6 seconds before `since`).
-    let old_ts =
-        (since - Duration::seconds(6)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let old_ts = (since - Duration::seconds(6)).to_rfc3339();
 
     let pool = store.pool();
     sqlx::query(
@@ -124,8 +122,7 @@ async fn incremental_poll_boundary_all_four_tables() {
     let (store, _temp_dir) = sqlite_store().await;
 
     let since = Utc::now();
-    let boundary_ts =
-        (since - Duration::seconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let boundary_ts = (since - Duration::seconds(1)).to_rfc3339();
 
     let pool = store.pool();
 
