@@ -44,7 +44,7 @@ mod tls_offload;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
-use tracing::{Level, Metadata, error, info, warn};
+use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -284,6 +284,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             soft_after = fd_raise.soft_after,
             hard = fd_raise.hard,
             "raised soft FD limit to hard cap"
+        );
+    } else if fd_raise.hard > 0 {
+        debug!(
+            soft = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            "FD soft limit already at hard cap"
         );
     }
 

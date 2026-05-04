@@ -427,6 +427,12 @@ const RLIMIT_NOFILE: i32 = 8;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const RLIMIT_NOFILE: i32 = 8; // BSD default
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+    fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+}
+
 /// Recommended floor for the FD hard cap on production hosts. 65,536 covers
 /// 30K+ inbound TCP conns + their amortized outbound pool entries + the
 /// runtime/CRT FDs without the gateway tripping its own 95% critical
@@ -449,17 +455,11 @@ pub struct RaiseFdLimitResult {
     pub raised: bool,
 }
 
-/// Get the maximum file descriptor limit (soft limit) via getrlimit.
+/// Get the maximum file descriptor limit (soft limit).
 fn get_fd_limit() -> u64 {
     #[cfg(unix)]
     {
-        // rlimit struct: two u64 fields (rlim_cur, rlim_max) on 64-bit platforms
-        let mut rlim: [u64; 2] = [0, 0];
-        unsafe extern "C" {
-            fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
-        }
-        let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
-        if result == 0 { rlim[0] } else { 0 }
+        get_fd_rlimit_pair().0
     }
     #[cfg(not(unix))]
     {
@@ -468,14 +468,11 @@ fn get_fd_limit() -> u64 {
 }
 
 /// Read both rlimit fields (soft, hard) at once. Returns `(0, 0)` on
-/// non-Unix or if the syscall fails. Used by [`raise_fd_limit`] so it can
-/// report `(before, after, hard)` in a single result struct.
+/// non-Unix or if the syscall fails. Used by [`raise_fd_limit`] and
+/// [`get_fd_limit`] so there is a single `getrlimit` call site.
 #[cfg(unix)]
 fn get_fd_rlimit_pair() -> (u64, u64) {
     let mut rlim: [u64; 2] = [0, 0];
-    unsafe extern "C" {
-        fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
-    }
     let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
     if result == 0 {
         (rlim[0], rlim[1])
@@ -524,9 +521,6 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
             };
         }
 
-        unsafe extern "C" {
-            fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
-        }
         let new_rlim: [u64; 2] = [hard, hard];
         let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_rlim) };
         if result == 0 {
