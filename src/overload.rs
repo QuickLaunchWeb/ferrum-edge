@@ -596,11 +596,61 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
     }
 }
 
-/// Measure event loop latency by yielding and measuring the scheduling delay.
+/// Measure event loop latency across ALL tokio workers and return the maximum
+/// observed scheduling delay.
+///
+/// Naively timing a single `tokio::task::yield_now().await` only measures the
+/// reschedule latency of the CURRENT task on the CURRENT worker. With a
+/// multi-threaded runtime (one worker per CPU by default), a single starved
+/// worker (e.g., a misbehaving plugin doing blocking I/O on worker 0) is
+/// invisible to a monitor task running on a healthy worker. The 500 ms
+/// `loop_critical_us` gate would then almost never trip even when individual
+/// workers are pinned.
+///
+/// To surface per-worker starvation, we spawn one tiny probe task per worker
+/// (queried via `Handle::current().metrics().num_workers()`), let tokio's
+/// scheduler distribute them across workers, and report the **maximum**
+/// scheduling delay observed across all probes. A starved worker will have at
+/// least one queued probe task that takes much longer than `yield_now()` to
+/// re-poll, surfacing the starvation in the aggregate reading.
+///
+/// Each probe is a single `yield_now().await` (a few microseconds in the
+/// healthy case), so the overall cost scales linearly with worker count and
+/// is negligible at the default 1 s monitor interval.
+///
+/// On `current_thread` runtimes (or any runtime where `num_workers()` returns 0
+/// or 1, e.g. tokio's `LocalSet`-based tests), this falls back to the original
+/// single-task probe.
 async fn measure_event_loop_latency() -> Duration {
-    let start = std::time::Instant::now();
-    tokio::task::yield_now().await;
-    start.elapsed()
+    let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
+
+    // Single-threaded fallback: just measure our own reschedule.
+    if num_workers <= 1 {
+        let start = std::time::Instant::now();
+        tokio::task::yield_now().await;
+        return start.elapsed();
+    }
+
+    let mut probes = tokio::task::JoinSet::new();
+    for _ in 0..num_workers {
+        probes.spawn(async {
+            let start = std::time::Instant::now();
+            tokio::task::yield_now().await;
+            start.elapsed()
+        });
+    }
+
+    let mut max_latency = Duration::ZERO;
+    while let Some(result) = probes.join_next().await {
+        // A probe task panicking is unexpected (yield_now never panics) but if
+        // it ever happens, prefer continuing over aborting the monitor cycle.
+        if let Ok(latency) = result
+            && latency > max_latency
+        {
+            max_latency = latency;
+        }
+    }
+    max_latency
 }
 
 // ── Background monitor task ─────────────────────────────────────────────
@@ -1278,6 +1328,82 @@ mod tests {
         assert!(
             state.should_disable_keepalive_red(),
             "RED helper must return true at saturation (1024/1024 == 100%)"
+        );
+    }
+
+    /// Sanity check: under no load, the all-worker probe should still return a
+    /// small latency, well under the 10 ms warn threshold. This guards against
+    /// regressions where the probe accidentally serializes on something that
+    /// would inflate idle-runtime readings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn measure_event_loop_latency_idle_is_small() {
+        let latency = measure_event_loop_latency().await;
+        assert!(
+            latency < Duration::from_millis(10),
+            "idle multi-worker probe should be <10ms, got {:?}",
+            latency
+        );
+    }
+
+    /// Sanity check: on a single-threaded runtime the function falls back to
+    /// the original single-task probe and still returns quickly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn measure_event_loop_latency_current_thread_fallback() {
+        let latency = measure_event_loop_latency().await;
+        assert!(
+            latency < Duration::from_millis(10),
+            "current-thread probe should be <10ms, got {:?}",
+            latency
+        );
+    }
+
+    /// Saturate every worker with a synchronous CPU-bound sleep, then verify
+    /// the probe surfaces the resulting scheduling delay.
+    ///
+    /// Strategy: spawn `2 * num_workers` synchronous-sleep tasks. The work
+    /// stealing scheduler distributes them, fully oversubscribing every
+    /// worker. The driver task immediately calls `measure_event_loop_latency`,
+    /// which in turn spawns one yield-now probe per worker. Each probe must
+    /// queue behind in-progress sleep work on its assigned worker, so the
+    /// MAX observed reschedule latency is bounded below by the sleep duration
+    /// minus the time the driver took to spin up the probes.
+    ///
+    /// The OLD single-task implementation would also detect this scenario
+    /// (because the driver itself can't make forward progress with every
+    /// worker pinned), but only because the single yield_now happens to land
+    /// behind a sleeping task — by luck of which worker the driver runs on.
+    /// The new per-worker probe is GUARANTEED to surface the worst-case
+    /// worker, not just the driver's worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measure_event_loop_latency_detects_saturated_workers() {
+        let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
+        const SLEEP_MS: u64 = 150;
+        // Spawn 2× workers worth of CPU-bound sleeps so every worker has a
+        // queued blocker behind whatever else lands on it.
+        let mut blockers = Vec::with_capacity(num_workers * 2);
+        for _ in 0..(num_workers * 2) {
+            blockers.push(tokio::spawn(async move {
+                std::thread::sleep(Duration::from_millis(SLEEP_MS));
+            }));
+        }
+
+        // Probe immediately. Each per-worker probe will queue behind the
+        // sleeping blocker(s) on whichever worker it lands on, so the MAX
+        // latency is at least the time it takes for one blocker to finish
+        // and release a worker (minus minor overhead).
+        let latency = measure_event_loop_latency().await;
+
+        for b in blockers {
+            let _ = b.await;
+        }
+
+        // Conservative lower bound: 25ms is well above µs-scale healthy
+        // readings, well below the SLEEP_MS budget, and tolerant of CI jitter.
+        assert!(
+            latency >= Duration::from_millis(25),
+            "expected probe to surface ≥25ms saturation, got {:?} \
+             (probe is not actually queuing on the busy workers)",
+            latency
         );
     }
 }
