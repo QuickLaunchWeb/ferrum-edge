@@ -167,6 +167,7 @@ where
     pub client_ip: &'a str,
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
+    pub requires_response_body_buffering: bool,
     pub sticky_cookie_needed: bool,
 }
 
@@ -311,6 +312,7 @@ where
         client_ip,
         ctx,
         plugins,
+        requires_response_body_buffering,
         sticky_cookie_needed,
     } = request;
     let backend_start = Instant::now();
@@ -373,6 +375,7 @@ where
                 backend_start,
                 ctx,
                 plugins,
+                requires_response_body_buffering,
                 sticky_cookie_needed,
             )
             .await
@@ -397,6 +400,7 @@ where
                 backend_start,
                 ctx,
                 plugins,
+                requires_response_body_buffering,
                 sticky_cookie_needed,
             )
             .await
@@ -566,6 +570,7 @@ async fn dispatch_plain<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    requires_response_body_buffering: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -628,9 +633,7 @@ where
             proxy,
             plugins,
             ctx,
-            state
-                .plugin_cache
-                .requires_response_body_buffering(&proxy.id),
+            requires_response_body_buffering,
         );
 
     let (response, request_bytes) = match prebuffered_body {
@@ -1354,6 +1357,7 @@ async fn dispatch_grpc<S>(
     backend_start: Instant,
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
+    requires_response_body_buffering: bool,
     sticky_cookie_needed: bool,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -1492,9 +1496,7 @@ where
         proxy,
         plugins,
         ctx,
-        state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        requires_response_body_buffering,
     );
     let body_bytes = Bytes::from(body);
     record_cross_protocol_connection_start(state, proxy, current_target.as_deref());

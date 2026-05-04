@@ -419,10 +419,8 @@ fn collect_active_jwks_uris(
     uris
 }
 
-/// All plugin-cache state swapped as a single unit so readers never see a
-/// mix of old and new data.  A request that calls `get_plugins()` followed
-/// by `requires_response_body_buffering()` is guaranteed to read values
-/// from the same config generation.
+/// All plugin-cache state swapped as a single unit so a single load observes
+/// either the old generation or the new generation, never a partial rebuild.
 struct PluginCacheInner {
     /// proxy_id -> pre-resolved plugin list (global + proxy-scoped, merged).
     proxy_plugins: ProxyPluginMap,
@@ -444,6 +442,118 @@ struct PluginCacheInner {
     requires_ws_frame: WsFrameMap,
     /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
     global_requires_ws_frame: bool,
+}
+
+impl PluginCacheInner {
+    fn get_plugins(&self, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
+        if let Some(plugins) = self.proxy_plugins.get(proxy_id) {
+            Arc::clone(plugins)
+        } else {
+            Arc::clone(&self.global_plugins)
+        }
+    }
+
+    fn protocol_entry(&self, proxy_id: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
+        self.protocol_snapshot
+            .proxy
+            .get(proxy_id)
+            .and_then(|m| m.get(&protocol))
+            .or_else(|| self.protocol_snapshot.global.get(&protocol))
+    }
+
+    fn get_plugins_for_protocol(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    fn get_auth_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| Arc::clone(&entry.phase.auth_plugins))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
+    fn get_capabilities(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCapabilities {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| entry.phase.capabilities)
+            .unwrap_or_default()
+    }
+
+    fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
+        self.requires_buffering
+            .get(proxy_id)
+            .copied()
+            .unwrap_or(self.global_requires_buffering)
+    }
+
+    fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
+        self.requires_request_buffering
+            .get(proxy_id)
+            .copied()
+            .unwrap_or(self.global_requires_request_buffering)
+    }
+
+    fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
+        self.requires_ws_frame
+            .get(proxy_id)
+            .copied()
+            .unwrap_or(self.global_requires_ws_frame)
+    }
+}
+
+/// Request-scoped plugin cache values for one proxy/protocol pair.
+///
+/// Built from one cache generation near the start of request handling. It
+/// stores only the values that request paths need, so the full plugin-cache
+/// snapshot does not stay pinned across plugin/backend awaits.
+#[derive(Clone)]
+pub struct PluginCacheRequestView {
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    capabilities: PluginCapabilities,
+    requires_response_body_buffering: bool,
+    requires_request_body_buffering: bool,
+    requires_ws_frame_hooks: bool,
+}
+
+impl PluginCacheRequestView {
+    /// Get pre-resolved protocol-filtered plugins from this request view.
+    pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
+        Arc::clone(&self.plugins)
+    }
+
+    /// Get pre-computed auth plugins from this request view.
+    pub fn auth_plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
+        Arc::clone(&self.auth_plugins)
+    }
+
+    /// Get pre-computed capability bitset from this request view.
+    pub fn capabilities(&self) -> PluginCapabilities {
+        self.capabilities
+    }
+
+    /// Check response-body buffering requirement from this request view.
+    pub fn requires_response_body_buffering(&self) -> bool {
+        self.requires_response_body_buffering
+    }
+
+    /// Check request-body buffering requirement from this request view.
+    pub fn requires_request_body_buffering(&self) -> bool {
+        self.requires_request_body_buffering
+    }
+
+    /// Check WebSocket frame-hook requirement from this request view.
+    pub fn requires_ws_frame_hooks(&self) -> bool {
+        self.requires_ws_frame_hooks
+    }
 }
 
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
@@ -503,6 +613,23 @@ impl PluginCache {
             })),
             http_client,
         })
+    }
+
+    /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
+    ///
+    /// Use this when a request needs more than one plugin-cache-derived value.
+    /// The cache is loaded once, all returned values come from that generation,
+    /// and the full cache snapshot is released before request processing awaits.
+    pub fn request_view(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCacheRequestView {
+        let inner = self.inner.load();
+        PluginCacheRequestView {
+            plugins: inner.get_plugins_for_protocol(proxy_id, protocol),
+            auth_plugins: inner.get_auth_plugins(proxy_id, protocol),
+            capabilities: inner.get_capabilities(proxy_id, protocol),
+            requires_response_body_buffering: inner.requires_response_body_buffering(proxy_id),
+            requires_request_body_buffering: inner.requires_request_body_buffering(proxy_id),
+            requires_ws_frame_hooks: inner.requires_ws_frame_hooks(proxy_id),
+        }
     }
 
     /// Atomically rebuild the cache when config changes.
@@ -811,12 +938,7 @@ impl PluginCache {
     #[allow(dead_code)] // Used by tests for protocol-agnostic plugin inspection
     pub fn get_plugins(&self, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
         let inner = self.inner.load();
-        if let Some(plugins) = inner.proxy_plugins.get(proxy_id) {
-            Arc::clone(plugins)
-        } else {
-            // Fallback to global-only plugins
-            Arc::clone(&inner.global_plugins)
-        }
+        inner.get_plugins(proxy_id)
     }
 
     /// Get pre-resolved plugins for a proxy filtered by protocol. Lock-free O(1) lookup.
@@ -829,78 +951,48 @@ impl PluginCache {
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
         let inner = self.inner.load();
-        if let Some(entry) = inner
-            .protocol_snapshot
-            .proxy
-            .get(proxy_id)
-            .and_then(|m| m.get(&protocol))
-        {
-            return Arc::clone(&entry.plugins);
-        }
-        if let Some(entry) = inner.protocol_snapshot.global.get(&protocol) {
-            Arc::clone(&entry.plugins)
-        } else {
-            Arc::new(Vec::new())
-        }
+        inner.get_plugins_for_protocol(proxy_id, protocol)
     }
 
     /// Get pre-computed auth plugins for a proxy+protocol. Lock-free O(1) lookup.
     /// Returns only plugins where `is_auth_plugin() == true`, pre-filtered at
     /// config reload time — eliminates the per-request `filter().collect()` Vec allocation.
     ///
-    /// All reads come from a single `inner.load()` snapshot, ensuring plugins,
-    /// auth lists, capabilities, and buffering flags are always from the same
-    /// config generation.
+    /// Standalone accessor: each call loads the cache independently. Request
+    /// paths that need multiple plugin-cache values should use
+    /// `request_view()` for cross-accessor generation consistency.
+    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn get_auth_plugins(
         &self,
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
         let inner = self.inner.load();
-        if let Some(entry) = inner
-            .protocol_snapshot
-            .proxy
-            .get(proxy_id)
-            .and_then(|m| m.get(&protocol))
-        {
-            return Arc::clone(&entry.phase.auth_plugins);
-        }
-        if let Some(entry) = inner.protocol_snapshot.global.get(&protocol) {
-            Arc::clone(&entry.phase.auth_plugins)
-        } else {
-            Arc::new(Vec::new())
-        }
+        inner.get_auth_plugins(proxy_id, protocol)
     }
 
     /// Get pre-computed capability bitset for a proxy+protocol. Lock-free O(1) lookup.
     /// Replaces per-request `plugins.iter().any(|p| p.some_flag())` scans.
+    ///
+    /// Standalone accessor: each call loads the cache independently. Request
+    /// paths that need multiple plugin-cache values should use
+    /// `request_view()` for cross-accessor generation consistency.
+    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn get_capabilities(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCapabilities {
         let inner = self.inner.load();
-        if let Some(entry) = inner
-            .protocol_snapshot
-            .proxy
-            .get(proxy_id)
-            .and_then(|m| m.get(&protocol))
-        {
-            return entry.phase.capabilities;
-        }
-        if let Some(entry) = inner.protocol_snapshot.global.get(&protocol) {
-            entry.phase.capabilities
-        } else {
-            PluginCapabilities::default()
-        }
+        inner.get_capabilities(proxy_id, protocol)
     }
 
     /// Check whether any plugin for this proxy requires response body buffering.
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
+    ///
+    /// Standalone accessor: each call loads the cache independently. Request
+    /// paths that need multiple plugin-cache values should use
+    /// `request_view()` for cross-accessor generation consistency.
+    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
         let inner = self.inner.load();
-        if let Some(&needs) = inner.requires_buffering.get(proxy_id) {
-            needs
-        } else {
-            // Fallback to global plugins' buffering requirement
-            inner.global_requires_buffering
-        }
+        inner.requires_response_body_buffering(proxy_id)
     }
 
     /// Check whether any plugin for this proxy may require request body
@@ -909,24 +1001,20 @@ impl PluginCache {
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
     pub fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
         let inner = self.inner.load();
-        if let Some(&needs) = inner.requires_request_buffering.get(proxy_id) {
-            needs
-        } else {
-            // Fallback to global plugins' request buffering requirement
-            inner.global_requires_request_buffering
-        }
+        inner.requires_request_body_buffering(proxy_id)
     }
 
     /// Check whether any plugin for this proxy requires per-frame WebSocket hooks.
     /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
     /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
+    ///
+    /// Standalone accessor: each call loads the cache independently. Request
+    /// paths that need multiple plugin-cache values should use
+    /// `request_view()` for cross-accessor generation consistency.
+    #[allow(dead_code)] // Retained standalone API; hot request paths use request_view().
     pub fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
         let inner = self.inner.load();
-        if let Some(&needs) = inner.requires_ws_frame.get(proxy_id) {
-            needs
-        } else {
-            inner.global_requires_ws_frame
-        }
+        inner.requires_ws_frame_hooks(proxy_id)
     }
 
     /// Collect all hostnames that plugins will send traffic to.

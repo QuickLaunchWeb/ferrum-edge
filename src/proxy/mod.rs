@@ -3026,6 +3026,7 @@ async fn handle_websocket_request_authenticated(
     is_h2_websocket: bool,
     is_tls: bool,
     cb_is_half_open_probe: bool,
+    requires_ws_frame_hooks: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -3415,28 +3416,22 @@ async fn handle_websocket_request_authenticated(
         .body(ProxyBody::empty())
         .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
 
-    // Collect plugins that opted into per-frame WebSocket hooks.
-    // The pre-computed flag avoids iterating the plugin list when no plugin opted in.
-    let all_ws_plugins = if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
-        state
-            .plugin_cache
-            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+    // Collect plugins that opted into per-frame WebSocket hooks. `plugins`
+    // was resolved from the request's plugin-cache snapshot, so the upgrade
+    // path does not reload the cache and risk mixing generations.
+    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = if requires_ws_frame_hooks {
+        plugins
+            .iter()
+            .filter(|p| p.requires_ws_frame_hooks())
+            .cloned()
+            .collect()
     } else {
-        // Even when no frame hooks are needed, we still need to check for
-        // disconnect hooks — those live on the same WebSocket protocol list.
-        state
-            .plugin_cache
-            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+        Vec::new()
     };
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
-        .iter()
-        .filter(|p| p.requires_ws_frame_hooks())
-        .cloned()
-        .collect();
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
     // avoids the per-frame filter cost paid by the frame-hook path.
-    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
         .iter()
         .filter(|p| p.requires_ws_disconnect_hooks())
         .cloned()
@@ -5697,15 +5692,16 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
+    // Load plugin-cache values once for this request. Every plugin list,
+    // capability bitset, and buffering flag below is derived from the same
+    // cache generation without retaining the full cache across awaits.
+    let plugin_cache_view = state.plugin_cache.request_view(&proxy.id, request_protocol);
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
-    let plugins = state
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, request_protocol);
+    let plugins = plugin_cache_view.plugins();
     // Pre-computed capability bitset and phase-specific plugin lists — avoids
     // per-request `iter().filter().collect()` and `iter().any()` scans.
-    let capabilities = state
-        .plugin_cache
-        .get_capabilities(&proxy.id, request_protocol);
+    let capabilities = plugin_cache_view.capabilities();
     let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
@@ -5759,9 +5755,7 @@ async fn handle_proxy_request_inner(
     ctx.materialize_query_params();
 
     // Authentication phase (pre-computed auth plugin list — zero allocation)
-    let auth_plugins = state
-        .plugin_cache
-        .get_auth_plugins(&proxy.id, request_protocol);
+    let auth_plugins = plugin_cache_view.auth_plugins();
 
     {
         let auth_phase_start = Instant::now();
@@ -5838,9 +5832,7 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    let maybe_requires_request_body_buffering = state
-        .plugin_cache
-        .requires_request_body_buffering(&proxy.id);
+    let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();
     // should_buffer_request_body is request-time (takes &RequestContext), so it
     // must still iterate. But the config-time capability checks use the bitset.
     let requires_request_body_buffering = maybe_requires_request_body_buffering
@@ -6085,6 +6077,7 @@ async fn handle_proxy_request_inner(
                 ));
             }
         };
+        let requires_ws_frame_hooks = plugin_cache_view.requires_ws_frame_hooks();
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -6100,6 +6093,7 @@ async fn handle_proxy_request_inner(
             is_h2_ws,
             is_tls,
             cb_is_half_open_probe,
+            requires_ws_frame_hooks,
         )
         .await;
     }
@@ -6150,9 +6144,7 @@ async fn handle_proxy_request_inner(
             &proxy,
             &plugins,
             &ctx,
-            state
-                .plugin_cache
-                .requires_response_body_buffering(&proxy.id),
+            plugin_cache_view.requires_response_body_buffering(),
         );
 
         // When plugins need request body access (e.g., protobuf validation),
@@ -7044,9 +7036,7 @@ async fn handle_proxy_request_inner(
         &proxy,
         &plugins,
         &ctx,
-        state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        plugin_cache_view.requires_response_body_buffering(),
     );
 
     // Determine if we can stream the request body to the backend without
