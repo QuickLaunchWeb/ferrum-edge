@@ -256,12 +256,35 @@ impl ResponseCaching {
         })
     }
 
-    fn build_base_cache_key(&self, ctx: &RequestContext) -> String {
+    /// Build the base cache key (proxy_id + Host + method + path + query + consumer).
+    ///
+    /// `request_headers` is supplied separately because in `before_proxy` the
+    /// gateway may have temporarily moved `ctx.headers` out of the context to
+    /// satisfy the borrow checker (zero-allocation hot path when no plugin
+    /// modifies headers). Always pass the same `headers` map you got from the
+    /// `before_proxy(ctx, headers)` parameter, or `&ctx.headers` from
+    /// post-proxy phases where the headers have been restored.
+    fn build_base_cache_key(
+        &self,
+        ctx: &RequestContext,
+        request_headers: &HashMap<String, String>,
+    ) -> String {
         let proxy_id = ctx
             .matched_proxy
             .as_ref()
             .map(|p| p.id.as_str())
             .unwrap_or("_");
+
+        // Include the request `Host` header in the base key so multi-host
+        // proxies (e.g. `hosts: ["a.example.com", "b.example.com"]`) don't
+        // collide. Without this, two virtual hosts served by the same proxy
+        // share one cache namespace and a response cached under host A is
+        // served to clients addressing host B. ASCII-lowercased so the key is
+        // case-insensitive (per RFC 9110 §4.2.3).
+        let host_part: String = request_headers
+            .get("host")
+            .map(|h| h.to_ascii_lowercase())
+            .unwrap_or_default();
 
         let query_part = if self.config.cache_key_include_query {
             let mut params: Vec<(&String, &String)> = ctx.query_params.iter().collect();
@@ -282,8 +305,8 @@ impl ResponseCaching {
         };
 
         format!(
-            "{}:{}:{}:{}:{}",
-            proxy_id, ctx.method, ctx.path, query_part, consumer_part
+            "{}:{}:{}:{}:{}:{}",
+            proxy_id, host_part, ctx.method, ctx.path, query_part, consumer_part
         )
     }
 
@@ -293,7 +316,7 @@ impl ResponseCaching {
         vary_headers: &[String],
         request_headers: &HashMap<String, String>,
     ) -> String {
-        let base_key = self.build_base_cache_key(ctx);
+        let base_key = self.build_base_cache_key(ctx, request_headers);
         if vary_headers.is_empty() {
             return base_key;
         }
@@ -504,7 +527,7 @@ impl ResponseCaching {
 
 /// Check if a cache key's path segment matches the invalidation path.
 ///
-/// Cache key format: `proxy_id:method:path:query:consumer[:vary...]`.
+/// Cache key format: `proxy_id:host:method:path:query:consumer[:vary...]`.
 /// Returns true if the cached path equals `target_path` or starts with it
 /// as a proper path prefix (followed by `/` or end of string).
 fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
@@ -512,8 +535,12 @@ fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
         Some(i) => &cache_key[i + 1..],
         None => return false,
     };
-    let after_method = match after_proxy_id.find(':') {
+    let after_host = match after_proxy_id.find(':') {
         Some(i) => &after_proxy_id[i + 1..],
+        None => return false,
+    };
+    let after_method = match after_host.find(':') {
+        Some(i) => &after_host[i + 1..],
         None => return false,
     };
     let cached_path = match after_method.find(':') {
@@ -580,7 +607,12 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        let base_key = self.build_base_cache_key(ctx);
+        // Use the `headers` parameter (not `ctx.headers`) — the gateway hot
+        // path may have temporarily moved `ctx.headers` out of the context
+        // before invoking `before_proxy` (zero-alloc when no plugin modifies
+        // headers). The `headers` parameter is the single source of truth
+        // during this phase.
+        let base_key = self.build_base_cache_key(ctx, headers);
         ctx.metadata
             .insert(CACHE_BASE_KEY.to_string(), base_key.clone());
 
@@ -739,7 +771,7 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        let vary_headers = match self.merged_vary_headers(response_headers) {
+        let mut vary_headers = match self.merged_vary_headers(response_headers) {
             Some(vary_headers) => vary_headers,
             None => {
                 self.invalidate_base_key(&base_key);
@@ -747,6 +779,30 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
         };
+
+        // Per RFC 7234 §3.2, a shared cache MUST NOT serve a cached response
+        // to a request other than the one that produced it when the original
+        // request carried an `Authorization` header — unless the response
+        // explicitly opted-in via `Cache-Control: public` / `must-revalidate`
+        // / `s-maxage`. `shared_cache_allows_authorized_response` already
+        // gates that decision above. Once we've decided to cache, we MUST
+        // also key the cache entry by the Authorization value so two users
+        // presenting different bearer tokens land on different cache entries.
+        //
+        // Auto-merge `authorization` into the Vary list whenever the request
+        // had an Authorization header. Operators don't need to remember to
+        // configure `cache_key_include_consumer: true` or list `authorization`
+        // in `vary_by_headers` — the safe default is to never share cached
+        // authorized responses across distinct credentials. The merged list
+        // is sorted and re-stored in `vary_index` so the same dimension
+        // applies to every subsequent lookup at this base key.
+        if ctx.headers.contains_key("authorization")
+            && !vary_headers.iter().any(|h| h == "authorization")
+        {
+            vary_headers.push("authorization".to_string());
+            vary_headers.sort();
+        }
+
         let cache_key = self.build_cache_key(ctx, &vary_headers, &ctx.headers);
 
         if body.len() > self.config.max_entry_size_bytes {
@@ -759,9 +815,20 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
+        // Mirror the keyed Vary list onto the cached response's `Vary` header
+        // so downstream caches and clients observe the same dimension we keyed
+        // by. In particular this surfaces the auto-merged `authorization`
+        // entry so any intermediate shared cache will also key by it (or
+        // refuse to cache, if it doesn't honor Vary).
+        let mut cached_response_headers = response_headers.clone();
+        if !vary_headers.is_empty() {
+            let merged_vary = vary_headers.join(", ");
+            cached_response_headers.insert("vary".to_string(), merged_vary);
+        }
+
         let entry = CacheEntry {
             status_code: response_status,
-            headers: response_headers.clone(),
+            headers: cached_response_headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
             ttl,
