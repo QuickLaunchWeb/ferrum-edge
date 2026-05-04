@@ -421,15 +421,19 @@ async fn test_global_shutdown_stops_tcp_accept_loop() {
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
     let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
     let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
+    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
+        config.clone(),
+        &plugin_cache,
+        &consumer_index,
+        &lb_cache,
+    ));
     let cb_cache = Arc::new(CircuitBreakerCache::new());
 
     let manager = StreamListenerManager::new(
         "127.0.0.1".parse::<IpAddr>().unwrap(),
         config_arc,
         dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
+        request_epoch,
         cb_cache,
         None,
         false,
@@ -521,15 +525,19 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
     let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
     let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
+    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
+        config.clone(),
+        &plugin_cache,
+        &consumer_index,
+        &lb_cache,
+    ));
     let cb_cache = Arc::new(CircuitBreakerCache::new());
 
     let manager = StreamListenerManager::new(
         "127.0.0.1".parse::<IpAddr>().unwrap(),
         config_arc,
         dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
+        request_epoch,
         cb_cache,
         None,
         false,
