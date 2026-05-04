@@ -1772,7 +1772,11 @@ async fn handle_h3_request(
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
             latency_backend_ttfb_ms: backend_total_ms,
-            latency_backend_total_ms: -1.0, // Streaming — total unknown at log time
+            // Native H3 streaming completes the `'outer` loop synchronously
+            // before constructing this summary, so the full backend duration
+            // (TTFB + body relay) is known here. Mirrors the symmetric H3
+            // native streaming path in `proxy_to_backend_h3_streaming`.
+            latency_backend_total_ms: backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
