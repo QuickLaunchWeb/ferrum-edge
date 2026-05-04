@@ -1050,3 +1050,33 @@ fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &
         known.insert(id.clone());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_known_ids_adds_and_removes() {
+        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
+        assert!(known.contains("a"));
+        assert!(!known.contains("b"));
+        assert!(known.contains("c"));
+        assert!(known.contains("d"));
+        assert_eq!(known.len(), 3);
+    }
+
+    #[test]
+    fn update_known_ids_remove_nonexistent_is_noop() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
+        assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn update_known_ids_duplicate_add_is_idempotent() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec!["a".to_string(), "a".to_string()], &[]);
+        assert_eq!(known.len(), 1);
+    }
+}
