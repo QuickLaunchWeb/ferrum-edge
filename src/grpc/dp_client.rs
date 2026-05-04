@@ -580,6 +580,21 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 // FULL_SNAPSHOT — replace entire config
                 match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
+                        // Defense in depth: even though the CP-side
+                        // namespace check should prevent any
+                        // cross-namespace resources from reaching this
+                        // DP, filter again locally so a CP regression or
+                        // buggy/malicious snapshot can't leak resources
+                        // from another tenant into this DP's
+                        // GatewayConfig. See `filter_config_to_namespace`.
+                        let filtered = filter_config_to_namespace(&mut config, namespace);
+                        if filtered > 0 {
+                            warn!(
+                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
+                                 the CP should have filtered these (verify CP namespace matches DP)",
+                                namespace, filtered
+                            );
+                        }
                         config.normalize_fields();
                         config.resolve_upstream_tls();
                         if let Err(errors) = config.validate_all_fields_with_ip_policy(
@@ -670,7 +685,17 @@ pub async fn connect_and_subscribe_with_startup_ready(
             1 => {
                 // DELTA — apply incremental changes only
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
-                    Ok(result) => {
+                    Ok(mut result) => {
+                        // Defense in depth: filter cross-namespace
+                        // additions/modifications before applying. See
+                        // `filter_incremental_to_namespace`.
+                        let filtered = filter_incremental_to_namespace(&mut result, namespace);
+                        if filtered > 0 {
+                            warn!(
+                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP delta",
+                                namespace, filtered
+                            );
+                        }
                         if proxy_state.apply_incremental(result).await {
                             update_state_config_received(connection_state);
                             info!("Incremental config delta applied from CP");
@@ -688,6 +713,70 @@ pub async fn connect_and_subscribe_with_startup_ready(
     }
 
     Ok(())
+}
+
+/// Defense-in-depth: filter a full config snapshot to only the DP's
+/// configured namespace before applying.
+///
+/// The CP-side `check_namespace` guard already rejects DP subscriptions that
+/// advertise a mismatched namespace, so under normal operation this filter
+/// is a no-op (the snapshot the CP sends is already single-namespace).
+/// We still run it because:
+///
+/// 1. A future bug or regression on the CP side that re-enables
+///    cross-namespace serving would silently leak resources to the DP.
+///    The DP enforcing its own namespace bound prevents that.
+/// 2. The serialization is JSON, so a malicious or buggy CP could craft
+///    a snapshot whose `proxies[i].namespace != requested_namespace`.
+///    Belt-and-braces is cheap.
+///
+/// Returns the number of resources filtered out so the caller can warn.
+fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> usize {
+    let pre = (
+        config.proxies.len(),
+        config.consumers.len(),
+        config.plugin_configs.len(),
+        config.upstreams.len(),
+    );
+    config.proxies.retain(|p| p.namespace == namespace);
+    config.consumers.retain(|c| c.namespace == namespace);
+    config.plugin_configs.retain(|pc| pc.namespace == namespace);
+    config.upstreams.retain(|u| u.namespace == namespace);
+    (pre.0 - config.proxies.len())
+        + (pre.1 - config.consumers.len())
+        + (pre.2 - config.plugin_configs.len())
+        + (pre.3 - config.upstreams.len())
+}
+
+/// Defense-in-depth filter for incremental deltas. Applied to
+/// `added_or_modified_*` vectors only; removal IDs are namespace-agnostic
+/// and harmless on the DP side because they only delete resources the DP
+/// already has (which were themselves filtered through this same check).
+///
+/// Returns the number of resources filtered out so the caller can warn.
+fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
+    let pre = (
+        result.added_or_modified_proxies.len(),
+        result.added_or_modified_consumers.len(),
+        result.added_or_modified_plugin_configs.len(),
+        result.added_or_modified_upstreams.len(),
+    );
+    result
+        .added_or_modified_proxies
+        .retain(|p| p.namespace == namespace);
+    result
+        .added_or_modified_consumers
+        .retain(|c| c.namespace == namespace);
+    result
+        .added_or_modified_plugin_configs
+        .retain(|pc| pc.namespace == namespace);
+    result
+        .added_or_modified_upstreams
+        .retain(|u| u.namespace == namespace);
+    (pre.0 - result.added_or_modified_proxies.len())
+        + (pre.1 - result.added_or_modified_consumers.len())
+        + (pre.2 - result.added_or_modified_plugin_configs.len())
+        + (pre.3 - result.added_or_modified_upstreams.len())
 }
 
 /// Check whether the CP's reported version is compatible with this DP.
@@ -715,4 +804,164 @@ fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for the DP-side namespace filter helpers. These are
+    //! private functions, so they live alongside the implementation rather
+    //! than in `tests/`. The end-to-end behavior is exercised by
+    //! `tests/integration/cp_dp_grpc_tests.rs` via
+    //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn proxy_in_namespace(id: &str, ns: &str) -> crate::config::types::Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "backend_host": "example.com",
+            "backend_port": 443,
+        }))
+        .expect("proxy fixture should deserialize")
+    }
+
+    fn upstream_in_namespace(id: &str, ns: &str) -> crate::config::types::Upstream {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "targets": [{"host": "example.com", "port": 443, "weight": 100}],
+            "algorithm": "round_robin",
+        }))
+        .expect("upstream fixture should deserialize")
+    }
+
+    fn consumer_in_namespace(id: &str, ns: &str) -> crate::config::types::Consumer {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "username": id,
+            "credentials": {},
+        }))
+        .expect("consumer fixture should deserialize")
+    }
+
+    fn plugin_config_in_namespace(id: &str, ns: &str) -> crate::config::types::PluginConfig {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "plugin_name": "rate_limiting",
+            "config": {},
+            "scope": "global",
+        }))
+        .expect("plugin_config fixture should deserialize")
+    }
+
+    #[test]
+    fn filter_config_keeps_matching_namespace_only() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![
+                proxy_in_namespace("p-prod", "production"),
+                proxy_in_namespace("p-staging", "staging"),
+                proxy_in_namespace("p-prod-2", "production"),
+            ],
+            consumers: vec![
+                consumer_in_namespace("c-prod", "production"),
+                consumer_in_namespace("c-staging", "staging"),
+            ],
+            plugin_configs: vec![
+                plugin_config_in_namespace("pc-prod", "production"),
+                plugin_config_in_namespace("pc-staging", "staging"),
+            ],
+            upstreams: vec![
+                upstream_in_namespace("u-prod", "production"),
+                upstream_in_namespace("u-staging", "staging"),
+            ],
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+
+        let filtered = filter_config_to_namespace(&mut cfg, "production");
+        assert_eq!(filtered, 4, "1 proxy + 1 consumer + 1 plugin + 1 upstream");
+
+        assert_eq!(cfg.proxies.len(), 2);
+        assert!(cfg.proxies.iter().all(|p| p.namespace == "production"));
+        assert_eq!(cfg.consumers.len(), 1);
+        assert_eq!(cfg.consumers[0].namespace, "production");
+        assert_eq!(cfg.plugin_configs.len(), 1);
+        assert_eq!(cfg.plugin_configs[0].namespace, "production");
+        assert_eq!(cfg.upstreams.len(), 1);
+        assert_eq!(cfg.upstreams[0].namespace, "production");
+    }
+
+    #[test]
+    fn filter_config_returns_zero_when_clean() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy_in_namespace("p-prod", "production")],
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        assert_eq!(cfg.proxies.len(), 1);
+    }
+
+    #[test]
+    fn filter_incremental_keeps_matching_namespace_only() {
+        let mut delta = IncrementalResult {
+            added_or_modified_proxies: vec![
+                proxy_in_namespace("p-prod", "production"),
+                proxy_in_namespace("p-staging", "staging"),
+            ],
+            removed_proxy_ids: vec!["doesnt-matter".to_string()],
+            added_or_modified_consumers: vec![consumer_in_namespace("c-staging", "staging")],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![plugin_config_in_namespace(
+                "pc-prod",
+                "production",
+            )],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![
+                upstream_in_namespace("u-prod", "production"),
+                upstream_in_namespace("u-staging", "staging"),
+            ],
+            removed_upstream_ids: vec![],
+            poll_timestamp: Utc::now(),
+        };
+
+        let filtered = filter_incremental_to_namespace(&mut delta, "production");
+        assert_eq!(filtered, 3, "1 proxy + 1 consumer + 1 upstream filtered");
+
+        assert_eq!(delta.added_or_modified_proxies.len(), 1);
+        assert_eq!(delta.added_or_modified_proxies[0].namespace, "production");
+        assert!(delta.added_or_modified_consumers.is_empty());
+        assert_eq!(delta.added_or_modified_plugin_configs.len(), 1);
+        assert_eq!(delta.added_or_modified_upstreams.len(), 1);
+
+        // Removal IDs are intentionally NOT filtered — the DP only has
+        // resources in its own namespace anyway, so deleting an unknown ID
+        // is harmless.
+        assert_eq!(delta.removed_proxy_ids.len(), 1);
+    }
+
+    #[test]
+    fn filter_incremental_returns_zero_when_empty() {
+        let mut delta = IncrementalResult {
+            added_or_modified_proxies: vec![],
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            poll_timestamp: Utc::now(),
+        };
+        assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 0);
+    }
 }

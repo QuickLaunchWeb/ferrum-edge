@@ -139,16 +139,19 @@ pub async fn run(
     };
 
     // Create gRPC server with shared DP node registry. The expected JWT
-    // issuer is threaded in from `FERRUM_CP_DP_GRPC_JWT_ISSUER` — DPs must
-    // mint tokens with the same `iss` value or the CP rejects them.
+    // issuer and namespace are threaded in from EnvConfig: DPs must mint
+    // tokens with the same `iss` value and advertise the same namespace, or
+    // the CP rejects them before streaming any config.
     let dp_registry = Arc::new(crate::grpc::cp_server::DpNodeRegistry::new());
-    let (grpc_server, update_tx) = CpGrpcServer::with_channel_capacity_registry_and_issuer(
-        config_arc.clone(),
-        grpc_secret,
-        env_config.cp_broadcast_channel_capacity,
-        dp_registry.clone(),
-        env_config.cp_dp_grpc_jwt_issuer.clone(),
-    );
+    let (grpc_server, update_tx) =
+        CpGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
+            config_arc.clone(),
+            grpc_secret,
+            env_config.cp_broadcast_channel_capacity,
+            dp_registry.clone(),
+            env_config.cp_dp_grpc_jwt_issuer.clone(),
+            env_config.namespace.clone(),
+        );
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;

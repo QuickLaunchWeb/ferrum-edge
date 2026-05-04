@@ -89,6 +89,16 @@ The `ConfigUpdate` proto message carries an `UpdateType` discriminator:
 
 DPs handle both types transparently: full snapshots replace the entire config; deltas are applied via `ProxyState::apply_incremental()` which patches the in-memory config and performs surgical cache updates.
 
+### Namespace Pairing
+
+A single CP serves a single namespace. Every DP that connects to a CP MUST set `FERRUM_NAMESPACE` to the same value the CP is running with. The CP rejects `Subscribe` and `GetFullConfig` calls from DPs that advertise a different namespace with `FailedPrecondition` and an error message naming both namespaces.
+
+This is a hard requirement, not a warning:
+
+- The CP loads only its own namespace from the database, so without this check it would silently serve `production` config to a DP that booted with `FERRUM_NAMESPACE=staging` — a multi-tenant security gap.
+- Operators running multiple namespaces must run multiple CP instances (one per namespace) and point each fleet of DPs at the matching CP.
+- The DP also re-filters every received snapshot/delta locally (defense in depth) so a future CP regression cannot silently pollute a DP's `GatewayConfig` with cross-namespace resources. Filtered resources are logged as warnings.
+
 ### Resilience
 
 The CP/DP architecture is designed so that data source outages are invisible to API consumers:

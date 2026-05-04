@@ -2492,3 +2492,290 @@ async fn test_dp_recovers_from_broadcast_channel_overflow() {
 
     client_handle.abort();
 }
+
+// ─── Cross-namespace rejection tests ─────────────────────────────────────────
+//
+// These tests cover the multi-tenant security gap where a DP started with
+// `FERRUM_NAMESPACE=staging` against a CP serving `FERRUM_NAMESPACE=production`
+// would silently inherit production config. The CP-side fix is explicit
+// rejection with `failed_precondition`; the DP-side defense-in-depth filter
+// strips cross-namespace resources from any snapshot/delta that slips
+// through.
+
+/// Start a CP gRPC server bound to a specific CP namespace.
+async fn start_test_cp_server_with_namespace(
+    config: GatewayConfig,
+    cp_namespace: &str,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    tokio::task::JoinHandle<()>,
+) {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let registry = Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
+    let (server, update_tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
+        config_arc,
+        TEST_JWT_SECRET.to_string(),
+        128,
+        registry,
+        cp_namespace.to_string(),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("gRPC server failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, update_tx, handle)
+}
+
+/// CP serves `production`, DP requests `staging` → CP returns
+/// `failed_precondition` and the error message includes both namespaces.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_dp_with_mismatched_namespace_subscribe() {
+    let cp_config = create_test_config(2);
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "production").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-dp").unwrap();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", generated_token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    // DP advertises a different namespace than the CP serves.
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "test-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "staging".to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject DP with mismatched namespace"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("staging"),
+        "Error should mention DP namespace 'staging', got: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("production"),
+        "Error should mention CP namespace 'production', got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
+}
+
+/// `GetFullConfig` enforces the same namespace check as `Subscribe`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_dp_with_mismatched_namespace_get_full_config() {
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "production").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-dp").unwrap();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", generated_token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
+        node_id: "test-dp".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "staging".to_string(),
+    });
+
+    let result = client.get_full_config(request).await;
+    assert!(result.is_err());
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status.message().contains("staging") && status.message().contains("production"),
+        "Error should mention both DP and CP namespaces, got: {}",
+        status.message()
+    );
+
+    server_handle.abort();
+}
+
+/// DP advertises the same namespace the CP serves → subscribe succeeds and
+/// the DP receives the initial config snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_accepts_dp_with_matching_namespace() {
+    let cp_config = create_test_config(2);
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(cp_config, "production").await;
+
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-dp").unwrap();
+    let token_meta: tonic::metadata::MetadataValue<_> =
+        format!("Bearer {}", generated_token).parse().unwrap();
+    let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let mut client =
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        );
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "test-dp-good".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "production".to_string(),
+    });
+
+    let mut stream = client
+        .subscribe(request)
+        .await
+        .expect("CP should accept matching namespace")
+        .into_inner();
+
+    // Pull the first message — the initial FULL_SNAPSHOT.
+    let first = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("stream should yield within 5s")
+        .expect("stream message should not error")
+        .expect("stream should yield a snapshot");
+    assert_eq!(
+        first.update_type, 0,
+        "first message should be FULL_SNAPSHOT"
+    );
+
+    let cfg: GatewayConfig =
+        serde_json::from_str(&first.config_json).expect("snapshot config should deserialize");
+    assert_eq!(cfg.proxies.len(), 2);
+
+    server_handle.abort();
+}
+
+/// DP-side defense in depth: when the CP somehow regresses and ships a
+/// snapshot containing resources from another namespace, the DP filters
+/// them out before applying so the local `GatewayConfig` stays
+/// single-namespace.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_filters_cross_namespace_resources_from_snapshot() {
+    // Build a config that intentionally mixes two namespaces. We can't
+    // get the CP to ship this in production (its `check_namespace` guard
+    // would fire first), but the helper is designed precisely for this
+    // kind of regression simulation — we connect with the same namespace
+    // the CP advertises (so `Subscribe` succeeds) and then verify that
+    // the DP-side filter still strips the cross-namespace pollution if
+    // the CP-side filter were ever bypassed.
+    //
+    // The mechanic we're verifying lives in
+    // `filter_config_to_namespace`. We exercise it via the real
+    // `connect_and_subscribe` path so the integration is realistic.
+    let mut mixed = create_test_config(0);
+    // 2 proxies in `production` (this DP's namespace).
+    let mut p_prod_a = create_test_proxy("prod-a", "/prod-a");
+    p_prod_a.namespace = "production".to_string();
+    let mut p_prod_b = create_test_proxy("prod-b", "/prod-b");
+    p_prod_b.namespace = "production".to_string();
+    // 1 proxy from another namespace that should be filtered out.
+    let mut p_staging = create_test_proxy("staging-a", "/staging-a");
+    p_staging.namespace = "staging".to_string();
+    mixed.proxies.push(p_prod_a);
+    mixed.proxies.push(p_prod_b);
+    mixed.proxies.push(p_staging);
+
+    // 1 upstream in production and 1 in staging — verify upstreams are
+    // filtered too.
+    let mut up_prod = create_test_upstream("up-prod", &[("prod.example.com", 443)]);
+    up_prod.namespace = "production".to_string();
+    let mut up_staging = create_test_upstream("up-staging", &[("staging.example.com", 443)]);
+    up_staging.namespace = "staging".to_string();
+    mixed.upstreams.push(up_prod);
+    mixed.upstreams.push(up_staging);
+
+    // Start the CP server in the `production` namespace so the DP's
+    // `Subscribe` is accepted; the snapshot itself contains
+    // cross-namespace pollution that the DP's filter must strip.
+    let (addr, _update_tx, server_handle) =
+        start_test_cp_server_with_namespace(mixed, "production").await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let _ = timeout(
+        Duration::from_secs(5),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "test-dp",
+            &proxy_state,
+            None,
+            "production",
+        ),
+    )
+    .await;
+
+    // Give the snapshot a moment to apply.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let cfg = proxy_state.config.load();
+    assert_eq!(
+        cfg.proxies.len(),
+        2,
+        "DP should retain only the 2 production proxies, not the 1 staging proxy"
+    );
+    for p in cfg.proxies.iter() {
+        assert_eq!(
+            p.namespace, "production",
+            "every retained proxy should be in the production namespace"
+        );
+    }
+    assert_eq!(
+        cfg.upstreams.len(),
+        1,
+        "DP should retain only the 1 production upstream, not the 1 staging upstream"
+    );
+    assert_eq!(cfg.upstreams[0].namespace, "production");
+
+    server_handle.abort();
+}
