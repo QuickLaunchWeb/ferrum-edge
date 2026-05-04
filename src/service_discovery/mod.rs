@@ -503,17 +503,17 @@ async fn run_discovery_loop(
 
                     // Publish the LB-only epoch under the request-epoch write lock.
                     if let Some(epoch_store) = &request_epoch {
-                        if let Some(epoch) = epoch_store.update_load_balancer(|current| {
-                            Some(LoadBalancerCache::build_update_targets_inner(
+                        epoch_store.update_load_balancer(|current| {
+                            let load_balancer = LoadBalancerCache::build_update_targets_inner(
                                 &current.load_balancer,
                                 upstream_id,
                                 merged.clone(),
                                 algorithm,
                                 hash_on.clone(),
-                            ))
-                        }) {
-                            lb_cache.store_inner(epoch.load_balancer.clone());
-                        }
+                            );
+                            lb_cache.store_inner(load_balancer.clone());
+                            Some(load_balancer)
+                        });
                     } else {
                         lb_cache.update_targets(
                             upstream_id,

@@ -3,6 +3,10 @@ use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::proxy::build_backend_url;
 
+// This suite intentionally exercises the legacy public RouterCache facade.
+// Request hot paths use epoch-loaded route snapshots and are covered by
+// request_epoch tests; these checks keep the standalone library/test API stable.
+
 /// Helper to create a test proxy with sensible defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {

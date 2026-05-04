@@ -423,6 +423,8 @@ impl RequestEpochStore {
         &self,
         build: impl FnOnce(&RequestEpoch) -> Result<Option<StagedRequestEpoch>, String>,
     ) -> Result<Option<Arc<RequestEpoch>>, String> {
+        // Poison only means a previous writer panicked before publishing; the
+        // ArcSwap still holds the last complete epoch, so continuing is safe.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.current.load_full();
         let Some(staged) = build(&current)? else {
@@ -455,6 +457,8 @@ impl RequestEpochStore {
         &self,
         build: impl FnOnce(&RequestEpoch) -> Option<Arc<LoadBalancerCacheInner>>,
     ) -> Option<Arc<RequestEpoch>> {
+        // Poison only means a previous writer panicked before publishing; the
+        // ArcSwap still holds the last complete epoch, so continuing is safe.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.current.load_full();
         let load_balancer = build(&current)?;
