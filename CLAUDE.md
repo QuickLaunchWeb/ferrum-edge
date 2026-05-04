@@ -205,6 +205,8 @@ Shared singleton; pre-warmed. Native TTL by default, floored by `FERRUM_DNS_MIN_
 
 Four rate plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`) support `sync_mode: "redis"`. Shared client in `src/plugins/utils/redis_rate_limiter.rs`. Algorithm: two-window weighted via pipelined `INCR`/`GET`/`EXPIRE` — no Lua. Keys `{prefix}:{rate_key}:{window_index}`; default prefix `{FERRUM_NAMESPACE}:{plugin_name}` prevents cross-gateway collisions. Auto-fallback to in-memory on outage + background reconnect. TLS via `rediss://` uses global `FERRUM_TLS_*`. Works with Redis/Valkey/DragonflyDB/KeyDB/Garnet.
 
+**ACL credentials**: `redis_username` / `redis_password` plugin fields are honored on both plain and TLS code paths — they are injected into the parsed `redis::ConnectionInfo` (via `set_username` / `set_password`) before the client connects, and used by both the main connection and the background health-check pinger. Explicit fields override any user-info embedded in `redis_url`; with both unset, URL-embedded credentials flow through unchanged.
+
 ## Test Structure
 
 ```
