@@ -135,6 +135,20 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
 /// request-only. `content-length` is preserved on responses because the
 /// downstream client uses it for framing.
 ///
+/// **Trailers**: this same predicate MUST be applied to backend response
+/// **trailers** (RFC 9110 §6.5 distinct concept). gRPC encodes
+/// `grpc-status` / `grpc-message` as trailers, and a misbehaving backend
+/// can put hop-by-hop directives (`connection: close`,
+/// `proxy-authenticate`, `keep-alive`, `transfer-encoding`, `upgrade`)
+/// in the trailer map. Hyper's H2 trailer encoder rejects some hop-by-hop
+/// names at the frame layer but `proxy-authenticate`, `proxy-connection`,
+/// and `keep-alive` are not blocked, so the proxy must filter them
+/// itself. Applied at:
+///   - `grpc_proxy::proxy_grpc_request_core` buffered-path trailer
+///     collection loop.
+///   - `proxy::body::StripHopByHopTrailers` wrapper interposed before
+///     `Coalescing<Incoming>` on the streaming path.
+///
 /// `name` is expected to be lowercase.
 #[inline]
 pub fn is_backend_response_strip_header(name: &str) -> bool {
