@@ -1674,12 +1674,23 @@ async fn handle_batch_create(
         if let Some(upstream_id) = proxy.upstream_id.as_deref()
             && !batch_upstream_ids.contains(upstream_id)
         {
-            match db.check_upstream_exists(upstream_id).await {
+            match db.check_upstream_exists(upstream_id, namespace).await {
                 Ok(true) => {}
-                Ok(false) => validation_errors.push(format!(
-                    "Proxy '{}' references non-existent upstream_id '{}'",
-                    proxy.id, upstream_id
-                )),
+                Ok(false) => {
+                    // Distinguish "missing" from "wrong namespace" so the
+                    // operator's diagnostic points at the real problem.
+                    let message = match db.get_upstream(upstream_id).await {
+                        Ok(Some(other)) => format!(
+                            "Proxy '{}' references upstream_id '{}' from namespace '{}' (proxy is in namespace '{}'); cross-namespace references are forbidden",
+                            proxy.id, upstream_id, other.namespace, namespace
+                        ),
+                        _ => format!(
+                            "Proxy '{}' references non-existent upstream_id '{}'",
+                            proxy.id, upstream_id
+                        ),
+                    };
+                    validation_errors.push(message);
+                }
                 Err(err) => validation_errors.push(format!(
                     "Proxy '{}' upstream reference check failed: {}",
                     proxy.id, err
@@ -1720,7 +1731,7 @@ async fn handle_batch_create(
 
         if !unresolved.is_empty() {
             match db
-                .validate_proxy_plugin_associations(&proxy.id, &unresolved)
+                .validate_proxy_plugin_associations(&proxy.id, namespace, &unresolved)
                 .await
             {
                 Ok(errs) => validation_errors.extend(errs),
@@ -1736,12 +1747,24 @@ async fn handle_batch_create(
         if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
             && !batch_proxy_ids.contains(proxy_id)
         {
-            match db.check_proxy_exists(proxy_id).await {
+            match db.check_proxy_exists(proxy_id, namespace).await {
                 Ok(true) => {}
-                Ok(false) => validation_errors.push(format!(
-                    "PluginConfig '{}' references non-existent proxy_id '{}'",
-                    plugin_config.id, proxy_id
-                )),
+                Ok(false) => {
+                    // Distinguish "missing" from "wrong namespace" — the
+                    // referenced proxy may exist in another namespace, in
+                    // which case the operator must move or recreate it.
+                    let message = match db.get_proxy(proxy_id).await {
+                        Ok(Some(other)) => format!(
+                            "PluginConfig '{}' references proxy_id '{}' from namespace '{}' (plugin_config is in namespace '{}'); cross-namespace references are forbidden",
+                            plugin_config.id, proxy_id, other.namespace, namespace
+                        ),
+                        _ => format!(
+                            "PluginConfig '{}' references non-existent proxy_id '{}'",
+                            plugin_config.id, proxy_id
+                        ),
+                    };
+                    validation_errors.push(message);
+                }
                 Err(err) => validation_errors.push(format!(
                     "PluginConfig '{}' proxy reference check failed: {}",
                     plugin_config.id, err
