@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ferrum_edge::grpc::dp_client::{DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt};
+use ferrum_edge::grpc::dp_client::{
+    DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt, generate_dp_jwt_with_issuer,
+};
 
 #[test]
 fn connection_state_new_disconnected() {
@@ -58,6 +60,35 @@ fn generate_dp_jwt_wrong_secret_fails_validation() {
     let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     let result = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation);
     assert!(result.is_err());
+}
+
+/// Default-issuer minting must include the `iss` claim with the documented
+/// default. Regression-protects the issuer enforcement security fix: a
+/// reverted DP that drops `iss` would silently fail to authenticate to the
+/// CP and this test would catch it before deploy.
+#[test]
+fn generate_dp_jwt_includes_default_iss_claim() {
+    let token = generate_dp_jwt("test-secret", "node-1").unwrap();
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    // Allow any issuer for this decode — we only want to read the claim.
+    validation.required_spec_claims = std::collections::HashSet::new();
+    let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).unwrap();
+    assert_eq!(decoded.claims["iss"], "ferrum-edge-cp-dp");
+}
+
+/// Custom-issuer minting must propagate the operator-supplied issuer into
+/// the `iss` claim verbatim.
+#[test]
+fn generate_dp_jwt_with_custom_issuer_propagates_iss() {
+    let token = generate_dp_jwt_with_issuer("test-secret", "node-1", "custom-fleet.cp-dp").unwrap();
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test-secret");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.required_spec_claims = std::collections::HashSet::new();
+    let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).unwrap();
+    assert_eq!(decoded.claims["iss"], "custom-fleet.cp-dp");
 }
 
 // --- startup_ready guard for should_race_primary ---

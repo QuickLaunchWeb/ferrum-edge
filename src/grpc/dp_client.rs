@@ -67,16 +67,43 @@ impl DpCpConnectionState {
 /// This wrapper exists so the compiler catches callers who accidentally pass a
 /// pre-signed JWT token where a shared secret is now expected. Before this change
 /// both were `String`, so the old code compiled silently with the wrong value.
+///
+/// The wrapper also carries the expected `iss` claim
+/// (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) since the secret and issuer always travel
+/// together: every token minted with this secret needs to bear the configured
+/// issuer or the CP will reject it.
 #[derive(Clone, Debug)]
-pub struct GrpcJwtSecret(pub String);
+pub struct GrpcJwtSecret {
+    secret: String,
+    issuer: String,
+}
 
 impl GrpcJwtSecret {
+    /// Create a `GrpcJwtSecret` with the default issuer
+    /// (`crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER`).
+    ///
+    /// Used by tests and library callers; production binary code path uses
+    /// [`GrpcJwtSecret::with_issuer`] so the operator-configured
+    /// `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored.
+    #[allow(dead_code)]
     pub fn new(secret: String) -> Self {
-        Self(secret)
+        Self::with_issuer(
+            secret,
+            crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+        )
+    }
+
+    /// Create a `GrpcJwtSecret` with an operator-configured issuer.
+    pub fn with_issuer(secret: String, issuer: String) -> Self {
+        Self { secret, issuer }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.secret
+    }
+
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 }
 
@@ -98,18 +125,42 @@ pub struct DpGrpcTlsConfig {
 /// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
 const DP_JWT_TTL_SECONDS: i64 = 3540;
 
+/// Generate a short-lived HS256 JWT for authenticating the DP to the CP using
+/// the default issuer (`DEFAULT_CP_DP_JWT_ISSUER`).
+///
+/// Most production callers should prefer [`generate_dp_jwt_with_issuer`] so
+/// the operator-configured `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored. This
+/// helper is kept for tests and library callers that want the default behavior
+/// without threading the issuer through.
+#[allow(dead_code)]
+pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
+    generate_dp_jwt_with_issuer(
+        secret,
+        node_id,
+        crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER,
+    )
+}
+
 /// Generate a short-lived HS256 JWT for authenticating the DP to the CP.
 ///
 /// The token is signed with the shared `FERRUM_CP_DP_GRPC_JWT_SECRET` and
-/// includes `sub`, `iat`, `exp`, and `role` claims. A fresh token is minted
+/// includes `sub`, `iat`, `exp`, `iss`, and `role` claims. The `iss` claim
+/// is set to `issuer` (operator-configured via `FERRUM_CP_DP_GRPC_JWT_ISSUER`,
+/// default `"ferrum-edge-cp-dp"`) and MUST match the value the CP expects —
+/// the CP rejects any token with a different `iss`. A fresh token is minted
 /// on each gRPC connection attempt so that tokens captured from the wire
 /// are only valid for ~59 minutes.
-pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
+pub fn generate_dp_jwt_with_issuer(
+    secret: &str,
+    node_id: &str,
+    issuer: &str,
+) -> Result<String, anyhow::Error> {
     let now = chrono::Utc::now().timestamp();
     let claims = json!({
         "sub": node_id,
         "iat": now,
         "exp": now + DP_JWT_TTL_SECONDS,
+        "iss": issuer,
         "role": "data_plane",
     });
     let token = encode(
@@ -465,11 +516,15 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
     let channel = endpoint.connect().await?;
 
-    // Mint a fresh short-lived JWT for this connection attempt.
-    let auth_token = generate_dp_jwt(jwt_secret.as_str(), node_id)?;
+    // Mint a fresh short-lived JWT for this connection attempt. The `iss`
+    // claim is set from the operator-configured issuer carried alongside
+    // the shared secret; the CP rejects any token with a mismatched `iss`.
+    let auth_token =
+        generate_dp_jwt_with_issuer(jwt_secret.as_str(), node_id, jwt_secret.issuer())?;
     info!(
-        "Generated fresh DP JWT (TTL={}s) for CP authentication",
-        DP_JWT_TTL_SECONDS
+        "Generated fresh DP JWT (TTL={}s, iss='{}') for CP authentication",
+        DP_JWT_TTL_SECONDS,
+        jwt_secret.issuer()
     );
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 

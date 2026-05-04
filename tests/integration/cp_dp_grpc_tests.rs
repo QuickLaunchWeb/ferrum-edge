@@ -498,6 +498,260 @@ async fn test_cp_rejects_token_missing_required_claims() {
     );
 }
 
+/// Helper: connect a tonic channel + interceptor that attaches `token` as the
+/// bearer credential, and yield a `ConfigSyncClient` ready to issue calls. A
+/// macro (rather than a fn returning `impl Future<Output = ConfigSyncClient<…>>`)
+/// keeps the concrete client type local to each test, so clippy's
+/// `type_complexity` rule does not fire on the function signature.
+macro_rules! connect_client_with_token {
+    ($bound_addr:expr, $token:expr) => {{
+        let channel = tonic::transport::Channel::from_shared(format!(
+            "http://127.0.0.1:{}",
+            $bound_addr.port()
+        ))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+        let token_meta: tonic::metadata::MetadataValue<_> =
+            format!("Bearer {}", $token).parse().unwrap();
+        ferrum_edge::grpc::proto::config_sync_client::ConfigSyncClient::with_interceptor(
+            channel,
+            move |mut req: tonic::Request<()>| {
+                req.metadata_mut()
+                    .insert("authorization", token_meta.clone());
+                Ok(req)
+            },
+        )
+    }};
+}
+
+/// Default issuer used by `start_test_cp_server`'s `CpGrpcServer::new()` path.
+const TEST_DEFAULT_ISSUER: &str = "ferrum-edge-cp-dp";
+
+/// Verify that the CP accepts a DP token whose `iss` claim matches the
+/// configured expected issuer. Sanity check that the new issuer enforcement
+/// does not break the happy path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_accepts_token_with_matching_issuer() {
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    // Mint a token with the default issuer that the test CP expects.
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "iss-good", TEST_DEFAULT_ISSUER)
+            .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "iss-good".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(
+        result.is_ok(),
+        "CP should accept token with matching issuer, got: {:?}",
+        result.err()
+    );
+}
+
+/// Verify that the CP rejects a DP token whose `iss` claim does not match
+/// the configured expected issuer. This is the core security fix: a token
+/// signed with the same shared secret but bearing a different `iss` (e.g.
+/// from a sibling service that reused the secret) must NOT authenticate.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_token_with_wrong_issuer() {
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    // Mint a token signed with the correct secret but bearing a foreign issuer.
+    let token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "iss-bad", "some-other-service")
+            .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "iss-bad".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject token with wrong issuer (cross-service replay)"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "Expected Unauthenticated, got: {}",
+        status
+    );
+}
+
+/// Verify that the CP rejects a DP token that has no `iss` claim at all.
+/// Pre-fix DPs (or any third-party token) without `iss` would have passed
+/// the old `exp/iat/sub` check; now they must be rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_rejects_token_with_no_issuer_claim() {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde_json::json;
+
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    // Hand-craft a token that has all OLD required claims (exp/iat/sub) but
+    // no `iss` claim, signed with the correct shared secret.
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": "iss-missing",
+        "iat": now,
+        "exp": now + 3600,
+        "role": "data_plane",
+    });
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .unwrap();
+
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "iss-missing".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP should reject token missing the `iss` claim"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "Expected Unauthenticated, got: {}",
+        status
+    );
+}
+
+/// Verify that issuer enforcement does not weaken the existing wrong-secret
+/// rejection: a token signed with the WRONG secret must still be rejected
+/// even if it carries a correct `iss`. Regression-protects against an
+/// implementation that, for example, validated `iss` first and ignored the
+/// signature check on issuer mismatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_still_rejects_token_signed_with_wrong_secret() {
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    // Token bearing the correct issuer but signed with a different secret.
+    let token = dp_client::generate_dp_jwt_with_issuer(
+        "totally-different-secret",
+        "iss-wrong-key",
+        TEST_DEFAULT_ISSUER,
+    )
+    .unwrap();
+    let mut client = connect_client_with_token!(addr, token);
+
+    let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "iss-wrong-key".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+
+    let result = client.subscribe(request).await;
+    assert!(
+        result.is_err(),
+        "CP must still reject tokens signed with the wrong secret"
+    );
+    let status = result.unwrap_err();
+    assert_eq!(
+        status.code(),
+        tonic::Code::Unauthenticated,
+        "Expected Unauthenticated, got: {}",
+        status
+    );
+}
+
+/// Verify that a CP configured with a non-default expected issuer accepts
+/// tokens with the matching custom issuer and rejects tokens with the
+/// default issuer. This exercises the
+/// `with_channel_capacity_registry_and_issuer` constructor that production
+/// uses to thread `FERRUM_CP_DP_GRPC_JWT_ISSUER` through.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
+    use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
+
+    const CUSTOM_ISSUER: &str = "my-fleet.cp-dp";
+
+    let config = create_test_config(1);
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, _update_tx) = CpGrpcServer::with_channel_capacity_registry_and_issuer(
+        config_arc,
+        TEST_JWT_SECRET.to_string(),
+        128,
+        Arc::new(DpNodeRegistry::new()),
+        CUSTOM_ISSUER.to_string(),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound_addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Token with the custom issuer the CP expects: accepted.
+    let good_token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "custom-good", CUSTOM_ISSUER)
+            .unwrap();
+    let mut good_client = connect_client_with_token!(bound_addr, good_token);
+    let good_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "custom-good".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+    assert!(
+        good_client.subscribe(good_req).await.is_ok(),
+        "CP with custom issuer should accept matching token"
+    );
+
+    // Token with the *default* issuer must now be rejected — this proves the
+    // expected-issuer string was actually plumbed through the constructor.
+    let stale_token =
+        dp_client::generate_dp_jwt_with_issuer(TEST_JWT_SECRET, "custom-bad", TEST_DEFAULT_ISSUER)
+            .unwrap();
+    let mut stale_client = connect_client_with_token!(bound_addr, stale_token);
+    let stale_req = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
+        node_id: "custom-bad".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
+    });
+    let stale_result = stale_client.subscribe(stale_req).await;
+    assert!(
+        stale_result.is_err(),
+        "CP with custom issuer must reject default-issuer tokens"
+    );
+    assert_eq!(
+        stale_result.unwrap_err().code(),
+        tonic::Code::Unauthenticated
+    );
+
+    server_handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_handles_malformed_config() {
     // Start CP server with valid initial config

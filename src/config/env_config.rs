@@ -332,6 +332,11 @@ pub struct EnvConfig {
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
     pub cp_dp_grpc_jwt_secret: Option<String>,
+    /// Expected `iss` claim on CP/DP gRPC JWTs. The CP rejects any token whose
+    /// `iss` claim does not exactly match this value, and the DP mints tokens
+    /// with this value. Defaults to "ferrum-edge-cp-dp". Operators rotating
+    /// the issuer must update CP and all DPs together.
+    pub cp_dp_grpc_jwt_issuer: String,
     pub dp_cp_grpc_url: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
     /// When set, takes precedence over `dp_cp_grpc_url`. The DP connects to the
@@ -996,6 +1001,7 @@ impl Default for EnvConfig {
             mongo_connect_timeout_seconds: 10,
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
+            cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
             dp_cp_grpc_url: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
@@ -1256,6 +1262,7 @@ impl EnvConfig {
             [cp_dp]
             cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
                 => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
             dp_cp_grpc_url: Option<String> = "FERRUM_DP_CP_GRPC_URL";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
@@ -1595,6 +1602,7 @@ impl EnvConfig {
             mongo_connect_timeout_seconds,
             cp_grpc_listen_addr,
             cp_dp_grpc_jwt_secret,
+            cp_dp_grpc_jwt_issuer,
             dp_cp_grpc_url,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
