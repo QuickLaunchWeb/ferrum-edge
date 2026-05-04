@@ -316,6 +316,14 @@ async fn test_http3_proxy_state_creation() {
     let dns_cache_for_sd = dns_cache.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
+        request_epoch: Arc::new(
+            ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+                gc.clone(),
+                &plugin_cache,
+                &consumer_index,
+                &lb_cache,
+            ),
+        ),
         dns_cache,
         connection_pool,
         router_cache,
@@ -346,6 +354,7 @@ async fn test_http3_proxy_state_creation() {
                     dns_cache_for_sd,
                     hc,
                     ferrum_edge::plugins::PluginHttpClient::default(),
+                    None,
                 ),
             )
         },
@@ -552,6 +561,14 @@ async fn test_http3_full_integration() {
     let dns_cache_for_sd = dns_cache.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
+        request_epoch: Arc::new(
+            ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+                gc.clone(),
+                &plugin_cache,
+                &consumer_index,
+                &lb_cache,
+            ),
+        ),
         dns_cache,
         connection_pool,
         router_cache,
@@ -582,6 +599,7 @@ async fn test_http3_full_integration() {
                     dns_cache_for_sd,
                     hc,
                     ferrum_edge::plugins::PluginHttpClient::default(),
+                    None,
                 ),
             )
         },

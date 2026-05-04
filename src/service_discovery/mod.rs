@@ -14,6 +14,7 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::PluginHttpClient;
+use crate::request_epoch::RequestEpochStore;
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -47,6 +48,7 @@ pub trait ServiceDiscoverer: Send + Sync {
 pub struct ServiceDiscoveryManager {
     tasks: DashMap<String, TaskEntry>,
     load_balancer_cache: Arc<LoadBalancerCache>,
+    request_epoch: Option<Arc<RequestEpochStore>>,
     dns_cache: DnsCache,
     health_checker: Arc<HealthChecker>,
     /// Shared HTTP client for Kubernetes and Consul discovery calls.
@@ -61,10 +63,12 @@ impl ServiceDiscoveryManager {
         dns_cache: DnsCache,
         health_checker: Arc<HealthChecker>,
         http_client: PluginHttpClient,
+        request_epoch: Option<Arc<RequestEpochStore>>,
     ) -> Self {
         Self {
             tasks: DashMap::new(),
             load_balancer_cache,
+            request_epoch,
             dns_cache,
             health_checker,
             http_client,
@@ -272,6 +276,7 @@ impl ServiceDiscoveryManager {
 
         let upstream_id_owned = upstream_id.to_string();
         let lb_cache = self.load_balancer_cache.clone();
+        let request_epoch = self.request_epoch.clone();
         let static_targets = static_targets.to_vec();
         let dns_cache = self.dns_cache.clone();
         let health_checker = self.health_checker.clone();
@@ -284,6 +289,7 @@ impl ServiceDiscoveryManager {
                 &upstream_id_owned,
                 discoverer,
                 &lb_cache,
+                request_epoch,
                 &static_targets,
                 algorithm,
                 hash_on,
@@ -392,6 +398,7 @@ async fn run_discovery_loop(
     upstream_id: &str,
     discoverer: Box<dyn ServiceDiscoverer>,
     lb_cache: &LoadBalancerCache,
+    request_epoch: Option<Arc<RequestEpochStore>>,
     static_targets: &[UpstreamTarget],
     algorithm: crate::config::types::LoadBalancerAlgorithm,
     hash_on: Option<String>,
@@ -494,13 +501,27 @@ async fn run_discovery_loop(
                         return;
                     }
 
-                    // Update the load balancer cache atomically
-                    lb_cache.update_targets(
-                        upstream_id,
-                        merged.clone(),
-                        algorithm,
-                        hash_on.clone(),
-                    );
+                    // Publish the LB-only epoch under the request-epoch write lock.
+                    if let Some(epoch_store) = &request_epoch {
+                        if let Some(epoch) = epoch_store.update_load_balancer(|current| {
+                            Some(LoadBalancerCache::build_update_targets_inner(
+                                &current.load_balancer,
+                                upstream_id,
+                                merged.clone(),
+                                algorithm,
+                                hash_on.clone(),
+                            ))
+                        }) {
+                            lb_cache.store_inner(epoch.load_balancer.clone());
+                        }
+                    } else {
+                        lb_cache.update_targets(
+                            upstream_id,
+                            merged.clone(),
+                            algorithm,
+                            hash_on.clone(),
+                        );
+                    }
 
                     // Clean up stale health state for targets that were removed
                     health_checker.remove_stale_targets(upstream_id, &merged);

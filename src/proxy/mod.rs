@@ -78,13 +78,14 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
-use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
+use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection,
 };
 use crate::proxy::headers as headers_mod;
+use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -1011,6 +1012,7 @@ fn reject_result_to_backend_response(
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
     pub router_cache: Arc<RouterCache>,
@@ -1218,6 +1220,16 @@ impl ProxyState {
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
+        let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
+            config: Arc::new(config.clone()),
+            route_table: RouterCache::build_route_table_snapshot(&config),
+            plugin_cache: plugin_cache.load_inner(),
+            consumer_index: consumer_index.load_inner(),
+            load_balancer: load_balancer_cache.load_inner(),
+            config_generation: 1,
+            route_generation: 1,
+            lb_generation: 1,
+        }));
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
@@ -1242,6 +1254,7 @@ impl ProxyState {
             dns_cache.clone(),
             health_checker.clone(),
             plugin_http_client,
+            Some(request_epoch.clone()),
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -1377,6 +1390,7 @@ impl ProxyState {
 
         Ok(Self {
             config: config_arc,
+            request_epoch,
             dns_cache,
             connection_pool,
             router_cache,
@@ -2228,16 +2242,54 @@ impl ProxyState {
             && new_config.upstreams.is_empty();
 
         if old_is_empty && !new_is_empty {
-            self.router_cache.rebuild(&new_config);
-            if let Err(e) = self.plugin_cache.rebuild(&new_config) {
-                error!(
-                    "Config reload rejected — security plugin validation failed: {}",
-                    e
-                );
-                return false;
-            }
-            self.consumer_index.rebuild(&new_config.consumers);
-            self.load_balancer_cache.rebuild(&new_config);
+            let route_table = RouterCache::build_route_table_snapshot(&new_config);
+            let plugin_inner = match self
+                .plugin_cache
+                .build_inner_with_existing_client(&new_config)
+            {
+                Ok(inner) => inner,
+                Err(e) => {
+                    error!(
+                        "Config reload rejected — security plugin validation failed: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
+            let lb_inner = LoadBalancerCache::build_inner(&new_config);
+            let staged_config = Arc::new(new_config.clone());
+            let published = match self.request_epoch.update_config(|_| {
+                Ok(Some(StagedRequestEpoch {
+                    config: Arc::clone(&staged_config),
+                    route_table: Arc::clone(&route_table),
+                    plugin_cache: Arc::clone(&plugin_inner),
+                    consumer_index: Arc::clone(&consumer_inner),
+                    load_balancer: Arc::clone(&lb_inner),
+                    route_changed: true,
+                    lb_changed: true,
+                }))
+            }) {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) => return false,
+                Err(e) => {
+                    error!("Config reload rejected: {}", e);
+                    return false;
+                }
+            };
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
+            );
+            self.router_cache.clear_lookup_caches();
+            self.plugin_cache
+                .store_inner(Arc::clone(&published.plugin_cache));
+            PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+            self.consumer_index
+                .store_inner(Arc::clone(&published.consumer_index));
+            self.load_balancer_cache
+                .store_inner(Arc::clone(&published.load_balancer));
+            self.config.store(Arc::clone(&published.config));
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -2271,7 +2323,6 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-            self.config.store(Arc::new(new_config));
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -2312,11 +2363,7 @@ impl ProxyState {
             return false;
         }
 
-        // --- RouterCache: rebuild route table, surgically invalidate path cache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache: only rebuild plugins for affected proxies ---
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
         let rebuild_globals = delta
             .added_plugin_configs
@@ -2324,33 +2371,81 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
+        let route_changed = !delta.added_proxies.is_empty()
+            || !delta.modified_proxies.is_empty()
+            || !delta.removed_proxy_ids.is_empty();
+        let lb_changed = !delta.added_upstreams.is_empty()
+            || !delta.modified_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty();
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(|current| {
+            let plugin_inner = self.plugin_cache.build_delta_inner(
+                &current.plugin_cache,
+                &new_config,
+                &proxy_ids_to_rebuild,
+                &delta.removed_proxy_ids,
+                rebuild_globals,
+            )?;
+            let consumer_changed = !delta.added_consumers.is_empty()
+                || !delta.modified_consumers.is_empty()
+                || !delta.removed_consumer_ids.is_empty();
+            let consumer_inner = if consumer_changed {
+                ConsumerIndex::build_inner(&new_config.consumers)
+            } else {
+                Arc::clone(&current.consumer_index)
+            };
+            let lb_inner = if lb_changed {
+                LoadBalancerCache::build_delta_inner(
+                    &current.load_balancer,
+                    &new_config,
+                    &delta.added_upstreams,
+                    &delta.removed_upstream_ids,
+                    &delta.modified_upstreams,
+                )
+            } else {
+                Arc::clone(&current.load_balancer)
+            };
+            let route_table = if route_changed {
+                RouterCache::build_route_table_snapshot(&new_config)
+            } else {
+                Arc::clone(&current.route_table)
+            };
+            Ok(Some(StagedRequestEpoch {
+                config: Arc::clone(&staged_config),
+                route_table,
+                plugin_cache: plugin_inner,
+                consumer_index: consumer_inner,
+                load_balancer: lb_inner,
+                route_changed,
+                lb_changed,
+            }))
+        });
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        if route_changed {
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
             );
-            return false;
+            self.router_cache.clear_lookup_caches();
         }
-
-        // --- ConsumerIndex: surgical add/remove/update ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
-        );
-
-        // --- LoadBalancerCache: only rebuild changed upstreams ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        self.plugin_cache
+            .store_inner(Arc::clone(&published.plugin_cache));
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+        self.consumer_index
+            .store_inner(Arc::clone(&published.consumer_index));
+        self.load_balancer_cache
+            .store_inner(Arc::clone(&published.load_balancer));
+        self.config.store(Arc::clone(&published.config));
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2413,9 +2508,6 @@ impl ProxyState {
             });
         }
 
-        // Clear cached pool keys when proxy settings change
-        // Swap the canonical config last (readers may still be using old caches
-        // via ArcSwap snapshots until they finish their current request)
         // Prune adaptive buffer state for removed proxies.
         {
             let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
@@ -2423,7 +2515,6 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -2709,11 +2800,7 @@ impl ProxyState {
         // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
-        // --- RouterCache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache ---
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
         let rebuild_globals = delta
             .added_plugin_configs
@@ -2721,33 +2808,81 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
+        let route_changed = !delta.added_proxies.is_empty()
+            || !delta.modified_proxies.is_empty()
+            || !delta.removed_proxy_ids.is_empty();
+        let lb_changed = !delta.added_upstreams.is_empty()
+            || !delta.modified_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty();
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(|current| {
+            let plugin_inner = self.plugin_cache.build_delta_inner(
+                &current.plugin_cache,
+                &new_config,
+                &proxy_ids_to_rebuild,
+                &delta.removed_proxy_ids,
+                rebuild_globals,
+            )?;
+            let consumer_changed = !delta.added_consumers.is_empty()
+                || !delta.modified_consumers.is_empty()
+                || !delta.removed_consumer_ids.is_empty();
+            let consumer_inner = if consumer_changed {
+                ConsumerIndex::build_inner(&new_config.consumers)
+            } else {
+                Arc::clone(&current.consumer_index)
+            };
+            let lb_inner = if lb_changed {
+                LoadBalancerCache::build_delta_inner(
+                    &current.load_balancer,
+                    &new_config,
+                    &delta.added_upstreams,
+                    &delta.removed_upstream_ids,
+                    &delta.modified_upstreams,
+                )
+            } else {
+                Arc::clone(&current.load_balancer)
+            };
+            let route_table = if route_changed {
+                RouterCache::build_route_table_snapshot(&new_config)
+            } else {
+                Arc::clone(&current.route_table)
+            };
+            Ok(Some(StagedRequestEpoch {
+                config: Arc::clone(&staged_config),
+                route_table,
+                plugin_cache: plugin_inner,
+                consumer_index: consumer_inner,
+                load_balancer: lb_inner,
+                route_changed,
+                lb_changed,
+            }))
+        });
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        if route_changed {
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
             );
-            return false;
+            self.router_cache.clear_lookup_caches();
         }
-
-        // --- ConsumerIndex ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
-        );
-
-        // --- LoadBalancerCache ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        self.plugin_cache
+            .store_inner(Arc::clone(&published.plugin_cache));
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
+        self.consumer_index
+            .store_inner(Arc::clone(&published.consumer_index));
+        self.load_balancer_cache
+            .store_inner(Arc::clone(&published.load_balancer));
+        self.config.store(Arc::clone(&published.config));
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2812,9 +2947,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_ids);
         }
 
-        // Store updated config
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -3019,7 +3152,9 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
+    epoch: Arc<RequestEpoch>,
     upstream_target: Option<Arc<UpstreamTarget>>,
+    upstream_balancer: Option<Arc<LoadBalancer>>,
     lb_hash_key: Option<String>,
     sticky_cookie_needed: bool,
     start_time: Instant,
@@ -3207,7 +3342,8 @@ async fn handle_websocket_request_authenticated(
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = state.load_balancer_cache.select_next_target(
+                        && let Some(next) = LoadBalancerCache::select_next_target_from(
+                            &epoch.load_balancer,
                             upstream_id,
                             hash_key,
                             prev_target,
@@ -3319,6 +3455,10 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
+    if let (Some(target), Some(balancer)) = (&current_target, &upstream_balancer) {
+        balancer.record_connection_start(target);
+    }
+
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
     let ws_status_code: u16 = if is_h2_websocket { 200 } else { 101 };
@@ -3399,9 +3539,10 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -3444,6 +3585,8 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
+    let ws_lb_target = current_target.clone();
+    let ws_lb_balancer = upstream_balancer.clone();
     // Capture session metadata while the originating RequestContext + proxy are
     // still in scope. Passed to run_websocket_proxy so it can construct a
     // WsDisconnectContext at teardown for plugins that opted in to
@@ -3498,6 +3641,9 @@ async fn handle_websocket_request_authenticated(
                     proxy_id, e
                 );
             }
+        }
+        if let (Some(target), Some(balancer)) = (ws_lb_target.as_ref(), ws_lb_balancer.as_ref()) {
+            balancer.record_connection_end(target);
         }
     });
 
@@ -5573,11 +5719,15 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+    let epoch = state.request_epoch.load();
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+    let route_match = state.router_cache.find_proxy_in_snapshot(
+        &epoch.route_table,
+        epoch.route_generation,
+        request_host.as_deref(),
+        &path,
+    );
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
@@ -5695,7 +5845,7 @@ async fn handle_proxy_request_inner(
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = state.plugin_cache.request_view(&proxy.id, request_protocol);
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
@@ -5759,11 +5909,12 @@ async fn handle_proxy_request_inner(
 
     {
         let auth_phase_start = Instant::now();
+        let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
         if let Some((status_code, body, headers)) = run_authentication_phase(
             proxy.auth_mode.clone(),
             &auth_plugins,
             &mut ctx,
-            &state.consumer_index,
+            &consumer_index,
         )
         .await
         {
@@ -5999,11 +6150,17 @@ async fn handle_proxy_request_inner(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
-    // Resolve upstream target and hash key with a single ArcSwap load.
-    let selection =
-        backend_dispatch::select_upstream_target(&proxy, &state, &ctx.client_ip, proxy_headers);
+    // Resolve upstream target and hash key from the request epoch.
+    let selection = backend_dispatch::select_upstream_target(
+        &proxy,
+        &state,
+        &epoch,
+        &ctx.client_ip,
+        proxy_headers,
+    );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
+    let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
@@ -6086,7 +6243,9 @@ async fn handle_proxy_request_inner(
             ctx,
             plugins,
             plugin_execution_ns,
+            Arc::clone(&epoch),
             upstream_target,
+            upstream_balancer,
             lb_hash_key,
             sticky_cookie_needed,
             start_time,
@@ -6374,7 +6533,8 @@ async fn handle_proxy_request_inner(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                    && let Some(next) = LoadBalancerCache::select_next_target_from(
+                        &epoch.load_balancer,
                         upstream_id,
                         hash_key,
                         prev_target,
@@ -6871,9 +7031,13 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+                    let strategy = LoadBalancerCache::get_hash_on_strategy_from(
+                        &epoch.load_balancer,
+                        upstream_id,
+                    );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-                        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+                        let upstream =
+                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
                         let default_cc = crate::config::types::HashOnCookieConfig::default();
                         let cookie_config = upstream
                             .as_ref()
@@ -7026,10 +7190,12 @@ async fn handle_proxy_request_inner(
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+        &proxy.upstream_id,
+        &upstream_target,
+        upstream_balancer.as_ref(),
+    ) {
+        balancer.record_connection_start(target);
     }
 
     let should_stream = should_stream_response_body(
@@ -7139,7 +7305,8 @@ async fn handle_proxy_request_inner(
             // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = state.load_balancer_cache.select_next_target(
+                && let Some(next) = LoadBalancerCache::select_next_target_from(
+                    &epoch.load_balancer,
                     upstream_id,
                     hash_key,
                     prev_target,
@@ -7274,6 +7441,8 @@ async fn handle_proxy_request_inner(
     backend_dispatch::record_backend_outcome(
         &state,
         &proxy,
+        &epoch.load_balancer,
+        upstream_balancer.as_ref(),
         upstream_target.as_deref(),
         final_cb_target_key.as_deref(),
         response_status,
@@ -7521,9 +7690,10 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()

@@ -421,7 +421,7 @@ fn collect_active_jwks_uris(
 
 /// All plugin-cache state swapped as a single unit so a single load observes
 /// either the old generation or the new generation, never a partial rebuild.
-struct PluginCacheInner {
+pub(crate) struct PluginCacheInner {
     /// proxy_id -> pre-resolved plugin list (global + proxy-scoped, merged).
     proxy_plugins: ProxyPluginMap,
     /// Fallback: global plugins only (for proxies with no scoped overrides).
@@ -445,7 +445,32 @@ struct PluginCacheInner {
 }
 
 impl PluginCacheInner {
-    fn get_plugins(&self, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        proxy_plugins: ProxyPluginMap,
+        global_plugins: PluginList,
+        requires_buffering: BufferingMap,
+        global_requires_buffering: bool,
+        requires_request_buffering: RequestBufferingMap,
+        global_requires_request_buffering: bool,
+        protocol_snapshot: ProtocolSnapshot,
+        requires_ws_frame: WsFrameMap,
+        global_requires_ws_frame: bool,
+    ) -> Self {
+        Self {
+            proxy_plugins,
+            global_plugins,
+            requires_buffering,
+            global_requires_buffering,
+            requires_request_buffering,
+            global_requires_request_buffering,
+            protocol_snapshot,
+            requires_ws_frame,
+            global_requires_ws_frame,
+        }
+    }
+
+    pub(crate) fn get_plugins(&self, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
         if let Some(plugins) = self.proxy_plugins.get(proxy_id) {
             Arc::clone(plugins)
         } else {
@@ -461,7 +486,7 @@ impl PluginCacheInner {
             .or_else(|| self.protocol_snapshot.global.get(&protocol))
     }
 
-    fn get_plugins_for_protocol(
+    pub(crate) fn get_plugins_for_protocol(
         &self,
         proxy_id: &str,
         protocol: ProxyProtocol,
@@ -471,7 +496,7 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
-    fn get_auth_plugins(
+    pub(crate) fn get_auth_plugins(
         &self,
         proxy_id: &str,
         protocol: ProxyProtocol,
@@ -481,31 +506,50 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
-    fn get_capabilities(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCapabilities {
+    pub(crate) fn get_capabilities(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> PluginCapabilities {
         self.protocol_entry(proxy_id, protocol)
             .map(|entry| entry.phase.capabilities)
             .unwrap_or_default()
     }
 
-    fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
+    pub(crate) fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
         self.requires_buffering
             .get(proxy_id)
             .copied()
             .unwrap_or(self.global_requires_buffering)
     }
 
-    fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
+    pub(crate) fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
         self.requires_request_buffering
             .get(proxy_id)
             .copied()
             .unwrap_or(self.global_requires_request_buffering)
     }
 
-    fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
+    pub(crate) fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
         self.requires_ws_frame
             .get(proxy_id)
             .copied()
             .unwrap_or(self.global_requires_ws_frame)
+    }
+
+    pub(crate) fn request_view(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> PluginCacheRequestView {
+        PluginCacheRequestView {
+            plugins: self.get_plugins_for_protocol(proxy_id, protocol),
+            auth_plugins: self.get_auth_plugins(proxy_id, protocol),
+            capabilities: self.get_capabilities(proxy_id, protocol),
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_id),
+        }
     }
 }
 
@@ -588,6 +632,17 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
+        let inner = Self::build_inner(config, &http_client)?;
+        Ok(Self {
+            inner: ArcSwap::new(inner),
+            http_client,
+        })
+    }
+
+    pub(crate) fn build_inner(
+        config: &GatewayConfig,
+        http_client: &PluginHttpClient,
+    ) -> Result<Arc<PluginCacheInner>, String> {
         let (
             proxy_map,
             globals,
@@ -597,22 +652,40 @@ impl PluginCache {
             global_needs_req_buffering,
             ws_frame_map,
             global_needs_ws_frame,
-        ) = Self::build_cache(config, &http_client)?;
+        ) = Self::build_cache(config, http_client)?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
-        Ok(Self {
-            inner: ArcSwap::new(Arc::new(PluginCacheInner {
-                proxy_plugins: proxy_map,
-                global_plugins: globals,
-                requires_buffering: buffering_map,
-                global_requires_buffering: global_needs_buffering,
-                requires_request_buffering: req_buffering_map,
-                global_requires_request_buffering: global_needs_req_buffering,
-                protocol_snapshot: snapshot,
-                requires_ws_frame: ws_frame_map,
-                global_requires_ws_frame: global_needs_ws_frame,
-            })),
-            http_client,
-        })
+
+        Ok(Arc::new(PluginCacheInner::new(
+            proxy_map,
+            globals,
+            buffering_map,
+            global_needs_buffering,
+            req_buffering_map,
+            global_needs_req_buffering,
+            snapshot,
+            ws_frame_map,
+            global_needs_ws_frame,
+        )))
+    }
+
+    pub(crate) fn build_inner_with_existing_client(
+        &self,
+        config: &GatewayConfig,
+    ) -> Result<Arc<PluginCacheInner>, String> {
+        Self::build_inner(config, &self.http_client)
+    }
+
+    pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
+        self.inner.store(inner);
+    }
+
+    pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
+        self.inner.load_full()
+    }
+
+    pub(crate) fn retain_active_uris_for_inner(inner: &PluginCacheInner) {
+        let active_uris = collect_active_jwks_uris(&inner.proxy_plugins, &inner.global_plugins);
+        retain_active_uris(&active_uris);
     }
 
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.
@@ -622,14 +695,7 @@ impl PluginCache {
     /// and the full cache snapshot is released before request processing awaits.
     pub fn request_view(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCacheRequestView {
         let inner = self.inner.load();
-        PluginCacheRequestView {
-            plugins: inner.get_plugins_for_protocol(proxy_id, protocol),
-            auth_plugins: inner.get_auth_plugins(proxy_id, protocol),
-            capabilities: inner.get_capabilities(proxy_id, protocol),
-            requires_response_body_buffering: inner.requires_response_body_buffering(proxy_id),
-            requires_request_body_buffering: inner.requires_request_body_buffering(proxy_id),
-            requires_ws_frame_hooks: inner.requires_ws_frame_hooks(proxy_id),
-        }
+        inner.request_view(proxy_id, protocol)
     }
 
     /// Atomically rebuild the cache when config changes.
@@ -638,35 +704,15 @@ impl PluginCache {
     ///
     /// Returns `Err` if a security-critical plugin fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
-        let (
-            proxy_map,
-            globals,
-            buffering_map,
-            global_needs_buffering,
-            req_buffering_map,
-            global_needs_req_buffering,
-            ws_frame_map,
-            global_needs_ws_frame,
-        ) = Self::build_cache(config, &self.http_client)?;
-        let snapshot = build_protocol_snapshot(&proxy_map, &globals);
-
-        // Clean up JWKS cache entries (and their background refresh tasks)
-        // for URIs no longer referenced by any active jwks_auth plugin.
-        let active_uris = collect_active_jwks_uris(&proxy_map, &globals);
-        retain_active_uris(&active_uris);
+        let inner = self.build_inner_with_existing_client(config)?;
 
         // Single atomic swap — readers see either the old or new generation.
-        self.inner.store(Arc::new(PluginCacheInner {
-            proxy_plugins: proxy_map,
-            global_plugins: globals,
-            requires_buffering: buffering_map,
-            global_requires_buffering: global_needs_buffering,
-            requires_request_buffering: req_buffering_map,
-            global_requires_request_buffering: global_needs_req_buffering,
-            protocol_snapshot: snapshot,
-            requires_ws_frame: ws_frame_map,
-            global_requires_ws_frame: global_needs_ws_frame,
-        }));
+        self.store_inner(Arc::clone(&inner));
+
+        // Clean up JWKS cache entries (and their background refresh tasks)
+        // after commit so a staged rebuild that fails validation cannot prune
+        // the still-live cache.
+        Self::retain_active_uris_for_inner(&inner);
         Ok(())
     }
 
@@ -679,18 +725,15 @@ impl PluginCache {
     /// global-scoped plugin config was added/modified/removed).
     /// Returns `Err` if a security-critical plugin fails validation during
     /// incremental update, matching the behavior of `rebuild()`.
-    pub fn apply_delta(
+    pub(crate) fn build_delta_inner(
         &self,
+        current: &PluginCacheInner,
         config: &GatewayConfig,
         proxy_ids_to_rebuild: &HashSet<String>,
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<PluginCacheInner>, String> {
         let mut security_errors: Vec<String> = Vec::new();
-
-        // Load the current snapshot — we clone-and-patch its fields, then
-        // swap the entire inner struct in one atomic store.
-        let current = self.inner.load();
 
         // Rebuild globals if any global plugin config changed
         let new_globals = if rebuild_globals {
@@ -860,11 +903,6 @@ impl PluginCache {
             ));
         }
 
-        // Clean up JWKS cache entries (and their background refresh tasks)
-        // for URIs no longer referenced by any active jwks_auth plugin.
-        let active_uris = collect_active_jwks_uris(&new_map, &new_globals);
-        retain_active_uris(&active_uris);
-
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
@@ -912,21 +950,44 @@ impl PluginCache {
             current.global_requires_ws_frame
         };
 
-        // Single atomic swap — readers see old or new, never a partial state.
-        self.inner.store(Arc::new(PluginCacheInner {
-            proxy_plugins: new_map,
-            global_plugins: new_globals,
-            requires_buffering: new_buffering,
-            global_requires_buffering: new_global_requires_buffering,
-            requires_request_buffering: new_req_buffering,
-            global_requires_request_buffering: new_global_requires_request_buffering,
-            protocol_snapshot: ProtocolSnapshot {
+        Ok(Arc::new(PluginCacheInner::new(
+            new_map,
+            new_globals,
+            new_buffering,
+            new_global_requires_buffering,
+            new_req_buffering,
+            new_global_requires_request_buffering,
+            ProtocolSnapshot {
                 proxy: new_proxy_proto,
                 global: new_global_proto,
             },
-            requires_ws_frame: new_ws_frame,
-            global_requires_ws_frame: new_global_requires_ws_frame,
-        }));
+            new_ws_frame,
+            new_global_requires_ws_frame,
+        )))
+    }
+
+    pub fn apply_delta(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        removed_proxy_ids: &[String],
+        rebuild_globals: bool,
+    ) -> Result<(), String> {
+        let current = self.inner.load();
+        let inner = self.build_delta_inner(
+            &current,
+            config,
+            proxy_ids_to_rebuild,
+            removed_proxy_ids,
+            rebuild_globals,
+        )?;
+
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.store_inner(Arc::clone(&inner));
+
+        // Clean up JWKS cache entries (and their background refresh tasks)
+        // after commit so a rejected staged cache never prunes the live set.
+        Self::retain_active_uris_for_inner(&inner);
 
         Ok(())
     }

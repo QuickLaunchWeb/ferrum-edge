@@ -33,6 +33,7 @@ pub mod plugin_cache;
 pub mod plugins;
 pub mod pool;
 pub mod proxy;
+pub mod request_epoch;
 pub mod retry;
 pub mod router_cache;
 pub mod secrets;

@@ -23,6 +23,8 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
+use crate::consumer_index::ConsumerIndex;
+use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::headers::{is_backend_request_strip_header, is_backend_response_strip_header};
 use crate::proxy::{
@@ -783,10 +785,15 @@ async fn handle_h3_request(
         None => None,
     };
 
+    let epoch = state.request_epoch.load();
+
     // Route: host + longest prefix match via router cache
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+    let route_match = state.router_cache.find_proxy_in_snapshot(
+        &epoch.route_table,
+        epoch.route_generation,
+        request_host.as_deref(),
+        &path,
+    );
 
     let proxy = match route_match {
         Some(rm) => {
@@ -883,7 +890,7 @@ async fn handle_h3_request(
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = state.plugin_cache.request_view(&proxy.id, request_protocol);
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
@@ -936,11 +943,12 @@ async fn handle_h3_request(
     let auth_plugins = plugin_cache_view.auth_plugins();
 
     let auth_phase_start = std::time::Instant::now();
+    let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
     if let Some((status_code, body, mut headers)) = run_authentication_phase(
         proxy.auth_mode.clone(),
         &auth_plugins,
         &mut ctx,
-        &state.consumer_index,
+        &consumer_index,
     )
     .await
     {
@@ -1178,11 +1186,13 @@ async fn handle_h3_request(
     let selection = crate::proxy::backend_dispatch::select_upstream_target(
         &proxy,
         &state,
+        &epoch,
         &ctx.client_ip,
         &proxy_headers,
     );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
+    let upstream_balancer = selection.balancer;
 
     let (cb_target_key, cb_is_half_open_probe) =
         match crate::proxy::backend_dispatch::check_circuit_breaker(
@@ -1310,6 +1320,7 @@ async fn handle_h3_request(
         let outcome =
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
+                epoch: &epoch,
                 proxy: &proxy,
                 stream: &mut stream,
                 method: &method,
@@ -1319,6 +1330,7 @@ async fn handle_h3_request(
                 backend_url: &backend_url,
                 lb_hash_key: lb_hash_key.as_deref(),
                 upstream_target: upstream_target.as_deref(),
+                upstream_balancer: upstream_balancer.as_ref(),
                 cb_target_key: cb_target_key.as_deref(),
                 cb_is_half_open_probe,
                 flavor: http_flavor,
@@ -1393,10 +1405,12 @@ async fn handle_h3_request(
         // (backend → frontend) without buffering either into memory.
 
         // Track connection for least-connections LB (after all pre-dispatch rejects)
-        if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-            state
-                .load_balancer_cache
-                .record_connection_start(upstream_id, target);
+        if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+            &proxy.upstream_id,
+            &upstream_target,
+            upstream_balancer.as_ref(),
+        ) {
+            balancer.record_connection_start(target);
         }
 
         let client_ip_owned = ctx.client_ip.clone();
@@ -1476,6 +1490,8 @@ async fn handle_h3_request(
                 crate::proxy::backend_dispatch::record_backend_outcome(
                     &state,
                     &proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer.as_ref(),
                     upstream_target.as_deref(),
                     cb_target_key.as_deref(),
                     502,
@@ -1548,6 +1564,8 @@ async fn handle_h3_request(
             crate::proxy::backend_dispatch::record_backend_outcome(
                 &state,
                 &proxy,
+                &epoch.load_balancer,
+                upstream_balancer.as_ref(),
                 upstream_target.as_deref(),
                 cb_target_key.as_deref(),
                 502,
@@ -1572,7 +1590,7 @@ async fn handle_h3_request(
 
         // Sticky session cookie injection
         inject_sticky_cookie(
-            &state,
+            &epoch,
             &proxy,
             upstream_target.as_deref(),
             sticky_cookie_needed,
@@ -1739,6 +1757,8 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
@@ -1885,10 +1905,12 @@ async fn handle_h3_request(
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
     // and early returns from body collection/plugin rejects don't leak counts.
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+        &proxy.upstream_id,
+        &upstream_target,
+        upstream_balancer.as_ref(),
+    ) {
+        balancer.record_connection_start(target);
     }
 
     if !needs_response_buffering {
@@ -1912,6 +1934,7 @@ async fn handle_h3_request(
             body_data,
             &client_ip_owned,
             upstream_target.as_deref(),
+            &epoch,
             sticky_cookie_needed,
             &mut stream,
             &plugins,
@@ -1991,6 +2014,8 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
             upstream_target.as_deref(),
             cb_target_key.as_deref(),
             response_status,
@@ -2131,7 +2156,8 @@ async fn handle_h3_request(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                    && let Some(next) = LoadBalancerCache::select_next_target_from(
+                        &epoch.load_balancer,
                         upstream_id,
                         hash_key,
                         prev_target,
@@ -2222,6 +2248,8 @@ async fn handle_h3_request(
         crate::proxy::backend_dispatch::record_backend_outcome(
             &state,
             &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
             final_target.as_deref(),
             final_cb_target_key.as_deref(),
             response_status,
@@ -2256,7 +2284,7 @@ async fn handle_h3_request(
         // Sticky session cookie injection
         if !after_proxy_rejected {
             inject_sticky_cookie(
-                &state,
+                &epoch,
                 &proxy,
                 upstream_target.as_deref(),
                 sticky_cookie_needed,
@@ -2536,7 +2564,7 @@ fn build_h3_backend_headers(
 /// Inject a sticky-session `Set-Cookie` header when the LB strategy is cookie-based
 /// and the cookie was not present in the original request.
 pub(crate) fn inject_sticky_cookie(
-    state: &ProxyState,
+    epoch: &crate::request_epoch::RequestEpoch,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
     sticky_cookie_needed: bool,
@@ -2545,9 +2573,10 @@ pub(crate) fn inject_sticky_cookie(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -2660,6 +2689,7 @@ async fn proxy_to_backend_h3_streaming(
     body_bytes: Vec<u8>,
     client_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    epoch: &crate::request_epoch::RequestEpoch,
     sticky_cookie_needed: bool,
     h3_stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     plugins: &[Arc<dyn Plugin>],
@@ -2785,7 +2815,7 @@ async fn proxy_to_backend_h3_streaming(
 
     // Sticky session cookie injection
     inject_sticky_cookie(
-        state,
+        epoch,
         proxy,
         upstream_target,
         sticky_cookie_needed,

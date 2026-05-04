@@ -102,11 +102,13 @@ use tracing::{debug, error, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::http3::server::h3_http_status_to_grpc_status;
+use crate::load_balancer::LoadBalancer;
 use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
 use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
 use crate::proxy::headers::is_backend_response_strip_header;
+use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
 /// Outcome reported back to the H3 listener so it can update request
@@ -151,6 +153,7 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     pub state: &'a ProxyState,
+    pub epoch: &'a RequestEpoch,
     pub proxy: &'a Proxy,
     pub stream: &'a mut RequestStream<S, Bytes>,
     pub method: &'a str,
@@ -160,6 +163,7 @@ where
     pub backend_url: &'a str,
     pub lb_hash_key: Option<&'a str>,
     pub upstream_target: Option<&'a UpstreamTarget>,
+    pub upstream_balancer: Option<&'a Arc<LoadBalancer>>,
     pub cb_target_key: Option<&'a str>,
     pub cb_is_half_open_probe: bool,
     pub flavor: HttpFlavor,
@@ -172,30 +176,27 @@ where
 }
 
 fn record_cross_protocol_connection_start(
-    state: &ProxyState,
-    proxy: &Proxy,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
 ) {
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+        balancer.record_connection_start(target);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_cross_protocol_retry_failure(
     state: &ProxyState,
     proxy: &Proxy,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
     cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
     is_half_open_probe: bool,
 ) {
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_end(upstream_id, target);
+    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+        balancer.record_connection_end(target);
     }
 
     if let Some(cb_config) = &proxy.circuit_breaker {
@@ -208,6 +209,7 @@ fn record_cross_protocol_retry_failure(
 
 fn select_next_cross_protocol_retry_target(
     state: &ProxyState,
+    epoch: &RequestEpoch,
     proxy: &Proxy,
     lb_hash_key: Option<&str>,
     current_target: Option<&Arc<UpstreamTarget>>,
@@ -229,7 +231,8 @@ fn select_next_cross_protocol_retry_target(
             .map(|r| r.value().clone()),
     };
 
-    let next = state.load_balancer_cache.select_next_target(
+    let next = crate::load_balancer::LoadBalancerCache::select_next_target_from(
+        &epoch.load_balancer,
         upstream_id,
         hash_key,
         prev_target,
@@ -296,6 +299,7 @@ where
 {
     let CrossProtocolRequest {
         state,
+        epoch,
         proxy,
         stream,
         method,
@@ -305,6 +309,7 @@ where
         backend_url,
         lb_hash_key,
         upstream_target,
+        upstream_balancer,
         cb_target_key,
         cb_is_half_open_probe,
         flavor,
@@ -358,6 +363,7 @@ where
         HttpFlavor::Plain => {
             dispatch_plain(
                 state,
+                epoch,
                 proxy,
                 stream,
                 method,
@@ -367,6 +373,7 @@ where
                 backend_url,
                 lb_hash_key,
                 upstream_target,
+                upstream_balancer,
                 cb_target_key,
                 cb_is_half_open_probe,
                 prebuffered_body,
@@ -383,6 +390,7 @@ where
         HttpFlavor::Grpc => {
             dispatch_grpc(
                 state,
+                epoch,
                 proxy,
                 stream,
                 method,
@@ -392,6 +400,7 @@ where
                 backend_url,
                 lb_hash_key,
                 upstream_target,
+                upstream_balancer,
                 cb_target_key,
                 cb_is_half_open_probe,
                 prebuffered_body,
@@ -553,6 +562,7 @@ async fn collect_reqwest_response_body_with_limit(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_plain<S>(
     state: &ProxyState,
+    epoch: &RequestEpoch,
     proxy: &Proxy,
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
@@ -562,6 +572,7 @@ async fn dispatch_plain<S>(
     backend_url: &str,
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
     cb_is_half_open_probe: bool,
     prebuffered_body: Option<Vec<u8>>,
@@ -586,6 +597,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 upstream_target,
                 cb_target_key,
                 502,
@@ -641,7 +654,7 @@ where
             let request_bytes = raw_prebuffered_body_bytes;
             let mut attempt = 0u32;
 
-            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             let response = loop {
                 let effective_host = current_target
@@ -683,6 +696,7 @@ where
                             record_cross_protocol_retry_failure(
                                 state,
                                 proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
@@ -695,6 +709,7 @@ where
                             if let Some((next_target, next_cb_target_key, next_url)) =
                                 select_next_cross_protocol_retry_target(
                                     state,
+                                    epoch,
                                     proxy,
                                     lb_hash_key,
                                     current_target.as_ref(),
@@ -714,8 +729,7 @@ where
                                 "Retrying cross-protocol H3→HTTP backend request"
                             );
                             record_cross_protocol_connection_start(
-                                state,
-                                proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                             );
                             continue;
@@ -742,6 +756,7 @@ where
                             record_cross_protocol_retry_failure(
                                 state,
                                 proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                                 current_cb_target_key.as_deref(),
                                 attempt_result.status_code,
@@ -754,6 +769,7 @@ where
                             if let Some((next_target, next_cb_target_key, next_url)) =
                                 select_next_cross_protocol_retry_target(
                                     state,
+                                    epoch,
                                     proxy,
                                     lb_hash_key,
                                     current_target.as_ref(),
@@ -773,8 +789,7 @@ where
                                 "Retrying cross-protocol H3→HTTP backend request"
                             );
                             record_cross_protocol_connection_start(
-                                state,
-                                proxy,
+                                upstream_balancer,
                                 current_target.as_deref(),
                             );
                             continue;
@@ -789,6 +804,8 @@ where
                         record_backend_outcome(
                             state,
                             proxy,
+                            &epoch.load_balancer,
+                            upstream_balancer,
                             current_target.as_deref(),
                             current_cb_target_key.as_deref(),
                             attempt_result.status_code,
@@ -816,7 +833,7 @@ where
             (response, request_bytes)
         }
         None => {
-            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             let effective_host = current_target
                 .as_deref()
@@ -1001,6 +1018,8 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     413,
@@ -1038,6 +1057,8 @@ where
                     record_backend_outcome(
                         state,
                         proxy,
+                        &epoch.load_balancer,
+                        upstream_balancer,
                         current_target.as_deref(),
                         current_cb_target_key.as_deref(),
                         attempt_result.status_code,
@@ -1078,6 +1099,8 @@ where
         record_backend_outcome(
             state,
             proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             502,
@@ -1111,6 +1134,8 @@ where
         record_backend_outcome(
             state,
             proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             reject.status_code,
@@ -1135,7 +1160,7 @@ where
     // Sticky session cookie injection — only runs if the LB selected a
     // sticky target.
     crate::http3::server::inject_sticky_cookie(
-        state,
+        epoch,
         proxy,
         current_target.as_deref(),
         sticky_cookie_needed,
@@ -1155,6 +1180,8 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     502,
@@ -1272,6 +1299,8 @@ where
         record_backend_outcome(
             state,
             proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
             current_target.as_deref(),
             current_cb_target_key.as_deref(),
             response_status,
@@ -1310,6 +1339,8 @@ where
     record_backend_outcome(
         state,
         proxy,
+        &epoch.load_balancer,
+        upstream_balancer,
         current_target.as_deref(),
         current_cb_target_key.as_deref(),
         status,
@@ -1340,6 +1371,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_grpc<S>(
     state: &ProxyState,
+    epoch: &RequestEpoch,
     proxy: &Proxy,
     stream: &mut RequestStream<S, Bytes>,
     method: &str,
@@ -1349,6 +1381,7 @@ async fn dispatch_grpc<S>(
     backend_url: &str,
     lb_hash_key: Option<&str>,
     upstream_target: Option<&UpstreamTarget>,
+    upstream_balancer: Option<&Arc<LoadBalancer>>,
     cb_target_key: Option<&str>,
     cb_is_half_open_probe: bool,
     prebuffered_body: Option<Vec<u8>>,
@@ -1499,7 +1532,7 @@ where
         requires_response_body_buffering,
     );
     let body_bytes = Bytes::from(body);
-    record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+    record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
         hmap.clone(),
@@ -1554,6 +1587,7 @@ where
             record_cross_protocol_retry_failure(
                 state,
                 proxy,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 502,
@@ -1568,6 +1602,7 @@ where
             if let Some((next_target, next_cb_target_key, next_url)) =
                 select_next_cross_protocol_retry_target(
                     state,
+                    epoch,
                     proxy,
                     lb_hash_key,
                     current_target.as_ref(),
@@ -1586,7 +1621,7 @@ where
                 max_retries = retry_config.max_retries,
                 "Retrying cross-protocol H3→gRPC backend request"
             );
-            record_cross_protocol_connection_start(state, proxy, current_target.as_deref());
+            record_cross_protocol_connection_start(upstream_balancer, current_target.as_deref());
 
             // Stream the retry response under the same conditions as the
             // initial attempt. Hard-coding `false` here would silently
@@ -1645,6 +1680,8 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
@@ -1657,7 +1694,7 @@ where
                 return Ok(outcome);
             }
             crate::http3::server::inject_sticky_cookie(
-                state,
+                epoch,
                 proxy,
                 current_target.as_deref(),
                 sticky_cookie_needed,
@@ -1759,6 +1796,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 response_status,
@@ -1816,6 +1855,8 @@ where
                 record_backend_outcome(
                     state,
                     proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
                     outcome.response_status,
@@ -1828,7 +1869,7 @@ where
                 return Ok(outcome);
             }
             crate::http3::server::inject_sticky_cookie(
-                state,
+                epoch,
                 proxy,
                 current_target.as_deref(),
                 sticky_cookie_needed,
@@ -1856,6 +1897,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 streaming.status,
@@ -1921,6 +1964,8 @@ where
             record_backend_outcome(
                 state,
                 proxy,
+                &epoch.load_balancer,
+                upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
                 502,

@@ -20,6 +20,7 @@ use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstrea
 /// Separates path-keyed changes (prefix / regex listen_paths) from host-keyed
 /// changes (host-only proxies with no listen_path). These need different
 /// invalidation strategies because their cache partitions are keyed differently.
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct AffectedRoutes {
     /// listen_path values (prefix or `~regex`) whose cache entries may be stale.
@@ -30,6 +31,7 @@ pub struct AffectedRoutes {
     pub host_only_hosts: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl AffectedRoutes {
     pub fn is_empty(&self) -> bool {
         self.listen_paths.is_empty() && self.host_only_hosts.is_empty()
@@ -187,6 +189,7 @@ impl ConfigDelta {
     /// and regex proxies) from host-keyed changes (host-only proxies whose
     /// `listen_path.is_none()`). Used by RouterCache to selectively invalidate
     /// only the cache entries that could match changed routes.
+    #[allow(dead_code)]
     pub fn affected_routes(&self, old_config: &GatewayConfig) -> AffectedRoutes {
         let mut paths = Vec::new();
         let mut hosts = Vec::new();
