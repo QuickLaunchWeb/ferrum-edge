@@ -33,8 +33,14 @@ pub enum OverloadLevel {
 /// Atomic overload state read by the proxy hot path.
 ///
 /// The background monitor writes these flags; request threads only read.
-/// All fields use `Ordering::Relaxed` — eventual consistency is acceptable
+/// Most fields use `Ordering::Relaxed` — eventual consistency is acceptable
 /// for overload signals (a few ms of stale state is harmless).
+///
+/// Exception: `draining` uses `Acquire`/`Release` because it gates a
+/// notify_one() on a separate atomic counter reaching zero, and weakly-ordered
+/// CPUs could otherwise reorder the visibility of `draining=true` past a
+/// concurrent guard Drop's `fetch_sub` to zero — silently forcing a
+/// full-timeout drain.
 pub struct OverloadState {
     // ── Action flags (hot-path reads) ──────────────────────────────────
     /// When true, responses include `Connection: close` to drain idle keepalives.
@@ -237,7 +243,15 @@ impl Drop for ConnectionGuard {
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
         // If this was the last connection and we are draining, notify the waiter.
-        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+        //
+        // Acquire/Release pair establishes happens-before between the drainer
+        // setting draining=true (Release in `wait_for_drain`) and the guard
+        // observing it (Acquire here). Without this, weakly-ordered CPUs
+        // (ARM64, RISC-V) may skip the notify_one() and force a full-timeout
+        // drain. The active_connections counter itself stays Relaxed because
+        // per-location coherence is sufficient for the count check; only the
+        // cross-location ordering with `draining` needs the fence.
+        if prev == 1 && self.state.draining.load(Ordering::Acquire) {
             self.state.drain_complete.notify_one();
         }
     }
@@ -267,7 +281,15 @@ impl Drop for RequestGuard {
         // If this was the last request and we are draining, notify the waiter.
         // The drain waiter re-checks both active_connections and active_requests,
         // so spurious wakes from one counter reaching zero are harmless.
-        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+        //
+        // Acquire/Release pair establishes happens-before between the drainer
+        // setting draining=true (Release in `wait_for_drain`) and the guard
+        // observing it (Acquire here). Without this, weakly-ordered CPUs
+        // (ARM64, RISC-V) may skip the notify_one() and force a full-timeout
+        // drain. The active_requests counter itself stays Relaxed because
+        // per-location coherence is sufficient for the count check; only the
+        // cross-location ordering with `draining` needs the fence.
+        if prev == 1 && self.state.draining.load(Ordering::Acquire) {
             self.state.drain_complete.notify_one();
         }
     }
@@ -688,7 +710,13 @@ pub fn start_monitor(
 /// Called after the accept loops have exited. Returns `true` if all connections
 /// and requests drained within the timeout, `false` if the timeout expired.
 pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bool {
-    state.draining.store(true, Ordering::Relaxed);
+    // Release pairs with the Acquire load in ConnectionGuard::Drop /
+    // RequestGuard::Drop. This establishes happens-before so that a guard
+    // dropping concurrently with this store cannot observe draining=false
+    // after its fetch_sub returned prev=1 — without the fence, weakly-ordered
+    // CPUs (ARM64, RISC-V) could skip notify_one() and force a full-timeout
+    // drain even after the last in-flight work completed.
+    state.draining.store(true, Ordering::Release);
 
     let active_conns = state.active_connections.load(Ordering::Relaxed);
     let active_reqs = state.active_requests.load(Ordering::Relaxed);
