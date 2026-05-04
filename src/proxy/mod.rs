@@ -2304,6 +2304,30 @@ impl ProxyState {
         })
     }
 
+    fn mirror_request_epoch_wrappers(
+        &self,
+        published: &RequestEpoch,
+        route_changed: bool,
+        clear_route_caches: bool,
+    ) {
+        if route_changed {
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
+            );
+            if clear_route_caches {
+                self.router_cache.clear_lookup_caches();
+            }
+        }
+        self.plugin_cache
+            .store_inner(Arc::clone(&published.plugin_cache));
+        self.consumer_index
+            .store_inner(Arc::clone(&published.consumer_index));
+        self.load_balancer_cache
+            .store_inner(Arc::clone(&published.load_balancer));
+        self.config.store(Arc::clone(&published.config));
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
@@ -2365,17 +2389,22 @@ impl ProxyState {
             let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
             let lb_inner = LoadBalancerCache::build_inner(&new_config);
             let staged_config = Arc::new(new_config.clone());
-            let published = match self.request_epoch.update_config(|_| {
-                Ok(Some(StagedRequestEpoch {
-                    config: Arc::clone(&staged_config),
-                    route_table: Arc::clone(&route_table),
-                    plugin_cache: Arc::clone(&plugin_inner),
-                    consumer_index: Arc::clone(&consumer_inner),
-                    load_balancer: Arc::clone(&lb_inner),
-                    route_changed: true,
-                    lb_changed: true,
-                }))
-            }) {
+            let published = match self.request_epoch.update_config(
+                |_| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&route_table),
+                        plugin_cache: Arc::clone(&plugin_inner),
+                        consumer_index: Arc::clone(&consumer_inner),
+                        load_balancer: Arc::clone(&lb_inner),
+                        route_changed: true,
+                        lb_changed: true,
+                    }))
+                },
+                |published| {
+                    self.mirror_request_epoch_wrappers(published, true, true);
+                },
+            ) {
                 Ok(Some(epoch)) => epoch,
                 Ok(None) => return false,
                 Err(e) => {
@@ -2383,19 +2412,7 @@ impl ProxyState {
                     return false;
                 }
             };
-            self.router_cache.store_route_table_snapshot(
-                Arc::clone(&published.route_table),
-                published.route_generation,
-            );
-            self.router_cache.clear_lookup_caches();
-            self.plugin_cache
-                .store_inner(Arc::clone(&published.plugin_cache));
             PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
-            self.consumer_index
-                .store_inner(Arc::clone(&published.consumer_index));
-            self.load_balancer_cache
-                .store_inner(Arc::clone(&published.load_balancer));
-            self.config.store(Arc::clone(&published.config));
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -2473,15 +2490,20 @@ impl ProxyState {
         let route_changed = Self::delta_routes_changed(&delta);
         let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
         let staged_config = Arc::new(new_config.clone());
-        let publish_result = self.request_epoch.update_config(|current| {
-            self.stage_incremental_request_epoch(
-                current,
-                &new_config,
-                Arc::clone(&staged_config),
-                &delta,
-            )
-            .map(Some)
-        });
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
+        );
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => return false,
@@ -2493,24 +2515,7 @@ impl ProxyState {
                 return false;
             }
         };
-        if route_changed {
-            self.router_cache.store_route_table_snapshot(
-                Arc::clone(&published.route_table),
-                published.route_generation,
-            );
-            // Route cache entries are generation-tagged. After publishing a new
-            // route table, stale cache hits miss and are lazily overwritten on
-            // the next lookup, which avoids an O(cache-size) clear and keeps
-            // the LFU sketch warm across small route changes.
-        }
-        self.plugin_cache
-            .store_inner(Arc::clone(&published.plugin_cache));
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
-        self.consumer_index
-            .store_inner(Arc::clone(&published.consumer_index));
-        self.load_balancer_cache
-            .store_inner(Arc::clone(&published.load_balancer));
-        self.config.store(Arc::clone(&published.config));
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2865,15 +2870,20 @@ impl ProxyState {
         // Stage all request-facing cache inners before publishing any request-visible epoch.
         let route_changed = Self::delta_routes_changed(&delta);
         let staged_config = Arc::new(new_config.clone());
-        let publish_result = self.request_epoch.update_config(|current| {
-            self.stage_incremental_request_epoch(
-                current,
-                &new_config,
-                Arc::clone(&staged_config),
-                &delta,
-            )
-            .map(Some)
-        });
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
+        );
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
             Ok(None) => return false,
@@ -2885,23 +2895,7 @@ impl ProxyState {
                 return false;
             }
         };
-        if route_changed {
-            self.router_cache.store_route_table_snapshot(
-                Arc::clone(&published.route_table),
-                published.route_generation,
-            );
-            // Route cache entries are generation-tagged. Stale entries miss
-            // and are lazily overwritten, so route changes do not need a full
-            // cache clear on the update path.
-        }
-        self.plugin_cache
-            .store_inner(Arc::clone(&published.plugin_cache));
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
-        self.consumer_index
-            .store_inner(Arc::clone(&published.consumer_index));
-        self.load_balancer_cache
-            .store_inner(Arc::clone(&published.load_balancer));
-        self.config.store(Arc::clone(&published.config));
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {

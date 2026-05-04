@@ -186,18 +186,22 @@ mod tests {
             vec![],
         );
 
-        let result = store.update_config(|current| {
-            let plugin_inner = PluginCache::build_inner(&new_config, &PluginHttpClient::default())?;
-            Ok(Some(StagedRequestEpoch {
-                config: Arc::new(new_config.clone()),
-                route_table: RouterCache::build_route_table_snapshot(&new_config),
-                plugin_cache: plugin_inner,
-                consumer_index: Arc::clone(&current.consumer_index),
-                load_balancer: Arc::clone(&current.load_balancer),
-                route_changed: true,
-                lb_changed: false,
-            }))
-        });
+        let result = store.update_config(
+            |current| {
+                let plugin_inner =
+                    PluginCache::build_inner(&new_config, &PluginHttpClient::default())?;
+                Ok(Some(StagedRequestEpoch {
+                    config: Arc::new(new_config.clone()),
+                    route_table: RouterCache::build_route_table_snapshot(&new_config),
+                    plugin_cache: plugin_inner,
+                    consumer_index: Arc::clone(&current.consumer_index),
+                    load_balancer: Arc::clone(&current.load_balancer),
+                    route_changed: true,
+                    lb_changed: false,
+                }))
+            },
+            |_| {},
+        );
 
         assert!(result.is_err());
         let after = store.load();
@@ -222,19 +226,22 @@ mod tests {
         );
 
         store
-            .update_config(|current| {
-                let plugin_inner =
-                    PluginCache::build_inner(&new_config, &PluginHttpClient::default())?;
-                Ok(Some(StagedRequestEpoch {
-                    config: Arc::new(new_config.clone()),
-                    route_table: RouterCache::build_route_table_snapshot(&new_config),
-                    plugin_cache: plugin_inner,
-                    consumer_index: Arc::clone(&current.consumer_index),
-                    load_balancer: Arc::clone(&current.load_balancer),
-                    route_changed: true,
-                    lb_changed: false,
-                }))
-            })
+            .update_config(
+                |current| {
+                    let plugin_inner =
+                        PluginCache::build_inner(&new_config, &PluginHttpClient::default())?;
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(new_config.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&new_config),
+                        plugin_cache: plugin_inner,
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: true,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
             .unwrap_or_else(|e| panic!("{e}"));
 
         let after = store.load();
@@ -307,24 +314,30 @@ mod tests {
         );
         let store = epoch_store(initial);
 
-        store.update_load_balancer(|current| {
-            Some(LoadBalancerCache::build_update_targets_inner(
-                &current.load_balancer,
-                "u1",
-                vec![target("a2.local", 81)],
-                LoadBalancerAlgorithm::RoundRobin,
-                None,
-            ))
-        });
-        store.update_load_balancer(|current| {
-            Some(LoadBalancerCache::build_update_targets_inner(
-                &current.load_balancer,
-                "u2",
-                vec![target("b2.local", 82)],
-                LoadBalancerAlgorithm::RoundRobin,
-                None,
-            ))
-        });
+        store.update_load_balancer(
+            |current| {
+                Some(LoadBalancerCache::build_update_targets_inner(
+                    &current.load_balancer,
+                    "u1",
+                    vec![target("a2.local", 81)],
+                    LoadBalancerAlgorithm::RoundRobin,
+                    None,
+                ))
+            },
+            |_| {},
+        );
+        store.update_load_balancer(
+            |current| {
+                Some(LoadBalancerCache::build_update_targets_inner(
+                    &current.load_balancer,
+                    "u2",
+                    vec![target("b2.local", 82)],
+                    LoadBalancerAlgorithm::RoundRobin,
+                    None,
+                ))
+            },
+            |_| {},
+        );
 
         let final_epoch = store.load();
         assert_eq!(
@@ -422,6 +435,7 @@ impl RequestEpochStore {
     pub(crate) fn update_config(
         &self,
         build: impl FnOnce(&RequestEpoch) -> Result<Option<StagedRequestEpoch>, String>,
+        mirror: impl FnOnce(&RequestEpoch),
     ) -> Result<Option<Arc<RequestEpoch>>, String> {
         // Poison only means a previous writer panicked before publishing; the
         // ArcSwap still holds the last complete epoch, so continuing is safe.
@@ -450,12 +464,17 @@ impl RequestEpochStore {
             },
         });
         self.current.store(Arc::clone(&next));
+        // Compatibility wrapper caches are mirrored while the epoch writer lock
+        // is still held so service discovery and config reloads cannot publish
+        // newer epochs and then be overwritten by an older post-lock mirror.
+        mirror(&next);
         Ok(Some(next))
     }
 
     pub(crate) fn update_load_balancer(
         &self,
         build: impl FnOnce(&RequestEpoch) -> Option<Arc<LoadBalancerCacheInner>>,
+        mirror: impl FnOnce(&RequestEpoch),
     ) -> Option<Arc<RequestEpoch>> {
         // Poison only means a previous writer panicked before publishing; the
         // ArcSwap still holds the last complete epoch, so continuing is safe.
@@ -473,6 +492,8 @@ impl RequestEpochStore {
             lb_generation: current.lb_generation.saturating_add(1),
         });
         self.current.store(Arc::clone(&next));
+        // Keep LB wrapper mirroring serialized with the epoch publication.
+        mirror(&next);
         Some(next)
     }
 }
