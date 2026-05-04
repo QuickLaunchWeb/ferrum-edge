@@ -880,14 +880,15 @@ async fn handle_h3_request(
         _ => ProxyProtocol::Http,
     };
 
+    // Load plugin-cache values once for this request. Every plugin list,
+    // capability bitset, and buffering flag below is derived from the same
+    // cache generation without retaining the full cache across awaits.
+    let plugin_cache_view = state.plugin_cache.request_view(&proxy.id, request_protocol);
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
-    let plugins = state
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, request_protocol);
+    let plugins = plugin_cache_view.plugins();
     // Pre-computed capability bitset — avoids per-request iter().any() scans.
-    let capabilities = state
-        .plugin_cache
-        .get_capabilities(&proxy.id, request_protocol);
+    let capabilities = plugin_cache_view.capabilities();
 
     let mut plugin_execution_ns: u64 = 0;
 
@@ -932,9 +933,7 @@ async fn handle_h3_request(
     // `request_protocol` matches the HTTP/1.1 + HTTP/2 path so H3 gRPC
     // requests load the gRPC auth plugin set (not the HTTP-only set) —
     // same proxy serves all three client versions uniformly.
-    let auth_plugins = state
-        .plugin_cache
-        .get_auth_plugins(&proxy.id, request_protocol);
+    let auth_plugins = plugin_cache_view.auth_plugins();
 
     let auth_phase_start = std::time::Instant::now();
     if let Some((status_code, body, mut headers)) = run_authentication_phase(
@@ -991,9 +990,7 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    let maybe_needs_request_buffering = state
-        .plugin_cache
-        .requires_request_body_buffering(&proxy.id);
+    let maybe_needs_request_buffering = plugin_cache_view.requires_request_body_buffering();
     let plugin_needs_request_buffering = maybe_needs_request_buffering
         && plugins
             .iter()
@@ -1166,13 +1163,13 @@ async fn handle_h3_request(
         HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
         HttpFlavor::WebSocket => false,
     };
+    let maybe_requires_response_body_buffering =
+        plugin_cache_view.requires_response_body_buffering();
     let should_stream_response = crate::proxy::should_stream_response_body(
         &proxy,
         &plugins,
         &ctx,
-        state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        maybe_requires_response_body_buffering,
     );
     let needs_request_buffering = has_retry || plugin_needs_request_buffering;
     let needs_response_buffering = has_retry || !should_stream_response;
@@ -1329,6 +1326,7 @@ async fn handle_h3_request(
                 client_ip: &client_ip_owned,
                 ctx: &mut ctx,
                 plugins: &plugins,
+                requires_response_body_buffering: maybe_requires_response_body_buffering,
                 sticky_cookie_needed,
             })
             .await?;

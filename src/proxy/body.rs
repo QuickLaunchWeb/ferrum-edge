@@ -1763,6 +1763,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn coalescing_append_to_unarmed_non_empty_buffer_arms_flush_timer() {
+        let mut body = Box::pin(Coalescing::with_flush_after(
+            MockSource::new(vec![MockStep::Pending]),
+            1_000,
+            None,
+            Some(Duration::from_millis(2)),
+        ));
+
+        body.buffer.extend_from_slice(b"stashed-");
+        assert!(!body.buffer.is_empty());
+        assert!(!body.flush_timer_armed);
+
+        body.buffer_data(&Bytes::from_static(b"tail"));
+        assert!(body.flush_timer_armed);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match body.as_mut().poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"stashed-tail");
+            }
+            other => panic!("expected timer-driven flush from rearmed buffer, got {other:?}"),
+        }
+    }
+
     #[test]
     fn into_tracked_swaps_stream_kind_to_tracked_and_drives_metrics() {
         use std::time::Instant;
