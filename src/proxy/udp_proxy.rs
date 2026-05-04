@@ -102,6 +102,16 @@ struct UdpSession {
     backend_scheme: BackendScheme,
     listen_port: u16,
     idle_timeout_ms: u64,
+    /// RAII guard that increments [`crate::overload::OverloadState::active_connections`]
+    /// on construction and decrements on drop. Each UDP session counts as one
+    /// connection toward the global pressure-shedding threshold so pure-UDP
+    /// gateways and mixed deployments contribute correctly to overload state
+    /// (parity with TCP/H3, which carry their own `ConnectionGuard` in the
+    /// per-connection task). Field is prefixed with `_` because it is held
+    /// solely for its `Drop` side-effect — the counter decrements automatically
+    /// when the session is removed (idle expiry, backend disconnect, or
+    /// ungraceful drop on listener shutdown).
+    _overload_guard: Option<crate::overload::ConnectionGuard>,
 }
 
 /// UDP session map using ahash (AES-NI accelerated) for faster per-datagram lookups.
@@ -720,6 +730,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
                                                     local2,
+                                                    &overload,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -756,6 +767,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &adaptive_buffer,
                                         udp_gso_enabled,
                                         local2,
+                                        &overload,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -829,6 +841,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &adaptive_buffer,
                     udp_gso_enabled,
                     None,
+                    &overload,
                 )
                 .await;
                 if let Err(e) = result {
@@ -893,6 +906,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
                                                     local2,
+                                                    &overload,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -929,6 +943,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &adaptive_buffer,
                                         udp_gso_enabled,
                                         local2,
+                                        &overload,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -971,6 +986,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &adaptive_buffer,
                                     udp_gso_enabled,
                                     None,
+                                    &overload,
                                 )
                                 .await;
                                 if let Err(e) = result {
@@ -1034,6 +1050,7 @@ async fn process_datagram(
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<(), anyhow::Error> {
     // Fast path: check last-client cache before hitting DashMap.
     // Skip the cache when the cached session has been flagged expired
@@ -1103,6 +1120,7 @@ async fn process_datagram(
             data,
             adaptive_buffer,
             udp_gso_enabled,
+            overload,
         )
         .await?
     };
@@ -1166,6 +1184,7 @@ async fn lookup_or_create_session(
     initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
         return Ok(existing.value().clone());
@@ -1198,6 +1217,7 @@ async fn lookup_or_create_session(
         initial_data,
         adaptive_buffer,
         udp_gso_enabled,
+        overload,
     )
     .await
     {
@@ -1443,6 +1463,19 @@ async fn start_dtls_frontend_listener(
                     "DTLS frontend connection accepted"
                 );
 
+                // Acquire the OverloadState connection guard for the accepted
+                // (post-handshake) DTLS session. Pre-handshake demux peers are
+                // tracked separately in `metrics.dtls_demux_sessions` and via
+                // the `allow_new_session` callback; we intentionally only
+                // contribute to `OverloadState.active_connections` after the
+                // handshake completed and plugin checks passed, so the global
+                // counter reflects committed sessions (parity with TCP/H3).
+                // The guard is moved into the per-client handler task below
+                // and decrements automatically when the task exits, regardless
+                // of which exit path (graceful, error, or shutdown) ran.
+                let handler_overload_guard =
+                    crate::overload::ConnectionGuard::new(&overload);
+
                 // Spawn per-client handler
                 let handler_proxy_id = proxy.id.clone();
                 let handler_epoch = Arc::clone(&epoch);
@@ -1459,6 +1492,9 @@ async fn start_dtls_frontend_listener(
 
                 let handler_crls = crls.clone();
                 tokio::spawn(async move {
+                    // Hold the guard for the lifetime of the handler task. Drop
+                    // at task exit decrements `OverloadState.active_connections`.
+                    let _overload_guard = handler_overload_guard;
                     let result = handle_dtls_client(
                         client_conn,
                         client_addr,
@@ -2137,6 +2173,7 @@ async fn create_session(
     _initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
         proxy,
@@ -2374,6 +2411,11 @@ async fn create_session(
         backend_scheme,
         listen_port,
         idle_timeout_ms: proxy.udp_idle_timeout_seconds.saturating_mul(1000),
+        // Increment OverloadState.active_connections for each accepted UDP
+        // session so per-session pressure shedding works the same as TCP/H3.
+        // Decrements automatically on session drop (idle expiry, backend
+        // disconnect, listener shutdown).
+        _overload_guard: Some(crate::overload::ConnectionGuard::new(overload)),
     });
 
     sessions.insert(client_addr, session.clone());
@@ -2995,6 +3037,11 @@ mod tests {
             backend_scheme: BackendScheme::Udp,
             listen_port: 5300,
             idle_timeout_ms: 60_000,
+            // Tests build sessions without an overload state; the
+            // `Option<ConnectionGuard>` keeps the type constructible without
+            // pulling in `OverloadState` for unit tests that exercise summary
+            // emission only.
+            _overload_guard: None,
         }
     }
 
@@ -3226,5 +3273,110 @@ mod tests {
             dtls_disconnect_direction(&e, &ErrorClass::ConnectionReset),
             Direction::ClientToBackend
         );
+    }
+
+    // --- OverloadState.active_connections parity (UDP <-> TCP/H3) ---
+
+    /// Build a `UdpSession` that holds a real `ConnectionGuard` against
+    /// `state`. Mirrors the production construction in `create_session()` —
+    /// every field except the guard is filler. This is the smallest faithful
+    /// reproduction of the production code path that exercises the guard
+    /// lifecycle without spinning up a UDP listener.
+    fn make_udp_session_with_overload(state: &Arc<crate::overload::OverloadState>) -> UdpSession {
+        UdpSession {
+            backend_socket: None,
+            dtls_conn: None,
+            last_activity: AtomicU64::new(0),
+            created_at: AtomicU64::new(0),
+            expired: std::sync::atomic::AtomicBool::new(false),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            last_request_size: AtomicU64::new(0),
+            backend_target: "10.0.0.50:5353".to_string(),
+            backend_resolved_ip: "10.0.0.50".to_string(),
+            sni_hostname: None,
+            consumer_username: None,
+            metadata: std::sync::Mutex::new(HashMap::new()),
+            local_addr: std::sync::OnceLock::new(),
+            plugins: Arc::new(Vec::new()),
+            datagram_plugins: Arc::from([]),
+            proxy_id: "udp-proxy".to_string(),
+            proxy_name: Some("UDP Proxy".to_string()),
+            proxy_namespace: "ferrum".to_string(),
+            backend_scheme: BackendScheme::Udp,
+            listen_port: 5300,
+            idle_timeout_ms: 60_000,
+            _overload_guard: Some(crate::overload::ConnectionGuard::new(state)),
+        }
+    }
+
+    #[test]
+    fn udp_session_increments_overload_active_connections_on_create() {
+        let state = Arc::new(crate::overload::OverloadState::new());
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+
+        let session = make_udp_session_with_overload(&state);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            1,
+            "creating a UDP session must increment OverloadState.active_connections (parity with TCP/H3)"
+        );
+
+        drop(session);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            0,
+            "dropping the UDP session must release the global connection slot"
+        );
+    }
+
+    #[test]
+    fn multiple_udp_sessions_track_concurrent_load() {
+        let state = Arc::new(crate::overload::OverloadState::new());
+
+        let s1 = make_udp_session_with_overload(&state);
+        let s2 = make_udp_session_with_overload(&state);
+        let s3 = make_udp_session_with_overload(&state);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 3);
+
+        // Drop in non-LIFO order to exercise per-session ownership.
+        drop(s2);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
+
+        drop(s1);
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(s3);
+        assert_eq!(
+            state.active_connections.load(Ordering::Relaxed),
+            0,
+            "all UDP sessions released — global counter must return to 0"
+        );
+    }
+
+    #[test]
+    fn udp_session_decrement_via_arc_unwrap_lifecycle() {
+        // The production code stores sessions as `Arc<UdpSession>` in the
+        // session map and clones them into the recv-loop fast-path cache and
+        // the spawned reply task. The guard must only fire when the LAST Arc
+        // is dropped. Verify Arc ref-counting interacts correctly.
+        let state = Arc::new(crate::overload::OverloadState::new());
+
+        let session = Arc::new(make_udp_session_with_overload(&state));
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        let cloned = session.clone();
+        let cloned2 = session.clone();
+        // Cloning the Arc must not double-count.
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(cloned);
+        drop(cloned2);
+        // Dropping clones leaves one Arc — guard still alive.
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+
+        drop(session);
+        // Last Arc dropped → UdpSession dropped → guard dropped → counter 0.
+        assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
     }
 }
