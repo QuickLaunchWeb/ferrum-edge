@@ -181,8 +181,12 @@ impl HealthChecker {
 
     /// Create a health checker with an HTTP client configured from the
     /// gateway's global pool settings and shared DNS cache.
+    ///
+    /// The default client is built with TLS verification ENABLED. If the
+    /// operator has set `FERRUM_TLS_NO_VERIFY=true`, the default client is
+    /// rebuilt by [`set_global_tls_config`] before traffic flows.
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
-        let client = build_health_check_client(pool_config, Some(dns_cache.clone()));
+        let client = build_health_check_client(pool_config, Some(dns_cache.clone()), false);
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
@@ -201,6 +205,10 @@ impl HealthChecker {
 
     /// Set global TLS config from the env config so health check clients
     /// can fall back to global mTLS credentials and CA bundles.
+    ///
+    /// When `tls_no_verify` is true, the default HTTPS probe client is
+    /// rebuilt with `danger_accept_invalid_certs(true)` — TLS verification
+    /// is opt-in via `FERRUM_TLS_NO_VERIFY`, never silently disabled.
     pub fn set_global_tls_config(
         &mut self,
         tls_ca_bundle_path: Option<String>,
@@ -212,11 +220,19 @@ impl HealthChecker {
         self.global_backend_tls_client_cert_path = backend_tls_client_cert_path;
         self.global_backend_tls_client_key_path = backend_tls_client_key_path;
         self.global_tls_no_verify = tls_no_verify;
+
+        // Rebuild the default client when no-verify is set so HTTPS probes
+        // through the no-TLS-config path honour the operator opt-in.
+        if tls_no_verify {
+            let client =
+                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify);
+            self.default_http_client = Arc::new(client);
+        }
     }
 
     /// Create a health checker without DNS cache (for tests).
     fn without_dns_cache(pool_config: &PoolConfig) -> Self {
-        let client = build_health_check_client(pool_config, None);
+        let client = build_health_check_client(pool_config, None, false);
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
@@ -266,7 +282,8 @@ impl HealthChecker {
                         server_ca_cert_path: upstream.backend_tls_server_ca_cert_path.clone(),
                         verify_server_cert: upstream.backend_tls_verify_server_cert,
                     };
-                    let upstream_client = self.build_upstream_health_client(&tls_config);
+                    let upstream_client =
+                        self.build_upstream_health_client(&tls_config, active.use_tls);
                     for target in &upstream.targets {
                         let handle = self.start_active_check(
                             target,
@@ -547,7 +564,18 @@ impl HealthChecker {
 
     /// Build a per-upstream HTTP client with the upstream's TLS config.
     /// Falls back to global TLS settings when the upstream doesn't specify them.
-    fn build_upstream_health_client(&self, tls_config: &BackendTlsConfig) -> Arc<reqwest::Client> {
+    ///
+    /// HTTPS probes (`use_tls = true`) ALWAYS route through the TLS-aware
+    /// builder so the trust store is constructed in-house from the upstream's
+    /// CA / global CA / webpki roots — never the default client (which only
+    /// applies when the operator has explicitly opted into no-verify, and
+    /// even then only on plaintext probes by construction). HTTP probes can
+    /// safely reuse the default client.
+    fn build_upstream_health_client(
+        &self,
+        tls_config: &BackendTlsConfig,
+        use_tls: bool,
+    ) -> Arc<reqwest::Client> {
         let has_tls_config = tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
             || tls_config.server_ca_cert_path.is_some()
@@ -556,7 +584,7 @@ impl HealthChecker {
             || self.global_backend_tls_client_cert_path.is_some()
             || self.global_tls_no_verify;
 
-        if !has_tls_config {
+        if !use_tls && !has_tls_config {
             return self.default_http_client.clone();
         }
 
@@ -1072,11 +1100,16 @@ async fn build_grpc_probe_channel_no_verify(
 fn build_health_check_client(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
+    no_verify: bool,
 ) -> reqwest::Client {
+    if no_verify {
+        warn!("health_check: TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY=true)");
+    }
+
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-        .danger_accept_invalid_certs(true);
+        .danger_accept_invalid_certs(no_verify);
 
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -1254,4 +1287,152 @@ pub async fn grpc_probe_for_test(
         false,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for private health-check helpers.
+    //!
+    //! `build_health_check_client` is intentionally private and these tests
+    //! sit inline so they can exercise it directly. Promoting it to `pub`
+    //! to enable an external test would widen the public API for no reason —
+    //! per CLAUDE.md private fns belong in inline `#[cfg(test)] mod tests`.
+    use super::*;
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::ServerConfig;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Once;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    static INIT_CRYPTO: Once = Once::new();
+
+    fn ensure_crypto_provider() {
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// Spawn a self-signed HTTPS server on 127.0.0.1:<random> that responds
+    /// to any inbound HTTP request with `200 OK`. Returns the bound port.
+    async fn spawn_self_signed_https_server() -> u16 {
+        ensure_crypto_provider();
+
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der().to_vec()));
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 1024];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                    let _ = tls.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Default-built health-check client (verify ON) MUST reject a
+    /// self-signed cert. Regression for the unconditional
+    /// `danger_accept_invalid_certs(true)` bypass.
+    #[tokio::test]
+    async fn build_health_check_client_default_rejects_self_signed_cert() {
+        let port = spawn_self_signed_https_server().await;
+        let pool_config = PoolConfig::default();
+
+        let client = build_health_check_client(&pool_config, None, false);
+        let result = client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+
+        assert!(
+            result.is_err(),
+            "default health-check client must reject self-signed certs (verify ON), \
+             got: {:?}",
+            result.map(|r| r.status())
+        );
+    }
+
+    /// When the operator opts into `FERRUM_TLS_NO_VERIFY=true` the same
+    /// probe SHOULD succeed against the self-signed server. Confirms the
+    /// new `no_verify` parameter is plumbed end-to-end.
+    #[tokio::test]
+    async fn build_health_check_client_no_verify_accepts_self_signed_cert() {
+        let port = spawn_self_signed_https_server().await;
+        let pool_config = PoolConfig::default();
+
+        let client = build_health_check_client(&pool_config, None, true);
+        let result = client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+
+        let response =
+            result.expect("no_verify=true health-check client must accept self-signed certs");
+        assert!(response.status().is_success());
+    }
+
+    /// `set_global_tls_config(tls_no_verify=true)` should rebuild the
+    /// default client so probes through the no-TLS-config path also honour
+    /// the operator opt-in. Without the rebuild, the original default
+    /// client (built with `no_verify=false` in the constructor) would still
+    /// reject the self-signed cert.
+    #[tokio::test]
+    async fn set_global_tls_config_no_verify_rebuilds_default_client() {
+        let port = spawn_self_signed_https_server().await;
+        let pool_config = PoolConfig::default();
+        let mut checker = HealthChecker::without_dns_cache(&pool_config);
+
+        // Before opt-in: default client must reject.
+        let pre = checker
+            .default_http_client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        assert!(pre.is_err(), "default client should reject before opt-in");
+
+        // Opt in via global flag.
+        checker.set_global_tls_config(None, None, None, true);
+
+        // After opt-in: rebuilt default client must accept.
+        let post = checker
+            .default_http_client
+            .get(format!("https://127.0.0.1:{}/", port))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .expect("default client should accept after no_verify opt-in");
+        assert!(post.status().is_success());
+    }
 }
