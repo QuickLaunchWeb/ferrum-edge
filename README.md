@@ -395,11 +395,11 @@ See `tests/performance/` for the full benchmark suite.
 |---|---|
 | systemd unit | `LimitNOFILE=1048576` in the `[Service]` section |
 | Docker / Podman | `--ulimit nofile=1048576:1048576` |
-| Kubernetes | container `securityContext` — note the host kernel's `fs.nr_open` ceiling |
+| Kubernetes | Configure nofile on the node/container runtime (for example containerd/runc or the kubelet/systemd service); Pod `securityContext` does not expose ulimit/nofile. |
 | Bare shell (dev) | `ulimit -n 1048576` before launching the binary |
 | `/etc/security/limits.conf` | `* hard nofile 1048576` (and matching soft line) |
 
-When the hard cap is below 65,536, Ferrum Edge emits one structured `warn!` line at startup (greppable as `"soft FD limit"`) and continues. Below the floor, the gateway will still serve, but its 95% FD-critical threshold will trigger earlier under load.
+When the effective soft cap after startup is below 65,536, Ferrum Edge emits one structured `warn!` line at startup (greppable as `"soft FD limit"`) and continues. Below the floor, the gateway will still serve, but its 95% FD-critical threshold will trigger earlier under load.
 
 **Concurrency planning**. Each inbound TCP/TLS connection consumes ~1 FD; HTTP/2 multiplexes many requests onto one. Linux `splice(2)` adds 2 pipe FDs per TCP relay. Plan for ~2–4× the target concurrent-connection count when sizing `nofile`.
 

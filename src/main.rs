@@ -263,17 +263,17 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // sockets. The call never asks for privileges we don't have (it caps at
     // the existing hard limit), so a sandboxed/seccomp-restricted run is a
     // silent no-op rather than a failure. We log the result so operators see
-    // the headroom they actually got, and emit a warn when the hard cap is
-    // below the production floor — the gateway will still run, but its 95%
-    // FD-critical threshold will trigger early on busy hosts.
+    // the headroom they actually got, and emit a warn when the effective
+    // soft cap remains below the production floor — the gateway will still
+    // run, but its 95% FD-critical threshold will trigger early on busy hosts.
     let fd_raise = overload::raise_fd_limit();
-    if fd_raise.hard > 0 && fd_raise.hard < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
+    if fd_raise.soft_after > 0 && fd_raise.soft_after < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
         warn!(
             soft_before = fd_raise.soft_before,
             soft_after = fd_raise.soft_after,
             hard = fd_raise.hard,
             target = overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
-            "soft FD limit is {} (hard cap {}); recommend raising to >= {} via /etc/security/limits.conf, systemd LimitNOFILE=, or docker --ulimit nofile= for production workloads",
+            "effective soft FD limit is {} (hard cap {}); recommend raising to >= {} via /etc/security/limits.conf, systemd LimitNOFILE=, or docker --ulimit nofile= for production workloads",
             fd_raise.soft_after,
             fd_raise.hard,
             overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
