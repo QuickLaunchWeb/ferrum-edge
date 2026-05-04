@@ -336,6 +336,97 @@ impl UrlTemplate {
     }
 }
 
+/// Validate an operator-supplied `base_url` against scheme + IP allowlist policy.
+///
+/// SSRF defense: an admin-API attacker who compromises plugin config can
+/// otherwise point `base_url` at an internal endpoint (`http://127.0.0.1`,
+/// AWS IMDS `http://169.254.169.254/latest/meta-data/`, an RFC 1918 host
+/// inside the gateway's VPC). This guard runs at plugin construction so
+/// the misconfigured provider never ships requests.
+///
+/// Rules:
+/// - Must parse as a URL.
+/// - Scheme is `https` by default. `http` is only allowed when the
+///   per-provider `allow_plaintext: true` opt-in is set.
+/// - If the host is a literal IP, it is checked against the gateway-wide
+///   `FERRUM_BACKEND_ALLOW_IPS` policy via [`check_backend_ip_allowed`].
+/// - If the host is a hostname, no compile-time IP check is possible —
+///   runtime DNS resolution flows through `DnsCacheResolver`, which
+///   re-applies the same policy before each request lands.
+fn validate_base_url(
+    provider_name: &str,
+    base_url: &str,
+    allow_plaintext: bool,
+    backend_allow_ips: &crate::config::BackendAllowIps,
+) -> Result<(), String> {
+    let parsed = url::Url::parse(base_url).map_err(|e| {
+        format!("ai_federation: provider '{provider_name}' invalid base_url '{base_url}': {e}")
+    })?;
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            if !allow_plaintext {
+                return Err(format!(
+                    "ai_federation: provider '{provider_name}' base_url uses 'http://' which is rejected by default; set 'allow_plaintext: true' on the provider to override"
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "ai_federation: provider '{provider_name}' base_url has unsupported scheme '{other}' (expected 'https' or 'http' with allow_plaintext)"
+            ));
+        }
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        format!("ai_federation: provider '{provider_name}' base_url '{base_url}' has no host")
+    })?;
+
+    // If the host is a literal IP, enforce the gateway IP policy at config
+    // time. Hostnames are checked at runtime by `DnsCacheResolver`.
+    //
+    // `url::Url::host_str()` keeps the brackets on bracketed IPv6 literals
+    // (e.g. `https://[::1]/` → `"[::1]"`), so strip them before parsing.
+    let host_for_ip = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = host_for_ip.parse::<std::net::IpAddr>()
+        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+    {
+        return Err(format!(
+            "ai_federation: provider '{provider_name}' base_url IP {ip} denied by FERRUM_BACKEND_ALLOW_IPS={backend_allow_ips} policy"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Read the gateway's backend IP policy from the environment.
+///
+/// Plugin construction runs single-threaded at startup before secrets are
+/// resolved (see [`main.rs`]), so reading `std::env` here is safe. Defaults
+/// to [`BackendAllowIps::Both`] when unset or unparseable.
+fn read_backend_allow_ips_env() -> crate::config::BackendAllowIps {
+    use crate::config::BackendAllowIps;
+    match std::env::var("FERRUM_BACKEND_ALLOW_IPS") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "private" => BackendAllowIps::Private,
+            "public" => BackendAllowIps::Public,
+            "both" => BackendAllowIps::Both,
+            other => {
+                warn!(
+                    raw = %other,
+                    "ai_federation: FERRUM_BACKEND_ALLOW_IPS unrecognized, defaulting to 'both'"
+                );
+                BackendAllowIps::Both
+            }
+        },
+        Err(_) => BackendAllowIps::Both,
+    }
+}
+
 /// Build the URL template for a provider at config-load time.
 ///
 /// The eight-argument shape is intentional: each field comes from a
@@ -427,6 +518,10 @@ impl AiFederation {
 
         let mut providers = Vec::with_capacity(providers_val.len());
 
+        // Read the gateway IP allowlist policy once. Used to validate every
+        // operator-supplied `base_url` below — see `validate_base_url`.
+        let backend_allow_ips = read_backend_allow_ips_env();
+
         for (i, pv) in providers_val.iter().enumerate() {
             let name = pv["name"]
                 .as_str()
@@ -468,6 +563,16 @@ impl AiFederation {
                 Duration::from_secs(pv["read_timeout_seconds"].as_u64().unwrap_or(60));
 
             let base_url = pv["base_url"].as_str().map(String::from);
+            let allow_plaintext = pv["allow_plaintext"].as_bool().unwrap_or(false);
+
+            // SSRF guard: validate operator-supplied base_url before storing
+            // it. Provider `default_base_url` literals are static `https://`
+            // strings and are inherently safe (covered by inspection — see
+            // `ProviderType::default_base_url`); only the operator override
+            // needs runtime validation.
+            if let Some(ref url) = base_url {
+                validate_base_url(&name, url, allow_plaintext, &backend_allow_ips)?;
+            }
 
             let auth = build_auth(provider_type, pv, &name)?;
 
@@ -1898,5 +2003,26 @@ pub mod test_helpers {
             tokens.completion_tokens.unwrap_or(0),
             tokens.total_tokens.unwrap_or(0),
         ))
+    }
+
+    /// Expose `base_url` validation for tests with an explicit IP policy.
+    ///
+    /// Skips the `FERRUM_BACKEND_ALLOW_IPS` env read so parallel tests don't
+    /// race on the global env table. Mirrors what `AiFederation::new` does
+    /// per provider once the policy has been resolved.
+    pub fn validate_base_url_test(
+        provider_name: &str,
+        base_url: &str,
+        allow_plaintext: bool,
+        policy: &str,
+    ) -> Result<(), String> {
+        use crate::config::BackendAllowIps;
+        let policy = match policy {
+            "private" => BackendAllowIps::Private,
+            "public" => BackendAllowIps::Public,
+            "both" => BackendAllowIps::Both,
+            other => return Err(format!("invalid policy '{other}'")),
+        };
+        validate_base_url(provider_name, base_url, allow_plaintext, &policy)
     }
 }

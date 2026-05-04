@@ -848,6 +848,205 @@ fn test_url_template_explicit_base_url_overrides_provider_logic() {
 }
 
 // ---------------------------------------------------------------------------
+// SSRF guard: scheme + IP allowlist on operator-supplied base_url.
+//
+// Construction-time validation prevents an admin-API attacker who
+// compromises plugin config from pivoting through the gateway to
+// internal services (cloud metadata, RFC 1918, loopback). Tests use
+// the `validate_base_url_test` helper to thread the policy directly,
+// avoiding `std::env` mutation that would race other tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_base_url_https_accepted() {
+    // Default policy (`both`) lets any host through; only the scheme matters.
+    let res = test_helpers::validate_base_url_test("openai", "https://example.com", false, "both");
+    assert!(
+        res.is_ok(),
+        "https://example.com should be accepted: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_http_rejected_without_allow_plaintext() {
+    let err = test_helpers::validate_base_url_test("openai", "http://example.com", false, "both")
+        .unwrap_err();
+    assert!(err.contains("http://"), "got: {err}");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_http_accepted_with_allow_plaintext_opt_in() {
+    // Operators on isolated networks (test rigs, on-prem mock providers)
+    // can opt-in to plaintext explicitly.
+    let res = test_helpers::validate_base_url_test("internal", "http://example.com", true, "both");
+    assert!(
+        res.is_ok(),
+        "http with allow_plaintext should be accepted: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_aws_metadata_rejected_under_public_policy() {
+    // The exact case from the bug report: an admin-API attacker can no longer
+    // point an AI federation provider at AWS instance metadata.
+    let err = test_helpers::validate_base_url_test(
+        "openai",
+        "https://169.254.169.254/latest/meta-data/",
+        false,
+        "public",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("169.254.169.254"),
+        "should mention metadata IP: {err}"
+    );
+    assert!(
+        err.contains("FERRUM_BACKEND_ALLOW_IPS"),
+        "should reference policy: {err}"
+    );
+}
+
+#[test]
+fn test_base_url_rfc1918_rejected_under_public_policy() {
+    let err = test_helpers::validate_base_url_test("openai", "https://10.0.0.1/", false, "public")
+        .unwrap_err();
+    assert!(err.contains("10.0.0.1"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_loopback_rejected_under_public_policy() {
+    let err = test_helpers::validate_base_url_test("openai", "https://127.0.0.1/", false, "public")
+        .unwrap_err();
+    assert!(err.contains("127.0.0.1"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_link_local_rejected_under_public_policy() {
+    // 169.254.0.0/16 includes AWS IMDS but also any link-local IP.
+    let err =
+        test_helpers::validate_base_url_test("openai", "https://169.254.42.42/", false, "public")
+            .unwrap_err();
+    assert!(err.contains("169.254.42.42"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_ipv6_loopback_rejected_under_public_policy() {
+    let err = test_helpers::validate_base_url_test("openai", "https://[::1]/", false, "public")
+        .unwrap_err();
+    assert!(err.contains("::1"), "got: {err}");
+}
+
+#[test]
+fn test_base_url_private_ip_allowed_under_both_policy() {
+    // Default `both` policy is permissive — operators who set this know
+    // private IPs may be intentional (on-prem, internal DNS).
+    let res = test_helpers::validate_base_url_test("openai", "https://10.0.0.1/", false, "both");
+    assert!(
+        res.is_ok(),
+        "10.0.0.1 should be accepted under 'both' policy: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_public_ip_allowed_under_public_policy() {
+    let res =
+        test_helpers::validate_base_url_test("openai", "https://8.8.8.8/api/", false, "public");
+    assert!(res.is_ok(), "8.8.8.8 should be accepted: {res:?}");
+}
+
+#[test]
+fn test_base_url_hostname_passes_under_public_policy() {
+    // Hostnames are not blocked at config time — runtime DNS resolution
+    // through `DnsCacheResolver` re-applies the policy after lookup.
+    // This is documented in `validate_base_url`'s rustdoc.
+    let res = test_helpers::validate_base_url_test(
+        "openai",
+        "https://internal.corp.example.com/v1/chat",
+        false,
+        "public",
+    );
+    assert!(
+        res.is_ok(),
+        "hostnames are deferred to runtime DNS check: {res:?}"
+    );
+}
+
+#[test]
+fn test_base_url_unparseable_rejected() {
+    let err =
+        test_helpers::validate_base_url_test("openai", "not a url", false, "both").unwrap_err();
+    assert!(
+        err.contains("invalid base_url") || err.contains("invalid"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_base_url_unsupported_scheme_rejected() {
+    let err = test_helpers::validate_base_url_test("openai", "file:///etc/passwd", false, "both")
+        .unwrap_err();
+    assert!(err.contains("unsupported scheme"), "got: {err}");
+}
+
+#[test]
+fn test_construction_rejects_metadata_base_url() {
+    // End-to-end: AiFederation::new() must refuse to construct when an
+    // operator base_url uses an unsafe scheme. The IP-policy half of the
+    // guard is covered by `validate_base_url_test` above (no env mutation);
+    // here we rely on the scheme branch which doesn't read FERRUM_BACKEND_ALLOW_IPS,
+    // so this test runs safely in parallel with the rest of the suite.
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "http://attacker.example.com/openai/v1/chat",
+        }]
+    });
+    let http_client = create_test_http_client();
+    let err = ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client)
+        .err()
+        .unwrap();
+    assert!(err.contains("http://"), "got: {err}");
+    assert!(err.contains("allow_plaintext"), "got: {err}");
+}
+
+#[test]
+fn test_construction_accepts_plaintext_with_opt_in() {
+    let config = json!({
+        "providers": [{
+            "name": "internal",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "http://internal-llm.local:8080/v1/chat",
+            "allow_plaintext": true,
+        }]
+    });
+    let http_client = create_test_http_client();
+    let result = ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client);
+    assert!(
+        result.is_ok(),
+        "allow_plaintext: true should permit http://: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_construction_accepts_https_base_url() {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "https://api.openai.com/v1/chat/completions",
+        }]
+    });
+    let http_client = create_test_http_client();
+    assert!(ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client).is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
