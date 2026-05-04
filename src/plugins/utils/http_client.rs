@@ -115,6 +115,34 @@ impl std::fmt::Debug for PluginHttpClient {
     }
 }
 
+/// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
+/// when available.
+///
+/// Used as a fallback when a fully-configured builder fails (e.g., due to
+/// invalid TLS material). Keeps the DNS cache attached so plugin outbound
+/// calls do not silently fall through to system DNS — every call would
+/// otherwise burn an ephemeral port through a fresh OS resolver, which
+/// CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
+/// every reqwest::Client in production").
+///
+/// If even this minimal builder fails, only then fall back to
+/// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
+fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(dns_cache) = dns_cache {
+        let resolver = DnsCacheResolver::new(dns_cache);
+        builder = builder.dns_resolver(Arc::new(resolver));
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::error!(
+            "Failed to build minimal DNS-cached fallback plugin client: {}. \
+             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+            e
+        );
+        reqwest::Client::new()
+    })
+}
+
 impl PluginHttpClient {
     /// Build a plugin HTTP client from the gateway's global pool configuration,
     /// using the gateway's DNS cache for hostname resolution.
@@ -204,8 +232,12 @@ impl PluginHttpClient {
         }
 
         let client = builder.build().unwrap_or_else(|e| {
-            tracing::error!("Failed to build plugin HTTP client: {}, using default", e);
-            reqwest::Client::new()
+            tracing::error!(
+                "Failed to build plugin HTTP client: {}. \
+                 Falling back to a minimal DNS-cached client (TLS/pool/keepalive settings will not apply).",
+                e
+            );
+            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
         });
 
         Self {
@@ -248,8 +280,16 @@ impl PluginHttpClient {
         }
 
         let client = builder.build().unwrap_or_else(|e| {
-            tracing::error!("Failed to build plugin HTTP client: {}, using default", e);
-            reqwest::Client::new()
+            tracing::error!(
+                "Failed to build plugin HTTP client: {}. \
+                 Falling back to a minimal client (no DNS cache available on this path).",
+                e
+            );
+            // No DNS cache to attach on this path — `from_pool_config` is
+            // explicitly the cache-less constructor (tests / fallback). Use
+            // the shared helper so the last-resort `Client::new()` path is
+            // logged uniformly across both `new()` and this code path.
+            build_dns_cached_fallback_client(None)
         });
 
         Self {
@@ -505,5 +545,51 @@ impl Default for PluginHttpClient {
     /// tuned settings and DNS cache. This default is provided for tests and fallback.
     fn default() -> Self {
         Self::from_pool_config(&PoolConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    //! Tests for the DNS-cached fallback path used by `PluginHttpClient`
+    //! when `reqwest::Client::builder().build()` fails (e.g., due to an
+    //! internal TLS connector failure).
+    //!
+    //! Targets a private helper, so these tests live inline.
+    use super::*;
+    use crate::dns::DnsConfig;
+
+    #[test]
+    fn fallback_client_builds_with_dns_cache() {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let _client = build_dns_cached_fallback_client(Some(dns_cache));
+    }
+
+    #[test]
+    fn fallback_client_builds_without_dns_cache() {
+        let _client = build_dns_cached_fallback_client(None);
+    }
+
+    #[tokio::test]
+    async fn fallback_client_uses_dns_cache_resolver() {
+        // Verify the fallback client routes DNS through the gateway cache.
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let initial_len = dns_cache.cache_len();
+        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()));
+
+        let _ = client
+            .get("http://localhost:1/")
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await;
+
+        let after_len = dns_cache.cache_len();
+        assert!(
+            after_len > initial_len,
+            "DNS cache should have populated via the cached resolver \
+             (initial={}, after={}). If the fallback bypassed the resolver \
+             via Client::new(), the cache would stay empty.",
+            initial_len,
+            after_len
+        );
     }
 }
