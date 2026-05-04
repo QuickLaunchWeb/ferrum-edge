@@ -137,6 +137,9 @@ fn start_gateway(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_LOG_LEVEL", "info")
+        // The binary's logger lets RUST_LOG override FERRUM_LOG_LEVEL. Keep
+        // this log-assertion harness isolated from the developer shell.
+        .env_remove("RUST_LOG")
         // Make sure perf features don't destabilize the small functional test harness.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false");
 
@@ -1314,7 +1317,7 @@ async fn overload_state_transitions_logged_with_warn_then_info() {
     };
 
     let log_path = temp_dir.path().join("gateway.log");
-    let (gw, proxy_port, _admin_port) =
+    let (gw, proxy_port, admin_port) =
         start_gateway_with_retry_capture_logs(config_path.to_str().unwrap(), &env, &log_path).await;
 
     let slow_url = format!("http://127.0.0.1:{proxy_port}/slow");
@@ -1338,12 +1341,34 @@ async fn overload_state_transitions_logged_with_warn_then_info() {
         let _ = f.await;
     }
 
-    // Allow the monitor to flip back to normal after drain. We wait
-    // generously here because the recovery transition fires on the next
-    // monitor tick AFTER active_connections drops below the critical
-    // threshold, and we also need the OS to flush the gateway's stderr
-    // buffer to the captured file.
-    sleep(Duration::from_millis(3000)).await;
+    // Wait until the monitor has actually observed the drain and published
+    // normal state; fixed sleeps are brittle on loaded CI hosts.
+    let mut recovered_via_admin = false;
+    let mut last_overload_body = serde_json::Value::Null;
+    for _ in 0..30 {
+        let (status, body) = get_overload(admin_port).await;
+        last_overload_body = body.clone();
+        let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("");
+        let disable_keepalive = body
+            .get("actions")
+            .and_then(|a| a.get("disable_keepalive"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if status == 200 && level == "normal" && !disable_keepalive {
+            recovered_via_admin = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        recovered_via_admin,
+        "/overload should have returned to normal before checking recovery logs; \
+         last /overload={last_overload_body}"
+    );
+
+    // Give the structured logger a short flush window before teardown closes
+    // the child process' stdout/stderr handles.
+    sleep(Duration::from_millis(500)).await;
 
     // Tear down the gateway BEFORE reading stderr so any buffered writes
     // are flushed by the kernel as the process exits. Reading the file

@@ -1283,110 +1283,113 @@ impl ProxyState {
 
         let overload = Arc::new(crate::overload::OverloadState::new());
 
-        let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
-            stream_bind_addr,
-            config_arc.clone(),
-            dns_cache.clone(),
-            load_balancer_cache.clone(),
-            consumer_index.clone(),
-            plugin_cache.clone(),
-            circuit_breaker_cache.clone(),
-            None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
-            env_config_arc.tls_no_verify,
-            env_config_arc.tls_ca_bundle_path.clone(),
-            env_config_arc.tcp_idle_timeout_seconds,
-            env_config_arc.tcp_half_close_max_wait_seconds,
-            env_config_arc.frontend_tls_handshake_timeout_seconds,
-            env_config_arc.udp_max_sessions,
-            env_config_arc.udp_cleanup_interval_seconds,
-            tls_policy_arc.clone(),
-            crls.clone(),
-            adaptive_buffer.clone(),
-            env_config_arc.udp_recvmmsg_batch_size,
-            {
-                let v = env_config_arc
-                    .tcp_fastopen_enabled
-                    .resolve(crate::socket_opts::is_tcp_fastopen_available);
-                tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
-                v
-            },
-            overload.clone(),
-            {
-                let v = env_config_arc
-                    .ktls_enabled
-                    .resolve(crate::socket_opts::ktls::is_ktls_available);
-                if v {
-                    tracing::info!("kTLS auto-detection: enabled (full key install probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .io_uring_splice_enabled
-                    .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
-                if v {
-                    tracing::info!(
-                        "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
-                    );
-                    // Warn if the tokio blocking-thread pool is too small for the
-                    // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                    // tasks per TCP connection (one per direction). With the default
-                    // cap of 512, thousands of concurrent streams will saturate the
-                    // pool and new splices will queue, causing latency spikes. 1024
-                    // is the rule-of-thumb floor; operators with very high connection
-                    // counts should set FERRUM_BLOCKING_THREADS much higher or
-                    // disable io_uring splice entirely.
-                    let effective_blocking_threads = env_config_arc.blocking_threads.unwrap_or(512);
-                    if effective_blocking_threads < 1024 {
-                        tracing::warn!(
-                            blocking_threads = effective_blocking_threads,
-                            "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
+        let stream_listener_manager = Arc::new(
+            stream_listener::StreamListenerManager::new_with_epoch(
+                stream_bind_addr,
+                config_arc.clone(),
+                dns_cache.clone(),
+                request_epoch.clone(),
+                circuit_breaker_cache.clone(),
+                None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
+                env_config_arc.tls_no_verify,
+                env_config_arc.tls_ca_bundle_path.clone(),
+                env_config_arc.tcp_idle_timeout_seconds,
+                env_config_arc.tcp_half_close_max_wait_seconds,
+                env_config_arc.frontend_tls_handshake_timeout_seconds,
+                env_config_arc.udp_max_sessions,
+                env_config_arc.udp_cleanup_interval_seconds,
+                tls_policy_arc.clone(),
+                crls.clone(),
+                adaptive_buffer.clone(),
+                env_config_arc.udp_recvmmsg_batch_size,
+                {
+                    let v = env_config_arc
+                        .tcp_fastopen_enabled
+                        .resolve(crate::socket_opts::is_tcp_fastopen_available);
+                    tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
+                    v
+                },
+                overload.clone(),
+                {
+                    let v = env_config_arc
+                        .ktls_enabled
+                        .resolve(crate::socket_opts::ktls::is_ktls_available);
+                    if v {
+                        tracing::info!(
+                            "kTLS auto-detection: enabled (full key install probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .io_uring_splice_enabled
+                        .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
+                    if v {
+                        tracing::info!(
+                            "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
+                        );
+                        // Warn if the tokio blocking-thread pool is too small for the
+                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
+                        // tasks per TCP connection (one per direction). With the default
+                        // cap of 512, thousands of concurrent streams will saturate the
+                        // pool and new splices will queue, causing latency spikes. 1024
+                        // is the rule-of-thumb floor; operators with very high connection
+                        // counts should set FERRUM_BLOCKING_THREADS much higher or
+                        // disable io_uring splice entirely.
+                        let effective_blocking_threads =
+                            env_config_arc.blocking_threads.unwrap_or(512);
+                        if effective_blocking_threads < 1024 {
+                            tracing::warn!(
+                                blocking_threads = effective_blocking_threads,
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
                              each TCP stream consumes 2 blocking threads. \
                              Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
-                            effective_blocking_threads
-                        );
+                                effective_blocking_threads
+                            );
+                        }
+                    } else {
+                        tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
                     }
-                } else {
-                    tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
-                }
-                v
-            },
-            env_config_arc.so_busy_poll_us,
-            {
-                let v = env_config_arc
-                    .udp_gro_enabled
-                    .resolve(crate::socket_opts::is_udp_gro_available);
-                // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
-                tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_gso_enabled
-                    .resolve(crate::socket_opts::is_udp_gso_available);
-                if v {
-                    tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_pktinfo_enabled
-                    .resolve(crate::socket_opts::is_udp_pktinfo_available);
-                if v {
-                    tracing::info!(
-                        "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
-                    );
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
-                }
-                v
-            },
-        ));
+                    v
+                },
+                env_config_arc.so_busy_poll_us,
+                {
+                    let v = env_config_arc
+                        .udp_gro_enabled
+                        .resolve(crate::socket_opts::is_udp_gro_available);
+                    // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
+                    tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_gso_enabled
+                        .resolve(crate::socket_opts::is_udp_gso_available);
+                    if v {
+                        tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_pktinfo_enabled
+                        .resolve(crate::socket_opts::is_udp_pktinfo_available);
+                    if v {
+                        tracing::info!(
+                            "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
+                    }
+                    v
+                },
+            ),
+        );
 
         Ok(Self {
             config: config_arc,

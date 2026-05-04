@@ -18,6 +18,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
+use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
 
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
@@ -64,9 +65,7 @@ pub struct StreamListenerManager {
     bind_addr: IpAddr,
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
-    load_balancer_cache: Arc<LoadBalancerCache>,
-    consumer_index: Arc<ConsumerIndex>,
-    plugin_cache: Arc<PluginCache>,
+    request_epoch: Arc<RequestEpochStore>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
     /// Uses `ArcSwap` because the TLS config may be loaded after `ProxyState::new()`
@@ -122,7 +121,7 @@ pub struct StreamListenerManager {
 }
 
 impl StreamListenerManager {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn new(
         bind_addr: IpAddr,
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
@@ -152,15 +151,77 @@ impl StreamListenerManager {
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
     ) -> Self {
+        let config_snapshot = config.load_full();
+        let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
+            config_snapshot.as_ref().clone(),
+            &plugin_cache,
+            &consumer_index,
+            &load_balancer_cache,
+        ));
+        Self::new_with_epoch(
+            bind_addr,
+            config,
+            dns_cache,
+            request_epoch,
+            circuit_breaker_cache,
+            frontend_tls_config,
+            tls_no_verify,
+            tls_ca_bundle_path,
+            tcp_idle_timeout_seconds,
+            tcp_half_close_max_wait_seconds,
+            frontend_tls_handshake_timeout_seconds,
+            udp_max_sessions,
+            udp_cleanup_interval_seconds,
+            tls_policy,
+            crls,
+            adaptive_buffer,
+            udp_recvmmsg_batch_size,
+            tcp_fastopen_enabled,
+            overload,
+            ktls_enabled,
+            io_uring_splice_enabled,
+            so_busy_poll_us,
+            udp_gro_enabled,
+            udp_gso_enabled,
+            udp_pktinfo_enabled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_epoch(
+        bind_addr: IpAddr,
+        config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
+        dns_cache: DnsCache,
+        request_epoch: Arc<RequestEpochStore>,
+        circuit_breaker_cache: Arc<CircuitBreakerCache>,
+        frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
+        tls_no_verify: bool,
+        tls_ca_bundle_path: Option<String>,
+        tcp_idle_timeout_seconds: u64,
+        tcp_half_close_max_wait_seconds: u64,
+        frontend_tls_handshake_timeout_seconds: u64,
+        udp_max_sessions: usize,
+        udp_cleanup_interval_seconds: u64,
+        tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
+        adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+        udp_recvmmsg_batch_size: usize,
+        tcp_fastopen_enabled: bool,
+        overload: Arc<crate::overload::OverloadState>,
+        ktls_enabled: bool,
+        io_uring_splice_enabled: bool,
+        so_busy_poll_us: u32,
+        udp_gro_enabled: bool,
+        udp_gso_enabled: bool,
+        udp_pktinfo_enabled: bool,
+    ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             dtls_metrics: arc_swap::ArcSwap::new(Arc::new(Vec::new())),
             bind_addr,
             config,
             dns_cache,
-            load_balancer_cache,
-            consumer_index,
-            plugin_cache,
+            request_epoch,
             circuit_breaker_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -420,7 +481,7 @@ impl StreamListenerManager {
             let proxy_id_owned = proxy_id.clone();
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
-            let lb_cache = self.load_balancer_cache.clone();
+            let request_epoch = self.request_epoch.clone();
             let tls_no_verify = self.tls_no_verify;
             let cb_cache = self.circuit_breaker_cache.clone();
             let started = Arc::new(AtomicBool::new(false));
@@ -463,8 +524,6 @@ impl StreamListenerManager {
                 let udp_max_sessions = self.udp_max_sessions;
                 let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
-                let consumer_index = self.consumer_index.clone();
-                let plugin_cache = self.plugin_cache.clone();
                 let crls = self.crls.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
@@ -482,8 +541,7 @@ impl StreamListenerManager {
                         proxy_id: proxy_id_owned.clone(),
                         config,
                         dns_cache,
-                        load_balancer_cache: lb_cache,
-                        consumer_index,
+                        request_epoch,
                         shutdown: shutdown_rx,
                         metrics,
                         frontend_dtls_config,
@@ -491,7 +549,6 @@ impl StreamListenerManager {
                         max_sessions: udp_max_sessions,
                         frontend_tls_handshake_timeout_seconds: frontend_tls_handshake_timeout,
                         cleanup_interval_seconds: udp_cleanup_interval,
-                        plugin_cache,
                         circuit_breaker_cache: cb_cache,
                         crls,
                         started: started_for_listener,
@@ -525,8 +582,6 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
-                let consumer_index = self.consumer_index.clone();
-                let plugin_cache = self.plugin_cache.clone();
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tcp_half_close_max_wait = self.tcp_half_close_max_wait_seconds;
                 let frontend_tls_handshake_timeout = self.frontend_tls_handshake_timeout_seconds;
@@ -546,14 +601,12 @@ impl StreamListenerManager {
                         proxy_id: proxy_id_owned.clone(),
                         config,
                         dns_cache,
-                        load_balancer_cache: lb_cache,
-                        consumer_index,
+                        request_epoch,
                         frontend_tls_config: tls_config,
                         shutdown: shutdown_rx,
                         metrics,
                         tls_no_verify,
                         tls_ca_bundle_path,
-                        plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds: tcp_half_close_max_wait,
                         frontend_tls_handshake_timeout_seconds: frontend_tls_handshake_timeout,
