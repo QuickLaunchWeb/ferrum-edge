@@ -15,6 +15,7 @@ pub mod jwks_store;
 pub mod log_helpers;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
+pub mod response_body;
 pub mod size_limit;
 pub mod tcp_endpoint;
 pub mod udp_endpoint;
