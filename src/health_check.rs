@@ -32,6 +32,7 @@ use crate::load_balancer::LoadBalancerCache;
 use dashmap::DashMap;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -143,7 +144,14 @@ pub struct HealthChecker {
     /// Used when the upstream has no TLS config.
     default_http_client: Arc<reqwest::Client>,
     /// Active check abort handles.
-    active_check_handles: Vec<tokio::task::JoinHandle<()>>,
+    ///
+    /// Wrapped in `Mutex` so [`Self::start_with_shutdown`] and
+    /// [`Self::restart_with_shutdown`] can re-spawn probe tasks on config
+    /// reload without requiring `&mut self` (the gateway holds an
+    /// `Arc<HealthChecker>` for the lifetime of `ProxyState`). Touched only
+    /// at startup, config reload, and drop — never on the proxy hot path,
+    /// so the lock is uncontested.
+    active_check_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Optional reference to the load balancer cache for recording active
     /// probe latencies (used by least-latency algorithm). Set via
     /// `set_load_balancer_cache()` after construction.
@@ -188,7 +196,7 @@ impl HealthChecker {
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
-            active_check_handles: Vec::new(),
+            active_check_handles: Mutex::new(Vec::new()),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: Some(dns_cache),
@@ -222,7 +230,7 @@ impl HealthChecker {
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
-            active_check_handles: Vec::new(),
+            active_check_handles: Mutex::new(Vec::new()),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: None,
@@ -240,21 +248,40 @@ impl HealthChecker {
     }
 
     /// Start health checks for all upstreams in the config.
-    pub fn start(&mut self, config: &GatewayConfig) {
+    pub fn start(&self, config: &GatewayConfig) {
         self.start_with_shutdown(config, None);
     }
 
     /// Start health checks with an optional shutdown signal.
+    ///
+    /// Aborts any previously spawned active-check / passive-recovery tasks
+    /// before re-spawning, so this is also the entry point used by
+    /// [`Self::restart_with_shutdown`] on config reload. Active probe state
+    /// (`active_unhealthy_targets`, `active_target_states`) is intentionally
+    /// preserved across the restart so consecutive_successes/failures
+    /// counters carry over and the next probe tick continues from current
+    /// state — avoiding probe flapping during reload.
     pub fn start_with_shutdown(
-        &mut self,
+        &self,
         config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Cancel any existing active check tasks
-        for handle in self.active_check_handles.drain(..) {
+        // Drain old handles into a temporary so we can release the lock
+        // before any `await` inside the spawned tasks could touch anything
+        // else. `Vec::drain` collects the aborted handles in declaration
+        // order; abort() is non-blocking so this is cheap.
+        let old_handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = match self.active_check_handles.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for handle in old_handles {
             handle.abort();
         }
 
+        let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for upstream in &config.upstreams {
             if let Some(hc_config) = &upstream.health_checks {
                 // Start active health checks
@@ -276,7 +303,7 @@ impl HealthChecker {
                             &upstream_client,
                             &tls_config,
                         );
-                        self.active_check_handles.push(handle);
+                        new_handles.push(handle);
                     }
                 }
 
@@ -290,10 +317,63 @@ impl HealthChecker {
                         passive.healthy_after_seconds,
                         shutdown_rx.clone(),
                     );
-                    self.active_check_handles.push(handle);
+                    new_handles.push(handle);
                 }
             }
         }
+
+        match self.active_check_handles.lock() {
+            Ok(mut guard) => *guard = new_handles,
+            Err(poisoned) => *poisoned.into_inner() = new_handles,
+        }
+    }
+
+    /// Restart probe tasks to match `new_config`.
+    ///
+    /// Called from [`crate::proxy::ProxyState::update_config`] and
+    /// [`crate::proxy::ProxyState::apply_incremental`] after the canonical
+    /// config swap so that:
+    ///
+    /// - Upstreams added on reload get probe tasks spawned.
+    /// - Upstreams removed on reload have their probe tasks aborted (no
+    ///   leaked timers probing dead targets).
+    /// - Upstreams whose `interval` / `timeout` / `unhealthy_threshold` /
+    ///   probe_type / TLS config / etc. changed pick up the new config —
+    ///   the old task is aborted and a fresh one is spawned with the new
+    ///   parameters.
+    ///
+    /// Stale entries in `active_unhealthy_targets` and `active_target_states`
+    /// for fully removed upstreams or removed targets are pruned so they
+    /// don't accumulate in the shared maps over the gateway's lifetime.
+    /// (`remove_stale_targets` is normally invoked from the service-discovery
+    /// path on dynamic target changes; this call covers the static-config
+    /// reload path so the two layers stay consistent.)
+    ///
+    /// We deliberately do a **full restart** rather than a per-upstream diff
+    /// because (a) reloads are rare (DB poll cycle, CP push, file SIGHUP)
+    /// and (b) the persistent `active_unhealthy_targets` / `active_target_states`
+    /// DashMaps carry consecutive-success/failure counters across the brief
+    /// abort + re-spawn window, so a target that was "unhealthy" before the
+    /// reload stays unhealthy until the next probe tick recovers it normally.
+    /// No flapping.
+    pub fn restart_with_shutdown(
+        &self,
+        new_config: &GatewayConfig,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
+        // Prune active-probe state for upstreams that are no longer in the
+        // config so the shared maps don't accumulate stale entries.
+        let active_keys: std::collections::HashSet<String> = new_config
+            .upstreams
+            .iter()
+            .flat_map(|u| u.targets.iter().map(move |t| active_target_key(&u.id, t)))
+            .collect();
+        self.active_unhealthy_targets
+            .retain(|key, _| active_keys.contains(key));
+        self.active_target_states
+            .retain(|key, _| active_keys.contains(key));
+
+        self.start_with_shutdown(new_config, shutdown_rx);
     }
 
     /// Get or create the per-proxy passive health state.
@@ -460,6 +540,25 @@ impl HealthChecker {
     pub fn prune_removed_proxies(&self, removed_proxy_ids: &[String]) {
         for id in removed_proxy_ids {
             self.passive_health.remove(id);
+        }
+    }
+
+    /// Return the number of currently-spawned probe / passive-recovery tasks.
+    ///
+    /// This counts both active probe tasks (one per upstream target with an
+    /// `active` health check configured) and passive recovery timers (one
+    /// per upstream with a non-zero `healthy_after_seconds`). Intended for
+    /// tests asserting that [`Self::start_with_shutdown`] /
+    /// [`Self::restart_with_shutdown`] correctly aborts old handles and
+    /// spawns new ones on config reload. The runtime crate itself doesn't
+    /// call it (the gateway uses operator metrics like `active_unhealthy_targets`
+    /// for observability), hence `#[allow(dead_code)]`.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn active_task_count(&self) -> usize {
+        match self.active_check_handles.lock() {
+            Ok(g) => g.len(),
+            Err(p) => p.into_inner().len(),
         }
     }
 
@@ -699,7 +798,16 @@ impl HealthChecker {
 
 impl Drop for HealthChecker {
     fn drop(&mut self) {
-        for handle in &self.active_check_handles {
+        // Best-effort: if the lock is poisoned (panic during start), still
+        // abort whatever handles we can recover so spawned tasks don't leak
+        // past the HealthChecker. `get_mut` avoids a lock entirely since
+        // we have unique access via `&mut self` in Drop.
+        let handles = self.active_check_handles.get_mut();
+        let handles = match handles {
+            Ok(v) => v,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for handle in handles.iter() {
             handle.abort();
         }
     }

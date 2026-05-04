@@ -1230,6 +1230,10 @@ impl ProxyState {
             env_config_arc.tls_no_verify,
         );
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
+        // `start_with_shutdown` re-spawns probe tasks under the inner Mutex,
+        // so we can call it through &HealthChecker. Probe tasks are restarted
+        // again from `update_config` / `apply_incremental` whenever the
+        // config changes (see `HealthChecker::restart_with_shutdown`).
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
@@ -2292,6 +2296,12 @@ impl ProxyState {
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
 
+            // Restart active health-check probes against the new config so
+            // upstreams added by this reload get their probes spawned and
+            // probe parameters (interval, timeout, threshold, probe_type,
+            // TLS config) for existing upstreams are picked up.
+            self.health_checker.restart_with_shutdown(&new_cfg, None);
+
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
             );
@@ -2486,6 +2496,18 @@ impl ProxyState {
         {
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
+        }
+
+        // Restart active health-check probes when upstreams or their probe
+        // configuration changed. Without this, probe tasks spawned at startup
+        // keep running with stale parameters, removed upstreams keep probing
+        // forever, and newly added upstreams never get probes.
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.health_checker.restart_with_shutdown(&new_cfg, None);
         }
 
         true
@@ -2878,6 +2900,19 @@ impl ProxyState {
         {
             let new_cfg = self.config.load_full();
             self.service_discovery_manager.reconcile(&new_cfg, None);
+        }
+
+        // Restart active health-check probes when upstreams or their probe
+        // configuration changed. Same rationale as the corresponding block
+        // in `update_config` — incremental DB polls and CP gRPC pushes both
+        // route through this method, so without it any upstream churn after
+        // startup is invisible to the probe layer.
+        if !delta.added_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+            || !delta.modified_upstreams.is_empty()
+        {
+            let new_cfg = self.config.load_full();
+            self.health_checker.restart_with_shutdown(&new_cfg, None);
         }
 
         true
