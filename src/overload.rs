@@ -521,6 +521,8 @@ pub fn raise_fd_limit() -> RaiseFdLimitResult {
             };
         }
 
+        // `hard == RLIM_INFINITY` is safe here; the kernel still enforces its
+        // platform ceiling (for example fs.nr_open on Linux).
         let new_rlim: [u64; 2] = [hard, hard];
         let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_rlim) };
         if result == 0 {

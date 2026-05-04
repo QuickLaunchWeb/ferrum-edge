@@ -267,25 +267,26 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     // soft cap remains below the production floor — the gateway will still
     // run, but its 95% FD-critical threshold will trigger early on busy hosts.
     let fd_raise = overload::raise_fd_limit();
-    if fd_raise.soft_after > 0 && fd_raise.soft_after < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
-        warn!(
-            soft_before = fd_raise.soft_before,
-            soft_after = fd_raise.soft_after,
-            hard = fd_raise.hard,
-            target = overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
-            "effective soft FD limit is {} (hard cap {}); recommend raising to >= {} via /etc/security/limits.conf, systemd LimitNOFILE=, or docker --ulimit nofile= for production workloads",
-            fd_raise.soft_after,
-            fd_raise.hard,
-            overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
-        );
-    } else if fd_raise.raised {
+    if fd_raise.raised {
         info!(
             soft_before = fd_raise.soft_before,
             soft_after = fd_raise.soft_after,
             hard = fd_raise.hard,
             "raised soft FD limit to hard cap"
         );
-    } else if fd_raise.hard > 0 {
+    }
+    if fd_raise.soft_after > 0 && fd_raise.soft_after < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
+        warn!(
+            soft_before = fd_raise.soft_before,
+            soft_after = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            recommended_floor = overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
+            "effective soft FD limit is {} (hard cap {}); recommend raising to >= {} via /etc/security/limits.conf, systemd LimitNOFILE=, or docker --ulimit nofile= for production workloads",
+            fd_raise.soft_after,
+            fd_raise.hard,
+            overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
+        );
+    } else if !fd_raise.raised && fd_raise.hard > 0 {
         debug!(
             soft = fd_raise.soft_after,
             hard = fd_raise.hard,
