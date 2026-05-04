@@ -281,3 +281,44 @@ pub fn resolve_client_ip_parsed(
     // All XFF entries were trusted proxies — fall back to socket IP
     socket_ip.to_string()
 }
+
+/// Resolve a configured single-hop real-IP header from a trusted direct proxy.
+///
+/// Unlike `X-Forwarded-For`, configured headers such as `CF-Connecting-IP` or
+/// `X-Real-IP` are expected to contain exactly one IP address. Comma-separated
+/// chains or malformed values are ignored so client-controlled header text
+/// cannot feed ACLs, rate limits, or logs.
+pub fn resolve_real_ip_header(
+    socket_ip: &str,
+    socket_addr: &IpAddr,
+    header_value: &str,
+    trusted_proxies: &TrustedProxies,
+) -> Option<String> {
+    if !trusted_proxies.contains(socket_addr) {
+        debug!(
+            socket_ip = socket_ip,
+            "Direct connection not from trusted proxy; ignoring configured real-IP header"
+        );
+        return None;
+    }
+
+    let value = header_value.trim();
+    if value.is_empty() || value.contains(',') {
+        debug!(
+            value = value,
+            "Configured real-IP header must contain a single IP address"
+        );
+        return None;
+    }
+
+    match value.parse::<IpAddr>() {
+        Ok(ip) => Some(ip.to_string()),
+        Err(_) => {
+            debug!(
+                value = value,
+                "Configured real-IP header was not a parseable IP address"
+            );
+            None
+        }
+    }
+}

@@ -5490,16 +5490,18 @@ async fn handle_proxy_request_inner(
             // real_ip_header is pre-lowercased at config load time — no allocation needed
             let header_val = ctx.raw_header_get(real_ip_header.as_str());
             if let Some(val) = header_val {
-                // Validate the direct connection is from a trusted proxy before
-                // trusting this header
-                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
-                    let trimmed = val.trim();
-                    // Only allocate if the resolved IP differs from socket_ip
-                    if trimmed != socket_ip {
-                        ctx.client_ip = trimmed.to_owned();
-                    }
+                if let Some(ref addr) = socket_addr
+                    && let Some(resolved) = client_ip::resolve_real_ip_header(
+                        &socket_ip,
+                        addr,
+                        val,
+                        &state.trusted_proxies,
+                    )
+                    && resolved != socket_ip
+                {
+                    ctx.client_ip = resolved;
                 }
-                // else: untrusted proxy, keep socket_ip (already set in ctx)
+                // else: untrusted proxy or invalid header; keep socket_ip (already set in ctx)
             } else if let Some(ref addr) = socket_addr {
                 ctx.client_ip = client_ip::resolve_client_ip_parsed(
                     &socket_ip,

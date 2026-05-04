@@ -689,10 +689,14 @@ async fn handle_h3_request(
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
             // real_ip_header is already lowercase from env config parsing
             let header_val = ctx.raw_header_get(real_ip_header.as_str());
-            if let Some(val) = header_val
-                && state.trusted_proxies.contains(&socket_addr)
-            {
-                val.trim().to_string()
+            if let Some(val) = header_val {
+                crate::proxy::client_ip::resolve_real_ip_header(
+                    socket_ip,
+                    &socket_addr,
+                    val,
+                    &state.trusted_proxies,
+                )
+                .unwrap_or_else(|| socket_ip.to_string())
             } else {
                 crate::proxy::client_ip::resolve_client_ip_parsed(
                     socket_ip,

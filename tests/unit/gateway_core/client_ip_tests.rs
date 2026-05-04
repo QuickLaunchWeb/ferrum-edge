@@ -1,6 +1,6 @@
 //! Tests for client IP resolution module
 
-use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
+use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip, resolve_real_ip_header};
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
 
@@ -257,5 +257,51 @@ fn real_world_cloudflare_pattern() {
     assert_eq!(
         resolve_client_ip("10.0.0.1", Some("198.51.100.23, 173.245.49.1"), &tp),
         "198.51.100.23"
+    );
+}
+
+// ── resolve_real_ip_header ──────────────────────────────────────────────
+
+#[test]
+fn real_ip_header_accepts_single_ip_from_trusted_proxy() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, " 203.0.113.50 ", &tp).as_deref(),
+        Some("203.0.113.50")
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_comma_separated_chain() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.23, 203.0.113.50", &tp,),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_malformed_value() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "not-an-ip", &tp),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_untrusted_direct_peer() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "198.51.100.2".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("198.51.100.2", &socket_addr, "203.0.113.50", &tp),
+        None
     );
 }
