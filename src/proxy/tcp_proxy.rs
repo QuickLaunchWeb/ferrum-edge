@@ -693,6 +693,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     let disconnected_at = chrono::Utc::now();
                     let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
                     let final_proxy_id = stream_ctx.proxy_id.clone();
+                    // Keep disconnect hooks/logging on the same epoch that
+                    // admitted the connection. Long-lived TCP streams can span
+                    // config reloads; using the connection epoch preserves a
+                    // consistent view of SNI-selected proxy metadata and
+                    // stream plugins for the full connection lifetime.
                     let final_proxy = epoch
                         .config
                         .proxies

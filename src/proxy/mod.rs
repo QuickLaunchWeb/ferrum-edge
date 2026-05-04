@@ -897,6 +897,33 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
+/// RAII guard for load-balancer connection accounting on upgraded sessions.
+///
+/// WebSocket proxying runs in a spawned task after the HTTP handler returns.
+/// Keeping the accounting in a guard makes the end event fire on normal close,
+/// upgrade failure, task cancellation, or panic unwind.
+struct LoadBalancerConnectionGuard {
+    target: Option<Arc<UpstreamTarget>>,
+    balancer: Option<Arc<LoadBalancer>>,
+}
+
+impl LoadBalancerConnectionGuard {
+    fn new(target: Option<Arc<UpstreamTarget>>, balancer: Option<Arc<LoadBalancer>>) -> Self {
+        if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
+            balancer.record_connection_start(target);
+        }
+        Self { target, balancer }
+    }
+}
+
+impl Drop for LoadBalancerConnectionGuard {
+    fn drop(&mut self) {
+        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
+            balancer.record_connection_end(target);
+        }
+    }
+}
+
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
 /// Writes directly into a single pre-allocated buffer to avoid intermediate
@@ -2201,6 +2228,82 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
+    fn delta_routes_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_proxies.is_empty()
+            || !delta.modified_proxies.is_empty()
+            || !delta.removed_proxy_ids.is_empty()
+    }
+
+    fn delta_consumers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_consumers.is_empty()
+            || !delta.modified_consumers.is_empty()
+            || !delta.removed_consumer_ids.is_empty()
+    }
+
+    fn delta_load_balancers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_upstreams.is_empty()
+            || !delta.modified_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+    }
+
+    fn stage_incremental_request_epoch(
+        &self,
+        current: &RequestEpoch,
+        new_config: &GatewayConfig,
+        staged_config: Arc<GatewayConfig>,
+        delta: &crate::config_delta::ConfigDelta,
+    ) -> Result<StagedRequestEpoch, String> {
+        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+        let rebuild_globals = delta
+            .added_plugin_configs
+            .iter()
+            .chain(delta.modified_plugin_configs.iter())
+            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
+            || !delta.removed_plugin_config_ids.is_empty();
+        let route_changed = Self::delta_routes_changed(delta);
+        let consumer_changed = Self::delta_consumers_changed(delta);
+        let lb_changed = Self::delta_load_balancers_changed(delta);
+
+        let plugin_inner = self.plugin_cache.build_delta_inner(
+            &current.plugin_cache,
+            new_config,
+            &proxy_ids_to_rebuild,
+            &delta.removed_proxy_ids,
+            rebuild_globals,
+        )?;
+        let consumer_inner = if consumer_changed {
+            ConsumerIndex::build_inner(&new_config.consumers)
+        } else {
+            Arc::clone(&current.consumer_index)
+        };
+        let load_balancer = if lb_changed {
+            LoadBalancerCache::build_delta_inner(
+                &current.load_balancer,
+                new_config,
+                &delta.added_upstreams,
+                &delta.removed_upstream_ids,
+                &delta.modified_upstreams,
+            )
+        } else {
+            Arc::clone(&current.load_balancer)
+        };
+        let route_table = if route_changed {
+            RouterCache::build_route_table_snapshot(new_config)
+        } else {
+            Arc::clone(&current.route_table)
+        };
+
+        Ok(StagedRequestEpoch {
+            config: staged_config,
+            route_table,
+            plugin_cache: plugin_inner,
+            consumer_index: consumer_inner,
+            load_balancer,
+            route_changed,
+            lb_changed,
+        })
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
@@ -2367,61 +2470,17 @@ impl ProxyState {
         }
 
         // Stage all request-facing cache inners before publishing any request-visible epoch.
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        let route_changed = !delta.added_proxies.is_empty()
-            || !delta.modified_proxies.is_empty()
-            || !delta.removed_proxy_ids.is_empty();
-        let lb_changed = !delta.added_upstreams.is_empty()
-            || !delta.modified_upstreams.is_empty()
-            || !delta.removed_upstream_ids.is_empty();
+        let route_changed = Self::delta_routes_changed(&delta);
+        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(|current| {
-            let plugin_inner = self.plugin_cache.build_delta_inner(
-                &current.plugin_cache,
+            self.stage_incremental_request_epoch(
+                current,
                 &new_config,
-                &proxy_ids_to_rebuild,
-                &delta.removed_proxy_ids,
-                rebuild_globals,
-            )?;
-            let consumer_changed = !delta.added_consumers.is_empty()
-                || !delta.modified_consumers.is_empty()
-                || !delta.removed_consumer_ids.is_empty();
-            let consumer_inner = if consumer_changed {
-                ConsumerIndex::build_inner(&new_config.consumers)
-            } else {
-                Arc::clone(&current.consumer_index)
-            };
-            let lb_inner = if lb_changed {
-                LoadBalancerCache::build_delta_inner(
-                    &current.load_balancer,
-                    &new_config,
-                    &delta.added_upstreams,
-                    &delta.removed_upstream_ids,
-                    &delta.modified_upstreams,
-                )
-            } else {
-                Arc::clone(&current.load_balancer)
-            };
-            let route_table = if route_changed {
-                RouterCache::build_route_table_snapshot(&new_config)
-            } else {
-                Arc::clone(&current.route_table)
-            };
-            Ok(Some(StagedRequestEpoch {
-                config: Arc::clone(&staged_config),
-                route_table,
-                plugin_cache: plugin_inner,
-                consumer_index: consumer_inner,
-                load_balancer: lb_inner,
-                route_changed,
-                lb_changed,
-            }))
+                Arc::clone(&staged_config),
+                &delta,
+            )
+            .map(Some)
         });
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
@@ -2439,7 +2498,10 @@ impl ProxyState {
                 Arc::clone(&published.route_table),
                 published.route_generation,
             );
-            self.router_cache.clear_lookup_caches();
+            // Route cache entries are generation-tagged. After publishing a new
+            // route table, stale cache hits miss and are lazily overwritten on
+            // the next lookup, which avoids an O(cache-size) clear and keeps
+            // the LFU sketch warm across small route changes.
         }
         self.plugin_cache
             .store_inner(Arc::clone(&published.plugin_cache));
@@ -2570,7 +2632,7 @@ impl ProxyState {
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
-            proxy_ids_to_rebuild.len(),
+            proxy_plugin_rebuild_count,
         );
 
         // Reconcile service discovery tasks for changed upstreams
@@ -2794,71 +2856,23 @@ impl ProxyState {
             }
         }
 
-        // Build a ConfigDelta to feed into existing cache apply_delta() methods.
-        // For incremental results, we treat all changed resources as "modified"
-        // since the DB layer doesn't distinguish adds from modifications.
-        // The cache apply_delta methods handle both cases correctly.
+        // Build a ConfigDelta against old + new to get proper
+        // add/modify/remove classification for the epoch builders.
         let old_config = self.config.load_full();
 
-        // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
         // Stage all request-facing cache inners before publishing any request-visible epoch.
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        let route_changed = !delta.added_proxies.is_empty()
-            || !delta.modified_proxies.is_empty()
-            || !delta.removed_proxy_ids.is_empty();
-        let lb_changed = !delta.added_upstreams.is_empty()
-            || !delta.modified_upstreams.is_empty()
-            || !delta.removed_upstream_ids.is_empty();
+        let route_changed = Self::delta_routes_changed(&delta);
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(|current| {
-            let plugin_inner = self.plugin_cache.build_delta_inner(
-                &current.plugin_cache,
+            self.stage_incremental_request_epoch(
+                current,
                 &new_config,
-                &proxy_ids_to_rebuild,
-                &delta.removed_proxy_ids,
-                rebuild_globals,
-            )?;
-            let consumer_changed = !delta.added_consumers.is_empty()
-                || !delta.modified_consumers.is_empty()
-                || !delta.removed_consumer_ids.is_empty();
-            let consumer_inner = if consumer_changed {
-                ConsumerIndex::build_inner(&new_config.consumers)
-            } else {
-                Arc::clone(&current.consumer_index)
-            };
-            let lb_inner = if lb_changed {
-                LoadBalancerCache::build_delta_inner(
-                    &current.load_balancer,
-                    &new_config,
-                    &delta.added_upstreams,
-                    &delta.removed_upstream_ids,
-                    &delta.modified_upstreams,
-                )
-            } else {
-                Arc::clone(&current.load_balancer)
-            };
-            let route_table = if route_changed {
-                RouterCache::build_route_table_snapshot(&new_config)
-            } else {
-                Arc::clone(&current.route_table)
-            };
-            Ok(Some(StagedRequestEpoch {
-                config: Arc::clone(&staged_config),
-                route_table,
-                plugin_cache: plugin_inner,
-                consumer_index: consumer_inner,
-                load_balancer: lb_inner,
-                route_changed,
-                lb_changed,
-            }))
+                Arc::clone(&staged_config),
+                &delta,
+            )
+            .map(Some)
         });
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
@@ -2876,7 +2890,9 @@ impl ProxyState {
                 Arc::clone(&published.route_table),
                 published.route_generation,
             );
-            self.router_cache.clear_lookup_caches();
+            // Route cache entries are generation-tagged. Stale entries miss
+            // and are lazily overwritten, so route changes do not need a full
+            // cache clear on the update path.
         }
         self.plugin_cache
             .store_inner(Arc::clone(&published.plugin_cache));
@@ -3458,9 +3474,8 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
-    if let (Some(target), Some(balancer)) = (&current_target, &upstream_balancer) {
-        balancer.record_connection_start(target);
-    }
+    let ws_lb_guard =
+        LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
 
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
@@ -3588,8 +3603,6 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
-    let ws_lb_target = current_target.clone();
-    let ws_lb_balancer = upstream_balancer.clone();
     // Capture session metadata while the originating RequestContext + proxy are
     // still in scope. Passed to run_websocket_proxy so it can construct a
     // WsDisconnectContext at teardown for plugins that opted in to
@@ -3617,6 +3630,7 @@ async fn handle_websocket_request_authenticated(
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
+        let _ws_lb_guard = ws_lb_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 if let Err(e) = run_websocket_proxy(
@@ -3644,9 +3658,6 @@ async fn handle_websocket_request_authenticated(
                     proxy_id, e
                 );
             }
-        }
-        if let (Some(target), Some(balancer)) = (ws_lb_target.as_ref(), ws_lb_balancer.as_ref()) {
-            balancer.record_connection_end(target);
         }
     });
 

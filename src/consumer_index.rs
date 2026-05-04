@@ -74,8 +74,15 @@ impl ConsumerIndex {
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<ConsumerIndexInner>) {
-        if let ConsumerIndexStorage::Shared(shared) = &self.inner {
-            shared.store(inner);
+        match &self.inner {
+            ConsumerIndexStorage::Shared(shared) => shared.store(inner),
+            ConsumerIndexStorage::Snapshot(_) => {
+                debug_assert!(
+                    false,
+                    "attempted to mutate a snapshot-backed ConsumerIndex facade"
+                );
+                error!("attempted to mutate a snapshot-backed ConsumerIndex facade");
+            }
         }
     }
 
@@ -124,7 +131,6 @@ impl ConsumerIndex {
     /// Returns the full consumer list for custom plugins that need to iterate.
     ///
     /// Returns `Arc<Vec<…>>` — cheap pointer clone, no O(n) Vec copy.
-    #[allow(dead_code)] // Public API used by custom plugins
     pub fn consumers(&self) -> Arc<Vec<Arc<Consumer>>> {
         self.with_inner(|inner| inner.consumers())
     }
@@ -288,7 +294,6 @@ impl ConsumerIndex {
     }
 
     /// Number of indexed entries (for testing).
-    #[allow(dead_code)]
     pub fn index_len(&self) -> usize {
         self.with_inner(|inner| {
             inner.keyauth_index.len() + inner.basic_index.len() + inner.identity_index.len()
@@ -296,7 +301,6 @@ impl ConsumerIndex {
     }
 
     /// Number of consumers (for testing).
-    #[allow(dead_code)]
     pub fn consumer_count(&self) -> usize {
         self.with_inner(|inner| inner.all_consumers.len())
     }

@@ -539,7 +539,6 @@ impl StreamListenerManager {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
-                        config,
                         dns_cache,
                         request_epoch,
                         shutdown: shutdown_rx,

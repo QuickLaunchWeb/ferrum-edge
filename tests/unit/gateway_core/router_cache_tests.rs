@@ -1,17 +1,7 @@
 use chrono::Utc;
 use ferrum_edge::RouterCache;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
-use ferrum_edge::config_delta::AffectedRoutes;
 use ferrum_edge::proxy::build_backend_url;
-
-/// Build an `AffectedRoutes` from a list of listen_paths (for the common case
-/// where a test cares about path-based invalidation only).
-fn paths(items: &[&str]) -> AffectedRoutes {
-    AffectedRoutes {
-        listen_paths: items.iter().map(|s| s.to_string()).collect(),
-        host_only_hosts: Vec::new(),
-    }
-}
 
 /// Helper to create a test proxy with sensible defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
@@ -399,7 +389,7 @@ fn test_cache_miss_not_cached() {
 }
 
 #[test]
-fn test_rebuild_clears_cache_and_uses_new_routes() {
+fn test_new_cache_uses_new_routes() {
     let config1 = test_config(vec![test_proxy("v1", "/api/v1")]);
     let cache = RouterCache::new(&config1, 100);
 
@@ -408,11 +398,10 @@ fn test_rebuild_clears_cache_and_uses_new_routes() {
     assert_eq!(matched.unwrap().proxy.id, "v1");
     assert_eq!(cache.cache_len(), 1);
 
-    // Rebuild with different config
     let config2 = test_config(vec![test_proxy("v2", "/api/v2")]);
-    cache.rebuild(&config2);
+    let cache = RouterCache::new(&config2, 100);
 
-    // Cache should be cleared
+    // New cache starts empty.
     assert_eq!(cache.cache_len(), 0);
 
     // Old route should no longer match
@@ -425,7 +414,7 @@ fn test_rebuild_clears_cache_and_uses_new_routes() {
 }
 
 #[test]
-fn test_rebuild_updates_route_count() {
+fn test_new_cache_updates_route_count() {
     let config1 = test_config(vec![test_proxy("a", "/a"), test_proxy("b", "/b")]);
     let cache = RouterCache::new(&config1, 100);
     assert_eq!(cache.route_count(), 2);
@@ -435,7 +424,7 @@ fn test_rebuild_updates_route_count() {
         test_proxy("y", "/y"),
         test_proxy("z", "/z"),
     ]);
-    cache.rebuild(&config2);
+    let cache = RouterCache::new(&config2, 100);
     assert_eq!(cache.route_count(), 3);
 }
 
@@ -723,7 +712,7 @@ fn test_cache_key_includes_host() {
 }
 
 #[test]
-fn test_rebuild_clears_host_path_cache() {
+fn test_new_cache_uses_new_host_routes() {
     let config1 = test_config(vec![test_proxy_with_hosts(
         "api",
         "/",
@@ -739,7 +728,7 @@ fn test_rebuild_clears_host_path_cache() {
         "/",
         vec!["new.example.com"],
     )]);
-    cache.rebuild(&config2);
+    let cache = RouterCache::new(&config2, 100);
     assert_eq!(cache.cache_len(), 0);
 
     // Old host should no longer match
@@ -1153,16 +1142,15 @@ fn test_regex_route_count() {
 }
 
 #[test]
-fn test_regex_rebuild_clears_caches() {
+fn test_new_cache_uses_new_regex_routes() {
     let config1 = test_config(vec![test_regex_proxy("v1", r"/users/[^/]+")]);
     let cache = RouterCache::new(&config1, 100);
 
     cache.find_proxy(None, "/users/42");
     assert_eq!(cache.regex_cache_len(), 1);
 
-    // Rebuild with different config
     let config2 = test_config(vec![test_regex_proxy("v2", r"/products/[^/]+")]);
-    cache.rebuild(&config2);
+    let cache = RouterCache::new(&config2, 100);
 
     assert_eq!(cache.regex_cache_len(), 0);
     assert_eq!(cache.cache_len(), 0);
@@ -1401,83 +1389,6 @@ fn test_regex_exact_path_no_remaining() {
 }
 
 // ============================================================
-// apply_delta tests
-// ============================================================
-
-#[test]
-fn test_apply_delta_empty_affected_paths_preserves_cache() {
-    let config = test_config(vec![test_proxy("p1", "/api")]);
-    let cache = RouterCache::new(&config, 10_000);
-
-    // Populate cache
-    cache.find_proxy(None, "/api/users");
-    assert!(cache.cache_len() > 0);
-
-    // Empty affected paths should not clear any cache
-    let before = cache.cache_len();
-    cache.apply_delta(&config, &AffectedRoutes::default());
-    assert_eq!(cache.cache_len(), before);
-}
-
-#[test]
-fn test_apply_delta_prefix_invalidates_affected_entries() {
-    let config = test_config(vec![test_proxy("p1", "/api"), test_proxy("p2", "/web")]);
-    let cache = RouterCache::new(&config, 10_000);
-
-    // Populate cache with entries under both prefixes
-    cache.find_proxy(None, "/api/users");
-    cache.find_proxy(None, "/web/home");
-    assert!(cache.cache_len() >= 2);
-
-    // Delta affects only /api
-    cache.apply_delta(&config, &paths(&["/api"]));
-
-    // /web/home should still be cached and routable
-    let result = cache.find_proxy(None, "/web/home");
-    assert!(result.is_some(), "/web should still route");
-}
-
-#[test]
-fn test_apply_delta_regex_clears_regex_cache() {
-    let config = test_config(vec![
-        test_regex_proxy("p1", r"/api/v[0-9]+/.*"),
-        test_proxy("p2", "/static"),
-    ]);
-    let cache = RouterCache::new(&config, 10_000);
-
-    // Populate both caches
-    cache.find_proxy(None, "/api/v1/users");
-    cache.find_proxy(None, "/static/img.png");
-
-    // Delta affects a regex route
-    cache.apply_delta(&config, &paths(&["~/api/v[0-9]+/.*"]));
-
-    // Regex cache should be cleared
-    assert_eq!(cache.regex_cache_len(), 0, "Regex cache should be cleared");
-    // Prefix cache should be unaffected
-    let result = cache.find_proxy(None, "/static/img.png");
-    assert!(result.is_some(), "/static should still route");
-}
-
-#[test]
-fn test_apply_delta_mixed_prefix_and_regex() {
-    let config = test_config(vec![
-        test_proxy("p1", "/api"),
-        test_regex_proxy("p2", r"/users/[0-9]+"),
-    ]);
-    let cache = RouterCache::new(&config, 10_000);
-
-    cache.find_proxy(None, "/api/test");
-    cache.find_proxy(None, "/users/123");
-
-    // Both a prefix and regex path changed
-    cache.apply_delta(&config, &paths(&["/api", "~/users/[0-9]+"]));
-
-    // Regex cache fully cleared, prefix cache surgically invalidated
-    assert_eq!(cache.regex_cache_len(), 0);
-}
-
-// ============================================================
 // cache_stats tests
 // ============================================================
 
@@ -1619,88 +1530,5 @@ fn test_host_only_no_match_without_host_header() {
     assert!(
         matched.is_none(),
         "host-only should not match when no host is provided"
-    );
-}
-
-#[test]
-fn test_host_only_cache_invalidation_on_hosts_change() {
-    use ferrum_edge::config_delta::AffectedRoutes;
-
-    let mut proxy = test_proxy("p1", "/placeholder");
-    proxy.listen_path = None;
-    proxy.hosts = vec!["a.example.com".to_string()];
-
-    let config = test_config(vec![proxy]);
-    let cache = RouterCache::new(&config, 10_000);
-
-    // Populate cache for the host
-    assert!(cache.find_proxy(Some("a.example.com"), "/api").is_some());
-    assert!(cache.cache_len() > 0);
-
-    // Simulate a delta that changes the host-only proxy's hosts — the
-    // RouterCache should invalidate prefix-cache entries matching that host.
-    let affected = AffectedRoutes {
-        listen_paths: Vec::new(),
-        host_only_hosts: vec!["a.example.com".to_string()],
-    };
-    cache.apply_delta(&config, &affected);
-    assert_eq!(
-        cache.cache_len(),
-        0,
-        "cache entries for affected host should be evicted"
-    );
-}
-
-#[test]
-fn test_host_only_change_also_evicts_regex_cache_for_host() {
-    use ferrum_edge::config_delta::AffectedRoutes;
-
-    // Phase 1: config has only the catch-all regex proxy.
-    let mut regex_proxy = test_proxy("regex-catchall", "~/users/[0-9]+");
-    regex_proxy.hosts = vec![]; // catch-all
-
-    let config_before = test_config(vec![regex_proxy.clone()]);
-    let cache = RouterCache::new(&config_before, 10_000);
-
-    // Populate a regex cache entry for `a.example.com`. With only the
-    // catch-all regex proxy in the config, a request to
-    // `a.example.com/users/42` falls through to catch-all regex.
-    let matched = cache.find_proxy(Some("a.example.com"), "/users/42");
-    assert!(matched.is_some());
-    assert_eq!(matched.unwrap().proxy.id, "regex-catchall");
-    assert!(
-        cache.regex_cache_len() > 0,
-        "expected regex_cache populated from catch-all regex match"
-    );
-
-    // Phase 2: add a host-only proxy on `a.example.com`. Exact-host tier now
-    // has a host-only fallback, which takes precedence over the catch-all
-    // regex — the previously cached match is stale. apply_delta MUST evict
-    // the regex cache entry so the next lookup re-evaluates. Without this,
-    // requests keep routing to the old catch-all regex proxy until global
-    // regex cache eviction.
-    let mut host_only = test_proxy("host-only", "/placeholder");
-    host_only.listen_path = None;
-    host_only.hosts = vec!["a.example.com".to_string()];
-
-    let config_after = test_config(vec![regex_proxy, host_only]);
-    let affected = AffectedRoutes {
-        listen_paths: Vec::new(),
-        host_only_hosts: vec!["a.example.com".to_string()],
-    };
-    cache.apply_delta(&config_after, &affected);
-    assert_eq!(
-        cache.regex_cache_len(),
-        0,
-        "regex cache entries for affected host must be evicted when host-only routes change"
-    );
-
-    // Re-query — now the host-only proxy wins.
-    let matched = cache.find_proxy(Some("a.example.com"), "/users/42");
-    assert!(matched.is_some());
-    assert_eq!(
-        matched.unwrap().proxy.id,
-        "host-only",
-        "post-delta lookup should route to the new host-only proxy, not the stale regex match"
     );
 }

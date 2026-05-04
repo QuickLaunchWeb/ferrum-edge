@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
+use crate::config::types::{BackendScheme, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
@@ -430,7 +430,6 @@ pub struct UdpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
-    pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
     pub shutdown: watch::Receiver<bool>,
@@ -487,7 +486,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
-        config,
         dns_cache,
         request_epoch,
         shutdown,
@@ -518,7 +516,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             port,
             bind_addr,
             proxy_id,
-            config,
             dns_cache,
             request_epoch,
             shutdown,
@@ -1284,7 +1281,6 @@ async fn start_dtls_frontend_listener(
     port: u16,
     bind_addr: IpAddr,
     proxy_id: String,
-    _config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
     shutdown: watch::Receiver<bool>,
