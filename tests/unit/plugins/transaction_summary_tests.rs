@@ -546,3 +546,217 @@ fn test_grpc_body_exceeded_emits_real_backend_total() {
     assert!(!summary.response_streamed);
     assert!((summary.latency_backend_total_ms - 40.0).abs() < 0.001);
 }
+
+// ── Metadata redaction in serialized log output ─────────────────────────
+//
+// Regression coverage for the bug where any plugin (built-in or custom) that
+// stashed credentials in `metadata` leaked them verbatim through every
+// logging sink. Redaction now lives in
+// `plugins::utils::metadata_redaction::serialize_redacted_metadata` and is
+// wired onto both `TransactionSummary.metadata` and
+// `StreamTransactionSummary.metadata` via `#[serde(serialize_with = ...)]`,
+// so every logger that calls `serde_json::to_string(summary)` gets the same
+// sanitized output without each call site having to remember to redact.
+
+#[test]
+fn test_summary_redacts_authorization_metadata_value() {
+    let mut summary = make_full_summary();
+    summary.metadata.insert(
+        "authorization".to_string(),
+        "Bearer super-secret-token".to_string(),
+    );
+    summary
+        .metadata
+        .insert("trace_id".to_string(), "abc-123".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["metadata"]["authorization"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["trace_id"], "abc-123");
+    assert!(
+        !json.contains("super-secret-token"),
+        "Bearer token must not leak into log output, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_summary_redacts_default_sensitive_substring_keys() {
+    let mut summary = make_full_summary();
+    // Each key contains a default sensitive substring.
+    summary
+        .metadata
+        .insert("Cookie".to_string(), "sid=abc".to_string());
+    summary.metadata.insert(
+        "downstream_authorization".to_string(),
+        "Bearer xyz".to_string(),
+    );
+    summary
+        .metadata
+        .insert("user_password_hash".to_string(), "argon2.value".to_string());
+    summary
+        .metadata
+        .insert("api_secret".to_string(), "shhh".to_string());
+    summary
+        .metadata
+        .insert("session_token".to_string(), "stk".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["metadata"]["Cookie"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["downstream_authorization"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["user_password_hash"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["api_secret"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["session_token"], "[REDACTED]");
+
+    // Raw values must not appear anywhere in the JSON.
+    for needle in ["sid=abc", "Bearer xyz", "argon2.value", "shhh", "stk"] {
+        assert!(
+            !json.contains(needle),
+            "Sensitive value {:?} leaked into output: {}",
+            needle,
+            json
+        );
+    }
+}
+
+#[test]
+fn test_summary_passes_through_non_sensitive_metadata_unchanged() {
+    let mut summary = make_full_summary();
+    summary
+        .metadata
+        .insert("correlation_id".to_string(), "corr-42".to_string());
+    summary
+        .metadata
+        .insert("trace_id".to_string(), "trace-99".to_string());
+    summary
+        .metadata
+        .insert("request_id".to_string(), "req-7".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["metadata"]["correlation_id"], "corr-42");
+    assert_eq!(parsed["metadata"]["trace_id"], "trace-99");
+    assert_eq!(parsed["metadata"]["request_id"], "req-7");
+    assert!(
+        !json.contains("[REDACTED]"),
+        "Non-sensitive metadata must not be redacted, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_extras_list_parses_env_format() {
+    use ferrum_edge::plugins::utils::metadata_redaction::{
+        is_sensitive_metadata_key_with_extras, parse_extras_list,
+    };
+
+    let extras = parse_extras_list("custom_field, MY-Trace-Header ,session_id");
+
+    // Mirrors what the env-driven path stores: lowercased + trimmed.
+    assert_eq!(
+        extras,
+        vec![
+            "custom_field".to_string(),
+            "my-trace-header".to_string(),
+            "session_id".to_string(),
+        ]
+    );
+
+    // Operator-supplied extras must redact.
+    assert!(is_sensitive_metadata_key_with_extras(
+        "custom_field",
+        &extras
+    ));
+    assert!(is_sensitive_metadata_key_with_extras(
+        "CUSTOM_FIELD",
+        &extras
+    ));
+    assert!(is_sensitive_metadata_key_with_extras(
+        "X-MY-Trace-Header-Value",
+        &extras
+    ));
+    assert!(is_sensitive_metadata_key_with_extras("session_id", &extras));
+
+    // Default list still applies even with extras configured.
+    assert!(is_sensitive_metadata_key_with_extras(
+        "Authorization",
+        &extras
+    ));
+
+    // Non-sensitive keys are untouched.
+    assert!(!is_sensitive_metadata_key_with_extras(
+        "benign_key",
+        &extras
+    ));
+    assert!(!is_sensitive_metadata_key_with_extras(
+        "backend_resolved_ip",
+        &extras
+    ));
+}
+
+#[test]
+fn test_serialize_redacted_metadata_with_explicit_extras() {
+    use ferrum_edge::plugins::utils::metadata_redaction::{
+        REDACTED_PLACEHOLDER, is_sensitive_metadata_key_with_extras, parse_extras_list,
+    };
+
+    // Explicit-extras helper bypasses the OnceLock so the test is hermetic
+    // (the env-driven `OnceLock` initializes once per process and would race
+    // with other parallel tests that touch the same global).
+    let extras = parse_extras_list("custom_field");
+    let mut metadata = HashMap::new();
+    metadata.insert("custom_field".to_string(), "leak-me".to_string());
+    metadata.insert("safe_key".to_string(), "ok".to_string());
+
+    let mut redacted = HashMap::new();
+    for (key, value) in &metadata {
+        if is_sensitive_metadata_key_with_extras(key, &extras) {
+            redacted.insert(key.clone(), REDACTED_PLACEHOLDER.to_string());
+        } else {
+            redacted.insert(key.clone(), value.clone());
+        }
+    }
+
+    assert_eq!(redacted.get("custom_field").unwrap(), "[REDACTED]");
+    assert_eq!(redacted.get("safe_key").unwrap(), "ok");
+}
+
+#[test]
+fn test_stream_summary_redacts_metadata() {
+    let mut summary = make_stream_summary();
+    summary
+        .metadata
+        .insert("authorization".to_string(), "Bearer s3cret".to_string());
+    summary
+        .metadata
+        .insert("correlation_id".to_string(), "corr-1".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["metadata"]["authorization"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["correlation_id"], "corr-1");
+    assert!(
+        !json.contains("s3cret"),
+        "Stream metadata bearer token must not leak: {}",
+        json
+    );
+}
+
+#[test]
+fn test_summary_omits_metadata_when_empty_for_stream_summary() {
+    // StreamTransactionSummary keeps `skip_serializing_if = "HashMap::is_empty"`
+    // so empty metadata stays out of the JSON entirely. Redaction layering on
+    // top must not change that.
+    let summary = make_stream_summary();
+    let json = serde_json::to_string(&summary).unwrap();
+    assert!(
+        !json.contains("\"metadata\""),
+        "Empty stream metadata should be skipped, got: {}",
+        json
+    );
+}
