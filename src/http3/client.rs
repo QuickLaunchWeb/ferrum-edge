@@ -620,6 +620,7 @@ impl Http3ConnectionPool {
     pub fn new(env_config: Arc<crate::config::EnvConfig>, dns_cache: crate::dns::DnsCache) -> Self {
         let connections_per_backend = env_config.http3_connections_per_backend;
         let cleanup_interval = Duration::from_secs(env_config.pool_cleanup_interval_seconds.max(1));
+        let shards = crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
         let pool_cfg = PoolConfig {
             idle_timeout_seconds: env_config.http3_pool_idle_timeout_seconds,
             max_idle_per_host: connections_per_backend.max(1),
@@ -627,7 +628,12 @@ impl Http3ConnectionPool {
         };
 
         Self {
-            pool: GenericPool::new(Arc::new(Http3PoolManager), pool_cfg, cleanup_interval),
+            pool: GenericPool::new(
+                Arc::new(Http3PoolManager),
+                pool_cfg,
+                cleanup_interval,
+                shards,
+            ),
             env_config,
             dns_cache,
             conn_counter: AtomicU64::new(0),

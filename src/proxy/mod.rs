@@ -1143,6 +1143,8 @@ impl ProxyState {
         let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
+        let pool_shard_amount =
+            crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -1431,7 +1433,9 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
-                Some(Arc::new(dashmap::DashMap::new()))
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
             } else {
                 None
             },

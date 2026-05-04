@@ -144,7 +144,16 @@ pub struct GenericPool<M: PoolManager> {
 }
 
 impl<M: PoolManager> GenericPool<M> {
-    pub fn new(manager: Arc<M>, cfg: PoolConfig, cleanup_interval: Duration) -> Arc<Self> {
+    /// Construct a generic pool with the given shard count for its internal
+    /// `DashMap`s. `shards` must be a power of two; callers should resolve
+    /// it via [`crate::util::sharding::pool_shard_amount`] which guarantees
+    /// that contract from the operator-facing env var.
+    pub fn new(
+        manager: Arc<M>,
+        cfg: PoolConfig,
+        cleanup_interval: Duration,
+        shards: usize,
+    ) -> Arc<Self> {
         // Cold-path connection establishment is bounded per pool so a burst of
         // cache misses cannot fan out into unbounded concurrent dials.
         let inflight_limit = std::thread::available_parallelism()
@@ -152,11 +161,11 @@ impl<M: PoolManager> GenericPool<M> {
             .unwrap_or(32);
         let pool = Arc::new(Self {
             manager,
-            entries: Arc::new(DashMap::new()),
+            entries: Arc::new(DashMap::with_shard_amount(shards)),
             cfg: Arc::new(cfg),
             cleanup_interval,
             inflight: Arc::new(Semaphore::new(inflight_limit)),
-            pending_creations: Arc::new(DashMap::new()),
+            pending_creations: Arc::new(DashMap::with_shard_amount(shards)),
         });
         pool.clone().spawn_cleanup();
         pool
@@ -570,6 +579,7 @@ mod tests {
             manager.clone(),
             PoolConfig::default(),
             Duration::from_secs(60),
+            64,
         );
         let proxy = test_proxy();
 
@@ -597,6 +607,7 @@ mod tests {
             manager.clone(),
             PoolConfig::default(),
             Duration::from_secs(60),
+            64,
         );
         let proxy = test_proxy();
 
@@ -632,6 +643,7 @@ mod tests {
             manager.clone(),
             PoolConfig::default(),
             Duration::from_secs(60),
+            64,
         );
         let proxy = test_proxy();
 
@@ -674,7 +686,7 @@ mod tests {
             healthy: AtomicBool::new(true),
             ..Default::default()
         });
-        let pool = GenericPool::new(manager, PoolConfig::default(), Duration::from_secs(60));
+        let pool = GenericPool::new(manager, PoolConfig::default(), Duration::from_secs(60), 64);
         let key = "backend.example.com|443|0".to_string();
         let creator_started = Arc::new(Notify::new());
         let creator_blocked = Arc::new(Notify::new());
@@ -747,6 +759,7 @@ mod tests {
             manager.clone(),
             PoolConfig::default(),
             Duration::from_secs(60),
+            64,
         );
         let proxy = test_proxy();
 
@@ -780,6 +793,7 @@ mod tests {
                 ..PoolConfig::default()
             },
             Duration::from_millis(10),
+            64,
         );
         let proxy = test_proxy();
 

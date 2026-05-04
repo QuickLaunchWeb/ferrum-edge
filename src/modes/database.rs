@@ -278,6 +278,7 @@ pub async fn run(
         max_active_requests: env_config.dns_max_active_requests,
         max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
     });
 
     // DNS warmup — resolve all hostnames (proxy backends, upstream targets,

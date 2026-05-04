@@ -332,10 +332,18 @@ impl RouterCache {
         let sketch_width = (max_cache_entries * 2).clamp(1024, 65536);
         // Age after cache_capacity * 4 increments to adapt to workload changes.
         let age_threshold = (max_cache_entries as u64).saturating_mul(4).max(1);
+        // Pre-size the DashMap shard count alongside the per-entry capacity.
+        // The router caches sit on the request hot path with high cardinality
+        // (one entry per distinct host+path) and concurrent writers (each
+        // tokio worker can race to insert a freshly resolved match), so the
+        // dashmap default of `4 * num_cpus` shards starves on inserts at
+        // scale. The helper resolves to `next_power_of_two(max(64,
+        // num_cpus * 16))` — see `crate::util::sharding`.
+        let shards = crate::util::sharding::pool_shard_amount(0);
         Self {
             route_table: ArcSwap::new(Arc::new(table)),
-            prefix_cache: DashMap::with_capacity(max_cache_entries),
-            regex_cache: DashMap::with_capacity(max_cache_entries / 4 + 1),
+            prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
+            regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
             max_cache_entries,
             prefix_eviction_counter: AtomicU64::new(0),
             regex_eviction_counter: AtomicU64::new(0),
