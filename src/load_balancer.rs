@@ -235,6 +235,18 @@ pub struct TargetSelection {
     pub is_fallback: bool,
 }
 
+/// Built-but-not-yet-stored load-balancer cache state.
+///
+/// Returned by [`LoadBalancerCache::prepare_delta`] /
+/// [`LoadBalancerCache::prepare_rebuild`] and consumed by
+/// [`LoadBalancerCache::commit`]. Splitting build from store lets sibling
+/// caches (router cache, plugin cache, consumer index) prepare their new
+/// state in parallel and then swap every cache in tight succession — closing
+/// the inter-cache mixed-generation window during config reload.
+pub struct PreparedLoadBalancerCache {
+    inner: Arc<LoadBalancerCacheInner>,
+}
+
 /// All load-balancer state swapped as a single unit so readers never see
 /// new balancer entries paired with a stale upstream index (or vice versa).
 pub struct LoadBalancerCacheInner {
@@ -287,12 +299,60 @@ impl LoadBalancerCache {
         }
     }
 
+    #[allow(dead_code)]
     pub fn rebuild(&self, config: &GatewayConfig) {
+        let prepared = self.prepare_rebuild(config);
+        self.commit(prepared);
+    }
+
+    /// Build the new load-balancer cache state from a full config without
+    /// storing it. See [`PluginCache::prepare_delta`] for the rationale
+    /// behind splitting build from store during config reload.
+    ///
+    /// [`PluginCache::prepare_delta`]: crate::plugin_cache::PluginCache::prepare_delta
+    pub fn prepare_rebuild(&self, config: &GatewayConfig) -> PreparedLoadBalancerCache {
         let balancers = Self::build_balancers(config);
         let upstreams = Self::build_upstream_index(config);
+        PreparedLoadBalancerCache {
+            inner: Arc::new(LoadBalancerCacheInner {
+                balancers,
+                upstreams,
+            }),
+        }
+    }
+
+    /// Atomically swap in a prepared load-balancer cache snapshot.
+    pub fn commit(&self, prepared: PreparedLoadBalancerCache) {
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.inner.store(prepared.inner);
+    }
+
+    /// Prune load-balancer entries for upstreams that were removed in the
+    /// current config reload.
+    ///
+    /// Called by `ProxyState::update_config` after the router has been
+    /// committed to a generation that no longer routes to proxies whose
+    /// `upstream_id` is in `removed_ids`. The router-first sequencing
+    /// guarantees that the prune cannot expose a request path to a
+    /// missing balancer entry — by the time any reader can resolve a
+    /// proxy's `upstream_id`, the router has already routed past the
+    /// removed proxies. Without this step, balancer entries for removed
+    /// upstreams would leak across reloads (the next delta no longer
+    /// lists them in `removed_upstream_ids`).
+    pub fn prune_upstreams(&self, removed_ids: &[String]) {
+        if removed_ids.is_empty() {
+            return;
+        }
+        let current = self.inner.load();
+        let mut new_balancers = current.balancers.clone();
+        let mut new_upstreams = current.upstreams.clone();
+        for id in removed_ids {
+            new_balancers.remove(id);
+            new_upstreams.remove(id);
+        }
         self.inner.store(Arc::new(LoadBalancerCacheInner {
-            balancers,
-            upstreams,
+            balancers: new_balancers,
+            upstreams: new_upstreams,
         }));
     }
 
@@ -329,6 +389,12 @@ impl LoadBalancerCache {
     /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
     ///   round-robin counters, WRR weights, active connection counts, latency
     ///   EWMAs, and hash rings
+    ///
+    /// Convenience wrapper around [`Self::prepare_delta`] + [`Self::commit`].
+    /// Used by tests / direct callers; the production reload path goes
+    /// through `prepare_*` and `commit` so sibling cache swaps share one
+    /// tight commit window.
+    #[allow(dead_code)]
     pub fn apply_delta(
         &self,
         full_new_config: &GatewayConfig,
@@ -336,8 +402,27 @@ impl LoadBalancerCache {
         removed_ids: &[String],
         modified: &[Upstream],
     ) {
+        if let Some(prepared) = self.prepare_delta(full_new_config, added, removed_ids, modified) {
+            self.commit(prepared);
+        }
+    }
+
+    /// Build the new load-balancer cache state for a delta without storing it.
+    ///
+    /// Returns `None` when the inputs describe a no-op delta. See
+    /// [`PluginCache::prepare_delta`] for the rationale behind splitting
+    /// build from store during config reload.
+    ///
+    /// [`PluginCache::prepare_delta`]: crate::plugin_cache::PluginCache::prepare_delta
+    pub fn prepare_delta(
+        &self,
+        full_new_config: &GatewayConfig,
+        added: &[Upstream],
+        removed_ids: &[String],
+        modified: &[Upstream],
+    ) -> Option<PreparedLoadBalancerCache> {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
-            return;
+            return None;
         }
 
         let current = self.inner.load();
@@ -366,11 +451,12 @@ impl LoadBalancerCache {
         // Upstream index is cheap to rebuild (just Arc<Upstream> clones)
         let new_upstream_idx = Self::build_upstream_index(full_new_config);
 
-        // Single atomic swap
-        self.inner.store(Arc::new(LoadBalancerCacheInner {
-            balancers: new_balancers,
-            upstreams: new_upstream_idx,
-        }));
+        Some(PreparedLoadBalancerCache {
+            inner: Arc::new(LoadBalancerCacheInner {
+                balancers: new_balancers,
+                upstreams: new_upstream_idx,
+            }),
+        })
     }
 
     /// O(1) lookup of an upstream by ID from the pre-built index.

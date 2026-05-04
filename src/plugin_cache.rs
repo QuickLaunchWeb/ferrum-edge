@@ -419,6 +419,24 @@ fn collect_active_jwks_uris(
     uris
 }
 
+/// Built-but-not-yet-stored plugin-cache state.
+///
+/// Returned by [`PluginCache::prepare_delta`] and consumed by
+/// [`PluginCache::commit`]. Splitting build from store lets sibling caches
+/// (router cache, consumer index, load-balancer cache) each prepare their
+/// own new state, then have every store happen in tight succession — closing
+/// the inter-cache mixed-generation window during config reload.
+pub struct PreparedPluginCache {
+    inner: Arc<PluginCacheInner>,
+    active_jwks_uris: HashSet<String>,
+}
+
+/// Same as [`PreparedPluginCache`] but for a full rebuild rather than a delta.
+pub struct PreparedPluginCacheRebuild {
+    inner: Arc<PluginCacheInner>,
+    active_jwks_uris: HashSet<String>,
+}
+
 /// All plugin-cache state swapped as a single unit so a single load observes
 /// either the old generation or the new generation, never a partial rebuild.
 struct PluginCacheInner {
@@ -637,7 +655,30 @@ impl PluginCache {
     /// only after all in-flight requests using them complete.
     ///
     /// Returns `Err` if a security-critical plugin fails validation.
+    ///
+    /// This is a convenience wrapper around [`prepare_rebuild`] +
+    /// [`commit_rebuild`]. Prefer the split form when coordinating sibling
+    /// cache rebuilds during the same config reload.
+    ///
+    /// [`prepare_rebuild`]: Self::prepare_rebuild
+    /// [`commit_rebuild`]: Self::commit_rebuild
+    #[allow(dead_code)]
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
+        let prepared = self.prepare_rebuild(config)?;
+        self.commit_rebuild(prepared);
+        Ok(())
+    }
+
+    /// Build the full plugin-cache state without storing it.
+    ///
+    /// See [`Self::prepare_delta`] for the rationale behind splitting build
+    /// from store. Used for the initial-load path inside
+    /// `ProxyState::update_config` so the rebuild and the canonical config
+    /// are swapped together.
+    pub fn prepare_rebuild(
+        &self,
+        config: &GatewayConfig,
+    ) -> Result<PreparedPluginCacheRebuild, String> {
         let (
             proxy_map,
             globals,
@@ -650,13 +691,8 @@ impl PluginCache {
         ) = Self::build_cache(config, &self.http_client)?;
         let snapshot = build_protocol_snapshot(&proxy_map, &globals);
 
-        // Clean up JWKS cache entries (and their background refresh tasks)
-        // for URIs no longer referenced by any active jwks_auth plugin.
-        let active_uris = collect_active_jwks_uris(&proxy_map, &globals);
-        retain_active_uris(&active_uris);
-
-        // Single atomic swap — readers see either the old or new generation.
-        self.inner.store(Arc::new(PluginCacheInner {
+        let active_jwks_uris = collect_active_jwks_uris(&proxy_map, &globals);
+        let inner = Arc::new(PluginCacheInner {
             proxy_plugins: proxy_map,
             global_plugins: globals,
             requires_buffering: buffering_map,
@@ -666,8 +702,24 @@ impl PluginCache {
             protocol_snapshot: snapshot,
             requires_ws_frame: ws_frame_map,
             global_requires_ws_frame: global_needs_ws_frame,
-        }));
-        Ok(())
+        });
+        Ok(PreparedPluginCacheRebuild {
+            inner,
+            active_jwks_uris,
+        })
+    }
+
+    /// Atomically swap in a prepared full-rebuild snapshot.
+    pub fn commit_rebuild(&self, prepared: PreparedPluginCacheRebuild) {
+        let PreparedPluginCacheRebuild {
+            inner,
+            active_jwks_uris,
+        } = prepared;
+        // Single atomic swap — readers see either the old or new generation.
+        self.inner.store(inner);
+        // Clean up JWKS cache entries (and their background refresh tasks)
+        // for URIs no longer referenced by any active jwks_auth plugin.
+        retain_active_uris(&active_jwks_uris);
     }
 
     /// Incrementally update the plugin cache, only rebuilding plugins for
@@ -679,6 +731,16 @@ impl PluginCache {
     /// global-scoped plugin config was added/modified/removed).
     /// Returns `Err` if a security-critical plugin fails validation during
     /// incremental update, matching the behavior of `rebuild()`.
+    ///
+    /// This is a convenience wrapper around [`prepare_delta`] + [`commit`].
+    /// Prefer calling them separately when coordinating with sibling caches
+    /// so the new state for every cache can be built first and then swapped
+    /// in tight succession (closes the inter-cache mixed-generation window
+    /// during config reload — see `ProxyState::update_config`).
+    ///
+    /// [`prepare_delta`]: Self::prepare_delta
+    /// [`commit`]: Self::commit
+    #[allow(dead_code)]
     pub fn apply_delta(
         &self,
         config: &GatewayConfig,
@@ -686,6 +748,36 @@ impl PluginCache {
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
     ) -> Result<(), String> {
+        let prepared = self.prepare_delta(
+            config,
+            proxy_ids_to_rebuild,
+            removed_proxy_ids,
+            rebuild_globals,
+        )?;
+        self.commit(prepared);
+        Ok(())
+    }
+
+    /// Build the new plugin-cache inner state without storing it.
+    ///
+    /// Returns a [`PreparedPluginCache`] that the caller commits with
+    /// [`Self::commit`]. Splitting the prepare and commit phases lets
+    /// `ProxyState::update_config` build every cache's new state first and
+    /// then perform all the atomic swaps in tight succession, eliminating
+    /// the per-cache build window during which readers could observe a new
+    /// router decision paired with a stale plugin map.
+    ///
+    /// The returned snapshot also carries the active-JWKS-URI set for
+    /// post-commit cleanup, so JWKS background refresh tasks for plugins
+    /// that have already been swapped in are not torn down before the
+    /// commit happens.
+    pub fn prepare_delta(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        removed_proxy_ids: &[String],
+        rebuild_globals: bool,
+    ) -> Result<PreparedPluginCache, String> {
         let mut security_errors: Vec<String> = Vec::new();
 
         // Load the current snapshot — we clone-and-patch its fields, then
@@ -860,11 +952,6 @@ impl PluginCache {
             ));
         }
 
-        // Clean up JWKS cache entries (and their background refresh tasks)
-        // for URIs no longer referenced by any active jwks_auth plugin.
-        let active_uris = collect_active_jwks_uris(&new_map, &new_globals);
-        retain_active_uris(&active_uris);
-
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
         let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
@@ -912,8 +999,11 @@ impl PluginCache {
             current.global_requires_ws_frame
         };
 
-        // Single atomic swap — readers see old or new, never a partial state.
-        self.inner.store(Arc::new(PluginCacheInner {
+        // Build the new inner state — the actual atomic store happens inside
+        // [`Self::commit`] so the orchestrator can swap every cache in tight
+        // succession after every cache's new state is built.
+        let active_jwks_uris = collect_active_jwks_uris(&new_map, &new_globals);
+        let inner = Arc::new(PluginCacheInner {
             proxy_plugins: new_map,
             global_plugins: new_globals,
             requires_buffering: new_buffering,
@@ -926,9 +1016,79 @@ impl PluginCache {
             },
             requires_ws_frame: new_ws_frame,
             global_requires_ws_frame: new_global_requires_ws_frame,
-        }));
+        });
+        Ok(PreparedPluginCache {
+            inner,
+            active_jwks_uris,
+        })
+    }
 
-        Ok(())
+    /// Atomically swap in a prepared plugin-cache snapshot.
+    ///
+    /// Pair with [`Self::prepare_delta`]. JWKS cache cleanup runs after the
+    /// store so background refresh tasks for URIs that disappear with this
+    /// generation are torn down only once the new cache is live and there
+    /// is no risk of an in-flight reader consulting them.
+    pub fn commit(&self, prepared: PreparedPluginCache) {
+        let PreparedPluginCache {
+            inner,
+            active_jwks_uris,
+        } = prepared;
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.inner.store(inner);
+        // Clean up JWKS cache entries (and their background refresh tasks)
+        // for URIs no longer referenced by any active jwks_auth plugin.
+        retain_active_uris(&active_jwks_uris);
+    }
+
+    /// Prune plugin-cache entries for proxies that were removed in the
+    /// current config reload.
+    ///
+    /// `ProxyState::update_config` calls this AFTER the router has already
+    /// been committed to a generation that doesn't route to `removed_ids`,
+    /// so a request path can no longer reach the orphan entries — making
+    /// the prune safe to perform as its own ArcSwap store outside the
+    /// tight commit window. Without this step the orphan entries would
+    /// leak forever (subsequent reload deltas no longer mention removed
+    /// proxy_ids in `removed_proxy_ids`).
+    pub fn prune_proxies(&self, removed_ids: &[String]) {
+        if removed_ids.is_empty() {
+            return;
+        }
+
+        let current = self.inner.load();
+        let mut new_proxy_plugins = current.proxy_plugins.clone();
+        let mut new_buffering = current.requires_buffering.clone();
+        let mut new_req_buffering = current.requires_request_buffering.clone();
+        let mut new_ws_frame = current.requires_ws_frame.clone();
+        let mut new_proxy_proto = current.protocol_snapshot.proxy.clone();
+
+        for id in removed_ids {
+            new_proxy_plugins.remove(id);
+            new_buffering.remove(id);
+            new_req_buffering.remove(id);
+            new_ws_frame.remove(id);
+            new_proxy_proto.remove(id);
+        }
+
+        // Single atomic swap — readers see old (with orphan entries) or
+        // new (without). Either way, the router no longer routes to any
+        // of `removed_ids`, so the missing entries cannot be observed by
+        // a request handler.
+        self.inner.store(Arc::new(PluginCacheInner {
+            proxy_plugins: new_proxy_plugins,
+            global_plugins: Arc::clone(&current.global_plugins),
+            requires_buffering: new_buffering,
+            global_requires_buffering: current.global_requires_buffering,
+            requires_request_buffering: new_req_buffering,
+            global_requires_request_buffering: current.global_requires_request_buffering,
+            protocol_snapshot: ProtocolSnapshot {
+                proxy: new_proxy_proto,
+                global: current.protocol_snapshot.global.clone(),
+            },
+            requires_ws_frame: new_ws_frame,
+            global_requires_ws_frame: current.global_requires_ws_frame,
+        }));
     }
 
     /// Get the pre-resolved plugins for a proxy. Lock-free O(1) lookup.

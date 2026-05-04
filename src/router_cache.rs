@@ -269,6 +269,25 @@ impl CountMinSketch {
     }
 }
 
+/// Built-but-not-yet-applied router cache update.
+///
+/// Returned by [`RouterCache::prepare_delta`] / [`RouterCache::prepare_rebuild`]
+/// and consumed by [`RouterCache::commit_delta`] /
+/// [`RouterCache::commit_rebuild`]. Splitting build from store lets sibling
+/// caches prepare their new state in parallel and then swap every cache in
+/// tight succession — closing the inter-cache mixed-generation window during
+/// config reload.
+pub struct PreparedRouterCacheDelta<'a> {
+    table: HostRouteTable,
+    affected: &'a AffectedRoutes,
+}
+
+/// Same as [`PreparedRouterCacheDelta`] but for a full rebuild.
+pub struct PreparedRouterCacheRebuild {
+    table: HostRouteTable,
+    proxy_count: usize,
+}
+
 /// High-performance router cache with pre-sorted route table and partitioned lookup caches.
 ///
 /// The route table is rebuilt atomically (via ArcSwap) whenever configuration changes,
@@ -348,15 +367,36 @@ impl RouterCache {
     /// Called by `ProxyState::update_config()` when database polling or SIGHUP
     /// delivers a new configuration. Lock-free for readers — in-flight requests
     /// continue using the previous table until they complete.
+    ///
+    /// Convenience wrapper around [`Self::prepare_rebuild`] +
+    /// [`Self::commit_rebuild`]. Used by tests / direct callers; the
+    /// production reload path goes through `prepare_*` and `commit_*` so
+    /// sibling cache swaps share one tight commit window.
+    #[allow(dead_code)]
     pub fn rebuild(&self, config: &GatewayConfig) {
-        let table = Self::build_route_table(config);
-        self.route_table.store(Arc::new(table));
+        let prepared = self.prepare_rebuild(config);
+        self.commit_rebuild(prepared);
+    }
+
+    /// Build the new sorted route table from a full config without storing
+    /// it. See [`crate::plugin_cache::PluginCache::prepare_delta`] for the
+    /// rationale behind splitting build from store during config reload.
+    pub fn prepare_rebuild(&self, config: &GatewayConfig) -> PreparedRouterCacheRebuild {
+        PreparedRouterCacheRebuild {
+            table: Self::build_route_table(config),
+            proxy_count: config.proxies.len(),
+        }
+    }
+
+    /// Atomically swap in a prepared full rebuild and clear all lookup caches.
+    pub fn commit_rebuild(&self, prepared: PreparedRouterCacheRebuild) {
+        self.route_table.store(Arc::new(prepared.table));
         self.prefix_cache.clear();
         self.regex_cache.clear();
         self.frequency_sketch.reset();
         debug!(
             "Router cache rebuilt: {} routes, caches cleared",
-            config.proxies.len()
+            prepared.proxy_count
         );
     }
 
@@ -631,9 +671,39 @@ impl RouterCache {
     /// insertion order matters for longest-prefix matching. But the caches
     /// — which are the expensive things to lose — are preserved for all
     /// unaffected routes. Only entries related to changed routes are evicted.
+    ///
+    /// Convenience wrapper around [`Self::prepare_delta`] +
+    /// [`Self::commit_delta`]. Used by tests / direct callers; the
+    /// production reload path goes through `prepare_*` and `commit_*` so
+    /// sibling cache swaps share one tight commit window.
+    #[allow(dead_code)]
     pub fn apply_delta(&self, config: &GatewayConfig, affected: &AffectedRoutes) {
-        // Rebuild the sorted route table (cheap, O(n log n))
-        let table = Self::build_route_table(config);
+        let prepared = self.prepare_delta(config, affected);
+        self.commit_delta(prepared);
+    }
+
+    /// Build the new sorted route table for a delta without storing it.
+    ///
+    /// The borrowed `affected` is threaded through to [`Self::commit_delta`]
+    /// because cache-invalidation eviction operates on it after the store —
+    /// the orchestrator owns the `AffectedRoutes` for the entire reload
+    /// window, so a borrow is safe here without cloning.
+    pub fn prepare_delta<'a>(
+        &self,
+        config: &GatewayConfig,
+        affected: &'a AffectedRoutes,
+    ) -> PreparedRouterCacheDelta<'a> {
+        PreparedRouterCacheDelta {
+            table: Self::build_route_table(config),
+            affected,
+        }
+    }
+
+    /// Atomically swap in a prepared route table and surgically invalidate
+    /// the affected lookup-cache entries.
+    pub fn commit_delta(&self, prepared: PreparedRouterCacheDelta<'_>) {
+        let PreparedRouterCacheDelta { table, affected } = prepared;
+        // Atomic store of the new sorted route table.
         self.route_table.store(Arc::new(table));
 
         if affected.is_empty() {
@@ -710,10 +780,7 @@ impl RouterCache {
             }
         }
 
-        debug!(
-            "Router cache: route table rebuilt ({} routes)",
-            config.proxies.len()
-        );
+        debug!("Router cache: route table rebuilt");
     }
 
     /// Build a pre-computed host route table from config.

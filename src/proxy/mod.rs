@@ -109,6 +109,27 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
 /// not inherit long per-request connect timeouts that could hold readiness.
 const BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP: u64 = 5_000;
 
+/// Delay between the router commit and the orphan-entry prune of caches
+/// keyed by proxy_id / upstream_id (plugin cache, load-balancer cache)
+/// during a config reload.
+///
+/// The prune cannot be inlined into the same tight commit window as the
+/// other ArcSwap stores: a request handler reads the router and the
+/// downstream cache as two separate `ArcSwap` loads, so a pre-commit
+/// router snapshot can return a `proxy_id` that is then looked up in a
+/// post-prune cache snapshot — which would surface as `request_view`
+/// returning an empty plugin list (silent auth bypass).
+///
+/// Steady-state request processing leaves only microseconds between the
+/// router lookup and the cache lookup (no awaits), so a one-second delay
+/// is more than enough to cover the in-flight reader window without
+/// holding orphan entries for any meaningful duration. Plugin lists
+/// returned by `request_view` are refcounted `Arc<Vec<Arc<dyn Plugin>>>`
+/// values, so already-resolved plugin references stay valid for the
+/// full lifetime of any long-running request even after the prune
+/// lands.
+const CACHE_PRUNE_DEFERRED_DELAY: Duration = Duration::from_secs(1);
+
 /// Partial outcome of a single H3 capability probe. `probe_h2_tls` writes
 /// directly into `record` (it owns `&mut record`), but `probe_h3` runs in
 /// parallel via `tokio::join!` so it can't simultaneously alias that borrow.
@@ -2228,16 +2249,26 @@ impl ProxyState {
             && new_config.upstreams.is_empty();
 
         if old_is_empty && !new_is_empty {
-            self.router_cache.rebuild(&new_config);
-            if let Err(e) = self.plugin_cache.rebuild(&new_config) {
-                error!(
-                    "Config reload rejected — security plugin validation failed: {}",
-                    e
-                );
-                return false;
-            }
-            self.consumer_index.rebuild(&new_config.consumers);
-            self.load_balancer_cache.rebuild(&new_config);
+            // Build every cache's new state into local variables BEFORE the
+            // first ArcSwap store. Any error here (security plugin
+            // validation) aborts the reload before any cache is observably
+            // mutated. Once we begin the swap sequence below, the four cache
+            // commits and the canonical config store happen back-to-back so
+            // that no in-flight request can observe a new router decision
+            // paired with a stale plugin / consumer / load-balancer cache.
+            let prepared_router = self.router_cache.prepare_rebuild(&new_config);
+            let prepared_plugins = match self.plugin_cache.prepare_rebuild(&new_config) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(
+                        "Config reload rejected — security plugin validation failed: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            let prepared_consumers = self.consumer_index.prepare_rebuild(&new_config.consumers);
+            let prepared_load_balancers = self.load_balancer_cache.prepare_rebuild(&new_config);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -2271,6 +2302,23 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+
+            // Tight-window commit sequence — readers see either the entire
+            // old generation or the entire new generation, never a mix that
+            // could route a request to a new proxy_id whose plugin map has
+            // not been swapped in yet (sub-millisecond auth-bypass window).
+            //
+            // Order rationale: commit the lookup-by-proxy-id caches (plugin,
+            // consumer, load-balancer) BEFORE the router cache, then store
+            // the canonical config last. A reader that observes the new
+            // route table must see the new plugin/consumer/load-balancer
+            // entries that go with it; a reader still on the old route
+            // table sees old proxy_ids whose entries were preserved
+            // unchanged by the prepare phase.
+            self.plugin_cache.commit_rebuild(prepared_plugins);
+            self.consumer_index.commit(prepared_consumers);
+            self.load_balancer_cache.commit(prepared_load_balancers);
+            self.router_cache.commit_rebuild(prepared_router);
             self.config.store(Arc::new(new_config));
             self.spawn_backend_capability_refresh();
 
@@ -2312,11 +2360,39 @@ impl ProxyState {
             return false;
         }
 
-        // --- RouterCache: rebuild route table, surgically invalidate path cache ---
+        // --- Phase 1: build every cache's new state into local variables ---
+        //
+        // Heavy work (route-table sort, plugin construction, consumer
+        // indexing, load-balancer instantiation) happens here BEFORE any
+        // ArcSwap store. Errors abort the reload before any cache is
+        // observably mutated, and the orchestrator below performs all the
+        // commits back-to-back. This closes the inter-cache window during
+        // which a request could route to a brand-new `Arc<Proxy>` whose
+        // proxy_id had no entry yet in the (still-old) plugin / consumer /
+        // load-balancer caches — a sub-millisecond window in which auth
+        // and authorization plugins silently did not run for that proxy.
+        //
+        // Removals are intentionally DEFERRED to a post-router-commit prune
+        // step: each lookup-by-proxy-id cache is committed as a SUPERSET
+        // (old entries preserved + new entries added) so the contract
+        // "every proxy_id observable through the router has an entry in
+        // the lookup cache" holds in BOTH directions:
+        //
+        //  * Reader on OLD route table sees old proxy_ids → still in
+        //    superset → lookup succeeds.
+        //  * Reader on NEW route table sees new proxy_ids → in superset
+        //    via the prepare additions → lookup succeeds.
+        //
+        // After the router has been committed only-new-proxy-ids, the
+        // orphan entries for removed proxy_ids are pruned in a follow-up
+        // ArcSwap store. Readers can no longer reach those proxy_ids
+        // through the router, so the prune cannot expose a missing-entry
+        // window.
         let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
+        let prepared_router = self
+            .router_cache
+            .prepare_delta(&new_config, &affected_routes);
 
-        // --- PluginCache: only rebuild plugins for affected proxies ---
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
         let rebuild_globals = delta
             .added_plugin_configs
@@ -2324,31 +2400,34 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
+        // Phase 1: prepare the SUPERSET plugin map (no removals yet).
+        let prepared_plugins = match self.plugin_cache.prepare_delta(
             &new_config,
             &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
+            &[],
             rebuild_globals,
         ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
 
-        // --- ConsumerIndex: surgical add/remove/update ---
-        self.consumer_index.apply_delta(
+        let prepared_consumers = self.consumer_index.prepare_delta(
             &delta.added_consumers,
             &delta.removed_consumer_ids,
             &delta.modified_consumers,
         );
 
-        // --- LoadBalancerCache: only rebuild changed upstreams ---
-        self.load_balancer_cache.apply_delta(
+        // Phase 1: prepare the SUPERSET LB cache (no upstream removals yet).
+        let prepared_load_balancers = self.load_balancer_cache.prepare_delta(
             &new_config,
             &delta.added_upstreams,
-            &delta.removed_upstream_ids,
+            &[],
             &delta.modified_upstreams,
         );
 
@@ -2413,9 +2492,6 @@ impl ProxyState {
             });
         }
 
-        // Clear cached pool keys when proxy settings change
-        // Swap the canonical config last (readers may still be using old caches
-        // via ArcSwap snapshots until they finish their current request)
         // Prune adaptive buffer state for removed proxies.
         {
             let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
@@ -2423,7 +2499,63 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+
+        // --- Phase 2: tight-window commit sequence ---
+        //
+        // Every store below is a single atomic ArcSwap (~10ns each). Order:
+        // proxy-id-keyed superset caches FIRST, then router cache, then
+        // canonical config. A reader that observes any of these committed
+        // generations always sees a state in which every proxy_id reachable
+        // through the route table has an entry in the lookup caches.
+        self.plugin_cache.commit(prepared_plugins);
+        if let Some(prepared) = prepared_consumers {
+            self.consumer_index.commit(prepared);
+        }
+        if let Some(prepared) = prepared_load_balancers {
+            self.load_balancer_cache.commit(prepared);
+        }
+        self.router_cache.commit_delta(prepared_router);
         self.config.store(Arc::new(new_config));
+
+        // --- Phase 3: deferred post-router-commit prune ---
+        //
+        // The router is now only routing to current proxy_ids, so orphan
+        // plugin entries (and orphan upstream balancers) for proxies that
+        // were removed in this delta cannot be reached through the route
+        // table. We still defer the prune so any in-flight request that
+        // already resolved the removed `proxy_id` from a pre-commit router
+        // snapshot has time to finish its `plugin_cache.request_view` call
+        // before the entry disappears.
+        //
+        // A request handler reads the router and the plugin cache as two
+        // separate `ArcSwap` loads, so without this delay an immediate
+        // prune could race a reader whose router lookup landed on the
+        // OLD generation (still routing to the removed proxy_id) but
+        // whose plugin lookup lands on the NEW generation (post-prune,
+        // no entry → falls back to global plugins → silent auth bypass).
+        // The window is microseconds in steady-state request processing,
+        // so a one-second delay swallows it without holding orphan
+        // memory for any meaningful duration. The plugin Vec returned
+        // by `request_view` is a refcounted `Arc`, so already-resolved
+        // plugin references stay valid for the full request lifetime
+        // even after the prune lands.
+        if !delta.removed_proxy_ids.is_empty() {
+            let plugin_cache = self.plugin_cache.clone();
+            let removed_ids = delta.removed_proxy_ids.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(CACHE_PRUNE_DEFERRED_DELAY).await;
+                plugin_cache.prune_proxies(&removed_ids);
+            });
+        }
+        if !delta.removed_upstream_ids.is_empty() {
+            let lb_cache = self.load_balancer_cache.clone();
+            let removed_ids = delta.removed_upstream_ids.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(CACHE_PRUNE_DEFERRED_DELAY).await;
+                lb_cache.prune_upstreams(&removed_ids);
+            });
+        }
+
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -2709,11 +2841,19 @@ impl ProxyState {
         // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
-        // --- RouterCache ---
+        // --- Phase 1: build every cache's new state into local variables ---
+        //
+        // Same atomicity contract as `update_config`: heavy build work
+        // happens BEFORE any ArcSwap store so security-plugin validation
+        // failures abort cleanly. Removals are deferred to a Phase 3
+        // post-router-commit prune so the lookup-by-proxy-id caches commit
+        // as supersets during the tight commit window — see the matching
+        // comment in `update_config` for the inter-cache atomicity rationale.
         let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
+        let prepared_router = self
+            .router_cache
+            .prepare_delta(&new_config, &affected_routes);
 
-        // --- PluginCache ---
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
         let rebuild_globals = delta
             .added_plugin_configs
@@ -2721,31 +2861,34 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
+        // Phase 1: SUPERSET plugin map (no removals yet).
+        let prepared_plugins = match self.plugin_cache.prepare_delta(
             &new_config,
             &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
+            &[],
             rebuild_globals,
         ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
+            Ok(p) => p,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
 
-        // --- ConsumerIndex ---
-        self.consumer_index.apply_delta(
+        let prepared_consumers = self.consumer_index.prepare_delta(
             &delta.added_consumers,
             &delta.removed_consumer_ids,
             &delta.modified_consumers,
         );
 
-        // --- LoadBalancerCache ---
-        self.load_balancer_cache.apply_delta(
+        // Phase 1: SUPERSET LB cache (no upstream removals yet).
+        let prepared_load_balancers = self.load_balancer_cache.prepare_delta(
             &new_config,
             &delta.added_upstreams,
-            &delta.removed_upstream_ids,
+            &[],
             &delta.modified_upstreams,
         );
 
@@ -2812,9 +2955,42 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_ids);
         }
 
-        // Store updated config
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
+
+        // --- Phase 2: tight-window commit sequence ---
+        //
+        // Same ordering as `update_config`: proxy-id-keyed superset caches
+        // first, router cache next, canonical config last. See the
+        // corresponding comment in `update_config` for the inter-cache
+        // atomicity rationale and the rationale for the post-router prune.
+        self.plugin_cache.commit(prepared_plugins);
+        if let Some(prepared) = prepared_consumers {
+            self.consumer_index.commit(prepared);
+        }
+        if let Some(prepared) = prepared_load_balancers {
+            self.load_balancer_cache.commit(prepared);
+        }
+        self.router_cache.commit_delta(prepared_router);
         self.config.store(Arc::new(new_config));
+
+        // --- Phase 3: deferred post-router-commit prune ---
+        // See `update_config` for the rationale behind the deferred prune.
+        if !delta.removed_proxy_ids.is_empty() {
+            let plugin_cache = self.plugin_cache.clone();
+            let removed_ids = delta.removed_proxy_ids.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(CACHE_PRUNE_DEFERRED_DELAY).await;
+                plugin_cache.prune_proxies(&removed_ids);
+            });
+        }
+        if !delta.removed_upstream_ids.is_empty() {
+            let lb_cache = self.load_balancer_cache.clone();
+            let removed_ids = delta.removed_upstream_ids.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(CACHE_PRUNE_DEFERRED_DELAY).await;
+                lb_cache.prune_upstreams(&removed_ids);
+            });
+        }
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the

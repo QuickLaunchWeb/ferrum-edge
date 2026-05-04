@@ -5,6 +5,18 @@ use tracing::{error, warn};
 
 use crate::config::types::Consumer;
 
+/// Built-but-not-yet-stored consumer index.
+///
+/// Returned by [`ConsumerIndex::prepare_delta`] /
+/// [`ConsumerIndex::prepare_rebuild`] and consumed by
+/// [`ConsumerIndex::commit`]. Splitting build from store lets sibling caches
+/// (router cache, plugin cache, load-balancer cache) prepare their new state
+/// in parallel and then swap every cache in tight succession — closing the
+/// inter-cache mixed-generation window during config reload.
+pub struct PreparedConsumerIndex {
+    inner: Arc<ConsumerIndexInner>,
+}
+
 /// All consumer-index data swapped as a single unit so readers never see a
 /// mix of old and new credential mappings (e.g., a new keyauth entry paired
 /// with a stale identity index).
@@ -61,17 +73,39 @@ impl ConsumerIndex {
     }
 
     /// Atomically rebuild the index when config changes.
+    ///
+    /// Convenience wrapper around [`Self::prepare_rebuild`] + [`Self::commit`].
+    /// Used by tests / direct callers; the production reload path goes
+    /// through `prepare_*` and `commit` so sibling cache swaps share one
+    /// tight commit window.
+    #[allow(dead_code)]
     pub fn rebuild(&self, consumers: &[Consumer]) {
+        let prepared = self.prepare_rebuild(consumers);
+        self.commit(prepared);
+    }
+
+    /// Build the new consumer index from a full consumer list without storing
+    /// it. See [`Self::prepare_delta`] for the rationale behind splitting
+    /// build from store during config reload.
+    pub fn prepare_rebuild(&self, consumers: &[Consumer]) -> PreparedConsumerIndex {
         let maps = Self::build_index(consumers);
-        self.inner.store(Arc::new(ConsumerIndexInner {
-            keyauth_index: maps.keyauth,
-            basic_index: maps.basic,
-            identity_index: maps.identity,
-            mtls_index: maps.mtls,
-            all_consumers: Arc::new(maps.all),
-            jwt_credential_count: maps.jwt_count,
-            hmac_credential_count: maps.hmac_count,
-        }));
+        PreparedConsumerIndex {
+            inner: Arc::new(ConsumerIndexInner {
+                keyauth_index: maps.keyauth,
+                basic_index: maps.basic,
+                identity_index: maps.identity,
+                mtls_index: maps.mtls,
+                all_consumers: Arc::new(maps.all),
+                jwt_credential_count: maps.jwt_count,
+                hmac_credential_count: maps.hmac_count,
+            }),
+        }
+    }
+
+    /// Atomically swap in a prepared consumer index.
+    pub fn commit(&self, prepared: PreparedConsumerIndex) {
+        // Single atomic swap — readers see old or new, never a partial state.
+        self.inner.store(prepared.inner);
     }
 
     /// O(1) lookup by API key (for key_auth plugin). No allocation.
@@ -112,9 +146,33 @@ impl ConsumerIndex {
     /// Uses O(1) HashMap removal by pre-indexing old credential keys instead of
     /// O(n) `.retain()` loops per consumer. This keeps delta application fast even
     /// at 100k+ consumers with thousands of modifications per reload.
+    ///
+    /// Convenience wrapper around [`Self::prepare_delta`] + [`Self::commit`].
+    /// Used by tests / direct callers; the production reload path goes
+    /// through `prepare_*` and `commit` so sibling cache swaps share one
+    /// tight commit window.
+    #[allow(dead_code)]
     pub fn apply_delta(&self, added: &[Consumer], removed_ids: &[String], modified: &[Consumer]) {
+        if let Some(prepared) = self.prepare_delta(added, removed_ids, modified) {
+            self.commit(prepared);
+        }
+    }
+
+    /// Build the new consumer-index state without storing it.
+    ///
+    /// Returns `None` when the inputs describe a no-op delta. See
+    /// [`PluginCache::prepare_delta`] for the rationale behind splitting
+    /// build from store during config reload.
+    ///
+    /// [`PluginCache::prepare_delta`]: crate::plugin_cache::PluginCache::prepare_delta
+    pub fn prepare_delta(
+        &self,
+        added: &[Consumer],
+        removed_ids: &[String],
+        modified: &[Consumer],
+    ) -> Option<PreparedConsumerIndex> {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
-            return;
+            return None;
         }
 
         // Load the current snapshot and clone its fields for patching
@@ -250,16 +308,17 @@ impl ConsumerIndex {
         let jwt_count = (current.jwt_credential_count as isize + jwt_delta).max(0) as usize;
         let hmac_count = (current.hmac_credential_count as isize + hmac_delta).max(0) as usize;
 
-        // Single atomic swap — readers see old or new, never a partial state.
-        self.inner.store(Arc::new(ConsumerIndexInner {
-            keyauth_index: keyauth,
-            basic_index: basic,
-            identity_index: identity,
-            mtls_index: mtls,
-            all_consumers: Arc::new(all),
-            jwt_credential_count: jwt_count,
-            hmac_credential_count: hmac_count,
-        }));
+        Some(PreparedConsumerIndex {
+            inner: Arc::new(ConsumerIndexInner {
+                keyauth_index: keyauth,
+                basic_index: basic,
+                identity_index: identity,
+                mtls_index: mtls,
+                all_consumers: Arc::new(all),
+                jwt_credential_count: jwt_count,
+                hmac_credential_count: hmac_count,
+            }),
+        })
     }
 
     /// Number of indexed entries (for testing).
