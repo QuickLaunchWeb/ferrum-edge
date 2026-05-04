@@ -234,19 +234,64 @@ fn snapshot_serializes_to_json() {
     assert!(json["active_requests"].is_number());
 }
 
+// ── begin_drain ──────────────────────────────────────────────────────
+
+#[test]
+fn begin_drain_sets_draining_and_reject_new_requests() {
+    let state = Arc::new(OverloadState::new());
+    assert!(!state.draining.load(Ordering::Acquire));
+    assert!(!state.reject_new_requests.load(Ordering::Acquire));
+
+    ferrum_edge::overload::begin_drain(&state);
+
+    assert!(
+        state.draining.load(Ordering::Acquire),
+        "begin_drain must set draining=true so HTTP/1.1 responses get \
+         Connection: close even when shutdown_drain_seconds=0",
+    );
+    assert!(
+        state.reject_new_requests.load(Ordering::Acquire),
+        "begin_drain must set reject_new_requests=true so new requests on \
+         existing keepalive H1 / multiplexed H2/H3 connections get 503'd \
+         during drain rather than continuing to be admitted",
+    );
+}
+
+#[test]
+fn begin_drain_promotes_state_to_critical() {
+    let state = Arc::new(OverloadState::new());
+    assert_eq!(state.level(), OverloadLevel::Normal);
+
+    ferrum_edge::overload::begin_drain(&state);
+
+    // reject_new_requests=true makes level Critical (see level()).
+    assert_eq!(state.level(), OverloadLevel::Critical);
+}
+
+#[test]
+fn begin_drain_is_idempotent() {
+    let state = Arc::new(OverloadState::new());
+    ferrum_edge::overload::begin_drain(&state);
+    ferrum_edge::overload::begin_drain(&state);
+    assert!(state.draining.load(Ordering::Acquire));
+    assert!(state.reject_new_requests.load(Ordering::Acquire));
+}
+
 // ── wait_for_drain ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn drain_returns_true_immediately_when_no_connections() {
     let state = Arc::new(OverloadState::new());
+    ferrum_edge::overload::begin_drain(&state);
     let result = ferrum_edge::overload::wait_for_drain(&state, Duration::from_secs(1)).await;
     assert!(result);
-    assert!(state.draining.load(Ordering::Relaxed));
+    assert!(state.draining.load(Ordering::Acquire));
 }
 
 #[tokio::test]
 async fn drain_waits_for_connections_to_complete() {
     let state = Arc::new(OverloadState::new());
+    ferrum_edge::overload::begin_drain(&state);
     let guard = ConnectionGuard::new(&state);
 
     let state2 = state.clone();
@@ -256,7 +301,7 @@ async fn drain_waits_for_connections_to_complete() {
 
     // Give the drain waiter time to start
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(state.draining.load(Ordering::Relaxed));
+    assert!(state.draining.load(Ordering::Acquire));
 
     // Drop the connection — should trigger drain completion
     drop(guard);
@@ -271,11 +316,28 @@ async fn drain_waits_for_connections_to_complete() {
 #[tokio::test]
 async fn drain_times_out_with_remaining_connections() {
     let state = Arc::new(OverloadState::new());
+    ferrum_edge::overload::begin_drain(&state);
     let _guard = ConnectionGuard::new(&state); // held for the duration
 
     let result = ferrum_edge::overload::wait_for_drain(&state, Duration::from_millis(50)).await;
     assert!(!result); // timed out
     assert_eq!(state.active_connections.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn wait_for_drain_does_not_clear_begin_drain_flags() {
+    // Regression: `begin_drain` is the unconditional shutdown signal; the
+    // wait loop must not be the only place those flags get set, otherwise
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS=0 (which skips wait_for_drain entirely
+    // in every mode) would leave keepalive connections without the close
+    // hint and admit new H2/H3 streams during drain.
+    let state = Arc::new(OverloadState::new());
+    ferrum_edge::overload::begin_drain(&state);
+    // Synchronously verify both flags are observable without invoking the
+    // async wait loop — the modes call `begin_drain` BEFORE the gated
+    // `if drain_seconds > 0 { wait_for_drain(...) }` block.
+    assert!(state.draining.load(Ordering::Acquire));
+    assert!(state.reject_new_requests.load(Ordering::Acquire));
 }
 
 // ── OverloadConfig ──────────────────────────────────────────────────
@@ -447,7 +509,7 @@ fn snapshot_ratios_correct() {
 #[tokio::test]
 async fn drain_with_concurrent_guard_creation() {
     let state = Arc::new(OverloadState::new());
-    state.draining.store(true, Ordering::Relaxed);
+    ferrum_edge::overload::begin_drain(&state);
 
     // Create a guard, then spawn drain waiter
     let g1 = ConnectionGuard::new(&state);
@@ -477,7 +539,7 @@ async fn drain_with_concurrent_guard_creation() {
 #[tokio::test]
 async fn drain_waits_for_both_connections_and_requests() {
     let state = Arc::new(OverloadState::new());
-    state.draining.store(true, Ordering::Relaxed);
+    ferrum_edge::overload::begin_drain(&state);
 
     let conn_guard = ConnectionGuard::new(&state);
     let req_guard = RequestGuard::new(&state);

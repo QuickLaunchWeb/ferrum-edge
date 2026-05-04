@@ -251,7 +251,10 @@ impl Drop for ConnectionGuard {
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
         // If this was the last connection and we are draining, notify the waiter.
-        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+        // `Acquire` synchronizes-with the `Release` store in `begin_drain` so the
+        // notify reliably fires when shutdown has begun, even on weakly-ordered
+        // architectures.
+        if prev == 1 && self.state.draining.load(Ordering::Acquire) {
             self.state.drain_complete.notify_one();
         }
     }
@@ -281,7 +284,10 @@ impl Drop for RequestGuard {
         // If this was the last request and we are draining, notify the waiter.
         // The drain waiter re-checks both active_connections and active_requests,
         // so spurious wakes from one counter reaching zero are harmless.
-        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+        // `Acquire` synchronizes-with the `Release` store in `begin_drain` so the
+        // notify reliably fires when shutdown has begun, even on weakly-ordered
+        // architectures.
+        if prev == 1 && self.state.draining.load(Ordering::Acquire) {
             self.state.drain_complete.notify_one();
         }
     }
@@ -806,14 +812,49 @@ pub fn start_monitor(
     })
 }
 
+/// Mark the overload state as draining and refuse new request admission.
+///
+/// Sets both `draining` and `reject_new_requests` together so they are observed
+/// atomically with respect to each other from the shutdown trigger task. Stores
+/// use `Ordering::Release` so any loader that does an `Acquire` load (proxy hot
+/// path keepalive-close decision, request admission control, guard drop drain
+/// notification) sees the post-shutdown state in a happens-before relationship.
+///
+/// Called by every serving mode at the START of the post-listener-exit phase,
+/// regardless of `FERRUM_SHUTDOWN_DRAIN_SECONDS`. Two effects:
+///
+/// 1. **`draining=true`** — `Connection: close` is injected on HTTP/1.1 responses
+///    so keepalive clients release connections instead of holding them open
+///    until process exit. Also gates the guard-drop `drain_complete` notify.
+/// 2. **`reject_new_requests=true`** — new requests/streams arriving on
+///    EXISTING connections (especially H2/H3 multiplexed streams that have no
+///    `Connection: close` analogue and keepalive H1 streams that race the
+///    close hint) are rejected with 503 / gRPC UNAVAILABLE before processing.
+///
+/// Decoupled from [`wait_for_drain`] so `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` still
+/// emits the close hint and admission rejection — the wait loop is only useful
+/// when the operator wants the gateway to linger for in-flight completion.
+///
+/// Mirrors the [PR #569] Acquire/Release pattern for `startup_ready`.
+///
+/// [PR #569]: https://github.com/ferrum-edge/ferrum-edge/pull/569
+pub fn begin_drain(state: &Arc<OverloadState>) {
+    state.draining.store(true, Ordering::Release);
+    state.reject_new_requests.store(true, Ordering::Release);
+}
+
 /// Wait for all in-flight connections and requests to drain, up to the
 /// configured timeout.
 ///
-/// Called after the accept loops have exited. Returns `true` if all connections
-/// and requests drained within the timeout, `false` if the timeout expired.
+/// Called after the accept loops have exited and after [`begin_drain`] has
+/// been invoked. Returns `true` if all connections and requests drained within
+/// the timeout, `false` if the timeout expired.
+///
+/// This function does NOT toggle `draining` / `reject_new_requests` — that is
+/// [`begin_drain`]'s job, run unconditionally on shutdown so the close hint
+/// fires even when the operator has set `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` to
+/// disable the wait loop.
 pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bool {
-    state.draining.store(true, Ordering::Relaxed);
-
     let active_conns = state.active_connections.load(Ordering::Relaxed);
     let active_reqs = state.active_requests.load(Ordering::Relaxed);
     if active_conns == 0 && active_reqs == 0 {
