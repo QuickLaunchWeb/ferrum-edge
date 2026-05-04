@@ -703,6 +703,7 @@ async fn connect_dtls_client_with_retry(
                 .expect("generate ephemeral cert"),
             server_name: None,
             server_cert_verifier: None,
+            connect_timeout_ms: 5_000,
         };
 
         match tokio::time::timeout(

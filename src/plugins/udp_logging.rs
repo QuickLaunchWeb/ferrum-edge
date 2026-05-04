@@ -229,6 +229,10 @@ async fn build_sender_for_addr(
             certificate,
             server_name,
             server_cert_verifier,
+            // The udp_logging plugin doesn't expose a connect timeout config,
+            // so preserve the historical 10s budget that this code path used
+            // before `BackendDtlsParams.connect_timeout_ms` existed.
+            connect_timeout_ms: 10_000,
         };
 
         let dtls_conn = crate::dtls::DtlsConnection::connect(socket, params)
