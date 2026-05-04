@@ -7,6 +7,7 @@ mod db_incremental_poll_tests;
 mod db_offline_bootstrap_tests;
 mod deferred_log_tests;
 mod dtls_integration_tests;
+mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;
