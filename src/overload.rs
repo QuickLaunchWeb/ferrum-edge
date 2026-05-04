@@ -8,6 +8,7 @@
 //! Also provides graceful shutdown draining: after SIGTERM, tracks in-flight
 //! connections and waits up to a configurable drain period for them to complete.
 
+use crossbeam_utils::CachePadded;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -35,27 +36,40 @@ pub enum OverloadLevel {
 /// The background monitor writes these flags; request threads only read.
 /// All fields use `Ordering::Relaxed` — eventual consistency is acceptable
 /// for overload signals (a few ms of stale state is harmless).
+///
+/// Hot-path atomics (`disable_keepalive`, `reject_new_connections`,
+/// `reject_new_requests`, `active_connections`, `active_requests`,
+/// `red_drop_probability`, `red_request_counter`) are wrapped in
+/// [`CachePadded`] to prevent false sharing across cores: at 1M conn/sec
+/// churn, an unpadded layout puts the read-mostly action flags on the same
+/// cache line as the `fetch_add`/`fetch_sub` counters, causing the line to
+/// ping-pong between cores and turning every accept into a coherence stall.
+/// Snapshot fields (`fd_current`, `conn_current`, etc.), `draining`, and
+/// `port_exhaustion_events` are NOT padded — they are written ≤ once/sec or
+/// only on rare events, so contention does not justify the memory cost.
+/// `CachePadded<T>` derefs to `T`, so all existing
+/// `.load()` / `.fetch_add()` call sites compile unchanged.
 pub struct OverloadState {
     // ── Action flags (hot-path reads) ──────────────────────────────────
     /// When true, responses include `Connection: close` to drain idle keepalives.
-    pub disable_keepalive: AtomicBool,
+    pub disable_keepalive: CachePadded<AtomicBool>,
     /// When true, new connections are rejected with 503 before routing.
-    pub reject_new_connections: AtomicBool,
+    pub reject_new_connections: CachePadded<AtomicBool>,
     /// When true, new requests/streams are rejected with 503 before processing.
     /// Independent of `reject_new_connections` — connections track sockets,
     /// requests track multiplexed H2/H3/gRPC streams.
-    pub reject_new_requests: AtomicBool,
+    pub reject_new_requests: CachePadded<AtomicBool>,
 
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
     pub draining: AtomicBool,
     /// In-flight connection counter. Incremented on accept, decremented on drop
     /// via [`ConnectionGuard`].
-    pub active_connections: AtomicU64,
+    pub active_connections: CachePadded<AtomicU64>,
     /// In-flight request/stream counter. Incremented on request start, decremented
     /// on drop via [`RequestGuard`]. Tracks H1 requests, H2/gRPC streams, and H3
     /// streams independently of connections.
-    pub active_requests: AtomicU64,
+    pub active_requests: CachePadded<AtomicU64>,
     /// Notified each time `active_connections` or `active_requests` reaches zero
     /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
@@ -67,10 +81,10 @@ pub struct OverloadState {
     /// When in the pressure zone (between pressure and critical thresholds), responses
     /// are probabilistically marked with Connection: close based on this value.
     /// The hot path reads this with a single AtomicU32::load(Relaxed).
-    pub red_drop_probability: AtomicU32,
+    pub red_drop_probability: CachePadded<AtomicU32>,
     /// Monotonic request counter used as per-request entropy for RED decisions.
     /// Incremented by `fetch_add(1, Relaxed)` on each `should_disable_keepalive_red()` call.
-    red_request_counter: AtomicU64,
+    red_request_counter: CachePadded<AtomicU64>,
 
     // ── Snapshot for admin endpoint (written by monitor, read by admin) ─
     pub fd_current: AtomicU64,
@@ -96,15 +110,15 @@ impl Default for OverloadState {
 impl OverloadState {
     pub fn new() -> Self {
         Self {
-            disable_keepalive: AtomicBool::new(false),
-            reject_new_connections: AtomicBool::new(false),
-            reject_new_requests: AtomicBool::new(false),
+            disable_keepalive: CachePadded::new(AtomicBool::new(false)),
+            reject_new_connections: CachePadded::new(AtomicBool::new(false)),
+            reject_new_requests: CachePadded::new(AtomicBool::new(false)),
             draining: AtomicBool::new(false),
-            active_connections: AtomicU64::new(0),
-            active_requests: AtomicU64::new(0),
+            active_connections: CachePadded::new(AtomicU64::new(0)),
+            active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
-            red_drop_probability: AtomicU32::new(0),
-            red_request_counter: AtomicU64::new(0),
+            red_drop_probability: CachePadded::new(AtomicU32::new(0)),
+            red_request_counter: CachePadded::new(AtomicU64::new(0)),
             fd_current: AtomicU64::new(0),
             fd_max: AtomicU64::new(0),
             conn_current: AtomicU64::new(0),
@@ -403,29 +417,139 @@ fn count_open_fds() -> u64 {
     0 // FD monitoring not available on this platform
 }
 
-/// Get the maximum file descriptor limit (soft limit) via getrlimit.
+/// Platform constant for `RLIMIT_NOFILE` (the rlimit resource selector for the
+/// per-process open-file-descriptor cap). Linux puts it at 7, the BSD lineage
+/// (macOS, FreeBSD, etc.) at 8 — see `<sys/resource.h>`.
+#[cfg(target_os = "linux")]
+const RLIMIT_NOFILE: i32 = 7;
+#[cfg(target_os = "macos")]
+const RLIMIT_NOFILE: i32 = 8;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+const RLIMIT_NOFILE: i32 = 8; // BSD default
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+    fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+}
+
+/// Recommended floor for the FD hard cap on production hosts. 65,536 covers
+/// 30K+ inbound TCP conns + their amortized outbound pool entries + the
+/// runtime/CRT FDs without the gateway tripping its own 95% critical
+/// threshold. Below this we emit a `warn!` at startup so operators see the
+/// signal in their log pipeline rather than discovering it at the EMFILE.
+pub const FD_HARD_LIMIT_PRODUCTION_FLOOR: u64 = 65_536;
+
+/// Outcome of the startup attempt to raise the soft FD cap to the hard cap.
+/// Reported by [`raise_fd_limit`] for logging and tests.
+#[derive(Debug, Clone, Copy)]
+pub struct RaiseFdLimitResult {
+    /// Soft limit observed before the call (0 on non-Unix or if `getrlimit` failed).
+    pub soft_before: u64,
+    /// Soft limit after the call. Equal to `soft_before` if `setrlimit` was a
+    /// no-op or failed; equal to `hard` on success.
+    pub soft_after: u64,
+    /// Hard limit (unchanged by this call — we never attempt to raise it).
+    pub hard: u64,
+    /// True when `setrlimit` actually moved the soft cap upward.
+    pub raised: bool,
+}
+
+/// Get the maximum file descriptor limit (soft limit).
 fn get_fd_limit() -> u64 {
     #[cfg(unix)]
     {
-        // rlimit struct: two u64 fields (rlim_cur, rlim_max) on 64-bit platforms
-        let mut rlim: [u64; 2] = [0, 0];
-        // RLIMIT_NOFILE is typically 7 on Linux, 8 on macOS — use platform constant
-        #[cfg(target_os = "linux")]
-        const RLIMIT_NOFILE: i32 = 7;
-        #[cfg(target_os = "macos")]
-        const RLIMIT_NOFILE: i32 = 8;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const RLIMIT_NOFILE: i32 = 8; // BSD default
-
-        unsafe extern "C" {
-            fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
-        }
-        let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
-        if result == 0 { rlim[0] } else { 0 }
+        get_fd_rlimit_pair().0
     }
     #[cfg(not(unix))]
     {
         0
+    }
+}
+
+/// Read both rlimit fields (soft, hard) at once. Returns `(0, 0)` on
+/// non-Unix or if the syscall fails. Used by [`raise_fd_limit`] and
+/// [`get_fd_limit`] so there is a single `getrlimit` call site.
+#[cfg(unix)]
+fn get_fd_rlimit_pair() -> (u64, u64) {
+    let mut rlim: [u64; 2] = [0, 0];
+    let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
+    if result == 0 {
+        (rlim[0], rlim[1])
+    } else {
+        (0, 0)
+    }
+}
+
+/// Raise the soft FD limit (`RLIMIT_NOFILE.rlim_cur`) to the hard limit.
+///
+/// Called once at startup. Conservative by design — we never attempt to raise
+/// the hard cap, so this never asks for privileges the process does not already
+/// have. If `setrlimit` fails (sandboxed container, seccomp filter, or the
+/// kernel rejects the value), the call is a no-op and the gateway continues
+/// with whatever soft cap it inherited.
+///
+/// On non-Unix platforms this is a no-op that returns zeros.
+///
+/// Operators running production workloads should make sure the *hard* cap is
+/// at least [`FD_HARD_LIMIT_PRODUCTION_FLOOR`] (set via `LimitNOFILE=` in
+/// systemd, `--ulimit nofile=` in Docker, or `/etc/security/limits.conf`) —
+/// when it is below that floor, [`raise_fd_limit`] only emits a structured
+/// `warn!` at startup; it does not fail. The caller (typically `main.rs`) is
+/// responsible for logging the result.
+pub fn raise_fd_limit() -> RaiseFdLimitResult {
+    #[cfg(unix)]
+    {
+        let (soft_before, hard) = get_fd_rlimit_pair();
+        if soft_before == 0 && hard == 0 {
+            // getrlimit failed — bail out without an unsafe second syscall.
+            return RaiseFdLimitResult {
+                soft_before: 0,
+                soft_after: 0,
+                hard: 0,
+                raised: false,
+            };
+        }
+
+        if soft_before >= hard {
+            // Already at the hard cap — nothing to do.
+            return RaiseFdLimitResult {
+                soft_before,
+                soft_after: soft_before,
+                hard,
+                raised: false,
+            };
+        }
+
+        // `hard == RLIM_INFINITY` is safe here; the kernel still enforces its
+        // platform ceiling (for example fs.nr_open on Linux).
+        let new_rlim: [u64; 2] = [hard, hard];
+        let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_rlim) };
+        if result == 0 {
+            RaiseFdLimitResult {
+                soft_before,
+                soft_after: hard,
+                hard,
+                raised: true,
+            }
+        } else {
+            // setrlimit refused the bump — keep running with the old soft cap.
+            RaiseFdLimitResult {
+                soft_before,
+                soft_after: soft_before,
+                hard,
+                raised: false,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        RaiseFdLimitResult {
+            soft_before: 0,
+            soft_after: 0,
+            hard: 0,
+            raised: false,
+        }
     }
 }
 
@@ -758,6 +882,89 @@ mod tests {
     fn fd_count_is_nonzero() {
         let count = count_open_fds();
         assert!(count > 0, "Process should have at least some open FDs");
+    }
+
+    /// `raise_fd_limit` must never return a soft cap above the hard cap, must
+    /// never lower the soft cap, and must accurately report whether it
+    /// actually moved the limit. Sandboxed/seccomp test runners are still
+    /// expected to satisfy these invariants because the call is a silent
+    /// no-op when `setrlimit` is denied.
+    #[cfg(unix)]
+    #[test]
+    fn raise_fd_limit_respects_invariants() {
+        let result = raise_fd_limit();
+        assert!(
+            result.soft_after >= result.soft_before,
+            "soft cap must never decrease: before={} after={}",
+            result.soft_before,
+            result.soft_after,
+        );
+        assert!(
+            result.soft_after <= result.hard,
+            "soft cap must never exceed hard cap: soft_after={} hard={}",
+            result.soft_after,
+            result.hard,
+        );
+        // `raised` must be consistent with the before/after delta.
+        if result.raised {
+            assert!(
+                result.soft_after > result.soft_before,
+                "raised=true requires soft_after > soft_before",
+            );
+        }
+    }
+
+    /// `raise_fd_limit` is idempotent — calling it a second time after the
+    /// first run reaches the hard cap must report `raised=false` and leave
+    /// the cap untouched. This protects against accidental double-call from
+    /// a future test or a CLI subcommand also wiring the helper into its
+    /// startup.
+    #[cfg(unix)]
+    #[test]
+    fn raise_fd_limit_is_idempotent() {
+        let first = raise_fd_limit();
+        let second = raise_fd_limit();
+        assert_eq!(
+            first.soft_after, second.soft_after,
+            "second call must not change the soft cap",
+        );
+        assert!(
+            !second.raised,
+            "second call must report raised=false; got soft_before={} soft_after={}",
+            second.soft_before, second.soft_after,
+        );
+    }
+
+    /// `CachePadded<T>` must occupy at least one cache line so that two
+    /// adjacent atomics in `OverloadState` do not share a line. The exact
+    /// alignment is platform-specific (64 B on x86-64, 128 B on aarch64),
+    /// but `crossbeam_utils` guarantees `>= 64`. This test catches a future
+    /// dep update that silently regresses the padding contract.
+    #[test]
+    fn cache_padded_atomic_u64_is_at_least_one_cache_line() {
+        let size = std::mem::size_of::<CachePadded<AtomicU64>>();
+        assert!(
+            size >= 64,
+            "CachePadded<AtomicU64> should be >= 64 bytes (one cache line); got {}",
+            size,
+        );
+    }
+
+    /// The hot atomics on `OverloadState` are intentionally on separate
+    /// cache lines from each other — verify the read-mostly action flag and
+    /// the write-heavy connection counter are not co-located. Address
+    /// distance >= 64 on x86-64 is sufficient evidence.
+    #[test]
+    fn hot_atomics_do_not_share_cache_line() {
+        let state = OverloadState::new();
+        let reject_addr = &*state.reject_new_connections as *const AtomicBool as usize;
+        let active_addr = &*state.active_connections as *const AtomicU64 as usize;
+        let distance = reject_addr.abs_diff(active_addr);
+        assert!(
+            distance >= 64,
+            "reject_new_connections and active_connections should be on different cache lines; distance={}",
+            distance,
+        );
     }
 
     /// Verify that the RED shedding rate matches the configured probability

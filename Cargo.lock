@@ -1900,6 +1900,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crossbeam-utils",
  "dashmap",
  "dimpl",
  "flate2",
