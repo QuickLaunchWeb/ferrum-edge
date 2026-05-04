@@ -944,6 +944,34 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
 }
 
 #[tokio::test]
+async fn test_charges_requires_admin_jwt() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client
+        .get(format!("{}/charges", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = unauthenticated.json().await.unwrap();
+    assert_eq!(body["error"], "Missing Authorization header");
+
+    let token = generate_test_token(&tc);
+    let authenticated = client
+        .get(format!("{}/charges?format=json", base_url))
+        .header("authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated.status(), reqwest::StatusCode::OK);
+    let body: Value = authenticated.json().await.unwrap();
+    assert!(body["consumers"].is_object());
+}
+
+#[tokio::test]
 async fn test_list_proxies_without_pagination_returns_plain_array() {
     let tc = TestConfig::default();
     let state = create_pagination_admin_state(&tc);
