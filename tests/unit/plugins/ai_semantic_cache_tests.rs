@@ -1,7 +1,80 @@
+use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::ai_semantic_cache::AiSemanticCache;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Build a synthetic Consumer for cross-consumer scoping tests. Only
+/// `username` matters because that's what `effective_identity()` returns
+/// when `identified_consumer` is set.
+fn make_consumer(username: &str) -> Arc<Consumer> {
+    Arc::new(Consumer {
+        id: format!("consumer-{}", username),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        acl_groups: Vec::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    })
+}
+
+/// Drive a request through `before_proxy` and report whether the call
+/// returned a cache HIT (`RejectBinary`) or a MISS (`Continue`).
+async fn run_before_proxy_get_status(
+    plugin: &AiSemanticCache,
+    body_str: &str,
+    consumer: Option<Arc<Consumer>>,
+) -> bool {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), body_str.to_string());
+    if let Some(c) = consumer {
+        ctx.identified_consumer = Some(c);
+    }
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::RejectBinary { .. }
+    )
+}
+
+/// MISS+store helper: send a request through `before_proxy` (cache MISS) and
+/// then write a synthetic response into the cache via `on_final_response_body`.
+async fn store_response(
+    plugin: &AiSemanticCache,
+    body_str: &str,
+    consumer: Option<Arc<Consumer>>,
+    response_body: &[u8],
+) {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), body_str.to_string());
+    if let Some(c) = consumer {
+        ctx.identified_consumer = Some(c);
+    }
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, response_body)
+        .await;
+}
 
 fn make_plugin(config: serde_json::Value) -> AiSemanticCache {
     AiSemanticCache::new(&config, PluginHttpClient::default()).unwrap()
@@ -438,4 +511,315 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
         }
         _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
     }
+}
+
+// -------------------------------------------------------------------------
+// Cross-prompt / param-collapse / consumer-leak hardening tests.
+//
+// These guard against four distinct correctness/security gaps:
+//   1. Anthropic top-level `system` prompt collapsing into the messages key.
+//   2. Sampling-parameter differences (temperature) collapsing under the old
+//      `include_params_in_key=false` default.
+//   3. Cross-consumer cache replay under the old `scope_by_consumer=false`
+//      default.
+//   4. `stream:true` vs `stream:false` collapsing into the same entry, which
+//      would let a non-streaming MISS-then-store replay JSON to a streaming
+//      caller (and vice versa).
+// -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_different_system_prompt_no_cache_hit() {
+    // SECURITY: Anthropic Messages API uses a top-level `system` field, not
+    // an in-`messages` system role. Without including it in the key, two
+    // requests with identical messages but different system prompts would
+    // collapse to the same cache entry — a cross-prompt poisoning vector.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body1 = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "system": "You are a helpful assistant.",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    let body2 = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "system": "You are a pirate. Speak in pirate dialect.",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"Hello!",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "different `system` prompts must NOT collapse to the same cache key"
+    );
+}
+
+#[tokio::test]
+async fn test_different_system_array_form_no_cache_hit() {
+    // Anthropic also accepts `system` as an array of content blocks; the
+    // array form must produce different keys for different system text.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body1 = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "system": [{"type": "text", "text": "Be terse."}],
+        "messages": [{"role": "user", "content": "ping"}]
+    });
+    let body2 = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "system": [{"type": "text", "text": "Be verbose."}],
+        "messages": [{"role": "user", "content": "ping"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"pong",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "different array-form `system` prompts must NOT collapse to the same cache key"
+    );
+}
+
+#[tokio::test]
+async fn test_different_temperature_no_cache_hit_with_default_config() {
+    // SECURITY: With the new `include_params_in_key=true` default, two
+    // requests differing only in `temperature` must produce different cache
+    // keys. The old default (`false`) silently served a temperature=0
+    // response to a temperature=1.5 request.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "temperature": 1.5,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"poem-from-temp-0",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "different `temperature` must NOT collapse with `include_params_in_key=true` default"
+    );
+}
+
+#[tokio::test]
+async fn test_same_request_different_consumer_no_cache_hit_with_default_config() {
+    // SECURITY: With the new `scope_by_consumer=true` default, two requests
+    // from different authenticated consumers must NOT share a cache entry.
+    // The old default (`false`) leaked one consumer's response to the next.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "what's my last invoice"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    let alice = make_consumer("alice");
+    let bob = make_consumer("bob");
+
+    store_response(&plugin, &body_str, Some(alice.clone()), b"alice-only-data").await;
+
+    let hit = run_before_proxy_get_status(&plugin, &body_str, Some(bob.clone())).await;
+    assert!(
+        !hit,
+        "consumer `bob` MUST NOT receive a cache hit on `alice`'s entry under default config"
+    );
+
+    // Sanity check: alice's repeat hits her own entry.
+    let alice_hit = run_before_proxy_get_status(&plugin, &body_str, Some(alice.clone())).await;
+    assert!(
+        alice_hit,
+        "consumer `alice` SHOULD see her own cache entry on repeat"
+    );
+}
+
+#[tokio::test]
+async fn test_same_request_same_consumer_same_params_cache_hit_positive() {
+    // POSITIVE control: when *every* key field matches (messages, model,
+    // params, system, stream, consumer), the second call must HIT. Confirms
+    // the harder-to-collide key composition is not over-broken.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let consumer = make_consumer("carol");
+
+    let body = json!({
+        "model": "gpt-4o",
+        "temperature": 0.7,
+        "max_tokens": 256,
+        "stream": false,
+        "system": "You are concise.",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    store_response(&plugin, &body_str, Some(consumer.clone()), b"hello-back").await;
+
+    let hit = run_before_proxy_get_status(&plugin, &body_str, Some(consumer)).await;
+    assert!(
+        hit,
+        "fully-identical request from the same consumer MUST hit the cache (positive control)"
+    );
+}
+
+#[tokio::test]
+async fn test_stream_true_vs_false_no_cache_hit() {
+    // SECURITY: `stream:true` produces SSE; `stream:false` produces a single
+    // JSON response. They must not share a cache entry. Note that we cache
+    // the `stream:false` response (since SSE is filtered out at store time)
+    // — without `stream` in the key, a `stream:true` follow-up would receive
+    // the buffered JSON in a `RejectBinary` reply and the client SDK would
+    // fail to parse SSE.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body_nostream = json!({
+        "model": "gpt-4o",
+        "stream": false,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let body_stream = json!({
+        "model": "gpt-4o",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_nostream).unwrap(),
+        None,
+        b"{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None)
+            .await;
+    assert!(
+        !hit,
+        "`stream:true` request MUST NOT receive the `stream:false` cached entry"
+    );
+}
+
+#[tokio::test]
+async fn test_different_tools_no_cache_hit() {
+    // SECURITY: Two requests with identical messages but different tool
+    // schemas should produce different responses (model may invoke a tool in
+    // one and not the other). Must not collapse to the same key.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+        "messages": [{"role": "user", "content": "weather in NYC?"}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "tools": [{"type": "function", "function": {"name": "get_news"}}],
+        "messages": [{"role": "user", "content": "weather in NYC?"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"weather-tool-call",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "different `tools` definitions must NOT collapse to the same cache key"
+    );
+}
+
+#[tokio::test]
+async fn test_different_response_format_no_cache_hit() {
+    // OpenAI: `response_format: {"type":"json_object"}` vs `text` produces
+    // structurally different responses; must not collide.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "user", "content": "give me a fruit"}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "response_format": {"type": "text"},
+        "messages": [{"role": "user", "content": "give me a fruit"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"{\"fruit\":\"apple\"}",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(
+        !hit,
+        "different `response_format` must NOT collapse to the same cache key"
+    );
+}
+
+#[tokio::test]
+async fn test_different_seed_no_cache_hit() {
+    // OpenAI's `seed` controls reproducibility; different seeds can produce
+    // different completions and should not collide.
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    let body1 = json!({
+        "model": "gpt-4o",
+        "seed": 42,
+        "messages": [{"role": "user", "content": "tell a joke"}]
+    });
+    let body2 = json!({
+        "model": "gpt-4o",
+        "seed": 99,
+        "messages": [{"role": "user", "content": "tell a joke"}]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        b"joke-seed-42",
+    )
+    .await;
+
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(!hit, "different `seed` must NOT collapse cache keys");
 }

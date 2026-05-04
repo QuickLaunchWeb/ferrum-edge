@@ -2734,8 +2734,8 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body in bytes (1 MiB) |
 | `max_total_size_bytes` | u64 | `104857600` | Maximum total cache size in bytes (100 MiB, local mode) |
 | `include_model_in_key` | bool | `true` | Include the model name in the cache key (different models get separate cache entries) |
-| `include_params_in_key` | bool | `false` | Include request parameters (temperature, max_tokens, etc.) in the cache key |
-| `scope_by_consumer` | bool | `false` | Scope cache entries per consumer (authenticated consumer ID is included in the cache key) |
+| `include_params_in_key` | bool | `true` | Include sampling parameters (temperature, top_p, max_tokens) in the cache key. Default `true` because different params produce different responses; set `false` only when cross-parameter reuse is intentional. |
+| `scope_by_consumer` | bool | `true` | Scope cache entries per authenticated consumer. Default `true` because cached responses must not be replayed across consumers; set `false` only for a public LLM proxy with no per-tenant data. |
 | `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -2749,6 +2749,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 **Behavior:**
 
 - **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
+- **Cache key composition**: The hashed key includes the proxy ID, optionally the authenticated consumer (default on), the model name (default on), optionally sampling params (default on — `temperature`, `top_p`, `max_tokens`), the normalized `messages` array, the Anthropic top-level `system` prompt (string or array-of-content-blocks form), and any of `tools`, `tool_choice`, `response_format`, `seed`, `logit_bias`, `stream` that are present on the request. Any byte-level change to these fields produces a different cache entry — two requests with different system prompts, tool sets, response formats, seeds, logit biases, or streaming flags will never collide.
 - **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
 - **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
