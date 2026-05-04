@@ -338,6 +338,45 @@ impl TrustBundleSet {
     }
 }
 
+// ── Top-level mesh config container ───────────────────────────────────────
+
+/// All mesh-specific configuration, kept in a single container so the
+/// core `GatewayConfig` struct stays lean for non-mesh deployments.
+/// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when
+/// the operator has no mesh resources, zero cost in that case.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MeshConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workloads: Vec<Workload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<MeshService>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mesh_policies: Vec<MeshPolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peer_authentications: Vec<PeerAuthentication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_entries: Vec<ServiceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_bundles: Option<TrustBundleSet>,
+}
+
+impl MeshConfig {
+    pub fn validate(&self) -> Vec<String> {
+        validate_mesh_config(
+            &self.workloads,
+            &self.services,
+            &self.mesh_policies,
+            &self.peer_authentications,
+            &self.service_entries,
+            self.trust_bundles.as_ref(),
+        )
+    }
+
+    pub fn normalize(&mut self) {
+        normalize_mesh_fields(&mut self.service_entries, &mut self.workloads);
+    }
+}
+
 // ── Validation ────────────────────────────────────────────────────────────
 
 /// Validate the mesh portion of a [`crate::config::types::GatewayConfig`].

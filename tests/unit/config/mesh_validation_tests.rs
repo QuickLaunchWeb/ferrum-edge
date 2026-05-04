@@ -259,16 +259,21 @@ fn trust_bundle_set_rejects_invalid_base64() {
 
 #[test]
 fn gateway_config_validate_mesh_fields_dispatches() {
-    let mut cfg = GatewayConfig::default();
-    cfg.workloads.push(Workload {
-        // SPIFFE ID with mismatched trust domain.
-        spiffe_id: SpiffeId::new("spiffe://other/ns/foo/sa/bar").unwrap(),
-        selector: WorkloadSelector::default(),
-        service_name: "x".into(),
-        ports: Vec::new(),
-        trust_domain: TrustDomain::new("td").unwrap(),
-        namespace: "default".into(),
-    });
+    use ferrum_edge::config::mesh::MeshConfig;
+    let cfg = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![Workload {
+                spiffe_id: SpiffeId::new("spiffe://other/ns/foo/sa/bar").unwrap(),
+                selector: WorkloadSelector::default(),
+                service_name: "x".into(),
+                ports: Vec::new(),
+                trust_domain: TrustDomain::new("td").unwrap(),
+                namespace: "default".into(),
+            }],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
     let errors = cfg.validate_mesh_fields();
     assert!(!errors.is_empty(), "expected at least one error");
 }

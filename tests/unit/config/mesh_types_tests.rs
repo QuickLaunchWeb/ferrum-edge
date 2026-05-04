@@ -2,10 +2,10 @@
 //! backwards-compat, decode helpers.
 
 use ferrum_edge::config::mesh::{
-    AppProtocol, MeshEndpoint, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
-    PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution, ServiceEntry,
-    ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload, WorkloadPort,
-    WorkloadRef, WorkloadSelector,
+    AppProtocol, MeshConfig, MeshEndpoint, MeshPolicy, MeshRule, MeshService, MtlsMode,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServicePort, TrustBundle, TrustBundleSet, Workload,
+    WorkloadPort, WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -21,20 +21,10 @@ fn non_mesh_config_round_trips_without_mesh_fields() {
     let cfg = GatewayConfig::default();
     let json = serde_json::to_value(&cfg).unwrap();
     let obj = json.as_object().expect("object");
-    for forbidden in [
-        "workloads",
-        "services",
-        "mesh_policies",
-        "peer_authentications",
-        "service_entries",
-        "trust_bundles",
-    ] {
-        assert!(
-            !obj.contains_key(forbidden),
-            "non-mesh config serialised an empty `{}` field",
-            forbidden
-        );
-    }
+    assert!(
+        !obj.contains_key("mesh"),
+        "non-mesh config serialised an empty `mesh` field",
+    );
 }
 
 #[test]
@@ -42,39 +32,43 @@ fn mesh_config_round_trips_through_serde() {
     let td = TrustDomain::new("prod.example.com").unwrap();
     let id = SpiffeId::from_parts(&td, "ns/svc/sa/api").unwrap();
     let cfg = GatewayConfig {
-        workloads: vec![Workload {
-            spiffe_id: id.clone(),
-            selector: WorkloadSelector {
-                labels: HashMap::from([("app".into(), "api".into())]),
-                namespace: Some("svc".into()),
-            },
-            service_name: "api".into(),
-            ports: vec![WorkloadPort {
-                port: 8443,
-                protocol: AppProtocol::Http2,
-                name: Some("https".into()),
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![Workload {
+                spiffe_id: id.clone(),
+                selector: WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "api".into())]),
+                    namespace: Some("svc".into()),
+                },
+                service_name: "api".into(),
+                ports: vec![WorkloadPort {
+                    port: 8443,
+                    protocol: AppProtocol::Http2,
+                    name: Some("https".into()),
+                }],
+                trust_domain: td.clone(),
+                namespace: "svc".into(),
             }],
-            trust_domain: td.clone(),
-            namespace: "svc".into(),
-        }],
-        services: vec![MeshService {
-            name: "api".into(),
-            namespace: "svc".into(),
-            ports: vec![ServicePort {
-                port: 8443,
-                protocol: AppProtocol::Http2,
-                name: None,
+            services: vec![MeshService {
+                name: "api".into(),
+                namespace: "svc".into(),
+                ports: vec![ServicePort {
+                    port: 8443,
+                    protocol: AppProtocol::Http2,
+                    name: None,
+                }],
+                workloads: vec![WorkloadRef { spiffe_id: id }],
+                protocol_overrides: HashMap::new(),
             }],
-            workloads: vec![WorkloadRef { spiffe_id: id }],
-            protocol_overrides: HashMap::new(),
-        }],
+            ..Default::default()
+        })),
         ..GatewayConfig::default()
     };
     let json = serde_json::to_string(&cfg).expect("serialises");
     let back: GatewayConfig = serde_json::from_str(&json).expect("deserialises");
-    assert_eq!(back.workloads.len(), 1);
-    assert_eq!(back.services.len(), 1);
-    assert_eq!(back.workloads[0].service_name, "api");
+    let mesh = back.mesh.as_ref().expect("mesh present");
+    assert_eq!(mesh.workloads.len(), 1);
+    assert_eq!(mesh.services.len(), 1);
+    assert_eq!(mesh.workloads[0].service_name, "api");
 }
 
 #[test]
@@ -90,20 +84,23 @@ fn unknown_mesh_fields_are_tolerated() {
         "upstreams": [],
         "loaded_at": "2026-04-28T00:00:00Z",
         "known_namespaces": [],
-        "workloads": [
-            {
-                "spiffe_id": "spiffe://td/ns/foo/sa/bar",
-                "selector": {"labels": {}, "namespace": null},
-                "service_name": "svc",
-                "ports": [],
-                "trust_domain": "td",
-                "namespace": "default",
-                "future_field_that_does_not_exist": "ignored"
-            }
-        ]
+        "mesh": {
+            "workloads": [
+                {
+                    "spiffe_id": "spiffe://td/ns/foo/sa/bar",
+                    "selector": {"labels": {}, "namespace": null},
+                    "service_name": "svc",
+                    "ports": [],
+                    "trust_domain": "td",
+                    "namespace": "default",
+                    "future_field_that_does_not_exist": "ignored"
+                }
+            ]
+        }
     }"#;
     let cfg: GatewayConfig = serde_json::from_str(json).expect("future fields are tolerated");
-    assert_eq!(cfg.workloads.len(), 1);
+    let mesh = cfg.mesh.as_ref().expect("mesh present");
+    assert_eq!(mesh.workloads.len(), 1);
 }
 
 // ── Per-type smoke tests ─────────────────────────────────────────────────

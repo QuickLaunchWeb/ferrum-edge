@@ -1169,24 +1169,8 @@ pub struct GatewayConfig {
     /// resources. DB-backed modes use `list_namespaces()` instead.
     #[serde(default)]
     pub known_namespaces: Vec<String>,
-    // ── Mesh model (Phase A — strictly additive) ─────────────────────────
-    //
-    // Every mesh field is `#[serde(default)]` + `skip_serializing_if` so a
-    // non-mesh `GatewayConfig` round-trips byte-identical (no extra keys in
-    // the output). Phase B/C wires these into the runtime; Phase A only
-    // models them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub workloads: Vec<crate::config::mesh::Workload>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub services: Vec<crate::config::mesh::MeshService>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mesh_policies: Vec<crate::config::mesh::MeshPolicy>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub peer_authentications: Vec<crate::config::mesh::PeerAuthentication>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub service_entries: Vec<crate::config::mesh::ServiceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trust_bundles: Option<crate::config::mesh::TrustBundleSet>,
+    pub mesh: Option<Box<crate::config::mesh::MeshConfig>>,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -3888,20 +3872,18 @@ impl GatewayConfig {
     /// existing proxy config.
     #[allow(dead_code)] // Phase A scaffolding — wired into modes in Phase B/C.
     pub fn validate_mesh_fields(&self) -> Vec<String> {
-        crate::config::mesh::validate_mesh_config(
-            &self.workloads,
-            &self.services,
-            &self.mesh_policies,
-            &self.peer_authentications,
-            &self.service_entries,
-            self.trust_bundles.as_ref(),
-        )
+        match &self.mesh {
+            Some(m) => m.validate(),
+            None => Vec::new(),
+        }
     }
 
     /// Normalise hostname-bearing mesh fields (lower-case ASCII). Idempotent.
     #[allow(dead_code)] // Phase A scaffolding — wired into loaders in Phase B/C.
     pub fn normalize_mesh_fields(&mut self) {
-        crate::config::mesh::normalize_mesh_fields(&mut self.service_entries, &mut self.workloads);
+        if let Some(m) = &mut self.mesh {
+            m.normalize();
+        }
     }
 
     /// Validate file dependencies for plugins that reference external files

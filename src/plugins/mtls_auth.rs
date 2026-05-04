@@ -433,32 +433,6 @@ auth_flow::impl_auth_plugin!(
     super::priority::MTLS_AUTH,
     crate::plugins::HTTP_FAMILY_AND_STREAM_PROTOCOLS,
     auth_flow::run_auth;
-    /// Populate `ctx.peer_spiffe_id` from the client certificate when it
-    /// carries a `spiffe://` URI SAN. Purely additive: non-mesh deployments
-    /// do not have such SANs, so the field stays `None`. Does not affect
-    /// authentication outcome — that still flows through `authenticate`.
-    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        if ctx.peer_spiffe_id.is_some() {
-            return PluginResult::Continue;
-        }
-        if let Some(der) = ctx.tls_client_cert_der.as_ref() {
-            match crate::identity::spiffe::try_extract_spiffe_id(der.as_ref()) {
-                Ok(Some(id)) => {
-                    debug!("mtls_auth: peer SPIFFE ID extracted: {}", id);
-                    ctx.peer_spiffe_id = Some(id);
-                }
-                Ok(None) => {} // no SPIFFE URI SAN — non-mesh deployment, expected
-                Err(e) => {
-                    debug!(
-                        "mtls_auth: peer cert has SPIFFE URI but it is malformed: {}",
-                        e
-                    );
-                }
-            }
-        }
-        PluginResult::Continue
-    }
-
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let cert_der = match &ctx.tls_client_cert_der {
             Some(der) => der,

@@ -60,6 +60,7 @@ pub mod response_transformer;
 pub mod serverless_function;
 pub mod soap_ws_security;
 pub mod spec_expose;
+pub mod spiffe_identity;
 pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
@@ -966,6 +967,7 @@ pub mod priority {
     pub const SSE: u16 = 250;
     pub const GRPC_WEB: u16 = 260;
     pub const GRPC_METHOD_ROUTER: u16 = 275;
+    pub const SPIFFE_IDENTITY: u16 = 940;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
@@ -1461,6 +1463,9 @@ pub fn create_plugin_with_http_client(
         )?))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
+        "spiffe_identity" => Ok(Some(Arc::new(spiffe_identity::SpiffeIdentity::new(
+            config,
+        )?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
@@ -1634,6 +1639,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ldap_auth",
         "hmac_auth",
         "mtls_auth",
+        "spiffe_identity",
         "compression",
         "cors",
         "access_control",
