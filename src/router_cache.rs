@@ -452,7 +452,9 @@ impl RouterCache {
                 if !route_match.path_params.is_empty() || is_regex_proxy(&route_match.proxy) =>
             {
                 // Regex match → regex cache
-                if self.regex_cache.len() >= self.max_cache_entries {
+                if self.regex_cache.len() >= self.max_cache_entries
+                    && !self.regex_cache.contains_key(&cache_key)
+                {
                     self.evict_regex_sample();
                 }
                 self.frequency_sketch.increment(&cache_key);
@@ -468,7 +470,9 @@ impl RouterCache {
             }
             Some(route_match) => {
                 // Prefix match → prefix cache
-                if self.prefix_cache.len() >= self.max_cache_entries {
+                if self.prefix_cache.len() >= self.max_cache_entries
+                    && !self.prefix_cache.contains_key(&cache_key)
+                {
                     self.evict_prefix_sample();
                 }
                 self.frequency_sketch.increment(&cache_key);
@@ -482,7 +486,9 @@ impl RouterCache {
             }
             None => {
                 // Negative entry → prefix cache (both tiers missed)
-                if self.prefix_cache.len() >= self.max_cache_entries {
+                if self.prefix_cache.len() >= self.max_cache_entries
+                    && !self.prefix_cache.contains_key(&cache_key)
+                {
                     self.evict_prefix_sample();
                 }
                 self.frequency_sketch.increment(&cache_key);
@@ -1357,6 +1363,78 @@ mod tests {
             proxies,
             ..GatewayConfig::default()
         }
+    }
+
+    #[test]
+    fn replacing_stale_prefix_entry_does_not_evict_unrelated_cache_entries() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 4);
+
+        for path in ["/api/a", "/api/b", "/api/c", "/api/d"] {
+            let matched = cache
+                .find_proxy(None, path)
+                .expect("old route should match");
+            assert_eq!(matched.proxy.id, "old");
+        }
+        let before = cache.cache_stats();
+        assert_eq!(before.0, 4);
+        assert_eq!(before.2, 0);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        let new_table = RouterCache::build_route_table_snapshot(&new_config);
+        let matched = cache
+            .find_proxy_in_snapshot(&new_table, 2, None, "/api/a")
+            .expect("new route should match");
+        assert_eq!(matched.proxy.id, "new");
+
+        let after = cache.cache_stats();
+        assert_eq!(after.0, 4);
+        assert_eq!(
+            after.2, before.2,
+            "replacing the same stale prefix key should not evict another entry"
+        );
+    }
+
+    #[test]
+    fn replacing_stale_regex_entry_does_not_evict_unrelated_cache_entries() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old-regex", "~/item/[0-9]+")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 4);
+
+        for path in ["/item/1", "/item/2", "/item/3", "/item/4"] {
+            let matched = cache
+                .find_proxy(None, path)
+                .expect("old regex should match");
+            assert_eq!(matched.proxy.id, "old-regex");
+        }
+        let before = cache.cache_stats();
+        assert_eq!(before.1, 4);
+        assert_eq!(before.3, 0);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new-regex", "~/item/[0-9]+")],
+            ..GatewayConfig::default()
+        };
+        let new_table = RouterCache::build_route_table_snapshot(&new_config);
+        let matched = cache
+            .find_proxy_in_snapshot(&new_table, 2, None, "/item/1")
+            .expect("new regex should match");
+        assert_eq!(matched.proxy.id, "new-regex");
+
+        let after = cache.cache_stats();
+        assert_eq!(after.1, 4);
+        assert_eq!(
+            after.3, before.3,
+            "replacing the same stale regex key should not evict another entry"
+        );
     }
 
     #[test]

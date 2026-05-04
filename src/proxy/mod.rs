@@ -2228,10 +2228,35 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
-    fn delta_routes_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
-        !delta.added_proxies.is_empty()
-            || !delta.modified_proxies.is_empty()
-            || !delta.removed_proxy_ids.is_empty()
+    fn delta_routes_changed(
+        delta: &crate::config_delta::ConfigDelta,
+        old_config: &GatewayConfig,
+    ) -> bool {
+        let is_route_indexed = |proxy: &Proxy| !proxy.dispatch_kind.is_stream();
+
+        if delta.added_proxies.iter().any(is_route_indexed)
+            || delta.modified_proxies.iter().any(is_route_indexed)
+        {
+            return true;
+        }
+
+        if delta.modified_proxies.is_empty() && delta.removed_proxy_ids.is_empty() {
+            return false;
+        }
+
+        let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
+            .proxies
+            .iter()
+            .filter(|proxy| is_route_indexed(proxy))
+            .map(|proxy| proxy.id.as_str())
+            .collect();
+
+        delta
+            .modified_proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .chain(delta.removed_proxy_ids.iter().map(String::as_str))
+            .any(|id| old_route_indexed_proxy_ids.contains(id))
     }
 
     fn delta_consumers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
@@ -2260,7 +2285,7 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        let route_changed = Self::delta_routes_changed(delta);
+        let route_changed = Self::delta_routes_changed(delta, &current.config);
         let consumer_changed = Self::delta_consumers_changed(delta);
         let lb_changed = Self::delta_load_balancers_changed(delta);
 
@@ -2487,7 +2512,7 @@ impl ProxyState {
         }
 
         // Stage all request-facing cache inners before publishing any request-visible epoch.
-        let route_changed = Self::delta_routes_changed(&delta);
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
         let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
@@ -2868,7 +2893,7 @@ impl ProxyState {
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
         // Stage all request-facing cache inners before publishing any request-visible epoch.
-        let route_changed = Self::delta_routes_changed(&delta);
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
         let staged_config = Arc::new(new_config.clone());
         let publish_result = self.request_epoch.update_config(
             |current| {
@@ -10735,6 +10760,99 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    fn route_delta_proxy(
+        id: &str,
+        dispatch_kind: DispatchKind,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Proxy {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.id = id.to_string();
+        proxy.dispatch_kind = dispatch_kind;
+        proxy.updated_at = updated_at;
+        proxy.created_at = updated_at;
+        if dispatch_kind.is_stream() {
+            proxy.backend_scheme = Some(BackendScheme::Tcp);
+            proxy.listen_path = None;
+            proxy.listen_port = Some(20_000);
+        } else {
+            proxy.backend_scheme = Some(BackendScheme::Http);
+            proxy.listen_path = Some(format!("/{id}"));
+            proxy.listen_port = None;
+        }
+        proxy
+    }
+
+    fn route_delta_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            proxies,
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn delta_routes_changed_ignores_stream_only_proxy_changes() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let old_config =
+            route_delta_config(vec![route_delta_proxy("tcp", DispatchKind::TcpRaw, t0)]);
+        let added_stream = route_delta_config(vec![
+            old_config.proxies[0].clone(),
+            route_delta_proxy("tcp-added", DispatchKind::TcpRaw, t1),
+        ]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &added_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let mut modified_stream = old_config.proxies[0].clone();
+        modified_stream.backend_port = 9443;
+        modified_stream.updated_at = t1;
+        let modified_config = route_delta_config(vec![modified_stream]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &modified_config);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let removed_stream = route_delta_config(vec![]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &removed_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_http_route_changes_and_transitions() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let empty_config = route_delta_config(vec![]);
+        let added_http =
+            route_delta_config(vec![route_delta_proxy("http", DispatchKind::HttpPool, t1)]);
+        let delta = crate::config_delta::ConfigDelta::compute(&empty_config, &added_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &empty_config));
+
+        let old_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t0,
+        )]);
+        let new_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_http, &new_stream);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_http));
+
+        let old_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t0,
+        )]);
+        let new_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_stream, &new_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_stream));
     }
 
     #[test]
