@@ -76,7 +76,9 @@ PRs: format check → tests (parallel) → lint → perf regression → build 5 
 
 ### Startup
 
-jemalloc (non-Windows) → CLI parse + env overrides (before `CONF_FILE_CACHE`) → rustls ring provider → tracing-subscriber non-blocking stdout → `validate` exits here → secret resolution (single-threaded rt, `std::env::set_var` is unsafe with concurrent threads) → `EnvConfig` parse → multi-threaded tokio → mode dispatch → SIGINT/SIGTERM via `watch::channel`.
+jemalloc (non-Windows) → CLI parse + env overrides (before `CONF_FILE_CACHE`) → rustls ring provider → tracing-subscriber non-blocking stdout → `validate` exits here → secret resolution (single-threaded rt, `std::env::set_var` is unsafe with concurrent threads) → `overload::raise_fd_limit()` (Unix only; raises `RLIMIT_NOFILE.rlim_cur` to `rlim_max`, never asks for privileges we don't have, no-op when denied) → `EnvConfig` parse → multi-threaded tokio → mode dispatch → SIGINT/SIGTERM via `watch::channel`.
+
+**FD soft-cap raise**: `raise_fd_limit()` runs once after logging is up so the result reaches stderr/structured logs. We never attempt to raise the *hard* cap (it requires `CAP_SYS_RESOURCE`) — operators set the hard cap via `LimitNOFILE=` (systemd), `--ulimit nofile=` (Docker), or `/etc/security/limits.conf`. When the hard cap is below `FD_HARD_LIMIT_PRODUCTION_FLOOR` (65,536), startup emits a single structured `warn!` with the suggested remediation and continues. Below the floor the gateway will still serve, but its 95% FD-critical threshold trips earlier under load.
 
 Per serving mode: TLS policy → frontend TLS → admin TLS → DTLS → backend TLS validation → CP/DP gRPC TLS → stream port validation → stream listener bind (fatal in db/file, non-fatal in dp) → DNS warmup → connection pool warmup (if `FERRUM_POOL_WARMUP_ENABLED`) → overload monitor.
 
@@ -93,6 +95,8 @@ SIGTERM/SIGINT → accept loops exit → drain (`OverloadState.draining=true`, `
 ### Overload Manager (`src/overload.rs`)
 
 Progressive load shedding via atomic flags (`disable_keepalive`, `reject_new_connections`, `reject_new_requests`). Monitors FD, connections, requests, event-loop latency. Thresholds: FD ≥ 80% / Conn ≥ 85% / Req ≥ 85% → disable keepalive. FD ≥ 95% / Conn ≥ 95% / Loop ≥ 500ms → reject new connections. Req ≥ 95% → reject new requests (503 / gRPC UNAVAILABLE). `GET /overload` (unauth) returns pressure + `port_exhaustion_events`; 503 at critical. State transitions logged (warn enter, info recover) — no spam. RED probabilistic shedding between thresholds via golden-ratio hashing.
+
+Hot atomics on `OverloadState` (`disable_keepalive`, `reject_new_connections`, `reject_new_requests`, `active_connections`, `active_requests`, `red_drop_probability`, `red_request_counter`) are wrapped in `crossbeam_utils::CachePadded` so the read-mostly action flags don't share a cache line with the `fetch_add`/`fetch_sub` counters — at multi-core accept rates this prevents coherence-traffic stalls on the hot accept path. Snapshot fields (`fd_current`, `conn_current`, etc.), `port_exhaustion_events`, and `draining` are NOT padded (written ≤ 1 Hz or only on rare events). `CachePadded<T>` derefs to `T`, so all `.load()` / `.fetch_add()` call sites compile unchanged — do not unwrap or re-shape these fields.
 
 ### External Secret Resolution
 
@@ -273,6 +277,7 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 - `ProxyBody`-backed response coalescing uses one generic `Coalescing<S: FrameSource>` adapter in `src/proxy/body.rs` with three pluggable sources (`ReqwestFrameSource` for H1/H2-via-reqwest, `Incoming` for direct H2 / gRPC pool, `H3FrameSource` for native H3). Each path calls a thin builder (`coalescing_body`, `coalescing_h2_body`, `coalescing_h3_body`) over the shared adapter — there is no separate H1/H2/H3 `ProxyBody` coalescer to keep in sync. The H3 frontend cross-protocol bridge is separate (`src/http3/cross_protocol.rs`) because it writes directly to QUIC streams, but it shares the H3 coalescing knobs. Per-protocol bounds differ because native frame sizes differ: `FERRUM_HTTP3_COALESCE_MIN/MAX_BYTES` clamp to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]` (H3 framing is QUIC-packet-sized), `FERRUM_H2_COALESCE_TARGET_BYTES` clamps to `[16 KiB, 1 MiB]` (matches RFC 9113 default frame size). Latency-tracked H1/H2 paths inherit the same coalescing by composing `base_body.into_tracked(baseline)` over the regular streaming dispatch — no parallel "tracked" body builders.
 - Skip plugin phases when empty — guard with `plugins.is_empty()`.
 - **Every `reqwest::Client::builder()` must call `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`**. No production path should fall back to system DNS.
+- **Hot atomics use `CachePadded`** — see "Overload Manager" above. Co-locating a read-mostly action flag with a write-heavy counter on the same cache line forces inter-core coherence traffic on every load, turning a free atomic read into a pipeline stall under sustained load. Apply the same treatment to any new accept/dispatch-path atomic that is read concurrently with a hot writer.
 
 ### Protocol Paths
 

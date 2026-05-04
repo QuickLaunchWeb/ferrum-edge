@@ -88,6 +88,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
 ahash = "0.8"
 arc-swap = "1"
+# CachePadded for hot-path atomics in OverloadState. Already transitive via
+# tokio/dashmap; the explicit pin makes the surface intentional.
+crossbeam-utils = "0.8"
 bytes = "1"
 thiserror = "2"
 anyhow = "1"
