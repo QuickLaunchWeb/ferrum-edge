@@ -282,6 +282,136 @@ fn test_glob_empty_pattern() {
 }
 
 // ---------------------------------------------------------------------------
+// Glob security tightening — `*` must not consume URL-structural separators.
+//
+// Regression coverage for the URL-injection class where a permissive
+// operator pattern (`gemini-*`) would otherwise match a malicious user
+// input (`gemini-../foo:streamGenerateContent?key=stolen`) and route it
+// to the matching provider.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_glob_wildcard_does_not_cross_path_separator() {
+    // Without tightening, `*` would consume `../foo` and the glob would
+    // match. With the security fix, `/` inside the wildcard window
+    // breaks the match.
+    assert!(!test_helpers::glob_match("gemini-*", "gemini-../foo"));
+    assert!(!test_helpers::glob_match(
+        "gemini-*",
+        "gemini-../foo:streamGenerateContent"
+    ));
+}
+
+#[test]
+fn test_glob_wildcard_does_not_cross_query_or_fragment() {
+    assert!(!test_helpers::glob_match("gpt-*", "gpt-4o?key=leaked"));
+    assert!(!test_helpers::glob_match("gpt-*", "gpt-4o#admin"));
+    assert!(!test_helpers::glob_match("claude-*", "claude-3&x=y"));
+}
+
+#[test]
+fn test_glob_wildcard_does_not_cross_whitespace_or_backslash() {
+    assert!(!test_helpers::glob_match("model-*", "model-foo bar"));
+    assert!(!test_helpers::glob_match("model-*", "model-foo\\bar"));
+    assert!(!test_helpers::glob_match("model-*", "model-foo\nbar"));
+}
+
+#[test]
+fn test_glob_legitimate_versions_with_dots_and_colons_still_match() {
+    // Bedrock-style IDs contain `:` and `.` — both must remain matchable
+    // through `*` since they are legal in URL path segments and are
+    // load-bearing for AWS model identifiers.
+    assert!(test_helpers::glob_match(
+        "anthropic.*",
+        "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    ));
+    assert!(test_helpers::glob_match(
+        "*claude*",
+        "anthropic.claude-3-sonnet"
+    ));
+    assert!(test_helpers::glob_match("gemini-*", "gemini-1.5-pro"));
+}
+
+// ---------------------------------------------------------------------------
+// URL-path-component validator (CVE-class: URL injection via `model` field)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_url_model_component_accepts_legit_gemini_names() {
+    assert!(test_helpers::is_valid_url_model_component("gemini-1.5-pro"));
+    assert!(test_helpers::is_valid_url_model_component("gemini-pro"));
+    assert!(test_helpers::is_valid_url_model_component(
+        "gemini-2.0-flash"
+    ));
+}
+
+#[test]
+fn test_url_model_component_accepts_legit_bedrock_ids() {
+    assert!(test_helpers::is_valid_url_model_component(
+        "anthropic.claude-3-5-sonnet-20240620-v1:0"
+    ));
+    assert!(test_helpers::is_valid_url_model_component(
+        "meta.llama3-70b-instruct-v1:0"
+    ));
+    assert!(test_helpers::is_valid_url_model_component(
+        "anthropic.claude-3-sonnet-20240229-v1:0"
+    ));
+}
+
+#[test]
+fn test_url_model_component_rejects_path_traversal() {
+    assert!(!test_helpers::is_valid_url_model_component("gemini-../foo"));
+    assert!(!test_helpers::is_valid_url_model_component(
+        "gemini-../foo:streamGenerateContent"
+    ));
+    assert!(!test_helpers::is_valid_url_model_component(
+        "gemini-../foo:streamGenerateContent?key=stolen"
+    ));
+    // Even a bare `..` is rejected — both individual `.`s would otherwise
+    // pass the per-character allowlist.
+    assert!(!test_helpers::is_valid_url_model_component(".."));
+    assert!(!test_helpers::is_valid_url_model_component("a..b"));
+}
+
+#[test]
+fn test_url_model_component_rejects_url_separators() {
+    assert!(!test_helpers::is_valid_url_model_component("foo/bar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo?x=y"));
+    assert!(!test_helpers::is_valid_url_model_component("foo#frag"));
+    assert!(!test_helpers::is_valid_url_model_component("foo&x=y"));
+    assert!(!test_helpers::is_valid_url_model_component("foo\\bar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo bar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo\nbar"));
+    assert!(!test_helpers::is_valid_url_model_component("foo\tbar"));
+}
+
+#[test]
+fn test_url_model_component_rejects_empty_string() {
+    assert!(!test_helpers::is_valid_url_model_component(""));
+}
+
+#[test]
+fn test_url_model_component_rejects_unicode_lookalikes() {
+    // Non-ASCII characters fall outside the allow-list. Reject so that
+    // homoglyph attacks (e.g. Cyrillic `р`) cannot bypass the validator.
+    assert!(!test_helpers::is_valid_url_model_component("gpt-4о"));
+    assert!(!test_helpers::is_valid_url_model_component("modеl"));
+}
+
+#[test]
+fn test_provider_embeds_model_in_url_correctness() {
+    // Only Gemini, Vertex, and Bedrock embed the resolved model directly
+    // in the URL path. Other providers put it in the request body.
+    assert!(test_helpers::provider_embeds_model_in_url("google_gemini").unwrap());
+    assert!(test_helpers::provider_embeds_model_in_url("google_vertex").unwrap());
+    assert!(test_helpers::provider_embeds_model_in_url("aws_bedrock").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("openai").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("anthropic").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("cohere").unwrap());
+    assert!(!test_helpers::provider_embeds_model_in_url("azure_openai").unwrap());
+}
+
+// ---------------------------------------------------------------------------
 // Request translation tests
 // ---------------------------------------------------------------------------
 

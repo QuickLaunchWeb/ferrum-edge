@@ -707,7 +707,27 @@ fn validate_provider_config(
 // Model routing
 // ---------------------------------------------------------------------------
 
-/// Simple glob match supporting only `*` as a wildcard (matches any sequence).
+/// Characters a `*` wildcard in a `model_patterns` glob is NOT allowed to
+/// consume.
+///
+/// This is the security tightening for `simple_glob_match`. Without this,
+/// an operator pattern like `gemini-*` would match a malicious user input
+/// such as `gemini-../foo:streamGenerateContent?key=stolen` and let
+/// `find_providers_for_model` route the request to a Gemini provider that
+/// then concatenates the user-controlled string into the URL path. The
+/// charset below covers every URL-structural separator (path traversal,
+/// query/fragment introducers, alternate path separators) plus
+/// whitespace and control-style characters that have no business in a
+/// model identifier. Compare with fnmatch(3) where `*` does not cross `/`.
+const GLOB_WILDCARD_FORBIDDEN_CHARS: &[char] = &['/', '?', '#', '&', '\\', ' ', '\t', '\n', '\r'];
+
+/// Simple glob match supporting only `*` as a wildcard.
+///
+/// `*` matches any sequence of characters EXCEPT those listed in
+/// [`GLOB_WILDCARD_FORBIDDEN_CHARS`]. The pattern is implicitly anchored to
+/// the start and end of the input — there is no "starts-with" mode. The
+/// literal segments between `*` markers must appear in order without
+/// overlapping the forbidden character set inside any `*` window.
 fn simple_glob_match(pattern: &str, input: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
@@ -726,6 +746,15 @@ fn simple_glob_match(pattern: &str, input: &str) -> bool {
             if i == 0 && found != 0 {
                 return false;
             }
+            // The substring `*` consumed (between the previous match end
+            // and the next literal) must not contain any URL-structural
+            // separator. Without this, `gemini-*` would match
+            // `gemini-../foo:streamGenerateContent` and let the dispatcher
+            // route a path-traversing model to a real Gemini provider.
+            let gap = &input[pos..pos + found];
+            if gap.contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
+                return false;
+            }
             pos += found + part.len();
         } else {
             return false;
@@ -737,7 +766,55 @@ fn simple_glob_match(pattern: &str, input: &str) -> bool {
         return false;
     }
 
+    // Trailing `*` window — the remainder must also not contain URL separators.
+    if pattern.ends_with('*') && input[pos..].contains(GLOB_WILDCARD_FORBIDDEN_CHARS) {
+        return false;
+    }
+
     true
+}
+
+/// Validate that a resolved model name is safe to substitute into a URL
+/// path component.
+///
+/// Three providers (Google Gemini, Google Vertex AI, AWS Bedrock) embed
+/// the resolved model directly in the URL path (`prefix + model +
+/// suffix`). Without validation, a user-supplied `model` field can steer
+/// the request to a different provider API path on the operator's API
+/// key — e.g. `gemini-../streamGenerateContent?key=stolen` collapses to
+/// a different endpoint after URL normalization.
+///
+/// Allowed charset: `[A-Za-z0-9._:-]`. The colon is required for AWS
+/// Bedrock model identifiers like
+/// `anthropic.claude-3-5-sonnet-20240620-v1:0`. The dot is required for
+/// every provider's versioning scheme. The hyphen and underscore cover
+/// the rest of the legitimate model-name space across all three.
+///
+/// Additionally, `..` is rejected outright — even though both `.`
+/// characters are in the allowed set individually, the sequence is the
+/// canonical path-traversal token after URL normalization.
+fn is_valid_url_model_component(model: &str) -> bool {
+    if model.is_empty() {
+        return false;
+    }
+    if model.contains("..") {
+        return false;
+    }
+    model
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' || b == b':')
+}
+
+/// Whether a provider embeds the resolved model directly in the URL path.
+///
+/// Only these providers are vulnerable to URL injection via the `model`
+/// field — for OpenAI-compatible / Anthropic / Cohere providers the
+/// model goes into the request body, not the URL.
+fn provider_embeds_model_in_url(provider_type: ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::GoogleGemini | ProviderType::GoogleVertex | ProviderType::AwsBedrock
+    )
 }
 
 impl AiFederation {
@@ -1574,6 +1651,31 @@ impl Plugin for AiFederation {
             let is_last_provider = idx + 1 == provider_count;
             let resolved_model = Self::resolve_model(provider, &model);
 
+            // Defense against URL injection via the user-controlled `model`
+            // field for providers that embed the resolved model directly in
+            // the URL path (Gemini, Vertex AI, Bedrock). Without this, a
+            // request with `"model": "gemini-../foo:streamGenerateContent"`
+            // and a permissive `model_patterns: ["gemini-*"]` (or no
+            // patterns at all — empty == catch-all) reaches
+            // `build_provider_url` with an attacker-controlled path
+            // component on the operator's API key. Reject early — do not
+            // fall through to the next provider, since the dangerous
+            // payload would just hit a different provider's URL.
+            if provider_embeds_model_in_url(provider.provider_type)
+                && !is_valid_url_model_component(&resolved_model)
+            {
+                warn!(
+                    provider = %provider.name,
+                    provider_type = %provider.provider_type.as_str(),
+                    model = %resolved_model,
+                    "ai_federation: rejected request — resolved model contains characters not permitted in URL path"
+                );
+                return self.error_response(
+                    400,
+                    "Invalid 'model' field: must contain only alphanumeric characters, dot, hyphen, underscore, or colon",
+                );
+            }
+
             let translated = match translate_request(provider, &openai_body, &resolved_model) {
                 Ok(t) => t,
                 Err(e) => {
@@ -1800,6 +1902,17 @@ pub mod test_helpers {
     /// Expose glob matching for tests.
     pub fn glob_match(pattern: &str, input: &str) -> bool {
         simple_glob_match(pattern, input)
+    }
+
+    /// Expose the URL-path-component validator for tests.
+    pub fn is_valid_url_model_component(model: &str) -> bool {
+        super::is_valid_url_model_component(model)
+    }
+
+    /// Expose the URL-embedding provider classifier for tests.
+    pub fn provider_embeds_model_in_url(provider_type: &str) -> Result<bool, String> {
+        let pt = ProviderType::from_str(provider_type)?;
+        Ok(super::provider_embeds_model_in_url(pt))
     }
 
     /// Expose request translation for tests.
