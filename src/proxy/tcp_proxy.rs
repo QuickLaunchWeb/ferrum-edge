@@ -1004,12 +1004,25 @@ async fn handle_tcp_connection_inner(
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
+    // Bound the passthrough SNI peek by the same deadline as terminating-TLS
+    // handshakes. Without this, a peer that opens a TCP connection and never
+    // writes a ClientHello would park the connection-handler task indefinitely.
+    // `0` keeps the historical "no timeout" behavior for operators who explicitly
+    // disable the handshake clock.
+    let sni_peek_timeout = if frontend_tls_handshake_timeout_seconds > 0 {
+        Some(std::time::Duration::from_secs(
+            frontend_tls_handshake_timeout_seconds,
+        ))
+    } else {
+        None
+    };
+
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
     // the ClientHello to extract SNI before looking up the proxy config.
     let _resolved_proxy_id: Option<String>;
     let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
-        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
+        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
         let current_config = config.load();
@@ -1089,7 +1102,8 @@ async fn handle_tcp_connection_inner(
         // Peek at the ClientHello to extract SNI for logging/routing.
         // Skip if already extracted during SNI-based proxy resolution above.
         if stream_ctx.sni_hostname.is_none() {
-            stream_ctx.sni_hostname = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
+            stream_ctx.sni_hostname =
+                super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         }
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
