@@ -2292,6 +2292,114 @@ impl ProxyState {
         })
     }
 
+    /// Run the full validation pipeline against a candidate config and reject
+    /// it if any rejecting validator fails. Should be called AFTER
+    /// `resolve_upstream_tls()` / `resolve_dispatch_kind()` and BEFORE the
+    /// `ArcSwap::store()` that publishes the new config to the hot path.
+    ///
+    /// **Validator categories** (matching the long-standing semantics of
+    /// `apply_incremental` — see `db_loader.rs::load_full_config()` and
+    /// `dp_client.rs::handle_full_snapshot` for the corresponding call-site
+    /// gates that pre-filter before this helper runs):
+    ///
+    /// - *Warn-only* — emit `warn!` but never reject:
+    ///   - `validate_all_fields_with_ip_policy` (TLS cert paths, expiry,
+    ///     `FERRUM_BACKEND_ALLOW_IPS` policy). The DB / DP contract is
+    ///     "data is already persisted; warn rather than block reload" so a
+    ///     stale TLS path or a single misconfigured backend IP doesn't
+    ///     freeze the entire control plane.
+    ///   - `validate_hosts` (hostname syntax). Same rationale.
+    ///
+    /// - *Reject* — accumulate into the returned error vector and abort
+    ///   the reload:
+    ///   - `validate_regex_listen_paths` — uncompilable regex would
+    ///     silently skip routes at runtime.
+    ///   - `validate_unique_listen_paths` — overlapping listen paths
+    ///     would route non-deterministically.
+    ///   - `validate_stream_proxies` — stream-family invariants (no
+    ///     `listen_path`, mandatory `listen_port`, etc.).
+    ///   - `validate_upstream_references` — dangling upstream IDs would
+    ///     500 every request through that proxy.
+    ///   - `validate_plugin_references` — dangling plugin IDs / wrong
+    ///     scope.
+    ///   - `validate_stream_proxy_port_conflicts` — rejects in non-DP
+    ///     modes, warns in DP mode (the DP doesn't control its config and
+    ///     one bad stream proxy port shouldn't block all other config
+    ///     updates pushed by the CP).
+    ///
+    /// **Why this lives inside the swap path:** every existing caller
+    /// (`file_loader`, `db_loader`, `dp_client`) already validates before
+    /// calling `update_config` / `apply_incremental`, but the contract
+    /// "validate fully BEFORE swap" must be honored by the swap function
+    /// itself so a future call site (e.g. an admin "import config" handler)
+    /// cannot publish an invalid config to the hot path. Existing call-site
+    /// validation becomes defense-in-depth — the canonical guard is here.
+    ///
+    /// Reject errors are accumulated into a single `Vec<String>` so callers
+    /// can log every reason in one pass instead of discovering them
+    /// iteratively across reloads.
+    fn validate_full_config(&self, config: &GatewayConfig) -> Result<(), Vec<String>> {
+        // Warn-only — TLS field validation (cert paths, expiry, IP policy).
+        if let Err(errors) = config.validate_all_fields_with_ip_policy(
+            self.env_config.tls_cert_expiry_warning_days,
+            &self.env_config.backend_allow_ips,
+        ) {
+            for msg in &errors {
+                warn!("Config field validation: {}", msg);
+            }
+        }
+
+        // Warn-only — hostname syntax.
+        if let Err(errors) = config.validate_hosts() {
+            for msg in &errors {
+                warn!("Config validation: {}", msg);
+            }
+        }
+
+        // Reject — collect all rejecting-validator failures into a single
+        // error vector so callers can log every reason at once instead of
+        // discovering them iteratively across reloads.
+        let mut errors: Vec<String> = Vec::new();
+        if let Err(errs) = config.validate_regex_listen_paths() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_unique_listen_paths() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_stream_proxies() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_upstream_references() {
+            errors.extend(errs);
+        }
+        if let Err(errs) = config.validate_plugin_references() {
+            errors.extend(errs);
+        }
+
+        // Stream proxy port conflicts — reject in non-DP modes, warn in DP
+        // mode. The DP doesn't control its config and one bad stream proxy
+        // port shouldn't block all other config updates pushed by the CP.
+        let reserved_ports = self.env_config.reserved_gateway_ports();
+        if let Err(errs) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errs {
+                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
+                }
+            } else {
+                errors.extend(errs);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Apply a new configuration, using incremental (surgical) updates when
     /// possible to avoid disrupting the hot request path.
     ///
@@ -2432,30 +2540,27 @@ impl ProxyState {
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
+        // Normalize hostnames (ASCII-lowercase) and pre-compute each
+        // proxy's `dispatch_kind` for O(1) hot-path dispatch. Both must run
+        // before any request reads `proxy.dispatch_kind`.
+        // `normalize_fields()` calls `resolve_dispatch_kind()` internally
+        // (see `GatewayConfig::normalize_fields` rustdoc) so we don't need
+        // a separate call here.
+        new_config.normalize_fields();
         // Resolve upstream TLS into each proxy's resolved_tls before applying.
         new_config.resolve_upstream_tls();
-        // Pre-compute each proxy's dispatch_kind for O(1) hot-path dispatch.
-        // Must run before any request reads proxy.dispatch_kind.
-        new_config.resolve_dispatch_kind();
 
-        // Validate stream proxy port conflicts before applying any config.
-        // In DP mode, warn but don't reject — the DP doesn't control its config
-        // and one bad stream proxy port shouldn't block all other config updates.
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            if matches!(
-                self.env_config.mode,
-                crate::config::env_config::OperatingMode::DataPlane
-            ) {
-                for msg in &errors {
-                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
-                }
-            } else {
-                for msg in &errors {
-                    error!("Config reload rejected: {}", msg);
-                }
-                return false;
+        // Run the full validation pipeline before swapping. Existing call
+        // sites (`file_loader`, `db_loader`, `dp_client`) validate first, so
+        // this is defense-in-depth for them — but the canonical "validate
+        // fully BEFORE swap" guard must live inside the swap function so a
+        // future caller (e.g. an admin "import config" handler) cannot
+        // publish an invalid config to the hot path.
+        if let Err(errors) = self.validate_full_config(&new_config) {
+            for msg in &errors {
+                error!("Config reload rejected: {}", msg);
             }
+            return false;
         }
 
         let old_config = self.config.load_full();
@@ -2919,70 +3024,18 @@ impl ProxyState {
 
         new_config.loaded_at = result.poll_timestamp;
 
-        // Validate the patched config before applying (same validations as load_full_config)
+        // Validate the patched config before applying. `validate_full_config`
+        // is the shared validation pipeline used by both `update_config` and
+        // `apply_incremental` so the two swap paths cannot drift in what they
+        // accept. Normalize + resolve must run first so the validators see
+        // canonicalized fields.
         new_config.normalize_fields();
         new_config.resolve_upstream_tls();
-        if let Err(errors) = new_config.validate_all_fields_with_ip_policy(
-            self.env_config.tls_cert_expiry_warning_days,
-            &self.env_config.backend_allow_ips,
-        ) {
-            for msg in &errors {
-                warn!("Incremental config field validation: {}", msg);
-            }
-        }
-        if let Err(errors) = new_config.validate_hosts() {
-            for msg in &errors {
-                warn!("Incremental config validation: {}", msg);
-            }
-        }
-        if let Err(errors) = new_config.validate_regex_listen_paths() {
+        if let Err(errors) = self.validate_full_config(&new_config) {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
             return IncrementalApplyOutcome::Rejected;
-        }
-        if let Err(errors) = new_config.validate_unique_listen_paths() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return IncrementalApplyOutcome::Rejected;
-        }
-        if let Err(errors) = new_config.validate_stream_proxies() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return IncrementalApplyOutcome::Rejected;
-        }
-        if let Err(errors) = new_config.validate_upstream_references() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return IncrementalApplyOutcome::Rejected;
-        }
-        if let Err(errors) = new_config.validate_plugin_references() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return IncrementalApplyOutcome::Rejected;
-        }
-        let reserved_ports = self.env_config.reserved_gateway_ports();
-        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            if matches!(
-                self.env_config.mode,
-                crate::config::env_config::OperatingMode::DataPlane
-            ) {
-                for msg in &errors {
-                    warn!(
-                        "Incremental stream proxy port conflict (non-fatal in DP mode): {}",
-                        msg
-                    );
-                }
-            } else {
-                for msg in &errors {
-                    error!("Incremental config rejected: {}", msg);
-                }
-                return IncrementalApplyOutcome::Rejected;
-            }
         }
 
         // Build a ConfigDelta against old + new to get proper
@@ -12638,5 +12691,191 @@ mod tests {
             "task without shutdown receiver should keep ticking"
         );
         handle.abort();
+    }
+
+    // ── update_config / validate_full_config: validate-before-swap contract ──
+    //
+    // These tests pin down the canonical "validate fully BEFORE swap"
+    // guard inside `update_config`. Existing call sites (file_loader,
+    // db_loader, dp_client) all pre-validate, but the swap function MUST
+    // also reject malformed configs so a future caller (e.g. an admin
+    // "import config" handler that deserializes JSON straight into
+    // `update_config`) cannot publish an invalid config to the hot path.
+    //
+    // See `validate_full_config()` rustdoc for the warn-vs-reject
+    // categorization and rationale.
+
+    fn make_test_proxy_state(initial_config: GatewayConfig) -> ProxyState {
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        ProxyState::new(initial_config, dns_cache, env_config, None, None)
+            .expect("ProxyState construction should succeed in tests")
+            .0
+    }
+
+    fn make_validation_proxy(id: &str, listen_path: &str) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": "ferrum",
+            "name": "test-proxy",
+            "hosts": [],
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true,
+        }))
+        .expect("validation test proxy should deserialize")
+    }
+
+    fn make_validation_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            version: "1".to_string(),
+            proxies,
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_malformed_regex_listen_path() {
+        // "Malformed hosts" in the validate-before-swap sense — a
+        // listen_path that starts with `~` (regex marker) but is not a
+        // compilable regex. `validate_regex_listen_paths` is a hard
+        // reject in `apply_incremental`; the helper must mirror that.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let bad = make_validation_proxy("p1", "~[unclosed");
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("malformed regex listen_path must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("regex listen_path")),
+            "error must mention regex listen_path; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_upstream_reference() {
+        // Stand-in for "out-of-policy backend IP" — a config-shape error
+        // that `apply_incremental` rejects. (`validate_all_fields_with_ip_policy`
+        // is warn-only by design — the DB / DP "data already persisted"
+        // contract — see `validate_full_config` rustdoc.)
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.upstream_id = Some("does-not-exist".to_string());
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling upstream_id must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("upstream")),
+            "error must reference the missing upstream; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_dangling_plugin_reference() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let bad: Proxy = serde_json::from_value(json!({
+            "id": "p1",
+            "namespace": "ferrum",
+            "name": "test-proxy",
+            "hosts": [],
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true,
+            "plugins": [
+                { "plugin_config_id": "missing-plugin-config-id" }
+            ],
+        }))
+        .expect("plugin-ref validation test proxy should deserialize");
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("dangling plugin reference must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("plugin")),
+            "error must reference the missing plugin; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_accepts_valid_config() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let good = make_validation_proxy("p1", "/api");
+        let good_config = make_validation_config(vec![good]);
+
+        assert!(
+            state.validate_full_config(&good_config).is_ok(),
+            "minimal valid config must pass validate_full_config"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_invalid_config_without_swapping() {
+        // End-to-end check: when validate_full_config rejects, the swap
+        // must not happen. This is the security-relevant contract — a
+        // future "import config" admin handler that calls update_config
+        // with attacker-shaped input cannot poison the running config.
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let pre_swap_loaded_at = state.config.load_full().loaded_at;
+
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.upstream_id = Some("does-not-exist".to_string());
+        let bad_config = make_validation_config(vec![bad]);
+
+        assert!(
+            !state.update_config(bad_config),
+            "update_config must return false when validation rejects the new config"
+        );
+
+        let post_attempt_config = state.config.load_full();
+        assert!(
+            post_attempt_config.proxies.is_empty(),
+            "rejected config must not have been swapped — proxies should still be empty"
+        );
+        assert_eq!(
+            post_attempt_config.loaded_at, pre_swap_loaded_at,
+            "loaded_at must not advance when a config is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_applies_valid_config() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let good = make_validation_proxy("p1", "/api");
+        let good_config = make_validation_config(vec![good]);
+
+        assert!(
+            state.update_config(good_config),
+            "update_config must return true for a valid initial config"
+        );
+
+        let post = state.config.load_full();
+        assert_eq!(
+            post.proxies.len(),
+            1,
+            "valid config must be swapped into hot state"
+        );
+        assert_eq!(post.proxies[0].id, "p1");
     }
 }
