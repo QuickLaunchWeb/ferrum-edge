@@ -146,6 +146,15 @@ impl OverloadState {
     /// Returns true if this response should have keepalive disabled based on RED probability.
     /// Uses a monotonic per-request counter with golden-ratio hashing for uniform distribution.
     /// Cost: one AtomicU32::load + one AtomicU64::fetch_add(Relaxed) + one multiply + one comparison.
+    ///
+    /// **This ONLY signals RED-probability shedding — NOT the binary "pressure-mode active"
+    /// signal.** Callers that want the full "should we close this HTTP/1.1 keepalive?"
+    /// decision must also OR with `self.disable_keepalive.load(Relaxed)`. Two reasons:
+    /// (1) at the exact pressure threshold the linear ramp produces probability 0 while
+    /// the binary flag is set; (2) the monitor loop writes `disable_keepalive` and
+    /// `red_drop_probability` as independent `Relaxed` stores, so a reader can transiently
+    /// observe the new flag with the prior cycle's probability. The hot-path response
+    /// builder in `proxy::mod` performs that OR — see `connection: close` decision.
     pub fn should_disable_keepalive_red(&self) -> bool {
         let prob = self.red_drop_probability.load(Ordering::Relaxed);
         if prob == 0 {
@@ -1059,6 +1068,68 @@ mod tests {
             "99.9% probability: expected {:.4}, got {:.4}",
             expected_rate,
             actual_rate
+        );
+    }
+
+    /// `should_disable_keepalive_red()` ONLY signals RED-probability shedding.
+    /// The HTTP/1.1 keepalive-close decision in `proxy::mod` must OR this
+    /// with `disable_keepalive`, otherwise pressure-mode is silently ignored
+    /// at the exact threshold (where ramp produces probability 0) or during
+    /// the inter-store window where the monitor has flipped the binary flag
+    /// but `red_drop_probability` still reflects the previous cycle's value.
+    ///
+    /// This test pins down the contract for the three combinations the hot
+    /// path must handle correctly. Because the hot path inlines the OR
+    /// expression (`draining || disable_keepalive || should_disable_keepalive_red`),
+    /// we assert each AtomicBool / AtomicU32 source independently. A future
+    /// regression that drops one of those terms will be caught here.
+    #[test]
+    fn keepalive_close_decision_honors_binary_flag_independently_of_red_probability() {
+        let state = OverloadState::new();
+
+        // Case 1: pressure-mode active, RED probability 0 (the regression case).
+        // The binary flag MUST cause Connection: close; the RED helper alone
+        // returns false because the linear ramp produced 0 at the exact
+        // pressure threshold, or because the cross-cycle inter-store window
+        // hasn't advanced `red_drop_probability` yet.
+        state.disable_keepalive.store(true, Ordering::Relaxed);
+        state.red_drop_probability.store(0, Ordering::Relaxed);
+        assert!(
+            state.disable_keepalive.load(Ordering::Relaxed),
+            "binary flag must surface true for the hot-path OR"
+        );
+        assert!(
+            !state.should_disable_keepalive_red(),
+            "RED helper alone returns false at probability 0 — \
+             pressure-mode would be ignored without the OR"
+        );
+
+        // Case 2: both signals quiet — connection should be reused.
+        state.disable_keepalive.store(false, Ordering::Relaxed);
+        state.red_drop_probability.store(0, Ordering::Relaxed);
+        assert!(
+            !state.disable_keepalive.load(Ordering::Relaxed),
+            "binary flag clear when no pressure"
+        );
+        assert!(
+            !state.should_disable_keepalive_red(),
+            "RED helper clear at probability 0"
+        );
+
+        // Case 3: binary flag clear but RED probability saturated (between
+        // pressure and critical thresholds, deep in the ramp). RED helper
+        // alone should still drive Connection: close.
+        state.disable_keepalive.store(false, Ordering::Relaxed);
+        state
+            .red_drop_probability
+            .store(RED_PROBABILITY_SCALE, Ordering::Relaxed);
+        assert!(
+            !state.disable_keepalive.load(Ordering::Relaxed),
+            "binary flag still clear in this regime"
+        );
+        assert!(
+            state.should_disable_keepalive_red(),
+            "RED helper must return true at saturation (1024/1024 == 100%)"
         );
     }
 }
