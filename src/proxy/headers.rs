@@ -49,13 +49,149 @@ pub fn is_backend_request_strip_header(name: &str) -> bool {
     )
 }
 
+/// Parse the lowercased header names listed in any `Connection` header(s),
+/// per RFC 9110 §7.6.1. Walks every value of `Connection`, splits each value
+/// by `,`, trims OWS, lowercases, parses to `HeaderName`, deduplicates.
+///
+/// Returns an empty `Vec` when `Connection` is absent or every list element
+/// is malformed / unparseable as a header name. Unparseable elements are
+/// silently skipped (no panic, no error) so a single bad token cannot
+/// blow up the strip pass — RFC 9110 mandates strip on a best-effort basis.
+///
+/// Hyper rejects `Connection` headers in HTTP/2 and HTTP/3 (RFC 9113 §8.2.2,
+/// RFC 9114 §4.2), so this helper is only meaningful on the HTTP/1.1 path.
+/// Calling it on H2/H3 maps is a no-op (no `Connection` value to walk).
+///
+/// This is called BEFORE the canonical hop-by-hop strip so the listed names
+/// are captured before `connection` itself is removed by the static
+/// allowlist.
+pub fn parse_connection_listed_headers(headers: &http::HeaderMap) -> Vec<http::HeaderName> {
+    // Typical: 0 listed names (Connection just carries `close` or `keep-alive`,
+    // which the static strip handles via `keep-alive`/Connection itself).
+    // Reserve a small upper bound to avoid rehashing on the rare case of a
+    // multi-value list.
+    let mut out: Vec<http::HeaderName> = Vec::new();
+    for value in headers.get_all(http::header::CONNECTION).iter() {
+        let Ok(s) = value.to_str() else {
+            // Non-ASCII / non-visible bytes — RFC 9110 §5.5 says field values
+            // are printable ASCII / OWS, so anything else is malformed and we
+            // skip the value entirely (matching the spec's best-effort tone).
+            continue;
+        };
+        for token in s.split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // The static strip already handles `connection`, `keep-alive`,
+            // `close`, and the rest of the canonical hop-by-hop set, so we
+            // could skip them here as a micro-optimisation. We don't —
+            // `HeaderMap::remove` of a name that isn't present is O(1) and
+            // the dedup pass below means any name only appears once. Skipping
+            // would just add a branch.
+            //
+            // Note: `close` is NOT a valid `HeaderName` (it's a *connection
+            // option*, not a header), so `HeaderName::from_bytes` will reject
+            // it and we move on.
+            //
+            // We lowercase via `HeaderName`'s case-insensitive parse: the
+            // `HeaderName` API normalises ASCII case on construction, so the
+            // returned name is suitable for comparison against lowercase
+            // string keys elsewhere in the proxy.
+            let Ok(name) = http::HeaderName::from_bytes(trimmed.as_bytes()) else {
+                continue;
+            };
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// In-place strip of every header named in the `Connection` field, per
+/// RFC 9110 §7.6.1. Companion to [`strip_backend_request_headers`] — call
+/// this BEFORE the canonical strip so the listed names are captured before
+/// `connection` itself is removed.
+///
+/// For convenience [`strip_backend_request_headers`] already calls this
+/// helper as its first step; direct callers only need to invoke it
+/// when working with a `HeaderMap` outside the request-build pipeline.
+pub fn strip_connection_listed_headers(headers: &mut http::HeaderMap) {
+    // Snapshot first — we cannot iterate `Connection` while mutating the
+    // map. The Vec is empty when no `Connection` header is present, making
+    // this a near-zero-cost no-op for the common case (most clients omit
+    // `Connection` entirely on H1.1).
+    let listed = parse_connection_listed_headers(headers);
+    for name in listed {
+        headers.remove(&name);
+    }
+}
+
+/// String-flavored counterpart to [`parse_connection_listed_headers`] for
+/// dispatch sites that iterate a materialised `&HashMap<String, String>`
+/// (e.g. `proxy::proxy_to_backend_retry`, the H3 client builders, the
+/// H3 server cross-protocol bridge). Returns the listed header names in
+/// lowercase ASCII.
+///
+/// `headers` is expected to use lowercase keys — Ferrum normalises header
+/// names at admission via the plugin pipeline, and HTTP/2 / HTTP/3 deliver
+/// names in lowercase per RFC 9113 §8.2.2 / RFC 9114 §4.2. Callers that
+/// might receive mixed-case keys should look up `connection` directly
+/// (the canonical strip predicate already does case-insensitive
+/// matching via lowercase normalisation).
+///
+/// Unparseable list elements are skipped (no panic). Empty / absent
+/// `Connection` returns an empty `Vec`.
+pub fn parse_connection_listed_from_str_map(
+    headers: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let Some(value) = headers.get("connection") else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    // The materialised request map folds multi-valued headers with `, `
+    // (see the request handler), so a single string lookup covers every
+    // value RFC 9110 considers part of the `Connection` field.
+    for token in value.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Validate as a header name to reject garbage tokens (e.g. `close`,
+        // `keep-alive` strip themselves; arbitrary smuggling attempts like
+        // `\r\nX-Foo:` get rejected here). Lowercase the result for the
+        // caller's convenience — it matches the plugin pipeline's lowercase
+        // key invariant.
+        let Ok(name) = http::HeaderName::from_bytes(trimmed.as_bytes()) else {
+            continue;
+        };
+        let lower = name.as_str().to_owned();
+        if !out.contains(&lower) {
+            out.push(lower);
+        }
+    }
+    out
+}
+
 /// In-place strip of every backend-request hop-by-hop header from a
-/// `http::HeaderMap`. Equivalent to `headers.retain(|n, _| !is_backend_request_strip_header(n.as_str()))`,
-/// except that `http::HeaderMap` does not expose `retain`, so we collect
-/// the matching keys with the small-vec optimisation in mind (typical
-/// strip count is 0-2 per request — `connection` and maybe `te` /
-/// `proxy-connection` from misbehaving clients).
+/// `http::HeaderMap`, including any header NAMED in the request's
+/// `Connection` field (RFC 9110 §7.6.1).
+///
+/// The Connection-listed strip runs FIRST — we must snapshot the listed
+/// names before `connection` itself is removed by the static allowlist. The
+/// Vec collected for the static strip covers the typical 0-2 names per
+/// request (`connection` and maybe `te` / `proxy-connection` from
+/// misbehaving clients). `http::HeaderMap` does not expose `retain`, so we
+/// collect the matching keys with the small-vec optimisation in mind.
 pub fn strip_backend_request_headers(headers: &mut http::HeaderMap) {
+    // RFC 9110 §7.6.1 Connection-listed strip MUST run before the canonical
+    // strip so the `Connection` header value is still present and we can
+    // walk it. This protects against `Connection: X-Sensitive` smuggling
+    // where the client (or an upstream intermediary) names a header that
+    // would otherwise pass through the static allowlist.
+    strip_connection_listed_headers(headers);
+
     let to_remove: Vec<http::HeaderName> = headers
         .keys()
         .filter(|name| is_backend_request_strip_header(name.as_str()))
@@ -150,6 +286,14 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
             | "upgrade"
     )
 }
+
+// NOTE: There is no `strip_connection_listed_response_headers` helper
+// because no response dispatch site holds a `&mut HeaderMap` long enough
+// to need it — they all collect from `&HeaderMap` into a
+// `HashMap<String, String>` and apply the strip in the same pass via
+// `parse_connection_listed_headers`. If a future caller needs in-place
+// removal on a response `HeaderMap`, just call
+// `parse_connection_listed_headers` and `remove` each returned name.
 
 #[cfg(test)]
 mod tests {
@@ -390,6 +534,306 @@ mod tests {
 
         merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
 
+        assert_eq!(
+            headers.get(http::header::TE),
+            Some(&http::HeaderValue::from_static("trailers"))
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 9110 §7.6.1 Connection-listed hop-by-hop strip — request and
+    // response directions. The Connection header lets either party name
+    // ADDITIONAL hop-by-hop headers; the proxy must remove every one of
+    // them before forwarding.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn connection_listed_strip_removes_single_named_header() {
+        // `Connection: x-foo` — the simplest case. `x-foo` must be
+        // stripped from the request; the static allowlist alone would not
+        // know to remove it.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("x-foo"),
+        );
+        headers.insert("x-foo", http::HeaderValue::from_static("secret"));
+        headers.insert("x-keep", http::HeaderValue::from_static("ok"));
+
+        strip_backend_request_headers(&mut headers);
+
+        assert!(
+            headers.get("x-foo").is_none(),
+            "Connection-listed header `x-foo` must be stripped per RFC 9110 §7.6.1"
+        );
+        assert_eq!(
+            headers.get("x-keep"),
+            Some(&http::HeaderValue::from_static("ok")),
+            "non-listed headers must pass through"
+        );
+        // `connection` itself is removed by the canonical static strip.
+        assert!(headers.get(http::header::CONNECTION).is_none());
+    }
+
+    #[test]
+    fn connection_listed_strip_removes_multiple_named_headers() {
+        // `Connection: x-foo, x-bar` — comma-separated list semantics.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("x-foo, x-bar"),
+        );
+        headers.insert("x-foo", http::HeaderValue::from_static("secret-a"));
+        headers.insert("x-bar", http::HeaderValue::from_static("secret-b"));
+        headers.insert("x-keep", http::HeaderValue::from_static("ok"));
+
+        strip_backend_request_headers(&mut headers);
+
+        assert!(headers.get("x-foo").is_none());
+        assert!(headers.get("x-bar").is_none());
+        assert_eq!(
+            headers.get("x-keep"),
+            Some(&http::HeaderValue::from_static("ok"))
+        );
+    }
+
+    #[test]
+    fn connection_listed_strip_is_case_insensitive() {
+        // `Connection: X-Foo, KEEP-ALIVE` — mixed case must still strip.
+        // HeaderName normalises ASCII case on construction so the
+        // comparison is naturally case-insensitive.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("X-Foo, KEEP-ALIVE"),
+        );
+        headers.insert("x-foo", http::HeaderValue::from_static("secret"));
+        headers.insert("keep-alive", http::HeaderValue::from_static("timeout=30"));
+
+        strip_backend_request_headers(&mut headers);
+
+        assert!(
+            headers.get("x-foo").is_none(),
+            "case-insensitive Connection-listed strip must remove `x-foo`"
+        );
+        // `keep-alive` is doubly stripped (canonical + Connection-listed);
+        // either path removes it.
+        assert!(headers.get("keep-alive").is_none());
+    }
+
+    #[test]
+    fn connection_listed_strip_handles_garbage_tokens_without_panic() {
+        // Malformed list elements (empty, whitespace-only, illegal name
+        // characters) must not panic. Parseable elements are still stripped.
+        // `HeaderValue::from_static` rejects raw control bytes, so we use
+        // visible-ASCII garbage tokens that `HeaderName::from_bytes` will
+        // refuse: `:` is not a valid token char per RFC 9110 §5.6.2, and
+        // a leading `\r\n` would be illegal — we exercise the simpler
+        // "syntactically invalid" path here.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            // Leading/trailing comma + whitespace + a token containing
+            // colon (forbidden in header names).
+            http::HeaderValue::from_static(", , x-foo, bad:token, x-bar,"),
+        );
+        headers.insert("x-foo", http::HeaderValue::from_static("a"));
+        headers.insert("x-bar", http::HeaderValue::from_static("b"));
+        headers.insert("x-keep", http::HeaderValue::from_static("c"));
+
+        strip_backend_request_headers(&mut headers);
+
+        // Parseable tokens are stripped.
+        assert!(headers.get("x-foo").is_none());
+        assert!(headers.get("x-bar").is_none());
+        // Unrelated header survives.
+        assert_eq!(
+            headers.get("x-keep"),
+            Some(&http::HeaderValue::from_static("c"))
+        );
+    }
+
+    #[test]
+    fn connection_listed_strip_handles_empty_value() {
+        // `Connection:` with an empty value is a no-op — nothing to
+        // strip beyond the canonical predicate.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONNECTION, http::HeaderValue::from_static(""));
+        headers.insert("x-keep", http::HeaderValue::from_static("ok"));
+
+        strip_backend_request_headers(&mut headers);
+
+        // `connection` is removed by the canonical strip; `x-keep` stays.
+        assert!(headers.get(http::header::CONNECTION).is_none());
+        assert_eq!(
+            headers.get("x-keep"),
+            Some(&http::HeaderValue::from_static("ok"))
+        );
+    }
+
+    #[test]
+    fn connection_listed_strip_walks_multiple_connection_headers() {
+        // Per RFC 9110 §5.3, multiple field lines for the same header name
+        // are equivalent to a single comma-folded value. `HeaderMap::append`
+        // preserves both values; `parse_connection_listed_headers` walks
+        // them all.
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("x-foo"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("x-bar, x-baz"),
+        );
+        headers.insert("x-foo", http::HeaderValue::from_static("a"));
+        headers.insert("x-bar", http::HeaderValue::from_static("b"));
+        headers.insert("x-baz", http::HeaderValue::from_static("c"));
+        headers.insert("x-keep", http::HeaderValue::from_static("d"));
+
+        strip_backend_request_headers(&mut headers);
+
+        assert!(headers.get("x-foo").is_none(), "x-foo from value 1");
+        assert!(headers.get("x-bar").is_none(), "x-bar from value 2");
+        assert!(headers.get("x-baz").is_none(), "x-baz from value 2");
+        assert_eq!(
+            headers.get("x-keep"),
+            Some(&http::HeaderValue::from_static("d"))
+        );
+    }
+
+    #[test]
+    fn parse_connection_listed_headers_returns_empty_when_absent() {
+        let headers = http::HeaderMap::new();
+        assert!(parse_connection_listed_headers(&headers).is_empty());
+    }
+
+    #[test]
+    fn parse_connection_listed_headers_dedups() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("x-foo, x-foo"),
+        );
+        headers.append(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("X-FOO"),
+        );
+        let listed = parse_connection_listed_headers(&headers);
+        assert_eq!(
+            listed.len(),
+            1,
+            "dedup must collapse case-variant duplicates"
+        );
+        assert_eq!(listed[0].as_str(), "x-foo");
+    }
+
+    #[test]
+    fn parse_connection_listed_from_str_map_returns_empty_when_absent() {
+        let headers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert!(parse_connection_listed_from_str_map(&headers).is_empty());
+    }
+
+    #[test]
+    fn parse_connection_listed_from_str_map_handles_comma_folded_values() {
+        // The HTTP request handler folds multi-valued headers into a single
+        // comma-separated string. This helper must walk that single value.
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "connection".to_string(),
+            "x-foo, X-Bar, , x-foo".to_string(),
+        );
+        let listed = parse_connection_listed_from_str_map(&headers);
+        // x-foo dedup + x-bar → 2 names, both lowercase, in iteration order.
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&"x-foo".to_string()));
+        assert!(listed.contains(&"x-bar".to_string()));
+    }
+
+    #[test]
+    fn parse_connection_listed_from_str_map_skips_garbage_tokens() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("connection".to_string(), "x-foo, \x01, , x-bar".to_string());
+        let listed = parse_connection_listed_from_str_map(&headers);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&"x-foo".to_string()));
+        assert!(listed.contains(&"x-bar".to_string()));
+    }
+
+    #[test]
+    fn response_strip_pipeline_removes_connection_listed_names() {
+        // Backend smuggling defence: a backend that names a header in
+        // `Connection` cannot route it past the proxy. This test exercises
+        // the pattern that every response-direction dispatch site uses —
+        // `parse_connection_listed_headers` to snapshot, plus the
+        // canonical `is_backend_response_strip_header` predicate.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("x-internal-token, close"),
+        );
+        headers.insert("x-internal-token", http::HeaderValue::from_static("leak"));
+        headers.insert("x-public", http::HeaderValue::from_static("ok"));
+
+        // Snapshot the listed names (the dispatch sites do this before the
+        // collect-and-strip loop).
+        let listed = parse_connection_listed_headers(&headers);
+        assert!(
+            listed.iter().any(|n| n.as_str() == "x-internal-token"),
+            "Connection-listed parse must surface the smuggled name"
+        );
+        for name in &listed {
+            headers.remove(name);
+        }
+        // Then run the canonical response strip — mirrors the dispatch
+        // sites that compose the two passes.
+        let to_remove: Vec<http::HeaderName> = headers
+            .keys()
+            .filter(|n| is_backend_response_strip_header(n.as_str()))
+            .cloned()
+            .collect();
+        for name in to_remove {
+            headers.remove(&name);
+        }
+
+        assert!(headers.get("x-internal-token").is_none());
+        assert!(headers.get(http::header::CONNECTION).is_none());
+        assert_eq!(
+            headers.get("x-public"),
+            Some(&http::HeaderValue::from_static("ok"))
+        );
+    }
+
+    #[test]
+    fn grpc_merge_then_strip_honors_connection_listed() {
+        // Composability check: the gRPC pipeline runs through
+        // `merge_proxy_headers_and_strip_for_grpc`, which delegates to
+        // `strip_backend_request_headers`. Anything named in the merged
+        // `Connection` header — whether it came from the original request
+        // or from `proxy_headers` — must be stripped.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/grpc"),
+        );
+
+        let mut proxy_headers = std::collections::HashMap::new();
+        proxy_headers.insert("connection".to_string(), "x-internal-token".to_string());
+        proxy_headers.insert("x-internal-token".to_string(), "leak".to_string());
+        proxy_headers.insert("x-keep".to_string(), "ok".to_string());
+
+        merge_proxy_headers_and_strip_for_grpc(&mut headers, &proxy_headers);
+
+        assert!(
+            headers.get("x-internal-token").is_none(),
+            "Connection-listed header must be stripped from gRPC requests"
+        );
+        assert_eq!(
+            headers.get("x-keep"),
+            Some(&http::HeaderValue::from_static("ok")),
+            "unrelated proxy_headers entries must still be forwarded"
+        );
+        // gRPC pipeline always synthesises te: trailers afterwards.
         assert_eq!(
             headers.get(http::header::TE),
             Some(&http::HeaderValue::from_static("trailers"))

@@ -106,8 +106,7 @@ use crate::load_balancer::LoadBalancer;
 use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
-use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
-use crate::proxy::headers::is_backend_response_strip_header;
+use crate::proxy::headers::{is_backend_response_strip_header, parse_connection_listed_headers};
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
@@ -2328,12 +2327,20 @@ fn classify_hyper_error(e: &hyper::Error) -> ErrorClass {
 fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<String, String> {
     let mut headers: HashMap<String, String> =
         HashMap::with_capacity(response.headers().keys_len());
+    // RFC 9110 §7.6.1 also requires removing every header NAMED in the
+    // response's `Connection` field. Snapshot the listed names before
+    // iterating so we can strip them in the same pass as the canonical
+    // predicate.
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         let name = k.as_str();
         // Strip hop-by-hop response headers per RFC 9110 §7.6.1 — see
         // `proxy::headers` for the canonical predicate. Response-direction
         // set differs from the request-direction set.
         if is_backend_response_strip_header(name) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(val) = v.to_str() {
