@@ -248,3 +248,60 @@ async fn wait_for_first_svid_no_deadlock_under_concurrent_install_storm() {
         w.await.expect("waiter task panicked");
     }
 }
+
+// ── Long-lived stream + rotation signal tests ──────────────────────────────
+
+#[tokio::test]
+async fn fetch_x509svid_stream_stays_open_and_pushes_on_rotation() {
+    use ferrum_edge::identity::workload_api::server::WorkloadApiService;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+    use tonic::Request;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca: Arc<dyn ferrum_edge::identity::ca::CertificateAuthority> = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
+        Arc::new(StubAttestor { id });
+
+    let (tx, _) = watch::channel(0u64);
+    let rotation = Arc::new(tx);
+    let svc = WorkloadApiService::with_rotation_signal(
+        vec![attestor],
+        ca,
+        trust_domain,
+        600,
+        Arc::clone(&rotation),
+    );
+
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use tokio_stream::StreamExt;
+
+    let resp = svc
+        .fetch_x509svid(Request::new(X509svidRequest {}))
+        .await
+        .unwrap();
+    let mut stream = resp.into_inner();
+
+    // First message arrives immediately.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first message")
+        .expect("stream ended unexpectedly")
+        .expect("first message was an error");
+    assert!(!first.svids.is_empty());
+
+    // Bump the rotation epoch — stream should push a second message.
+    rotation.send_modify(|v| *v += 1);
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for rotation push")
+        .expect("stream ended unexpectedly")
+        .expect("rotation push was an error");
+    assert!(!second.svids.is_empty());
+}

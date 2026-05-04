@@ -172,6 +172,21 @@ impl WorkloadApiClient {
     }
 }
 
+/// Parse a federated bundle map key into a [`TrustDomain`].
+///
+/// The SPIFFE Workload API allows bundle map keys in either plain trust-domain
+/// form (`example.org`) or SPIFFE URI form (`spiffe://example.org`). We strip
+/// the `spiffe://` prefix and any trailing path before parsing.
+fn parse_trust_domain_key(key: &str) -> Result<TrustDomain, String> {
+    let domain_str = key
+        .strip_prefix("spiffe://")
+        .unwrap_or(key)
+        .split('/')
+        .next()
+        .unwrap_or(key);
+    TrustDomain::new(domain_str.to_string()).map_err(|e| e.to_string())
+}
+
 /// Convert one `X509SVIDResponse` into a [`SvidBundle`]. Picks the first
 /// SVID in the response (per spec, the "default identity" for the workload).
 fn svid_response_to_bundle(
@@ -221,7 +236,7 @@ fn svid_response_to_bundle(
     };
 
     for (td_str, bundle_bytes) in msg.federated_bundles {
-        match TrustDomain::new(td_str.clone()) {
+        match parse_trust_domain_key(&td_str) {
             Ok(td) => match split_concatenated_der(&bundle_bytes) {
                 Ok(certs) => {
                     trust_bundles.federated.insert(
@@ -375,5 +390,38 @@ mod tests {
     fn split_rejects_non_sequence_tag() {
         let blob = [0x31, 0x00];
         assert!(split_concatenated_der(&blob).is_err());
+    }
+}
+
+#[cfg(test)]
+mod trust_domain_key_tests {
+    use super::parse_trust_domain_key;
+
+    #[test]
+    fn plain_trust_domain() {
+        let td = parse_trust_domain_key("example.org").unwrap();
+        assert_eq!(td.as_str(), "example.org");
+    }
+
+    #[test]
+    fn spiffe_uri_form() {
+        let td = parse_trust_domain_key("spiffe://example.org").unwrap();
+        assert_eq!(td.as_str(), "example.org");
+    }
+
+    #[test]
+    fn spiffe_uri_with_path() {
+        let td = parse_trust_domain_key("spiffe://example.org/ns/foo").unwrap();
+        assert_eq!(td.as_str(), "example.org");
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(parse_trust_domain_key("").is_err());
+    }
+
+    #[test]
+    fn rejects_spiffe_prefix_only() {
+        assert!(parse_trust_domain_key("spiffe://").is_err());
     }
 }

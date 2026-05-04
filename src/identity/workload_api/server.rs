@@ -21,7 +21,9 @@
 use async_trait::async_trait;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio_stream::Stream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
@@ -43,6 +45,10 @@ pub struct WorkloadApiService {
     /// SVID lifetime (seconds) when an SVID is freshly minted in response to
     /// an attested workload. Falls back to the CA's clamp if higher.
     pub svid_ttl_secs: u64,
+    /// Bumped by the rotation layer when SVIDs or trust bundles change.
+    /// Long-lived Workload API streams subscribe to this channel and push
+    /// fresh responses on each epoch change.
+    rotation_signal: Arc<watch::Sender<u64>>,
 }
 
 impl WorkloadApiService {
@@ -52,12 +58,34 @@ impl WorkloadApiService {
         trust_domain: TrustDomain,
         svid_ttl_secs: u64,
     ) -> Self {
+        let (tx, _) = watch::channel(0u64);
         Self {
             attestors,
             ca,
             trust_domain,
             svid_ttl_secs,
+            rotation_signal: Arc::new(tx),
         }
+    }
+
+    pub fn with_rotation_signal(
+        attestors: Vec<Arc<dyn Attestor>>,
+        ca: Arc<dyn CertificateAuthority>,
+        trust_domain: TrustDomain,
+        svid_ttl_secs: u64,
+        rotation_signal: Arc<watch::Sender<u64>>,
+    ) -> Self {
+        Self {
+            attestors,
+            ca,
+            trust_domain,
+            svid_ttl_secs,
+            rotation_signal,
+        }
+    }
+
+    pub fn rotation_signal(&self) -> &Arc<watch::Sender<u64>> {
+        &self.rotation_signal
     }
 
     /// Wrap into a `tonic` server. Exposed so callers can register additional
@@ -144,6 +172,60 @@ impl WorkloadApiService {
             federated_bundles: Default::default(),
         })
     }
+
+    async fn build_x509_svid_response_static(
+        ca: &Arc<dyn CertificateAuthority>,
+        trust_domain: &TrustDomain,
+        spiffe_id: &crate::identity::spiffe::SpiffeId,
+        ttl_secs: u64,
+    ) -> Result<X509svidResponse, Status> {
+        let svid = ca
+            .issue_svid(IssuanceRequest::Generate {
+                spiffe_id: spiffe_id.clone(),
+                ttl_secs,
+            })
+            .await
+            .map_err(|e| {
+                error!(error = %e, "CA failed to issue SVID");
+                Status::internal(format!("CA failed: {e}"))
+            })?;
+
+        let bundle = ca
+            .trust_bundle(trust_domain)
+            .await
+            .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
+
+        let chain_concat: Vec<u8> = svid.cert_chain_der.iter().flatten().copied().collect();
+        let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
+
+        let proto_svid = X509svid {
+            spiffe_id: svid.spiffe_id.to_string(),
+            x509_svid: chain_concat,
+            x509_svid_key: svid.private_key_pkcs8_der,
+            bundle: bundle_concat,
+            hint: String::new(),
+        };
+
+        Ok(X509svidResponse {
+            svids: vec![proto_svid],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        })
+    }
+
+    async fn build_x509_bundles_response_static(
+        ca: &Arc<dyn CertificateAuthority>,
+        trust_domain: &TrustDomain,
+    ) -> Result<X509BundlesResponse, crate::identity::ca::CaError> {
+        let bundle = ca.trust_bundle(trust_domain).await?;
+        let mut bundles = std::collections::HashMap::new();
+        let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
+        bundles.insert(trust_domain.to_string(), bundle_concat);
+        Ok(X509BundlesResponse {
+            crl: Vec::new(),
+            bundles,
+        })
+    }
 }
 
 /// Parse an `authorization` header value into the bare bearer token.
@@ -185,9 +267,38 @@ impl SpiffeWorkloadApi for WorkloadApiService {
     ) -> Result<Response<Self::FetchX509SVIDStream>, Status> {
         let peer = Self::peer_info_from_request(&request);
         let identity = self.attest(&peer).await?;
-        let response = self.build_x509_svid_response(&identity).await?;
-        let stream = futures_util::stream::iter(vec![Ok(response)]);
-        Ok(Response::new(Box::pin(stream)))
+        let initial = self.build_x509_svid_response(&identity).await?;
+
+        let ca = Arc::clone(&self.ca);
+        let td = self.trust_domain.clone();
+        let ttl = self.svid_ttl_secs;
+        let id = identity.spiffe_id.clone();
+        let mut rx = self.rotation_signal.subscribe();
+
+        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(initial));
+
+        tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+                match Self::build_x509_svid_response_static(&ca, &td, &id, ttl).await {
+                    Ok(resp) => {
+                        if tx.send(Ok(resp)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "rotation push failed for FetchX509SVID stream");
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
+            out_rx,
+        ))))
     }
 
     type FetchX509BundlesStream =
@@ -197,22 +308,38 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         _request: Request<X509BundlesRequest>,
     ) -> Result<Response<Self::FetchX509BundlesStream>, Status> {
-        let bundle = self
-            .ca
-            .trust_bundle(&self.trust_domain)
+        let initial = Self::build_x509_bundles_response_static(&self.ca, &self.trust_domain)
             .await
             .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
 
-        let mut bundles = std::collections::HashMap::new();
-        let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
-        bundles.insert(self.trust_domain.to_string(), bundle_concat);
+        let ca = Arc::clone(&self.ca);
+        let td = self.trust_domain.clone();
+        let mut rx = self.rotation_signal.subscribe();
 
-        let response = X509BundlesResponse {
-            crl: Vec::new(),
-            bundles,
-        };
-        let stream = futures_util::stream::iter(vec![Ok(response)]);
-        Ok(Response::new(Box::pin(stream)))
+        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(initial));
+
+        tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+                match Self::build_x509_bundles_response_static(&ca, &td).await {
+                    Ok(resp) => {
+                        if tx.send(Ok(resp)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "rotation push failed for FetchX509Bundles stream");
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
+            out_rx,
+        ))))
     }
 
     async fn fetch_jwtsvid(
@@ -233,11 +360,31 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         _request: Request<JwtBundlesRequest>,
     ) -> Result<Response<Self::FetchJWTBundlesStream>, Status> {
-        let response = JwtBundlesResponse {
+        let initial = JwtBundlesResponse {
             bundles: Default::default(),
         };
-        let stream = futures_util::stream::iter(vec![Ok(response)]);
-        Ok(Response::new(Box::pin(stream)))
+
+        let mut rx = self.rotation_signal.subscribe();
+        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(initial));
+
+        tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+                let resp = JwtBundlesResponse {
+                    bundles: Default::default(),
+                };
+                if tx.send(Ok(resp)).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
+            out_rx,
+        ))))
     }
 
     async fn validate_jwtsvid(
