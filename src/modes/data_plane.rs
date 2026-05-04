@@ -67,12 +67,19 @@ pub async fn run(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
 
-    // Start with empty config; CP will push the real one via gRPC
-    let proxy_state = ProxyState::new(
+    // Start with empty config; CP will push the real one via gRPC.
+    // The empty initial config means `start_with_shutdown` spawns no
+    // health-check tasks today, so `health_check_handles` is normally
+    // empty here. Plumbed through the per-mode background drain anyway
+    // for symmetry with file/db modes and for forward-compatibility:
+    // if a future change starts health checks at DP startup or on the
+    // first CP push, the drain phase already awaits them cleanly.
+    let (proxy_state, health_check_handles) = ProxyState::new(
         GatewayConfig::default(),
         dns_cache,
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
     // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
     // their accept loops exit promptly during graceful drain. Without this,
@@ -578,6 +585,12 @@ pub async fn run(
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a gRPC stream read).
+    // `health_check_handles` is normally empty in DP mode (empty initial
+    // config — see comment at `ProxyState::new` call site) but plumbed
+    // through anyway so a future change that starts health checks at DP
+    // startup is already drained by this loop.
+    let mut health_check_handles = health_check_handles;
+    health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
     let bg_drain = async {
         let _ = dns_handle.await;
         if let Some(h) = dns_retry_handle {
@@ -587,6 +600,9 @@ pub async fn run(
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
         if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
+        for h in health_check_handles {
             let _ = h.await;
         }
     };

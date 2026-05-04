@@ -120,7 +120,9 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
     };
-    ProxyState::new(config, dns_cache, create_test_env_config(), None).unwrap()
+    ProxyState::new(config, dns_cache, create_test_env_config(), None, None)
+        .unwrap()
+        .0
 }
 
 /// Start a plain HTTP/1.1 backend that responds 200 OK on every request.
@@ -511,7 +513,9 @@ fn create_test_proxy_state_with_env(
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
     };
-    ProxyState::new(config, dns_cache, env_config, None).unwrap()
+    ProxyState::new(config, dns_cache, env_config, None, None)
+        .unwrap()
+        .0
 }
 
 /// Track that imports are exercised even on platforms where no individual

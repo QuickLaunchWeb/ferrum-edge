@@ -344,6 +344,7 @@ async fn test_http3_proxy_state_creation() {
         ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        health_check_shutdown_rx: None,
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
         service_discovery_manager: {
             let hc = Arc::new(ferrum_edge::health_check::HealthChecker::new());
@@ -588,6 +589,7 @@ async fn test_http3_full_integration() {
         ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        health_check_shutdown_rx: None,
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
         service_discovery_manager: {
             let hc = Arc::new(ferrum_edge::health_check::HealthChecker::new());

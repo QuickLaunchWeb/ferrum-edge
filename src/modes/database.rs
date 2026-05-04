@@ -315,11 +315,12 @@ pub async fn run(
 
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(
+    let (proxy_state, health_check_handles) = ProxyState::new(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
 
     // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
@@ -1044,6 +1045,12 @@ pub async fn run(
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a DB query or DNS lookup).
+    // Active-health-check probes and the passive recovery timer observe the
+    // shutdown watch channel via `tokio::select!` (see `start_with_shutdown`)
+    // so they exit cleanly within the 5s cap rather than racing the
+    // `Drop for HealthChecker` abort that fires at process exit.
+    let mut health_check_handles = health_check_handles;
+    health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
     let bg_drain = async {
         let _ = dns_handle.await;
         if let Some(h) = dns_retry_handle {
@@ -1053,6 +1060,9 @@ pub async fn run(
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
         if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
+        for h in health_check_handles {
             let _ = h.await;
         }
     };
