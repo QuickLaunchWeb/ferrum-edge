@@ -485,6 +485,11 @@ pub struct TcpListenerConfig {
     pub consumer_index: Arc<ConsumerIndex>,
     pub frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
     pub shutdown: watch::Receiver<bool>,
+    /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
+    /// the accept loop exits as soon as either this OR the per-listener
+    /// `shutdown` channel fires. Injected by [`StreamListenerManager`] from
+    /// the watch channel created in `main.rs`.
+    pub global_shutdown: Option<watch::Receiver<bool>>,
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
@@ -542,6 +547,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         consumer_index,
         frontend_tls_config,
         shutdown,
+        global_shutdown,
         metrics,
         tls_no_verify,
         tls_ca_bundle_path,
@@ -624,6 +630,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     };
 
     let mut shutdown_rx = shutdown;
+    // Optional global gateway shutdown — fires on SIGTERM/SIGINT regardless of
+    // per-listener config-driven removal. We watch BOTH so accept loops exit
+    // promptly during graceful drain. When `None` (e.g. tests that build a
+    // listener directly without the manager), we substitute a never-fires
+    // pending future so the existing per-listener channel still works.
+    let mut global_shutdown_rx = global_shutdown;
 
     loop {
         tokio::select! {
@@ -837,6 +849,15 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "TCP proxy listener shutting down on port {}", port);
+                return Ok(());
+            }
+            _ = async {
+                match global_shutdown_rx.as_mut() {
+                    Some(rx) => { let _ = rx.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                info!(proxy_id = %proxy_id, "TCP proxy listener shutting down on port {} (global SIGTERM)", port);
                 return Ok(());
             }
         }

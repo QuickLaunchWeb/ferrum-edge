@@ -330,6 +330,11 @@ pub struct UdpListenerConfig {
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     pub consumer_index: Arc<ConsumerIndex>,
     pub shutdown: watch::Receiver<bool>,
+    /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
+    /// the receive loop exits as soon as either this OR the per-listener
+    /// `shutdown` channel fires. Injected by [`crate::proxy::stream_listener::StreamListenerManager`]
+    /// from the watch channel created in `main.rs`.
+    pub global_shutdown: Option<watch::Receiver<bool>>,
     pub metrics: Arc<UdpProxyMetrics>,
     /// DTLS server config for frontend termination. When `Some`, the listener
     /// accepts DTLS connections from clients instead of plain UDP.
@@ -389,6 +394,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         load_balancer_cache,
         consumer_index,
         shutdown,
+        global_shutdown,
         metrics,
         frontend_dtls_config,
         tls_no_verify,
@@ -422,6 +428,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             load_balancer_cache,
             consumer_index,
             shutdown,
+            global_shutdown,
             metrics,
             dtls_config,
             tls_no_verify,
@@ -554,6 +561,10 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let mut shutdown_rx = shutdown;
+    // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
+    // per-listener config-driven removal. We watch BOTH so the recv loop
+    // exits promptly during graceful drain.
+    let mut global_shutdown_rx = global_shutdown;
 
     // Pre-allocate recvmmsg batch buffers (Linux only). On non-Linux, this is a no-op stub.
     #[cfg(target_os = "linux")]
@@ -964,6 +975,15 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {}", port);
                 return Ok(());
             }
+            _ = async {
+                match global_shutdown_rx.as_mut() {
+                    Some(rx) => { let _ = rx.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                info!(proxy_id = %proxy_id, "UDP proxy listener shutting down on port {} (global SIGTERM)", port);
+                return Ok(());
+            }
         }
     }
 }
@@ -1286,6 +1306,7 @@ async fn start_dtls_frontend_listener(
     load_balancer_cache: Arc<LoadBalancerCache>,
     consumer_index: Arc<ConsumerIndex>,
     shutdown: watch::Receiver<bool>,
+    global_shutdown: Option<watch::Receiver<bool>>,
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: crate::dtls::FrontendDtlsConfig,
     tls_no_verify: bool,
@@ -1343,6 +1364,10 @@ async fn start_dtls_frontend_listener(
     });
 
     let mut shutdown_rx = shutdown;
+    // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
+    // per-listener config-driven removal. Watch BOTH so the DTLS accept loop
+    // exits promptly during graceful drain.
+    let mut global_shutdown_rx = global_shutdown;
 
     loop {
         tokio::select! {
@@ -1520,6 +1545,17 @@ async fn start_dtls_frontend_listener(
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {}", port);
+                server.close().await;
+                let _ = server_task.await;
+                return Ok(());
+            }
+            _ = async {
+                match global_shutdown_rx.as_mut() {
+                    Some(rx) => { let _ = rx.changed().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {} (global SIGTERM)", port);
                 server.close().await;
                 let _ = server_task.await;
                 return Ok(());

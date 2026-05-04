@@ -73,6 +73,13 @@ pub async fn run(
         env_config.clone(),
         Some(tls_policy.clone()),
     )?;
+    // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
+    // their accept loops exit promptly during graceful drain. Without this,
+    // stream listeners would only react to per-listener (config-driven)
+    // shutdown and keep accepting connections until the runtime is dropped.
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
     // DP starts with an empty config — the initial refresh has nothing
     // to probe. The first `apply_incremental` / `update_config` call from
     // the CP gRPC stream will trigger `spawn_backend_capability_refresh`,
@@ -547,7 +554,15 @@ pub async fn run(
         }
     }
 
-    // Graceful connection drain: wait for in-flight requests to complete.
+    // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
+    // also observe the global shutdown receiver wired above and will already
+    // be exiting; firing each per-listener channel here clears the listener
+    // map (releasing ports) and is a no-op if the loops have already exited.
+    proxy_state.stream_listener_manager.shutdown_all().await;
+
+    // Graceful connection drain: wait for in-flight requests AND active
+    // stream connections to complete (`OverloadState` counts both via the
+    // shared RAII guards).
     let drain_seconds = env_config.shutdown_drain_seconds;
     if drain_seconds > 0 {
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))

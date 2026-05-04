@@ -214,6 +214,15 @@ impl ServeHandles {
             })
             .await
         };
+        // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
+        // also observe the global shutdown receiver wired in `serve()` and
+        // will already be exiting; firing each per-listener channel here
+        // clears the listener map (releasing ports) and is a no-op if the
+        // loops have already exited.
+        self.proxy_state
+            .stream_listener_manager
+            .shutdown_all()
+            .await;
         if self.drain_seconds > 0 {
             crate::overload::wait_for_drain(
                 &self.proxy_state.overload,
@@ -595,6 +604,14 @@ pub async fn serve(
         env_config.clone(),
         Some(tls_policy.clone()),
     )?;
+
+    // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
+    // their accept loops exit promptly during graceful drain. Without this,
+    // stream listeners would only react to per-listener (config-driven)
+    // shutdown and keep accepting connections until the runtime is dropped.
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
 
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
     for host in plugin_hosts {
