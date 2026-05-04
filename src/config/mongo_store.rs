@@ -29,6 +29,7 @@ mod inner {
     use crate::config::types::{
         Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy, Upstream,
     };
+    use arc_swap::ArcSwap;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use mongodb::bson::{Bson, Document, doc};
@@ -36,17 +37,55 @@ mod inner {
     use mongodb::{Client, Collection, Database, IndexModel};
     use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
     use tracing::{debug, info, warn};
+
+    /// Connection settings captured at startup so `reconnect()` and
+    /// `try_failover_reconnect()` can rebuild the underlying `Client` against
+    /// a different URL without changing any other client behavior.
+    ///
+    /// Stored alongside the live `Client` in `MongoStore` because the typed
+    /// `ClientOptions` are URL-derived — when failover swaps the URL, every
+    /// non-URL setting (database name, app name, replica set, auth mechanism,
+    /// timeouts) must be re-applied identically. Without this struct,
+    /// `reconnect()` would have no way to rebuild the client.
+    #[derive(Clone, Debug)]
+    pub(super) struct MongoConnSettings {
+        pub database_name: String,
+        pub app_name: Option<String>,
+        pub replica_set: Option<String>,
+        pub auth_mechanism: Option<String>,
+        pub server_selection_timeout_secs: u64,
+        pub connect_timeout_secs: u64,
+    }
 
     /// MongoDB-backed config store.
     ///
     /// Implements [`DatabaseBackend`] to provide a NoSQL alternative to the
     /// sqlx-backed `DatabaseStore`. Uses the official `mongodb` Rust driver.
+    ///
+    /// **Failover & reconnect**: `client` and `db` are wrapped in
+    /// `Arc<ArcSwap<...>>` so [`Self::try_failover_reconnect`] can atomically
+    /// replace the underlying `Client` when the primary URL is unreachable
+    /// and a configured failover URL is healthy. Readers that already loaded
+    /// the old client keep using it (commands in flight complete normally),
+    /// then drop their reference and pick up the new one on the next call.
+    /// This mirrors the `Arc<ArcSwap<AnyPool>>` pattern used by the sqlx
+    /// `DatabaseStore` for the same reason — without it, every "failover"
+    /// attempt would just ping the dead client and the gateway would never
+    /// recover for standalone (non-replica-set) MongoDB deployments.
     #[derive(Clone)]
     pub struct MongoStore {
-        client: Client,
-        db: Database,
+        // The live client. Held only so it gets dropped when swapped out;
+        // every collection access goes through `db()`, which loads from
+        // `db` directly (the `Database` handle internally references the
+        // current client).
+        client: Arc<ArcSwap<Client>>,
+        db: Arc<ArcSwap<Database>>,
+        // Settings captured at startup so failover rebuilds use identical
+        // ClientOptions for every non-URL field.
+        conn_settings: MongoConnSettings,
         db_type_str: String,
         slow_query_threshold_ms: Option<u64>,
         cert_expiry_warning_days: u64,
@@ -86,15 +125,64 @@ mod inner {
             tls_client_key_path: Option<&str>,
             tls_insecure: bool,
         ) -> Result<Self, anyhow::Error> {
+            let conn_settings = MongoConnSettings {
+                database_name: database_name.to_string(),
+                app_name: app_name.map(str::to_string),
+                replica_set: replica_set.map(str::to_string),
+                auth_mechanism: auth_mechanism.map(str::to_string),
+                server_selection_timeout_secs,
+                connect_timeout_secs,
+            };
+
+            let (client, db) = Self::build_client_and_db(
+                mongo_url,
+                &conn_settings,
+                tls_enabled,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )
+            .await?;
+
+            Ok(Self {
+                client: Arc::new(ArcSwap::from_pointee(client)),
+                db: Arc::new(ArcSwap::from_pointee(db)),
+                conn_settings,
+                db_type_str: "mongodb".to_string(),
+                slow_query_threshold_ms: None,
+                cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
+                backend_allow_ips: crate::config::BackendAllowIps::Both,
+                failover_urls: Vec::new(),
+            })
+        }
+
+        /// Build a `Client` + `Database` from a URL plus the captured
+        /// connection settings, applying TLS if requested. Verifies
+        /// connectivity with a `ping` before returning so callers can
+        /// distinguish "URL parse / config error" from "URL is down".
+        ///
+        /// Used by both [`Self::connect`] (initial connect) and
+        /// [`DatabaseBackend::reconnect`] (failover) so the two paths
+        /// can never diverge on how `ClientOptions` are built.
+        async fn build_client_and_db(
+            mongo_url: &str,
+            settings: &MongoConnSettings,
+            tls_enabled: bool,
+            tls_ca_cert_path: Option<&str>,
+            tls_client_cert_path: Option<&str>,
+            tls_client_key_path: Option<&str>,
+            tls_insecure: bool,
+        ) -> Result<(Client, Database), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
 
-            if let Some(name) = app_name {
-                client_options.app_name = Some(name.to_string());
+            if let Some(name) = &settings.app_name {
+                client_options.app_name = Some(name.clone());
             }
-            if let Some(rs) = replica_set {
-                client_options.repl_set_name = Some(rs.to_string());
+            if let Some(rs) = &settings.replica_set {
+                client_options.repl_set_name = Some(rs.clone());
             }
-            if let Some(mechanism) = auth_mechanism {
+            if let Some(mechanism) = &settings.auth_mechanism {
                 client_options
                     .credential
                     .get_or_insert_with(Default::default)
@@ -103,8 +191,9 @@ mod inner {
                 })?);
             }
             client_options.server_selection_timeout =
-                Some(Duration::from_secs(server_selection_timeout_secs));
-            client_options.connect_timeout = Some(Duration::from_secs(connect_timeout_secs));
+                Some(Duration::from_secs(settings.server_selection_timeout_secs));
+            client_options.connect_timeout =
+                Some(Duration::from_secs(settings.connect_timeout_secs));
 
             // Configure TLS via the existing FERRUM_DB_TLS_* env vars.
             // Only set programmatic TLS if the connection string doesn't already
@@ -138,32 +227,24 @@ mod inner {
             }
 
             let client = Client::with_options(client_options)?;
-            let db = client.database(database_name);
+            let db = client.database(&settings.database_name);
 
             // Verify connectivity
             db.run_command(doc! { "ping": 1 }).await.map_err(|e| {
                 anyhow::anyhow!(
                     "MongoDB connectivity check failed (database='{}'): {}",
-                    database_name,
+                    settings.database_name,
                     e
                 )
             })?;
 
             info!(
                 "MongoDB connected (database='{}', url={})",
-                database_name,
+                settings.database_name,
                 crate::config::db_backend::redact_url(mongo_url)
             );
 
-            Ok(Self {
-                client,
-                db,
-                db_type_str: "mongodb".to_string(),
-                slow_query_threshold_ms: None,
-                cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
-                backend_allow_ips: crate::config::BackendAllowIps::Both,
-                failover_urls: Vec::new(),
-            })
+            Ok((client, db))
         }
 
         /// Combine separate PEM cert and key files into a single temporary file.
@@ -340,20 +421,27 @@ mod inner {
         // Collection accessors
         // -------------------------------------------------------------------
 
+        /// Snapshot of the current `Database` handle. Cheap clone (the driver's
+        /// `Database` is internally Arc-based) so callers can hold the handle
+        /// across awaits without blocking concurrent `reconnect()` swaps.
+        fn db(&self) -> Database {
+            (**self.db.load()).clone()
+        }
+
         fn proxies(&self) -> Collection<Document> {
-            self.db.collection("proxies")
+            self.db().collection("proxies")
         }
 
         fn consumers(&self) -> Collection<Document> {
-            self.db.collection("consumers")
+            self.db().collection("consumers")
         }
 
         fn plugin_configs(&self) -> Collection<Document> {
-            self.db.collection("plugin_configs")
+            self.db().collection("plugin_configs")
         }
 
         fn upstreams(&self) -> Collection<Document> {
-            self.db.collection("upstreams")
+            self.db().collection("upstreams")
         }
 
         // -------------------------------------------------------------------
@@ -504,7 +592,7 @@ mod inner {
     #[async_trait]
     impl DatabaseBackend for MongoStore {
         async fn health_check(&self) -> Result<(), anyhow::Error> {
-            self.db.run_command(doc! { "ping": 1 }).await?;
+            self.db().run_command(doc! { "ping": 1 }).await?;
             Ok(())
         }
 
@@ -1285,21 +1373,42 @@ mod inner {
 
         async fn reconnect(
             &self,
-            _db_url: &str,
-            _tls_enabled: bool,
-            _tls_ca_cert_path: Option<&str>,
-            _tls_client_cert_path: Option<&str>,
-            _tls_client_key_path: Option<&str>,
-            _tls_insecure: bool,
+            db_url: &str,
+            tls_enabled: bool,
+            tls_ca_cert_path: Option<&str>,
+            tls_client_cert_path: Option<&str>,
+            tls_client_key_path: Option<&str>,
+            tls_insecure: bool,
         ) -> Result<(), anyhow::Error> {
-            // MongoDB driver handles connection pooling and reconnection internally.
-            // A full reconnect would require replacing the Client, which is complex
-            // for an Arc-shared store. For now, verify the connection is alive.
-            self.db
-                .run_command(doc! { "ping": 1 })
-                .await
-                .map_err(|e| anyhow::anyhow!("MongoDB reconnect ping failed: {}", e))?;
-            info!("MongoDB connection verified after reconnect request");
+            // Build a fresh Client + Database against the requested URL using
+            // the captured connection settings. `build_client_and_db` runs a
+            // ping before returning, so on `Ok` we know the new client can
+            // actually talk to MongoDB. On `Err` the swap is skipped and the
+            // existing (possibly degraded) client stays in place — same
+            // contract as `DatabaseStore::reconnect` for sqlx.
+            let (new_client, new_db) = Self::build_client_and_db(
+                db_url,
+                &self.conn_settings,
+                tls_enabled,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )
+            .await?;
+
+            // Atomic swap. Readers that already loaded the old `Database`
+            // handle keep using it (in-flight commands complete); the next
+            // call to `db()` picks up the new handle. Old client is held
+            // briefly here, then dropped — the driver closes idle
+            // connections in the background.
+            let _old_db = self.db.swap(Arc::new(new_db));
+            let _old_client = self.client.swap(Arc::new(new_client));
+
+            info!(
+                "MongoDB client reconnected to {}",
+                crate::config::db_backend::redact_url(db_url)
+            );
             Ok(())
         }
 
@@ -1327,7 +1436,10 @@ mod inner {
             tls_client_key_path: Option<&str>,
             tls_insecure: bool,
         ) -> Result<String, anyhow::Error> {
-            // Try primary first
+            // Try primary first. `reconnect()` rebuilds the underlying
+            // `Client` against the primary URL and pings it; on success
+            // the swap is committed and the gateway is back on the
+            // primary.
             if self
                 .reconnect(
                     primary_url,
@@ -1340,10 +1452,16 @@ mod inner {
                 .await
                 .is_ok()
             {
+                info!(
+                    "Reconnected to primary MongoDB ({})",
+                    crate::config::db_backend::redact_url(primary_url)
+                );
                 return Ok(primary_url.to_string());
             }
 
-            // Try failover URLs
+            // Try failover URLs in order. The first one that successfully
+            // pings wins; subsequent URLs are not tried until the next
+            // failover-reconnect cycle.
             for (i, url) in self.failover_urls.iter().enumerate() {
                 if self
                     .reconnect(
@@ -1364,9 +1482,17 @@ mod inner {
                     );
                     return Ok(url.clone());
                 }
+                warn!(
+                    "Failover MongoDB #{} ({}) reconnect failed",
+                    i + 1,
+                    crate::config::db_backend::redact_url(url)
+                );
             }
 
-            Err(anyhow::anyhow!("All MongoDB URLs failed during reconnect"))
+            Err(anyhow::anyhow!(
+                "All MongoDB URLs failed during reconnect ({} failover URL(s) tried)",
+                self.failover_urls.len()
+            ))
         }
 
         async fn run_migrations(&self) -> Result<(), anyhow::Error> {
@@ -1599,7 +1725,7 @@ mod inner {
             collection_name: &str,
             filter: Document,
         ) -> Result<HashSet<String>, anyhow::Error> {
-            let collection: Collection<Document> = self.db.collection(collection_name);
+            let collection: Collection<Document> = self.db().collection(collection_name);
             let options = FindOptions::builder().projection(doc! { "_id": 1 }).build();
             let mut cursor = collection.find(filter).with_options(options).await?;
             let mut ids = HashSet::new();
@@ -1617,7 +1743,7 @@ mod inner {
             &self,
             collection_name: &str,
         ) -> Result<HashSet<String>, anyhow::Error> {
-            let collection: Collection<Document> = self.db.collection(collection_name);
+            let collection: Collection<Document> = self.db().collection(collection_name);
             let values = collection.distinct("namespace", doc! {}).await?;
             let mut namespaces = HashSet::new();
             for val in values {
@@ -2174,6 +2300,172 @@ mod inner {
             assert_eq!(restored.plugins[0].plugin_config_id, "plugin-a");
             assert_eq!(restored.plugins[1].plugin_config_id, "plugin-b");
             assert_eq!(restored.upstream_id, Some("my-upstream".to_string()));
+        }
+
+        // -------------------------------------------------------------------
+        // Failover reconnect tests
+        //
+        // These tests exercise the runtime client-replacement path
+        // introduced when `try_failover_reconnect` was promoted from a
+        // no-op ping into an actual `Client` rebuild + atomic swap. Earlier
+        // versions ignored the URL parameter and just pinged the (already
+        // dead) primary, so failover never actually happened for
+        // standalone MongoDB deployments.
+        //
+        // We build a `MongoStore` whose `db` and `client` ArcSwaps point at
+        // a `Client` constructed against a non-routable URL. `Client::with_options`
+        // does NOT connect (the driver is lazy — the first command triggers
+        // the real handshake), so this works without a live MongoDB.
+        // -------------------------------------------------------------------
+
+        /// Construct a `MongoStore` directly without going through `connect()`,
+        /// bypassing the startup ping. The resulting store has a Client that
+        /// will fail on any real command, but its ArcSwap pointers are valid
+        /// — which is all the failover tests need to verify the swap path.
+        fn make_test_store(failover_urls: Vec<String>) -> MongoStore {
+            let settings = MongoConnSettings {
+                database_name: "test".to_string(),
+                app_name: None,
+                replica_set: None,
+                auth_mechanism: None,
+                server_selection_timeout_secs: 1,
+                connect_timeout_secs: 1,
+            };
+            // Build a client against a non-routable URL. `Client::with_options`
+            // is lazy — no connection is attempted here.
+            let opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let client = mongodb::Client::with_options(opts)
+                .expect("Client::with_options should accept empty hosts");
+            let db = client.database(&settings.database_name);
+            MongoStore {
+                client: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(client)),
+                db: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(db)),
+                conn_settings: settings,
+                db_type_str: "mongodb".to_string(),
+                slow_query_threshold_ms: None,
+                cert_expiry_warning_days: 30,
+                backend_allow_ips: crate::config::BackendAllowIps::Both,
+                failover_urls,
+            }
+        }
+
+        /// Both primary and every failover URL are unroutable — `try_failover_reconnect`
+        /// must surface a final error and not silently report success.
+        ///
+        /// Regression guard: the pre-fix implementation called `reconnect()` for
+        /// every URL, which only pinged the existing client. If the existing
+        /// client happened to be alive at that moment, every "failover" attempt
+        /// reported success even though no actual rebuild had taken place.
+        #[tokio::test(flavor = "current_thread")]
+        async fn try_failover_reconnect_returns_err_when_all_urls_unroutable() {
+            // 240.0.0.1 is in the reserved 240/4 block — no host will ever
+            // route to it, so `ClientOptions::parse` succeeds but the
+            // subsequent ping inside `build_client_and_db` fails fast
+            // (bounded by `server_selection_timeout_secs = 1`).
+            let store = make_test_store(vec![
+                "mongodb://240.0.0.1:27017/test".to_string(),
+                "mongodb://240.0.0.2:27017/test".to_string(),
+            ]);
+
+            let result = store
+                .try_failover_reconnect(
+                    "mongodb://240.0.0.3:27017/test",
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
+
+            assert!(
+                result.is_err(),
+                "try_failover_reconnect must return Err when every URL is unreachable, \
+                 not silently succeed by pinging the cached client"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("All MongoDB URLs failed"),
+                "expected 'All MongoDB URLs failed' in error, got: {}",
+                err
+            );
+            assert!(
+                err.contains("2 failover URL(s) tried"),
+                "expected error to mention failover-url count, got: {}",
+                err
+            );
+        }
+
+        /// Empty failover list and unroutable primary — error must mention
+        /// zero failovers tried (proves we didn't hallucinate attempts).
+        #[tokio::test(flavor = "current_thread")]
+        async fn try_failover_reconnect_no_failovers_returns_clean_err() {
+            let store = make_test_store(vec![]);
+            let result = store
+                .try_failover_reconnect(
+                    "mongodb://240.0.0.1:27017/test",
+                    false,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
+
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("0 failover URL(s) tried"),
+                "expected error to report zero failovers, got: {}",
+                err
+            );
+        }
+
+        /// White-box check that successful `reconnect()` actually replaces
+        /// the underlying `Client` and `Database` handles. Earlier code held
+        /// `client: Client` and `db: Database` directly and the trait's
+        /// `&self` receiver made replacement impossible — every "reconnect"
+        /// just pinged the old client, so a genuinely-down standalone
+        /// MongoDB deployment would never recover.
+        ///
+        /// We can't run a real reconnect without a live MongoDB, so this
+        /// test simulates a successful rebuild by directly swapping new
+        /// Client + Database handles into the ArcSwap fields and verifies
+        /// `db()` returns the new handle. If somebody re-introduces a
+        /// `client: Client` / `db: Database` field (or makes `db()` return
+        /// the original startup handle), this test fails to compile or
+        /// returns the wrong namespace.
+        #[tokio::test(flavor = "current_thread")]
+        async fn db_accessor_reflects_swapped_handle() {
+            let store = make_test_store(vec![]);
+
+            // Build a "fresh" client+db pretending failover succeeded.
+            let opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let new_client = mongodb::Client::with_options(opts).unwrap();
+            let new_db = new_client.database("after_failover");
+
+            // Confirm the accessor sees the original namespace before the swap.
+            assert_eq!(store.db().name(), "test");
+
+            // Swap in the new handles (mirrors what `reconnect()` does on success).
+            store.db.store(std::sync::Arc::new(new_db));
+            store.client.store(std::sync::Arc::new(new_client));
+
+            // Accessor must now return the swapped handle. If it kept a
+            // captured copy of the original `db` field (the pre-fix bug),
+            // this assertion fails.
+            assert_eq!(
+                store.db().name(),
+                "after_failover",
+                "db() must reflect the swapped handle — collection accessors \
+                 (proxies/consumers/plugin_configs/upstreams) all flow through \
+                 db(), so a stale handle would mean every read still goes to \
+                 the dead primary even after a successful reconnect"
+            );
         }
     }
 }
