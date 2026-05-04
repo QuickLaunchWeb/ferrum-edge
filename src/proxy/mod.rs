@@ -1450,19 +1450,26 @@ impl ProxyState {
     /// entries from `per_ip_request_counts`. Normally entries are cleaned via
     /// the `PerIpRequestGuard` RAII drop, but this sweep catches edge cases
     /// (e.g., task cancellation without guard drop).
-    pub fn start_per_ip_cleanup_task(&self) {
-        if let Some(ref counts) = self.per_ip_request_counts {
-            let counts = counts.clone();
-            let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
-            tokio::spawn(async move {
-                let mut timer =
-                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                loop {
-                    timer.tick().await;
-                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
-                }
-            });
-        }
+    ///
+    /// Returns `Some(JoinHandle)` when per-IP tracking is enabled so the
+    /// caller can join the task during the background-task drain phase of
+    /// graceful shutdown. Returns `None` when
+    /// `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (no tracking, no task to
+    /// spawn). The task exits cleanly on `shutdown_rx` change so it doesn't
+    /// wedge shutdown — consistent with `start_backend_capability_refresh_task`,
+    /// `dns_cache.start_background_refresh_with_shutdown`, and the overload /
+    /// metrics monitors.
+    pub fn start_per_ip_cleanup_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let counts = self.per_ip_request_counts.as_ref()?.clone();
+        let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
+        Some(tokio::spawn(run_per_ip_cleanup_loop(
+            counts,
+            interval_secs,
+            shutdown_rx,
+        )))
     }
 
     /// Reconcile stream proxy listeners at startup.
@@ -2885,6 +2892,38 @@ impl ProxyState {
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
+    }
+}
+
+/// Drives the per-IP cleanup interval loop.
+///
+/// Pulled out of `start_per_ip_cleanup_task` so the shutdown semantics can be
+/// unit-tested without constructing a full `ProxyState` (which requires a TLS
+/// policy, listener manager, etc.). When `shutdown_rx` is `Some`, the loop
+/// exits cleanly on watch-channel change so the spawned task can be drained
+/// during graceful shutdown alongside DNS / overload / metrics handles.
+async fn run_per_ip_cleanup_loop(
+    counts: Arc<dashmap::DashMap<String, AtomicU64>>,
+    interval_secs: u64,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    match shutdown_rx {
+        Some(mut shutdown_rx) => loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("Per-IP cleanup task shutting down");
+                    break;
+                }
+            }
+        },
+        None => loop {
+            timer.tick().await;
+            counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+        },
     }
 }
 
@@ -11801,5 +11840,53 @@ mod tests {
             !target_uses_direct_h2_pool(&registry, &proxy, "h3only.test", 443),
             "h3=Supported alone is not sufficient — H1/H2 frontends still need reqwest"
         );
+    }
+
+    // ----- Per-IP cleanup task shutdown wiring ---------------------------
+    //
+    // The cleanup loop must honour the global shutdown watch channel so the
+    // spawned task can be drained during the 5 s background-task drain phase
+    // (mirrors DNS / overload / metrics handles). Before this wiring the task
+    // ran an unbounded `loop { timer.tick().await; ... }` and the handle was
+    // dropped on the floor, so shutdown couldn't await it. Regression test:
+    // signalling the channel must end the task within a tight grace window.
+
+    #[tokio::test]
+    async fn per_ip_cleanup_loop_exits_when_shutdown_signal_fires() {
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Use a long interval so the test latency is dominated by the
+        // shutdown branch of the `tokio::select!`, not by `timer.tick()`.
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts.clone(), 3600, Some(rx)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "task should still be running before shutdown is signalled"
+        );
+
+        tx.send(true).expect("watch receiver should still be live");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "task should exit within 2s of shutdown signal; got {result:?}"
+        );
+    }
+
+    // Sanity: a `None` shutdown receiver leaves the loop running indefinitely.
+    // Verifies the un-wired path is unchanged (regression cover for the
+    // legacy behaviour while shutdown wiring is opt-in via `Some`).
+    #[tokio::test]
+    async fn per_ip_cleanup_loop_runs_without_shutdown_receiver() {
+        let counts: Arc<dashmap::DashMap<String, AtomicU64>> = Arc::new(dashmap::DashMap::new());
+        let handle = tokio::spawn(run_per_ip_cleanup_loop(counts, 3600, None));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "task without shutdown receiver should keep ticking"
+        );
+        handle.abort();
     }
 }

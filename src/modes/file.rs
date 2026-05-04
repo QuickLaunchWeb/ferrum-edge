@@ -616,7 +616,8 @@ pub async fn serve(
     proxy_state
         .start_backend_capability_refresh_task(run_initial_refresh, Some(shutdown_tx.subscribe()));
 
-    proxy_state.start_per_ip_cleanup_task();
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
 
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
@@ -993,6 +994,9 @@ pub async fn serve(
     let mut background_handles: Vec<JoinHandle<()>> =
         vec![dns_handle, overload_handle, metrics_handle];
     if let Some(h) = dns_retry_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = per_ip_cleanup_handle {
         background_handles.push(h);
     }
 
