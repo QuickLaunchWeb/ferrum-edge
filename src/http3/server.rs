@@ -1546,6 +1546,7 @@ async fn handle_h3_request(
             &proxy_headers,
             &client_ip_owned,
             &state,
+            ctx.is_early_data,
         );
         let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(&proxy);
 
@@ -2242,6 +2243,7 @@ async fn handle_h3_request(
                 &body_data,
                 &ctx.client_ip,
                 current_target.as_deref(),
+                ctx.is_early_data,
             )
             .await;
 
@@ -2332,6 +2334,7 @@ async fn handle_h3_request(
                     &body_data,
                     &ctx.client_ip,
                     current_target.as_deref(),
+                    ctx.is_early_data,
                 )
                 .await;
             }
@@ -2356,6 +2359,7 @@ async fn handle_h3_request(
                 &body_data,
                 &ctx.client_ip,
                 upstream_target.as_deref(),
+                ctx.is_early_data,
             )
             .await;
             (
@@ -2606,6 +2610,7 @@ fn build_h3_backend_headers(
     headers: &HashMap<String, String>,
     client_ip: &str,
     state: &ProxyState,
+    is_early_data: bool,
 ) -> Vec<(http::header::HeaderName, http::header::HeaderValue)> {
     let mut h3_headers = Vec::with_capacity(headers.len() + 5);
 
@@ -2631,6 +2636,16 @@ fn build_h3_backend_headers(
             // RFC 9110 §7.6.1 Connection-listed strip — see
             // `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
+            // forwarded the request over 0-RTT, never by the originating
+            // client. Strip any client-supplied value here so a malicious
+            // or buggy client cannot trick the backend into believing the
+            // request was carried over 0-RTT (or, conversely, suppress our
+            // own injection of `Early-Data: 1` below). Treated as a
+            // hop-by-hop-style header on the request path: gateway
+            // re-injects the correct value only when the request actually
+            // arrived as 0-RTT early data.
+            "early-data" => continue,
             k if k.starts_with(':') => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
@@ -2641,6 +2656,19 @@ fn build_h3_backend_headers(
                 }
             }
         }
+    }
+
+    // RFC 8470 §5.2: when this request arrived over TLS 1.3 0-RTT early data
+    // and the gateway forwards it to the backend, advertise `Early-Data: 1`
+    // so the origin server can apply its own replay-safety policy (return
+    // 425 Too Early, defer the response, etc.). The gateway has already
+    // gated by `state.early_data_methods`, but the backend may have
+    // stricter policy than the gateway's allow-list.
+    if is_early_data {
+        h3_headers.push((
+            http::header::HeaderName::from_static("early-data"),
+            http::header::HeaderValue::from_static("1"),
+        ));
     }
 
     // X-Forwarded-For
@@ -2830,7 +2858,14 @@ async fn proxy_to_backend_h3_streaming(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
 ) -> Result<H3StreamResult, anyhow::Error> {
-    let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
+    let h3_headers = build_h3_backend_headers(
+        proxy,
+        upstream_target,
+        headers,
+        client_ip,
+        state,
+        ctx.is_early_data,
+    );
     let body = bytes::Bytes::from(body_bytes);
 
     // Dispatch via the h3+quinn connection pool
@@ -3193,8 +3228,16 @@ async fn proxy_to_backend_h3(
     body_bytes: &[u8],
     client_ip: &str,
     upstream_target: Option<&UpstreamTarget>,
+    is_early_data: bool,
 ) -> H3BufferedDispatchResult {
-    let h3_headers = build_h3_backend_headers(proxy, upstream_target, headers, client_ip, state);
+    let h3_headers = build_h3_backend_headers(
+        proxy,
+        upstream_target,
+        headers,
+        client_ip,
+        state,
+        is_early_data,
+    );
     let body = bytes::Bytes::copy_from_slice(body_bytes);
 
     let tls_config_fn = || state.connection_pool.get_tls_config_for_backend(proxy);
@@ -3811,5 +3854,179 @@ mod handshake_timeout_helper_tests {
         let pending = std::future::pending::<()>();
         let result = await_with_optional_timeout(pending, Duration::from_millis(50)).await;
         assert!(result.is_err(), "expected Elapsed when the future stalls");
+    }
+}
+
+#[cfg(test)]
+mod build_h3_backend_headers_tests {
+    //! Regression tests for `build_h3_backend_headers` covering the RFC
+    //! 8470 §5.2 `Early-Data: 1` injection on the native H3 backend
+    //! dispatch path. The function is `fn` (module-private) so these
+    //! tests must live inline.
+    //!
+    //! Notes on test fixture:
+    //! - `ProxyState::new` requires a tokio runtime (it spawns health
+    //!   check tasks); empty `GatewayConfig` keeps the spawn list empty.
+    //! - The tests use `via_header_http3 = None` and
+    //!   `add_forwarded_header = false` (default `EnvConfig`) so the
+    //!   output vector contains only host + XFF + XFP + maybe XFH +
+    //!   the `Early-Data` header under test.
+    use std::collections::HashMap;
+
+    use super::build_h3_backend_headers;
+    use crate::config::EnvConfig;
+    use crate::config::types::{GatewayConfig, Proxy};
+    use crate::dns::{DnsCache, DnsConfig};
+    use crate::proxy::ProxyState;
+
+    fn minimal_proxy_state() -> ProxyState {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![],
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+        ProxyState::new(config, dns_cache, EnvConfig::default(), None)
+            .expect("minimal ProxyState should construct")
+    }
+
+    fn minimal_proxy() -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "backend_host": "backend.example",
+            "backend_port": 443,
+        }))
+        .expect("minimal proxy should deserialize")
+    }
+
+    fn header_present(
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        name: &str,
+    ) -> bool {
+        headers
+            .iter()
+            .any(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+    }
+
+    fn header_value<'a>(
+        headers: &'a [(http::header::HeaderName, http::header::HeaderValue)],
+        name: &str,
+    ) -> Option<&'a http::header::HeaderValue> {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
+
+    #[tokio::test]
+    async fn injects_early_data_header_when_request_is_zero_rtt() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ true,
+        );
+
+        assert!(
+            header_present(&out, "early-data"),
+            "Early-Data must be injected on outbound H3 backend request when ctx.is_early_data is true"
+        );
+        assert_eq!(
+            header_value(&out, "early-data").map(|v| v.as_bytes()),
+            Some(&b"1"[..]),
+            "RFC 8470 §5.2 mandates the value `1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_inject_early_data_header_for_normal_request() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert!(
+            !header_present(&out, "early-data"),
+            "Early-Data must NOT be injected when the request is not 0-RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_supplied_early_data_header_when_zero_rtt() {
+        // RFC 8470 §5.2: clients never set `Early-Data`; only intermediaries
+        // do. The gateway must strip and re-inject so the value is
+        // authoritative regardless of what the client sent.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("early-data".to_string(), "0".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ true,
+        );
+
+        let early_data_count = out
+            .iter()
+            .filter(|(n, _)| n.as_str() == "early-data")
+            .count();
+        assert_eq!(
+            early_data_count, 1,
+            "client-supplied Early-Data must not duplicate or survive — \
+             expected exactly one Early-Data: 1 from the gateway, got {early_data_count}"
+        );
+        assert_eq!(
+            header_value(&out, "early-data").map(|v| v.as_bytes()),
+            Some(&b"1"[..]),
+            "client's `0` must be replaced with the gateway's `1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_supplied_early_data_header_when_not_zero_rtt() {
+        // Even when `is_early_data == false`, the gateway must strip a
+        // client-supplied `Early-Data` header. A bogus client cannot
+        // trick the backend into believing the request was 0-RTT.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("early-data".to_string(), "1".to_string());
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            &state,
+            /* is_early_data = */ false,
+        );
+
+        assert!(
+            !header_present(&out, "early-data"),
+            "client-supplied Early-Data must be stripped, and no value injected when is_early_data == false"
+        );
     }
 }

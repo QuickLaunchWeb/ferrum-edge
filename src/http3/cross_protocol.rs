@@ -445,6 +445,7 @@ fn build_plain_request_builder(
     backend_url: &str,
     effective_host: &str,
     client_ip: &str,
+    is_early_data: bool,
 ) -> reqwest::RequestBuilder {
     let mut req_builder = client.request(req_method, backend_url);
 
@@ -471,6 +472,12 @@ fn build_plain_request_builder(
                     req_builder = req_builder.header("Host", effective_host);
                 }
             }
+            // RFC 8470 §5.2: strip any client-supplied `Early-Data` header
+            // — only the gateway is permitted to set it on a forwarded
+            // request, and only when the inbound request actually arrived
+            // over TLS 1.3 0-RTT. See the matching strip in
+            // `build_h3_backend_headers` (native H3 backend path).
+            _ if k.as_str() == "early-data" => {}
             _ if should_skip_cross_protocol_backend_header(k.as_str()) => {}
             _ => {
                 req_builder = req_builder.header(k, v);
@@ -492,6 +499,14 @@ fn build_plain_request_builder(
             "Forwarded",
             crate::proxy::build_forwarded_value(client_ip, "https", original_host_header),
         );
+    }
+    // RFC 8470 §5.2: signal to the origin that this request was carried
+    // over TLS 1.3 0-RTT so the backend can apply its own replay-safety
+    // policy (return 425 Too Early, defer the response, etc.). The
+    // gateway has already gated by `state.early_data_methods`, but the
+    // backend may have stricter policy than the gateway's allow-list.
+    if is_early_data {
+        req_builder = req_builder.header("Early-Data", "1");
     }
 
     req_builder
@@ -670,6 +685,7 @@ where
                     &current_url,
                     effective_host,
                     client_ip,
+                    ctx.is_early_data,
                 )
                 .body(buffered_body.clone())
                 .send()
@@ -848,6 +864,7 @@ where
                 &current_url,
                 effective_host,
                 client_ip,
+                ctx.is_early_data,
             );
 
             let max_req_bytes = state.max_request_body_size_bytes;
@@ -1482,6 +1499,13 @@ where
         if should_skip_cross_protocol_backend_header(k.as_str()) {
             continue;
         }
+        // RFC 8470 §5.2: `Early-Data` is set by the intermediary that
+        // forwarded the request over 0-RTT, never by the originating
+        // client. Strip any client-supplied value and let the
+        // `is_early_data` injection below produce the canonical form.
+        if k.as_str() == "early-data" {
+            continue;
+        }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
@@ -1511,6 +1535,14 @@ where
         if let Ok(val) = HeaderValue::from_str(&fwd) {
             hmap.insert(hyper::header::FORWARDED, val);
         }
+    }
+    // RFC 8470 §5.2: signal to the origin that this request was carried
+    // over TLS 1.3 0-RTT so the gRPC backend can apply its own
+    // replay-safety policy (e.g. reject with `UNAVAILABLE` on a
+    // non-idempotent unary call). The gateway has already gated by
+    // `state.early_data_methods`; the backend may apply additional policy.
+    if ctx.is_early_data {
+        hmap.insert("early-data", HeaderValue::from_static("1"));
     }
 
     // Stream the response whenever the per-request streaming policy
@@ -2794,11 +2826,16 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata, normalize_h3_grpc_reject,
-        reject_body_as_h3_grpc_message, sanitize_h3_grpc_message_for_header,
-        should_finish_h3_stream_without_trailers, should_skip_cross_protocol_backend_header,
+        apply_buffered_grpc_plugin_reject, apply_h3_grpc_reject_metadata,
+        build_plain_request_builder, normalize_h3_grpc_reject, reject_body_as_h3_grpc_message,
+        sanitize_h3_grpc_message_for_header, should_finish_h3_stream_without_trailers,
+        should_skip_cross_protocol_backend_header,
     };
+    use crate::config::EnvConfig;
+    use crate::config::types::{GatewayConfig, Proxy};
+    use crate::dns::{DnsCache, DnsConfig};
     use crate::plugins::{PluginResult, RequestContext};
+    use crate::proxy::ProxyState;
     use hyper::{HeaderMap, StatusCode};
 
     #[test]
@@ -3324,6 +3361,193 @@ mod tests {
             "expected `stream_grpc_response` to be threaded into the H3 \
              cross-protocol retry call; argument list was:\n{}",
             call_args
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 8470 §5.2 `Early-Data: 1` injection on the H3→non-H3 plain
+    // bridge (`build_plain_request_builder`). Tests cover:
+    //   - injection when ctx.is_early_data == true
+    //   - no injection when ctx.is_early_data == false
+    //   - client-supplied Early-Data header is always stripped
+    //
+    // The gRPC bridge uses an inline `HeaderMap` rather than a shared
+    // builder, so its injection is exercised end-to-end via the
+    // integration / functional test suite alongside the rest of the
+    // gRPC dispatch path.
+    // -----------------------------------------------------------------
+
+    fn minimal_proxy_state() -> ProxyState {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let config = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![],
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: chrono::Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+        ProxyState::new(config, dns_cache, EnvConfig::default(), None)
+            .expect("minimal ProxyState should construct")
+    }
+
+    fn minimal_proxy() -> Proxy {
+        serde_json::from_value(serde_json::json!({
+            "backend_host": "backend.example",
+            "backend_port": 443,
+        }))
+        .expect("minimal proxy should deserialize")
+    }
+
+    /// Count occurrences of a header (lowercase compare) in a built
+    /// reqwest `Request`. reqwest header names are already lowercased
+    /// by the http crate.
+    fn count_header(req: &reqwest::Request, name: &str) -> usize {
+        req.headers()
+            .iter()
+            .filter(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .count()
+    }
+
+    fn header_value<'a>(req: &'a reqwest::Request, name: &str) -> Option<&'a [u8]> {
+        req.headers()
+            .iter()
+            .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_injects_early_data_header_when_zero_rtt() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ true,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            header_value(&req, "early-data"),
+            Some(&b"1"[..]),
+            "RFC 8470 §5.2: Early-Data: 1 must be injected when ctx.is_early_data is true"
+        );
+        assert_eq!(
+            count_header(&req, "early-data"),
+            1,
+            "exactly one Early-Data header expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_does_not_inject_early_data_header_for_normal_request() {
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("user-agent".to_string(), "test-client".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ false,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            count_header(&req, "early-data"),
+            0,
+            "Early-Data must NOT be injected when the request is not 0-RTT"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_strips_client_supplied_early_data_when_zero_rtt() {
+        // RFC 8470 §5.2: clients never set Early-Data; only intermediaries
+        // do. The gateway must strip and re-inject so the value is
+        // authoritative regardless of what the client sent.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("early-data".to_string(), "0".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ true,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            count_header(&req, "early-data"),
+            1,
+            "client-supplied Early-Data must not duplicate or survive — \
+             expected exactly one Early-Data: 1 from the gateway"
+        );
+        assert_eq!(
+            header_value(&req, "early-data"),
+            Some(&b"1"[..]),
+            "client's `0` must be replaced with the gateway's `1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_plain_request_builder_strips_client_supplied_early_data_when_not_zero_rtt() {
+        // Even when is_early_data is false, the gateway must strip a
+        // client-supplied Early-Data header. A bogus client cannot
+        // trick the backend into believing the request was 0-RTT.
+        let state = minimal_proxy_state();
+        let proxy = minimal_proxy();
+        let client = reqwest::Client::new();
+
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("early-data".to_string(), "1".to_string());
+
+        let builder = build_plain_request_builder(
+            &client,
+            &state,
+            &proxy,
+            reqwest::Method::GET,
+            &headers,
+            "https://backend.example/path",
+            "backend.example",
+            "203.0.113.1",
+            /* is_early_data = */ false,
+        );
+
+        let req = builder.build().expect("request should build");
+        assert_eq!(
+            count_header(&req, "early-data"),
+            0,
+            "client-supplied Early-Data must be stripped, and no value \
+             injected when is_early_data == false"
         );
     }
 }
