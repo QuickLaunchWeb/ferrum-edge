@@ -32,7 +32,7 @@ use super::proto::config_sync_client::ConfigSyncClient;
 use crate::FERRUM_VERSION;
 use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
-use crate::proxy::ProxyState;
+use crate::proxy::{IncrementalApplyOutcome, ProxyState};
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -696,9 +696,27 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 namespace, filtered
                             );
                         }
-                        if proxy_state.apply_incremental(result).await {
-                            update_state_config_received(connection_state);
-                            info!("Incremental config delta applied from CP");
+                        match proxy_state.apply_incremental(result).await {
+                            IncrementalApplyOutcome::Applied => {
+                                update_state_config_received(connection_state);
+                                info!("Incremental config delta applied from CP");
+                            }
+                            IncrementalApplyOutcome::NoChanges => {
+                                // Empty delta — preserve original behavior of not
+                                // touching `last_config_received_at` so cluster
+                                // observability still reflects only deltas that
+                                // carried real changes.
+                            }
+                            IncrementalApplyOutcome::Rejected => {
+                                // CP-side validation could not reproduce locally
+                                // (e.g. file dependencies missing on this DP); the
+                                // DP keeps its prior config. CP will eventually
+                                // reconcile via a full snapshot on broadcast lag.
+                                warn!(
+                                    "Incremental config delta from CP rejected by local validation; \
+                                     keeping prior config"
+                                );
+                            }
                         }
                     }
                     Err(e) => {

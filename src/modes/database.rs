@@ -883,18 +883,46 @@ pub async fn run(
                                 let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
                                 let removed_upstream_ids = result.removed_upstream_ids.clone();
 
-                                if proxy_state_poll.apply_incremental(result).await {
-                                    // Update known IDs only after successful apply to keep them
-                                    // in sync with actual proxy state. If apply is rejected
-                                    // (e.g. security plugin validation), known_ids stay unchanged
-                                    // so the next poll re-fetches the same changes.
-                                    update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
-                                    update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
-                                    update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
-                                    update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
-                                    debug!("Incremental config reload complete");
+                                match proxy_state_poll.apply_incremental(result).await {
+                                    proxy::IncrementalApplyOutcome::Applied => {
+                                        // Update known IDs only after successful apply to keep them
+                                        // in sync with actual proxy state.
+                                        update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
+                                        update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
+                                        update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
+                                        update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
+                                        debug!("Incremental config reload complete");
+                                        last_poll_at = Some(poll_ts);
+                                    }
+                                    proxy::IncrementalApplyOutcome::NoChanges => {
+                                        // Nothing to apply this cycle. Advance the cursor
+                                        // so the next poll only fetches truly newer rows.
+                                        last_poll_at = Some(poll_ts);
+                                    }
+                                    proxy::IncrementalApplyOutcome::Rejected => {
+                                        // Validation rejected the patched config (e.g. security
+                                        // plugin / unique listen-path). Leave `last_poll_at`
+                                        // unchanged so the next poll re-fetches the same rows
+                                        // and tries again. Without this, a rejected resource
+                                        // older than the 1-second `since_safe` margin would
+                                        // silently disappear from the gateway's view of the
+                                        // DB, leaving permanent divergence between DB state
+                                        // and in-memory config until a full reload.
+                                        //
+                                        // Known follow-up: if the same poll timestamp keeps
+                                        // failing validation (a malformed row stuck in the
+                                        // DB), the loop will spin re-fetching it forever.
+                                        // A future change should escalate after N consecutive
+                                        // rejections at the same `poll_ts` — log an error and
+                                        // trigger a full reload to recover (or mark the
+                                        // offending IDs and skip them with operator alert).
+                                        warn!(
+                                            "Incremental config update rejected by validation; \
+                                             leaving last_poll_at unchanged so the next poll \
+                                             retries the same rows"
+                                        );
+                                    }
                                 }
-                                last_poll_at = Some(poll_ts);
                             }
                             Err(e) => {
                                 warn!(
