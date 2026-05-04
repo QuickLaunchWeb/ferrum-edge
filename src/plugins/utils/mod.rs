@@ -8,6 +8,7 @@ pub mod auth_flow;
 pub mod aws_sigv4;
 pub mod batching_logger;
 pub mod body_transform;
+pub mod cache_headers;
 pub mod http_client;
 pub mod json_escape;
 pub mod jwks_cache;
