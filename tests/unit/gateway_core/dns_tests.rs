@@ -1,5 +1,6 @@
 //! Tests for DNS cache and resolution module
 
+use ferrum_edge::config::BackendAllowIps;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use std::collections::HashMap;
 
@@ -7,6 +8,14 @@ use std::collections::HashMap;
 fn default_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
     DnsConfig {
         global_overrides: overrides,
+        ..DnsConfig::default()
+    }
+}
+
+fn public_dns_config(overrides: HashMap<String, String>) -> DnsConfig {
+    DnsConfig {
+        global_overrides: overrides,
+        backend_allow_ips: BackendAllowIps::Public,
         ..DnsConfig::default()
     }
 }
@@ -85,6 +94,26 @@ async fn test_dns_invalid_override_ip() {
 
     // Invalid IP override should return an error
     let result = cache.resolve("example.com", Some("not-an-ip"), None).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_dns_public_policy_denies_private_per_proxy_override() {
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+
+    let result = cache
+        .resolve("example.com", Some("169.254.169.254"), None)
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_dns_public_policy_denies_private_global_override() {
+    let mut overrides = HashMap::new();
+    overrides.insert("metadata.local".to_string(), "169.254.169.254".to_string());
+    let cache = DnsCache::new(public_dns_config(overrides));
+
+    let result = cache.resolve("metadata.local", None, None).await;
     assert!(result.is_err());
 }
 
@@ -765,6 +794,24 @@ async fn test_dns_resolve_all_per_proxy_override() {
         result,
         vec!["192.168.1.1".parse::<std::net::IpAddr>().unwrap()]
     );
+}
+
+#[tokio::test]
+async fn test_dns_resolve_all_public_policy_denies_private_override() {
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+
+    let result = cache
+        .resolve_all("example.com", Some("192.168.1.1"), None)
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_dns_public_policy_denies_localhost() {
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+
+    let result = cache.resolve("localhost", None, None).await;
+    assert!(result.is_err());
 }
 
 #[tokio::test]

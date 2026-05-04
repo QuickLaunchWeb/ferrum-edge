@@ -107,6 +107,17 @@ impl ReqwestPoolManager {
         if let Some(ref dns_override) = proxy.dns_override
             && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
         {
+            if !crate::config::check_backend_ip_allowed(
+                &ip,
+                &self.global_env_config.backend_allow_ips,
+            ) {
+                anyhow::bail!(
+                    "Proxy '{}': dns_override IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                    proxy.id,
+                    ip,
+                    self.global_env_config.backend_allow_ips
+                );
+            }
             let socket_addr = SocketAddr::new(ip, proxy.backend_port);
             client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
         }

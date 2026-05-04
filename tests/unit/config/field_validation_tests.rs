@@ -1613,6 +1613,44 @@ fn test_validate_backend_ip_policy_public_allows_public_proxy() {
 }
 
 #[test]
+fn test_validate_backend_ip_policy_public_denies_private_dns_override() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "example.com".to_string(),
+            dns_override: Some("169.254.169.254".to_string()),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    assert!(result.is_err());
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("dns_override") && e.contains("169.254.169.254"))
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_public_allows_public_dns_override() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "example.com".to_string(),
+            dns_override: Some("8.8.8.8".to_string()),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    assert!(
+        config
+            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .is_ok()
+    );
+}
+
+#[test]
 fn test_validate_backend_ip_policy_private_denies_public_proxy() {
     let proxy = make_proxy("test", "/api");
     let config = GatewayConfig {

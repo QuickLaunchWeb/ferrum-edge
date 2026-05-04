@@ -3834,6 +3834,15 @@ impl GatewayConfig {
                         proxy.id, ip, backend_allow_ips
                     ));
                 }
+                if let Some(ref dns_override) = proxy.dns_override
+                    && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
+                    && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                {
+                    errors.push(format!(
+                        "Proxy '{}': dns_override IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                        proxy.id, ip, backend_allow_ips
+                    ));
+                }
             }
             for upstream in &self.upstreams {
                 for (i, target) in upstream.targets.iter().enumerate() {

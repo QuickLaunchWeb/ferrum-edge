@@ -242,6 +242,41 @@ impl DnsCache {
         Ok(addr)
     }
 
+    fn check_backend_addresses_policy(
+        &self,
+        addresses: &[IpAddr],
+        hostname: &str,
+    ) -> Result<(), anyhow::Error> {
+        for &addr in addresses {
+            self.check_backend_ip_policy(addr, hostname)?;
+        }
+        Ok(())
+    }
+
+    fn cache_success_entry(
+        &self,
+        hostname: &str,
+        addresses: Vec<IpAddr>,
+        record_type: Option<CachedRecordType>,
+        ttl: Duration,
+    ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        self.check_backend_addresses_policy(&addresses, hostname)?;
+
+        self.cache.insert(
+            hostname.to_string(),
+            DnsCacheEntry {
+                addresses: addresses.clone(),
+                expires_at: Instant::now() + ttl,
+                stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                applied_ttl: ttl,
+                record_type_used: record_type,
+                is_error: false,
+            },
+        );
+
+        Ok(addresses)
+    }
+
     /// Resolution priority:
     /// 1. Per-proxy static override (highest priority)
     /// 2. Global static overrides
@@ -271,6 +306,7 @@ impl DnsCache {
 
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses[0]);
             }
 
@@ -314,6 +350,7 @@ impl DnsCache {
                         hostname
                     );
                 }
+                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses[0]);
             }
 
@@ -326,23 +363,8 @@ impl DnsCache {
         // 4. Perform actual DNS resolution
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                // Check backend IP policy BEFORE caching to prevent denied IPs
-                // from being served on subsequent requests via the cache.
-                self.check_backend_ip_policy(addrs[0], hostname)?;
-
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-
-                self.cache.insert(
-                    hostname.to_string(),
-                    DnsCacheEntry {
-                        addresses: addrs.clone(),
-                        expires_at: Instant::now() + ttl,
-                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
-                        applied_ttl: ttl,
-                        record_type_used: record_type,
-                        is_error: false,
-                    },
-                );
+                let addrs = self.cache_success_entry(hostname, addrs, record_type, ttl)?;
 
                 debug!(
                     "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
@@ -356,19 +378,9 @@ impl DnsCache {
                 // if AAAA appears before A, prefer IPv6 loopback.
                 let addr = self.localhost_addr();
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
-                self.cache.insert(
-                    hostname.to_string(),
-                    DnsCacheEntry {
-                        addresses: vec![addr],
-                        expires_at: Instant::now() + ttl,
-                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
-                        applied_ttl: ttl,
-                        record_type_used: None,
-                        is_error: false,
-                    },
-                );
+                let addrs = self.cache_success_entry(hostname, vec![addr], None, ttl)?;
                 debug!("DNS resolved localhost -> {} (built-in fallback)", addr);
-                Ok(addr)
+                Ok(addrs[0])
             }
             Ok(_) => {
                 self.cache_error(hostname);
@@ -395,13 +407,13 @@ impl DnsCache {
         // 1. Per-proxy static override
         if let Some(ip_str) = per_proxy_override {
             let addr: IpAddr = ip_str.parse()?;
-            return Ok(vec![addr]);
+            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
         }
 
         // 2. Global overrides
         if let Some(ip_str) = self.global_overrides.get(hostname) {
             let addr: IpAddr = ip_str.parse()?;
-            return Ok(vec![addr]);
+            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
         }
 
         // 3. Cache with stale-while-revalidate
@@ -409,6 +421,7 @@ impl DnsCache {
             let now = Instant::now();
 
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses.clone());
             }
 
@@ -432,6 +445,7 @@ impl DnsCache {
                         }
                     }
                 }
+                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses.clone());
             }
 
@@ -444,37 +458,12 @@ impl DnsCache {
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-
-                self.cache.insert(
-                    hostname.to_string(),
-                    DnsCacheEntry {
-                        addresses: addrs.clone(),
-                        expires_at: Instant::now() + ttl,
-                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
-                        applied_ttl: ttl,
-                        record_type_used: record_type,
-                        is_error: false,
-                    },
-                );
-
-                Ok(addrs)
+                self.cache_success_entry(hostname, addrs, record_type, ttl)
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
                 let addr = self.localhost_addr();
-                let addrs = vec![addr];
                 let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
-                self.cache.insert(
-                    hostname.to_string(),
-                    DnsCacheEntry {
-                        addresses: addrs.clone(),
-                        expires_at: Instant::now() + ttl,
-                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
-                        applied_ttl: ttl,
-                        record_type_used: None,
-                        is_error: false,
-                    },
-                );
-                Ok(addrs)
+                self.cache_success_entry(hostname, vec![addr], None, ttl)
             }
             Ok(_) => {
                 self.cache_error(hostname);
@@ -499,18 +488,7 @@ impl DnsCache {
         }
 
         let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-
-        self.cache.insert(
-            hostname.to_string(),
-            DnsCacheEntry {
-                addresses: addrs,
-                expires_at: Instant::now() + ttl,
-                stale_deadline: Instant::now() + ttl + self.stale_ttl,
-                applied_ttl: ttl,
-                record_type_used: record_type,
-                is_error: false,
-            },
-        );
+        self.cache_success_entry(hostname, addrs, record_type, ttl)?;
 
         debug!(
             "DNS background refresh: {} refreshed (ttl={:?})",
@@ -911,21 +889,25 @@ impl DnsCache {
                     match cache.timed_resolve(&hostname).await {
                         Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                             let refresh_ttl = cache.effective_ttl(native_ttl, None);
-                            cache.cache.insert(
-                                hostname.clone(),
-                                DnsCacheEntry {
-                                    addresses: addrs,
-                                    expires_at: Instant::now() + refresh_ttl,
-                                    stale_deadline: Instant::now() + refresh_ttl + cache.stale_ttl,
-                                    applied_ttl: refresh_ttl,
-                                    record_type_used: record_type,
-                                    is_error: false,
-                                },
-                            );
-                            debug!(
-                                "DNS background refresh: {} refreshed (ttl={:?})",
-                                hostname, refresh_ttl
-                            );
+                            match cache.cache_success_entry(
+                                &hostname,
+                                addrs,
+                                record_type,
+                                refresh_ttl,
+                            ) {
+                                Ok(_) => {
+                                    debug!(
+                                        "DNS background refresh: {} refreshed (ttl={:?})",
+                                        hostname, refresh_ttl
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "DNS background refresh: '{}' resolved but denied by IP policy: {}",
+                                        hostname, e
+                                    );
+                                }
+                            }
                         }
                         Ok(_) => {
                             warn!("DNS background refresh: {} returned no addresses", hostname);
@@ -1003,31 +985,21 @@ impl DnsCache {
 
                     match cache.timed_resolve(&hostname).await {
                         Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                            // Check IP policy before promoting to success
-                            if let Err(e) = cache.check_backend_ip_policy(addrs[0], &hostname) {
-                                warn!(
-                                    "DNS failed retry: '{}' resolved but denied by IP policy: {}",
-                                    hostname, e
-                                );
-                                continue;
-                            }
-
                             let ttl = cache.effective_ttl(native_ttl, None);
-                            cache.cache.insert(
-                                hostname.clone(),
-                                DnsCacheEntry {
-                                    addresses: addrs.clone(),
-                                    expires_at: Instant::now() + ttl,
-                                    stale_deadline: Instant::now() + ttl + cache.stale_ttl,
-                                    applied_ttl: ttl,
-                                    record_type_used: record_type,
-                                    is_error: false,
-                                },
-                            );
-                            warn!(
-                                "DNS failed retry: '{}' resolved successfully -> {:?} (ttl={:?})",
-                                hostname, addrs[0], ttl
-                            );
+                            match cache.cache_success_entry(&hostname, addrs, record_type, ttl) {
+                                Ok(addrs) => {
+                                    warn!(
+                                        "DNS failed retry: '{}' resolved successfully -> {:?} (ttl={:?})",
+                                        hostname, addrs[0], ttl
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "DNS failed retry: '{}' resolved but denied by IP policy: {}",
+                                        hostname, e
+                                    );
+                                }
+                            }
                         }
                         Ok(_) => {
                             // Re-cache the error with fresh error TTL

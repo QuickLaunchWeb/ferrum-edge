@@ -1838,10 +1838,22 @@ fn test_is_private_ip_cgnat() {
 }
 
 #[test]
+fn test_is_private_ip_special_use_v4() {
+    assert!(is_private_ip(&"192.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.2.5".parse().unwrap()));
+    assert!(is_private_ip(&"192.88.99.1".parse().unwrap()));
+    assert!(is_private_ip(&"198.18.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"198.51.100.5".parse().unwrap()));
+    assert!(is_private_ip(&"203.0.113.5".parse().unwrap()));
+    assert!(is_private_ip(&"224.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"240.0.0.1".parse().unwrap()));
+}
+
+#[test]
 fn test_is_private_ip_public_v4() {
     assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
     assert!(!is_private_ip(&"1.1.1.1".parse().unwrap()));
-    assert!(!is_private_ip(&"203.0.113.5".parse().unwrap()));
+    assert!(!is_private_ip(&"100.128.0.1".parse().unwrap()));
 }
 
 #[test]
@@ -1849,9 +1861,12 @@ fn test_is_private_ip_ipv6() {
     assert!(is_private_ip(&"::1".parse().unwrap()));
     assert!(is_private_ip(&"::".parse().unwrap()));
     assert!(is_private_ip(&"fe80::1".parse().unwrap()));
+    assert!(is_private_ip(&"fc00::1".parse().unwrap()));
     assert!(is_private_ip(&"fd00::1".parse().unwrap()));
+    assert!(is_private_ip(&"ff02::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:db8::1".parse().unwrap()));
+    assert!(is_private_ip(&"::ffff:127.0.0.1".parse().unwrap()));
     // Public IPv6
-    assert!(!is_private_ip(&"2001:db8::1".parse().unwrap()));
     assert!(!is_private_ip(&"2607:f8b0:4004:800::200e".parse().unwrap()));
 }
 
