@@ -1311,13 +1311,14 @@ credentials:
 
 ### `hmac_auth`
 
-Authenticates requests using HMAC signatures.
+Authenticates requests using HMAC signatures with mandatory request-body integrity protection (RFC 9421 / RFC 3230).
 
 **Priority:** 1400
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
+| `require_digest` | bool | `true` | When `true` (default, secure), inbound requests must include a `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421) header that matches the request body, and the digest header value is folded into the HMAC signing string. When `false`, the legacy 3-field signing string is used and the request body is NOT integrity-protected. |
 
 Expected `Authorization` header format:
 
@@ -1329,6 +1330,22 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 - Supported algorithms: `hmac-sha256`, `hmac-sha512`
 - Unknown algorithms are rejected
 - Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
+
+**Signing string** (with `require_digest = true`, the default):
+
+```text
+{METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
+```
+
+where `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Including the digest header in the signing string means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+
+**Signing string** (with `require_digest = false`, legacy mode):
+
+```text
+{METHOD}\n{PATH}\n{DATE}
+```
+
+In legacy mode the request body is **not** integrity-protected — an attacker who captures a signed request can replay it with any modified body within the clock-skew window. Set `require_digest: true` for production. The plugin emits a `warn!` log at construction time when `require_digest = false`.
 
 **Consumer credential** (`hmac_auth`) — single or array for rotation:
 ```yaml

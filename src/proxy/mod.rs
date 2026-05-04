@@ -5754,6 +5754,65 @@ async fn handle_proxy_request_inner(
     // and on_request_received so plugin-less early rejects skip the work.
     ctx.materialize_query_params();
 
+    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
+    // request body integrity at authenticate time. Buffer the body before the
+    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    let requires_body_before_authenticate = capabilities
+        .has(PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_authenticate()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    if requires_body_before_authenticate {
+        client_request_body = match client_request_body {
+            ClientRequestBody::Streaming(request) => {
+                match buffer_request_body_for_before_proxy(
+                    *request,
+                    &method,
+                    &ctx.headers,
+                    state.max_request_body_size_bytes,
+                )
+                .await
+                {
+                    Ok(buffered) => {
+                        if let ClientRequestBody::Buffered(body) = &buffered {
+                            // Auth plugins that need bytes (hmac_auth digest
+                            // verification) read `ctx.request_body_bytes`, so
+                            // always populate the binary-safe handle here.
+                            store_request_body_metadata(&mut ctx, body, true);
+                            ctx.request_bytes_observed
+                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
+                        }
+                        buffered
+                    }
+                    Err(RequestBodyBufferError::TooLarge) => {
+                        record_request(&state, 413);
+                        return Ok(build_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            r#"{"error":"Request body exceeds maximum size"}"#,
+                        ));
+                    }
+                    Err(RequestBodyBufferError::ClientDisconnected(error_message)) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            path = %ctx.path,
+                            error_kind = "client_disconnect",
+                            error = %error_message,
+                            "Client disconnected while buffering request body before authenticate"
+                        );
+                        record_request(&state, 499);
+                        return Ok(build_response(
+                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                            r#"{"error":"Client disconnected"}"#,
+                        ));
+                    }
+                }
+            }
+            already_buffered => already_buffered,
+        };
+    }
+
     // Authentication phase (pre-computed auth plugin list — zero allocation)
     let auth_plugins = plugin_cache_view.auth_plugins();
 
