@@ -332,12 +332,10 @@ async fn connect_with_socket_opts_ipv6_loopback() {
 }
 
 #[tokio::test]
-async fn connect_with_socket_opts_refuses_closed_port() {
-    // Bind and drop to get a port that's definitely closed.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-
+async fn connect_with_socket_opts_refuses_unreachable() {
+    // Port 1 on loopback requires root and is never listening in CI.
+    // No bind-drop-rebind race since we never held the port.
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
     let result = connect_with_socket_opts(addr).await;
     assert!(result.is_err());
 }
