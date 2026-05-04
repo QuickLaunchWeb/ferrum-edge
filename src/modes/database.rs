@@ -520,6 +520,7 @@ pub async fn run(
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+            let h3_client_crls = crls.clone();
             let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
@@ -532,6 +533,7 @@ pub async fn run(
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
+                        client_crls: h3_client_crls,
                         started_tx: Some(h3_started_tx),
                     },
                 )

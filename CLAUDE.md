@@ -262,7 +262,7 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 **Cert expiration** (`check_cert_expiry()` in `src/tls/mod.rs`): all surfaces check `notBefore`/`notAfter`. Expired = hard failure. Warning within `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` (default 30).
 
-**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS, all 6 rustls backend paths, DTLS, and the rustls-based logging sinks (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS — plumbed via `PluginHttpClient::tls_crls()`). NOT applied to DP→CP gRPC (tonic-managed) or reqwest-based plugin paths (reqwest does not expose CRL configuration). Restart to reload. No hot reload for any TLS surface.
+**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS (H1/H2 via `load_tls_config_with_client_auth`, H3 via `build_client_cert_verifier`, DTLS via `build_frontend_dtls_config`), all 6 rustls backend paths, and the rustls-based logging sinks (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS — plumbed via `PluginHttpClient::tls_crls()`). NOT applied to DP→CP gRPC (tonic-managed) or reqwest-based plugin paths (reqwest does not expose CRL configuration). Restart to reload. No hot reload for any TLS surface.
 
 **Pool-per-cert-path**: reqwest paths (HTTP/1.1, H2 via reqwest, H3 frontend→backend) → distinct `reqwest::Client`. rustls paths (gRPC pool, H2 direct) → per-connection.
 
