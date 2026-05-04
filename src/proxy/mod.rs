@@ -1208,6 +1208,7 @@ impl ProxyState {
             env_config_arc.plugin_http_retry_delay_ms,
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.as_deref(),
+            crls.clone(),
             &env_config_arc.namespace,
         );
         let plugin_cache = Arc::new(

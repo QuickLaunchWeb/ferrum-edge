@@ -254,11 +254,11 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 **Cert expiration** (`check_cert_expiry()` in `src/tls/mod.rs`): all surfaces check `notBefore`/`notAfter`. Expired = hard failure. Warning within `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` (default 30).
 
-**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS, all 6 rustls backend paths, DTLS. NOT applied to DP→CP gRPC (tonic-managed). Restart to reload. No hot reload for any TLS surface.
+**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS, all 6 rustls backend paths, DTLS, and the rustls-based logging sinks (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS — plumbed via `PluginHttpClient::tls_crls()`). NOT applied to DP→CP gRPC (tonic-managed) or reqwest-based plugin paths (reqwest does not expose CRL configuration). Restart to reload. No hot reload for any TLS surface.
 
 **Pool-per-cert-path**: reqwest paths (HTTP/1.1, H2 via reqwest, H3 frontend→backend) → distinct `reqwest::Client`. rustls paths (gRPC pool, H2 direct) → per-connection.
 
-**Non-rustls paths**: `kafka_logging` (librdkafka/OpenSSL) — `FERRUM_TLS_CA_BUNDLE_PATH`→`ssl.ca.location`, `FERRUM_TLS_NO_VERIFY`→`enable.ssl.certificate.verification=false` (plugin fields override; CRL via `producer_config.ssl.crl.location`). `redis` applies global flags via `PluginHttpClient` accessors.
+**Non-rustls paths**: `kafka_logging` (librdkafka/OpenSSL) — `FERRUM_TLS_CA_BUNDLE_PATH`→`ssl.ca.location`, `FERRUM_TLS_NO_VERIFY`→`enable.ssl.certificate.verification=false` (plugin fields override; CRL via `producer_config.ssl.crl.location`). `redis` applies global flags via `PluginHttpClient` accessors. Logging sinks built on rustls (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS) now apply the gateway CRL list via `PluginHttpClient::tls_crls()` → `build_server_verifier_with_crls`.
 
 **`PluginHttpClient` limits**: plugins bypassing proxy dispatch (`ai_federation` "terminate and respond") use shared `PluginHttpClient` with global TLS only — no per-proxy CA/CRL/cipher. For private endpoints, add internal CAs to global bundle (include public roots too since CA exclusivity disables webpki).
 

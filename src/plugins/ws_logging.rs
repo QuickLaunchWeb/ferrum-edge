@@ -15,6 +15,10 @@
 //! - Custom CA (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor (webpki roots excluded)
 //! - No CA configured → webpki/system roots as default fallback
 //! - `FERRUM_TLS_NO_VERIFY` → skip server certificate verification
+//! - CRL list (`FERRUM_TLS_CRL_FILE_PATH`) is applied via `WebPkiServerVerifier`
+//!   with `allow_unknown_revocation_status() + only_check_end_entity_revocation()`,
+//!   so revoked log-sink certificates are rejected. Matches the proxy backend /
+//!   DTLS / frontend mTLS surfaces.
 
 use async_trait::async_trait;
 use futures_util::SinkExt;
@@ -117,12 +121,16 @@ impl WsLogging {
 
 /// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's
 /// CA trust chain: custom CA → sole anchor, no CA → webpki roots, no-verify →
-/// skip verification entirely.
+/// skip verification entirely. The gateway's CRL list
+/// (`FERRUM_TLS_CRL_FILE_PATH`) is applied via `WebPkiServerVerifier` so that
+/// revoked log-sink certificates are rejected, matching the proxy backend /
+/// DTLS / frontend mTLS surfaces.
 fn build_tls_connector(
     http_client: &PluginHttpClient,
 ) -> Result<tokio_tungstenite::Connector, String> {
     let tls_no_verify = http_client.tls_no_verify();
     let ca_bundle_path = http_client.tls_ca_bundle_path();
+    let crls = http_client.tls_crls();
 
     // Build root certificate store following the gateway's CA trust chain:
     // - Custom CA configured → empty store + only that CA (CA exclusivity)
@@ -144,9 +152,20 @@ fn build_tls_connector(
         }
     }
 
-    let mut client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let mut client_config = if tls_no_verify {
+        // No-verify path bypasses CRL checking entirely; warn below on first build.
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    } else {
+        // Apply gateway CRL list via `build_server_verifier_with_crls` (uses
+        // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`).
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
+            .map_err(|e| format!("ws_logging: failed to build TLS verifier: {e}"))?;
+        rustls::ClientConfig::builder()
+            .with_webpki_verifier(verifier)
+            .with_no_client_auth()
+    };
 
     if tls_no_verify {
         warn!("WebSocket logging TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY)");
