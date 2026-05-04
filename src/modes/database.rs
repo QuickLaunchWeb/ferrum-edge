@@ -205,6 +205,20 @@ pub async fn run(
         }
     }
 
+    // Custom-plugin migrations: warn on pending, opt-in auto-apply.
+    // Skipped when bootstrap_from_backup is still true — the database is
+    // unreachable so we can't probe migration state. The polling loop will
+    // reconcile when the DB recovers; until then the operator's existing
+    // schema is what matters anyway.
+    if !bootstrap_from_backup {
+        crate::modes::handle_startup_plugin_migrations(
+            &db,
+            env_config.auto_apply_plugin_migrations,
+            "database",
+        )
+        .await?;
+    }
+
     // Load initial config from database, falling back to backup file if configured
     let backup_path = env_config.db_config_backup_path.clone();
     let config = match db.load_full_config(&env_config.namespace).await {

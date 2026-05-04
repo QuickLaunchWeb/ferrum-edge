@@ -119,6 +119,14 @@ pub async fn run(
     };
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
 
+    // Custom-plugin migrations: warn on pending, opt-in auto-apply.
+    crate::modes::handle_startup_plugin_migrations(
+        &db,
+        env_config.auto_apply_plugin_migrations,
+        "cp",
+    )
+    .await?;
+
     let config = db.load_full_config(&env_config.namespace).await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers",

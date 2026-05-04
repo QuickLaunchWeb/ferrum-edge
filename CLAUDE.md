@@ -452,6 +452,13 @@ Graceful degradation pattern (`geo_restriction` example): constructor logs `warn
 
 `custom_plugins/my_plugin.rs` with `create_plugin()` + exported `plugin_migrations() -> Vec<CustomPluginMigration>`. Fields: `version` (per-plugin), `name`, `checksum`, `sql` + optional `sql_postgres`/`sql_mysql`. Prefix tables with plugin name. Multi-statement supported. Run with `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up`; tracked in `_ferrum_plugin_migrations` with `(plugin_name, version)` PK. See `custom_plugins/example_audit_plugin.rs` + `CUSTOM_PLUGINS.md`. **MongoDB**: `CustomPluginMigration` is SQL-only; create MongoDB collections/indexes in `create_plugin()`.
 
+**Startup behavior** (`database` and `cp` modes): on boot, after core schema migrations (`run_pending`), the gateway calls `db.pending_plugin_migrations()` and:
+
+- If any are pending and `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=false` (default), emits a `warn!` listing them — the gateway does NOT auto-mutate the schema. Operators must run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` explicitly before serving traffic that depends on the new schema. This preserves the contract that schema changes never run silently at boot.
+- If `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true`, applies pending plugin migrations via `db.apply_plugin_migrations()` before `load_full_config`. A failed migration in this path is fatal — better to refuse startup than to come up with an inconsistent schema. Useful for embedded deployments (e.g., SQLite where the binary owns the database) that want a single binary upgrade to bring plugin schema up to date.
+
+The trait methods `pending_plugin_migrations` / `apply_plugin_migrations` default to no-op for backends that don't support SQL plugin migrations (e.g., MongoDB). The `database` and `cp` startup paths share `crate::modes::handle_startup_plugin_migrations()`. The standalone `migrate` mode is unchanged — it always applies plugin migrations regardless of this flag.
+
 ### Adding a New Config Field
 
 1. Struct in `src/config/types.rs` with `#[serde(default)]`
@@ -501,6 +508,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)
 - `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_POOL_MAX_CONNECTIONS` (10, bump for CP)
+- `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` (`false`; opt-in auto-apply of pending custom-plugin SQL migrations at startup in `database`/`cp`. Default off — gateway warns but does not auto-mutate schema; operators run `FERRUM_MODE=migrate` explicitly. Enable for embedded SQLite deployments)
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)

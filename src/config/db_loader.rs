@@ -3615,6 +3615,31 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::maybe_apply_deferred_migrations(self).await
     }
 
+    async fn pending_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        let status = runner.plugin_status(plugin_migrations).await?;
+        Ok(status.pending)
+    }
+
+    async fn apply_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        runner.run_plugin_pending(plugin_migrations).await
+    }
+
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::list_namespaces(self).await
     }

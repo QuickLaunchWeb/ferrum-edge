@@ -365,6 +365,37 @@ pub trait DatabaseBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Return the list of custom-plugin migrations that have not yet been
+    /// applied to the database. Used at startup to warn operators when a
+    /// gateway upgrade brings in new plugin schema changes that have not yet
+    /// been applied.
+    ///
+    /// The default implementation returns an empty list — appropriate for
+    /// backends that do not support SQL-based plugin migrations (e.g.,
+    /// MongoDB; per the docs, `CustomPluginMigration` is SQL-only and
+    /// MongoDB plugins create collections/indexes inside `create_plugin()`).
+    async fn pending_plugin_migrations(
+        &self,
+        _plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Apply all pending custom-plugin migrations. Used by the opt-in
+    /// `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true` startup path so operators
+    /// can ship a binary upgrade with bundled plugin schema changes without
+    /// running a separate `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up`
+    /// step.
+    ///
+    /// The default implementation is a no-op for backends that do not
+    /// support SQL-based plugin migrations (e.g., MongoDB).
+    async fn apply_plugin_migrations(
+        &self,
+        _plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
+        Ok(Vec::new())
+    }
+
     /// Return all distinct namespaces across all resource tables.
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
 }

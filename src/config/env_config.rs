@@ -787,6 +787,22 @@ pub struct EnvConfig {
     /// Default: false.
     pub migrate_dry_run: bool,
 
+    /// When true, automatically apply pending custom-plugin database
+    /// migrations at gateway startup in `database` and `cp` modes.
+    ///
+    /// Default: `false` (opt-in). Most operators expect schema changes to
+    /// only run via an explicit `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up`
+    /// step, so the gateway never silently mutates the database. When this
+    /// flag is `false` and pending plugin migrations exist, the gateway
+    /// emits a `warn!` listing them so the operator knows to run the
+    /// migration command before serving traffic that depends on the new
+    /// schema.
+    ///
+    /// Set to `true` for environments where a single binary upgrade should
+    /// also apply bundled custom-plugin schema changes (e.g. embedded
+    /// SQLite deployments where the binary owns the database).
+    pub auto_apply_plugin_migrations: bool,
+
     // ── Runtime & listener tuning ────────────────────────────────────────
     /// Number of tokio worker threads. Default: number of CPU cores.
     pub worker_threads: Option<usize>,
@@ -1128,6 +1144,7 @@ impl Default for EnvConfig {
             admin_restore_max_body_size_mib: 100,
             migrate_action: "up".into(),
             migrate_dry_run: false,
+            auto_apply_plugin_migrations: false,
             worker_threads: None,
             blocking_threads: None,
             max_connections: 100_000,
@@ -1406,6 +1423,7 @@ impl EnvConfig {
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
+            auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
         }
 
         env_config! {
@@ -1731,6 +1749,7 @@ impl EnvConfig {
             admin_restore_max_body_size_mib,
             migrate_action,
             migrate_dry_run,
+            auto_apply_plugin_migrations,
             worker_threads,
             blocking_threads,
             max_connections,
