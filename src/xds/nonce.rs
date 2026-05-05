@@ -31,6 +31,9 @@ pub enum AckOutcome {
 /// an LDS update on the same node, and two nodes must never share nonce state.
 #[derive(Default)]
 pub struct XdsNonceTracker {
+    // ADS is opt-in and nonce state is one entry per active `(node, type_url)`.
+    // Default DashMap sharding keeps Phase B small; revisit for very large mesh
+    // fleets if this becomes an operator-visible pressure point.
     states: DashMap<NonceKey, NonceState>,
     counter: AtomicU64,
 }

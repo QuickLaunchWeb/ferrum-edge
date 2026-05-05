@@ -783,39 +783,44 @@ fn apply_incremental_to_config(
 
     // Upsert added/modified resources using index for O(1) lookups
     upsert_by_id(&mut config.proxies, result.added_or_modified_proxies, |p| {
-        p.id.clone()
+        p.id.as_str()
     });
     upsert_by_id(
         &mut config.consumers,
         result.added_or_modified_consumers,
-        |c| c.id.clone(),
+        |c| c.id.as_str(),
     );
     upsert_by_id(
         &mut config.plugin_configs,
         result.added_or_modified_plugin_configs,
-        |pc| pc.id.clone(),
+        |pc| pc.id.as_str(),
     );
     upsert_by_id(
         &mut config.upstreams,
         result.added_or_modified_upstreams,
-        |u| u.id.clone(),
+        |u| u.id.as_str(),
     );
 }
 
 /// Upsert items into a vec by ID: replace existing entries, append new ones.
-fn upsert_by_id<T>(existing: &mut Vec<T>, updates: Vec<T>, get_id: fn(&T) -> String) {
-    let index: std::collections::HashMap<String, usize> = existing
+fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
+where
+    F: Fn(&T) -> &str,
+{
+    let mut index: std::collections::HashMap<String, usize> = existing
         .iter()
         .enumerate()
-        .map(|(i, item)| (get_id(item), i))
+        .map(|(i, item)| (get_id(item).to_string(), i))
         .collect();
 
     for item in updates {
-        let id = get_id(&item);
-        if let Some(&pos) = index.get(&id) {
+        let id = get_id(&item).to_string();
+        if let Some(&pos) = index.get(id.as_str()) {
             existing[pos] = item;
         } else {
+            let pos = existing.len();
             existing.push(item);
+            index.insert(id, pos);
         }
     }
 }
@@ -930,7 +935,7 @@ mod tests {
     #[test]
     fn upsert_replaces_existing_by_id() {
         let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0);
         assert_eq!(items[1].1, 99);
         assert_eq!(items.len(), 2);
     }
@@ -938,7 +943,7 @@ mod tests {
     #[test]
     fn upsert_appends_new_items() {
         let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0);
         assert_eq!(items.len(), 2);
         assert_eq!(items[1], ("c", 3));
     }
@@ -946,9 +951,7 @@ mod tests {
     #[test]
     fn upsert_mixed_replace_and_append() {
         let mut items = vec![("a", 1), ("b", 2)];
-        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| {
-            item.0.to_string()
-        });
+        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| item.0);
         assert_eq!(items.len(), 3);
         assert_eq!(items[1].1, 20); // b replaced
         assert_eq!(items[2], ("c", 30)); // c appended
@@ -957,14 +960,14 @@ mod tests {
     #[test]
     fn upsert_empty_updates_is_noop() {
         let mut items = vec![("a", 1)];
-        upsert_by_id(&mut items, vec![], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![], |item| item.0);
         assert_eq!(items.len(), 1);
     }
 
     #[test]
     fn upsert_into_empty_list() {
         let mut items: Vec<(&str, i32)> = vec![];
-        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0.to_string());
+        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0);
         assert_eq!(items.len(), 1);
     }
 

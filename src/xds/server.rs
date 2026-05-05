@@ -51,6 +51,8 @@ pub struct XdsAdsServer {
 
 #[derive(Default)]
 struct XdsStreamRegistry {
+    // ADS stream counts are outside the proxy hot path and exist only when
+    // FERRUM_XDS_ENABLED=true, so default DashMap sharding is intentional here.
     counts: DashMap<String, usize>,
 }
 
@@ -198,6 +200,18 @@ impl XdsAdsServer {
         translate_mesh_slice_to_snapshot(&slice)
     }
 
+    fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
+        let version = config.loaded_at.to_rfc3339();
+        if let Some(snapshot) = self.snapshot_cache.get(node_id)
+            && snapshot.version == version
+        {
+            return snapshot;
+        }
+
+        self.snapshot_cache
+            .insert(self.rebuild_snapshot_from_config(node_id, config))
+    }
+
     fn stream_guard(&self) -> XdsStreamGuard {
         XdsStreamGuard::new(
             self.snapshot_cache.clone(),
@@ -329,8 +343,7 @@ impl XdsAdsServer {
         config: &GatewayConfig,
     ) -> Vec<DiscoveryResponse> {
         let previous = self.snapshot_cache.get(node_id);
-        let snapshot = self.rebuild_snapshot_from_config(node_id, config);
-        self.snapshot_cache.insert(snapshot.clone());
+        let snapshot = self.snapshot_for_config(node_id, config);
         subscriptions
             .values()
             .filter(|subscription| {
@@ -385,8 +398,16 @@ impl XdsAdsServer {
             .is_none_or(|previous| previous != &subscription);
         subscriptions.insert(request.type_url.clone(), subscription.clone());
         if should_send_sotw_response(request, resource_names_changed) {
-            let snapshot = self.rebuild_snapshot_from_config(node_id, config);
-            self.snapshot_cache.insert(snapshot.clone());
+            let snapshot = self.snapshot_for_config(node_id, config);
+            if !request.response_nonce.is_empty()
+                && !subscription_change_affects_resources(
+                    &snapshot,
+                    previous_subscription.as_ref(),
+                    &subscription,
+                )
+            {
+                return None;
+            }
             Some(self.sotw_response(&snapshot, &subscription))
         } else {
             None
@@ -409,8 +430,7 @@ impl XdsAdsServer {
         config: &GatewayConfig,
     ) -> Vec<DeltaDiscoveryResponse> {
         let previous = self.snapshot_cache.get(node_id);
-        let snapshot = self.rebuild_snapshot_from_config(node_id, config);
-        self.snapshot_cache.insert(snapshot.clone());
+        let snapshot = self.snapshot_for_config(node_id, config);
         subscriptions
             .values()
             .filter(|subscription| {
@@ -704,8 +724,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         ) {
                             let previous = server.snapshot_cache.get(&current_node_id);
                             let snapshot =
-                                server.rebuild_snapshot_from_config(&current_node_id, &stream_config);
-                            server.snapshot_cache.insert(snapshot.clone());
+                                server.snapshot_for_config(&current_node_id, &stream_config);
                             let response = server.delta_response(
                                 &snapshot,
                                 previous.as_deref(),
@@ -806,6 +825,24 @@ fn subscription_resources_changed(
         &subscription.resource_names,
         subscription.wildcard,
     );
+    !resources_equal_ignoring_version(&previous_resources, &next_resources)
+}
+
+fn subscription_change_affects_resources(
+    snapshot: &XdsSnapshot,
+    previous: Option<&XdsSubscription>,
+    next: &XdsSubscription,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    let previous_resources = snapshot.filtered_resources(
+        &previous.type_url,
+        &previous.resource_names,
+        previous.wildcard,
+    );
+    let next_resources =
+        snapshot.filtered_resources(&next.type_url, &next.resource_names, next.wildcard);
     !resources_equal_ignoring_version(&previous_resources, &next_resources)
 }
 
@@ -936,9 +973,13 @@ mod tests {
     }
 
     fn gateway_config_with_named_service(name: &str, version_second: u32) -> GatewayConfig {
+        gateway_config_with_services(&[name], version_second)
+    }
+
+    fn gateway_config_with_services(names: &[&str], version_second: u32) -> GatewayConfig {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                services: vec![mesh_service(name)],
+                services: names.iter().map(|name| mesh_service(name)).collect(),
                 ..MeshConfig::default()
             })),
             loaded_at: Utc
@@ -1134,8 +1175,40 @@ mod tests {
     }
 
     #[test]
-    fn sotw_ack_outcome_still_applies_subscription_change() {
-        let server = test_server(gateway_config_with_service(true, 0));
+    fn sotw_subscription_change_skips_response_when_effective_resources_match() {
+        let config = gateway_config_with_service(true, 0);
+        let server = test_server(config.clone());
+        let mut subscriptions = cds_subscription();
+        let snapshot = server.snapshot_for_config("node-a", &config);
+        assert_eq!(
+            snapshot
+                .resources(super::super::translator::CDS_TYPE_URL)
+                .len(),
+            1
+        );
+        let name = "cluster/default/api/8080".to_string();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            response_nonce: "stale-or-unknown".to_string(),
+            resource_names: vec![name.clone()],
+            ..DiscoveryRequest::default()
+        };
+
+        let response =
+            server.sotw_response_for_request("node-a", &config, &mut subscriptions, &request);
+
+        assert!(response.is_none());
+        let subscription = subscriptions
+            .get(super::super::translator::CDS_TYPE_URL)
+            .expect("subscription should be tracked");
+        assert!(!subscription.wildcard);
+        assert_eq!(subscription.resource_names, vec![name]);
+    }
+
+    #[test]
+    fn sotw_ack_outcome_still_applies_effective_subscription_change() {
+        let config = gateway_config_with_services(&["api", "admin"], 0);
+        let server = test_server(config.clone());
         let mut subscriptions = cds_subscription();
         let name = "cluster/default/api/8080".to_string();
         let request = DiscoveryRequest {
@@ -1146,12 +1219,7 @@ mod tests {
         };
 
         let response = server
-            .sotw_response_for_request(
-                "node-a",
-                &gateway_config_with_service(true, 0),
-                &mut subscriptions,
-                &request,
-            )
+            .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
             .expect("subscription update should send the requested resource");
 
         let subscription = subscriptions
