@@ -696,6 +696,42 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 namespace, filtered
                             );
                         }
+
+                        // Empty deltas mean "nothing changed since last poll" — the
+                        // CP poll loop suppresses these (see modes/control_plane.rs),
+                        // but a custom CP or test could still emit one. Treat as
+                        // benign so we don't trip the divergence log below.
+                        let was_empty = result.is_empty();
+
+                        // Capture summary BEFORE moving `result` into apply_incremental
+                        // so the rejection log can identify the divergent CP push.
+                        let added_proxy_ids: Vec<String> = result
+                            .added_or_modified_proxies
+                            .iter()
+                            .map(|p| p.id.clone())
+                            .collect();
+                        let added_upstream_ids: Vec<String> = result
+                            .added_or_modified_upstreams
+                            .iter()
+                            .map(|u| u.id.clone())
+                            .collect();
+                        let added_consumer_ids: Vec<String> = result
+                            .added_or_modified_consumers
+                            .iter()
+                            .map(|c| c.id.clone())
+                            .collect();
+                        let added_plugin_config_ids: Vec<String> = result
+                            .added_or_modified_plugin_configs
+                            .iter()
+                            .map(|pc| pc.id.clone())
+                            .collect();
+                        let removed_proxy_ids = result.removed_proxy_ids.clone();
+                        let removed_upstream_ids = result.removed_upstream_ids.clone();
+                        let removed_consumer_ids = result.removed_consumer_ids.clone();
+                        let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
+                        let cp_version = update.ferrum_version.clone();
+                        let update_version = update.version;
+
                         match proxy_state.apply_incremental(result).await {
                             IncrementalApplyOutcome::Applied => {
                                 update_state_config_received(connection_state);
@@ -706,16 +742,37 @@ pub async fn connect_and_subscribe_with_startup_ready(
                                 // touching `last_config_received_at` so cluster
                                 // observability still reflects only deltas that
                                 // carried real changes.
+                                if was_empty {
+                                    tracing::debug!(
+                                        "Ignoring empty delta from CP (no resource changes)"
+                                    );
+                                }
                             }
                             IncrementalApplyOutcome::Rejected => {
-                                // CP-side validation could not reproduce locally
-                                // (e.g. file dependencies missing on this DP); the
-                                // DP keeps its prior config. CP will eventually
-                                // reconcile via a full snapshot on broadcast lag.
-                                warn!(
-                                    "Incremental config delta from CP rejected by local validation; \
-                                     keeping prior config"
-                                );
+                                if was_empty {
+                                    tracing::debug!(
+                                        "Ignoring rejected empty delta from CP (no resource changes)"
+                                    );
+                                } else {
+                                    // apply_incremental rejected a non-empty delta
+                                    // — surface the divergence to operators so the
+                                    // DP does not silently keep serving its cached
+                                    // config until the next full snapshot.
+                                    error!(
+                                        cp_version = %cp_version,
+                                        update_version = update_version,
+                                        added_proxies = ?added_proxy_ids,
+                                        removed_proxies = ?removed_proxy_ids,
+                                        added_upstreams = ?added_upstream_ids,
+                                        removed_upstreams = ?removed_upstream_ids,
+                                        added_consumers = ?added_consumer_ids,
+                                        removed_consumers = ?removed_consumer_ids,
+                                        added_plugin_configs = ?added_plugin_config_ids,
+                                        removed_plugin_configs = ?removed_plugin_config_ids,
+                                        "DP rejected CP-pushed delta — divergence possible until next full snapshot. \
+                                         See preceding 'Incremental config rejected' log lines for the underlying reason."
+                                    );
+                                }
                             }
                         }
                     }
