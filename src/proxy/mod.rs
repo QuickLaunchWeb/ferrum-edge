@@ -3624,6 +3624,26 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
+    // Track the upgraded WebSocket session in `OverloadState.active_connections`
+    // so graceful drain waits for in-flight WS sessions before exiting.
+    //
+    // Why a fresh `ConnectionGuard` rather than reusing the request-side guard:
+    //   - The originating HTTP request's `RequestGuard` is attached to the
+    //     `ProxyBody::empty()` returned upstream (see `handle_proxy_request`).
+    //     Hyper finishes flushing that empty body the moment the 101/200 is
+    //     written, dropping the `RequestGuard` immediately. The HTTP request is
+    //     genuinely complete at that point — its accounting should release.
+    //   - The outer per-connection `_conn_guard` (created in the accept loop in
+    //     `proxy_listener` / `handle_tls_connection`) covers the underlying TCP
+    //     connection only until `serve_connection_with_upgrades` returns, which
+    //     happens shortly after `OnUpgrade` hands off the I/O. The WS session
+    //     lifetime extends well beyond the HTTP layer's view of the connection.
+    //   - A WebSocket session is functionally a long-lived "connection" (one
+    //     persistent client peer using the frontend's connection slot), so
+    //     `ConnectionGuard` is the semantically correct counter.
+    //
+    // Captured by the spawned task below so it lives until the WS session ends.
+    let ws_session_guard = crate::overload::ConnectionGuard::new(&state.overload);
     // Capture session metadata while the originating RequestContext + proxy are
     // still in scope. Passed to run_websocket_proxy so it can construct a
     // WsDisconnectContext at teardown for plugins that opted in to
@@ -3652,6 +3672,10 @@ async fn handle_websocket_request_authenticated(
     };
     tokio::spawn(async move {
         let _ws_lb_guard = ws_lb_guard;
+        // Hold the connection guard for the full WS session lifetime. Drops on
+        // every exit path (upgrade failure, run_websocket_proxy completion or
+        // error), decrementing `active_connections` exactly once.
+        let _ws_session_guard = ws_session_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 if let Err(e) = run_websocket_proxy(
