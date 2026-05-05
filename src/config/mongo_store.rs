@@ -2646,9 +2646,13 @@ mod inner {
             spec_id: &str,
         ) -> Result<Vec<crate::config::types::PluginConfig>, anyhow::Error> {
             let start = std::time::Instant::now();
+            let options = FindOptions::builder()
+                .sort(doc! { "created_at": 1, "_id": 1 })
+                .build();
             let mut cursor = self
                 .plugin_configs()
                 .find(doc! { "namespace": namespace, "api_spec_id": spec_id })
+                .with_options(options)
                 .await?;
             let mut configs = Vec::new();
             while cursor.advance().await? {

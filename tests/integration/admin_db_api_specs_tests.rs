@@ -269,6 +269,67 @@ async fn submit_bundle_happy_path_all_resources_tagged() {
     assert_eq!(spec_plugins.len(), 2, "expected 2 plugins for proxy");
 }
 
+#[tokio::test]
+async fn list_spec_owned_plugin_configs_orders_by_created_at_then_id() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let mut proxy = make_proxy(&proxy_id, ns);
+
+    let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut plugin_b = make_plugin("plugin-b", &proxy_id, ns, None);
+    let mut plugin_a = make_plugin("plugin-a", &proxy_id, ns, None);
+    for plugin in [&mut plugin_b, &mut plugin_a] {
+        plugin.created_at = timestamp;
+        plugin.updated_at = timestamp;
+    }
+
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: plugin_b.id.clone(),
+        },
+        PluginAssociation {
+            plugin_config_id: plugin_a.id.clone(),
+        },
+    ];
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![plugin_b, plugin_a],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"spec with duplicate canonical plugins",
+    );
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit_api_spec_bundle failed");
+
+    let ordered_ids: Vec<String> = store
+        .list_spec_owned_plugin_configs(ns, &spec_id)
+        .await
+        .expect("list_spec_owned_plugin_configs failed")
+        .into_iter()
+        .map(|pc| pc.id)
+        .collect();
+
+    assert_eq!(
+        ordered_ids,
+        vec!["plugin-a".to_string(), "plugin-b".to_string()],
+        "PUT canonical ID reuse depends on a deterministic FIFO order for \
+         duplicate spec-owned plugins"
+    );
+}
+
 /// submit with proxy-only bundle (no upstream, no plugins).
 #[tokio::test]
 async fn submit_bundle_proxy_only() {

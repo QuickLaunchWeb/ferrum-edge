@@ -4124,9 +4124,11 @@ impl DatabaseStore {
         spec_id: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = std::time::Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query(
-            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND api_spec_id = ?"),
-        )
+        let rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT * FROM plugin_configs ",
+            "WHERE namespace = ? AND api_spec_id = ? ",
+            "ORDER BY created_at ASC, id ASC"
+        )))
         .bind(namespace)
         .bind(spec_id)
         .fetch_all(&self.pool())
