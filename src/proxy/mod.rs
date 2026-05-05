@@ -1190,7 +1190,7 @@ impl ProxyState {
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
-        // `RouterCache::new` resolves the auto sentinel (single source of truth).
+        // the RouterCache constructor resolves the auto sentinel (single source of truth).
         let max_cache_entries = if env_config_arc.router_cache_max_entries > 0 {
             env_config_arc
                 .router_cache_max_entries
@@ -1198,7 +1198,11 @@ impl ProxyState {
         } else {
             0
         };
-        let router_cache = Arc::new(RouterCache::new(&config, max_cache_entries));
+        let router_cache = Arc::new(RouterCache::with_shard_amount(
+            &config,
+            max_cache_entries,
+            pool_shard_amount,
+        ));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).

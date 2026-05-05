@@ -292,6 +292,9 @@ pub struct RouterCache {
     regex_cache: DashMap<String, RegexCacheEntry>,
     /// Maximum entries in each cache partition before eviction.
     max_cache_entries: usize,
+    /// Resolved DashMap shard count used by the lookup caches.
+    #[cfg(test)]
+    cache_shard_amount: usize,
     /// Monotonic counters for eviction tracking per partition.
     prefix_eviction_counter: AtomicU64,
     regex_eviction_counter: AtomicU64,
@@ -315,7 +318,21 @@ impl RouterCache {
     /// Without this,
     /// `frequency_aware_evict`'s `max_entries / 4 == 0` short-circuit would leave
     /// the cache unbounded under load.
+    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
+        Self::with_shard_amount(config, max_cache_entries, 0)
+    }
+
+    /// Build a new RouterCache with an explicit pool/cache shard amount.
+    ///
+    /// `pool_shard_amount == 0` keeps the documented auto sentinel. Non-zero
+    /// values are normalized by `pool_shard_amount()` so direct callers get the
+    /// same power-of-two clamping as production env config.
+    pub fn with_shard_amount(
+        config: &GatewayConfig,
+        max_cache_entries: usize,
+        pool_shard_amount: usize,
+    ) -> Self {
         let max_cache_entries = if max_cache_entries == 0 {
             let resolved = resolve_auto_router_cache_entries(config.proxies.len());
             debug!(
@@ -339,12 +356,14 @@ impl RouterCache {
         // dashmap default of `4 * num_cpus` shards starves on inserts at
         // scale. The helper resolves to `next_power_of_two(max(64,
         // num_cpus * 16))` — see `crate::util::sharding`.
-        let shards = crate::util::sharding::pool_shard_amount(0);
+        let shards = crate::util::sharding::pool_shard_amount(pool_shard_amount);
         Self {
             route_table: ArcSwap::new(Arc::new(table)),
             prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
             regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
             max_cache_entries,
+            #[cfg(test)]
+            cache_shard_amount: shards,
             prefix_eviction_counter: AtomicU64::new(0),
             regex_eviction_counter: AtomicU64::new(0),
             frequency_sketch: CountMinSketch::new(sketch_width, age_threshold),
@@ -565,6 +584,12 @@ impl RouterCache {
     #[allow(dead_code)]
     pub fn regex_cache_len(&self) -> usize {
         self.regex_cache.len()
+    }
+
+    /// Resolved DashMap shard count used by `prefix_cache` and `regex_cache`.
+    #[cfg(test)]
+    pub fn cache_shard_amount(&self) -> usize {
+        self.cache_shard_amount
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
@@ -1497,10 +1522,9 @@ mod tests {
     // ── RouterCache::new auto-resolution tests ──────────────────────────
     //
     // FERRUM_ROUTER_CACHE_MAX_ENTRIES=0 is the documented "auto" sentinel.
-    // The production caller in `ProxyState::new` resolves it before calling
-    // `RouterCache::new`, but we also harden `new` itself so direct callers
-    // (tests, future refactors) can't end up with an effectively unbounded
-    // cache — `frequency_aware_evict` returns 0 when `max_entries / 4 == 0`.
+    // Harden `new` itself so direct callers (tests, future refactors) can't
+    // end up with an effectively unbounded cache — `frequency_aware_evict`
+    // returns 0 when `max_entries / 4 == 0`.
 
     fn minimal_proxy_for_routing(id: &str, listen_path: &str) -> Proxy {
         use crate::config::types::{
@@ -1609,5 +1633,29 @@ mod tests {
         let config = config_with_n_proxies(5);
         let cache = RouterCache::new(&config, 5_000);
         assert_eq!(cache.cache_stats().4, 5_000);
+    }
+
+    #[test]
+    fn new_defaults_cache_shards_to_auto_value() {
+        let config = config_with_n_proxies(5);
+        let cache = RouterCache::new(&config, 5_000);
+        assert_eq!(
+            cache.cache_shard_amount(),
+            crate::util::sharding::pool_shard_amount(0)
+        );
+    }
+
+    #[test]
+    fn with_shard_amount_uses_configured_cache_shards() {
+        let config = config_with_n_proxies(5);
+        let cache = RouterCache::with_shard_amount(&config, 5_000, 256);
+        assert_eq!(cache.cache_shard_amount(), 256);
+    }
+
+    #[test]
+    fn with_shard_amount_normalizes_cache_shards() {
+        let config = config_with_n_proxies(5);
+        let cache = RouterCache::with_shard_amount(&config, 5_000, 3);
+        assert_eq!(cache.cache_shard_amount(), 4);
     }
 }
