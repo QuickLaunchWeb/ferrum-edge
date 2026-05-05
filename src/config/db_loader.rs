@@ -4087,6 +4087,12 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
 
+        // Deleting the proxy removes proxy_plugins junction rows via FK
+        // cascade. If a spec-associated proxy was the last proxy referencing a
+        // proxy_group plugin, mirror delete_proxy() and remove that now-orphaned
+        // shared plugin config inside the same transaction.
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
         // Delete spec-owned upstream (no FK cascade on this path).
         sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
             .bind(id)

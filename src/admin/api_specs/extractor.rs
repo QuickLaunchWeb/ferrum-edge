@@ -216,16 +216,16 @@ pub fn extract(
     // autodetect_format, but they use unquoted keys which serde_json rejects.
     // When JSON parsing fails on autodetected (not declared) input, retry as
     // YAML before surfacing the error.
-    let (root, parsed_via_yaml): (serde_json::Value, bool) = match fmt {
+    let (root, parsed_via_yaml, actual_format): (serde_json::Value, bool, SpecFormat) = match fmt {
         SpecFormat::Json => match serde_json::from_slice(body) {
-            Ok(v) => (v, false),
+            Ok(v) => (v, false, SpecFormat::Json),
             Err(e) if declared_format.is_none() => {
                 // Autodetected as JSON but failed — try YAML (covers flow-style).
                 let yv: serde_yaml::Value = serde_yaml::from_slice(body)
                     .map_err(|_| ExtractError::InvalidJson(e.to_string()))?;
                 let val = serde_json::to_value(yv)
                     .map_err(|e2| ExtractError::InvalidYaml(e2.to_string()))?;
-                (val, true)
+                (val, true, SpecFormat::Yaml)
             }
             Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
         },
@@ -234,7 +234,7 @@ pub fn extract(
                 .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
             let val =
                 serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
-            (val, true)
+            (val, true, SpecFormat::Yaml)
         }
     };
     // serde_yaml 0.9 does not cap alias/anchor expansion.  A small YAML doc
@@ -478,7 +478,7 @@ pub fn extract(
 
     let metadata = SpecMetadata {
         version,
-        format: fmt,
+        format: actual_format,
         title,
         info_version,
         description: tier1.description,
@@ -1071,6 +1071,23 @@ mod tests {
         assert_eq!(
             autodetect_format(b"  \n  {\"swagger\": \"2.0\"}"),
             SpecFormat::Json
+        );
+    }
+
+    #[test]
+    fn test_autodetected_flow_style_yaml_records_yaml_format() {
+        let spec = format!(
+            "{{openapi: '3.1.0', info: {{title: flow, version: '1.0'}}, x-ferrum-proxy: {}}}",
+            minimal_proxy()
+        );
+
+        let (_, meta) = extract(spec.as_bytes(), None, "prod").expect("flow YAML must parse");
+
+        assert_eq!(
+            meta.format,
+            SpecFormat::Yaml,
+            "flow-style YAML starts with '{{' and first autodetects as JSON, \
+             but the YAML fallback must record the actual stored format"
         );
     }
 

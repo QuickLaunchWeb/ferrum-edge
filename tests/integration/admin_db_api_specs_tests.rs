@@ -902,6 +902,81 @@ async fn delete_api_spec_does_not_delete_same_api_spec_id_in_other_namespace() {
     );
 }
 
+#[tokio::test]
+async fn delete_api_spec_cleans_orphaned_proxy_group_plugin() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let proxy_group_plugin_id = uid("proxy-group-plugin");
+    let spec_id = uid("spec");
+
+    let proxy_group_plugin = PluginConfig {
+        id: proxy_group_plugin_id.clone(),
+        namespace: ns.to_string(),
+        plugin_name: "cors".to_string(),
+        config: serde_json::json!({}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store
+        .create_plugin_config(&proxy_group_plugin)
+        .await
+        .expect("create proxy_group plugin");
+
+    let mut proxy = make_proxy(&proxy_id, ns);
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: proxy_group_plugin_id.clone(),
+    }];
+    let bundle = ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(
+        &spec_id,
+        &proxy_id,
+        ns,
+        b"spec with proxy_group association",
+    );
+
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit bundle");
+
+    assert!(
+        store
+            .get_plugin_config(&proxy_group_plugin_id)
+            .await
+            .expect("get proxy_group before delete")
+            .is_some(),
+        "proxy_group plugin must exist before deleting the spec"
+    );
+
+    let deleted = store
+        .delete_api_spec(ns, &spec_id)
+        .await
+        .expect("delete api spec");
+    assert!(deleted, "delete_api_spec should report deletion");
+
+    assert!(
+        store
+            .get_plugin_config(&proxy_group_plugin_id)
+            .await
+            .expect("get proxy_group after delete")
+            .is_none(),
+        "delete_api_spec must mirror delete_proxy and remove proxy_group \
+         plugin configs once their last proxy association is gone"
+    );
+}
+
 /// delete_api_spec returns false for a non-existent spec.
 ///
 /// Mongo invariant (non-RS path): `delete_api_spec` in `mongo_store.rs` uses

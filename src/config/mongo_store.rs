@@ -2238,6 +2238,21 @@ mod inner {
             bundle: &crate::admin::api_specs::ExtractedBundle,
             spec: &ApiSpec,
         ) -> Result<(), anyhow::Error> {
+            // Pre-flight size check: measure actual BSON size before either
+            // the metadata-only short-circuit or the full replace path.  Both
+            // paths write the api_specs document, so both must return the
+            // handler's friendly 413 classification instead of raw MongoDB
+            // document-limit errors.
+            let spec_doc_check = api_spec_to_doc(spec)?;
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc_check)?;
+            if bson_bytes.len() > 15 * 1024 * 1024 {
+                anyhow::bail!(
+                    "MongoDB document limit exceeded: serialized spec is {} bytes \
+                     (limit ~15 MiB); use a SQL backend for large specs",
+                    bson_bytes.len()
+                );
+            }
+
             // --- Hash short-circuit (Wave 5 Feature A) -----------------------
             // If the resource bundle is byte-identical (same resource_hash),
             // only update the api_specs document metadata and leave all other
@@ -2252,27 +2267,15 @@ mod inner {
                     let old_hash = existing_doc.get_str("resource_hash").unwrap_or("");
                     if old_hash == spec.resource_hash {
                         // Only update metadata fields on the spec doc.
-                        let spec_doc = api_spec_to_doc(spec)?;
                         self.api_specs()
                             .replace_one(
                                 doc! { "_id": &spec.id, "namespace": &spec.namespace },
-                                spec_doc,
+                                spec_doc_check,
                             )
                             .await?;
                         return Ok(());
                     }
                 }
-            }
-
-            // Pre-flight size check: measure actual BSON size.
-            let spec_doc_check = api_spec_to_doc(spec)?;
-            let bson_bytes = mongodb::bson::to_vec(&spec_doc_check)?;
-            if bson_bytes.len() > 15 * 1024 * 1024 {
-                anyhow::bail!(
-                    "MongoDB document limit exceeded: serialized spec is {} bytes \
-                     (limit ~15 MiB); use a SQL backend for large specs",
-                    bson_bytes.len()
-                );
             }
 
             // Fix 3 (Mongo): Preserve manual proxy.plugins associations added
@@ -2714,6 +2717,8 @@ mod inner {
                         .session(&mut session)
                         .await?;
                 }
+                self.cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut session))
+                    .await?;
                 // 3. Spec-owned upstreams.
                 self.upstreams()
                     .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
@@ -2765,6 +2770,13 @@ mod inner {
                             pid, id, e
                         );
                     }
+                }
+                if let Err(e) = self.cleanup_orphaned_proxy_group_plugins().await {
+                    warn!(
+                        "delete_api_spec: failed to cleanup orphaned proxy_group plugins \
+                         after deleting spec {}: {}",
+                        id, e
+                    );
                 }
                 if let Err(e) = self
                     .upstreams()
