@@ -64,10 +64,16 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 bcrypt = "0.19"
 argon2 = "0.5"
 
-# LDAP
-ldap3 = "0.12"
-native-tls = "0.2"
-openssl = { version = "0.10", features = ["vendored"] }
+# LDAP — `tls-rustls-ring` selects rustls (matching the gateway's TLS stack)
+# with the ring crypto provider, dropping the implicit native-tls/OpenSSL
+# dependency. `default-features = false` is required because the default
+# feature set pulls in `tls-native`, which is mutually exclusive with
+# `tls-rustls`. `sync` is re-enabled for parity with the previous default.
+# Migrating to rustls makes CA exclusivity (CLAUDE.md "TLS Architecture")
+# enforceable for LDAP TLS — `RootCertStore::empty()` + custom CA replaces
+# the system trust pool wholesale, which native-tls's `add_root_certificate`
+# could not do.
+ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-ring"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
