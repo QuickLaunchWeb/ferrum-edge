@@ -179,6 +179,47 @@ impl XdsAdsServer {
         }
     }
 
+    fn sotw_responses_for_subscriptions(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+    ) -> Vec<DiscoveryResponse> {
+        let snapshot = self.rebuild_snapshot(node_id);
+        self.snapshot_cache.insert(snapshot.clone());
+        subscriptions
+            .values()
+            .map(|subscription| {
+                self.sotw_response(
+                    &snapshot,
+                    &subscription.type_url,
+                    &subscription.resource_names,
+                )
+            })
+            .collect()
+    }
+
+    fn delta_responses_for_subscriptions(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+    ) -> Vec<DeltaDiscoveryResponse> {
+        let previous = self.snapshot_cache.get(node_id);
+        let snapshot = self.rebuild_snapshot(node_id);
+        self.snapshot_cache.insert(snapshot.clone());
+        subscriptions
+            .values()
+            .map(|subscription| {
+                self.delta_response(
+                    &snapshot,
+                    previous.as_deref(),
+                    &subscription.type_url,
+                    &subscription.resource_names,
+                    &HashMap::new(),
+                )
+            })
+            .collect()
+    }
+
     fn record_sotw_ack(&self, node_id: &str, request: &DiscoveryRequest) -> AckOutcome {
         let error_message = request
             .error_detail
@@ -317,14 +358,10 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                let snapshot = server.rebuild_snapshot(current_node_id);
-                                server.snapshot_cache.insert(snapshot.clone());
-                                for subscription in subscriptions.values() {
-                                    let response = server.sotw_response(
-                                        &snapshot,
-                                        &subscription.type_url,
-                                        &subscription.resource_names,
-                                    );
+                                for response in server.sotw_responses_for_subscriptions(
+                                    current_node_id,
+                                    &subscriptions,
+                                ) {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
@@ -332,6 +369,17 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS ADS stream lagged by {} config updates; sending fresh snapshots", n);
+                                let Some(current_node_id) = node_id.as_ref() else {
+                                    continue;
+                                };
+                                for response in server.sotw_responses_for_subscriptions(
+                                    current_node_id,
+                                    &subscriptions,
+                                ) {
+                                    if tx.send(Ok(response)).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
                         }
@@ -470,17 +518,10 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                let previous = server.snapshot_cache.get(current_node_id);
-                                let snapshot = server.rebuild_snapshot(current_node_id);
-                                server.snapshot_cache.insert(snapshot.clone());
-                                for subscription in subscriptions.values() {
-                                    let response = server.delta_response(
-                                        &snapshot,
-                                        previous.as_deref(),
-                                        &subscription.type_url,
-                                        &subscription.resource_names,
-                                        &HashMap::new(),
-                                    );
+                                for response in server.delta_responses_for_subscriptions(
+                                    current_node_id,
+                                    &subscriptions,
+                                ) {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
                                     }
@@ -488,6 +529,17 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS delta ADS stream lagged by {} config updates; sending fresh snapshots", n);
+                                let Some(current_node_id) = node_id.as_ref() else {
+                                    continue;
+                                };
+                                for response in server.delta_responses_for_subscriptions(
+                                    current_node_id,
+                                    &subscriptions,
+                                ) {
+                                    if tx.send(Ok(response)).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
                         }
@@ -505,5 +557,105 @@ fn non_empty_string(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::mesh::{AppProtocol, MeshConfig, MeshService, ServicePort};
+    use chrono::{TimeZone, Utc};
+
+    fn gateway_config_with_service(include_service: bool, version_second: u32) -> GatewayConfig {
+        let services = if include_service {
+            vec![MeshService {
+                name: "api".to_string(),
+                namespace: "default".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Http,
+                    name: Some("http".to_string()),
+                }],
+                workloads: Vec::new(),
+                protocol_overrides: HashMap::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                services,
+                ..MeshConfig::default()
+            })),
+            loaded_at: Utc
+                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+                .unwrap(),
+            ..GatewayConfig::default()
+        }
+    }
+
+    fn test_server(config: GatewayConfig) -> XdsAdsServer {
+        let (tx, _) = broadcast::channel(1);
+        XdsAdsServer::new(
+            Arc::new(ArcSwap::from_pointee(config)),
+            tx,
+            "x".repeat(32),
+            "issuer".to_string(),
+            "default".to_string(),
+        )
+    }
+
+    fn cds_subscription() -> HashMap<String, XdsSubscription> {
+        HashMap::from([(
+            super::super::translator::CDS_TYPE_URL.to_string(),
+            XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+            },
+        )])
+    }
+
+    #[test]
+    fn sotw_lag_recovery_rebuilds_and_sends_current_snapshot() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = cds_subscription();
+
+        let initial = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].resources.len(), 1);
+
+        server
+            .config
+            .store(Arc::new(gateway_config_with_service(false, 1)));
+        let recovered = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].resources.len(), 0);
+        assert_ne!(recovered[0].nonce, initial[0].nonce);
+    }
+
+    #[test]
+    fn delta_lag_recovery_reports_removed_resources() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = cds_subscription();
+
+        let initial = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].resources.len(), 1);
+        assert!(initial[0].removed_resources.is_empty());
+
+        server
+            .config
+            .store(Arc::new(gateway_config_with_service(false, 1)));
+        let recovered = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].resources.len(), 0);
+        assert_eq!(
+            recovered[0].removed_resources,
+            vec!["cluster/default/api/8080".to_string()]
+        );
     }
 }
