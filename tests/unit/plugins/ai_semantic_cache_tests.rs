@@ -631,6 +631,73 @@ async fn test_different_temperature_no_cache_hit_with_default_config() {
 }
 
 #[tokio::test]
+async fn test_sub_cent_sampling_params_do_not_collapse() {
+    // Regression: cache-key hardening used to format `temperature` and
+    // `top_p` with two decimal places, so 0.001 and 0.004 both became 0.00.
+    let temperature_plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let low_temperature = json!({
+        "model": "gpt-4o",
+        "temperature": 0.001,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+    let nearby_temperature = json!({
+        "model": "gpt-4o",
+        "temperature": 0.004,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+
+    store_response(
+        &temperature_plugin,
+        &serde_json::to_string(&low_temperature).unwrap(),
+        None,
+        b"poem-from-temp-0.001",
+    )
+    .await;
+
+    let temperature_hit = run_before_proxy_get_status(
+        &temperature_plugin,
+        &serde_json::to_string(&nearby_temperature).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !temperature_hit,
+        "sub-cent `temperature` values must not collapse to the same cache key"
+    );
+
+    let top_p_plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let low_top_p = json!({
+        "model": "gpt-4o",
+        "top_p": 0.001,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+    let nearby_top_p = json!({
+        "model": "gpt-4o",
+        "top_p": 0.004,
+        "messages": [{"role": "user", "content": "draft a poem"}]
+    });
+
+    store_response(
+        &top_p_plugin,
+        &serde_json::to_string(&low_top_p).unwrap(),
+        None,
+        b"poem-from-top-p-0.001",
+    )
+    .await;
+
+    let top_p_hit = run_before_proxy_get_status(
+        &top_p_plugin,
+        &serde_json::to_string(&nearby_top_p).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !top_p_hit,
+        "sub-cent `top_p` values must not collapse to the same cache key"
+    );
+}
+
+#[tokio::test]
 async fn test_same_request_different_consumer_no_cache_hit_with_default_config() {
     // SECURITY: With the new `scope_by_consumer=true` default, two requests
     // from different authenticated consumers must NOT share a cache entry.

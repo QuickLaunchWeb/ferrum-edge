@@ -186,11 +186,11 @@ impl AiSemanticCache {
 
         // Sampling parameters
         if self.include_params_in_key {
-            if let Some(temp) = body.get("temperature").and_then(|t| t.as_f64()) {
-                key_parts.push(format!("t:{:.2}", temp));
+            if let Some(temp) = body.get("temperature") {
+                key_parts.push(format!("t:{}", canonical_param_value(temp)));
             }
-            if let Some(top_p) = body.get("top_p").and_then(|t| t.as_f64()) {
-                key_parts.push(format!("p:{:.2}", top_p));
+            if let Some(top_p) = body.get("top_p") {
+                key_parts.push(format!("p:{}", canonical_param_value(top_p)));
             }
             if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
                 key_parts.push(format!("mt:{}", max_tokens));
@@ -455,6 +455,10 @@ fn sanitize_cached_headers(headers: &HashMap<String, String>) -> HashMap<String,
         .filter(|(name, _)| !is_sensitive_header(name))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+fn canonical_param_value(value: &Value) -> String {
+    value.to_string()
 }
 
 /// Normalize text: lowercase, collapse whitespace to single spaces, trim.
