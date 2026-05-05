@@ -858,13 +858,30 @@ async fn assign_ids_for_put(
     }
 
     // Load existing spec-owned plugins for canonical-tuple matching (Fix 5).
-    let existing_plugins = match db
+    let mut existing_plugins = match db
         .list_spec_owned_plugin_configs(namespace, &existing_spec.id)
         .await
     {
         Ok(v) => v,
         Err(e) => return Err(classify_db_error(e)),
     };
+    if let Some(existing_proxy) = existing_proxy.as_ref() {
+        let assoc_order: std::collections::HashMap<String, usize> = existing_proxy
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(idx, assoc)| (assoc.plugin_config_id.clone(), idx))
+            .collect();
+        existing_plugins.sort_by(|a, b| {
+            assoc_order
+                .get(&a.id)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(&assoc_order.get(&b.id).copied().unwrap_or(usize::MAX))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
 
     // Build a map from canonical key → FIFO queue of existing plugins.
     // Canonical key = (plugin_name, sorted-keys config JSON, priority_override).

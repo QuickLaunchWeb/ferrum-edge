@@ -49,6 +49,63 @@ struct PluginConfigRef {
     proxy_id: Option<String>,
 }
 
+fn declared_proxy_plugin_association_ids_from_spec(
+    spec: &crate::config::types::ApiSpec,
+) -> Result<HashSet<String>, anyhow::Error> {
+    if spec.content_encoding != "gzip" {
+        warn!(
+            "api_spec '{}' uses unsupported content_encoding '{}'",
+            spec.id, spec.content_encoding
+        );
+        return Ok(HashSet::new());
+    }
+    let cap = usize::try_from(spec.uncompressed_size).unwrap_or(usize::MAX);
+    let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(
+                "failed to decompress stored api_spec '{}' proxy plugin associations: {}",
+                spec.id, e
+            );
+            return Ok(HashSet::new());
+        }
+    };
+    let ids = match crate::admin::api_specs::extract_declared_proxy_plugin_association_ids(
+        &body,
+        Some(spec.spec_format),
+    ) {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(
+                "failed to parse stored api_spec '{}' proxy plugin associations: {}",
+                spec.id, e
+            );
+            return Ok(HashSet::new());
+        }
+    };
+    Ok(ids.into_iter().collect())
+}
+
+fn store_canonical_resource_hash(
+    bundle: &crate::admin::api_specs::ExtractedBundle,
+) -> Result<String, anyhow::Error> {
+    let mut proxy = bundle.proxy.clone();
+    proxy.normalize_fields();
+    let upstream = bundle.upstream.clone().map(|mut upstream| {
+        upstream.normalize_fields();
+        upstream
+    });
+    let mut plugins = bundle.plugins.clone();
+    for plugin in &mut plugins {
+        plugin.normalize_fields();
+    }
+    crate::admin::api_specs::hash_resource_bundle(&crate::admin::api_specs::ExtractedBundle {
+        proxy,
+        upstream,
+        plugins,
+    })
+}
+
 /// Identifies a resource table for lightweight `SELECT id` queries.
 ///
 /// Used by `load_table_ids()` to eliminate dynamic table-name interpolation
@@ -3446,34 +3503,44 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         use crate::config::types::{AuthMode, ResponseBodyMode};
 
-        // --- Hash short-circuit (Wave 5 Feature A) ---------------------------
-        // Fetch the current resource_hash and compare to the bundle hash inside
-        // the SAME transaction as any subsequent write. Doing the SELECT and
-        // the conditional UPDATE in one transaction closes a TOCTOU window:
-        // two concurrent PUTs would otherwise both read the old hash, both
-        // see a mismatch, and both proceed with a full replace — flapping the
-        // proxy row's updated_at twice and re-running the polling cycle's
-        // rebuild path twice. SQLite serializes writes globally; Postgres /
-        // MySQL get repeatable-read semantics within the tx (the second tx
-        // either sees the first's commit or contends on row locks).
-        //
-        // If the bundle is byte-identical to what's already stored, only the
-        // api_specs metadata row is updated; proxy/upstream/plugin tables are
-        // left untouched, preserving the resource-level idempotency invariant.
+        // --- Resource no-op shortcut (Wave 5 Feature A) -----------------------
+        // Compare the current spec-owned resource graph to the incoming bundle
+        // inside the SAME transaction as any subsequent write. If they already
+        // match, only the api_specs metadata row is updated; proxy/upstream/plugin
+        // tables are left untouched. Because this reads the live resources, direct
+        // admin CRUD drift forces the full replace path even when the submitted
+        // spec's resource_hash matches the stored metadata.
         let mut tx = self.pool().begin().await?;
 
-        let old_hash: Option<String> = {
-            let row: Option<sqlx::any::AnyRow> = sqlx::query(
-                &self.q("SELECT resource_hash FROM api_specs WHERE namespace = ? AND id = ?"),
-            )
-            .bind(&spec.namespace)
-            .bind(&spec.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            row.and_then(|r| r.try_get::<String, _>("resource_hash").ok())
-        };
+        let existing_spec: Option<crate::config::types::ApiSpec> =
+            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? AND id = ?"))
+                .bind(&spec.namespace)
+                .bind(&spec.id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(|row| row_to_api_spec(&row))
+                .transpose()?;
+        let previous_declared_assoc_ids = existing_spec
+            .as_ref()
+            .map(declared_proxy_plugin_association_ids_from_spec)
+            .transpose()?
+            .unwrap_or_default();
+        let desired_resource_hash = store_canonical_resource_hash(bundle)?;
 
-        if old_hash.as_deref() == Some(&spec.resource_hash) && !spec.resource_hash.is_empty() {
+        let current_resource_hash = if !spec.resource_hash.is_empty() {
+            self.current_api_spec_resource_hash_tx(
+                &mut tx,
+                bundle,
+                spec,
+                &previous_declared_assoc_ids,
+            )
+            .await?
+        } else {
+            None
+        };
+        if !spec.resource_hash.is_empty()
+            && current_resource_hash.as_deref() == Some(desired_resource_hash.as_str())
+        {
             // Bundle is unchanged — only update the api_specs metadata row.
             let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
             let server_urls_json =
@@ -3516,10 +3583,17 @@ impl DatabaseStore {
             tx.commit().await?;
             return Ok(());
         }
+        // Resource graph mismatch — fall through to the full replace path. The
+        // same `tx` wraps the rest of the operation; opening another `begin()`
+        // would double-nest and is redundant.
 
-        // Hash mismatch — fall through to the full replace path. The same `tx`
-        // wraps the rest of the operation; opening another `begin()` would
-        // double-nest and is redundant.
+        self.ensure_no_external_spec_upstream_refs_tx(
+            &mut tx,
+            &spec.namespace,
+            &spec.id,
+            &spec.proxy_id,
+        )
+        .await?;
 
         // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
         // are intentionally preserved. The proxy itself is updated in place (not deleted)
@@ -3741,15 +3815,27 @@ impl DatabaseStore {
             .await?;
         }
 
-        // Fix 2: rebuild the proxy_plugins junction table for this proxy.
-        // Delete all existing spec-owned junction rows (the hand-added plugin
-        // associations written by the operator are keyed by non-spec plugin ids
-        // and survive because we only clear associations whose plugin_config_id
-        // belongs to the newly re-generated spec-owned plugin_configs). For
-        // simplicity — and correctness — delete all associations whose
-        // plugin_config_id is now in the new plugin list, then re-insert.
-        // Hand-added associations (referencing plugin_configs with api_spec_id IS NULL)
-        // are not touched because their plugin_config_ids are not in bundle.plugins.
+        // Rebuild the proxy_plugins junction table for this proxy. Associations
+        // declared in the previous spec are removed when absent from the new
+        // document; truly hand-added associations remain untouched.
+        let desired_assoc_ids: HashSet<String> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .map(|a| a.plugin_config_id.clone())
+            .collect();
+        for previous_id in &previous_declared_assoc_ids {
+            if !desired_assoc_ids.contains(previous_id) {
+                sqlx::query(
+                    &self
+                        .q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
+                )
+                .bind(&bundle.proxy.id)
+                .bind(previous_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         for assoc in &bundle.proxy.plugins {
             sqlx::query(
                 &self.q("DELETE FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ?"),
@@ -3769,6 +3855,7 @@ impl DatabaseStore {
             .execute(&mut *tx)
             .await?;
         }
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
 
         // Update the api_specs row (no CASCADE delete needed since proxy survives).
         let tags_json = serde_json::to_string(&spec.tags).unwrap_or_else(|_| "[]".to_string());
@@ -3812,6 +3899,145 @@ impl DatabaseStore {
         .await?;
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn current_api_spec_resource_hash_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+        spec: &crate::config::types::ApiSpec,
+        previous_declared_assoc_ids: &HashSet<String>,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let plugin_rows: Vec<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT * FROM plugin_configs ",
+            "WHERE namespace = ? AND api_spec_id = ? ",
+            "ORDER BY created_at ASC, id ASC"
+        )))
+        .bind(&spec.namespace)
+        .bind(&spec.id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut plugins = Vec::with_capacity(plugin_rows.len());
+        for row in &plugin_rows {
+            let mut plugin = row_to_plugin_config(row)?;
+            plugin.normalize_fields();
+            plugins.push(plugin);
+        }
+
+        let spec_owned_plugin_ids: HashSet<String> =
+            plugins.iter().map(|pc| pc.id.clone()).collect();
+        let desired_assoc_ids: HashSet<String> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .map(|assoc| assoc.plugin_config_id.clone())
+            .collect();
+        let mut relevant_assoc_ids = spec_owned_plugin_ids.clone();
+        relevant_assoc_ids.extend(previous_declared_assoc_ids.iter().cloned());
+        relevant_assoc_ids.extend(desired_assoc_ids.iter().cloned());
+
+        let assoc_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?"))
+                .bind(&spec.proxy_id)
+                .fetch_all(&mut **tx)
+                .await?;
+        let mut current_relevant_assoc_ids = HashSet::new();
+        for row in &assoc_rows {
+            if let Ok(id) = row.try_get::<String, _>("plugin_config_id")
+                && relevant_assoc_ids.contains(&id)
+            {
+                current_relevant_assoc_ids.insert(id);
+            }
+        }
+        if current_relevant_assoc_ids != desired_assoc_ids {
+            return Ok(None);
+        }
+
+        let proxy_row: Option<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM proxies WHERE id = ? AND namespace = ? AND api_spec_id = ?"),
+        )
+        .bind(&spec.proxy_id)
+        .bind(&spec.namespace)
+        .bind(&spec.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(proxy_row) = proxy_row else {
+            return Ok(None);
+        };
+        let desired_assocs: Vec<PluginAssociation> = bundle
+            .proxy
+            .plugins
+            .iter()
+            .filter(|assoc| current_relevant_assoc_ids.contains(&assoc.plugin_config_id))
+            .cloned()
+            .collect();
+        let mut proxy = row_to_proxy(&proxy_row, spec.proxy_id.clone(), desired_assocs)?;
+        proxy.normalize_fields();
+
+        let upstream_rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND api_spec_id = ?"))
+                .bind(&spec.namespace)
+                .bind(&spec.id)
+                .fetch_all(&mut **tx)
+                .await?;
+        if upstream_rows.len() > 1 {
+            return Ok(None);
+        }
+        let upstream =
+            upstream_rows
+                .first()
+                .map(row_to_upstream)
+                .transpose()?
+                .map(|mut upstream| {
+                    upstream.normalize_fields();
+                    upstream
+                });
+
+        let current = crate::admin::api_specs::ExtractedBundle {
+            proxy,
+            upstream,
+            plugins,
+        };
+        crate::admin::api_specs::hash_resource_bundle(&current).map(Some)
+    }
+
+    async fn ensure_no_external_spec_upstream_refs_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        spec_id: &str,
+        spec_proxy_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(&self.q(concat!(
+            "SELECT p.id AS proxy_id, p.upstream_id AS upstream_id ",
+            "FROM proxies p ",
+            "INNER JOIN upstreams u ON p.upstream_id = u.id ",
+            "WHERE u.namespace = ? AND u.api_spec_id = ? AND p.id <> ? ",
+            "LIMIT 1"
+        )))
+        .bind(namespace)
+        .bind(spec_id)
+        .bind(spec_proxy_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if let Some(row) = row {
+            let proxy_id = row
+                .try_get::<String, _>("proxy_id")
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let upstream_id = row
+                .try_get::<String, _>("upstream_id")
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            anyhow::bail!(
+                "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                 detach it before replacing or deleting the API spec",
+                proxy_id,
+                upstream_id,
+                spec_id
+            );
+        }
+
         Ok(())
     }
 
@@ -4068,6 +4294,9 @@ impl DatabaseStore {
         };
 
         let proxy_id: String = row.try_get("proxy_id")?;
+
+        self.ensure_no_external_spec_upstream_refs_tx(&mut tx, namespace, id, &proxy_id)
+            .await?;
 
         // Delete spec-owned plugin_configs by api_spec_id (belt-and-suspenders;
         // the proxy FK cascade below would handle proxy-scoped ones, but

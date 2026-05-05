@@ -6,5 +6,6 @@ pub mod extractor;
 pub mod handlers;
 
 pub use extractor::{
-    ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract, hash_resource_bundle,
+    ExtractError, ExtractedBundle, SpecFormat, SpecMetadata, extract,
+    extract_declared_proxy_plugin_association_ids, hash_resource_bundle,
 };

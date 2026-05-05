@@ -586,6 +586,134 @@ mod inner {
 
             Ok(())
         }
+
+        async fn current_api_spec_resource_hash(
+            &self,
+            bundle: &crate::admin::api_specs::ExtractedBundle,
+            spec: &ApiSpec,
+            previous_declared_assoc_ids: &HashSet<String>,
+        ) -> Result<Option<String>, anyhow::Error> {
+            let mut plugin_cursor = self
+                .plugin_configs()
+                .find(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
+                .await?;
+            let mut plugins = Vec::new();
+            while plugin_cursor.advance().await? {
+                let mut plugin = doc_to_plugin_config(plugin_cursor.deserialize_current()?)?;
+                plugin.normalize_fields();
+                plugins.push(plugin);
+            }
+
+            let spec_owned_plugin_ids: HashSet<String> =
+                plugins.iter().map(|pc| pc.id.clone()).collect();
+            let desired_assoc_ids: HashSet<String> = bundle
+                .proxy
+                .plugins
+                .iter()
+                .map(|assoc| assoc.plugin_config_id.clone())
+                .collect();
+            let mut relevant_assoc_ids = spec_owned_plugin_ids.clone();
+            relevant_assoc_ids.extend(previous_declared_assoc_ids.iter().cloned());
+            relevant_assoc_ids.extend(desired_assoc_ids.iter().cloned());
+
+            let proxy_doc = self
+                .proxies()
+                .find_one(
+                    doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace, "api_spec_id": &spec.id },
+                )
+                .await?;
+            let Some(proxy_doc) = proxy_doc else {
+                return Ok(None);
+            };
+            let mut proxy = doc_to_proxy(proxy_doc)?;
+            proxy.normalize_fields();
+            let current_relevant_assoc_ids: HashSet<String> = proxy
+                .plugins
+                .iter()
+                .filter_map(|assoc| {
+                    if relevant_assoc_ids.contains(&assoc.plugin_config_id) {
+                        Some(assoc.plugin_config_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if current_relevant_assoc_ids != desired_assoc_ids {
+                return Ok(None);
+            }
+            proxy.plugins = bundle
+                .proxy
+                .plugins
+                .iter()
+                .filter(|assoc| current_relevant_assoc_ids.contains(&assoc.plugin_config_id))
+                .cloned()
+                .collect();
+
+            let mut upstream_cursor = self
+                .upstreams()
+                .find(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
+                .await?;
+            let mut upstreams = Vec::new();
+            while upstream_cursor.advance().await? {
+                let mut upstream = doc_to_upstream(upstream_cursor.deserialize_current()?)?;
+                upstream.normalize_fields();
+                upstreams.push(upstream);
+            }
+            if upstreams.len() > 1 {
+                return Ok(None);
+            }
+
+            let current = crate::admin::api_specs::ExtractedBundle {
+                proxy,
+                upstream: upstreams.into_iter().next(),
+                plugins,
+            };
+            crate::admin::api_specs::hash_resource_bundle(&current).map(Some)
+        }
+
+        async fn ensure_no_external_spec_upstream_refs(
+            &self,
+            namespace: &str,
+            spec_id: &str,
+            spec_proxy_id: &str,
+        ) -> Result<(), anyhow::Error> {
+            let mut upstream_cursor = self
+                .upstreams()
+                .find(doc! { "api_spec_id": spec_id, "namespace": namespace })
+                .projection(doc! { "_id": 1 })
+                .await?;
+            let mut upstream_ids = Vec::new();
+            while upstream_cursor.advance().await? {
+                let doc = upstream_cursor.deserialize_current()?;
+                if let Ok(id) = doc.get_str("_id") {
+                    upstream_ids.push(id.to_string());
+                }
+            }
+            if upstream_ids.is_empty() {
+                return Ok(());
+            }
+
+            let external = self
+                .proxies()
+                .find_one(
+                    doc! { "upstream_id": { "$in": upstream_ids }, "_id": { "$ne": spec_proxy_id } },
+                )
+                .projection(doc! { "_id": 1, "upstream_id": 1 })
+                .await?;
+            if let Some(doc) = external {
+                let proxy_id = doc.get_str("_id").unwrap_or("<unknown>");
+                let upstream_id = doc.get_str("upstream_id").unwrap_or("<unknown>");
+                anyhow::bail!(
+                    "proxy '{}' references a spec-owned upstream '{}' from api_spec '{}'; \
+                     detach it before replacing or deleting the API spec",
+                    proxy_id,
+                    upstream_id,
+                    spec_id
+                );
+            }
+
+            Ok(())
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -617,6 +745,63 @@ mod inner {
                 doc.remove(*field);
             }
         }
+    }
+
+    fn declared_proxy_plugin_association_ids_from_spec(
+        spec: &ApiSpec,
+    ) -> Result<HashSet<String>, anyhow::Error> {
+        if spec.content_encoding != "gzip" {
+            warn!(
+                "api_spec '{}' uses unsupported content_encoding '{}'",
+                spec.id, spec.content_encoding
+            );
+            return Ok(HashSet::new());
+        }
+        let cap = usize::try_from(spec.uncompressed_size).unwrap_or(usize::MAX);
+        let body = match crate::admin::spec_codec::decompress_gzip_capped(&spec.spec_content, cap) {
+            Ok(body) => body,
+            Err(e) => {
+                warn!(
+                    "failed to decompress stored api_spec '{}' proxy plugin associations: {}",
+                    spec.id, e
+                );
+                return Ok(HashSet::new());
+            }
+        };
+        let ids = match crate::admin::api_specs::extract_declared_proxy_plugin_association_ids(
+            &body,
+            Some(spec.spec_format),
+        ) {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(
+                    "failed to parse stored api_spec '{}' proxy plugin associations: {}",
+                    spec.id, e
+                );
+                return Ok(HashSet::new());
+            }
+        };
+        Ok(ids.into_iter().collect())
+    }
+
+    fn store_canonical_resource_hash(
+        bundle: &crate::admin::api_specs::ExtractedBundle,
+    ) -> Result<String, anyhow::Error> {
+        let mut proxy = bundle.proxy.clone();
+        proxy.normalize_fields();
+        let upstream = bundle.upstream.clone().map(|mut upstream| {
+            upstream.normalize_fields();
+            upstream
+        });
+        let mut plugins = bundle.plugins.clone();
+        for plugin in &mut plugins {
+            plugin.normalize_fields();
+        }
+        crate::admin::api_specs::hash_resource_bundle(&crate::admin::api_specs::ExtractedBundle {
+            proxy,
+            upstream,
+            plugins,
+        })
     }
 
     /// Convert a domain `Proxy` into a BSON `Document` for storage.
@@ -2177,6 +2362,8 @@ mod inner {
                     .insert_one(spec_doc)
                     .session(&mut session)
                     .await?;
+                self.cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut session))
+                    .await?;
 
                 session.commit_transaction().await?;
             } else {
@@ -2253,30 +2440,45 @@ mod inner {
                 );
             }
 
-            // --- Hash short-circuit (Wave 5 Feature A) -----------------------
-            // If the resource bundle is byte-identical (same resource_hash),
-            // only update the api_specs document metadata and leave all other
-            // collections untouched. This prevents spurious updated_at bumps
-            // and unnecessary polling cycle processing for doc-only edits.
-            if !spec.resource_hash.is_empty() {
-                let existing = self
-                    .api_specs()
-                    .find_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
+            let existing_spec_doc = self
+                .api_specs()
+                .find_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
+                .await?;
+            let existing_spec: Option<ApiSpec> = existing_spec_doc
+                .as_ref()
+                .map(|doc| doc_to_api_spec(doc.clone()))
+                .transpose()?;
+            let previous_declared_assoc_ids = existing_spec
+                .as_ref()
+                .map(declared_proxy_plugin_association_ids_from_spec)
+                .transpose()?
+                .unwrap_or_default();
+            let desired_resource_hash = store_canonical_resource_hash(bundle)?;
+
+            // --- Resource no-op shortcut (Wave 5 Feature A) ------------------
+            // If the current spec-owned resource graph already matches the
+            // incoming bundle, only update the api_specs document metadata. The
+            // live-resource check prevents direct admin CRUD drift from pinning
+            // stale runtime config behind unchanged spec metadata.
+            if !spec.resource_hash.is_empty()
+                && self
+                    .current_api_spec_resource_hash(bundle, spec, &previous_declared_assoc_ids)
+                    .await?
+                    .as_deref()
+                    == Some(desired_resource_hash.as_str())
+            {
+                // Only update metadata fields on the spec doc.
+                self.api_specs()
+                    .replace_one(
+                        doc! { "_id": &spec.id, "namespace": &spec.namespace },
+                        spec_doc_check,
+                    )
                     .await?;
-                if let Some(ref existing_doc) = existing {
-                    let old_hash = existing_doc.get_str("resource_hash").unwrap_or("");
-                    if old_hash == spec.resource_hash {
-                        // Only update metadata fields on the spec doc.
-                        self.api_specs()
-                            .replace_one(
-                                doc! { "_id": &spec.id, "namespace": &spec.namespace },
-                                spec_doc_check,
-                            )
-                            .await?;
-                        return Ok(());
-                    }
-                }
+                return Ok(());
             }
+
+            self.ensure_no_external_spec_upstream_refs(&spec.namespace, &spec.id, &spec.proxy_id)
+                .await?;
 
             // Fix 3 (Mongo): Preserve manual proxy.plugins associations added
             // after spec creation (e.g. a global rate-limit plugin associated
@@ -2333,6 +2535,7 @@ mod inner {
                             // Keep manual associations: not spec-owned AND not already
                             // in the new bundle's plugin list (avoid duplicates).
                             !old_spec_plugin_ids.contains(&a.plugin_config_id)
+                                && !previous_declared_assoc_ids.contains(&a.plugin_config_id)
                                 && !new_spec_plugin_ids.contains(a.plugin_config_id.as_str())
                         })
                         .collect();
@@ -2407,6 +2610,8 @@ mod inner {
                 self.api_specs()
                     .insert_one(spec_doc)
                     .session(&mut session)
+                    .await?;
+                self.cleanup_orphaned_proxy_group_plugins_opt_session(Some(&mut session))
                     .await?;
 
                 session.commit_transaction().await?;
@@ -2526,6 +2731,7 @@ mod inner {
                     .await;
                     return Err(e);
                 }
+                self.cleanup_orphaned_proxy_group_plugins().await?;
             }
 
             Ok(())
@@ -2695,6 +2901,13 @@ mod inner {
                 .as_ref()
                 .and_then(|d| d.get_str("proxy_id").ok())
                 .map(str::to_string);
+
+            self.ensure_no_external_spec_upstream_refs(
+                namespace,
+                id,
+                proxy_id.as_deref().unwrap_or(""),
+            )
+            .await?;
 
             if self.replica_set_configured() {
                 // With a replica set: use a multi-document transaction so that a

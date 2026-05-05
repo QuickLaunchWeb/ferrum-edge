@@ -1525,6 +1525,50 @@ fn make_spec_with_metadata(
     (bundle, spec)
 }
 
+fn make_spec_from_openapi_body(
+    id: &str,
+    proxy_id: &str,
+    namespace: &str,
+    body: &str,
+) -> (ferrum_edge::admin::api_specs::ExtractedBundle, ApiSpec) {
+    use ferrum_edge::admin::api_specs::hash_resource_bundle;
+    use ferrum_edge::admin::spec_codec;
+    use ferrum_edge::config::types::SpecFormat;
+
+    let body_bytes = body.as_bytes();
+    let (bundle, meta) = ferrum_edge::admin::api_specs::extract(body_bytes, None, namespace)
+        .expect("extract failed");
+    let resource_hash = hash_resource_bundle(&bundle)
+        .expect("hash_resource_bundle should never fail for a valid bundle");
+
+    let spec = ApiSpec {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        proxy_id: proxy_id.to_string(),
+        spec_version: meta.version.clone(),
+        spec_format: SpecFormat::Json,
+        spec_content: spec_codec::compress_gzip(body_bytes).expect("compress failed"),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: body_bytes.len() as u64,
+        content_hash: spec_codec::sha256_hex(body_bytes),
+        title: meta.title.clone(),
+        info_version: meta.info_version.clone(),
+        description: meta.description.clone(),
+        contact_name: meta.contact_name.clone(),
+        contact_email: meta.contact_email.clone(),
+        license_name: meta.license_name.clone(),
+        license_identifier: meta.license_identifier.clone(),
+        tags: meta.tags.clone(),
+        server_urls: meta.server_urls.clone(),
+        operation_count: meta.operation_count,
+        resource_hash,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    (bundle, spec)
+}
+
 // ---------------------------------------------------------------------------
 // Feature B: Tier 1 metadata extraction
 // ---------------------------------------------------------------------------
@@ -2758,6 +2802,242 @@ async fn replace_with_changed_resources_keeps_manual_proxy_plugin_association() 
         plugin_ids.contains(&new_spec_plugin_id.as_str()),
         "new spec-owned plugin must be in proxy.plugins; found: {:?}",
         plugin_ids
+    );
+}
+
+#[tokio::test]
+async fn replace_removes_removed_spec_declared_external_proxy_plugin_association() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let group_plugin_id = uid("group-plugin");
+
+    let group_plugin = PluginConfig {
+        id: group_plugin_id.clone(),
+        namespace: ns.to_string(),
+        plugin_name: "rate_limiting".to_string(),
+        config: serde_json::json!({"limit": 100}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store
+        .create_plugin_config(&group_plugin)
+        .await
+        .expect("create proxy_group plugin failed");
+
+    let body_v1 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}",
+                "plugins": [{{ "plugin_config_id": "{group_plugin_id}" }}]
+            }}
+        }}"#
+    );
+    let (bundle_v1, spec_v1) = make_spec_from_openapi_body(&spec_id, &proxy_id, ns, &body_v1);
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("initial submit failed");
+
+    let proxy_before = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist");
+    assert!(
+        proxy_before
+            .plugins
+            .iter()
+            .any(|a| a.plugin_config_id == group_plugin_id),
+        "v1 spec-declared proxy_group association must be active before replace"
+    );
+
+    let body_v2 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0.1" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let (bundle_v2, spec_v2) = make_spec_from_openapi_body(&spec_id, &proxy_id, ns, &body_v2);
+    store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect("replace failed");
+
+    let proxy_after = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must still exist");
+    assert!(
+        !proxy_after
+            .plugins
+            .iter()
+            .any(|a| a.plugin_config_id == group_plugin_id),
+        "removed spec-declared proxy_group association must not persist after replace"
+    );
+}
+
+#[tokio::test]
+async fn replace_same_hash_reconciles_drifted_spec_owned_proxy() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let body = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "spec.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }}
+        }}"#
+    );
+    let (bundle, spec) = make_spec_from_openapi_body(&spec_id, &proxy_id, ns, &body);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("initial submit failed");
+
+    let mut drifted_proxy = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist");
+    drifted_proxy.backend_host = "drifted.internal".to_string();
+    drifted_proxy.updated_at = chrono::Utc::now();
+    store
+        .update_proxy(&drifted_proxy)
+        .await
+        .expect("direct proxy drift update failed");
+
+    let proxy_after_drift = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must exist");
+    assert_eq!(proxy_after_drift.backend_host, "drifted.internal");
+
+    store
+        .replace_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("same-hash replace should reconcile drift");
+
+    let proxy_after_replace = store
+        .get_proxy(&proxy_id)
+        .await
+        .expect("get_proxy failed")
+        .expect("proxy must still exist");
+    assert_eq!(
+        proxy_after_replace.backend_host, "spec.internal",
+        "unchanged resource_hash must not skip reconciliation when spec-owned rows drift"
+    );
+}
+
+#[tokio::test]
+async fn replace_api_spec_rejects_external_proxy_referencing_spec_owned_upstream() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let manual_proxy_id = uid("manual-proxy");
+    let upstream_id = uid("upstream");
+    let spec_id = uid("spec");
+    let body_v1 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }},
+            "x-ferrum-upstream": {{
+                "id": "{upstream_id}",
+                "targets": [{{ "host": "target.internal", "port": 443 }}]
+            }}
+        }}"#
+    );
+    let (bundle_v1, spec_v1) = make_spec_from_openapi_body(&spec_id, &proxy_id, ns, &body_v1);
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("initial submit failed");
+
+    let mut manual_proxy = make_proxy(&manual_proxy_id, ns);
+    manual_proxy.upstream_id = Some(upstream_id.clone());
+    store
+        .create_proxy(&manual_proxy)
+        .await
+        .expect("create manual proxy sharing spec upstream failed");
+
+    let body_v2 = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0.1" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "replacement.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }},
+            "x-ferrum-upstream": {{
+                "id": "{upstream_id}",
+                "targets": [{{ "host": "target.internal", "port": 443 }}]
+            }}
+        }}"#
+    );
+    let (bundle_v2, spec_v2) = make_spec_from_openapi_body(&spec_id, &proxy_id, ns, &body_v2);
+    let err = store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect_err("replace must reject shared spec-owned upstream");
+    assert!(
+        err.to_string().contains("references a spec-owned upstream"),
+        "unexpected error: {err}"
+    );
+
+    let upstream_after = store
+        .get_upstream(&upstream_id)
+        .await
+        .expect("get_upstream failed");
+    assert!(
+        upstream_after.is_some(),
+        "guarded replace must leave the spec-owned upstream intact"
+    );
+    let manual_proxy_after = store
+        .get_proxy(&manual_proxy_id)
+        .await
+        .expect("get_proxy failed");
+    assert!(
+        manual_proxy_after.is_some(),
+        "guarded replace must leave the external proxy intact"
     );
 }
 

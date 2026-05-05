@@ -206,49 +206,7 @@ pub fn extract(
     declared_format: Option<SpecFormat>,
     namespace: &str,
 ) -> Result<(ExtractedBundle, SpecMetadata), ExtractError> {
-    let fmt = declared_format.unwrap_or_else(|| autodetect_format(body));
-
-    // Parse to serde_json::Value.  serde_yaml accepts JSON as a YAML subset, so
-    // a single serde_yaml parse covers both formats.  For JSON we still prefer
-    // serde_json so the error messages mention "JSON" rather than "YAML".
-    //
-    // Fallback: YAML flow-style documents start with `{` and look like JSON to
-    // autodetect_format, but they use unquoted keys which serde_json rejects.
-    // When JSON parsing fails on autodetected (not declared) input, retry as
-    // YAML before surfacing the error.
-    let (root, parsed_via_yaml, actual_format): (serde_json::Value, bool, SpecFormat) = match fmt {
-        SpecFormat::Json => match serde_json::from_slice(body) {
-            Ok(v) => (v, false, SpecFormat::Json),
-            Err(e) if declared_format.is_none() => {
-                // Autodetected as JSON but failed — try YAML (covers flow-style).
-                let yv: serde_yaml::Value = serde_yaml::from_slice(body)
-                    .map_err(|_| ExtractError::InvalidJson(e.to_string()))?;
-                let val = serde_json::to_value(yv)
-                    .map_err(|e2| ExtractError::InvalidYaml(e2.to_string()))?;
-                (val, true, SpecFormat::Yaml)
-            }
-            Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
-        },
-        SpecFormat::Yaml => {
-            let yv: serde_yaml::Value = serde_yaml::from_slice(body)
-                .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
-            let val =
-                serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
-            (val, true, SpecFormat::Yaml)
-        }
-    };
-    // serde_yaml 0.9 does not cap alias/anchor expansion.  A small YAML doc
-    // using nested aliases can expand to billions of Value nodes despite the
-    // HTTP body-size limit.  Walk the tree with a budget to reject bombs.
-    // Applied to both the explicit YAML path and the JSON→YAML fallback.
-    if parsed_via_yaml {
-        let mut budget = MAX_YAML_EXPANDED_NODES;
-        if !count_value_nodes(&root, &mut budget) {
-            return Err(ExtractError::InvalidYaml(
-                "YAML alias expansion exceeds node limit; reduce anchor nesting".to_string(),
-            ));
-        }
-    }
+    let (root, actual_format) = parse_root_document(body, declared_format)?;
 
     // --- Version detection -----------------------------------------------
     let version = detect_version(&root)?;
@@ -501,6 +459,45 @@ pub fn extract(
     ))
 }
 
+/// Return plugin IDs explicitly listed in `x-ferrum-proxy.plugins`.
+///
+/// This deliberately ignores associations auto-added from `x-ferrum-plugins`.
+/// Replacement code uses it to distinguish associations owned by the previous
+/// spec document from associations an operator added later through direct CRUD.
+pub fn extract_declared_proxy_plugin_association_ids(
+    body: &[u8],
+    declared_format: Option<SpecFormat>,
+) -> Result<Vec<String>, ExtractError> {
+    let (root, _) = parse_root_document(body, declared_format)?;
+    let Some(proxy_val) = root.get("x-ferrum-proxy") else {
+        return Ok(Vec::new());
+    };
+    let Some(plugins_val) = proxy_val.get("plugins") else {
+        return Ok(Vec::new());
+    };
+    let arr = plugins_val
+        .as_array()
+        .ok_or_else(|| ExtractError::MalformedExtension {
+            which: "x-ferrum-proxy.plugins",
+            error: "expected an array".to_string(),
+        })?;
+
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let assoc: PluginAssociation = serde_json::from_value(entry.clone()).map_err(|e| {
+            ExtractError::MalformedExtension {
+                which: "x-ferrum-proxy.plugins",
+                error: e.to_string(),
+            }
+        })?;
+        if !assoc.plugin_config_id.is_empty() && !out.iter().any(|id| id == &assoc.plugin_config_id)
+        {
+            out.push(assoc.plugin_config_id);
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Public helpers — metadata extraction + resource hashing
 // ---------------------------------------------------------------------------
@@ -742,7 +739,26 @@ fn strip_metadata(mut v: serde_json::Value) -> serde_json::Value {
         obj.remove("created_at");
         obj.remove("updated_at");
     }
-    v
+    sort_json_value(v)
+}
+
+fn sort_json_value(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(obj) => {
+            let mut entries: Vec<_> = obj.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sort_json_value(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(sort_json_value).collect())
+        }
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +783,58 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
     }
 
     Err(ExtractError::UnknownVersion)
+}
+
+fn parse_root_document(
+    body: &[u8],
+    declared_format: Option<SpecFormat>,
+) -> Result<(serde_json::Value, SpecFormat), ExtractError> {
+    let fmt = declared_format.unwrap_or_else(|| autodetect_format(body));
+
+    // Parse to serde_json::Value.  serde_yaml accepts JSON as a YAML subset, so
+    // a single serde_yaml parse covers both formats.  For JSON we still prefer
+    // serde_json so the error messages mention "JSON" rather than "YAML".
+    //
+    // Fallback: YAML flow-style documents start with `{` and look like JSON to
+    // autodetect_format, but they use unquoted keys which serde_json rejects.
+    // When JSON parsing fails on autodetected (not declared) input, retry as
+    // YAML before surfacing the error.
+    let (root, parsed_via_yaml, actual_format): (serde_json::Value, bool, SpecFormat) = match fmt {
+        SpecFormat::Json => match serde_json::from_slice(body) {
+            Ok(v) => (v, false, SpecFormat::Json),
+            Err(e) if declared_format.is_none() => {
+                // Autodetected as JSON but failed — try YAML (covers flow-style).
+                let yv: serde_yaml::Value = serde_yaml::from_slice(body)
+                    .map_err(|_| ExtractError::InvalidJson(e.to_string()))?;
+                let val = serde_json::to_value(yv)
+                    .map_err(|e2| ExtractError::InvalidYaml(e2.to_string()))?;
+                (val, true, SpecFormat::Yaml)
+            }
+            Err(e) => return Err(ExtractError::InvalidJson(e.to_string())),
+        },
+        SpecFormat::Yaml => {
+            let yv: serde_yaml::Value = serde_yaml::from_slice(body)
+                .map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
+            let val =
+                serde_json::to_value(yv).map_err(|e| ExtractError::InvalidYaml(e.to_string()))?;
+            (val, true, SpecFormat::Yaml)
+        }
+    };
+
+    // serde_yaml 0.9 does not cap alias/anchor expansion.  A small YAML doc
+    // using nested aliases can expand to billions of Value nodes despite the
+    // HTTP body-size limit.  Walk the tree with a budget to reject bombs.
+    // Applied to both the explicit YAML path and the JSON→YAML fallback.
+    if parsed_via_yaml {
+        let mut budget = MAX_YAML_EXPANDED_NODES;
+        if !count_value_nodes(&root, &mut budget) {
+            return Err(ExtractError::InvalidYaml(
+                "YAML alias expansion exceeds node limit; reduce anchor nesting".to_string(),
+            ));
+        }
+    }
+
+    Ok((root, actual_format))
 }
 
 // ---------------------------------------------------------------------------
