@@ -136,7 +136,7 @@ fn metadata_key_segments(key: &str) -> Vec<String> {
 }
 
 fn segment_is_any(segment: &str, candidates: &[&str]) -> bool {
-    candidates.iter().any(|candidate| segment == *candidate)
+    candidates.contains(&segment)
 }
 
 fn is_sensitive_token_metadata_key(key: &str) -> bool {

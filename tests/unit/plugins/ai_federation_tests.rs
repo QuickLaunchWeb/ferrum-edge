@@ -1206,8 +1206,10 @@ fn create_test_http_client() -> ferrum_edge::plugins::PluginHttpClient {
 fn create_test_http_client_with_backend_allow_ips(
     backend_allow_ips: BackendAllowIps,
 ) -> ferrum_edge::plugins::PluginHttpClient {
-    let mut dns_config = DnsConfig::default();
-    dns_config.backend_allow_ips = backend_allow_ips.clone();
+    let dns_config = DnsConfig {
+        backend_allow_ips: backend_allow_ips.clone(),
+        ..Default::default()
+    };
     ferrum_edge::plugins::PluginHttpClient::new(
         &PoolConfig::default(),
         DnsCache::new(dns_config),

@@ -1147,10 +1147,12 @@ mod tests {
             refresh_period_ms, 60_000,
             "fd_limit refresh should be ~60s at the default 1s monitor tick"
         );
-        assert!(
-            FD_LIMIT_REFRESH_INTERVAL_TICKS > 0,
-            "refresh interval must be positive to ever trigger a refresh"
-        );
+        const {
+            assert!(
+                FD_LIMIT_REFRESH_INTERVAL_TICKS > 0,
+                "refresh interval must be positive to ever trigger a refresh"
+            );
+        }
     }
 
     /// Simulate the monitor loop's tick counter and verify a changed
