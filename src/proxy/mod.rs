@@ -3066,10 +3066,18 @@ impl ProxyState {
 /// Uses hyper-util's auto builder which accepts both HTTP/1.1 and HTTP/2
 /// connections. h2c (cleartext HTTP/2) is required for gRPC clients that
 /// connect without TLS.
+///
+/// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
+/// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
+/// stop accepting new requests. Without this, persistent H2/keepalive
+/// connections continue to accept new streams indefinitely after the listener
+/// exits, forcing every shutdown to wait the full
+/// `FERRUM_SHUTDOWN_DRAIN_SECONDS` timeout.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set TCP keepalive on inbound connection to detect stale clients
     set_tcp_keepalive(&stream);
@@ -3121,7 +3129,24 @@ async fn handle_connection(
         let addr = remote_addr;
         async move { handle_proxy_request(req, state, addr, false, None, None).await }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+
+    let result = tokio::select! {
+        biased;
+        res = conn.as_mut() => res,
+        _ = shutdown_rx.changed() => {
+            // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
+            // in-flight requests to complete on this connection. Continuing
+            // to poll the connection lets streams finish before the connection
+            // future resolves.
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    };
+
+    if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
             debug!(
@@ -4867,6 +4892,12 @@ async fn run_accept_loop(
 
                         let state = state.clone();
                         let tls_config = tls_config.clone();
+                        // Each connection gets its own subscriber so that
+                        // shutdown can interrupt the per-connection serve
+                        // future (sending GOAWAY on H2 / closing keepalive
+                        // on H1) instead of letting it sit idle until the
+                        // drain timeout fires.
+                        let conn_shutdown_rx = shutdown_rx.clone();
 
                         tokio::spawn(async move {
                             // Hold the permit for the connection lifetime.
@@ -4878,9 +4909,17 @@ async fn run_accept_loop(
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
 
                             let result = if let Some(tls_config) = tls_config {
-                                handle_tls_connection(stream, remote_addr, state, tls_config).await
+                                handle_tls_connection(
+                                    stream,
+                                    remote_addr,
+                                    state,
+                                    tls_config,
+                                    conn_shutdown_rx,
+                                )
+                                .await
                             } else {
-                                handle_connection(stream, remote_addr, state).await
+                                handle_connection(stream, remote_addr, state, conn_shutdown_rx)
+                                    .await
                             };
 
                             if let Err(e) = result {
@@ -4902,11 +4941,16 @@ async fn run_accept_loop(
 }
 
 /// Handle TLS connections with HTTP/1.1 and HTTP/2 auto-negotiation via ALPN.
+///
+/// On shutdown, calls `graceful_shutdown()` on the hyper connection so that
+/// HTTP/2 clients receive a GOAWAY frame and HTTP/1.1 keepalive connections
+/// stop accepting new requests. See [`handle_connection`] for rationale.
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: ProxyState,
     tls_config: Arc<rustls::ServerConfig>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
 
@@ -4985,7 +5029,22 @@ async fn handle_tls_connection(
         let chain = client_cert_chain_der.clone();
         async move { handle_proxy_request(req, state, addr, true, cert, chain).await }
     });
-    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+    tokio::pin!(conn);
+
+    let result = tokio::select! {
+        biased;
+        res = conn.as_mut() => res,
+        _ = shutdown_rx.changed() => {
+            // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
+            // in-flight requests to complete on this connection.
+            conn.as_mut().graceful_shutdown();
+            conn.as_mut().await
+        }
+    };
+
+    if let Err(e) = result {
         let err_string = e.to_string();
         if is_client_disconnect_error(&err_string) {
             debug!(

@@ -231,6 +231,8 @@ pub async fn start_http3_listener_with_signal(
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
     let handshake_timeout = h3_config.handshake_timeout;
+    let drain_seconds = state.env_config.shutdown_drain_seconds;
+    let overload_state = state.overload.clone();
 
     loop {
         tokio::select! {
@@ -262,12 +264,62 @@ pub async fn start_http3_listener_with_signal(
                 }
             }
             _ = shutdown_rx.changed() => {
-                info!("HTTP/3 listener shutting down");
-                endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+                info!("HTTP/3 listener shutting down — refusing new connections, draining in-flight");
+                // Stop accepting new server-side QUIC handshakes. Existing
+                // connections continue to serve in-flight streams. Without
+                // this, an immediate `endpoint.close()` would abort live
+                // requests with a CONNECTION_CLOSE frame mid-stream.
+                endpoint.set_server_config(None);
                 break;
             }
         }
     }
+
+    // Wait for in-flight HTTP/3 connections to drain, bounded by
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS. Without this, any subsequent
+    // `endpoint.close()` call would forcefully terminate active streams the
+    // moment the listener task exited — exactly the abrupt-abort behaviour
+    // the soft-shutdown sequence is here to avoid.
+    if drain_seconds > 0 {
+        let drain_timeout = Duration::from_secs(drain_seconds);
+        let drained = tokio::time::timeout(drain_timeout, async {
+            loop {
+                if endpoint.open_connections() == 0 {
+                    break;
+                }
+                // Poll active connections via overload state's notify
+                // signal — the same mechanism the central drain helper
+                // uses, so notifications are coherent across listeners.
+                tokio::select! {
+                    _ = overload_state.drain_complete.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .is_ok();
+
+        if drained {
+            info!(
+                phase = "drain",
+                listener = "http3",
+                "HTTP/3 in-flight connections drained"
+            );
+        } else {
+            warn!(
+                phase = "drain",
+                listener = "http3",
+                remaining_connections = endpoint.open_connections(),
+                "HTTP/3 drain timeout — forcing endpoint close"
+            );
+        }
+    }
+
+    // Finally, close any remaining connections cleanly. wait_idle() lets
+    // peers receive the CONNECTION_CLOSE frame before the socket is
+    // dropped — without it some clients see a transport-layer abort.
+    endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+    endpoint.wait_idle().await;
 
     Ok(())
 }
