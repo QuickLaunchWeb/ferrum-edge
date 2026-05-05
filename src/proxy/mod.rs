@@ -6868,15 +6868,33 @@ async fn handle_proxy_request_inner(
                 // naturally propagates the h2 error to the client.
 
                 // Stream H2 DATA frames on the gRPC streaming path.
+                //
+                // Wrap the backend body in `StripHopByHopTrailers` (via the
+                // `*_strip_hop_by_hop_trailers` helper) so RFC 9110 §7.6.1
+                // response-direction hop-by-hop names (`connection`,
+                // `keep-alive`, `proxy-authenticate`, `proxy-connection`,
+                // `te`, `trailer`, `transfer-encoding`, `upgrade`) cannot
+                // leak to the downstream client through TRAILERS frames.
+                // Without this filter, a misbehaving backend can punch a
+                // hole in the proxy boundary by emitting `proxy-authenticate`
+                // / `keep-alive` / `connection: close` in the trailer map —
+                // hyper's H2 trailer encoder rejects some hop-by-hop names
+                // at the frame layer but `proxy-authenticate`,
+                // `proxy-connection`, and `keep-alive` are not blocked.
+                // Mirrors the buffered-path strip in `grpc_proxy.rs` so the
+                // two response paths cannot drift.
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl)
+                    crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
+                        grpc_streaming.body,
+                        cl,
+                    )
                 } else {
-                    crate::proxy::body::coalescing_h2_body(
+                    crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
