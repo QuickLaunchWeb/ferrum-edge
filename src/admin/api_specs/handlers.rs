@@ -18,6 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::admin::AdminState;
+use crate::admin::api_specs::extractor::{MAX_YAML_EXPANDED_NODES, count_value_nodes};
 use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
 };
@@ -659,6 +660,14 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
                 .map_err(|e| format!("YAML parse error during conversion: {e}"))?;
             let jv: serde_json::Value = serde_json::to_value(val)
                 .map_err(|e| format!("YAML→JSON conversion error: {e}"))?;
+            let mut budget = MAX_YAML_EXPANDED_NODES;
+            if !count_value_nodes(&jv, &mut budget) {
+                return Err(
+                    "YAML alias expansion exceeds node limit during conversion; \
+                     retrieve the stored YAML representation instead"
+                        .to_string(),
+                );
+            }
             serde_json::to_vec_pretty(&jv).map_err(|e| format!("JSON serialization error: {e}"))
         }
         (SpecFormat::Json, SpecFormat::Yaml) => {

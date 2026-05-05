@@ -778,11 +778,11 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
 /// public specs top out around 50k nodes). serde_yaml expands aliases while
 /// parsing, so this is a post-parse guard rather than a hard pre-parse memory
 /// cap; the HTTP body-size limit remains the outer bound for parser input.
-const MAX_YAML_EXPANDED_NODES: usize = 500_000;
+pub(crate) const MAX_YAML_EXPANDED_NODES: usize = 500_000;
 
 /// Walk a `serde_json::Value` tree, decrementing `budget` for each node
 /// visited.  Returns `false` (reject) when the budget hits zero.
-fn count_value_nodes(val: &serde_json::Value, budget: &mut usize) -> bool {
+pub(crate) fn count_value_nodes(val: &serde_json::Value, budget: &mut usize) -> bool {
     if *budget == 0 {
         return false;
     }
