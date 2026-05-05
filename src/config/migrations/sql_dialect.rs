@@ -111,6 +111,7 @@ impl V001SqlBuilder {
             // run WHERE api_spec_id = ? against these tables. Without indexes,
             // those queries are full-table scans that grow with overall config
             // volume, not spec count.
+            "CREATE INDEX IF NOT EXISTS idx_proxies_api_spec_id ON proxies (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_api_spec_id ON plugin_configs (api_spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_api_spec_id ON upstreams (api_spec_id)",
         ];

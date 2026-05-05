@@ -606,6 +606,9 @@ pub async fn handle_admin_request(
             return api_specs::handlers::handle_post_api_spec(req, &state, &namespace).await;
         }
         (Method::PUT, ["api-specs", id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
             let id = id.to_string();
             return api_specs::handlers::handle_put_api_spec(req, &state, &namespace, &id).await;
         }
@@ -613,6 +616,9 @@ pub async fn handle_admin_request(
             return api_specs::handlers::handle_list_api_specs(req, &state, &namespace).await;
         }
         (Method::GET, ["api-specs", "by-proxy", proxy_id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(proxy_id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
             let proxy_id = proxy_id.to_string();
             return api_specs::handlers::handle_get_api_spec_by_proxy(
                 req, &state, &namespace, &proxy_id,
@@ -620,10 +626,16 @@ pub async fn handle_admin_request(
             .await;
         }
         (Method::GET, ["api-specs", id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
             let id = id.to_string();
             return api_specs::handlers::handle_get_api_spec(req, &state, &namespace, &id).await;
         }
         (Method::DELETE, ["api-specs", id]) => {
+            if let Err(e) = crate::config::types::validate_resource_id(id) {
+                return Ok(json_response(StatusCode::BAD_REQUEST, &json!({"error": e})));
+            }
             let id = id.to_string();
             // DELETE should have no body. Drop the receiver so hyper discards
             // any remaining bytes via Drop without buffering them in userspace.

@@ -661,9 +661,7 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
         (SpecFormat::Json, SpecFormat::Yaml) => {
             let jv: serde_json::Value = serde_json::from_slice(body)
                 .map_err(|e| format!("JSON parse error during conversion: {e}"))?;
-            let yv: serde_yaml::Value = serde_json::from_value(jv)
-                .map_err(|e| format!("JSON→YAML conversion error: {e}"))?;
-            serde_yaml::to_string(&yv)
+            serde_yaml::to_string(&jv)
                 .map(|s| s.into_bytes())
                 .map_err(|e| format!("YAML serialization error: {e}"))
         }
