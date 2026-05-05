@@ -1,4 +1,7 @@
-use super::{AutoBool, BackendAllowIps, ConfFile, DbTlsMode, OperatingMode, resolve_var};
+use super::{
+    AutoBool, BackendAllowIps, ConfFile, DbTlsMode, MeshConfigSource, MeshTopology, OperatingMode,
+    resolve_var,
+};
 use std::collections::HashMap;
 
 pub(crate) trait EnvValue: Sized {
@@ -59,6 +62,7 @@ fn mode_matches_any(mode: &OperatingMode, candidates: &[&str]) -> bool {
         OperatingMode::File => "file",
         OperatingMode::ControlPlane => "cp",
         OperatingMode::DataPlane => "dp",
+        OperatingMode::Mesh => "mesh",
         OperatingMode::Migrate => "migrate",
     };
 
@@ -115,6 +119,31 @@ impl EnvValue for AutoBool {
             "true" | "1" => Ok(Self::True),
             "false" | "0" => Ok(Self::False),
             _ => Err(invalid_env_value(key, raw, "auto, true, false, 1, or 0")),
+        }
+    }
+}
+
+impl EnvValue for MeshTopology {
+    fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "sidecar" => Ok(Self::Sidecar),
+            "ambient" => Ok(Self::Ambient),
+            _ => Err(invalid_env_value(key, raw, "sidecar or ambient")),
+        }
+    }
+}
+
+impl EnvValue for MeshConfigSource {
+    fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "file" => Ok(Self::File),
+            "native" | "configsync" | "meshsubscribe" => Ok(Self::Native),
+            "xds" => Ok(Self::Xds),
+            _ => Err(invalid_env_value(
+                key,
+                raw,
+                "file, native, configsync, meshsubscribe, or xds",
+            )),
         }
     }
 }

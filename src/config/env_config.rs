@@ -25,6 +25,7 @@ pub enum OperatingMode {
     File,
     ControlPlane,
     DataPlane,
+    Mesh,
     Migrate,
 }
 
@@ -41,11 +42,46 @@ impl OperatingMode {
             "file" => Ok(Self::File),
             "cp" => Ok(Self::ControlPlane),
             "dp" => Ok(Self::DataPlane),
+            "mesh" => Ok(Self::Mesh),
             "migrate" => Ok(Self::Migrate),
             other => Err(format!(
-                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, migrate",
+                "Invalid FERRUM_MODE '{}'. Expected: database, file, cp, dp, mesh, migrate",
                 other
             )),
+        }
+    }
+}
+
+/// Mesh runtime topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshTopology {
+    Sidecar,
+    Ambient,
+}
+
+impl std::fmt::Display for MeshTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sidecar => write!(f, "sidecar"),
+            Self::Ambient => write!(f, "ambient"),
+        }
+    }
+}
+
+/// Source used by mesh mode to obtain canonical Layer-2 config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshConfigSource {
+    File,
+    Native,
+    Xds,
+}
+
+impl std::fmt::Display for MeshConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File => write!(f, "file"),
+            Self::Native => write!(f, "native"),
+            Self::Xds => write!(f, "xds"),
         }
     }
 }
@@ -501,6 +537,18 @@ pub struct EnvConfig {
     /// Mount Envoy ADS (`AggregatedDiscoveryService`) on the CP gRPC listener.
     /// Default false so existing CP/DP deployments expose only ConfigSync.
     pub xds_enabled: bool,
+
+    // Mesh runtime
+    pub mesh_topology: MeshTopology,
+    pub mesh_config_source: MeshConfigSource,
+    pub mesh_node_id: String,
+    pub mesh_workload_spiffe_id: Option<String>,
+    pub mesh_labels: HashMap<String, String>,
+    pub mesh_bind_address: String,
+    pub mesh_inbound_port: u16,
+    pub mesh_outbound_port: u16,
+    pub mesh_hbone_port: u16,
+    pub mesh_hbone_enabled: bool,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1176,6 +1224,16 @@ impl Default for EnvConfig {
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
             xds_enabled: false,
+            mesh_topology: MeshTopology::Sidecar,
+            mesh_config_source: MeshConfigSource::File,
+            mesh_node_id: "ferrum-mesh-node".to_string(),
+            mesh_workload_spiffe_id: None,
+            mesh_labels: HashMap::new(),
+            mesh_bind_address: "0.0.0.0".to_string(),
+            mesh_inbound_port: 15006,
+            mesh_outbound_port: 15001,
+            mesh_hbone_port: 15008,
+            mesh_hbone_enabled: true,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1439,6 +1497,21 @@ impl EnvConfig {
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
             dp_grpc_tls_no_verify: bool = "FERRUM_DP_GRPC_TLS_NO_VERIFY" => false;
+        }
+
+        env_config! {
+            conf = conf, mode = &mode;
+            [mesh]
+            mesh_topology: MeshTopology = "FERRUM_MESH_TOPOLOGY" => MeshTopology::Sidecar;
+            mesh_config_source: MeshConfigSource = "FERRUM_MESH_CONFIG_SOURCE" => MeshConfigSource::File;
+            mesh_node_id: String = "FERRUM_MESH_NODE_ID" => "ferrum-mesh-node".to_string();
+            mesh_workload_spiffe_id: Option<String> = "FERRUM_MESH_WORKLOAD_SPIFFE_ID";
+            mesh_labels: HashMap<String, String> = "FERRUM_MESH_LABELS" => HashMap::new();
+            mesh_bind_address: String = "FERRUM_MESH_BIND_ADDRESS" => "0.0.0.0".to_string();
+            mesh_inbound_port: u16 = "FERRUM_MESH_INBOUND_PORT" => 15006u16;
+            mesh_outbound_port: u16 = "FERRUM_MESH_OUTBOUND_PORT" => 15001u16;
+            mesh_hbone_port: u16 = "FERRUM_MESH_HBONE_PORT" => 15008u16;
+            mesh_hbone_enabled: bool = "FERRUM_MESH_HBONE_ENABLED" => true;
         }
 
         env_config! {
@@ -1773,6 +1846,16 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
             xds_enabled,
+            mesh_topology,
+            mesh_config_source,
+            mesh_node_id,
+            mesh_workload_spiffe_id,
+            mesh_labels,
+            mesh_bind_address,
+            mesh_inbound_port,
+            mesh_outbound_port,
+            mesh_hbone_port,
+            mesh_hbone_enabled,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,
@@ -1952,6 +2035,15 @@ impl EnvConfig {
             .admin_bind_address
             .parse()
             .expect("admin_bind_address validated at config load");
+        std::net::SocketAddr::new(ip, port)
+    }
+
+    /// Build a `SocketAddr` from the mesh bind address and the given port.
+    pub fn mesh_socket_addr(&self, port: u16) -> std::net::SocketAddr {
+        let ip = self
+            .mesh_bind_address
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         std::net::SocketAddr::new(ip, port)
     }
 
@@ -2286,6 +2378,24 @@ impl EnvConfig {
                     );
                 }
             }
+            OperatingMode::Mesh => match self.mesh_config_source {
+                MeshConfigSource::File => {
+                    if self.file_config_path.is_none() {
+                        return Err(
+                            "FERRUM_FILE_CONFIG_PATH is required in mesh mode when FERRUM_MESH_CONFIG_SOURCE=file"
+                                .into(),
+                        );
+                    }
+                }
+                MeshConfigSource::Native | MeshConfigSource::Xds => {
+                    if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
+                        return Err(
+                            "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in mesh mode when FERRUM_MESH_CONFIG_SOURCE=native/xds"
+                                .into(),
+                        );
+                    }
+                }
+            },
             OperatingMode::Migrate => {
                 // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
                 // For "config", FERRUM_FILE_CONFIG_PATH is required.
@@ -2372,6 +2482,41 @@ impl EnvConfig {
                 "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
                 self.admin_bind_address
             ));
+        }
+        if self.mode == OperatingMode::Mesh {
+            if self.mesh_bind_address.parse::<std::net::IpAddr>().is_err() {
+                return Err(format!(
+                    "Invalid FERRUM_MESH_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
+                    self.mesh_bind_address
+                ));
+            }
+            if self.mesh_inbound_port == self.mesh_outbound_port {
+                return Err(
+                    "FERRUM_MESH_INBOUND_PORT and FERRUM_MESH_OUTBOUND_PORT must be different"
+                        .into(),
+                );
+            }
+            if self.mesh_hbone_enabled
+                && (self.mesh_hbone_port == self.mesh_inbound_port
+                    || self.mesh_hbone_port == self.mesh_outbound_port)
+            {
+                return Err(
+                    "FERRUM_MESH_HBONE_PORT must be distinct from inbound/outbound capture ports"
+                        .into(),
+                );
+            }
+            if self.mesh_config_source == MeshConfigSource::Native
+                && self
+                    .cp_dp_grpc_jwt_secret
+                    .as_deref()
+                    .filter(|secret| secret.len() >= crate::config::types::MIN_JWT_SECRET_LENGTH)
+                    .is_none()
+            {
+                return Err(
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in mesh mode when FERRUM_MESH_CONFIG_SOURCE=native"
+                        .into(),
+                );
+            }
         }
 
         // Validate global backend TLS cert/key files exist and are parseable

@@ -412,6 +412,7 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             OperatingMode::File => modes::file::run(env_config, shutdown_tx).await,
             OperatingMode::ControlPlane => modes::control_plane::run(env_config, shutdown_tx).await,
             OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
+            OperatingMode::Mesh => modes::mesh::run(env_config, shutdown_tx).await,
             OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
         };
 

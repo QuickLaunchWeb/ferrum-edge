@@ -1,4 +1,4 @@
-//! Plugin system — 58 built-in plugins with a trait-based architecture.
+//! Plugin system — 61 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -15,6 +15,7 @@
 //! Non-security plugins that fail validation are skipped with a warning.
 
 pub mod access_control;
+pub mod access_log;
 pub mod ai_federation;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
@@ -44,6 +45,7 @@ pub mod key_auth;
 pub mod ldap_auth;
 pub mod load_testing;
 pub mod loki_logging;
+pub mod mesh_authz;
 pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
@@ -70,6 +72,7 @@ pub mod transaction_debugger;
 pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
+pub mod workload_metrics;
 pub mod ws_frame_logging;
 pub mod ws_logging;
 pub mod ws_message_size_limiting;
@@ -279,10 +282,10 @@ pub struct RequestContext {
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
-    /// Peer SPIFFE identity, populated by the `mtls_auth` plugin when the
-    /// client certificate carries a `spiffe://` URI SAN. `None` for non-mesh
-    /// deployments and for clients that present a non-SPIFFE certificate.
-    /// Plugins downstream of `mtls_auth` may read this for identity-aware
+    /// Peer SPIFFE identity, populated by the `spiffe_identity` plugin from a
+    /// client certificate URI SAN or HBONE connection metadata. `None` for
+    /// non-mesh deployments and for clients that present no SPIFFE identity.
+    /// Plugins downstream of `spiffe_identity` may read this for identity-aware
     /// authorization (e.g. mesh policy evaluation in Phase C).
     pub peer_spiffe_id: Option<crate::identity::SpiffeId>,
     /// Cumulative nanoseconds spent by plugins making external HTTP calls
@@ -993,6 +996,7 @@ pub mod priority {
     pub const HMAC_AUTH: u16 = 1400;
     pub const SOAP_WS_SECURITY: u16 = 1500;
     pub const ACCESS_CONTROL: u16 = 2000;
+    pub const MESH_AUTHZ: u16 = 2010;
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
     pub const AI_SEMANTIC_CACHE: u16 = 2700;
     pub const REQUEST_DEDUPLICATION: u16 = 2750;
@@ -1017,6 +1021,7 @@ pub mod priority {
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
+    pub const ACCESS_LOG: u16 = 9005;
     pub const STATSD_LOGGING: u16 = 9075;
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TCP_LOGGING: u16 = 9125;
@@ -1025,6 +1030,7 @@ pub mod priority {
     pub const UDP_LOGGING: u16 = 9160;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
+    pub const WORKLOAD_METRICS: u16 = 9310;
     pub const API_CHARGEBACK: u16 = 9350;
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
     pub const WS_RATE_LIMITING: u16 = 2910;
@@ -1451,6 +1457,7 @@ pub fn create_plugin_with_http_client(
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
+        "access_log" => Ok(Some(Arc::new(access_log::AccessLog::new(config)?))),
         "statsd_logging" => Ok(Some(Arc::new(statsd_logging::StatsdLogging::new(
             config,
             http_client.clone(),
@@ -1501,6 +1508,7 @@ pub fn create_plugin_with_http_client(
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
+        "mesh_authz" => Ok(Some(Arc::new(mesh_authz::MeshAuthz::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
@@ -1561,6 +1569,9 @@ pub fn create_plugin_with_http_client(
         "prometheus_metrics" => Ok(Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(
             config,
             http_client.namespace(),
+        )?))),
+        "workload_metrics" => Ok(Some(Arc::new(workload_metrics::WorkloadMetrics::new(
+            config,
         )?))),
         "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
             config,
@@ -1651,6 +1662,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwks_auth"
             | "mtls_auth"
             | "access_control"
+            | "mesh_authz"
             | "tcp_connection_throttle"
             | "ip_restriction"
     )
@@ -1659,6 +1671,7 @@ pub fn is_security_plugin(name: &str) -> bool {
 pub fn available_plugins() -> Vec<&'static str> {
     let mut plugins = vec![
         "stdout_logging",
+        "access_log",
         "http_logging",
         "tcp_logging",
         "kafka_logging",
@@ -1672,6 +1685,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "hmac_auth",
         "mtls_auth",
         "spiffe_identity",
+        "mesh_authz",
         "compression",
         "cors",
         "access_control",
@@ -1694,6 +1708,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "response_mock",
         "serverless_function",
         "prometheus_metrics",
+        "workload_metrics",
         "otel_tracing",
         "ai_token_metrics",
         "ai_request_guard",
