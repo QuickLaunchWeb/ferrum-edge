@@ -272,6 +272,7 @@ impl GrpcConnectionPool {
     ) -> Self {
         let cleanup_interval =
             Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
+        let shards = crate::util::sharding::pool_shard_amount(global_env_config.pool_shard_amount);
         let manager = Arc::new(GrpcPoolManager {
             global_pool_config: global_pool_config.clone(),
             global_env_config,
@@ -282,8 +283,8 @@ impl GrpcConnectionPool {
         });
 
         Self {
-            pool: GenericPool::new(manager, global_pool_config, cleanup_interval),
-            rr_counters: Arc::new(DashMap::new()),
+            pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
+            rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 

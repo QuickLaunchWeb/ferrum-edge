@@ -142,6 +142,7 @@ fn create_proxy_state() -> ProxyState {
         num_concurrent_reqs: 3,
         max_active_requests: 512,
         max_concurrent_refreshes: 64,
+        shard_amount: 0,
     });
     ProxyState::new(
         GatewayConfig::default(),

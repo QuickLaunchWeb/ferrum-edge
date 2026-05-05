@@ -1172,6 +1172,8 @@ impl ProxyState {
         let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let websocket_tunnel_mode = env_config.websocket_tunnel_mode;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
+        let pool_shard_amount =
+            crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -1217,7 +1219,7 @@ impl ProxyState {
         ));
         // Build router cache with pre-sorted route table and HashMap prefix index.
         // Cache size: explicit env var if set (>0), otherwise pass through 0 so
-        // `RouterCache::new` resolves the auto sentinel (single source of truth).
+        // the RouterCache constructor resolves the auto sentinel (single source of truth).
         let max_cache_entries = if env_config_arc.router_cache_max_entries > 0 {
             env_config_arc
                 .router_cache_max_entries
@@ -1225,7 +1227,11 @@ impl ProxyState {
         } else {
             0
         };
-        let router_cache = Arc::new(RouterCache::new(&config, max_cache_entries));
+        let router_cache = Arc::new(RouterCache::with_shard_amount(
+            &config,
+            max_cache_entries,
+            pool_shard_amount,
+        ));
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
@@ -1477,7 +1483,9 @@ impl ProxyState {
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
-                Some(Arc::new(dashmap::DashMap::new()))
+                Some(Arc::new(dashmap::DashMap::with_shard_amount(
+                    pool_shard_amount,
+                )))
             } else {
                 None
             },

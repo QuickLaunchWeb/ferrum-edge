@@ -815,6 +815,19 @@ pub struct EnvConfig {
     /// target churn in dynamic environments (e.g., Kubernetes pod cycling).
     /// Default: 10000.
     pub circuit_breaker_cache_max_entries: usize,
+    /// DashMap shard count for hot pool/cache maps (HTTP/H2/gRPC connection
+    /// pools, DNS cache, per-IP request counters, router prefix/regex
+    /// caches). DashMap defaults to `4 * num_cpus`, which is fine for small
+    /// maps but starves on write contention at high cardinality (1K+ unique
+    /// pool keys, distinct DNS hosts, distinct client IPs). Higher shard
+    /// counts give concurrent inserts more independent locks.
+    ///
+    /// Resolution: `0` (default) auto-derives `next_power_of_two(max(64,
+    /// num_cpus * 16))` — 64 on small dev hosts, 256 on a 16-core box,
+    /// 1024 on a 64-core box. Any positive value is rounded up to the
+    /// next power of two (DashMap's API requires power-of-two shard counts).
+    /// Default: 0.
+    pub pool_shard_amount: usize,
     /// Maximum entries in the HTTP status code counters map. Common codes
     /// (200, 404, 500, etc.) are pre-populated at startup. Rare/exotic codes
     /// create entries on first occurrence up to this cap. Prevents unbounded
@@ -1122,6 +1135,7 @@ impl Default for EnvConfig {
             max_concurrent_requests_per_ip: 0,
             per_ip_cleanup_interval_seconds: 60,
             circuit_breaker_cache_max_entries: 10_000,
+            pool_shard_amount: 0,
             status_counts_max_entries: 200,
             tcp_listen_backlog: 2048,
             accept_threads: 0,
@@ -1402,6 +1416,7 @@ impl EnvConfig {
             max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
             per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
+            pool_shard_amount: usize = "FERRUM_POOL_SHARD_AMOUNT" => 0usize;
             status_counts_max_entries: usize = "FERRUM_STATUS_COUNTS_MAX_ENTRIES" => 200usize;
             tcp_listen_backlog: u32 = "FERRUM_TCP_LISTEN_BACKLOG" => 2048u32, max(128u32);
             server_http2_max_concurrent_streams: u32 = "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS" => 1000u32, max(1u32);
@@ -1723,6 +1738,7 @@ impl EnvConfig {
             max_concurrent_requests_per_ip,
             per_ip_cleanup_interval_seconds,
             circuit_breaker_cache_max_entries,
+            pool_shard_amount,
             status_counts_max_entries,
             tcp_listen_backlog,
             accept_threads,

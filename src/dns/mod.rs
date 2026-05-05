@@ -107,6 +107,12 @@ pub struct DnsConfig {
     pub max_concurrent_refreshes: usize,
     /// Backend IP allowlist policy for SSRF protection.
     pub backend_allow_ips: crate::config::BackendAllowIps,
+    /// DashMap shard count for the DNS cache and refresh-tracking maps.
+    /// Sourced from `FERRUM_POOL_SHARD_AMOUNT` (same env var as connection
+    /// pools) — both surfaces share the workload shape (high cardinality,
+    /// multi-core write contention). `0` (default) auto-derives via
+    /// [`crate::util::sharding::pool_shard_amount`].
+    pub shard_amount: usize,
 }
 
 impl Default for DnsConfig {
@@ -130,6 +136,7 @@ impl Default for DnsConfig {
             max_active_requests: 512,
             max_concurrent_refreshes: 64,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
+            shard_amount: 0,
         }
     }
 }
@@ -201,8 +208,10 @@ impl DnsCache {
 
         let dns_order = parse_dns_order(config.dns_order.as_deref());
 
+        let shards = crate::util::sharding::pool_shard_amount(config.shard_amount);
+
         Self {
-            cache: Arc::new(DashMap::new()),
+            cache: Arc::new(DashMap::with_shard_amount(shards)),
             global_overrides: config.global_overrides,
             resolver: Arc::new(resolver),
             dns_order,
@@ -211,7 +220,7 @@ impl DnsCache {
             stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
             error_ttl: Duration::from_secs(config.error_ttl_seconds),
             max_cache_size: config.max_cache_size,
-            refreshing: Arc::new(DashMap::new()),
+            refreshing: Arc::new(DashMap::with_shard_amount(shards)),
             refresh_semaphore: Arc::new(Semaphore::new(config.max_concurrent_refreshes.max(1))),
             slow_threshold: config.slow_threshold_ms.map(Duration::from_millis),
             resolver_label,
