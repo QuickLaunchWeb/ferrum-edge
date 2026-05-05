@@ -34,6 +34,7 @@ struct XdsSubscription {
     type_url: String,
     resource_names: Vec<String>,
     wildcard: bool,
+    legacy_wildcard: bool,
 }
 
 /// Envoy ADS implementation for Phase B.
@@ -513,6 +514,30 @@ impl XdsAdsServer {
             }
         }
     }
+
+    fn catch_up_pending_updates(
+        &self,
+        updates: &mut broadcast::Receiver<ConfigUpdate>,
+        stream_config: &mut GatewayConfig,
+    ) {
+        loop {
+            match updates.try_recv() {
+                Ok(update) => {
+                    Self::apply_update_to_stream_config(stream_config, &update);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => return,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    warn!(
+                        "xDS ADS stream lagged by {} config updates while catching up; using current shared snapshot",
+                        n
+                    );
+                    let current = self.config.load_full();
+                    *stream_config = current.as_ref().clone();
+                }
+                Err(broadcast::error::TryRecvError::Closed) => return,
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -570,6 +595,9 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             let _ = tx.send(Err(Status::invalid_argument("xDS type_url is required"))).await;
                             return;
                         }
+                        if subscriptions.is_empty() {
+                            server.catch_up_pending_updates(&mut updates, &mut stream_config);
+                        }
 
                         let send_failed = if let Some(response) = server.sotw_response_for_request(
                             &current_node_id,
@@ -586,13 +614,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             return;
                         }
                     }
-                    update = updates.recv(), if !subscriptions.is_empty() => {
+                    update = updates.recv() => {
                         match update {
                             Ok(update) => {
+                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                    continue;
+                                }
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                if subscriptions.is_empty() {
                                     continue;
                                 }
                                 for response in server.sotw_responses_for_subscriptions_from_config(
@@ -607,11 +638,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS ADS stream lagged by {} config updates; sending fresh snapshots", n);
+                                let current = server.config.load_full();
+                                stream_config = current.as_ref().clone();
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                let current = server.config.load_full();
-                                stream_config = current.as_ref().clone();
+                                if subscriptions.is_empty() {
+                                    continue;
+                                }
                                 for response in server.sotw_responses_for_subscriptions_from_config(
                                     current_node_id,
                                     &subscriptions,
@@ -680,6 +714,9 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             let _ = tx.send(Err(Status::invalid_argument("xDS type_url is required"))).await;
                             return;
                         }
+                        if subscriptions.is_empty() {
+                            server.catch_up_pending_updates(&mut updates, &mut stream_config);
+                        }
 
                         if !request.response_nonce.is_empty() {
                             match server.record_delta_ack(&current_node_id, &request) {
@@ -737,13 +774,16 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                         }
                     }
-                    update = updates.recv(), if !subscriptions.is_empty() => {
+                    update = updates.recv() => {
                         match update {
                             Ok(update) => {
+                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                    continue;
+                                }
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                if subscriptions.is_empty() {
                                     continue;
                                 }
                                 for response in server.delta_responses_for_subscriptions_from_config(
@@ -758,11 +798,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("xDS delta ADS stream lagged by {} config updates; sending fresh snapshots", n);
+                                let current = server.config.load_full();
+                                stream_config = current.as_ref().clone();
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                let current = server.config.load_full();
-                                stream_config = current.as_ref().clone();
+                                if subscriptions.is_empty() {
+                                    continue;
+                                }
                                 for response in server.delta_responses_for_subscriptions_from_config(
                                     current_node_id,
                                     &subscriptions,
@@ -864,8 +907,9 @@ fn build_sotw_subscription(
 ) -> XdsSubscription {
     let has_wildcard = resource_names.iter().any(|name| name == "*");
     let legacy_wildcard = resource_names.is_empty()
+        && !has_wildcard
         && previous.is_none_or(|subscription| {
-            subscription.wildcard && subscription.resource_names.is_empty()
+            subscription.legacy_wildcard && subscription.resource_names.is_empty()
         });
     let mut resource_names = resource_names
         .iter()
@@ -880,6 +924,7 @@ fn build_sotw_subscription(
         type_url: type_url.to_string(),
         resource_names,
         wildcard: has_wildcard || legacy_wildcard,
+        legacy_wildcard,
     }
 }
 
@@ -898,10 +943,14 @@ fn build_delta_subscription(
     let mut wildcard = previous
         .map(|subscription| subscription.wildcard)
         .unwrap_or(!explicit_subscription_request);
+    let mut legacy_wildcard = previous
+        .map(|subscription| subscription.legacy_wildcard)
+        .unwrap_or(!explicit_subscription_request);
 
     for name in resource_names_subscribe {
         if name == "*" {
             wildcard = true;
+            legacy_wildcard = false;
             continue;
         }
         if !resource_names.contains(name) {
@@ -918,6 +967,7 @@ fn build_delta_subscription(
             .collect();
         if removed.contains("*") {
             wildcard = false;
+            legacy_wildcard = false;
         }
         resource_names.retain(|name| !removed.contains(name.as_str()));
     }
@@ -927,6 +977,7 @@ fn build_delta_subscription(
         type_url: type_url.to_string(),
         resource_names,
         wildcard,
+        legacy_wildcard,
     };
     let changed = previous.is_none_or(|previous| previous != &subscription);
     (subscription, changed, explicit_subscription_request)
@@ -1015,6 +1066,22 @@ mod tests {
             .collect()
     }
 
+    fn delta_cluster_names(response: &DeltaDiscoveryResponse) -> Vec<String> {
+        response
+            .resources
+            .iter()
+            .map(|resource| {
+                let resource = resource
+                    .resource
+                    .as_ref()
+                    .expect("delta resource should carry an Any payload");
+                super::super::proto::Cluster::decode(resource.value.as_slice())
+                    .expect("cluster resource should decode")
+                    .name
+            })
+            .collect()
+    }
+
     fn empty_delta(version_second: u32) -> IncrementalResult {
         IncrementalResult {
             added_or_modified_proxies: Vec::new(),
@@ -1076,6 +1143,7 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
                 wildcard: true,
+                legacy_wildcard: true,
             },
         )])
     }
@@ -1172,6 +1240,74 @@ mod tests {
         ));
 
         assert_eq!(stream_config.loaded_at, delta.poll_timestamp);
+    }
+
+    #[test]
+    fn pending_update_before_first_sotw_request_updates_stream_config() {
+        let old_config = gateway_config_with_named_service("old", 0);
+        let server = test_server(old_config.clone());
+        let mut updates = server.update_tx.subscribe();
+        let new_config = gateway_config_with_named_service("new", 1);
+        server
+            .update_tx
+            .send(full_config_update(&new_config))
+            .expect("pending update should send");
+        let mut stream_config = old_config;
+        server.catch_up_pending_updates(&mut updates, &mut stream_config);
+        let mut subscriptions = HashMap::new();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        };
+
+        let response = server
+            .sotw_response_for_request("node-a", &stream_config, &mut subscriptions, &request)
+            .expect("first SotW request should receive the caught-up snapshot");
+
+        assert_eq!(
+            cluster_names(&response),
+            vec!["cluster/default/new/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn pending_update_before_first_delta_request_updates_stream_config() {
+        let old_config = gateway_config_with_named_service("old", 0);
+        let server = test_server(old_config.clone());
+        let mut updates = server.update_tx.subscribe();
+        let new_config = gateway_config_with_named_service("new", 1);
+        server
+            .update_tx
+            .send(full_config_update(&new_config))
+            .expect("pending update should send");
+        let mut stream_config = old_config;
+        server.catch_up_pending_updates(&mut updates, &mut stream_config);
+        let request = DeltaDiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        };
+        let (subscription, _, _) = build_delta_subscription(
+            None,
+            "node-a",
+            &request.type_url,
+            &request.resource_names_subscribe,
+            &request.resource_names_unsubscribe,
+        );
+        let previous = server.snapshot_cache.get("node-a");
+        let snapshot = server.snapshot_for_config("node-a", &stream_config);
+
+        let response = server.delta_response(
+            &snapshot,
+            previous.as_deref(),
+            &subscription,
+            &request.initial_resource_versions,
+            &request.resource_names_subscribe,
+        );
+
+        assert_eq!(
+            delta_cluster_names(&response),
+            vec!["cluster/default/new/8080".to_string()]
+        );
     }
 
     #[test]
@@ -1288,6 +1424,7 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
                 wildcard: true,
+                legacy_wildcard: true,
             },
             &initial_resource_versions,
             &[],
@@ -1311,6 +1448,7 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
                 wildcard: false,
+                legacy_wildcard: false,
             },
             &HashMap::new(),
             &[],
@@ -1327,6 +1465,7 @@ mod tests {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: vec!["cluster/default/api/8080".to_string()],
             wildcard: false,
+            legacy_wildcard: false,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous),
@@ -1368,12 +1507,37 @@ mod tests {
     }
 
     #[test]
+    fn sotw_empty_after_explicit_wildcard_is_unsubscribe_all() {
+        let previous = build_sotw_subscription(
+            None,
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &["*".to_string()],
+        );
+        assert!(previous.wildcard);
+        assert!(!previous.legacy_wildcard);
+        assert!(previous.resource_names.is_empty());
+
+        let subscription = build_sotw_subscription(
+            Some(&previous),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+        );
+
+        assert!(!subscription.wildcard);
+        assert!(!subscription.legacy_wildcard);
+        assert!(subscription.resource_names.is_empty());
+    }
+
+    #[test]
     fn delta_named_subscription_keeps_existing_wildcard_until_star_unsubscribed() {
         let previous = XdsSubscription {
             node_id: "node-a".to_string(),
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: Vec::new(),
             wildcard: true,
+            legacy_wildcard: true,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous),
@@ -1421,6 +1585,7 @@ mod tests {
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: vec![subscribed.clone()],
                 wildcard: false,
+                legacy_wildcard: false,
             },
             &HashMap::new(),
             std::slice::from_ref(&subscribed),
@@ -1437,6 +1602,7 @@ mod tests {
             type_url: super::super::translator::CDS_TYPE_URL.to_string(),
             resource_names: vec!["cluster/default/api/8080".to_string()],
             wildcard: false,
+            legacy_wildcard: false,
         };
         let (subscription, changed, explicit) = build_delta_subscription(
             Some(&previous),
