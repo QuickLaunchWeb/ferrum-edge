@@ -9,6 +9,11 @@
 //!    intersection, but both sets are small in practice).
 //! 3. **Optional external-auth bypass**: `allow_authenticated_identity` permits
 //!    requests that have `ctx.authenticated_identity` set but no mapped Consumer.
+//!    The `disallowed_consumers` list is still applied to the external identity
+//!    string (e.g. JWKS `sub` claim), so operators can revoke a compromised
+//!    externally-authenticated principal without a gateway Consumer mapping.
+//!    Group allow/deny lists are NOT applied to external identities — there is
+//!    no Consumer-mapped `acl_groups` for an unmapped external principal.
 //!
 //! IP-based access control lives in the `ip_restriction` plugin so all client-IP
 //! enforcement is centralized in one place.
@@ -108,7 +113,26 @@ impl AccessControl {
         let consumer = match identified_consumer {
             Some(consumer) => consumer,
             None => {
-                if self.allow_authenticated_identity && authenticated_identity.is_some() {
+                if self.allow_authenticated_identity
+                    && let Some(identity) = authenticated_identity
+                {
+                    // Apply the consumer deny list to the external identity string
+                    // (e.g. JWKS `sub` claim). Group denylists are not applicable —
+                    // external identities have no Consumer-mapped `acl_groups`.
+                    if self.disallowed_consumers.contains(identity) {
+                        warn!(
+                            consumer = %identity,
+                            client_ip = %client_ip,
+                            plugin = "access_control",
+                            reason = "external_identity_disallowed",
+                            "External identity rejected by access control"
+                        );
+                        return PluginResult::Reject {
+                            status_code: 403,
+                            body: r#"{"error":"Identity is not allowed"}"#.into(),
+                            headers: HashMap::new(),
+                        };
+                    }
                     return PluginResult::Continue;
                 }
                 warn!(client_ip = %client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
