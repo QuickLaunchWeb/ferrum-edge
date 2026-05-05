@@ -1,6 +1,8 @@
 //! Tests for client IP resolution module
 
-use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip, resolve_real_ip_header};
+use ferrum_edge::proxy::client_ip::{
+    TrustedProxies, resolve_client_ip, resolve_forwarded_client_ip, resolve_real_ip_header,
+};
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
 
@@ -274,12 +276,88 @@ fn real_ip_header_accepts_single_ip_from_trusted_proxy() {
 }
 
 #[test]
+fn real_ip_header_normalizes_single_ip_value() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header(
+            "10.0.0.1",
+            &socket_addr,
+            " 2001:0db8:0000:0000:0000:0000:0000:0001 ",
+            &tp
+        )
+        .as_deref(),
+        Some("2001:db8::1")
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_empty_value() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "  ", &tp),
+        None
+    );
+}
+
+#[test]
 fn real_ip_header_rejects_comma_separated_chain() {
     let tp = TrustedProxies::parse("10.0.0.0/8");
     let socket_addr = "10.0.0.1".parse().unwrap();
 
     assert_eq!(
         resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.23, 203.0.113.50", &tp,),
+        None
+    );
+}
+
+// ── resolve_forwarded_client_ip ─────────────────────────────────────────────
+
+#[test]
+fn absent_real_ip_header_falls_back_to_xff_resolution() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip("10.0.0.1", &socket_addr, None, Some("203.0.113.50"), &tp)
+            .as_deref(),
+        Some("203.0.113.50")
+    );
+}
+
+#[test]
+fn present_empty_real_ip_header_keeps_socket_ip_instead_of_xff() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip(
+            "10.0.0.1",
+            &socket_addr,
+            Some("  "),
+            Some("203.0.113.50"),
+            &tp
+        ),
+        None
+    );
+}
+
+#[test]
+fn present_real_ip_header_from_untrusted_peer_keeps_socket_ip_instead_of_xff() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "198.51.100.2".parse().unwrap();
+
+    assert_eq!(
+        resolve_forwarded_client_ip(
+            "198.51.100.2",
+            &socket_addr,
+            Some("203.0.113.50"),
+            Some("192.0.2.9"),
+            &tp
+        ),
         None
     );
 }

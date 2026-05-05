@@ -322,3 +322,33 @@ pub fn resolve_real_ip_header(
         }
     }
 }
+
+/// Resolve client IP when a caller has already performed targeted header
+/// lookups from the request.
+///
+/// If a configured real-IP header is present, that single-hop header is the
+/// only forwarded source considered. Rejected real-IP values return `None` so
+/// callers keep the socket IP rather than falling through to XFF. When the
+/// configured real-IP header is absent, this falls back to the XFF walk.
+pub fn resolve_forwarded_client_ip(
+    socket_ip: &str,
+    socket_addr: &IpAddr,
+    real_ip_header_value: Option<&str>,
+    xff_header: Option<&str>,
+    trusted_proxies: &TrustedProxies,
+) -> Option<String> {
+    if trusted_proxies.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = real_ip_header_value {
+        return resolve_real_ip_header(socket_ip, socket_addr, value, trusted_proxies);
+    }
+
+    let resolved = resolve_client_ip_parsed(socket_ip, socket_addr, xff_header, trusted_proxies);
+    if resolved == socket_ip {
+        None
+    } else {
+        Some(resolved)
+    }
+}

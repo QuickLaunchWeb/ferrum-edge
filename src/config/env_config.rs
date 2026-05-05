@@ -733,8 +733,9 @@ pub struct EnvConfig {
     pub add_forwarded_header: bool,
     /// Header to use as the authoritative source of client IP. When set, this
     /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare, or
-    /// "X-Real-IP" for nginx). If the header is absent or the direct connection
-    /// is not from a trusted proxy, falls back to the X-Forwarded-For walk.
+    /// "X-Real-IP" for nginx). If the configured header is absent, falls back
+    /// to the X-Forwarded-For walk. If it is present but rejected, the socket IP
+    /// remains the source of truth.
     pub real_ip_header: Option<String>,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes

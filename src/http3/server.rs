@@ -685,34 +685,23 @@ async fn handle_h3_request(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
-        let xff = ctx.raw_header_get("x-forwarded-for");
-        let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            // real_ip_header is already lowercase from env config parsing
-            let header_val = ctx.raw_header_get(real_ip_header.as_str());
-            if let Some(val) = header_val {
-                crate::proxy::client_ip::resolve_real_ip_header(
-                    socket_ip,
-                    &socket_addr,
-                    val,
-                    &state.trusted_proxies,
-                )
-                .unwrap_or_else(|| socket_ip.to_string())
-            } else {
-                crate::proxy::client_ip::resolve_client_ip_parsed(
-                    socket_ip,
-                    &socket_addr,
-                    xff,
-                    &state.trusted_proxies,
-                )
-            }
-        } else {
-            crate::proxy::client_ip::resolve_client_ip_parsed(
-                socket_ip,
-                &socket_addr,
-                xff,
-                &state.trusted_proxies,
-            )
-        };
+        let real_ip_header_val =
+            state
+                .env_config
+                .real_ip_header
+                .as_ref()
+                .and_then(|real_ip_header| {
+                    // real_ip_header is already lowercase from env config parsing
+                    ctx.raw_header_get(real_ip_header.as_str())
+                });
+        let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
+            socket_ip,
+            &socket_addr,
+            real_ip_header_val,
+            ctx.raw_header_get("x-forwarded-for"),
+            &state.trusted_proxies,
+        )
+        .unwrap_or_else(|| socket_ip.to_string());
         ctx.client_ip = resolved;
     }
 
