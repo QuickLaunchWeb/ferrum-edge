@@ -223,6 +223,12 @@ impl ServeHandles {
             .stream_listener_manager
             .shutdown_all()
             .await;
+
+        // Signal drain state to the proxy hot path (Connection: close +
+        // reject new requests) unconditionally so the close hint fires even
+        // when the operator has disabled the wait loop with
+        // FERRUM_SHUTDOWN_DRAIN_SECONDS=0. Only the wait loop itself is gated.
+        crate::overload::begin_drain(&self.proxy_state.overload);
         if self.drain_seconds > 0 {
             crate::overload::wait_for_drain(
                 &self.proxy_state.overload,

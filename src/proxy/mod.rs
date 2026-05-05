@@ -5541,11 +5541,14 @@ pub async fn handle_proxy_request(
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     // Global request admission control. Single atomic load (~1ns) on the fast
     // path. Rejects with 503 when request pressure exceeds the critical
-    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD).
+    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD)
+    // OR when shutdown drain has begun (set by `overload::begin_drain` via
+    // Release; loaded here with Acquire to synchronize-with that store and
+    // also reject new H2/H3 streams on existing connections during drain).
     if state
         .overload
         .reject_new_requests
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
     {
         let is_grpc = grpc_proxy::is_grpc_request(&req);
         record_request(&state, 503);
@@ -8001,12 +8004,15 @@ async fn handle_proxy_request_inner(
     // Connection: close is applied probabilistically (linear ramp from 0%
     // to 100%) rather than all-or-nothing. This smooths tail latency by
     // gradually shedding keepalive connections as load increases.
-    // Cost: draining check is one AtomicBool::load(Relaxed) ~1ns;
+    // `draining` uses Acquire to synchronize-with the Release-ordered store
+    // in `overload::begin_drain` so the close hint is observed promptly on
+    // weakly-ordered architectures (mirrors the PR #569 startup_ready pattern).
+    // Cost: AtomicBool::load(Acquire) ~1ns (no-op on x86);
     // RED check is one AtomicU32::load + one AtomicU64::load + one multiply ~3ns.
     if state
         .overload
         .draining
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
         || state.overload.should_disable_keepalive_red()
     {
         resp_builder = resp_builder.header("connection", "close");
