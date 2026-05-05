@@ -49,8 +49,6 @@ pub struct CachedDbHealthResult {
 
 /// Duration for which a DB health check result is reused.
 const DB_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
-const DEFAULT_ADMIN_HTTP_HEADER_READ_TIMEOUT_SECONDS: u64 = 10;
-const DEFAULT_ADMIN_TLS_HANDSHAKE_TIMEOUT_SECONDS: u64 = 10;
 
 /// Admin API state.
 #[derive(Clone)]
@@ -114,6 +112,10 @@ pub struct AdminState {
     pub dp_registry: Option<Arc<DpNodeRegistry>>,
     /// Connection state to the CP (DP mode only).
     pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    /// Admin HTTP header read timeout (seconds). 0 disables.
+    pub admin_http_header_read_timeout_seconds: u64,
+    /// Admin TLS handshake timeout (seconds). 0 disables.
+    pub admin_tls_handshake_timeout_seconds: u64,
 }
 
 impl AdminState {
@@ -162,26 +164,6 @@ pub async fn start_admin_listener_with_tls(
     let listener = TcpListener::bind(addr).await?;
     info!("Admin API listener started on {}", addr);
     serve_admin_on_listener(listener, state, shutdown, tls_config).await
-}
-
-fn parse_admin_timeout_seconds(value: Option<String>, default: u64) -> u64 {
-    value.and_then(|s| s.parse().ok()).unwrap_or(default)
-}
-
-fn admin_http_header_read_timeout_seconds() -> u64 {
-    parse_admin_timeout_seconds(
-        crate::config::conf_file::resolve_ferrum_var("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS"),
-        DEFAULT_ADMIN_HTTP_HEADER_READ_TIMEOUT_SECONDS,
-    )
-}
-
-fn admin_tls_handshake_timeout_seconds() -> u64 {
-    parse_admin_timeout_seconds(
-        crate::config::conf_file::resolve_ferrum_var(
-            "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS",
-        ),
-        DEFAULT_ADMIN_TLS_HANDSHAKE_TIMEOUT_SECONDS,
-    )
 }
 
 /// Run the Admin API accept loop on a pre-bound `TcpListener`.
@@ -289,10 +271,12 @@ async fn handle_admin_tls_connection(
     use tokio_rustls::TlsAcceptor;
 
     let acceptor = TlsAcceptor::from(tls_config);
+    let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
+    let header_read_timeout = state.admin_http_header_read_timeout_seconds;
     let tls_stream = match accept_admin_tls_with_optional_timeout(
         &acceptor,
         stream,
-        admin_tls_handshake_timeout_seconds(),
+        tls_handshake_timeout,
         &remote_addr,
     )
     .await
@@ -325,11 +309,10 @@ async fn handle_admin_tls_connection(
     // either protocol.
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    let header_read_timeout_seconds = admin_http_header_read_timeout_seconds();
-    if header_read_timeout_seconds > 0 {
+    if header_read_timeout > 0 {
         let mut http1 = builder.http1();
         http1.timer(hyper_util::rt::TokioTimer::new());
-        http1.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
+        http1.header_read_timeout(Duration::from_secs(header_read_timeout));
     }
     let conn = builder.serve_connection(io, svc);
 
@@ -347,13 +330,13 @@ async fn handle_admin_connection(
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
+    let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         async move { handle_admin_request(req, state).await }
     });
 
     let mut builder = http1::Builder::new();
-    let header_read_timeout_seconds = admin_http_header_read_timeout_seconds();
     if header_read_timeout_seconds > 0 {
         builder.timer(hyper_util::rt::TokioTimer::new());
         builder.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
@@ -2422,24 +2405,5 @@ fn protocol_support_label(
         ProtocolSupport::Unknown => "unknown",
         ProtocolSupport::Supported => "supported",
         ProtocolSupport::Unsupported => "unsupported",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_admin_timeout_seconds;
-
-    #[test]
-    fn parse_admin_timeout_seconds_uses_default_when_absent_or_invalid() {
-        assert_eq!(parse_admin_timeout_seconds(None, 10), 10);
-        assert_eq!(
-            parse_admin_timeout_seconds(Some("not-a-number".into()), 10),
-            10
-        );
-    }
-
-    #[test]
-    fn parse_admin_timeout_seconds_accepts_zero_to_disable() {
-        assert_eq!(parse_admin_timeout_seconds(Some("0".into()), 10), 0);
     }
 }
