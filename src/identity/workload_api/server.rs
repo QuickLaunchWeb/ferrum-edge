@@ -37,6 +37,9 @@ use crate::identity::attestation::{Attestor, PeerInfo, attest_chain};
 use crate::identity::ca::{CertificateAuthority, IssuanceRequest};
 use crate::identity::spiffe::TrustDomain;
 
+const WORKLOAD_METADATA_KEY: &str = "workload.spiffe.io";
+const WORKLOAD_METADATA_VAL: &str = "true";
+
 /// Workload API service implementation. Held as an `Arc` and cloned per RPC.
 pub struct WorkloadApiService {
     pub attestors: Vec<Arc<dyn Attestor>>,
@@ -105,6 +108,25 @@ impl WorkloadApiService {
             info.bearer_token = parse_authorization_header(s);
         }
         info
+    }
+
+    fn validate_workload_metadata<T>(req: &Request<T>) -> Result<(), Status> {
+        match req.metadata().get(WORKLOAD_METADATA_KEY) {
+            Some(value) if value == WORKLOAD_METADATA_VAL => Ok(()),
+            _ => Err(Status::invalid_argument(format!(
+                "missing required {WORKLOAD_METADATA_KEY}: {WORKLOAD_METADATA_VAL} metadata"
+            ))),
+        }
+    }
+
+    async fn wait_for_rotation_or_stream_close<T>(
+        rx: &mut watch::Receiver<u64>,
+        tx: &tokio::sync::mpsc::UnboundedSender<Result<T, Status>>,
+    ) -> bool {
+        tokio::select! {
+            changed = rx.changed() => changed.is_ok(),
+            _ = tx.closed() => false,
+        }
     }
 
     async fn attest(
@@ -265,6 +287,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<X509svidRequest>,
     ) -> Result<Response<Self::FetchX509SVIDStream>, Status> {
+        Self::validate_workload_metadata(&request)?;
         let peer = Self::peer_info_from_request(&request);
         let identity = self.attest(&peer).await?;
         let initial = self.build_x509_svid_response(&identity).await?;
@@ -280,7 +303,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if rx.changed().await.is_err() {
+                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
                     return;
                 }
                 match Self::build_x509_svid_response_static(&ca, &td, &id, ttl).await {
@@ -306,8 +329,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
     async fn fetch_x509_bundles(
         &self,
-        _request: Request<X509BundlesRequest>,
+        request: Request<X509BundlesRequest>,
     ) -> Result<Response<Self::FetchX509BundlesStream>, Status> {
+        Self::validate_workload_metadata(&request)?;
         let initial = Self::build_x509_bundles_response_static(&self.ca, &self.trust_domain)
             .await
             .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
@@ -321,7 +345,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if rx.changed().await.is_err() {
+                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
                     return;
                 }
                 match Self::build_x509_bundles_response_static(&ca, &td).await {
@@ -344,8 +368,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
     async fn fetch_jwtsvid(
         &self,
-        _request: Request<JwtsvidRequest>,
+        request: Request<JwtsvidRequest>,
     ) -> Result<Response<JwtsvidResponse>, Status> {
+        Self::validate_workload_metadata(&request)?;
         // Phase A: JWT-SVID minting is intentionally unimplemented; later
         // phases plug into the CA's `jwt_authorities()`.
         Err(Status::unimplemented(
@@ -358,8 +383,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
     async fn fetch_jwt_bundles(
         &self,
-        _request: Request<JwtBundlesRequest>,
+        request: Request<JwtBundlesRequest>,
     ) -> Result<Response<Self::FetchJWTBundlesStream>, Status> {
+        Self::validate_workload_metadata(&request)?;
         let initial = JwtBundlesResponse {
             bundles: Default::default(),
         };
@@ -370,7 +396,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         tokio::spawn(async move {
             loop {
-                if rx.changed().await.is_err() {
+                if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
                     return;
                 }
                 let resp = JwtBundlesResponse {
@@ -389,8 +415,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
     async fn validate_jwtsvid(
         &self,
-        _request: Request<ValidateJwtsvidRequest>,
+        request: Request<ValidateJwtsvidRequest>,
     ) -> Result<Response<ValidateJwtsvidResponse>, Status> {
+        Self::validate_workload_metadata(&request)?;
         Err(Status::unimplemented(
             "JWT-SVID validation is deferred to a later mesh phase",
         ))

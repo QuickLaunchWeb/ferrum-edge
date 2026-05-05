@@ -16,6 +16,16 @@ use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::identity::workload_api::server::WorkloadApiService;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tonic::Request;
+
+fn workload_request<T>(payload: T) -> Request<T> {
+    let mut req = Request::new(payload);
+    req.metadata_mut().insert(
+        "workload.spiffe.io",
+        tonic::metadata::AsciiMetadataValue::from_static("true"),
+    );
+    req
+}
 
 // ── CA stub ──────────────────────────────────────────────────────────────
 
@@ -88,6 +98,30 @@ impl Attestor for StubAttestor {
             spiffe_id: self.id.clone(),
             selectors: HashMap::new(),
             attestor_kind: "stub".to_string(),
+        })
+    }
+}
+
+struct CountingAttestor {
+    id: SpiffeId,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Attestor for CountingAttestor {
+    fn kind(&self) -> &'static str {
+        "counting"
+    }
+
+    async fn attest(
+        &self,
+        _peer: &PeerInfo,
+    ) -> Result<WorkloadIdentity, ferrum_edge::identity::attestation::AttestError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(WorkloadIdentity {
+            spiffe_id: self.id.clone(),
+            selectors: HashMap::new(),
+            attestor_kind: "counting".to_string(),
         })
     }
 }
@@ -256,7 +290,6 @@ async fn fetch_x509svid_stream_stays_open_and_pushes_on_rotation() {
     use ferrum_edge::identity::workload_api::server::WorkloadApiService;
     use std::sync::Arc;
     use tokio::sync::watch;
-    use tonic::Request;
 
     let trust_domain = TrustDomain::new("td.test").unwrap();
     let ca: Arc<dyn ferrum_edge::identity::ca::CertificateAuthority> = Arc::new(StubCa {
@@ -282,7 +315,7 @@ async fn fetch_x509svid_stream_stays_open_and_pushes_on_rotation() {
     use tokio_stream::StreamExt;
 
     let resp = svc
-        .fetch_x509svid(Request::new(X509svidRequest {}))
+        .fetch_x509svid(workload_request(X509svidRequest {}))
         .await
         .unwrap();
     let mut stream = resp.into_inner();
@@ -304,4 +337,82 @@ async fn fetch_x509svid_stream_stays_open_and_pushes_on_rotation() {
         .expect("stream ended unexpectedly")
         .expect("rotation push was an error");
     assert!(!second.svids.is_empty());
+}
+
+#[tokio::test]
+async fn fetch_x509svid_rejects_missing_workload_metadata_before_attestation() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use tonic::Code;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
+        Arc::new(CountingAttestor {
+            id,
+            calls: Arc::clone(&calls),
+        });
+
+    let svc = WorkloadApiService::new(vec![attestor], ca, trust_domain, 600);
+    let err = match svc.fetch_x509svid(Request::new(X509svidRequest {})).await {
+        Ok(_) => panic!("missing workload metadata must be rejected"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fetch_x509svid_rotation_task_exits_when_client_drops_stream() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use tokio::sync::watch;
+    use tokio_stream::StreamExt;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca: Arc<dyn ferrum_edge::identity::ca::CertificateAuthority> = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
+        Arc::new(StubAttestor { id });
+
+    let (tx, _) = watch::channel(0u64);
+    let rotation = Arc::new(tx);
+    let svc = WorkloadApiService::with_rotation_signal(
+        vec![attestor],
+        ca,
+        trust_domain,
+        600,
+        Arc::clone(&rotation),
+    );
+
+    let resp = svc
+        .fetch_x509svid(workload_request(X509svidRequest {}))
+        .await
+        .unwrap();
+    let mut stream = resp.into_inner();
+    let _first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first message")
+        .expect("stream ended unexpectedly")
+        .expect("first message was an error");
+    assert_eq!(rotation.receiver_count(), 1);
+
+    drop(stream);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while rotation.receiver_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rotation stream task did not exit after client dropped stream");
 }
