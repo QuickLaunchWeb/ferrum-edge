@@ -43,7 +43,7 @@
 //! }
 //! ```
 
-use crate::config::PoolConfig;
+use crate::config::{BackendAllowIps, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
 use std::sync::Arc;
@@ -85,6 +85,10 @@ pub struct PluginHttpClient {
     /// collisions when multiple gateway instances with different namespaces share
     /// the same external backend.
     namespace: String,
+    /// Resolved backend IP policy (`FERRUM_BACKEND_ALLOW_IPS` after CLI/env/conf
+    /// precedence). Used by plugins that validate outbound endpoints outside the
+    /// proxy backend path.
+    backend_allow_ips: BackendAllowIps,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -97,6 +101,7 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("tls_no_verify", &self.tls_no_verify)
             .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
             .field("namespace", &self.namespace)
+            .field("backend_allow_ips", &self.backend_allow_ips)
             .finish()
     }
 }
@@ -124,6 +129,7 @@ impl PluginHttpClient {
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
         namespace: &str,
+        backend_allow_ips: BackendAllowIps,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -201,6 +207,7 @@ impl PluginHttpClient {
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
             namespace: namespace.to_string(),
+            backend_allow_ips,
         }
     }
 
@@ -243,6 +250,7 @@ impl PluginHttpClient {
             tls_no_verify: false,
             tls_ca_bundle_path: None,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+            backend_allow_ips: BackendAllowIps::Both,
         }
     }
 
@@ -310,6 +318,14 @@ impl PluginHttpClient {
     /// for backward compatibility.
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Resolved backend IP allowlist policy.
+    ///
+    /// This is the gateway-level `FERRUM_BACKEND_ALLOW_IPS` value after the
+    /// normal CLI/env/conf/default precedence has been applied.
+    pub fn backend_allow_ips(&self) -> &BackendAllowIps {
+        &self.backend_allow_ips
     }
 
     /// Get the underlying `reqwest::Client` for building requests.
