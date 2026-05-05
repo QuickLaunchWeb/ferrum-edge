@@ -347,16 +347,17 @@ impl CpGrpcServer {
         })
     }
 
-    #[allow(clippy::result_large_err)]
-    fn build_mesh_config_update_from_delta(
-        current_config: &GatewayConfig,
+    fn apply_mesh_delta_to_stream_config(
+        stream_config: &mut GatewayConfig,
         delta: crate::config::db_loader::IncrementalResult,
         slice_request: MeshSliceRequest,
     ) -> Result<MeshConfigUpdate, Status> {
-        let mut config = current_config.clone();
-        Self::apply_incremental_to_config_snapshot(&mut config, delta);
-        config.normalize_fields();
-        Self::build_mesh_config_update(&config, slice_request)
+        let mut candidate = stream_config.clone();
+        Self::apply_incremental_to_config_snapshot(&mut candidate, delta);
+        candidate.normalize_fields();
+        let update = Self::build_mesh_config_update(&candidate, slice_request)?;
+        *stream_config = candidate;
+        Ok(update)
     }
 
     fn apply_incremental_to_config_snapshot(
@@ -688,6 +689,7 @@ impl ConfigSync for CpGrpcServer {
         let config = self.config.load_full();
         let initial = Self::build_mesh_config_update(config.as_ref(), slice_request.clone())?;
 
+        let mut stream_config = config.as_ref().clone();
         let rx = self.update_tx.subscribe();
         let config_for_recovery = self.config.clone();
         let stream = BroadcastStream::new(rx).filter_map(move |result| {
@@ -695,7 +697,16 @@ impl ConfigSync for CpGrpcServer {
             match result {
                 Ok(update) if update.update_type == 0 => {
                     match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-                        Ok(config) => Self::build_mesh_config_update(&config, slice_request).ok().map(Ok),
+                        Ok(mut config) => {
+                            config.normalize_fields();
+                            match Self::build_mesh_config_update(&config, slice_request) {
+                                Ok(mesh_update) => {
+                                    stream_config = config;
+                                    Some(Ok(mesh_update))
+                                }
+                                Err(e) => Some(Err(e)),
+                            }
+                        }
                         Err(e) => {
                             warn!("Failed to deserialize full config for mesh stream: {}", e);
                             None
@@ -707,9 +718,8 @@ impl ConfigSync for CpGrpcServer {
                         &update.config_json,
                     ) {
                         Ok(delta) => {
-                            let current = config_for_recovery.load_full();
-                            Self::build_mesh_config_update_from_delta(
-                                current.as_ref(),
+                            Self::apply_mesh_delta_to_stream_config(
+                                &mut stream_config,
                                 delta,
                                 slice_request,
                             )
@@ -735,7 +745,13 @@ impl ConfigSync for CpGrpcServer {
                         n
                     );
                     let current = config_for_recovery.load_full();
-                    Self::build_mesh_config_update(current.as_ref(), slice_request).ok().map(Ok)
+                    match Self::build_mesh_config_update(current.as_ref(), slice_request) {
+                        Ok(update) => {
+                            stream_config = current.as_ref().clone();
+                            Some(Ok(update))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
                 }
             }
         });
@@ -772,10 +788,14 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     fn mesh_config_with_service(version_second: u32) -> GatewayConfig {
+        mesh_config_with_named_service("api", version_second)
+    }
+
+    fn mesh_config_with_named_service(name: &str, version_second: u32) -> GatewayConfig {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
                 services: vec![MeshService {
-                    name: "api".to_string(),
+                    name: name.to_string(),
                     namespace: "ferrum".to_string(),
                     ports: vec![ServicePort {
                         port: 8080,
@@ -796,7 +816,7 @@ mod tests {
 
     #[test]
     fn mesh_delta_update_uses_broadcast_payload_version() {
-        let base = mesh_config_with_service(0);
+        let mut stream_config = mesh_config_with_service(0);
         let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 42).unwrap();
         let delta = IncrementalResult {
             added_or_modified_proxies: Vec::new(),
@@ -809,8 +829,8 @@ mod tests {
             removed_upstream_ids: vec!["stale-upstream".to_string()],
             poll_timestamp,
         };
-        let update = CpGrpcServer::build_mesh_config_update_from_delta(
-            &base,
+        let update = CpGrpcServer::apply_mesh_delta_to_stream_config(
+            &mut stream_config,
             delta,
             MeshSliceRequest::from_native(
                 "node-a".to_string(),
@@ -825,6 +845,39 @@ mod tests {
 
         assert_eq!(slice.version, poll_timestamp.to_rfc3339());
         assert_eq!(slice.services.len(), 1);
+    }
+
+    #[test]
+    fn mesh_delta_update_preserves_stream_local_snapshot() {
+        let mut stream_config = mesh_config_with_named_service("stream-local", 0);
+        let poll_timestamp = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 43).unwrap();
+        let delta = IncrementalResult {
+            added_or_modified_proxies: Vec::new(),
+            removed_proxy_ids: Vec::new(),
+            added_or_modified_consumers: Vec::new(),
+            removed_consumer_ids: Vec::new(),
+            added_or_modified_plugin_configs: Vec::new(),
+            removed_plugin_config_ids: Vec::new(),
+            added_or_modified_upstreams: Vec::new(),
+            removed_upstream_ids: Vec::new(),
+            poll_timestamp,
+        };
+        let update = CpGrpcServer::apply_mesh_delta_to_stream_config(
+            &mut stream_config,
+            delta,
+            MeshSliceRequest::from_native(
+                "node-a".to_string(),
+                "ferrum".to_string(),
+                String::new(),
+                std::collections::HashMap::new(),
+            ),
+        )
+        .expect("mesh delta should build");
+        let slice: MeshSlice =
+            serde_json::from_str(&update.mesh_slice_json).expect("mesh slice should deserialize");
+
+        assert_eq!(slice.version, poll_timestamp.to_rfc3339());
+        assert_eq!(slice.services[0].name, "stream-local");
     }
 
     #[test]
