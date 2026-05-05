@@ -814,3 +814,236 @@ fn update_known_ids(
         known.insert(id.clone());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::db_backend::IncrementalResult;
+    use crate::config::types::*;
+    use chrono::Utc;
+    use std::collections::HashSet;
+
+    fn empty_incremental() -> IncrementalResult {
+        IncrementalResult {
+            added_or_modified_proxies: vec![],
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            poll_timestamp: Utc::now(),
+        }
+    }
+
+    fn make_proxy(id: &str) -> Proxy {
+        Proxy {
+            id: id.to_string(),
+            namespace: default_namespace(),
+            name: None,
+            hosts: vec![],
+            listen_path: Some(format!("/{id}")),
+            backend_scheme: Some(BackendScheme::Http),
+            dispatch_kind: DispatchKind::from(BackendScheme::Http),
+            backend_host: "localhost".to_string(),
+            backend_port: 8080,
+            backend_path: None,
+            strip_listen_path: true,
+            preserve_host_header: false,
+            backend_connect_timeout_ms: 5000,
+            backend_read_timeout_ms: 30000,
+            backend_write_timeout_ms: 30000,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            resolved_tls: Default::default(),
+            dns_override: None,
+            dns_cache_ttl_seconds: None,
+            auth_mode: AuthMode::Single,
+            plugins: vec![],
+            pool_idle_timeout_seconds: None,
+            pool_enable_http_keep_alive: None,
+            pool_enable_http2: None,
+            pool_tcp_keepalive_seconds: None,
+            pool_http2_keep_alive_interval_seconds: None,
+            pool_http2_keep_alive_timeout_seconds: None,
+            pool_http2_initial_stream_window_size: None,
+            pool_http2_initial_connection_window_size: None,
+            pool_http2_adaptive_window: None,
+            pool_http2_max_frame_size: None,
+            pool_http2_max_concurrent_streams: None,
+            pool_http3_connections_per_backend: None,
+            upstream_id: None,
+            circuit_breaker: None,
+            retry: None,
+            response_body_mode: ResponseBodyMode::default(),
+            listen_port: None,
+            frontend_tls: false,
+            passthrough: false,
+            udp_idle_timeout_seconds: 60,
+            tcp_idle_timeout_seconds: Some(300),
+            allowed_methods: None,
+            allowed_ws_origins: vec![],
+            udp_max_response_amplification_factor: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn make_consumer(id: &str) -> Consumer {
+        Consumer {
+            id: id.to_string(),
+            namespace: default_namespace(),
+            username: format!("user_{id}"),
+            custom_id: None,
+            credentials: std::collections::HashMap::new(),
+            acl_groups: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // ── upsert_by_id ───────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_replaces_existing_by_id() {
+        let mut items = vec![("a", 1), ("b", 2)];
+        upsert_by_id(&mut items, vec![("b", 99)], |item| item.0.to_string());
+        assert_eq!(items[1].1, 99);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn upsert_appends_new_items() {
+        let mut items = vec![("a", 1)];
+        upsert_by_id(&mut items, vec![("c", 3)], |item| item.0.to_string());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1], ("c", 3));
+    }
+
+    #[test]
+    fn upsert_mixed_replace_and_append() {
+        let mut items = vec![("a", 1), ("b", 2)];
+        upsert_by_id(&mut items, vec![("b", 20), ("c", 30)], |item| {
+            item.0.to_string()
+        });
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].1, 20); // b replaced
+        assert_eq!(items[2], ("c", 30)); // c appended
+    }
+
+    #[test]
+    fn upsert_empty_updates_is_noop() {
+        let mut items = vec![("a", 1)];
+        upsert_by_id(&mut items, vec![], |item| item.0.to_string());
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn upsert_into_empty_list() {
+        let mut items: Vec<(&str, i32)> = vec![];
+        upsert_by_id(&mut items, vec![("a", 1)], |item| item.0.to_string());
+        assert_eq!(items.len(), 1);
+    }
+
+    // ── update_known_ids ───────────────────────────────────────��───────
+
+    #[test]
+    fn update_known_ids_adds_and_removes() {
+        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
+        assert!(known.contains("a"));
+        assert!(!known.contains("b"));
+        assert!(known.contains("c"));
+        assert!(known.contains("d"));
+    }
+
+    #[test]
+    fn update_known_ids_remove_nonexistent_is_noop() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
+        assert_eq!(known.len(), 1);
+        assert!(known.contains("a"));
+    }
+
+    #[test]
+    fn update_known_ids_empty_operations() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec![], &[]);
+        assert_eq!(known.len(), 1);
+    }
+
+    // ── apply_incremental_to_config ────────────────────────────────────
+
+    #[test]
+    fn apply_incremental_empty_is_noop() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("p1")],
+            ..Default::default()
+        };
+        apply_incremental_to_config(&mut config, empty_incremental());
+        assert_eq!(config.proxies.len(), 1);
+    }
+
+    #[test]
+    fn apply_incremental_adds_proxy() {
+        let mut config = GatewayConfig::default();
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![make_proxy("new")];
+        apply_incremental_to_config(&mut config, inc);
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].id, "new");
+    }
+
+    #[test]
+    fn apply_incremental_removes_proxy() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("p1"), make_proxy("p2")],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.removed_proxy_ids = vec!["p1".to_string()];
+        apply_incremental_to_config(&mut config, inc);
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].id, "p2");
+    }
+
+    #[test]
+    fn apply_incremental_modifies_proxy() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("p1")],
+            ..Default::default()
+        };
+        let mut updated = make_proxy("p1");
+        updated.backend_port = 9999;
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![updated];
+        apply_incremental_to_config(&mut config, inc);
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].backend_port, 9999);
+    }
+
+    #[test]
+    fn apply_incremental_mixed_operations() {
+        let mut config = GatewayConfig {
+            proxies: vec![make_proxy("keep"), make_proxy("remove")],
+            consumers: vec![make_consumer("c1")],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.removed_proxy_ids = vec!["remove".to_string()];
+        inc.added_or_modified_proxies = vec![make_proxy("added")];
+        inc.removed_consumer_ids = vec!["c1".to_string()];
+        inc.added_or_modified_consumers = vec![make_consumer("c2")];
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.proxies.len(), 2);
+        assert!(config.proxies.iter().any(|p| p.id == "keep"));
+        assert!(config.proxies.iter().any(|p| p.id == "added"));
+        assert!(!config.proxies.iter().any(|p| p.id == "remove"));
+        assert_eq!(config.consumers.len(), 1);
+        assert_eq!(config.consumers[0].id, "c2");
+    }
+}
