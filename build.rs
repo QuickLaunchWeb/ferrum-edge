@@ -8,6 +8,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/ferrum.proto"], &["proto/"])?;
 
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(
+            &["proto/envoy/service/discovery/v3/discovery.proto"],
+            &["proto/"],
+        )?;
+
     tonic_prost_build::compile_protos("proto/health.proto")?;
 
     // SPIFFE Workload API — vendored proto compiled with both client and

@@ -40,9 +40,13 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
-use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
+use super::proto::{
+    ConfigUpdate, FullConfigRequest, FullConfigResponse, MeshConfigUpdate, MeshSubscribeRequest,
+    SubscribeRequest,
+};
 use crate::FERRUM_VERSION;
 use crate::config::types::{GatewayConfig, default_namespace};
+use crate::xds::{MeshSlice, MeshSliceRequest};
 
 /// Metadata about a connected Data Plane node.
 #[derive(Clone, Serialize)]
@@ -324,6 +328,24 @@ impl CpGrpcServer {
         ConfigSyncServer::new(self)
     }
 
+    #[allow(clippy::result_large_err)]
+    fn build_mesh_config_update(
+        config: &GatewayConfig,
+        slice_request: MeshSliceRequest,
+    ) -> Result<MeshConfigUpdate, Status> {
+        let slice = MeshSlice::from_gateway_config(config, slice_request);
+        let mesh_slice_json = serde_json::to_string(&slice).map_err(|e| {
+            error!("Failed to serialize mesh slice: {}", e);
+            Status::internal("Failed to serialize mesh slice")
+        })?;
+        Ok(MeshConfigUpdate {
+            version: slice.version,
+            timestamp: chrono::Utc::now().timestamp(),
+            mesh_slice_json,
+            ferrum_version: FERRUM_VERSION.to_string(),
+        })
+    }
+
     /// Check whether the DP's reported version is compatible with this CP.
     ///
     /// Compatibility rule: major and minor versions must match. Patch-level
@@ -441,6 +463,8 @@ impl CpGrpcServer {
 impl ConfigSync for CpGrpcServer {
     type SubscribeStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<ConfigUpdate, Status>> + Send>>;
+    type MeshSubscribeStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>> + Send>>;
 
     async fn subscribe(
         &self,
@@ -559,6 +583,68 @@ impl ConfigSync for CpGrpcServer {
             version: config.loaded_at.to_rfc3339(),
             ferrum_version: FERRUM_VERSION.to_string(),
         }))
+    }
+
+    async fn mesh_subscribe(
+        &self,
+        request: Request<MeshSubscribeRequest>,
+    ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
+        self.verify_jwt_metadata(request.metadata())?;
+
+        let inner = request.into_inner();
+        Self::check_version_compatibility(&inner.ferrum_version)?;
+        self.check_namespace(&inner.namespace)?;
+        if inner.node_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "MeshSubscribe node_id is required",
+            ));
+        }
+
+        info!(
+            "Mesh node '{}' (v{}) subscribed for mesh config (namespace='{}')",
+            inner.node_id, inner.ferrum_version, inner.namespace
+        );
+
+        let slice_request = MeshSliceRequest::from_native(
+            inner.node_id,
+            inner.namespace,
+            inner.workload_spiffe_id,
+            inner.labels,
+        );
+        let config = self.config.load_full();
+        let initial = Self::build_mesh_config_update(config.as_ref(), slice_request.clone())?;
+
+        let rx = self.update_tx.subscribe();
+        let config_for_recovery = self.config.clone();
+        let stream = BroadcastStream::new(rx).filter_map(move |result| {
+            let slice_request = slice_request.clone();
+            match result {
+                Ok(update) if update.update_type == 0 => {
+                    match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                        Ok(config) => Self::build_mesh_config_update(&config, slice_request).ok().map(Ok),
+                        Err(e) => {
+                            warn!("Failed to deserialize full config for mesh stream: {}", e);
+                            None
+                        }
+                    }
+                }
+                Ok(_) => {
+                    let current = config_for_recovery.load_full();
+                    Self::build_mesh_config_update(current.as_ref(), slice_request).ok().map(Ok)
+                }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    warn!(
+                        "Mesh config stream lagged behind by {} updates — sending full mesh slice to recover",
+                        n
+                    );
+                    let current = config_for_recovery.load_full();
+                    Self::build_mesh_config_update(current.as_ref(), slice_request).ok().map(Ok)
+                }
+            }
+        });
+
+        let initial_stream = tokio_stream::once(Ok(initial));
+        Ok(Response::new(Box::pin(initial_stream.chain(stream))))
     }
 }
 

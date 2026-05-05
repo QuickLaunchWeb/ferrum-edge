@@ -44,6 +44,7 @@ pub mod startup;
 pub mod tls;
 pub mod tls_offload;
 pub mod util;
+pub mod xds;
 
 pub use config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor, Proxy,

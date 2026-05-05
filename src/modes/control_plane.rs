@@ -30,6 +30,7 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
+use crate::xds::XdsAdsServer;
 
 pub async fn run(
     env_config: EnvConfig,
@@ -144,12 +145,24 @@ pub async fn run(
     let (grpc_server, update_tx) =
         CpGrpcServer::with_channel_capacity_registry_issuer_and_namespace(
             config_arc.clone(),
-            grpc_secret,
+            grpc_secret.clone(),
             env_config.cp_broadcast_channel_capacity,
             dp_registry.clone(),
             env_config.cp_dp_grpc_jwt_issuer.clone(),
             env_config.namespace.clone(),
         );
+    let xds_server = if env_config.xds_enabled {
+        info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
+        Some(XdsAdsServer::new(
+            config_arc.clone(),
+            update_tx.clone(),
+            grpc_secret,
+            env_config.cp_dp_grpc_jwt_issuer.clone(),
+            env_config.namespace.clone(),
+        ))
+    } else {
+        None
+    };
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
@@ -372,7 +385,16 @@ pub async fn run(
             };
             let incoming = TcpListenerStream::new(grpc_listener);
             let _ = grpc_started_tx.send(());
-            if let Err(e) = builder
+            if let Some(xds_server) = xds_server {
+                if let Err(e) = builder
+                    .add_service(grpc_server.into_service())
+                    .add_service(xds_server.into_service())
+                    .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                    .await
+                {
+                    error!("gRPC server error: {}", e);
+                }
+            } else if let Err(e) = builder
                 .add_service(grpc_server.into_service())
                 .serve_with_incoming_shutdown(incoming, shutdown_signal)
                 .await
@@ -391,6 +413,7 @@ pub async fn run(
     } else {
         info!("CP gRPC listen port is 0 — gRPC listener disabled");
         drop(grpc_server); // consumed by the gRPC spawn when enabled
+        drop(xds_server);
         None
     };
     // Mark CP as ready — same rationale as database mode: the initial

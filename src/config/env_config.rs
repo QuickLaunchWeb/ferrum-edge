@@ -498,6 +498,9 @@ pub struct EnvConfig {
     /// Higher values trade memory for fewer full-snapshot recoveries under
     /// high config churn. Default: 128.
     pub cp_broadcast_channel_capacity: usize,
+    /// Mount Envoy ADS (`AggregatedDiscoveryService`) on the CP gRPC listener.
+    /// Default false so existing CP/DP deployments expose only ConfigSync.
+    pub xds_enabled: bool,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -1172,6 +1175,7 @@ impl Default for EnvConfig {
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
             cp_broadcast_channel_capacity: 128,
+            xds_enabled: false,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -1430,6 +1434,7 @@ impl EnvConfig {
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
+            xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             dp_grpc_tls_ca_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CA_CERT_PATH";
             dp_grpc_tls_client_cert_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH";
             dp_grpc_tls_client_key_path: Option<String> = "FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH";
@@ -1767,6 +1772,7 @@ impl EnvConfig {
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
             cp_broadcast_channel_capacity,
+            xds_enabled,
             dp_grpc_tls_ca_cert_path,
             dp_grpc_tls_client_cert_path,
             dp_grpc_tls_client_key_path,

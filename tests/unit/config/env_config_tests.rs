@@ -103,6 +103,36 @@ fn test_env_config_file_mode_valid() {
 }
 
 #[test]
+fn test_xds_enabled_defaults_false() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_XDS_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(!config.xds_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_xds_enabled_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_XDS_ENABLED", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.xds_enabled);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_file_mode_missing_path() {
     with_env_vars(&[("FERRUM_MODE", "file")], || {
         remove_var("FERRUM_FILE_CONFIG_PATH");
