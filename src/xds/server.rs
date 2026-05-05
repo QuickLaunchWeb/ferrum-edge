@@ -325,6 +325,58 @@ impl XdsAdsServer {
             .collect()
     }
 
+    fn sotw_response_for_request(
+        &self,
+        node_id: &str,
+        subscriptions: &mut HashMap<String, XdsSubscription>,
+        request: &DiscoveryRequest,
+    ) -> Option<DiscoveryResponse> {
+        if !request.response_nonce.is_empty() {
+            match self.record_sotw_ack(node_id, request) {
+                AckOutcome::Acked => debug!(
+                    node_id = %node_id,
+                    type_url = %request.type_url,
+                    "xDS ACK accepted"
+                ),
+                AckOutcome::Nacked { message } => {
+                    warn!(
+                        node_id = %node_id,
+                        type_url = %request.type_url,
+                        error = %message,
+                        "xDS NACK received"
+                    );
+                }
+                outcome => {
+                    warn!(
+                        node_id = %node_id,
+                        type_url = %request.type_url,
+                        outcome = ?outcome,
+                        "xDS ACK ignored"
+                    );
+                }
+            }
+        }
+
+        let previous_subscription = subscriptions.get(&request.type_url).cloned();
+        let subscription = build_sotw_subscription(
+            previous_subscription.as_ref(),
+            node_id,
+            &request.type_url,
+            &request.resource_names,
+        );
+        let resource_names_changed = previous_subscription
+            .as_ref()
+            .is_none_or(|previous| previous != &subscription);
+        subscriptions.insert(request.type_url.clone(), subscription.clone());
+        if should_send_sotw_response(request, resource_names_changed) {
+            let snapshot = self.rebuild_snapshot(node_id);
+            self.snapshot_cache.insert(snapshot.clone());
+            Some(self.sotw_response(&snapshot, &subscription))
+        } else {
+            None
+        }
+    }
+
     fn delta_responses_for_subscriptions(
         &self,
         node_id: &str,
@@ -436,52 +488,15 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             return;
                         }
 
-                        let previous_subscription = subscriptions.get(&request.type_url).cloned();
-                        if !request.response_nonce.is_empty() {
-                            match server.record_sotw_ack(&current_node_id, &request) {
-                                AckOutcome::Acked => debug!(
-                                    node_id = %current_node_id,
-                                    type_url = %request.type_url,
-                                    "xDS ACK accepted"
-                                ),
-                                AckOutcome::Nacked { message } => {
-                                    warn!(
-                                        node_id = %current_node_id,
-                                        type_url = %request.type_url,
-                                        error = %message,
-                                        "xDS NACK received"
-                                    );
-                                    continue;
-                                }
-                                outcome => {
-                                    warn!(
-                                        node_id = %current_node_id,
-                                        type_url = %request.type_url,
-                                        outcome = ?outcome,
-                                        "xDS ACK ignored"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let subscription = build_sotw_subscription(
-                            previous_subscription.as_ref(),
-                            &current_node_id,
-                            &request.type_url,
-                            &request.resource_names,
-                        );
-                        let resource_names_changed = previous_subscription
-                            .as_ref()
-                            .is_none_or(|previous| previous != &subscription);
-                        subscriptions.insert(request.type_url.clone(), subscription.clone());
-                        if request.response_nonce.is_empty() || resource_names_changed {
-                            let snapshot = server.rebuild_snapshot(&current_node_id);
-                            server.snapshot_cache.insert(snapshot.clone());
-                            let response = server.sotw_response(&snapshot, &subscription);
-                            if tx.send(Ok(response)).await.is_err() {
-                                return;
-                            }
+                        let send_failed = if let Some(response) =
+                            server.sotw_response_for_request(&current_node_id, &mut subscriptions, &request)
+                        {
+                            tx.send(Ok(response)).await.is_err()
+                        } else {
+                            false
+                        };
+                        if send_failed {
+                            return;
                         }
                     }
                     update = updates.recv(), if !subscriptions.is_empty() => {
@@ -797,6 +812,10 @@ fn build_delta_subscription(
     (subscription, changed, explicit_subscription_request)
 }
 
+fn should_send_sotw_response(request: &DiscoveryRequest, resource_names_changed: bool) -> bool {
+    request.response_nonce.is_empty() || resource_names_changed
+}
+
 fn should_send_delta_response(
     request: &DeltaDiscoveryRequest,
     resource_names_changed: bool,
@@ -913,6 +932,30 @@ mod tests {
         let unchanged = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
 
         assert!(unchanged.is_empty());
+    }
+
+    #[test]
+    fn sotw_ack_outcome_still_applies_subscription_change() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let mut subscriptions = cds_subscription();
+        let name = "cluster/default/api/8080".to_string();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            response_nonce: "stale-or-unknown".to_string(),
+            resource_names: vec![name.clone()],
+            ..DiscoveryRequest::default()
+        };
+
+        let response = server
+            .sotw_response_for_request("node-a", &mut subscriptions, &request)
+            .expect("subscription update should send the requested resource");
+
+        let subscription = subscriptions
+            .get(super::super::translator::CDS_TYPE_URL)
+            .expect("subscription should be tracked");
+        assert!(!subscription.wildcard);
+        assert_eq!(subscription.resource_names, vec![name]);
+        assert_eq!(response.resources.len(), 1);
     }
 
     #[test]
