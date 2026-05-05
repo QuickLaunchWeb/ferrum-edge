@@ -1130,6 +1130,7 @@ mod tests {
             100,
             false,
             None,
+            std::sync::Arc::new(Vec::new()),
             namespace,
             crate::config::BackendAllowIps::Both,
         )

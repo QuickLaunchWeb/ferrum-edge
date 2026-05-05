@@ -46,6 +46,7 @@
 use crate::config::{BackendAllowIps, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
+use crate::tls::CrlList;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -80,6 +81,13 @@ pub struct PluginHttpClient {
     /// Path to a PEM CA bundle for verifying outbound TLS connections.
     /// Mirrors `FERRUM_TLS_CA_BUNDLE_PATH` - shared with Redis rate limiting clients.
     tls_ca_bundle_path: Option<String>,
+    /// Certificate Revocation Lists for outbound TLS verification.
+    /// Loaded once at startup from `FERRUM_TLS_CRL_FILE_PATH` and shared via Arc.
+    /// Used by non-reqwest TLS sinks (tcp_logging, ws_logging, udp_logging DTLS)
+    /// so that revoked backend certificates are rejected on log-shipping paths,
+    /// matching the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
+    /// Empty when `FERRUM_TLS_CRL_FILE_PATH` is unset.
+    tls_crls: CrlList,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
@@ -100,6 +108,7 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("has_dns_cache", &self.dns_cache.is_some())
             .field("tls_no_verify", &self.tls_no_verify)
             .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
+            .field("tls_crls_count", &self.tls_crls.len())
             .field("namespace", &self.namespace)
             .field("backend_allow_ips", &self.backend_allow_ips)
             .finish()
@@ -128,6 +137,7 @@ impl PluginHttpClient {
         retry_delay_ms: u64,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
+        tls_crls: CrlList,
         namespace: &str,
         backend_allow_ips: BackendAllowIps,
     ) -> Self {
@@ -206,6 +216,7 @@ impl PluginHttpClient {
             dns_cache: Some(dns_cache_clone),
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
+            tls_crls,
             namespace: namespace.to_string(),
             backend_allow_ips,
         }
@@ -249,6 +260,7 @@ impl PluginHttpClient {
             dns_cache: None,
             tls_no_verify: false,
             tls_ca_bundle_path: None,
+            tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             backend_allow_ips: BackendAllowIps::Both,
         }
@@ -308,6 +320,18 @@ impl PluginHttpClient {
     /// centralized rate limiting) to share the gateway's `FERRUM_TLS_CA_BUNDLE_PATH`.
     pub fn tls_ca_bundle_path(&self) -> Option<&str> {
         self.tls_ca_bundle_path.as_deref()
+    }
+
+    /// The gateway's loaded Certificate Revocation Lists (`FERRUM_TLS_CRL_FILE_PATH`).
+    ///
+    /// Empty when no CRL file is configured. Used by plugins that build their own
+    /// `rustls::ClientConfig` (tcp_logging, ws_logging, udp_logging DTLS) so that
+    /// revoked backend certificates are rejected on log-shipping paths, matching
+    /// the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
+    /// reqwest-based outbound calls are unaffected — reqwest does not expose CRL
+    /// configuration.
+    pub fn tls_crls(&self) -> &[rustls::pki_types::CertificateRevocationListDer<'static>] {
+        &self.tls_crls
     }
 
     /// The gateway's namespace (`FERRUM_NAMESPACE`).
