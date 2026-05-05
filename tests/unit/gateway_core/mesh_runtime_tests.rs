@@ -1,9 +1,10 @@
 use ferrum_edge::config::mesh::{
-    MeshConfig, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
-    PrincipalMatch,
+    AppProtocol, MeshConfig, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication, PolicyAction,
+    PolicyScope, PrincipalMatch, Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::config::{EnvConfig, MeshConfigSource, MeshTopology};
+use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::hbone::{
     HBONE_DEFAULT_PORT, extract_source_identity_from_baggage, is_hbone_connect,
 };
@@ -12,7 +13,26 @@ use ferrum_edge::modes::mesh::runtime::{
     MESH_WORKLOAD_METRICS_PLUGIN_ID, MeshListenerKind, MeshRuntimeConfig, MeshTrafficDirection,
     prepare_gateway_config_for_mesh,
 };
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
+
+fn workload(name: &str, app: &str) -> Workload {
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    Workload {
+        spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/default/sa/{name}")).unwrap(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), app.to_string())]),
+            namespace: Some("default".to_string()),
+        },
+        service_name: name.to_string(),
+        ports: vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain,
+        namespace: "default".to_string(),
+    }
+}
 
 #[test]
 fn hbone_baggage_extracts_percent_encoded_source_identity() {
@@ -131,6 +151,95 @@ fn mesh_runtime_prepares_global_mesh_plugins() {
         .and_then(|peer_authentications| peer_authentications.as_array())
         .expect("mesh_authz peer_authentications array");
     assert_eq!(peer_authentications.len(), 1);
+}
+
+#[test]
+fn mesh_runtime_injects_node_scoped_mesh_slice_policy() {
+    let env = EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::Mesh,
+        file_config_path: Some("/tmp/ferrum.yaml".to_string()),
+        namespace: "default".to_string(),
+        mesh_workload_spiffe_id: Some("spiffe://cluster.local/ns/default/sa/api".to_string()),
+        ..EnvConfig::default()
+    };
+    let runtime = MeshRuntimeConfig::from_env(&env);
+    let api_policy = MeshPolicy {
+        name: "api-only".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        },
+        rules: Vec::new(),
+    };
+    let worker_policy = MeshPolicy {
+        name: "worker-only".to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "worker".to_string())]),
+                namespace: Some("default".to_string()),
+            },
+        },
+        rules: Vec::new(),
+    };
+    let worker_peer_auth = PeerAuthentication {
+        name: "worker-strict".to_string(),
+        namespace: "default".to_string(),
+        selector: Some(WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "worker".to_string())]),
+            namespace: Some("default".to_string()),
+        }),
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: Default::default(),
+    };
+    let config = GatewayConfig {
+        mesh: Some(Box::new(MeshConfig {
+            workloads: vec![workload("api", "api"), workload("worker", "worker")],
+            mesh_policies: vec![api_policy, worker_policy],
+            peer_authentications: vec![worker_peer_auth],
+            ..MeshConfig::default()
+        })),
+        ..GatewayConfig::default()
+    };
+
+    let prepared = prepare_gateway_config_for_mesh(config, &runtime).unwrap();
+    let mesh_authz = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+        .expect("mesh_authz injected");
+    let policies = mesh_authz
+        .config
+        .get("policies")
+        .and_then(|policies| policies.as_array())
+        .expect("policies array");
+    assert_eq!(policies.len(), 1);
+    assert_eq!(
+        policies[0].get("name").and_then(|name| name.as_str()),
+        Some("api-only")
+    );
+    let peer_authentications = mesh_authz
+        .config
+        .get("peer_authentications")
+        .and_then(|peer_authentications| peer_authentications.as_array())
+        .expect("peer authentications array");
+    assert!(peer_authentications.is_empty());
+
+    let workload_metrics = prepared
+        .plugin_configs
+        .iter()
+        .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+        .expect("workload_metrics injected");
+    assert_eq!(
+        workload_metrics
+            .config
+            .pointer("/labels/app")
+            .and_then(|label| label.as_str()),
+        Some("api")
+    );
 }
 
 #[test]

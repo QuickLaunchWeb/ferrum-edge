@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use crate::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use crate::config::{EnvConfig, MeshConfigSource, MeshTopology};
+use crate::xds::{MeshSlice, MeshSliceRequest};
 
 use super::config_consumer::native_client::NativeMeshClientConfig;
 use super::config_consumer::xds_client::XdsClientConfig;
@@ -111,6 +112,15 @@ impl MeshRuntimeConfig {
             namespace: self.namespace.clone(),
         }
     }
+
+    pub fn mesh_slice_request(&self) -> MeshSliceRequest {
+        MeshSliceRequest {
+            node_id: self.node_id.clone(),
+            namespace: self.namespace.clone(),
+            workload_spiffe_id: self.workload_spiffe_id.clone(),
+            labels: self.labels.clone().into_iter().collect(),
+        }
+    }
 }
 
 /// Prepare a gateway snapshot for mesh-mode serving.
@@ -131,11 +141,16 @@ pub fn prepare_gateway_config_for_mesh(
         ));
     }
 
-    inject_mesh_global_plugins(&mut config, runtime);
+    let mesh_slice = MeshSlice::from_gateway_config(&config, runtime.mesh_slice_request());
+    inject_mesh_global_plugins(&mut config, runtime, &mesh_slice);
     Ok(config)
 }
 
-fn inject_mesh_global_plugins(config: &mut GatewayConfig, runtime: &MeshRuntimeConfig) {
+fn inject_mesh_global_plugins(
+    config: &mut GatewayConfig,
+    runtime: &MeshRuntimeConfig,
+    mesh_slice: &MeshSlice,
+) {
     ensure_global_plugin(
         config,
         MESH_SPIFFE_IDENTITY_PLUGIN_ID,
@@ -144,23 +159,13 @@ fn inject_mesh_global_plugins(config: &mut GatewayConfig, runtime: &MeshRuntimeC
         &runtime.namespace,
     );
 
-    let policies = config
-        .mesh
-        .as_ref()
-        .map(|mesh| mesh.mesh_policies.clone())
-        .unwrap_or_default();
-    let peer_authentications = config
-        .mesh
-        .as_ref()
-        .map(|mesh| mesh.peer_authentications.clone())
-        .unwrap_or_default();
     ensure_global_plugin(
         config,
         MESH_AUTHZ_PLUGIN_ID,
         "mesh_authz",
         serde_json::json!({
-            "policies": policies,
-            "peer_authentications": peer_authentications,
+            "policies": mesh_slice.mesh_policies.clone(),
+            "peer_authentications": mesh_slice.peer_authentications.clone(),
         }),
         &runtime.namespace,
     );
@@ -170,8 +175,11 @@ fn inject_mesh_global_plugins(config: &mut GatewayConfig, runtime: &MeshRuntimeC
         MESH_WORKLOAD_METRICS_PLUGIN_ID,
         "workload_metrics",
         serde_json::json!({
-            "node_id": runtime.node_id,
+            "node_id": runtime.node_id.clone(),
             "topology": runtime.topology.to_string(),
+            "namespace": mesh_slice.namespace.clone(),
+            "workload_spiffe_id": mesh_slice.workload_spiffe_id.clone(),
+            "labels": mesh_slice.labels.clone(),
         }),
         &runtime.namespace,
     );
