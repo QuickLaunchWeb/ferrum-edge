@@ -288,6 +288,45 @@ pub(crate) fn is_response_body_complete(
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 
+/// Pool entry bundling an `H3SendRequest` with the underlying `quinn::Connection`.
+///
+/// `is_healthy()` needs to detect closed QUIC connections (peer GOAWAY,
+/// transport-level reset, network blip, idle timeout from the QUIC layer)
+/// so the cleanup task can evict dead handles before their idle deadline
+/// — `h3::client::SendRequest` doesn't surface a `close_reason()` /
+/// `is_closed()` query of its own, so we hold a clone of the source
+/// `quinn::Connection` (cheap `Arc`-based clone via `ConnectionRef`) and
+/// inspect that. Without this, closed connections stayed cached until
+/// `idle_timeout_seconds` elapsed; the next request fetched a dead
+/// handle, failed, and only then was invalidated by the per-request
+/// retry logic — wasted handshake amortization plus an avoidable
+/// fast-fail on the hot path.
+///
+/// Both fields are `Clone` and the clones share underlying state, so this
+/// struct is `Clone` at the same cost as the original `H3SendRequest`.
+#[derive(Clone)]
+struct H3PooledConnection {
+    send_request: H3SendRequest,
+    connection: quinn::Connection,
+}
+
+impl H3PooledConnection {
+    fn new(send_request: H3SendRequest, connection: quinn::Connection) -> Self {
+        Self {
+            send_request,
+            connection,
+        }
+    }
+
+    /// Returns `true` once the underlying QUIC connection has reached a
+    /// terminal state (peer-initiated `CONNECTION_CLOSE`, transport reset,
+    /// idle-timeout, or local close). Used by `Http3PoolManager::is_healthy`
+    /// so the shared pool cleanup task evicts dead entries on its next pass.
+    fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+}
+
 /// Type alias for the h3 client request stream (bidirectional).
 pub type H3RequestStream =
     h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
@@ -592,7 +631,7 @@ struct Http3PoolManager;
 
 #[async_trait]
 impl PoolManager for Http3PoolManager {
-    type Connection = H3SendRequest;
+    type Connection = H3PooledConnection;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
         Http3ConnectionPool::write_pool_key_with_host(buf, host, port, proxy, shard);
@@ -607,8 +646,14 @@ impl PoolManager for Http3PoolManager {
         ))
     }
 
-    fn is_healthy(&self, _conn: &Self::Connection) -> bool {
-        true
+    /// Reject pool entries whose underlying QUIC connection has already
+    /// terminated. The shared cleanup task in `pool::GenericPool` evicts
+    /// any entry where `is_healthy` returns `false` on its next pass, so
+    /// dead handles no longer survive until `idle_timeout_seconds`.
+    /// Mirrors `Http2PoolManager::is_healthy` (which calls
+    /// `!conn.is_closed()` on the hyper H2 sender).
+    fn is_healthy(&self, conn: &Self::Connection) -> bool {
+        !conn.is_closed()
     }
 
     fn destroy(&self, conn: Self::Connection) {
@@ -771,7 +816,7 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
-    ) -> Result<H3SendRequest, anyhow::Error> {
+    ) -> Result<H3PooledConnection, anyhow::Error> {
         // H3 is the one pool that needs extra creation context beyond the
         // `Proxy`, so it uses the shared shell's explicit creation closure.
         self.pool
@@ -794,7 +839,7 @@ impl Http3ConnectionPool {
         port: u16,
         tls_config: Arc<rustls::ClientConfig>,
         h3_config: super::config::Http3ServerConfig,
-    ) -> Result<H3SendRequest, anyhow::Error> {
+    ) -> Result<H3PooledConnection, anyhow::Error> {
         self.pool
             .create_or_get_existing_owned(key, |_| {
                 let tls_config = tls_config.clone();
@@ -910,7 +955,8 @@ impl Http3ConnectionPool {
         let cached = self
             .pool
             .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
-        if let Some(mut sr) = cached {
+        if let Some(pooled) = cached {
+            let mut sr = pooled.send_request;
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
@@ -929,7 +975,8 @@ impl Http3ConnectionPool {
         let key = Self::pool_key(proxy, start);
 
         // Try cached connection on the selected index first
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
@@ -944,7 +991,8 @@ impl Http3ConnectionPool {
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key = Self::pool_key(proxy, fallback_index);
-                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
+                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                            let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request(
                                 &mut fallback_sr,
                                 proxy,
@@ -983,11 +1031,11 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request(
             &mut sr_for_request,
@@ -1029,7 +1077,8 @@ impl Http3ConnectionPool {
         let mut any_request_on_wire = false;
 
         // Try cached connection on the selected index first
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
             {
                 Ok(result) => return Ok(result),
@@ -1052,7 +1101,8 @@ impl Http3ConnectionPool {
                             target_port,
                             fallback_index,
                         );
-                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
+                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                            let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request(
                                 &mut fallback_sr,
                                 proxy,
@@ -1085,7 +1135,7 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -1096,7 +1146,7 @@ impl Http3ConnectionPool {
             )
             .await
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request(
             &mut sr_for_request,
@@ -1120,7 +1170,7 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
-    ) -> Result<H3SendRequest, anyhow::Error> {
+    ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create QUIC client config (ensure TLS 1.3 cipher suites are available): {}",
@@ -1170,6 +1220,11 @@ impl Http3ConnectionPool {
         let connection =
             timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
 
+        // Clone the quinn::Connection (`Arc`-based, cheap) before passing it
+        // into `h3_quinn::Connection::new` so the pool entry retains a handle
+        // for `close_reason()` health checks. h3_quinn would otherwise own
+        // the only ref via its internal stream-stream tasks.
+        let quic_conn = connection.clone();
         let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
         let (mut driver, send_request) = timeout_backend_handshake(
             h3_handshake,
@@ -1187,7 +1242,7 @@ impl Http3ConnectionPool {
             debug!("HTTP/3 pool connection driver closed: {}", err);
         });
 
-        Ok(send_request)
+        Ok(H3PooledConnection::new(send_request, quic_conn))
     }
 
     /// Create a new QUIC connection + h3 session to an explicit host/port
@@ -1206,7 +1261,7 @@ impl Http3ConnectionPool {
         port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
-    ) -> Result<H3SendRequest, anyhow::Error> {
+    ) -> Result<H3PooledConnection, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create QUIC client config (ensure TLS 1.3 cipher suites are available): {}",
@@ -1254,6 +1309,10 @@ impl Http3ConnectionPool {
         let connection =
             timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
 
+        // See `create_connection` for why we clone the quinn::Connection
+        // before handing it to h3_quinn — the pool entry needs a handle for
+        // `close_reason()` health checks.
+        let quic_conn = connection.clone();
         let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
         let (mut driver, send_request) = timeout_backend_handshake(
             h3_handshake,
@@ -1271,7 +1330,7 @@ impl Http3ConnectionPool {
             debug!("HTTP/3 pool connection driver closed: {}", err);
         });
 
-        Ok(send_request)
+        Ok(H3PooledConnection::new(send_request, quic_conn))
     }
 
     /// Execute an HTTP/3 request on an existing SendRequest handle.
@@ -1725,10 +1784,11 @@ impl Http3ConnectionPool {
         // if the first attempt fails mid-body. Go straight to the slow path.
         let key = Self::pool_key(proxy, start);
 
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
             // Single attempt — body is consumed, no retry possible.
             // On error, evict the stale connection so subsequent requests
             // don't repeatedly fail on the same dead QUIC handle.
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming_body(
                 &mut sr,
                 proxy,
@@ -1759,11 +1819,11 @@ impl Http3ConnectionPool {
         // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
             .map_err(H3PoolError::pre_wire)?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_body(
             &mut sr_for_request,
@@ -1800,7 +1860,8 @@ impl Http3ConnectionPool {
         let key = Self::pool_key(proxy, start);
         let mut frontend_body = Some(frontend_body);
 
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming_incoming_body(
                 &mut sr,
                 proxy,
@@ -1834,11 +1895,11 @@ impl Http3ConnectionPool {
         // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
             .map_err(H3PoolError::pre_wire)?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_incoming_body(
             &mut sr_for_request,
@@ -1878,7 +1939,8 @@ impl Http3ConnectionPool {
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
 
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming_body(
                 &mut sr,
                 proxy,
@@ -1909,7 +1971,7 @@ impl Http3ConnectionPool {
         // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -1920,7 +1982,7 @@ impl Http3ConnectionPool {
             )
             .await
             .map_err(H3PoolError::pre_wire)?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_body(
             &mut sr_for_request,
@@ -1958,7 +2020,8 @@ impl Http3ConnectionPool {
         let key = Self::pool_key_for_target(proxy, target_host, target_port, start);
         let mut frontend_body = Some(frontend_body);
 
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming_incoming_body(
                 &mut sr,
                 proxy,
@@ -1992,7 +2055,7 @@ impl Http3ConnectionPool {
         // future multi-attempt loop here MUST follow.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -2003,7 +2066,7 @@ impl Http3ConnectionPool {
             )
             .await
             .map_err(H3PoolError::pre_wire)?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming_incoming_body(
             &mut sr_for_request,
@@ -2040,7 +2103,8 @@ impl Http3ConnectionPool {
         let cached = self
             .pool
             .cached_with(|buf| Self::write_pool_key(buf, proxy, start));
-        if let Some(mut sr) = cached {
+        if let Some(pooled) = cached {
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming(
                 &mut sr,
                 proxy,
@@ -2063,7 +2127,8 @@ impl Http3ConnectionPool {
         // Slow path: allocate pool key String
         let key = Self::pool_key(proxy, start);
 
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming(
                 &mut sr,
                 proxy,
@@ -2085,7 +2150,8 @@ impl Http3ConnectionPool {
                     for offset in 1..conns_per_backend {
                         let fallback_index = (start + offset) % conns_per_backend;
                         let fallback_key = Self::pool_key(proxy, fallback_index);
-                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
+                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                            let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request_streaming(
                                 &mut fallback_sr,
                                 proxy,
@@ -2115,11 +2181,11 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_proxy_sender(key, proxy, tls_config, h3_config)
             .await
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming(
             &mut sr_for_request,
@@ -2156,7 +2222,8 @@ impl Http3ConnectionPool {
 
         let mut any_request_on_wire = false;
 
-        if let Some(mut sr) = self.pool.cached(&key) {
+        if let Some(pooled) = self.pool.cached(&key) {
+            let mut sr = pooled.send_request;
             match Self::do_request_streaming(
                 &mut sr,
                 proxy,
@@ -2186,7 +2253,8 @@ impl Http3ConnectionPool {
                             target_port,
                             fallback_index,
                         );
-                        if let Some(mut fallback_sr) = self.pool.cached(&fallback_key) {
+                        if let Some(fallback_pooled) = self.pool.cached(&fallback_key) {
+                            let mut fallback_sr = fallback_pooled.send_request;
                             match Self::do_request_streaming(
                                 &mut fallback_sr,
                                 proxy,
@@ -2216,7 +2284,7 @@ impl Http3ConnectionPool {
         let tls_config = tls_config_fn()
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let sr = self
+        let pooled = self
             .create_or_get_target_sender(
                 key,
                 proxy,
@@ -2227,7 +2295,7 @@ impl Http3ConnectionPool {
             )
             .await
             .map_err(|e| H3PoolError::pre_wire(e).promote_on_wire_if(any_request_on_wire))?;
-        let mut sr_for_request = sr.clone();
+        let mut sr_for_request = pooled.send_request;
 
         Self::do_request_streaming(
             &mut sr_for_request,
@@ -2709,5 +2777,352 @@ mod h3_pool_error_tests {
         assert!(promoted_false.is_graceful_close());
         // request_on_wire stays true (graceful_close constructor sets it true)
         assert!(promoted_false.request_on_wire());
+    }
+}
+
+#[cfg(test)]
+mod h3_pool_health_tests {
+    //! Inline tests for [`Http3PoolManager::is_healthy`] — the bug fix
+    //! that motivates this module is described on the manager impl.
+    //!
+    //! These tests stand up a real local QUIC server + client using rcgen
+    //! self-signed certs (no h3 layer needed; we exercise the QUIC layer
+    //! exclusively). After establishing a connection, we wrap the
+    //! `quinn::Connection` in [`H3PooledConnection`] alongside an h3
+    //! `SendRequest`, then verify:
+    //!
+    //! 1. `is_healthy` returns `true` for a live connection.
+    //! 2. After `connection.close(...)`, `is_healthy` flips to `false`
+    //!    (because `close_reason()` becomes `Some(_)`).
+    //!
+    //! That is exactly the predicate the shared cleanup task in
+    //! `pool::GenericPool::spawn_cleanup` uses to decide whether an entry
+    //! should be evicted before its idle deadline. The previous
+    //! implementation returned `true` unconditionally and dead handles
+    //! survived until `idle_timeout_seconds`.
+    //!
+    //! Note on the SendRequest test plumbing: the bug only requires the
+    //! `quinn::Connection` half of the pooled struct to be live; the
+    //! `H3SendRequest` plays no role in `is_healthy()`. To avoid the full
+    //! h3-handshake dance for an in-process unit test (and the matching
+    //! peer that needs to drive the H3 control streams), we build the
+    //! pool entry by completing only the QUIC handshake on both sides
+    //! and constructing a `SendRequest` against the client-side QUIC
+    //! connection via `h3::client::new`. The `is_healthy` predicate is
+    //! purely a `close_reason()` check, so the SendRequest's own
+    //! liveness is irrelevant to this test.
+
+    use super::*;
+    use quinn::{ClientConfig, Endpoint, ServerConfig};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Instant;
+
+    fn install_provider() {
+        // rustls 0.23 requires a process-wide crypto provider before any
+        // `ClientConfig::builder()` / `ServerConfig::builder()` call. The
+        // "ring" provider is installed wholesale by the gateway main; in
+        // unit tests several test mods may race to install — `_ = ...`
+        // ignores the "already installed" return.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn issue_cert() -> (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign cert");
+
+        let cert_pem = cert.pem();
+        let mut cert_reader = cert_pem.as_bytes();
+        let mut chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_reader)
+                .filter_map(Result::ok)
+                .collect();
+        let cert_der = chain.pop().expect("at least one cert");
+
+        let key_pem = key_pair.serialize_pem();
+        let mut key_reader = key_pem.as_bytes();
+        let key_der = rustls_pemfile::private_key(&mut key_reader)
+            .expect("read private key")
+            .expect("private key present");
+
+        (cert_der, key_der)
+    }
+
+    fn make_server_endpoint(addr: SocketAddr) -> Endpoint {
+        let (cert, key) = issue_cert();
+
+        let mut server_crypto =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("server config");
+        server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+            .expect("quic server config");
+        let server_config = ServerConfig::with_crypto(Arc::new(quic_server));
+
+        Endpoint::server(server_config, addr).expect("server endpoint")
+    }
+
+    fn make_client_endpoint() -> Endpoint {
+        // Trust any cert — this is a localhost-only loopback test.
+        #[derive(Debug)]
+        struct AcceptAny;
+        impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &rustls::pki_types::CertificateDer<'_>,
+                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+                _server_name: &rustls::pki_types::ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                vec![
+                    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                    rustls::SignatureScheme::ED25519,
+                    rustls::SignatureScheme::RSA_PSS_SHA256,
+                ]
+            }
+        }
+
+        let mut client_crypto =
+            rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+            .expect("quic client config");
+        let client_config = ClientConfig::new(Arc::new(quic_client));
+
+        let mut endpoint = Endpoint::client("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .expect("client endpoint");
+        endpoint.set_default_client_config(client_config);
+        endpoint
+    }
+
+    /// Drive a real QUIC handshake on loopback and return both peer
+    /// connections so the caller can manipulate either side.
+    async fn handshake_pair() -> (quinn::Connection, quinn::Connection, Endpoint, Endpoint) {
+        install_provider();
+
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = make_server_endpoint(server_addr);
+        let bound = server.local_addr().expect("server bound");
+
+        let client = make_client_endpoint();
+
+        // Race the client connect against the server accept — both must
+        // succeed. quinn doesn't expose a single-call `connect_pair`.
+        let server_clone = server.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_clone.accept().await.expect("server accept");
+            incoming.await.expect("server connection")
+        });
+
+        let client_conn = client
+            .connect(bound, "localhost")
+            .expect("client connect_with")
+            .await
+            .expect("client connection");
+        let server_conn = server_task.await.expect("server task");
+
+        (client_conn, server_conn, client, server)
+    }
+
+    #[tokio::test]
+    async fn pool_manager_reports_live_connection_healthy() {
+        let (client_conn, _server_conn, _client_ep, _server_ep) = handshake_pair().await;
+
+        // Build an h3 client SendRequest off the live QUIC connection.
+        // The `_driver` task processes h3 control frames; we don't need
+        // to drive it because is_healthy() inspects only the QUIC
+        // close_reason — h3 protocol state is irrelevant.
+        let h3_conn = h3_quinn::Connection::new(client_conn.clone());
+        let (mut driver, send_request) =
+            h3::client::new(h3_conn).await.expect("h3 client handshake");
+        let driver_handle = tokio::spawn(async move {
+            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let pooled = H3PooledConnection::new(send_request, client_conn);
+        let manager = Http3PoolManager;
+
+        assert!(
+            manager.is_healthy(&pooled),
+            "freshly-handshaken QUIC connection must report healthy"
+        );
+
+        driver_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn pool_manager_reports_closed_connection_unhealthy() {
+        let (client_conn, _server_conn, _client_ep, _server_ep) = handshake_pair().await;
+
+        let h3_conn = h3_quinn::Connection::new(client_conn.clone());
+        let (mut driver, send_request) =
+            h3::client::new(h3_conn).await.expect("h3 client handshake");
+        let driver_handle = tokio::spawn(async move {
+            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let pooled = H3PooledConnection::new(send_request, client_conn.clone());
+        let manager = Http3PoolManager;
+
+        // Sanity: live before close.
+        assert!(manager.is_healthy(&pooled));
+
+        // Initiate local close and wait for `close_reason()` to surface.
+        // `Connection::close` is fire-and-forget at the API level; the
+        // close_reason is set synchronously inside the connection's
+        // shared state so a single read suffices, but loop briefly to
+        // tolerate any internal scheduling.
+        client_conn.close(0u32.into(), b"test");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !manager.is_healthy(&pooled) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "expected is_healthy=false after close(), got true (close_reason={:?})",
+                    client_conn.close_reason()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Final check — the predicate stayed false (no flapping).
+        assert!(!manager.is_healthy(&pooled));
+
+        driver_handle.abort();
+    }
+
+    /// Regression for the original bug: an entry whose underlying QUIC
+    /// connection has been closed must be evicted from the shared pool
+    /// shell (`pool::GenericPool`), BEFORE the idle-timeout would
+    /// otherwise fire. Previously `Http3PoolManager::is_healthy`
+    /// returned `true` unconditionally, so closed entries lingered until
+    /// `idle_timeout_seconds` elapsed and the next request to that key
+    /// fetched a dead handle.
+    ///
+    /// Two eviction paths share the same `is_healthy` predicate:
+    ///   1. The background cleanup task in `spawn_cleanup` (interval-driven).
+    ///   2. The synchronous `cached()` lookup (which invalidates and
+    ///      returns `None` when `is_healthy` returns `false`).
+    ///
+    /// Both paths are valid eviction mechanisms; what matters for the
+    /// regression is that NEITHER returned a dead handle once the
+    /// connection had closed. The previous unconditional `true` broke
+    /// both paths simultaneously. This test asserts the cumulative
+    /// behaviour: after `client_conn.close()`, `pool.cached(&key)`
+    /// stops returning the entry within a tight bound — a behaviour
+    /// the bugged implementation could not satisfy because the cleanup
+    /// task ignored closed entries AND `cached()` always saw
+    /// `is_healthy=true` and returned the dead handle.
+    #[tokio::test]
+    async fn closed_connection_is_evicted_from_pool() {
+        use crate::config::PoolConfig;
+        use crate::pool::GenericPool;
+
+        let (client_conn, _server_conn, _client_ep, _server_ep) = handshake_pair().await;
+
+        let h3_conn = h3_quinn::Connection::new(client_conn.clone());
+        let (mut driver, send_request) =
+            h3::client::new(h3_conn).await.expect("h3 client handshake");
+        let driver_handle = tokio::spawn(async move {
+            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        // Long idle timeout so any eviction observed within the test
+        // window can only come from `is_healthy=false`, never from the
+        // timeout branch. Tight cleanup interval just keeps the test fast.
+        let pool_cfg = PoolConfig {
+            idle_timeout_seconds: 3600,
+            max_idle_per_host: 1,
+            ..PoolConfig::default()
+        };
+        let pool = GenericPool::new(
+            Arc::new(Http3PoolManager),
+            pool_cfg,
+            Duration::from_millis(50),
+        );
+
+        let key = "evict-test-key".to_string();
+        let pooled = H3PooledConnection::new(send_request, client_conn.clone());
+
+        // Seed the pool with this entry. Use the explicit-create path
+        // because Http3PoolManager::create() returns an error by design
+        // (H3 needs per-call TLS / h3 config — see the manager docstring).
+        pool.create_or_get_existing_owned::<_, _, anyhow::Error>(key.clone(), |_| {
+            let pooled = pooled.clone();
+            async move { Ok(pooled) }
+        })
+        .await
+        .expect("seed pool");
+
+        // While the connection is live, cached() returns the entry.
+        // (Sanity check: this would also have passed under the old buggy
+        // is_healthy=true, so it is NOT a regression guard on its own —
+        // the next loop is what proves the fix.)
+        assert!(pool.cached(&key).is_some(), "live entry present");
+
+        // Close the underlying QUIC connection. `is_healthy` MUST flip
+        // to false (via `connection.close_reason() == Some(...)`) and
+        // the pool MUST stop handing out the dead entry. The previous
+        // implementation returned `true` unconditionally and `cached()`
+        // would keep returning the dead handle indefinitely.
+        client_conn.close(0u32.into(), b"test-close");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if pool.cached(&key).is_none() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "pool kept returning dead QUIC entry 2s after close — \
+                     Http3PoolManager::is_healthy regression? \
+                     close_reason={:?}",
+                    client_conn.close_reason()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        driver_handle.abort();
     }
 }
