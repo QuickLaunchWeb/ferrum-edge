@@ -823,9 +823,11 @@ pub struct EnvConfig {
     /// When true, add a Forwarded header (RFC 7239) alongside X-Forwarded-* headers.
     pub add_forwarded_header: bool,
     /// Header to use as the authoritative source of client IP. When set, this
-    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare, or
-    /// "X-Real-IP" for nginx). If the header is absent or the direct connection
-    /// is not from a trusted proxy, falls back to the X-Forwarded-For walk.
+    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare,
+    /// "X-Real-IP" for nginx, or CloudFront's "CloudFront-Viewer-Address"
+    /// ip:source-port value). If the configured header is absent, falls back to
+    /// the X-Forwarded-For walk. If it is present but rejected, the socket IP
+    /// remains the source of truth.
     pub real_ip_header: Option<String>,
 
     /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes
