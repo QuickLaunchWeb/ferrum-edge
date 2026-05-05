@@ -11,16 +11,16 @@
 | Upstream issue | [hyperium/h3#338](https://github.com/hyperium/h3/issues/338) |
 | Upstream PR | [hyperium/h3#339](https://github.com/hyperium/h3/pull/339) |
 | Local fork | https://github.com/jeremyjpj0916/h3 (branch: `fix/recv-frame-drain-on-quic-close`) |
-| Tracks | [ferrum-edge#506](https://github.com/ferrum-edge/ferrum-edge/pull/506) — gateway-side suppression that compensates while this is unfixed |
+| Tracks | [ferrum-edge#506](https://github.com/ferrum-edge/ferrum-edge/pull/506) — gateway-side suppression (correct independently of this patch; see "Relationship to PR #506" below) |
 
 ## Why this directory exists
 
-PR #506 ships a gateway-side workaround for the recv_response graceful-close race (don't penalize the backend's H3 capability, don't bypass `retryable_methods`, opt-in retry via `retryable_status_codes: [502]`). The 502 to the client at recv_response is unavoidable at the gateway level — it's a symptom of an upstream library limitation. This directory captures the upstream fix as deliverable artifacts so we can:
+PR #506 ships a gateway-side suppression for the recv_response graceful-close race (don't penalize the backend's H3 capability, don't bypass `retryable_methods`, opt-in retry via `retryable_status_codes: [502]`). That suppression is correct on its own merits, but the 502 itself is a symptom of an upstream library limitation — fixed by the patch in this directory and currently shipped via a vendored crate. This directory captures the upstream artifacts so we can:
 
-1. File the issue + PR upstream
+1. File the issue + PR upstream (artifacts ready in `issue.md` / `pr-description.md` / `h3-frame-rs.patch`)
 2. Track when it merges
-3. Optionally vendor in the meantime
-4. Cleanly retire the workaround once the fix is widely available
+3. Cleanly retire the vendored copy once a registry release contains the fix
+4. Audit-trail the change while it lives in `vendor/h3-0.0.8-ferrum-patched/`
 
 ## Files
 
@@ -32,7 +32,7 @@ PR #506 ships a gateway-side workaround for the recv_response graceful-close rac
 
 ## Hand-off — how to file the upstream issue + PR
 
-This PR (#506) does NOT contain a working active patch — the parallel session that produced these artifacts hit permission boundaries on (a) pushing to a fork branch and (b) vendoring external code into the trusted build. To complete the upstream work:
+The patch is currently shipped via the vendored crate at `vendor/h3-0.0.8-ferrum-patched/` and wired in via `[patch.crates-io]` in the workspace `Cargo.toml`. The artifacts in this directory exist so we can submit the same fix upstream and ultimately retire the vendor copy. To file the upstream work:
 
 1. **Open the issue.** GitHub → hyperium/h3 → New issue → paste `issue.md`. Capture the issue number.
 2. **Update `pr-description.md`** — replace the `Fixes #NNN` placeholder with the real number.
@@ -58,9 +58,9 @@ This PR (#506) does NOT contain a working active patch — the parallel session 
 4. **Open the PR** at https://github.com/hyperium/h3/compare/master...jeremyjpj0916:fix/recv-frame-drain-on-quic-close — paste `pr-description.md` as the body. Link the issue.
 5. **Update this README** with the issue + PR numbers under "Status" so future readers can find them.
 
-## Optional — vendor the patched h3 into ferrum-edge while we wait
+## How we vendored — historical record
 
-This is opt-in. The upstream merge timeline is unknown, and PR #506's gateway-side suppression is sufficient to ship correctness in the meantime (no spurious capability downgrades; well-defined retry semantics for the 502). If we want to additionally eliminate the 502 itself, we can vendor the patched h3:
+We vendored the patched h3 crate into the build because the upstream merge timeline was unknown and we wanted to eliminate the 502 itself in addition to PR #506's gateway-side suppression (which on its own already shipped safe behavior — no spurious capability downgrades; well-defined retry semantics for the 502). The reproduction steps that produced the current vendored copy:
 
 ```bash
 # In a fresh worktree off ferrum-edge main:
@@ -87,24 +87,26 @@ git add Cargo.toml vendor/
 git commit -m "Vendor h3 with frame-drain-on-quic-close patch (tracks hyperium/h3#NNN)"
 ```
 
-After vendoring, the gateway-side suppression in PR #506 still applies (it's the right behavior independently — graceful closes shouldn't downgrade backend capability), but the 502 itself goes away because `recv_response` now drains buffered HEADERS instead of erroring. Inline tests in `tests/integration/http3_integration_tests.rs` that simulate the race (e.g., the `h3_buffered_response_survives_graceful_close_race` style) should switch from "expect 502 + Supported capability" to "expect 200 + Supported capability." Update assertions accordingly.
+With the vendored crate in place, the gateway-side suppression in PR #506 still applies (it's the right behavior independently — graceful closes shouldn't downgrade backend capability), and the 502 itself goes away because `recv_response` now drains buffered HEADERS instead of erroring. Inline regression tests in `vendor/h3-0.0.8-ferrum-patched/src/frame.rs` (`poll_next_drains_buffered_headers_before_quic_close`, `poll_data_drains_buffered_body_before_quic_close`) cover the fix at the library layer.
 
 ## Retirement — when upstream merges
 
 Once `hyperium/h3` releases a version with the fix:
 
-1. **Update the floor.** Bump `h3 = "X.Y.Z"` in `Cargo.toml` to the version that includes the fix.
-2. **If we vendored:**
-   - Remove the `[patch.crates-io] h3 = ...` line from `Cargo.toml`.
-   - `git rm -r vendor/h3-0.0.8-ferrum-patched`.
-   - `cargo build` — confirm we're now pulling from crates.io.
-3. **Decide whether to remove PR #506's gateway-side suppression.** Don't. It's correct behavior independently of the upstream fix:
+1. **Update the registry floor.** Bump `h3 = "X.Y.Z"` in `Cargo.toml` `[dependencies]` to the version that includes the fix.
+2. **Drop the vendored crate** (mandatory — currently in use):
+   - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line from the `[patch.crates-io]` block at the bottom of `Cargo.toml`. If `reqwest` (the other `[patch.crates-io]` entry) is also retired by then and the block becomes empty, drop the block + its comment header too.
+   - `git rm -r vendor/h3-0.0.8-ferrum-patched`. If `vendor/` becomes empty (i.e., the reqwest vendor was already retired), delete it too.
+   - `cargo build` — confirm we're now pulling h3 from crates.io and the registry version is being resolved.
+   - `cargo test --test unit_tests && cargo test --test integration_tests && cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored` — confirm the registry version still passes regression tests for the graceful-close race (the inline regression tests we added live in the vendored frame.rs and disappear with it; the upstream version is expected to carry equivalents).
+3. **Leave PR #506's gateway-side suppression in place.** It's correct behavior independently of the upstream fix:
    - `mark_h3_unsupported` should not fire for graceful closes regardless of whether we can recover the response.
    - `connection_error=false` for `GracefulRemoteClose` is the right contract — the request reached the wire.
    - The retry semantics, CB semantics, and passive-health semantics that PR #506 nailed down are correct on their own merits.
-   The upstream fix removes the SYMPTOM (the 502 at recv_response); the gateway-side change ensures we behave correctly in the failure modes that DO remain (e.g., the recv_response close happens BEFORE any HEADERS bytes are buffered, which the upstream fix can't recover either).
-4. **Update `docs/http3.md`'s "Graceful close handling at recv_response" section** to remove the "this still 502s" caveat — once vendored / upstreamed, normal responses survive the race.
-5. **Move this directory to `docs/upstream-h3-patches/_retired/001-recv-frame-drain-on-quic-close/`** with a `STATUS.md` noting the merge commit and version. Keeps the audit trail without cluttering the active patches list.
+   The upstream fix removes the SYMPTOM (the 502 at recv_response when HEADERS are buffered); the gateway-side change ensures we behave correctly in the failure modes that DO remain (e.g., the recv_response close happens BEFORE any HEADERS bytes are buffered, which the upstream fix can't recover either).
+4. **Update CLAUDE.md** — the "Backend Capability Registry" / "Upstream h3 fix tracked separately" paragraph references the vendored crate (`vendor/h3-0.0.8-ferrum-patched`); replace that with a note that the fix landed upstream in h3 vX.Y.Z.
+5. **Update `docs/http3.md`** — remove any "this still 502s" caveat once normal responses survive the race.
+6. **Move this directory to `docs/upstream-h3-patches/_retired/001-recv-frame-drain-on-quic-close/`** with a `STATUS.md` noting the merge commit and version. Keeps the audit trail without cluttering the active patches list. If `docs/upstream-h3-patches/` becomes empty (no other active patches and no `_retired/` content you want to surface), tidy as appropriate.
 
 ## Changing the patch design before submission
 
@@ -121,8 +123,6 @@ Alternative designs considered and rejected:
 - *Fix in h3-quinn's `RecvStream::poll_data`* — would re-shape the API contract between quinn and h3-quinn, larger surface area.
 - *Stash the error on `FrameStream` itself as a new `pending_close_error: Option<StreamErrorIncoming>` field* — works but reintroduces a question of "when do we forget the error?" Local-variable hoist is simpler.
 
-## Why this isn't applied to our build
+## Relationship to PR #506
 
-Per the discussion that produced this artifact set, the permission system in our worktree treats vendoring external crates and pushing to fork branches as actions requiring explicit per-action confirmation, even when the prior conversation authorized them. The maintainer can complete steps 3+ above with their own credentials and a freshly-permissioned session.
-
-The gateway-side fix in PR #506 already ships safe behavior — the upstream patch is a strict improvement, not a correctness prerequisite.
+The gateway-side suppression in PR #506 is correct independently of this patch — it ensures `mark_h3_unsupported` doesn't fire on graceful closes, that `connection_error=false` for `GracefulRemoteClose` matches the "request reached the wire" contract, and that retry/CB/passive-health semantics behave correctly when the close happens before any HEADERS are buffered (which the vendored fix can't recover from anyway). Vendoring the patched h3 in addition eliminates the 502 itself for the buffered-HEADERS-then-graceful-close shape; the two changes compose rather than replace one another.
