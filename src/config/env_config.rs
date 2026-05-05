@@ -2136,6 +2136,9 @@ impl EnvConfig {
     /// parameters appended for PostgreSQL and MySQL. SQLite and MongoDB URLs are
     /// returned unchanged: SQLite has no network TLS, and MongoDB uses driver
     /// `TlsOptions` or MongoDB URI TLS options.
+    ///
+    /// The `Err` path is reachable only if `validate_db_tls_config()` was not
+    /// called first (defense-in-depth for invalid backend+mode combos).
     pub fn effective_db_url(&self) -> Result<Option<String>, String> {
         let Some(base_url) = self.db_url.as_ref() else {
             return Ok(None);
