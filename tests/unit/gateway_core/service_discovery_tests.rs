@@ -383,6 +383,7 @@ async fn test_manager_start_with_no_sd_upstreams() {
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
     );
 
     // No SD config → no tasks started
@@ -401,6 +402,7 @@ async fn test_manager_stop_is_idempotent() {
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
     );
 
     manager.stop();
@@ -1435,6 +1437,7 @@ async fn test_manager_start_with_mismatched_provider_skips() {
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
     );
 
     // Should not panic — the mismatched upstream is silently skipped
@@ -1468,6 +1471,7 @@ async fn test_manager_start_with_dns_sd_mismatch_skips() {
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
     );
 
     manager.start(&config, None);
@@ -1495,6 +1499,7 @@ async fn test_manager_start_with_kubernetes_mismatch_skips() {
         dns_cache,
         Arc::new(ferrum_edge::health_check::HealthChecker::new()),
         ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
     );
 
     manager.start(&config, None);

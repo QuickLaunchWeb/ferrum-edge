@@ -21,12 +21,12 @@ use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
-use crate::load_balancer::LoadBalancerCache;
-use crate::plugin_cache::PluginCache;
+use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
     Direction, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
 };
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
+use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
 
 pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
@@ -481,15 +481,13 @@ pub struct TcpListenerConfig {
     pub proxy_id: String,
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
-    pub load_balancer_cache: Arc<LoadBalancerCache>,
-    pub consumer_index: Arc<ConsumerIndex>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
     /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
     pub tls_ca_bundle_path: Option<String>,
-    pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
     /// Hard cap (seconds) on Phase 2 of the TCP bidirectional relay — the
@@ -538,14 +536,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         proxy_id,
         config,
         dns_cache,
-        load_balancer_cache,
-        consumer_index,
+        request_epoch,
         frontend_tls_config,
         shutdown,
         metrics,
         tls_no_verify,
         tls_ca_bundle_path,
-        plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         tcp_half_close_max_wait_seconds,
         frontend_tls_handshake_timeout_seconds,
@@ -570,24 +566,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         "TCP proxy listener started on {}",
         addr
     );
-
-    // Pre-capture proxy metadata for plugin context (static for this listener's lifetime).
-    let (proxy_name, proxy_namespace, backend_scheme) = {
-        let current_config = config.load();
-        current_config
-            .proxies
-            .iter()
-            .find(|p| *p.id == *proxy_id)
-            .map(|p| (p.name.clone(), p.namespace.clone(), p.effective_scheme()))
-            .unwrap_or((
-                None,
-                crate::config::types::default_namespace(),
-                BackendScheme::Tcp,
-            ))
-    };
-
-    // Pre-resolve plugins for this proxy's protocol (TCP).
-    let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Tcp);
 
     // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
@@ -646,16 +624,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 metrics.active_connections.fetch_add(1, Ordering::Relaxed);
 
                 let proxy_id = proxy_id.clone();
-                let config = config.clone();
                 let dns_cache = dns_cache.clone();
-                let lb_cache = load_balancer_cache.clone();
-                let consumer_index = consumer_index.clone();
+                let request_epoch = request_epoch.clone();
                 let frontend_tls = frontend_tls_config.clone();
                 let metrics = metrics.clone();
                 let backend_tls = backend_tls_cache.clone();
-                let plugins = plugins.clone();
-                let proxy_name = proxy_name.clone();
-                let proxy_namespace = proxy_namespace.clone();
                 let cb_cache = circuit_breaker_cache.clone();
                 let sni_proxy_ids = sni_proxy_ids.clone();
                 let adaptive_buf = adaptive_buffer.clone();
@@ -667,15 +640,25 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     let _conn_guard = crate::overload::ConnectionGuard::new(&overload_for_conn);
 
                     let connected_at = chrono::Utc::now();
+                    let epoch = request_epoch.load();
+                    let base_proxy = epoch
+                        .config
+                        .proxies
+                        .iter()
+                        .find(|p| p.id.as_str() == proxy_id.as_ref());
+                    let consumer_index =
+                        Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
                     // Build stream context — plugins run inside handle_tcp_connection
                     // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext {
                         client_ip: remote_addr.ip().to_string(),
                         proxy_id: proxy_id.to_string(),
-                        proxy_name: proxy_name.clone(),
+                        proxy_name: base_proxy.and_then(|p| p.name.clone()),
                         listen_port: port,
-                        backend_scheme,
+                        backend_scheme: base_proxy
+                            .map(|p| p.effective_scheme())
+                            .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                         identified_consumer: None,
                         authenticated_identity: None,
@@ -689,16 +672,14 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         stream,
                         remote_addr,
                         &proxy_id,
-                        &config,
+                        &epoch,
                         &dns_cache,
-                        &lb_cache,
                         frontend_tls.as_ref(),
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
                         tcp_half_close_max_wait_seconds,
                         frontend_tls_handshake_timeout_seconds,
                         &cb_cache,
-                        &plugins,
                         &mut stream_ctx,
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
@@ -711,6 +692,27 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
                     let disconnected_at = chrono::Utc::now();
                     let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
+                    let final_proxy_id = stream_ctx.proxy_id.clone();
+                    // Keep disconnect hooks/logging on the same epoch that
+                    // admitted the connection. Long-lived TCP streams can span
+                    // config reloads; using the connection epoch preserves a
+                    // consistent view of SNI-selected proxy metadata and
+                    // stream plugins for the full connection lifetime.
+                    let final_proxy = epoch
+                        .config
+                        .proxies
+                        .iter()
+                        .find(|p| p.id == final_proxy_id);
+                    let plugins = epoch
+                        .plugin_cache
+                        .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);
+                    let proxy_name = stream_ctx.proxy_name.clone();
+                    let proxy_namespace = final_proxy
+                        .map(|p| p.namespace.clone())
+                        .unwrap_or_else(crate::config::types::default_namespace);
+                    let backend_scheme = final_proxy
+                        .map(|p| p.effective_scheme())
+                        .unwrap_or(stream_ctx.backend_scheme);
                     let (
                         bytes_in,
                         bytes_out,
@@ -807,7 +809,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
-                            proxy_id: proxy_id.to_string(),
+                            proxy_id: final_proxy_id,
                             proxy_name,
                             client_ip: remote_addr.ip().to_string(),
                             consumer_username,
@@ -916,16 +918,14 @@ async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
     tcp_half_close_max_wait_seconds: u64,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
-    plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
@@ -949,9 +949,8 @@ async fn handle_tcp_connection(
         client_stream,
         remote_addr,
         proxy_id,
-        config,
+        epoch,
         dns_cache,
-        lb_cache,
         frontend_tls_config,
         cached_backend_tls,
         global_tcp_idle_timeout,
@@ -960,7 +959,6 @@ async fn handle_tcp_connection(
         circuit_breaker_cache,
         start,
         &mut backend_info,
-        plugins,
         stream_ctx,
         sni_proxy_ids,
         adaptive_buffer,
@@ -984,9 +982,8 @@ async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
-    config: &arc_swap::ArcSwap<GatewayConfig>,
+    epoch: &RequestEpoch,
     dns_cache: &DnsCache,
-    lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
@@ -995,7 +992,6 @@ async fn handle_tcp_connection_inner(
     circuit_breaker_cache: &CircuitBreakerCache,
     start: Instant,
     backend_info: &mut TcpBackendInfo,
-    plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
@@ -1012,8 +1008,7 @@ async fn handle_tcp_connection_inner(
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
         stream_ctx.sni_hostname = sni.clone();
 
-        let current_config = config.load();
-        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &current_config)
+        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &epoch.config)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No matching passthrough proxy for SNI {:?} on port {}",
@@ -1024,7 +1019,8 @@ async fn handle_tcp_connection_inner(
         _resolved_proxy_id = Some(matched.to_string());
         // Update stream_ctx to reflect the resolved proxy
         stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = current_config
+        stream_ctx.proxy_name = epoch
+            .config
             .proxies
             .iter()
             .find(|p| p.id == matched)
@@ -1036,16 +1032,19 @@ async fn handle_tcp_connection_inner(
     };
 
     // Look up the proxy config and extract only the fields we need.
-    // The ArcSwap guard (and full Proxy) is dropped before any async work.
     let (params, cb_info) = {
-        let current_config = config.load();
-        let proxy = current_config
+        let proxy = epoch
+            .config
             .proxies
             .iter()
             .find(|p| p.id == proxy_id)
             .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
-        let (backend_host, backend_port) = resolve_backend_target(proxy, lb_cache)?;
+        stream_ctx.proxy_id = proxy.id.clone();
+        stream_ctx.proxy_name = proxy.name.clone();
+        stream_ctx.backend_scheme = proxy.effective_scheme();
+
+        let (backend_host, backend_port) = resolve_backend_target(proxy, &epoch.load_balancer)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
@@ -1083,6 +1082,9 @@ async fn handle_tcp_connection_inner(
 
         (params, cb_info)
     };
+    let plugins = epoch
+        .plugin_cache
+        .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
 
     // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
     if params.passthrough {
@@ -1094,7 +1096,7 @@ async fn handle_tcp_connection_inner(
 
         // Run on_stream_connect plugins (they see SNI but not decrypted data).
         if !plugins.is_empty() {
-            for plugin in plugins {
+            for plugin in plugins.iter() {
                 if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
                     debug!(
                         proxy_id = %proxy_id,
@@ -1264,7 +1266,7 @@ async fn handle_tcp_connection_inner(
     // For non-TLS proxies, run on_stream_connect plugins before backend connection.
     // TLS proxies defer this until after the TLS handshake so client cert is available.
     if frontend_tls_config.is_none() && !plugins.is_empty() {
-        for plugin in plugins {
+        for plugin in plugins.iter() {
             if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
                 debug!(
                     proxy_id = %proxy_id,
@@ -1320,9 +1322,12 @@ async fn handle_tcp_connection_inner(
                 Err(_) => {
                     if can_retry && attempt < max_retries {
                         // Circuit open on this target — try another
-                        if let Some(next) =
-                            try_next_target(&params, &current_host, current_port, lb_cache)
-                        {
+                        if let Some(next) = try_next_target(
+                            &params,
+                            &current_host,
+                            current_port,
+                            &epoch.load_balancer,
+                        ) {
                             warn!(
                                 proxy_id = %proxy_id,
                                 attempt,
@@ -1372,7 +1377,7 @@ async fn handle_tcp_connection_inner(
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, lb_cache)
+                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
                 {
                     warn!(
                         proxy_id = %proxy_id,
@@ -1435,7 +1440,7 @@ async fn handle_tcp_connection_inner(
                 if can_retry
                     && attempt < max_retries
                     && let Some(next) =
-                        try_next_target(&params, &current_host, current_port, lb_cache)
+                        try_next_target(&params, &current_host, current_port, &epoch.load_balancer)
                 {
                     warn!(
                         proxy_id = %proxy_id,
@@ -1521,7 +1526,7 @@ async fn handle_tcp_connection_inner(
 
         // Run on_stream_connect plugins after TLS handshake so client cert is available.
         if !plugins.is_empty() {
-            for plugin in plugins {
+            for plugin in plugins.iter() {
                 if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
                     debug!(
                         proxy_id = %proxy_id,
@@ -1737,18 +1742,18 @@ async fn handle_tcp_connection_inner(
 /// Resolve the backend target — either direct from proxy config or via load balancer.
 fn resolve_backend_target(
     proxy: &Proxy,
-    lb_cache: &LoadBalancerCache,
+    lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let selection = lb_cache
-            .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| -> anyhow::Error {
-                StreamSetupError::new(
-                    StreamSetupKind::NoHealthyTargets,
-                    format!("for upstream {upstream_id}"),
-                )
-                .into()
-            })?;
+        let selection =
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
+                .ok_or_else(|| -> anyhow::Error {
+                    StreamSetupError::new(
+                        StreamSetupKind::NoHealthyTargets,
+                        format!("for upstream {upstream_id}"),
+                    )
+                    .into()
+                })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
@@ -1769,7 +1774,7 @@ fn try_next_target(
     params: &TcpConnParams,
     current_host: &str,
     current_port: u16,
-    lb_cache: &LoadBalancerCache,
+    lb_snapshot: &LoadBalancerCacheInner,
 ) -> Option<(String, u16)> {
     let upstream_id = params.upstream_id.as_ref()?;
     let exclude = crate::config::types::UpstreamTarget {
@@ -1779,7 +1784,13 @@ fn try_next_target(
         path: None,
         tags: std::collections::HashMap::new(),
     };
-    let next = lb_cache.select_next_target(upstream_id, current_host, &exclude, None)?;
+    let next = LoadBalancerCache::select_next_target_from(
+        lb_snapshot,
+        upstream_id,
+        current_host,
+        &exclude,
+        None,
+    )?;
     Some((next.host.clone(), next.port))
 }
 

@@ -230,34 +230,6 @@ fn test_detects_consumer_changes() {
     assert_eq!(delta.modified_consumers[0].id, "c1");
 }
 
-#[test]
-fn test_affected_routes_paths() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
-    let old = GatewayConfig {
-        proxies: vec![
-            make_proxy("p1", "/api", t1),
-            make_proxy("p2", "/old-path", t1),
-        ],
-        ..Default::default()
-    };
-    let new = GatewayConfig {
-        proxies: vec![
-            make_proxy("p2", "/new-path", t2), // modified, listen_path changed
-            make_proxy("p3", "/added", t2),    // added
-                                               // p1 removed
-        ],
-        ..Default::default()
-    };
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    assert!(affected.listen_paths.contains(&"/api".to_string())); // removed proxy's path
-    assert!(affected.listen_paths.contains(&"/new-path".to_string())); // modified proxy's new path
-    assert!(affected.listen_paths.contains(&"/old-path".to_string())); // modified proxy's old path
-    assert!(affected.listen_paths.contains(&"/added".to_string())); // added proxy's path
-    assert!(affected.host_only_hosts.is_empty());
-}
-
 // --- Upstream delta tests ---
 
 #[test]

@@ -78,13 +78,14 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
-use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
+use crate::load_balancer::{HashOnStrategy, LoadBalancer, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection,
 };
 use crate::proxy::headers as headers_mod;
+use crate::request_epoch::{RequestEpoch, RequestEpochStore, StagedRequestEpoch};
 use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
@@ -896,6 +897,33 @@ impl Drop for PerIpRequestGuard {
     }
 }
 
+/// RAII guard for load-balancer connection accounting on upgraded sessions.
+///
+/// WebSocket proxying runs in a spawned task after the HTTP handler returns.
+/// Keeping the accounting in a guard makes the end event fire on normal close,
+/// upgrade failure, task cancellation, or panic unwind.
+struct LoadBalancerConnectionGuard {
+    target: Option<Arc<UpstreamTarget>>,
+    balancer: Option<Arc<LoadBalancer>>,
+}
+
+impl LoadBalancerConnectionGuard {
+    fn new(target: Option<Arc<UpstreamTarget>>, balancer: Option<Arc<LoadBalancer>>) -> Self {
+        if let (Some(target), Some(balancer)) = (target.as_ref(), balancer.as_ref()) {
+            balancer.record_connection_start(target);
+        }
+        Self { target, balancer }
+    }
+}
+
+impl Drop for LoadBalancerConnectionGuard {
+    fn drop(&mut self) {
+        if let (Some(target), Some(balancer)) = (self.target.as_ref(), self.balancer.as_ref()) {
+            balancer.record_connection_end(target);
+        }
+    }
+}
+
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
 /// Writes directly into a single pre-allocated buffer to avoid intermediate
@@ -1011,6 +1039,7 @@ fn reject_result_to_backend_response(
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
+    pub request_epoch: Arc<RequestEpochStore>,
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
     pub router_cache: Arc<RouterCache>,
@@ -1220,6 +1249,16 @@ impl ProxyState {
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
+        let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
+            config: Arc::new(config.clone()),
+            route_table: RouterCache::build_route_table_snapshot(&config),
+            plugin_cache: plugin_cache.load_inner(),
+            consumer_index: consumer_index.load_inner(),
+            load_balancer: load_balancer_cache.load_inner(),
+            config_generation: 1,
+            route_generation: 1,
+            lb_generation: 1,
+        }));
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
@@ -1244,6 +1283,7 @@ impl ProxyState {
             dns_cache.clone(),
             health_checker.clone(),
             plugin_http_client,
+            Some(request_epoch.clone()),
         ));
 
         let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -1272,113 +1312,117 @@ impl ProxyState {
 
         let overload = Arc::new(crate::overload::OverloadState::new());
 
-        let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
-            stream_bind_addr,
-            config_arc.clone(),
-            dns_cache.clone(),
-            load_balancer_cache.clone(),
-            consumer_index.clone(),
-            plugin_cache.clone(),
-            circuit_breaker_cache.clone(),
-            None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
-            env_config_arc.tls_no_verify,
-            env_config_arc.tls_ca_bundle_path.clone(),
-            env_config_arc.tcp_idle_timeout_seconds,
-            env_config_arc.tcp_half_close_max_wait_seconds,
-            env_config_arc.frontend_tls_handshake_timeout_seconds,
-            env_config_arc.udp_max_sessions,
-            env_config_arc.udp_cleanup_interval_seconds,
-            tls_policy_arc.clone(),
-            crls.clone(),
-            adaptive_buffer.clone(),
-            env_config_arc.udp_recvmmsg_batch_size,
-            {
-                let v = env_config_arc
-                    .tcp_fastopen_enabled
-                    .resolve(crate::socket_opts::is_tcp_fastopen_available);
-                tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
-                v
-            },
-            overload.clone(),
-            {
-                let v = env_config_arc
-                    .ktls_enabled
-                    .resolve(crate::socket_opts::ktls::is_ktls_available);
-                if v {
-                    tracing::info!("kTLS auto-detection: enabled (full key install probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .io_uring_splice_enabled
-                    .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
-                if v {
-                    tracing::info!(
-                        "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
-                    );
-                    // Warn if the tokio blocking-thread pool is too small for the
-                    // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
-                    // tasks per TCP connection (one per direction). With the default
-                    // cap of 512, thousands of concurrent streams will saturate the
-                    // pool and new splices will queue, causing latency spikes. 1024
-                    // is the rule-of-thumb floor; operators with very high connection
-                    // counts should set FERRUM_BLOCKING_THREADS much higher or
-                    // disable io_uring splice entirely.
-                    let effective_blocking_threads = env_config_arc.blocking_threads.unwrap_or(512);
-                    if effective_blocking_threads < 1024 {
-                        tracing::warn!(
-                            blocking_threads = effective_blocking_threads,
-                            "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
+        let stream_listener_manager = Arc::new(
+            stream_listener::StreamListenerManager::new_with_epoch(
+                stream_bind_addr,
+                config_arc.clone(),
+                dns_cache.clone(),
+                request_epoch.clone(),
+                circuit_breaker_cache.clone(),
+                None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
+                env_config_arc.tls_no_verify,
+                env_config_arc.tls_ca_bundle_path.clone(),
+                env_config_arc.tcp_idle_timeout_seconds,
+                env_config_arc.tcp_half_close_max_wait_seconds,
+                env_config_arc.frontend_tls_handshake_timeout_seconds,
+                env_config_arc.udp_max_sessions,
+                env_config_arc.udp_cleanup_interval_seconds,
+                tls_policy_arc.clone(),
+                crls.clone(),
+                adaptive_buffer.clone(),
+                env_config_arc.udp_recvmmsg_batch_size,
+                {
+                    let v = env_config_arc
+                        .tcp_fastopen_enabled
+                        .resolve(crate::socket_opts::is_tcp_fastopen_available);
+                    tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
+                    v
+                },
+                overload.clone(),
+                {
+                    let v = env_config_arc
+                        .ktls_enabled
+                        .resolve(crate::socket_opts::ktls::is_ktls_available);
+                    if v {
+                        tracing::info!(
+                            "kTLS auto-detection: enabled (full key install probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .io_uring_splice_enabled
+                        .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
+                    if v {
+                        tracing::info!(
+                            "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
+                        );
+                        // Warn if the tokio blocking-thread pool is too small for the
+                        // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
+                        // tasks per TCP connection (one per direction). With the default
+                        // cap of 512, thousands of concurrent streams will saturate the
+                        // pool and new splices will queue, causing latency spikes. 1024
+                        // is the rule-of-thumb floor; operators with very high connection
+                        // counts should set FERRUM_BLOCKING_THREADS much higher or
+                        // disable io_uring splice entirely.
+                        let effective_blocking_threads =
+                            env_config_arc.blocking_threads.unwrap_or(512);
+                        if effective_blocking_threads < 1024 {
+                            tracing::warn!(
+                                blocking_threads = effective_blocking_threads,
+                                "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
                              each TCP stream consumes 2 blocking threads. \
                              Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
-                            effective_blocking_threads
-                        );
+                                effective_blocking_threads
+                            );
+                        }
+                    } else {
+                        tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
                     }
-                } else {
-                    tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
-                }
-                v
-            },
-            env_config_arc.so_busy_poll_us,
-            {
-                let v = env_config_arc
-                    .udp_gro_enabled
-                    .resolve(crate::socket_opts::is_udp_gro_available);
-                // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
-                tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_gso_enabled
-                    .resolve(crate::socket_opts::is_udp_gso_available);
-                if v {
-                    tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
-                }
-                v
-            },
-            {
-                let v = env_config_arc
-                    .udp_pktinfo_enabled
-                    .resolve(crate::socket_opts::is_udp_pktinfo_available);
-                if v {
-                    tracing::info!(
-                        "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
-                    );
-                } else {
-                    tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
-                }
-                v
-            },
-        ));
+                    v
+                },
+                env_config_arc.so_busy_poll_us,
+                {
+                    let v = env_config_arc
+                        .udp_gro_enabled
+                        .resolve(crate::socket_opts::is_udp_gro_available);
+                    // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
+                    tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_gso_enabled
+                        .resolve(crate::socket_opts::is_udp_gso_available);
+                    if v {
+                        tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
+                    }
+                    v
+                },
+                {
+                    let v = env_config_arc
+                        .udp_pktinfo_enabled
+                        .resolve(crate::socket_opts::is_udp_pktinfo_available);
+                    if v {
+                        tracing::info!(
+                            "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
+                        );
+                    } else {
+                        tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
+                    }
+                    v
+                },
+            ),
+        );
 
         Ok(Self {
             config: config_arc,
+            request_epoch,
             dns_cache,
             connection_pool,
             router_cache,
@@ -2186,6 +2230,131 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
+    fn delta_routes_changed(
+        delta: &crate::config_delta::ConfigDelta,
+        old_config: &GatewayConfig,
+    ) -> bool {
+        let is_route_indexed = |proxy: &Proxy| !proxy.dispatch_kind.is_stream();
+
+        if delta.added_proxies.iter().any(is_route_indexed)
+            || delta.modified_proxies.iter().any(is_route_indexed)
+        {
+            return true;
+        }
+
+        if delta.modified_proxies.is_empty() && delta.removed_proxy_ids.is_empty() {
+            return false;
+        }
+
+        let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
+            .proxies
+            .iter()
+            .filter(|proxy| is_route_indexed(proxy))
+            .map(|proxy| proxy.id.as_str())
+            .collect();
+
+        delta
+            .modified_proxies
+            .iter()
+            .map(|proxy| proxy.id.as_str())
+            .chain(delta.removed_proxy_ids.iter().map(String::as_str))
+            .any(|id| old_route_indexed_proxy_ids.contains(id))
+    }
+
+    fn delta_consumers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_consumers.is_empty()
+            || !delta.modified_consumers.is_empty()
+            || !delta.removed_consumer_ids.is_empty()
+    }
+
+    fn delta_load_balancers_changed(delta: &crate::config_delta::ConfigDelta) -> bool {
+        !delta.added_upstreams.is_empty()
+            || !delta.modified_upstreams.is_empty()
+            || !delta.removed_upstream_ids.is_empty()
+    }
+
+    fn stage_incremental_request_epoch(
+        &self,
+        current: &RequestEpoch,
+        new_config: &GatewayConfig,
+        staged_config: Arc<GatewayConfig>,
+        delta: &crate::config_delta::ConfigDelta,
+    ) -> Result<StagedRequestEpoch, String> {
+        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(new_config);
+        let rebuild_globals = delta
+            .added_plugin_configs
+            .iter()
+            .chain(delta.modified_plugin_configs.iter())
+            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
+            || !delta.removed_plugin_config_ids.is_empty();
+        let route_changed = Self::delta_routes_changed(delta, &current.config);
+        let consumer_changed = Self::delta_consumers_changed(delta);
+        let lb_changed = Self::delta_load_balancers_changed(delta);
+
+        let plugin_inner = self.plugin_cache.build_delta_inner(
+            &current.plugin_cache,
+            new_config,
+            &proxy_ids_to_rebuild,
+            &delta.removed_proxy_ids,
+            rebuild_globals,
+        )?;
+        let consumer_inner = if consumer_changed {
+            ConsumerIndex::build_inner(&new_config.consumers)
+        } else {
+            Arc::clone(&current.consumer_index)
+        };
+        let load_balancer = if lb_changed {
+            LoadBalancerCache::build_delta_inner(
+                &current.load_balancer,
+                new_config,
+                &delta.added_upstreams,
+                &delta.removed_upstream_ids,
+                &delta.modified_upstreams,
+            )
+        } else {
+            Arc::clone(&current.load_balancer)
+        };
+        let route_table = if route_changed {
+            RouterCache::build_route_table_snapshot(new_config)
+        } else {
+            Arc::clone(&current.route_table)
+        };
+
+        Ok(StagedRequestEpoch {
+            config: staged_config,
+            route_table,
+            plugin_cache: plugin_inner,
+            consumer_index: consumer_inner,
+            load_balancer,
+            route_changed,
+            lb_changed,
+        })
+    }
+
+    fn mirror_request_epoch_wrappers(
+        &self,
+        published: &RequestEpoch,
+        route_changed: bool,
+        clear_route_caches: bool,
+    ) {
+        if route_changed {
+            self.router_cache.store_route_table_snapshot(
+                Arc::clone(&published.route_table),
+                published.route_generation,
+            );
+            if clear_route_caches {
+                self.router_cache.clear_lookup_caches();
+            }
+        }
+        self.plugin_cache
+            .store_inner(Arc::clone(&published.plugin_cache));
+        self.consumer_index
+            .store_inner(Arc::clone(&published.consumer_index));
+        self.load_balancer_cache
+            .store_inner(Arc::clone(&published.load_balancer));
+        self.config.store(Arc::clone(&published.config));
+    }
+
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, mut new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
@@ -2230,16 +2399,47 @@ impl ProxyState {
             && new_config.upstreams.is_empty();
 
         if old_is_empty && !new_is_empty {
-            self.router_cache.rebuild(&new_config);
-            if let Err(e) = self.plugin_cache.rebuild(&new_config) {
-                error!(
-                    "Config reload rejected — security plugin validation failed: {}",
-                    e
-                );
-                return false;
-            }
-            self.consumer_index.rebuild(&new_config.consumers);
-            self.load_balancer_cache.rebuild(&new_config);
+            let route_table = RouterCache::build_route_table_snapshot(&new_config);
+            let plugin_inner = match self
+                .plugin_cache
+                .build_inner_with_existing_client(&new_config)
+            {
+                Ok(inner) => inner,
+                Err(e) => {
+                    error!(
+                        "Config reload rejected — security plugin validation failed: {}",
+                        e
+                    );
+                    return false;
+                }
+            };
+            let consumer_inner = ConsumerIndex::build_inner(&new_config.consumers);
+            let lb_inner = LoadBalancerCache::build_inner(&new_config);
+            let staged_config = Arc::new(new_config.clone());
+            let published = match self.request_epoch.update_config(
+                |_| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::clone(&staged_config),
+                        route_table: Arc::clone(&route_table),
+                        plugin_cache: Arc::clone(&plugin_inner),
+                        consumer_index: Arc::clone(&consumer_inner),
+                        load_balancer: Arc::clone(&lb_inner),
+                        route_changed: true,
+                        lb_changed: true,
+                    }))
+                },
+                |published| {
+                    self.mirror_request_epoch_wrappers(published, true, true);
+                },
+            ) {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) => return false,
+                Err(e) => {
+                    error!("Config reload rejected: {}", e);
+                    return false;
+                }
+            };
+            PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -2273,7 +2473,6 @@ impl ProxyState {
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-            self.config.store(Arc::new(new_config));
             self.spawn_backend_capability_refresh();
 
             // Reconcile stream proxy listeners (TCP/UDP)
@@ -2314,45 +2513,36 @@ impl ProxyState {
             return false;
         }
 
-        // --- RouterCache: rebuild route table, surgically invalidate path cache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache: only rebuild plugins for affected proxies ---
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
-
-        // --- ConsumerIndex: surgical add/remove/update ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let proxy_plugin_rebuild_count = delta.proxy_ids_needing_plugin_rebuild(&new_config).len();
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
         );
-
-        // --- LoadBalancerCache: only rebuild changed upstreams ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2415,9 +2605,6 @@ impl ProxyState {
             });
         }
 
-        // Clear cached pool keys when proxy settings change
-        // Swap the canonical config last (readers may still be using old caches
-        // via ArcSwap snapshots until they finish their current request)
         // Prune adaptive buffer state for removed proxies.
         {
             let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
@@ -2425,7 +2612,6 @@ impl ProxyState {
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
         self.spawn_backend_capability_refresh();
 
         // Reconcile stream proxy listeners if any proxies changed
@@ -2478,7 +2664,7 @@ impl ProxyState {
             delta.added_upstreams.len(),
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
-            proxy_ids_to_rebuild.len(),
+            proxy_plugin_rebuild_count,
         );
 
         // Reconcile service discovery tasks for changed upstreams
@@ -2702,54 +2888,41 @@ impl ProxyState {
             }
         }
 
-        // Build a ConfigDelta to feed into existing cache apply_delta() methods.
-        // For incremental results, we treat all changed resources as "modified"
-        // since the DB layer doesn't distinguish adds from modifications.
-        // The cache apply_delta methods handle both cases correctly.
+        // Build a ConfigDelta against old + new to get proper
+        // add/modify/remove classification for the epoch builders.
         let old_config = self.config.load_full();
 
-        // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
-        // --- RouterCache ---
-        let affected_routes = delta.affected_routes(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_routes);
-
-        // --- PluginCache ---
-        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
-        let rebuild_globals = delta
-            .added_plugin_configs
-            .iter()
-            .chain(delta.modified_plugin_configs.iter())
-            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
-            || !delta.removed_plugin_config_ids.is_empty();
-        if let Err(e) = self.plugin_cache.apply_delta(
-            &new_config,
-            &proxy_ids_to_rebuild,
-            &delta.removed_proxy_ids,
-            rebuild_globals,
-        ) {
-            error!(
-                "Config reload rejected — security plugin validation failed: {}",
-                e
-            );
-            return false;
-        }
-
-        // --- ConsumerIndex ---
-        self.consumer_index.apply_delta(
-            &delta.added_consumers,
-            &delta.removed_consumer_ids,
-            &delta.modified_consumers,
+        // Stage all request-facing cache inners before publishing any request-visible epoch.
+        let route_changed = Self::delta_routes_changed(&delta, &old_config);
+        let staged_config = Arc::new(new_config.clone());
+        let publish_result = self.request_epoch.update_config(
+            |current| {
+                self.stage_incremental_request_epoch(
+                    current,
+                    &new_config,
+                    Arc::clone(&staged_config),
+                    &delta,
+                )
+                .map(Some)
+            },
+            |published| {
+                self.mirror_request_epoch_wrappers(published, route_changed, false);
+            },
         );
-
-        // --- LoadBalancerCache ---
-        self.load_balancer_cache.apply_delta(
-            &new_config,
-            &delta.added_upstreams,
-            &delta.removed_upstream_ids,
-            &delta.modified_upstreams,
-        );
+        let published = match publish_result {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => return false,
+            Err(e) => {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
+        };
+        PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
 
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -2814,9 +2987,7 @@ impl ProxyState {
             self.adaptive_buffer.prune_missing(&active_ids);
         }
 
-        // Store updated config
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
-        self.config.store(Arc::new(new_config));
 
         // Trigger a coalesced capability refresh so added/modified HTTPS
         // backends get classified immediately instead of waiting up to the
@@ -3021,7 +3192,9 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
+    epoch: Arc<RequestEpoch>,
     upstream_target: Option<Arc<UpstreamTarget>>,
+    upstream_balancer: Option<Arc<LoadBalancer>>,
     lb_hash_key: Option<String>,
     sticky_cookie_needed: bool,
     start_time: Instant,
@@ -3209,7 +3382,8 @@ async fn handle_websocket_request_authenticated(
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
                         && let Some(ref hash_key) = lb_hash_key
-                        && let Some(next) = state.load_balancer_cache.select_next_target(
+                        && let Some(next) = LoadBalancerCache::select_next_target_from(
+                            &epoch.load_balancer,
                             upstream_id,
                             hash_key,
                             prev_target,
@@ -3321,6 +3495,9 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
+    let ws_lb_guard =
+        LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
+
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
     let ws_status_code: u16 = if is_h2_websocket { 200 } else { 101 };
@@ -3401,9 +3578,10 @@ async fn handle_websocket_request_authenticated(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -3473,6 +3651,7 @@ async fn handle_websocket_request_authenticated(
         session_start: chrono::Utc::now(),
     };
     tokio::spawn(async move {
+        let _ws_lb_guard = ws_lb_guard;
         match on_upgrade.await {
             Ok(upgraded) => {
                 if let Err(e) = run_websocket_proxy(
@@ -5575,11 +5754,15 @@ async fn handle_proxy_request_inner(
         None => None,
     };
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
+    let epoch = state.request_epoch.load();
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let route_match = state
-        .router_cache
-        .find_proxy(request_host.as_deref(), &path);
+    let route_match = state.router_cache.find_proxy_in_snapshot(
+        &epoch.route_table,
+        epoch.route_generation,
+        request_host.as_deref(),
+        &path,
+    );
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
@@ -5697,7 +5880,7 @@ async fn handle_proxy_request_inner(
     // Load plugin-cache values once for this request. Every plugin list,
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = state.plugin_cache.request_view(&proxy.id, request_protocol);
+    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
@@ -5761,11 +5944,12 @@ async fn handle_proxy_request_inner(
 
     {
         let auth_phase_start = Instant::now();
+        let consumer_index = ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index));
         if let Some((status_code, body, headers)) = run_authentication_phase(
             proxy.auth_mode.clone(),
             &auth_plugins,
             &mut ctx,
-            &state.consumer_index,
+            &consumer_index,
         )
         .await
         {
@@ -6001,11 +6185,17 @@ async fn handle_proxy_request_inner(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
-    // Resolve upstream target and hash key with a single ArcSwap load.
-    let selection =
-        backend_dispatch::select_upstream_target(&proxy, &state, &ctx.client_ip, proxy_headers);
+    // Resolve upstream target and hash key from the request epoch.
+    let selection = backend_dispatch::select_upstream_target(
+        &proxy,
+        &state,
+        &epoch,
+        &ctx.client_ip,
+        proxy_headers,
+    );
     let lb_hash_key = selection.lb_hash_key;
     let upstream_target = selection.target;
+    let upstream_balancer = selection.balancer;
     let upstream_is_fallback = selection.is_fallback;
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
@@ -6088,7 +6278,9 @@ async fn handle_proxy_request_inner(
             ctx,
             plugins,
             plugin_execution_ns,
+            Arc::clone(&epoch),
             upstream_target,
+            upstream_balancer,
             lb_hash_key,
             sticky_cookie_needed,
             start_time,
@@ -6376,7 +6568,8 @@ async fn handle_proxy_request_inner(
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(ref hash_key) = lb_hash_key
-                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                    && let Some(next) = LoadBalancerCache::select_next_target_from(
+                        &epoch.load_balancer,
                         upstream_id,
                         hash_key,
                         prev_target,
@@ -6873,9 +7066,13 @@ async fn handle_proxy_request_inner(
                     && let (Some(upstream_id), Some(target)) =
                         (&proxy.upstream_id, &upstream_target)
                 {
-                    let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+                    let strategy = LoadBalancerCache::get_hash_on_strategy_from(
+                        &epoch.load_balancer,
+                        upstream_id,
+                    );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-                        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+                        let upstream =
+                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
                         let default_cc = crate::config::types::HashOnCookieConfig::default();
                         let cookie_config = upstream
                             .as_ref()
@@ -7028,10 +7225,12 @@ async fn handle_proxy_request_inner(
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_start(upstream_id, target);
+    if let (Some(_upstream_id), Some(target), Some(balancer)) = (
+        &proxy.upstream_id,
+        &upstream_target,
+        upstream_balancer.as_ref(),
+    ) {
+        balancer.record_connection_start(target);
     }
 
     let should_stream = should_stream_response_body(
@@ -7141,7 +7340,8 @@ async fn handle_proxy_request_inner(
             // same protocol.
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(ref hash_key) = lb_hash_key
-                && let Some(next) = state.load_balancer_cache.select_next_target(
+                && let Some(next) = LoadBalancerCache::select_next_target_from(
+                    &epoch.load_balancer,
                     upstream_id,
                     hash_key,
                     prev_target,
@@ -7276,6 +7476,8 @@ async fn handle_proxy_request_inner(
     backend_dispatch::record_backend_outcome(
         &state,
         &proxy,
+        &epoch.load_balancer,
+        upstream_balancer.as_ref(),
         upstream_target.as_deref(),
         final_cb_target_key.as_deref(),
         response_status,
@@ -7523,9 +7725,10 @@ async fn handle_proxy_request_inner(
     if sticky_cookie_needed
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let strategy =
+            LoadBalancerCache::get_hash_on_strategy_from(&epoch.load_balancer, upstream_id);
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -10559,6 +10762,99 @@ mod tests {
             }
         }))
         .expect("test proxy should deserialize")
+    }
+
+    fn route_delta_proxy(
+        id: &str,
+        dispatch_kind: DispatchKind,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Proxy {
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.id = id.to_string();
+        proxy.dispatch_kind = dispatch_kind;
+        proxy.updated_at = updated_at;
+        proxy.created_at = updated_at;
+        if dispatch_kind.is_stream() {
+            proxy.backend_scheme = Some(BackendScheme::Tcp);
+            proxy.listen_path = None;
+            proxy.listen_port = Some(20_000);
+        } else {
+            proxy.backend_scheme = Some(BackendScheme::Http);
+            proxy.listen_path = Some(format!("/{id}"));
+            proxy.listen_port = None;
+        }
+        proxy
+    }
+
+    fn route_delta_config(proxies: Vec<Proxy>) -> GatewayConfig {
+        GatewayConfig {
+            proxies,
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn delta_routes_changed_ignores_stream_only_proxy_changes() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let old_config =
+            route_delta_config(vec![route_delta_proxy("tcp", DispatchKind::TcpRaw, t0)]);
+        let added_stream = route_delta_config(vec![
+            old_config.proxies[0].clone(),
+            route_delta_proxy("tcp-added", DispatchKind::TcpRaw, t1),
+        ]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &added_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let mut modified_stream = old_config.proxies[0].clone();
+        modified_stream.backend_port = 9443;
+        modified_stream.updated_at = t1;
+        let modified_config = route_delta_config(vec![modified_stream]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &modified_config);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+
+        let removed_stream = route_delta_config(vec![]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &removed_stream);
+        assert!(!ProxyState::delta_routes_changed(&delta, &old_config));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_http_route_changes_and_transitions() {
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+
+        let empty_config = route_delta_config(vec![]);
+        let added_http =
+            route_delta_config(vec![route_delta_proxy("http", DispatchKind::HttpPool, t1)]);
+        let delta = crate::config_delta::ConfigDelta::compute(&empty_config, &added_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &empty_config));
+
+        let old_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t0,
+        )]);
+        let new_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_http, &new_stream);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_http));
+
+        let old_stream = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::TcpRaw,
+            t0,
+        )]);
+        let new_http = route_delta_config(vec![route_delta_proxy(
+            "transition",
+            DispatchKind::HttpPool,
+            t1,
+        )]);
+        let delta = crate::config_delta::ConfigDelta::compute(&old_stream, &new_http);
+        assert!(ProxyState::delta_routes_changed(&delta, &old_stream));
     }
 
     #[test]

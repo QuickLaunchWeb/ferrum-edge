@@ -32,6 +32,7 @@ mod plugin_cache;
 mod plugins;
 mod pool;
 mod proxy;
+pub mod request_epoch;
 mod retry;
 mod router_cache;
 mod secrets;

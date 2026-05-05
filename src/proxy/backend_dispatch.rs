@@ -14,9 +14,12 @@ use hyper::Request;
 use tracing::{debug, warn};
 
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
-use crate::load_balancer::{HashOnStrategy, HealthContext, LoadBalancerCache};
+use crate::load_balancer::{
+    HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
+};
 use crate::proxy::ProxyState;
 use crate::proxy::is_valid_websocket_key;
+use crate::request_epoch::RequestEpoch;
 
 // ---------------------------------------------------------------------------
 // Runtime HTTP flavor detection
@@ -131,6 +134,8 @@ pub(crate) struct UpstreamSelection {
     /// Selected upstream target, or `None` if no upstream is configured or all
     /// targets are unavailable.
     pub target: Option<Arc<UpstreamTarget>>,
+    /// Exact LB object used for selection, for same-generation accounting.
+    pub balancer: Option<Arc<crate::load_balancer::LoadBalancer>>,
     /// `true` when all targets were unhealthy and the selection fell back to the
     /// least-unhealthy target.
     pub is_fallback: bool,
@@ -146,6 +151,7 @@ pub(crate) struct UpstreamSelection {
 pub(crate) fn select_upstream_target(
     proxy: &Proxy,
     state: &ProxyState,
+    epoch: &RequestEpoch,
     client_ip: &str,
     proxy_headers: &HashMap<String, String>,
 ) -> UpstreamSelection {
@@ -153,6 +159,7 @@ pub(crate) fn select_upstream_target(
         return UpstreamSelection {
             lb_hash_key: None,
             target: None,
+            balancer: None,
             is_fallback: false,
             sticky_cookie_needed: false,
         };
@@ -168,13 +175,13 @@ pub(crate) fn select_upstream_target(
         proxy_passive: proxy_passive.clone(),
     };
 
-    // Single ArcSwap load for both strategy + selection
-    let balancers = state.load_balancer_cache.load();
-    let strategy = LoadBalancerCache::get_hash_on_strategy_from(&balancers, upstream_id);
+    let balancers = &epoch.load_balancer;
+    let strategy = LoadBalancerCache::get_hash_on_strategy_from(balancers, upstream_id);
     let (hash_key, needs_set) = resolve_hash_key(&strategy, client_ip, proxy_headers);
 
+    let selected_balancer = balancers.get_balancer(upstream_id);
     match LoadBalancerCache::select_target_from(
-        &balancers,
+        balancers,
         upstream_id,
         &hash_key,
         Some(&health_ctx),
@@ -200,6 +207,7 @@ pub(crate) fn select_upstream_target(
             UpstreamSelection {
                 lb_hash_key: Some(hash_key),
                 target: Some(selection.target),
+                balancer: selected_balancer,
                 is_fallback: selection.is_fallback,
                 sticky_cookie_needed: needs_set,
             }
@@ -209,6 +217,7 @@ pub(crate) fn select_upstream_target(
             UpstreamSelection {
                 lb_hash_key: Some(hash_key),
                 target: None,
+                balancer: None,
                 is_fallback: false,
                 sticky_cookie_needed: false,
             }
@@ -257,6 +266,8 @@ pub(crate) fn check_circuit_breaker(
 pub(crate) fn record_backend_outcome(
     state: &ProxyState,
     proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
     upstream_target: Option<&UpstreamTarget>,
     final_cb_target_key: Option<&str>,
     response_status: u16,
@@ -265,10 +276,8 @@ pub(crate) fn record_backend_outcome(
     backend_elapsed: Duration,
 ) {
     // End connection tracking for least-connections
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_end(upstream_id, target);
+    if let (Some(target), Some(balancer)) = (upstream_target, selected_balancer) {
+        balancer.record_connection_end(target);
     }
 
     // Record backend TTFB for least-latency load balancing (passive path).
@@ -283,17 +292,15 @@ pub(crate) fn record_backend_outcome(
         && response_status < 500
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
     {
-        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+        let upstream = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id);
         let has_active_hc = upstream
             .as_ref()
             .and_then(|u| u.health_checks.as_ref())
             .and_then(|hc| hc.active.as_ref())
             .is_some();
-        if !has_active_hc {
+        if !has_active_hc && let Some(balancer) = selected_balancer {
             let latency_us = backend_elapsed.as_micros() as u64;
-            state
-                .load_balancer_cache
-                .record_latency(upstream_id, target, latency_us);
+            balancer.record_latency(target, latency_us);
         }
     }
 
@@ -320,7 +327,7 @@ pub(crate) fn record_backend_outcome(
 
     // Passive health check reporting (O(1) upstream lookup via index)
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target)
-        && let Some(upstream) = state.load_balancer_cache.get_upstream(upstream_id)
+        && let Some(upstream) = LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
         && let Some(hc) = &upstream.health_checks
     {
         state.health_checker.report_response(

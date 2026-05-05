@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
-use crate::config_delta::AffectedRoutes;
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -53,9 +52,6 @@ struct RouteEntry {
 /// This is the key optimization for scaling to thousands of proxies — without it,
 /// every cache miss triggers a linear scan of ALL routes in the tier.
 struct IndexedPrefixRoutes {
-    /// Sorted by listen_path length descending (longest first).
-    /// Used as fallback and for the apply_delta retain scan.
-    sorted: Vec<RouteEntry>,
     /// Maps listen_path → Arc<Proxy> for O(1) exact-match and O(depth) prefix lookups.
     path_index: HashMap<String, Arc<Proxy>>,
 }
@@ -116,7 +112,7 @@ impl IndexedRegexRoutes {
 ///
 /// Host-only routes never exist in the catch-all tier: a proxy with both
 /// `hosts.is_empty()` and `listen_path.is_none()` is rejected at config validation.
-struct HostRouteTable {
+pub(crate) struct HostRouteTable {
     /// Exact host → indexed prefix route entries (longest listen_path first + HashMap index).
     exact_hosts: HashMap<String, IndexedPrefixRoutes>,
     /// Wildcard suffix entries, e.g., ("*.example.com", routes).
@@ -147,6 +143,14 @@ struct RegexCacheEntry {
     proxy: Arc<Proxy>,
     path_params: Vec<(String, String)>,
     matched_len: usize,
+    route_generation: u64,
+}
+
+/// Cached prefix or host-only match result.
+#[derive(Clone)]
+struct PrefixCacheEntry {
+    proxy: Option<Arc<Proxy>>,
+    route_generation: u64,
 }
 
 /// Cache-line aligned counter row for the Count-Min Sketch.
@@ -283,8 +287,8 @@ pub struct RouterCache {
     /// Pre-computed host-based route index.
     route_table: ArcSwap<HostRouteTable>,
     /// Bounded cache for prefix route lookups: "host\0path" → matched proxy.
-    /// `None` entries represent negative cache (no route matched from any tier).
-    prefix_cache: DashMap<String, Option<Arc<Proxy>>>,
+    /// `proxy: None` entries represent negative cache (no route matched from any tier).
+    prefix_cache: DashMap<String, PrefixCacheEntry>,
     /// Bounded cache for regex route lookups: "host\0path" → match result.
     /// Separate partition prevents high-cardinality regex paths from evicting
     /// prefix cache entries. `None` entries are NOT stored here — a regex miss
@@ -298,6 +302,10 @@ pub struct RouterCache {
     /// Frequency sketch shared by both cache partitions.
     /// Tracks access frequency for frequency-aware eviction (least-frequent-of-sample).
     frequency_sketch: CountMinSketch,
+    /// Route-table generation for standalone wrapper users. RequestEpoch hot
+    /// paths pass their own route_generation into lookup so LB-only epochs do
+    /// not invalidate route cache entries.
+    route_generation: AtomicU64,
 }
 
 impl RouterCache {
@@ -340,24 +348,28 @@ impl RouterCache {
             prefix_eviction_counter: AtomicU64::new(0),
             regex_eviction_counter: AtomicU64::new(0),
             frequency_sketch: CountMinSketch::new(sketch_width, age_threshold),
+            route_generation: AtomicU64::new(1),
         }
     }
 
-    /// Atomically rebuild the route table from new config and clear all caches.
-    ///
-    /// Called by `ProxyState::update_config()` when database polling or SIGHUP
-    /// delivers a new configuration. Lock-free for readers — in-flight requests
-    /// continue using the previous table until they complete.
-    pub fn rebuild(&self, config: &GatewayConfig) {
-        let table = Self::build_route_table(config);
-        self.route_table.store(Arc::new(table));
+    pub(crate) fn build_route_table_snapshot(config: &GatewayConfig) -> Arc<HostRouteTable> {
+        Arc::new(Self::build_route_table(config))
+    }
+
+    pub(crate) fn store_route_table_snapshot(
+        &self,
+        table: Arc<HostRouteTable>,
+        route_generation: u64,
+    ) {
+        self.route_table.store(table);
+        self.route_generation
+            .store(route_generation, Ordering::Release);
+    }
+
+    pub(crate) fn clear_lookup_caches(&self) {
         self.prefix_cache.clear();
         self.regex_cache.clear();
         self.frequency_sketch.reset();
-        debug!(
-            "Router cache rebuilt: {} routes, caches cleared",
-            config.proxies.len()
-        );
     }
 
     /// Find the matching proxy for a request host and path.
@@ -370,7 +382,20 @@ impl RouterCache {
     ///
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
+    #[allow(dead_code)] // Library/test API; request hot paths use find_proxy_in_snapshot().
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
+        let generation = self.route_generation.load(Ordering::Acquire);
+        let table = self.route_table.load();
+        self.find_proxy_in_snapshot(&table, generation, host, path)
+    }
+
+    pub(crate) fn find_proxy_in_snapshot(
+        &self,
+        table: &HostRouteTable,
+        route_generation: u64,
+        host: Option<&str>,
+        path: &str,
+    ) -> Option<RouteMatch> {
         // Fast path: use thread-local buffer for cache lookup to avoid String
         // allocation on cache hits (99%+ of requests). Only allocate on misses.
         let hit = CACHE_KEY_BUF.with(|buf| {
@@ -379,26 +404,31 @@ impl RouterCache {
 
             // Fast path 1: check prefix cache (includes negative entries for total misses)
             if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
-                self.frequency_sketch.increment(&buf);
-                return Some(entry.value().as_ref().map(|proxy| RouteMatch {
-                    // Host-only proxies (listen_path == None) match any path and
-                    // strip nothing; `matched_prefix_len` is 0. Otherwise, use
-                    // the listen_path length as before.
-                    matched_prefix_len: proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
-                    proxy: Arc::clone(proxy),
-                    path_params: Vec::new(),
-                }));
+                let cached = entry.value();
+                if cached.route_generation == route_generation {
+                    self.frequency_sketch.increment(&buf);
+                    return Some(cached.proxy.as_ref().map(|proxy| RouteMatch {
+                        // Host-only proxies (listen_path == None) match any path and
+                        // strip nothing; `matched_prefix_len` is 0. Otherwise, use
+                        // the listen_path length as before.
+                        matched_prefix_len: proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+                        proxy: Arc::clone(proxy),
+                        path_params: Vec::new(),
+                    }));
+                }
             }
 
             // Fast path 2: check regex cache (only contains positive matches)
             if let Some(entry) = self.regex_cache.get(buf.as_str()) {
-                self.frequency_sketch.increment(&buf);
                 let cached = entry.value();
-                return Some(Some(RouteMatch {
-                    proxy: Arc::clone(&cached.proxy),
-                    path_params: cached.path_params.clone(),
-                    matched_prefix_len: cached.matched_len,
-                }));
+                if cached.route_generation == route_generation {
+                    self.frequency_sketch.increment(&buf);
+                    return Some(Some(RouteMatch {
+                        proxy: Arc::clone(&cached.proxy),
+                        path_params: cached.path_params.clone(),
+                        matched_prefix_len: cached.matched_len,
+                    }));
+                }
             }
 
             None // Cache miss — need slow path
@@ -410,8 +440,7 @@ impl RouterCache {
         }
 
         // Slow path: search the host route table (cache miss)
-        let table = self.route_table.load();
-        let result = Self::search_route_table(&table, host, path);
+        let result = Self::search_route_table(table, host, path);
 
         // Allocate the cache key String only on the cold path (cache miss + insert).
         let cache_key = make_cache_key(host, path);
@@ -423,7 +452,9 @@ impl RouterCache {
                 if !route_match.path_params.is_empty() || is_regex_proxy(&route_match.proxy) =>
             {
                 // Regex match → regex cache
-                if self.regex_cache.len() >= self.max_cache_entries {
+                if self.regex_cache.len() >= self.max_cache_entries
+                    && !self.regex_cache.contains_key(&cache_key)
+                {
                     self.evict_regex_sample();
                 }
                 self.frequency_sketch.increment(&cache_key);
@@ -433,25 +464,41 @@ impl RouterCache {
                         proxy: Arc::clone(&route_match.proxy),
                         path_params: route_match.path_params.clone(),
                         matched_len: route_match.matched_prefix_len,
+                        route_generation,
                     },
                 );
             }
             Some(route_match) => {
                 // Prefix match → prefix cache
-                if self.prefix_cache.len() >= self.max_cache_entries {
+                if self.prefix_cache.len() >= self.max_cache_entries
+                    && !self.prefix_cache.contains_key(&cache_key)
+                {
                     self.evict_prefix_sample();
                 }
                 self.frequency_sketch.increment(&cache_key);
-                self.prefix_cache
-                    .insert(cache_key, Some(Arc::clone(&route_match.proxy)));
+                self.prefix_cache.insert(
+                    cache_key,
+                    PrefixCacheEntry {
+                        proxy: Some(Arc::clone(&route_match.proxy)),
+                        route_generation,
+                    },
+                );
             }
             None => {
                 // Negative entry → prefix cache (both tiers missed)
-                if self.prefix_cache.len() >= self.max_cache_entries {
+                if self.prefix_cache.len() >= self.max_cache_entries
+                    && !self.prefix_cache.contains_key(&cache_key)
+                {
                     self.evict_prefix_sample();
                 }
                 self.frequency_sketch.increment(&cache_key);
-                self.prefix_cache.insert(cache_key, None);
+                self.prefix_cache.insert(
+                    cache_key,
+                    PrefixCacheEntry {
+                        proxy: None,
+                        route_generation,
+                    },
+                );
             }
         }
 
@@ -548,26 +595,26 @@ impl RouterCache {
     }
 
     /// Number of entries currently in the prefix cache (for testing).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn cache_len(&self) -> usize {
         self.prefix_cache.len()
     }
 
     /// Number of entries currently in the regex cache (for testing).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn regex_cache_len(&self) -> usize {
         self.regex_cache.len()
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
     pub fn route_count(&self) -> usize {
         let table = self.route_table.load();
-        let exact_count: usize = table.exact_hosts.values().map(|v| v.sorted.len()).sum();
+        let exact_count: usize = table.exact_hosts.values().map(|v| v.path_index.len()).sum();
         let wildcard_count: usize = table
             .wildcard_hosts
             .iter()
-            .map(|(_, v)| v.sorted.len())
+            .map(|(_, v)| v.path_index.len())
             .sum();
         let exact_regex: usize = table
             .exact_hosts_regex
@@ -581,7 +628,7 @@ impl RouterCache {
             .sum();
         exact_count
             + wildcard_count
-            + table.catch_all.sorted.len()
+            + table.catch_all.path_index.len()
             + exact_regex
             + wildcard_regex
             + table.catch_all_regex.entries.len()
@@ -621,98 +668,6 @@ impl RouterCache {
         debug!(
             "Router regex cache evicted {} entries (was at capacity {})",
             removed, self.max_cache_entries
-        );
-    }
-
-    /// Incrementally update the route table and surgically invalidate only
-    /// the cache entries affected by changed routes.
-    ///
-    /// The route table itself is rebuilt (cheap O(n log n) sort) because
-    /// insertion order matters for longest-prefix matching. But the caches
-    /// — which are the expensive things to lose — are preserved for all
-    /// unaffected routes. Only entries related to changed routes are evicted.
-    pub fn apply_delta(&self, config: &GatewayConfig, affected: &AffectedRoutes) {
-        // Rebuild the sorted route table (cheap, O(n log n))
-        let table = Self::build_route_table(config);
-        self.route_table.store(Arc::new(table));
-
-        if affected.is_empty() {
-            return;
-        }
-
-        // Separate affected listen_paths into prefix patterns and regex patterns
-        let (regex_patterns, prefix_patterns): (Vec<&String>, Vec<&String>) = affected
-            .listen_paths
-            .iter()
-            .partition(|lp| lp.starts_with('~'));
-
-        // Surgically invalidate prefix cache entries affected by changed routes.
-        // Also invalidate any prefix-cache entry whose host matches a
-        // changed host-only proxy — adding or removing a host-only proxy
-        // can change whether a previously-unmatched path falls through to a
-        // host-only fallback, or whether a previously-matched path now has
-        // different precedence.
-        if !prefix_patterns.is_empty() || !affected.host_only_hosts.is_empty() {
-            let before = self.prefix_cache.len();
-            self.prefix_cache.retain(|cached_key, _| {
-                let (cached_host, cached_path) = split_cache_key(cached_key);
-                let path_hit = prefix_patterns
-                    .iter()
-                    .any(|lp| cached_path.starts_with(lp.as_str()) || lp.starts_with(cached_path));
-                let host_hit = affected
-                    .host_only_hosts
-                    .iter()
-                    .any(|h| host_matches_for_eviction(h, cached_host));
-                !(path_hit || host_hit)
-            });
-            let evicted = before - self.prefix_cache.len();
-            if evicted > 0 {
-                debug!(
-                    "Router cache: surgically evicted {} prefix cache entries",
-                    evicted
-                );
-            }
-        }
-
-        // For regex route changes, clear the entire regex cache (regex patterns
-        // can match arbitrary paths, so surgical invalidation isn't reliable).
-        // For host-only changes, surgically evict regex cache entries whose
-        // host matches the affected pattern. Host-tier precedence can change
-        // regex outcomes (e.g. a cached catch-all regex match for
-        // `api.example.com` must be invalidated when a host-only proxy is
-        // added for that host — the new host-only tier takes precedence once
-        // the prefix + regex tiers for that exact host miss).
-        if !regex_patterns.is_empty() {
-            let before = self.regex_cache.len();
-            self.regex_cache.clear();
-            if before > 0 {
-                debug!(
-                    "Router cache: cleared {} regex cache entries due to regex route change",
-                    before
-                );
-            }
-        } else if !affected.host_only_hosts.is_empty() {
-            let before = self.regex_cache.len();
-            self.regex_cache.retain(|cached_key, _| {
-                let (cached_host, _) = split_cache_key(cached_key);
-                let host_hit = affected
-                    .host_only_hosts
-                    .iter()
-                    .any(|h| host_matches_for_eviction(h, cached_host));
-                !host_hit
-            });
-            let evicted = before - self.regex_cache.len();
-            if evicted > 0 {
-                debug!(
-                    "Router cache: surgically evicted {} regex cache entries for host-only change",
-                    evicted
-                );
-            }
-        }
-
-        debug!(
-            "Router cache: route table rebuilt ({} routes)",
-            config.proxies.len()
         );
     }
 
@@ -919,7 +874,7 @@ impl IndexedPrefixRoutes {
             .iter()
             .map(|entry| (entry.listen_path.clone(), Arc::clone(&entry.proxy)))
             .collect();
-        Self { sorted, path_index }
+        Self { path_index }
     }
 }
 
@@ -1019,29 +974,6 @@ fn find_prefix_match_indexed(routes: &IndexedPrefixRoutes, path: &str) -> Option
     None
 }
 
-/// Find the first prefix-matching route in a pre-sorted route list (linear scan fallback).
-#[allow(dead_code)]
-fn find_prefix_match(routes: &[RouteEntry], path: &str) -> Option<RouteMatch> {
-    routes
-        .iter()
-        .find(|entry| {
-            if path == entry.listen_path {
-                true
-            } else if path.starts_with(&entry.listen_path) {
-                entry.listen_path.ends_with('/')
-                    || path.as_bytes().get(entry.listen_path.len()) == Some(&b'/')
-                    || path.as_bytes().get(entry.listen_path.len()) == Some(&b'?')
-            } else {
-                false
-            }
-        })
-        .map(|entry| RouteMatch {
-            proxy: Arc::clone(&entry.proxy),
-            path_params: Vec::new(),
-            matched_prefix_len: entry.listen_path.len(),
-        })
-}
-
 /// Find the first regex-matching route using the RegexSet index.
 ///
 /// Instead of testing each regex pattern sequentially (O(n_patterns) per cache miss),
@@ -1079,62 +1011,6 @@ fn find_regex_match_indexed(routes: &IndexedRegexRoutes, path: &str) -> Option<R
         path_params,
         matched_prefix_len: matched_len,
     })
-}
-
-/// Find the first regex-matching route in a list of regex route entries (linear scan fallback).
-#[allow(dead_code)]
-fn find_regex_match(routes: &[RegexRouteEntry], path: &str) -> Option<RouteMatch> {
-    for entry in routes {
-        if let Some(captures) = entry.pattern.captures(path) {
-            let matched_len = captures.get(0).map(|m| m.end()).unwrap_or(0);
-
-            let path_params: Vec<(String, String)> = entry
-                .capture_names
-                .iter()
-                .filter_map(|name| {
-                    captures
-                        .name(name)
-                        .map(|m| (name.clone(), m.as_str().to_string()))
-                })
-                .collect();
-
-            return Some(RouteMatch {
-                proxy: Arc::clone(&entry.proxy),
-                path_params,
-                matched_prefix_len: matched_len,
-            });
-        }
-    }
-    None
-}
-
-/// Split a cache key into (host, path) where the two are separated by '\0'.
-/// Host is empty when the original request had no host.
-fn split_cache_key(key: &str) -> (&str, &str) {
-    match key.find('\0') {
-        Some(i) => (&key[..i], &key[i + 1..]),
-        None => ("", key),
-    }
-}
-
-/// Returns true when `cached_host` would have been routed through an
-/// affected host-only pattern. Uses the same matching semantics as the
-/// router (`wildcard_matches`) so eviction never over-matches unrelated
-/// cache entries — e.g. pattern `*.example.com` must not evict
-/// `notexample.com` or the bare `example.com`.
-fn host_matches_for_eviction(affected_host: &str, cached_host: &str) -> bool {
-    if cached_host.is_empty() {
-        return false;
-    }
-    if affected_host.starts_with("*.") {
-        // Wildcard pattern → use the router's wildcard semantics.
-        // `wildcard_matches` requires exactly one label before the suffix
-        // and explicitly rejects the bare base domain.
-        wildcard_matches(affected_host, cached_host)
-    } else {
-        // Exact host → HTTP hostnames are case-insensitive.
-        cached_host.eq_ignore_ascii_case(affected_host)
-    }
 }
 
 /// Check if a proxy uses a regex listen_path.
@@ -1412,80 +1288,6 @@ mod tests {
         assert_eq!(removed, 0);
     }
 
-    // ── host_matches_for_eviction tests ──────────────────────────────────
-    //
-    // Must mirror the router's `wildcard_matches` semantics exactly so cache
-    // eviction never over-matches unrelated hosts (which would flush valid
-    // cache entries on every host-only add/remove).
-
-    #[test]
-    fn eviction_exact_host_matches_case_insensitively() {
-        assert!(host_matches_for_eviction(
-            "api.example.com",
-            "api.example.com"
-        ));
-        assert!(host_matches_for_eviction(
-            "api.example.com",
-            "API.EXAMPLE.COM"
-        ));
-    }
-
-    #[test]
-    fn eviction_exact_host_does_not_match_different_host() {
-        assert!(!host_matches_for_eviction(
-            "api.example.com",
-            "other.example.com"
-        ));
-        assert!(!host_matches_for_eviction(
-            "api.example.com",
-            "api.example.org"
-        ));
-    }
-
-    #[test]
-    fn eviction_wildcard_matches_single_label_subdomain() {
-        assert!(host_matches_for_eviction(
-            "*.example.com",
-            "api.example.com"
-        ));
-        assert!(host_matches_for_eviction(
-            "*.example.com",
-            "www.example.com"
-        ));
-    }
-
-    #[test]
-    fn eviction_wildcard_does_not_match_base_domain() {
-        // Router's wildcard_matches rejects the bare suffix — eviction must too.
-        assert!(!host_matches_for_eviction("*.example.com", "example.com"));
-    }
-
-    #[test]
-    fn eviction_wildcard_does_not_match_deep_subdomain() {
-        // *.example.com requires exactly one label before the suffix.
-        assert!(!host_matches_for_eviction(
-            "*.example.com",
-            "api.v2.example.com"
-        ));
-    }
-
-    #[test]
-    fn eviction_wildcard_does_not_match_lookalike_suffix() {
-        // Without the dot boundary, `notexample.com` ends with `example.com`
-        // but is NOT a subdomain. Router wouldn't route it here either.
-        assert!(!host_matches_for_eviction(
-            "*.example.com",
-            "notexample.com"
-        ));
-        assert!(!host_matches_for_eviction("*.example.com", "example.org"));
-    }
-
-    #[test]
-    fn eviction_empty_cached_host_never_matches() {
-        assert!(!host_matches_for_eviction("api.example.com", ""));
-        assert!(!host_matches_for_eviction("*.example.com", ""));
-    }
-
     // ── RouterCache::new auto-resolution tests ──────────────────────────
     //
     // FERRUM_ROUTER_CACHE_MAX_ENTRIES=0 is the documented "auto" sentinel.
@@ -1561,6 +1363,78 @@ mod tests {
             proxies,
             ..GatewayConfig::default()
         }
+    }
+
+    #[test]
+    fn replacing_stale_prefix_entry_does_not_evict_unrelated_cache_entries() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old", "/api")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 4);
+
+        for path in ["/api/a", "/api/b", "/api/c", "/api/d"] {
+            let matched = cache
+                .find_proxy(None, path)
+                .expect("old route should match");
+            assert_eq!(matched.proxy.id, "old");
+        }
+        let before = cache.cache_stats();
+        assert_eq!(before.0, 4);
+        assert_eq!(before.2, 0);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new", "/api")],
+            ..GatewayConfig::default()
+        };
+        let new_table = RouterCache::build_route_table_snapshot(&new_config);
+        let matched = cache
+            .find_proxy_in_snapshot(&new_table, 2, None, "/api/a")
+            .expect("new route should match");
+        assert_eq!(matched.proxy.id, "new");
+
+        let after = cache.cache_stats();
+        assert_eq!(after.0, 4);
+        assert_eq!(
+            after.2, before.2,
+            "replacing the same stale prefix key should not evict another entry"
+        );
+    }
+
+    #[test]
+    fn replacing_stale_regex_entry_does_not_evict_unrelated_cache_entries() {
+        let old_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("old-regex", "~/item/[0-9]+")],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&old_config, 4);
+
+        for path in ["/item/1", "/item/2", "/item/3", "/item/4"] {
+            let matched = cache
+                .find_proxy(None, path)
+                .expect("old regex should match");
+            assert_eq!(matched.proxy.id, "old-regex");
+        }
+        let before = cache.cache_stats();
+        assert_eq!(before.1, 4);
+        assert_eq!(before.3, 0);
+
+        let new_config = GatewayConfig {
+            proxies: vec![minimal_proxy_for_routing("new-regex", "~/item/[0-9]+")],
+            ..GatewayConfig::default()
+        };
+        let new_table = RouterCache::build_route_table_snapshot(&new_config);
+        let matched = cache
+            .find_proxy_in_snapshot(&new_table, 2, None, "/item/1")
+            .expect("new regex should match");
+        assert_eq!(matched.proxy.id, "new-regex");
+
+        let after = cache.cache_stats();
+        assert_eq!(after.1, 4);
+        assert_eq!(
+            after.3, before.3,
+            "replacing the same stale regex key should not evict another entry"
+        );
     }
 
     #[test]

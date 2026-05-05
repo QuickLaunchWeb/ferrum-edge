@@ -1,9 +1,9 @@
 //! Configuration delta computation for incremental cache updates.
 //!
 //! Instead of rebuilding every cache from scratch on each config change,
-//! `ConfigDelta` identifies exactly which resources changed so each cache
-//! can surgically update only the affected entries. This keeps the hot
-//! request path undisturbed — no full cache clears, no thundering herds.
+//! `ConfigDelta` identifies exactly which resources changed so cache builders
+//! can preserve unchanged plugin, consumer, and load-balancer state while
+//! publishing a fresh request epoch atomically.
 //!
 //! Changes are detected by comparing `id` + `updated_at` timestamps.
 //! Resources present in the new config but not the old are additions;
@@ -15,31 +15,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 
-/// Summary of routing changes that should trigger router-cache invalidation.
-///
-/// Separates path-keyed changes (prefix / regex listen_paths) from host-keyed
-/// changes (host-only proxies with no listen_path). These need different
-/// invalidation strategies because their cache partitions are keyed differently.
-#[derive(Debug, Default, Clone)]
-pub struct AffectedRoutes {
-    /// listen_path values (prefix or `~regex`) whose cache entries may be stale.
-    pub listen_paths: Vec<String>,
-    /// Host entries (exact or wildcard) whose host-only cache entries may be stale.
-    /// Populated when a host-only proxy (listen_path.is_none()) is added,
-    /// removed, or has its hosts list changed.
-    pub host_only_hosts: Vec<String>,
-}
-
-impl AffectedRoutes {
-    pub fn is_empty(&self) -> bool {
-        self.listen_paths.is_empty() && self.host_only_hosts.is_empty()
-    }
-}
-
 /// Identifies which resources changed between two config snapshots.
 ///
-/// Used by each cache's `apply_delta` method to perform surgical updates
-/// instead of full rebuilds.
+/// Used by request-epoch builders to decide which pre-computed inners can be
+/// reused and which must be rebuilt from the new config.
 #[derive(Debug)]
 pub struct ConfigDelta {
     // Proxy changes
@@ -179,64 +158,6 @@ impl ConfigDelta {
         }
 
         ids
-    }
-
-    /// Collect routing changes that were affected by proxy adds/removes/modifies.
-    ///
-    /// Returns `AffectedRoutes` separating listen_path-keyed changes (prefix
-    /// and regex proxies) from host-keyed changes (host-only proxies whose
-    /// `listen_path.is_none()`). Used by RouterCache to selectively invalidate
-    /// only the cache entries that could match changed routes.
-    pub fn affected_routes(&self, old_config: &GatewayConfig) -> AffectedRoutes {
-        let mut paths = Vec::new();
-        let mut hosts = Vec::new();
-
-        let record = |paths: &mut Vec<String>, hosts: &mut Vec<String>, p: &Proxy| {
-            if p.dispatch_kind.is_stream() {
-                return;
-            }
-            match p.listen_path.as_deref() {
-                Some(path) => paths.push(path.to_string()),
-                None => hosts.extend(p.hosts.iter().cloned()),
-            }
-        };
-
-        // Added proxies: new routes may take priority over existing cache entries
-        for p in &self.added_proxies {
-            record(&mut paths, &mut hosts, p);
-        }
-
-        // Removed proxies: cache entries pointing to them are stale
-        let old_proxy_map: HashMap<&str, &Proxy> = old_config
-            .proxies
-            .iter()
-            .map(|p| (p.id.as_str(), p))
-            .collect();
-        for id in &self.removed_proxy_ids {
-            if let Some(old_proxy) = old_proxy_map.get(id.as_str()) {
-                record(&mut paths, &mut hosts, old_proxy);
-            }
-        }
-
-        // Modified proxies: record the new routing identity, and also the
-        // previous one if routing-relevant fields changed.
-        for p in &self.modified_proxies {
-            record(&mut paths, &mut hosts, p);
-            if let Some(old_proxy) = old_proxy_map.get(p.id.as_str()) {
-                let routing_changed = old_proxy.dispatch_kind.is_stream()
-                    != p.dispatch_kind.is_stream()
-                    || old_proxy.listen_path != p.listen_path
-                    || old_proxy.hosts != p.hosts;
-                if routing_changed {
-                    record(&mut paths, &mut hosts, old_proxy);
-                }
-            }
-        }
-
-        AffectedRoutes {
-            listen_paths: paths,
-            host_only_hosts: hosts,
-        }
     }
 }
 
