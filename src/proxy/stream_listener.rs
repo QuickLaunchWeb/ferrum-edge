@@ -115,6 +115,15 @@ pub struct StreamListenerManager {
     udp_gso_enabled: bool,
     /// Enable IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets.
     udp_pktinfo_enabled: bool,
+    /// Global shutdown receiver. When the gateway-wide SIGTERM/SIGINT fires,
+    /// every spawned listener observes it via this receiver in addition to the
+    /// per-listener `shutdown_tx` (which is only fired on config-driven removal).
+    ///
+    /// Stored in `ArcSwap` because it is injected after construction by
+    /// [`Self::set_global_shutdown_rx`] — `StreamListenerManager` is built
+    /// inside `ProxyState::new()` (synchronous) but the watch channel is
+    /// created in `main.rs` and threaded into each mode separately.
+    global_shutdown_rx: arc_swap::ArcSwap<Option<watch::Receiver<bool>>>,
 }
 
 impl StreamListenerManager {
@@ -233,7 +242,21 @@ impl StreamListenerManager {
             udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
+            global_shutdown_rx: arc_swap::ArcSwap::new(Arc::new(None)),
         }
+    }
+
+    /// Inject the gateway-wide shutdown receiver. Each subsequently spawned
+    /// stream listener (TCP/UDP/DTLS) will observe SIGTERM/SIGINT through this
+    /// receiver in addition to its private per-listener channel, so accept
+    /// loops exit promptly during graceful drain.
+    ///
+    /// Must be called once per mode after [`Self::new`] and BEFORE the first
+    /// `reconcile()` so listeners that bind on initial startup pick up the
+    /// receiver. Listeners spawned by later reconciles also pick it up via
+    /// the `ArcSwap` load.
+    pub fn set_global_shutdown_rx(&self, rx: watch::Receiver<bool>) {
+        self.global_shutdown_rx.store(Arc::new(Some(rx)));
     }
 
     /// Update the frontend TLS configuration used for TCP stream proxies with `frontend_tls: true`.
@@ -473,6 +496,9 @@ impl StreamListenerManager {
             let tls_no_verify = self.tls_no_verify;
             let cb_cache = self.circuit_breaker_cache.clone();
             let started = Arc::new(AtomicBool::new(false));
+            // Clone the global shutdown receiver (if injected) so the spawned
+            // listener observes both per-listener removal AND global SIGTERM.
+            let global_shutdown = self.global_shutdown_rx.load().as_ref().clone();
 
             let (join_handle, udp_metrics) = if scheme.is_udp() {
                 let started_for_listener = started.clone();
@@ -522,6 +548,7 @@ impl StreamListenerManager {
                 let udp_gso_enabled = self.udp_gso_enabled;
                 let udp_pktinfo_enabled = self.udp_pktinfo_enabled;
                 let listener_udp_metrics = Some(metrics.clone());
+                let global_shutdown_for_listener = global_shutdown.clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -530,6 +557,7 @@ impl StreamListenerManager {
                         dns_cache,
                         request_epoch,
                         shutdown: shutdown_rx,
+                        global_shutdown: global_shutdown_for_listener,
                         metrics,
                         frontend_dtls_config,
                         tls_no_verify,
@@ -581,6 +609,7 @@ impl StreamListenerManager {
                 let overload = self.overload.clone();
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
+                let global_shutdown_for_listener = global_shutdown.clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -591,6 +620,7 @@ impl StreamListenerManager {
                         request_epoch,
                         frontend_tls_config: tls_config,
                         shutdown: shutdown_rx,
+                        global_shutdown: global_shutdown_for_listener,
                         metrics,
                         tls_no_verify,
                         tls_ca_bundle_path,
@@ -758,7 +788,14 @@ impl StreamListenerManager {
     }
 
     /// Shut down all active stream listeners.
-    #[allow(dead_code)] // Called during gateway shutdown
+    ///
+    /// Called from each mode's graceful-shutdown path AFTER HTTP listener
+    /// handles have been awaited and BEFORE `wait_for_drain` runs. The
+    /// per-listener watch channel fires alongside the global SIGTERM channel
+    /// (see [`Self::set_global_shutdown_rx`]) so accept loops exit promptly
+    /// regardless of which signal arrives first; calling this here also
+    /// ensures the `JoinHandle` set is cleared even when the global channel
+    /// is not injected (e.g. unit tests that build a manager standalone).
     pub async fn shutdown_all(&self) {
         let mut listeners = self.listeners.lock().await;
         for (proxy_id, handle) in listeners.drain() {

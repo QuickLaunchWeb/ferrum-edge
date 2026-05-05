@@ -301,6 +301,7 @@ async fn try_spawn_fast_path_gateway(
             request_epoch,
             frontend_tls_config: None,
             shutdown: shutdown_rx,
+            global_shutdown: None,
             metrics: listener_metrics,
             tls_no_verify: false,
             tls_ca_bundle_path: None,
