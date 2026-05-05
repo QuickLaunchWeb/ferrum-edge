@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use h3::server::RequestStream;
@@ -214,6 +215,10 @@ pub async fn start_http3_listener_with_signal(
     }
 
     let mut shutdown_rx = shutdown;
+    // Captured before the accept loop so each spawned connection task can apply
+    // the same QUIC handshake bound without reading `state.env_config` per-conn.
+    // `Duration::ZERO` preserves the documented "0 disables" semantic.
+    let handshake_timeout = h3_config.handshake_timeout;
 
     loop {
         tokio::select! {
@@ -231,7 +236,9 @@ pub async fn start_http3_listener_with_signal(
                         tokio::spawn(async move {
                             let _conn_guard =
                                 crate::overload::ConnectionGuard::new(&state.overload);
-                            if let Err(e) = handle_h3_connection(connecting, state).await {
+                            if let Err(e) =
+                                handle_h3_connection(connecting, state, handshake_timeout).await
+                            {
                                 debug!("HTTP/3 connection error: {}", e);
                             }
                         });
@@ -253,10 +260,28 @@ pub async fn start_http3_listener_with_signal(
     Ok(())
 }
 
+/// Await `fut` while bounding the wait by `timeout`. Passing `Duration::ZERO`
+/// disables the bound — used so `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`
+/// matches the "0 disables" semantic shared by the TCP/TLS and DTLS frontends.
+async fn await_with_optional_timeout<F, T>(
+    fut: F,
+    timeout: Duration,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: std::future::Future<Output = T>,
+{
+    if timeout.is_zero() {
+        Ok(fut.await)
+    } else {
+        tokio::time::timeout(timeout, fut).await
+    }
+}
+
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
     state: ProxyState,
+    handshake_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     let early_data_enabled = !state.early_data_methods.is_empty();
 
@@ -271,6 +296,14 @@ async fn handle_h3_connection(
     // request checks the current state — not the connection-level flag.
     let in_early_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Bound the QUIC handshake so a peer that completes the UDP path-MTU
+    // probe / Initial packets but never finishes TLS 1.3 cannot hold a
+    // connection slot indefinitely. `quinn::TransportConfig::max_idle_timeout`
+    // is a post-handshake idle bound and is NOT a handshake bound — so without
+    // this `tokio::time::timeout`, the gateway has no admission-control
+    // ceiling on QUIC handshake cost. Aligns HTTP/3 with the TCP/TLS
+    // (`accept_with_optional_timeout`) and DTLS (`DtlsServerLimits.handshake_timeout`)
+    // frontends, all gated by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
     let connection = if early_data_enabled {
         let connecting = connecting.accept()?.into_0rtt();
         match connecting {
@@ -282,21 +315,60 @@ async fn handle_h3_connection(
                 in_early_data.store(true, std::sync::atomic::Ordering::Release);
                 // Spawn a task that waits for the handshake to complete, then
                 // clears the early-data flag. Requests dispatched after this
-                // point will see is_early_data = false.
+                // point will see is_early_data = false. The handshake bound
+                // also applies here: if the peer never completes TLS, the
+                // ZeroRttAccepted future never resolves and the connection
+                // would otherwise sit consuming a slot forever. Closing the
+                // connection on timeout fails any in-flight 0.5-RTT streams.
                 let flag = in_early_data.clone();
+                let conn_for_close = conn.clone();
+                let remote = conn.remote_address();
                 tokio::spawn(async move {
-                    zero_rtt_accepted.await;
-                    flag.store(false, std::sync::atomic::Ordering::Release);
+                    match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout).await {
+                        Ok(_accepted) => {
+                            flag.store(false, std::sync::atomic::Ordering::Release);
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
+                                remote, handshake_timeout
+                            );
+                            conn_for_close.close(quinn::VarInt::from_u32(0), b"handshake timeout");
+                        }
+                    }
                 });
                 conn
             }
             Err(connecting) => {
-                // No 0-RTT — fall back to full handshake
-                connecting.await?
+                // No 0-RTT — fall back to full handshake.
+                match await_with_optional_timeout(connecting, handshake_timeout).await {
+                    Ok(result) => result?,
+                    Err(_elapsed) => {
+                        warn!("HTTP/3 handshake timed out after {:?}", handshake_timeout);
+                        return Err(anyhow::anyhow!(
+                            "HTTP/3 handshake timed out after {:?}",
+                            handshake_timeout
+                        ));
+                    }
+                }
             }
         }
     } else {
-        connecting.await?
+        // `quinn::Incoming` is `IntoFuture` (yielding a `Connecting`); the
+        // explicit `.accept()?` here both surfaces address-validation errors
+        // synchronously and gives us a typed `Connecting` future that
+        // `tokio::time::timeout` can wrap directly.
+        let connecting = connecting.accept()?;
+        match await_with_optional_timeout(connecting, handshake_timeout).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                warn!("HTTP/3 handshake timed out after {:?}", handshake_timeout);
+                return Err(anyhow::anyhow!(
+                    "HTTP/3 handshake timed out after {:?}",
+                    handshake_timeout
+                ));
+            }
+        }
     };
 
     let remote_addr = connection.remote_address();
@@ -3682,5 +3754,46 @@ mod h3_streaming_outcome_tests {
             "backend-emitted 5xx without any error class is a status failure, \
              not a connection failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod handshake_timeout_helper_tests {
+    //! Regression tests for `await_with_optional_timeout`. The helper backs
+    //! the QUIC frontend handshake bound that aligns HTTP/3 admission control
+    //! with the TCP/TLS and DTLS frontends — see the comment block above the
+    //! `let connection = if early_data_enabled { ... }` arm in
+    //! `handle_h3_connection`.
+
+    use std::time::Duration;
+
+    use super::await_with_optional_timeout;
+
+    #[tokio::test]
+    async fn zero_duration_skips_timeout_and_resolves_when_future_completes() {
+        // `Duration::ZERO` is the documented "0 disables" knob shared with
+        // TCP/TLS and DTLS frontends. The future must run to completion
+        // without being wrapped in `tokio::time::timeout`.
+        let result = await_with_optional_timeout(async { 42_u32 }, Duration::ZERO).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn nonzero_duration_returns_ok_when_future_completes_first() {
+        // Future resolves well before the deadline — the helper must surface
+        // the inner value via `Ok(...)`.
+        let result = await_with_optional_timeout(async { "ok" }, Duration::from_secs(60)).await;
+        assert_eq!(result.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn nonzero_duration_returns_elapsed_when_future_stalls() {
+        // The handshake bound *only* fires when the future never resolves
+        // within the deadline. A pending future + a tiny real timeout keeps
+        // the assertion deterministic without needing tokio's `test-util`
+        // feature on the dev-dependency.
+        let pending = std::future::pending::<()>();
+        let result = await_with_optional_timeout(pending, Duration::from_millis(50)).await;
+        assert!(result.is_err(), "expected Elapsed when the future stalls");
     }
 }
