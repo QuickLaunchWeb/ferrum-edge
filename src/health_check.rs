@@ -264,8 +264,40 @@ impl HealthChecker {
     }
 
     /// Start health checks for all upstreams in the config.
+    #[allow(dead_code)]
     pub fn start(&self, config: &GatewayConfig) {
         self.start_with_shutdown(config, None);
+    }
+
+    /// Drain the spawned active-check / passive-recovery `JoinHandle`s out
+    /// of the checker so callers can await them in their per-mode
+    /// background-drain phase.
+    ///
+    /// `start_with_shutdown` records every spawned task in
+    /// `active_check_handles` so that [`Drop for HealthChecker`] can abort
+    /// them on cleanup. `Drop` only fires once the last `Arc<HealthChecker>`
+    /// clone is dropped — which happens at process exit, AFTER the
+    /// background-drain phase. That late abort lets active HTTP probes
+    /// race with shutdown: a probe connecting to a backend mid-shutdown
+    /// can emit a misleading "unhealthy" log line right before exit.
+    ///
+    /// Modes call this immediately after `ProxyState::new` to take
+    /// ownership of the handles and `await` them alongside DNS / metrics
+    /// / overload tasks. The shutdown receiver passed into
+    /// `start_with_shutdown` lets each spawned loop observe shutdown via
+    /// `tokio::select!` and exit cleanly before the await completes.
+    ///
+    /// After this call `active_check_handles` is empty, so `Drop` becomes
+    /// a no-op safety net — the modes own the handles. If a future caller
+    /// re-invokes `start_with_shutdown` (e.g. on config reload) the
+    /// existing drain logic at the top of `start_with_shutdown` still
+    /// aborts whatever was pushed since the last `take`.
+    pub fn take_active_check_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut guard = match self.active_check_handles.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *guard)
     }
 
     /// Start health checks with an optional shutdown signal.

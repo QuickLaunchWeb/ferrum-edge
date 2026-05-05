@@ -144,13 +144,15 @@ fn create_proxy_state() -> ProxyState {
         max_concurrent_refreshes: 64,
         shard_amount: 0,
     });
-    ProxyState::new(
+    let (state, _health_check_handles) = ProxyState::new(
         GatewayConfig::default(),
         dns_cache,
         create_test_env_config(),
         None,
+        None,
     )
-    .expect("ProxyState::new failed")
+    .expect("ProxyState::new failed");
+    state
 }
 
 /// Build a CP-scoped admin `AdminState` that exposes `GET /cluster` with the

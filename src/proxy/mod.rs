@@ -1064,6 +1064,8 @@ pub struct ProxyState {
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
     pub health_checker: Arc<HealthChecker>,
+    /// Shutdown receiver reused when config reloads restart health-check tasks.
+    pub health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// Circuit breaker cache for proxy-level circuit breaking.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Service discovery manager for dynamic upstream target resolution.
@@ -1136,12 +1138,31 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
+    /// Construct the gateway state and start the health checker.
+    ///
+    /// `health_check_shutdown_rx` is forwarded to
+    /// [`HealthChecker::start_with_shutdown`] so active HTTP probes and the
+    /// passive recovery timer observe gateway shutdown via `tokio::select!`
+    /// and exit cleanly. Pass `Some(shutdown_tx.subscribe())` from each
+    /// mode's startup; tests that don't drive shutdown can pass `None`.
+    ///
+    /// Returns `(ProxyState, Vec<JoinHandle>)`. The handle vec is populated
+    /// by [`HealthChecker::take_active_check_handles`] — they wrap the
+    /// spawned active-check / passive-recovery tasks. Modes must `await`
+    /// them in the per-mode background-drain phase (alongside DNS / metrics
+    /// / overload). Without that, cleanup falls back to
+    /// `Drop for HealthChecker`, which only aborts tasks once the last
+    /// `Arc<HealthChecker>` clone is dropped — at process exit, AFTER the
+    /// drain window has already closed. That late abort lets a probe
+    /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
+    /// a misleading "unhealthy" log line right before tear-down.
     pub fn new(
         config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
         tls_policy: Option<TlsPolicy>,
-    ) -> Result<Self, anyhow::Error> {
+        health_check_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<(Self, Vec<tokio::task::JoinHandle<()>>), anyhow::Error> {
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
         } else {
@@ -1277,11 +1298,20 @@ impl ProxyState {
             env_config_arc.tls_no_verify,
         );
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
-        // `start_with_shutdown` re-spawns probe tasks under the inner Mutex,
-        // so we can call it through &HealthChecker. Probe tasks are restarted
-        // again from `update_config` / `apply_incremental` whenever the
-        // config changes (see `HealthChecker::restart_with_shutdown`).
-        health_checker.start(&config);
+        // Use `start_with_shutdown` so active HTTP probes and the passive
+        // recovery timer race their `interval.tick()` against the shutdown
+        // watch channel. Without the receiver the inner tasks exit only when
+        // `Drop for HealthChecker` aborts them — and `Drop` runs at process
+        // exit, after the background-drain phase has already given up. That
+        // late abort lets a probe that's mid-`http_probe` finish its TCP /
+        // TLS / HTTP round-trip and emit a misleading "unhealthy" log line
+        // immediately before the process tears down.
+        let health_check_restart_rx = health_check_shutdown_rx.clone();
+        health_checker.start_with_shutdown(&config, health_check_shutdown_rx);
+        // Drain the spawned task handles BEFORE wrapping in Arc so the
+        // caller can await them in the background-drain phase. Drop is
+        // a no-op safety net once the Vec is empty.
+        let health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
@@ -1430,7 +1460,7 @@ impl ProxyState {
             ),
         );
 
-        Ok(Self {
+        let state = Self {
             config: config_arc,
             request_epoch,
             dns_cache,
@@ -1440,6 +1470,7 @@ impl ProxyState {
             consumer_index,
             load_balancer_cache,
             health_checker,
+            health_check_shutdown_rx: health_check_restart_rx,
             circuit_breaker_cache,
             service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
@@ -1501,7 +1532,8 @@ impl ProxyState {
             crls,
             overload,
             adaptive_buffer,
-        })
+        };
+        Ok((state, health_check_handles))
     }
 
     /// Start a background task that periodically removes stale zero-count
@@ -2516,7 +2548,8 @@ impl ProxyState {
             // upstreams added by this reload get their probes spawned and
             // probe parameters (interval, timeout, threshold, probe_type,
             // TLS config) for existing upstreams are picked up.
-            self.health_checker.restart_with_shutdown(&new_cfg, None);
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
 
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
@@ -2710,7 +2743,8 @@ impl ProxyState {
             || !delta.modified_upstreams.is_empty()
         {
             let new_cfg = self.config.load_full();
-            self.health_checker.restart_with_shutdown(&new_cfg, None);
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
         true
@@ -2719,7 +2753,8 @@ impl ProxyState {
     /// Start service discovery background tasks for all upstreams in the config.
     ///
     /// Should be called once after `ProxyState::new()` in each mode's startup,
-    /// similar to `health_checker.start()`.
+    /// similar to `HealthChecker::start_with_shutdown` (which `ProxyState::new`
+    /// invokes internally).
     pub fn start_service_discovery(&self, shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>) {
         let config = self.config.load_full();
         self.service_discovery_manager.start(&config, shutdown_rx);
@@ -3100,7 +3135,8 @@ impl ProxyState {
             || !delta.modified_upstreams.is_empty()
         {
             let new_cfg = self.config.load_full();
-            self.health_checker.restart_with_shutdown(&new_cfg, None);
+            self.health_checker
+                .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
         true

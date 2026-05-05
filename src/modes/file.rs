@@ -236,7 +236,9 @@ impl ServeHandles {
             )
             .await;
         }
-        join_background_handles(self.background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+        let mut background_handles = self.background_handles;
+        background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
+        join_background_handles(background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
         listener_result
     }
 
@@ -615,11 +617,12 @@ pub async fn serve(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
 
-    let proxy_state = ProxyState::new(
+    let (proxy_state, health_check_handles) = ProxyState::new(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
 
     // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
@@ -1035,6 +1038,14 @@ pub async fn serve(
     if let Some(h) = per_ip_cleanup_handle {
         background_handles.push(h);
     }
+    // Active-health-check probes and the passive recovery timer race
+    // their `interval.tick()` against the shutdown watch channel passed
+    // into `ProxyState::new`, so awaiting them here gives them a clean
+    // exit before `BACKGROUND_DRAIN_TIMEOUT`. Without this they'd live
+    // until `Drop for HealthChecker` aborts at process exit (after the
+    // drain window has already closed), which lets a probe mid-`http_probe`
+    // emit a misleading "unhealthy" log line right before tear-down.
+    background_handles.extend(health_check_handles);
 
     // Build `ServeHandles` BEFORE the late-startup `?` calls so that
     // failure to bind stream listeners / receive listener-started
