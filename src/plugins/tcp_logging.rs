@@ -7,14 +7,18 @@
 //! re-established automatically on failure.
 //!
 //! Supports both plaintext TCP and TLS-encrypted connections. TLS uses the
-//! gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify
-//! (`FERRUM_TLS_NO_VERIFY`) settings, with per-plugin `tls_server_name`
-//! override.
+//! gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify
+//! (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`) settings,
+//! with per-plugin `tls_server_name` override. Revoked log-sink certificates
+//! are rejected via `WebPkiServerVerifier`'s
+//! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
+//! policy, matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
 //! `LogEntry` union type, matching the http_logging plugin's behavior.
 
 use async_trait::async_trait;
+use rustls::pki_types::CertificateRevocationListDer;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
@@ -36,6 +40,11 @@ struct TcpFlushConfig {
     tls_server_name: Option<String>,
     tls_no_verify: bool,
     tls_ca_bundle_path: Option<String>,
+    /// Gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`). Applied to the rustls
+    /// `WebPkiServerVerifier` for TLS-enabled connections so that revoked
+    /// log-sink certificates are rejected, matching the proxy backend / DTLS /
+    /// frontend mTLS surfaces. Empty when no CRL file is configured.
+    tls_crls: Vec<CertificateRevocationListDer<'static>>,
     connect_timeout: Duration,
     /// Gateway-shared DNS cache for endpoint resolution. Pre-warmed at startup
     /// via `Plugin::warmup_hostnames`, refreshed in the background. `None` only
@@ -87,6 +96,7 @@ impl TcpLogging {
             tls_server_name,
             tls_no_verify: http_client.tls_no_verify(),
             tls_ca_bundle_path: http_client.tls_ca_bundle_path().map(|s| s.to_string()),
+            tls_crls: http_client.tls_crls().to_vec(),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             dns_cache: http_client.dns_cache().cloned(),
         };
@@ -239,8 +249,15 @@ async fn connect_tcp(cfg: &TcpFlushConfig) -> Result<TcpWriter, String> {
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth()
     } else {
+        // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so that revoked
+        // log-sink certificates are rejected, matching the proxy backend / DTLS
+        // / frontend mTLS surfaces. The verifier uses
+        // `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
+        // (set inside `build_server_verifier_with_crls`).
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.tls_crls)
+            .map_err(|error| format!("TCP logging: failed to build TLS verifier: {error}"))?;
         rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
+            .with_webpki_verifier(verifier)
             .with_no_client_auth()
     };
 
@@ -358,4 +375,241 @@ async fn send_batch(
         .map_err(|_| "TCP logging: writer state lock poisoned".to_string())? = connection;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline unit tests for the TLS path. The plugin test fixtures live in
+    //! `tests/unit/plugins/tcp_logging_tests.rs` (public-API surface); this
+    //! module covers the private `connect_tcp` TLS verification path which
+    //! tests under `tests/` cannot reach.
+    use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
+    };
+    use rustls::pki_types::pem::PemObject;
+    use std::sync::Once;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    static INIT_CRYPTO: Once = Once::new();
+    fn ensure_crypto_provider() {
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    fn generate_ca() -> (Issuer<'static, KeyPair>, String) {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_pem = cert.pem();
+        (Issuer::new(params, key_pair), cert_pem)
+    }
+
+    fn generate_signed_leaf(
+        ca: &Issuer<'static, KeyPair>,
+        sans: &[&str],
+    ) -> (String, String, SerialNumber) {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
+        let mut params = CertificateParams::new(san_strings).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test Leaf");
+        let serial_bytes: Vec<u8> = (1..=20).collect();
+        let serial = SerialNumber::from_slice(&serial_bytes);
+        params.serial_number = Some(serial.clone());
+        let cert = params.signed_by(&key_pair, ca).unwrap();
+        (cert.pem(), key_pair.serialize_pem(), serial)
+    }
+
+    fn generate_crl_pem(ca: &Issuer<'static, KeyPair>, revoked_serials: &[SerialNumber]) -> String {
+        let now = time::OffsetDateTime::now_utc();
+        let revoked_certs: Vec<RevokedCertParams> = revoked_serials
+            .iter()
+            .map(|s| RevokedCertParams {
+                serial_number: s.clone(),
+                revocation_time: now,
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            })
+            .collect();
+        let params = CertificateRevocationListParams {
+            this_update: now,
+            next_update: now + time::Duration::days(30),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        params.signed_by(ca).unwrap().pem().unwrap()
+    }
+
+    /// Spawn a one-shot TLS server that completes the handshake (or fails) and
+    /// returns the bound port.
+    async fn spawn_tls_server(cert_pem: &str, key_pem: &str) -> u16 {
+        let cert_chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .filter_map(|c| c.ok())
+            .collect();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .unwrap()
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            // Accept up to two connections then exit; keeps the test free of
+            // long-lived background tasks.
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // The handshake should be rejected client-side when the
+                    // leaf is revoked, so we simply attempt accept + drain.
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        let mut buf = [0u8; 64];
+                        let _ = tls.read(&mut buf).await;
+                    }
+                });
+            }
+        });
+
+        port
+    }
+
+    /// Revoking the server cert via the CRL list passed to `PluginHttpClient`
+    /// must cause `connect_tcp` to reject the TLS handshake. This proves the
+    /// gateway-wide CRL list reaches the logging-sink rustls verifier (the
+    /// previous code path used `with_root_certificates(...)` which bypassed
+    /// CRL checking entirely).
+    #[tokio::test]
+    async fn test_tcp_logging_rejects_revoked_server_cert_via_crl() {
+        ensure_crypto_provider();
+
+        let (ca_issuer, ca_pem) = generate_ca();
+        let (leaf_pem, leaf_key_pem, leaf_serial) =
+            generate_signed_leaf(&ca_issuer, &["localhost", "127.0.0.1"]);
+        let crl_pem = generate_crl_pem(&ca_issuer, std::slice::from_ref(&leaf_serial));
+
+        // Write CA to a tempfile — `PluginHttpClient` consumes the bundle by path.
+        let td = tempfile::tempdir().unwrap();
+        let ca_path = td.path().join("ca.pem");
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        // Parse CRL into the in-memory `CrlList` form `PluginHttpClient` expects.
+        let crls: Vec<_> =
+            rustls::pki_types::CertificateRevocationListDer::pem_slice_iter(crl_pem.as_bytes())
+                .filter_map(|c| c.ok())
+                .collect();
+        assert_eq!(crls.len(), 1, "CRL should parse as exactly one entry");
+        let crl_list: crate::tls::CrlList = Arc::new(crls);
+
+        // Spawn the TLS server with the now-revoked leaf and dial it.
+        let port = spawn_tls_server(&leaf_pem, &leaf_key_pem).await;
+
+        // Build a plugin HTTP client carrying the gateway CA + CRL.
+        let http_client = PluginHttpClient::new(
+            &crate::config::PoolConfig::default(),
+            crate::dns::DnsCache::new(crate::dns::DnsConfig::default()),
+            1000,
+            0,
+            100,
+            false,
+            Some(ca_path.to_str().unwrap()),
+            crl_list.clone(),
+            "ferrum",
+            crate::config::BackendAllowIps::Both,
+        );
+
+        let plugin = TcpLogging::new(
+            &serde_json::json!({
+                "host": "127.0.0.1",
+                "port": port,
+                "tls": true,
+                "tls_server_name": "localhost",
+                "connect_timeout_ms": 2000,
+            }),
+            http_client,
+        )
+        .unwrap();
+        assert_eq!(plugin.name(), "tcp_logging");
+
+        // Reach into `connect_tcp` directly so the handshake error surfaces
+        // synchronously rather than being swallowed by the batching task.
+        let cfg = TcpFlushConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls_enabled: true,
+            tls_server_name: Some("localhost".to_string()),
+            tls_no_verify: false,
+            tls_ca_bundle_path: Some(ca_path.to_str().unwrap().to_string()),
+            tls_crls: (*crl_list).clone(),
+            connect_timeout: Duration::from_secs(2),
+            dns_cache: None,
+        };
+        let result = connect_tcp(&cfg).await;
+        let err = match result {
+            Ok(_) => {
+                panic!("TLS handshake to a revoked server cert must fail when the CRL is applied")
+            }
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("TLS handshake failed") || err.contains("revoked"),
+            "Expected revocation/handshake error, got: {err}"
+        );
+    }
+
+    /// Sanity counter-test: with an empty CRL list, the same fixture connects.
+    /// Pinpoints the previous bug — the leaf was indistinguishable from a valid
+    /// cert when CRLs weren't plumbed through.
+    #[tokio::test]
+    async fn test_tcp_logging_accepts_unrevoked_server_cert_with_empty_crl() {
+        ensure_crypto_provider();
+
+        let (ca_issuer, ca_pem) = generate_ca();
+        let (leaf_pem, leaf_key_pem, _) =
+            generate_signed_leaf(&ca_issuer, &["localhost", "127.0.0.1"]);
+
+        let td = tempfile::tempdir().unwrap();
+        let ca_path = td.path().join("ca.pem");
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        let port = spawn_tls_server(&leaf_pem, &leaf_key_pem).await;
+
+        let cfg = TcpFlushConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls_enabled: true,
+            tls_server_name: Some("localhost".to_string()),
+            tls_no_verify: false,
+            tls_ca_bundle_path: Some(ca_path.to_str().unwrap().to_string()),
+            tls_crls: Vec::new(),
+            connect_timeout: Duration::from_secs(2),
+            dns_cache: None,
+        };
+        let result = connect_tcp(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "Empty CRL must allow the unrevoked cert to connect, got: {:?}",
+            result.err()
+        );
+    }
 }

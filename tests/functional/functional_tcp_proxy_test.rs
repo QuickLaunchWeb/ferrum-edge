@@ -42,6 +42,34 @@ async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHan
     })
 }
 
+/// Start a TCP echo server that prefixes each echoed frame with a backend tag.
+async fn start_tagged_tcp_echo_server_on(
+    listener: TcpListener,
+    tag: &'static [u8],
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((mut stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if stream.write_all(tag).await.is_err() {
+                                break;
+                            }
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    })
+}
+
 // ============================================================================
 // TLS Echo Server (for testing backend TLS origination)
 // ============================================================================
@@ -155,6 +183,26 @@ async fn wait_for_health(admin_port: u16) -> bool {
             _ => sleep(Duration::from_millis(500)).await,
         }
     }
+}
+
+async fn tagged_round_trip(
+    stream: &mut tokio::net::TcpStream,
+    payload: &[u8],
+    expected_tag: &[u8],
+) {
+    stream.write_all(payload).await.expect("Failed to send");
+
+    let mut expected = Vec::with_capacity(expected_tag.len() + payload.len());
+    expected.extend_from_slice(expected_tag);
+    expected.extend_from_slice(payload);
+
+    let mut buf = vec![0u8; expected.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .expect("Tagged echo read timed out")
+        .expect("Tagged echo read error");
+
+    assert_eq!(buf, expected, "Tagged echo response should match");
 }
 
 /// Start the gateway with retry on port-binding failures.
@@ -645,7 +693,111 @@ plugin_configs: []
     echo_server.abort();
 }
 
-/// Test 6 (formerly 5): TCP proxy handles connection to unreachable backend gracefully.
+/// Test 6: Active TCP relay keeps its accepted connection epoch across config reload.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_active_connection_survives_config_reload() {
+    let backend_a_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_a_port = backend_a_listener.local_addr().unwrap().port();
+    let backend_a = start_tagged_tcp_echo_server_on(backend_a_listener, b"A:").await;
+
+    let backend_b_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_b_port = backend_b_listener.local_addr().unwrap().port();
+    let backend_b = start_tagged_tcp_echo_server_on(backend_b_listener, b"B:").await;
+
+    let (mut gateway, proxy_port, _admin_port, dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
+proxies:
+  - id: "tcp-reload-active"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_a_port}
+
+consumers: []
+plugin_configs: []
+"#
+            )
+        },
+        None,
+        None,
+    )
+    .await;
+
+    let mut active = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("Failed to connect to TCP proxy");
+    tagged_round_trip(&mut active, b"before-reload", b"A:").await;
+
+    let updated = format!(
+        r#"
+proxies:
+  - id: "tcp-reload-active"
+    listen_port: {proxy_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_b_port}
+
+consumers: []
+plugin_configs: []
+"#
+    );
+    std::fs::write(dir.path().join("config.yaml"), updated).expect("rewrite config");
+
+    #[cfg(unix)]
+    {
+        let pid = gateway.id();
+        let _ = std::process::Command::new("kill")
+            .args(["-HUP", &pid.to_string()])
+            .output();
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        backend_a.abort();
+        backend_b.abort();
+        return;
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut fresh = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+            .await
+            .expect("Failed to connect fresh TCP stream after reload");
+        fresh
+            .write_all(b"after-reload")
+            .await
+            .expect("Failed to send fresh stream payload");
+
+        let mut buf = vec![0u8; b"B:after-reload".len()];
+        if tokio::time::timeout(Duration::from_secs(2), fresh.read_exact(&mut buf))
+            .await
+            .is_ok_and(|read| read.is_ok())
+            && buf == b"B:after-reload"
+        {
+            break;
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fresh TCP streams did not observe reloaded backend before timeout"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    tagged_round_trip(&mut active, b"still-old-epoch", b"A:").await;
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_a.abort();
+    backend_b.abort();
+}
+
+/// Test 7 (formerly 6): TCP proxy handles connection to unreachable backend gracefully.
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {

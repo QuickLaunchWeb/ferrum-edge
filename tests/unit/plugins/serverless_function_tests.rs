@@ -928,6 +928,154 @@ fn test_aws_sigv4_different_payloads_produce_different_signatures() {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded response-body reads
+// ---------------------------------------------------------------------------
+//
+// These tests verify that `serverless_function` enforces
+// `max_response_body_bytes` while streaming the body, instead of buffering
+// the full payload before checking. A misbehaving function returning a body
+// larger than the cap must fail without allocating the whole response.
+
+/// Backend returns a 2 KiB body, the plugin caps reads at 1 KiB.
+/// In `terminate` mode, an over-limit response yields a Reject with the
+/// configured error status code.
+#[tokio::test]
+async fn test_terminate_mode_rejects_oversized_response_body() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = vec![b'A'; 2048];
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "max_response_body_bytes": 1024,
+            "on_error": "reject",
+            "error_status_code": 502,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    // pre_proxy/terminate both go through invoke(); verify the
+    // bounded read fires and the error is surfaced as a Reject.
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(
+                body.contains("exceeds")
+                    || body.contains("max_response_body_bytes")
+                    || body.contains("invocation"),
+                "expected rejection body to mention the size error, got: {body}"
+            );
+        }
+        other => panic!("Expected Reject for oversized response, got {:?}", other),
+    }
+}
+
+/// `pre_proxy` mode with `on_error: continue` and an oversized response —
+/// the plugin must record the error in metadata and continue, without ever
+/// having buffered the full 2 KiB body.
+#[tokio::test]
+async fn test_pre_proxy_continue_on_oversized_response_body() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = vec![b'X'; 2048];
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "max_response_body_bytes": 1024,
+            "on_error": "continue",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Continue => {
+            let err = ctx
+                .metadata
+                .get("serverless_function_error")
+                .expect("error should be recorded in metadata");
+            assert!(
+                err.contains("exceeds") || err.contains("max_response_body_bytes"),
+                "expected size-limit error in metadata, got: {err}"
+            );
+        }
+        other => panic!("Expected Continue with metadata error, got {:?}", other),
+    }
+}
+
+/// Backend returns a body within the limit — call succeeds.
+#[tokio::test]
+async fn test_pre_proxy_succeeds_when_response_body_within_limit() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = serde_json::json!({"headers": {"x-injected": "true"}})
+        .to_string()
+        .into_bytes();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "max_response_body_bytes": 4096,
+            "on_error": "reject",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Continue => {
+            // pre_proxy success: the function's headers should be injected.
+            assert_eq!(headers.get("x-injected").map(|s| s.as_str()), Some("true"));
+        }
+        other => panic!("Expected Continue with injected headers, got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

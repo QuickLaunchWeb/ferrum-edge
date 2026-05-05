@@ -1318,13 +1318,14 @@ credentials:
 
 ### `hmac_auth`
 
-Authenticates requests using HMAC signatures.
+Authenticates requests using HMAC signatures with mandatory request-body integrity protection (RFC 9421 / RFC 3230).
 
 **Priority:** 1400
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header replay window |
+| `require_digest` | bool | `true` | When `true` (default, secure), inbound requests must include a `Digest:` (RFC 3230) or `Content-Digest:` (RFC 9421) header that matches the request body, and the digest header value is folded into the HMAC signing string. When `false`, the legacy 3-field signing string is used and the request body is NOT integrity-protected. |
 
 Expected `Authorization` header format:
 
@@ -1336,6 +1337,22 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 - Supported algorithms: `hmac-sha256`, `hmac-sha512`
 - Unknown algorithms are rejected
 - Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
+
+**Signing string** (with `require_digest = true`, the default):
+
+```text
+{METHOD}\n{PATH}\n{DATE}\n{DIGEST_HEADER_VALUE}
+```
+
+where `DIGEST_HEADER_VALUE` is the literal value of the `Digest:` or `Content-Digest:` header (e.g., `sha-256=<base64-of-sha256-of-body>`). Including the digest header in the signing string means a tampered digest header (without re-signing) breaks the HMAC, and a tampered body (without recomputing the digest) breaks the digest verification.
+
+**Signing string** (with `require_digest = false`, legacy mode):
+
+```text
+{METHOD}\n{PATH}\n{DATE}
+```
+
+In legacy mode the request body is **not** integrity-protected — an attacker who captures a signed request can replay it with any modified body within the clock-skew window. Set `require_digest: true` for production. The plugin emits a `warn!` log at construction time when `require_digest = false`.
 
 **Consumer credential** (`hmac_auth`) — single or array for rotation:
 ```yaml
@@ -2545,6 +2562,7 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
+| `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
 
 When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store. Non-UTF-8 request bodies are mirrored correctly.
 
@@ -2741,8 +2759,8 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 | `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body in bytes (1 MiB) |
 | `max_total_size_bytes` | u64 | `104857600` | Maximum total cache size in bytes (100 MiB, local mode) |
 | `include_model_in_key` | bool | `true` | Include the model name in the cache key (different models get separate cache entries) |
-| `include_params_in_key` | bool | `false` | Include request parameters (temperature, max_tokens, etc.) in the cache key |
-| `scope_by_consumer` | bool | `false` | Scope cache entries per consumer (authenticated consumer ID is included in the cache key) |
+| `include_params_in_key` | bool | `true` | Include sampling parameters (temperature, top_p, max_tokens) in the cache key. Default `true` because different params produce different responses; set `false` only when cross-parameter reuse is intentional. |
+| `scope_by_consumer` | bool | `true` | Scope cache entries per authenticated consumer. Default `true` because cached responses must not be replayed across consumers; set `false` only for a public LLM proxy with no per-tenant data. |
 | `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -2756,6 +2774,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 **Behavior:**
 
 - **Cache key normalization**: The prompt text is lowercased and whitespace is collapsed (multiple spaces, tabs, newlines reduced to a single space), then SHA-256 hashed. This ensures semantically identical prompts with minor formatting differences produce the same cache key.
+- **Cache key composition**: The hashed key includes the proxy ID, optionally the authenticated consumer (default on), the model name (default on), optionally sampling params (default on — `temperature`, `top_p`, `max_tokens`), the normalized `messages` array, the Anthropic top-level `system` prompt (string or array-of-content-blocks form), and any of `tools`, `tool_choice`, `response_format`, `seed`, `logit_bias`, `stream` that are present on the request. Any byte-level change to these fields produces a different cache entry — two requests with different system prompts, tool sets, response formats, seeds, logit biases, or streaming flags will never collide.
 - **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
 - **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.

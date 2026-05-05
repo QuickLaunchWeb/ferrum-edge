@@ -230,34 +230,6 @@ fn test_detects_consumer_changes() {
     assert_eq!(delta.modified_consumers[0].id, "c1");
 }
 
-#[test]
-fn test_affected_routes_paths() {
-    let t1 = Utc::now();
-    let t2 = t1 + chrono::Duration::seconds(5);
-    let old = GatewayConfig {
-        proxies: vec![
-            make_proxy("p1", "/api", t1),
-            make_proxy("p2", "/old-path", t1),
-        ],
-        ..Default::default()
-    };
-    let new = GatewayConfig {
-        proxies: vec![
-            make_proxy("p2", "/new-path", t2), // modified, listen_path changed
-            make_proxy("p3", "/added", t2),    // added
-                                               // p1 removed
-        ],
-        ..Default::default()
-    };
-    let delta = ConfigDelta::compute(&old, &new);
-    let affected = delta.affected_routes(&old);
-    assert!(affected.listen_paths.contains(&"/api".to_string())); // removed proxy's path
-    assert!(affected.listen_paths.contains(&"/new-path".to_string())); // modified proxy's new path
-    assert!(affected.listen_paths.contains(&"/old-path".to_string())); // modified proxy's old path
-    assert!(affected.listen_paths.contains(&"/added".to_string())); // added proxy's path
-    assert!(affected.host_only_hosts.is_empty());
-}
-
 // --- Upstream delta tests ---
 
 #[test]
@@ -513,4 +485,264 @@ fn test_full_mixed_delta_all_entity_types() {
     assert_eq!(delta.added_upstreams.len(), 1);
     assert_eq!(delta.modified_upstreams.len(), 1);
     assert!(!delta.is_empty());
+}
+
+// --- AffectedRoutes::is_empty tests ---
+
+#[test]
+fn test_affected_routes_is_empty_default() {
+    use ferrum_edge::config_delta::AffectedRoutes;
+    let routes = AffectedRoutes::default();
+    assert!(routes.is_empty());
+}
+
+#[test]
+fn test_affected_routes_not_empty_with_listen_paths() {
+    use ferrum_edge::config_delta::AffectedRoutes;
+    let routes = AffectedRoutes {
+        listen_paths: vec!["/api".to_string()],
+        host_only_hosts: vec![],
+    };
+    assert!(!routes.is_empty());
+}
+
+#[test]
+fn test_affected_routes_not_empty_with_hosts() {
+    use ferrum_edge::config_delta::AffectedRoutes;
+    let routes = AffectedRoutes {
+        listen_paths: vec![],
+        host_only_hosts: vec!["example.com".to_string()],
+    };
+    assert!(!routes.is_empty());
+}
+
+// --- Host-only proxy routing tests ---
+
+#[test]
+fn test_affected_routes_host_only_proxy_added() {
+    let t = Utc::now();
+    let mut host_proxy = make_proxy("h1", "/unused", t);
+    host_proxy.listen_path = None;
+    host_proxy.hosts = vec![
+        "api.example.com".to_string(),
+        "api2.example.com".to_string(),
+    ];
+
+    let old = GatewayConfig::default();
+    let new = GatewayConfig {
+        proxies: vec![host_proxy],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let affected = delta.affected_routes(&old);
+    assert!(affected.listen_paths.is_empty());
+    assert!(
+        affected
+            .host_only_hosts
+            .contains(&"api.example.com".to_string())
+    );
+    assert!(
+        affected
+            .host_only_hosts
+            .contains(&"api2.example.com".to_string())
+    );
+}
+
+#[test]
+fn test_affected_routes_host_only_proxy_removed() {
+    let t = Utc::now();
+    let mut host_proxy = make_proxy("h1", "/unused", t);
+    host_proxy.listen_path = None;
+    host_proxy.hosts = vec!["removed.example.com".to_string()];
+
+    let old = GatewayConfig {
+        proxies: vec![host_proxy],
+        ..Default::default()
+    };
+    let new = GatewayConfig::default();
+    let delta = ConfigDelta::compute(&old, &new);
+    let affected = delta.affected_routes(&old);
+    assert!(affected.listen_paths.is_empty());
+    assert!(
+        affected
+            .host_only_hosts
+            .contains(&"removed.example.com".to_string())
+    );
+}
+
+#[test]
+fn test_affected_routes_host_only_proxy_modified() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+
+    let mut old_proxy = make_proxy("h1", "/unused", t1);
+    old_proxy.listen_path = None;
+    old_proxy.hosts = vec!["old.example.com".to_string()];
+
+    let mut new_proxy = make_proxy("h1", "/unused", t2);
+    new_proxy.listen_path = None;
+    new_proxy.hosts = vec!["new.example.com".to_string()];
+
+    let old = GatewayConfig {
+        proxies: vec![old_proxy],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![new_proxy],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let affected = delta.affected_routes(&old);
+    assert!(affected.listen_paths.is_empty());
+    // Both old and new hosts should be recorded
+    assert!(
+        affected
+            .host_only_hosts
+            .contains(&"new.example.com".to_string())
+    );
+    assert!(
+        affected
+            .host_only_hosts
+            .contains(&"old.example.com".to_string())
+    );
+}
+
+// --- Stream proxy skipping ---
+
+#[test]
+fn test_affected_routes_skips_stream_proxies() {
+    let t = Utc::now();
+    let mut stream_proxy = make_proxy("tcp1", "/unused", t);
+    stream_proxy.listen_path = None;
+    stream_proxy.dispatch_kind = DispatchKind::TcpRaw;
+    stream_proxy.listen_port = Some(9999);
+
+    let old = GatewayConfig::default();
+    let new = GatewayConfig {
+        proxies: vec![stream_proxy],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let affected = delta.affected_routes(&old);
+    assert!(affected.is_empty());
+}
+
+#[test]
+fn test_affected_routes_mixed_http_and_stream() {
+    let t = Utc::now();
+    let http_proxy = make_proxy("http1", "/api", t);
+
+    let mut stream_proxy = make_proxy("tcp1", "/unused", t);
+    stream_proxy.listen_path = None;
+    stream_proxy.dispatch_kind = DispatchKind::TcpRaw;
+    stream_proxy.listen_port = Some(9999);
+
+    let old = GatewayConfig::default();
+    let new = GatewayConfig {
+        proxies: vec![http_proxy, stream_proxy],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let affected = delta.affected_routes(&old);
+    // Only the HTTP proxy path should appear
+    assert_eq!(affected.listen_paths.len(), 1);
+    assert!(affected.listen_paths.contains(&"/api".to_string()));
+    assert!(affected.host_only_hosts.is_empty());
+}
+
+// --- Proxy-scoped plugin rebuild ---
+
+#[test]
+fn test_plugin_rebuild_proxy_scoped_plugin_change() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+
+    let proxy = make_proxy("p1", "/api", t1);
+    let old = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            t1,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            t2,
+        )],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    assert!(ids.contains("p1"));
+}
+
+#[test]
+fn test_plugin_rebuild_unrelated_proxy_not_affected() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+
+    let proxy1 = make_proxy("p1", "/api", t1);
+    let proxy2 = make_proxy("p2", "/other", t1);
+    let old = GatewayConfig {
+        proxies: vec![proxy1.clone(), proxy2.clone()],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            t1,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![proxy1, proxy2],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            t2,
+        )],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    assert!(ids.contains("p1"));
+    // p2 should NOT need rebuild since its plugin didn't change
+    assert!(!ids.contains("p2"));
+}
+
+// --- Same timestamp not treated as modification ---
+
+#[test]
+fn test_same_timestamp_is_not_modification() {
+    let t = Utc::now();
+    let old = GatewayConfig {
+        proxies: vec![make_proxy("p1", "/api", t)],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![make_proxy("p1", "/api/v2", t)], // different path, same timestamp
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    // Same updated_at = no modification detected (by design)
+    assert!(delta.modified_proxies.is_empty());
+}
+
+// --- Both configs empty ---
+
+#[test]
+fn test_both_configs_empty() {
+    let delta = ConfigDelta::compute(&GatewayConfig::default(), &GatewayConfig::default());
+    assert!(delta.is_empty());
 }

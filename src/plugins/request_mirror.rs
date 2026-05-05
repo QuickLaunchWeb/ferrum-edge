@@ -39,7 +39,8 @@
 //!   "mirror_protocol": "https",
 //!   "mirror_path": "/shadow",
 //!   "percentage": 100.0,
-//!   "mirror_request_body": true
+//!   "mirror_request_body": true,
+//!   "max_response_body_bytes": 1048576
 //! }
 //! ```
 //!
@@ -51,6 +52,7 @@
 //! | `mirror_path` | string | (none) | Override the request path for the mirror. When unset, the original request path is used |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
+//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -60,7 +62,15 @@ use std::time::Duration;
 use tracing::warn;
 use url::form_urlencoded;
 
+use super::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+/// Default cap on the size of mirror response bodies the gateway is willing
+/// to read. The body is discarded — only its length is reported in mirror
+/// metadata — so 1 MiB is plenty for the size-derivation use case while still
+/// protecting against a misbehaving mirror endpoint streaming an unbounded
+/// response over a fire-and-forget task.
+const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 pub struct RequestMirror {
     http_client: PluginHttpClient,
@@ -70,6 +80,12 @@ pub struct RequestMirror {
     mirror_path: Option<String>,
     percentage: f64,
     mirror_request_body: bool,
+    /// Maximum number of bytes to read from the mirror response when deriving
+    /// `mirror_response_size_bytes`. The body is discarded after measurement,
+    /// so this only bounds memory usage for fire-and-forget mirror tasks
+    /// against misbehaving sinks. Used only when the mirror response has no
+    /// `content-length` header (the CL fast path doesn't read the body).
+    max_response_body_bytes: usize,
     mirror_hostname: String,
     /// Monotonic counter for deterministic percentage sampling without rand.
     /// Every Nth request is mirrored based on the percentage threshold.
@@ -127,6 +143,28 @@ impl RequestMirror {
 
         let mirror_request_body = config["mirror_request_body"].as_bool().unwrap_or(true);
 
+        let max_response_body_bytes = match config.get("max_response_body_bytes") {
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(0) => {
+                    return Err("request_mirror: 'max_response_body_bytes' must be > 0".to_string());
+                }
+                Some(v) => v as usize,
+                None => {
+                    return Err(
+                        "request_mirror: 'max_response_body_bytes' must be a non-negative integer"
+                            .to_string(),
+                    );
+                }
+            },
+            Some(Value::Null) | None => DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES,
+            Some(_) => {
+                return Err(
+                    "request_mirror: 'max_response_body_bytes' must be a non-negative integer"
+                        .to_string(),
+                );
+            }
+        };
+
         let mirror_hostname = mirror_host.clone();
 
         Ok(Self {
@@ -137,6 +175,7 @@ impl RequestMirror {
             mirror_path,
             percentage,
             mirror_request_body,
+            max_response_body_bytes,
             mirror_hostname,
             request_counter: AtomicU64::new(0),
         })
@@ -265,6 +304,7 @@ impl Plugin for RequestMirror {
 
         let http_client = self.http_client.clone();
         let mirror_url_for_log = mirror_url.clone();
+        let max_response_body_bytes = self.max_response_body_bytes;
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
@@ -311,26 +351,44 @@ impl Plugin for RequestMirror {
                 req_builder = req_builder.body(body);
             }
 
-            let (status_code, response_size, error_msg) =
-                match http_client.execute(req_builder, "request_mirror").await {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        // Derive response size from content-length when available (avoids
-                        // reading the body). Fall back to consuming the body bytes.
-                        let size = match resp.content_length() {
-                            Some(cl) => Some(cl),
-                            None => resp.bytes().await.ok().map(|b| b.len() as u64),
-                        };
-                        (Some(status), size, None)
-                    }
-                    Err(err) => {
-                        warn!(
-                            "request_mirror: failed to mirror {} {} → {}",
-                            method, mirror_url_for_log, err
-                        );
-                        (None, None, Some(err.to_string()))
-                    }
-                };
+            let (status_code, response_size, error_msg) = match http_client
+                .execute(req_builder, "request_mirror")
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    // Derive response size from content-length when available (avoids
+                    // reading the body). When absent, the body would otherwise be
+                    // unbounded — a misbehaving mirror sink could exhaust gateway
+                    // memory in a fire-and-forget task. Stream and bound by
+                    // `max_response_body_bytes`, discarding the bytes after sizing.
+                    let size = match resp.content_length() {
+                        Some(cl) => Some(cl),
+                        None => match measure_response_body_bounded(resp, max_response_body_bytes)
+                            .await
+                        {
+                            Ok(n) => Some(n),
+                            Err(BoundedReadError::LimitExceeded { read_so_far, .. }) => {
+                                warn!(
+                                    "request_mirror: response from {} truncated at {} bytes \
+                                         (max_response_body_bytes = {})",
+                                    mirror_url_for_log, read_so_far, max_response_body_bytes
+                                );
+                                Some(read_so_far as u64)
+                            }
+                            Err(BoundedReadError::Stream(_)) => None,
+                        },
+                    };
+                    (Some(status), size, None)
+                }
+                Err(err) => {
+                    warn!(
+                        "request_mirror: failed to mirror {} {} → {}",
+                        method, mirror_url_for_log, err
+                    );
+                    (None, None, Some(err.to_string()))
+                }
+            };
 
             let elapsed = start.elapsed();
 

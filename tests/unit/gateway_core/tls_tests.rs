@@ -750,7 +750,7 @@ fn test_build_client_cert_verifier_with_valid_ca() {
     let ca_path = dir.path().join("ca.pem");
     std::fs::write(&ca_path, &ca_pem).unwrap();
 
-    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap());
+    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap(), &[]);
     assert!(
         result.is_ok(),
         "Should build verifier with valid CA: {:?}",
@@ -762,7 +762,7 @@ fn test_build_client_cert_verifier_with_valid_ca() {
 fn test_build_client_cert_verifier_missing_file() {
     ensure_crypto_provider();
 
-    let result = tls::build_client_cert_verifier("/nonexistent/path/ca.pem");
+    let result = tls::build_client_cert_verifier("/nonexistent/path/ca.pem", &[]);
     assert!(result.is_err(), "Missing CA file should fail");
 }
 
@@ -774,6 +774,146 @@ fn test_build_client_cert_verifier_empty_file() {
     let ca_path = dir.path().join("empty_ca.pem");
     std::fs::write(&ca_path, "").unwrap();
 
-    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap());
+    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap(), &[]);
     assert!(result.is_err(), "Empty CA file should fail");
+}
+
+#[test]
+fn test_build_client_cert_verifier_with_crls_succeeds() {
+    use rcgen::{
+        CertificateRevocationListParams, RevocationReason, RevokedCertParams, SerialNumber,
+    };
+
+    ensure_crypto_provider();
+
+    let dir = TempDir::new().unwrap();
+    let (ca_issuer, ca_pem, _) = generate_ca();
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+
+    // Build a valid CRL signed by the CA. The CRL revokes a placeholder serial;
+    // the verifier construction itself only requires the CRL to be parseable
+    // and validly signed by a CA in the trust store.
+    let now = time::OffsetDateTime::now_utc();
+    let revoked_certs = vec![RevokedCertParams {
+        serial_number: SerialNumber::from(99u64),
+        revocation_time: now,
+        reason_code: Some(RevocationReason::KeyCompromise),
+        invalidity_date: None,
+    }];
+    let params = CertificateRevocationListParams {
+        this_update: now,
+        next_update: now + time::Duration::days(30),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs,
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let crl_pem = params.signed_by(&ca_issuer).unwrap().pem().unwrap();
+    let crl_der: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
+        rustls_pemfile::crls(&mut crl_pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
+    assert!(
+        !crl_der.is_empty(),
+        "should parse at least one CRL from PEM"
+    );
+
+    // Verifier construction must succeed and (implicitly) honour CRL config.
+    // The `with_crls` call path is gated on `!crls.is_empty()`, so this
+    // exercises that branch — earlier the H3 verifier silently skipped CRLs.
+    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap(), &crl_der);
+    assert!(
+        result.is_ok(),
+        "Should build verifier with CRLs: {:?}",
+        result.err()
+    );
+}
+
+/// End-to-end CRL enforcement on the H3 client-cert verifier.
+///
+/// Issue a CA-signed leaf with an explicit serial, build a CRL revoking that
+/// exact serial, then verify the leaf via the verifier returned by
+/// `build_client_cert_verifier`. Before the H3 CRL fix, the verifier silently
+/// dropped the CRL list and accepted the revoked cert. After the fix, with
+/// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`, a
+/// matching revocation entry must produce a verification failure surfacing the
+/// `Revoked` rustls error.
+#[test]
+fn test_h3_client_verifier_rejects_revoked_cert() {
+    use rcgen::{
+        CertificateParams, CertificateRevocationListParams, KeyPair, RevocationReason,
+        RevokedCertParams, SerialNumber,
+    };
+    use rustls::pki_types::{CertificateDer, UnixTime};
+
+    ensure_crypto_provider();
+
+    let dir = TempDir::new().unwrap();
+    let (ca_issuer, ca_pem, _) = generate_ca();
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+
+    // Issue a leaf cert with a known serial so the CRL can revoke it by serial.
+    let leaf_serial = SerialNumber::from_slice(&(1u8..=20).collect::<Vec<u8>>());
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut leaf_params = CertificateParams::new(vec!["client.example".to_string()]).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Test Client");
+    leaf_params.serial_number = Some(leaf_serial.clone());
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
+    let leaf_der: CertificateDer<'static> = {
+        let pem = leaf_cert.pem();
+        let parsed: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
+        parsed.into_iter().next().expect("leaf DER")
+    };
+
+    // Build a CRL that revokes the leaf's serial.
+    let now = time::OffsetDateTime::now_utc();
+    let crl_params = CertificateRevocationListParams {
+        this_update: now,
+        next_update: now + time::Duration::days(30),
+        crl_number: SerialNumber::from(1u64),
+        issuing_distribution_point: None,
+        revoked_certs: vec![RevokedCertParams {
+            serial_number: leaf_serial.clone(),
+            revocation_time: now,
+            reason_code: Some(RevocationReason::KeyCompromise),
+            invalidity_date: None,
+        }],
+        key_identifier_method: rcgen::KeyIdMethod::Sha256,
+    };
+    let crl_pem = crl_params.signed_by(&ca_issuer).unwrap().pem().unwrap();
+    let crl_der: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
+        rustls_pemfile::crls(&mut crl_pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
+    assert!(!crl_der.is_empty(), "should parse CRL from PEM");
+
+    // Sanity: without CRLs, the verifier accepts the leaf.
+    let no_crl_verifier = tls::build_client_cert_verifier(ca_path.to_str().unwrap(), &[]).unwrap();
+    let no_crl_result = no_crl_verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
+    assert!(
+        no_crl_result.is_ok(),
+        "Without CRLs, the leaf must verify: {:?}",
+        no_crl_result.err()
+    );
+
+    // With CRLs, the same leaf must be rejected as revoked.
+    let crl_verifier =
+        tls::build_client_cert_verifier(ca_path.to_str().unwrap(), &crl_der).unwrap();
+    let result = crl_verifier.verify_client_cert(&leaf_der, &[], UnixTime::now());
+    assert!(
+        result.is_err(),
+        "Revoked client cert must be rejected when CRL is configured"
+    );
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(
+        err.to_ascii_lowercase().contains("revoked"),
+        "expected a revocation error, got: {}",
+        err
+    );
 }

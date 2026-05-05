@@ -137,6 +137,19 @@ async fn start_gateway_with_retry<F>(
 where
     F: Fn(u16, &std::path::Path) -> String,
 {
+    start_gateway_with_retry_env(write_config, &[]).await
+}
+
+/// Variant of `start_gateway_with_retry` that lets the caller add extra env
+/// variables (e.g. `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`) without
+/// duplicating the port-allocation + retry scaffolding.
+async fn start_gateway_with_retry_env<F>(
+    write_config: F,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, u16, u16, u16, TempDir)
+where
+    F: Fn(u16, &std::path::Path) -> String,
+{
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -156,17 +169,19 @@ where
         let config_content = write_config(proxy_listen_port, dir.path());
         std::fs::write(&config_path, &config_content).unwrap();
 
-        let mut child = std::process::Command::new(gateway_binary_path())
-            .env("FERRUM_MODE", "file")
+        let mut cmd = std::process::Command::new(gateway_binary_path());
+        cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
             .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "debug")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("Failed to start gateway");
+            .stderr(std::process::Stdio::null());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("Failed to start gateway");
 
         if wait_for_health(admin_port).await {
             return (child, proxy_listen_port, http_port, admin_port, dir);
@@ -317,6 +332,101 @@ upstreams: []
         &buf[..n],
         msg,
         "TLS echo through passthrough should return same data"
+    );
+
+    gateway.kill().ok();
+    gateway.wait().ok();
+}
+
+/// Slow-loris defense: a peer that opens a TCP connection to a passthrough
+/// listener and never writes a ClientHello must NOT park a connection-handler
+/// task indefinitely. The peek is bounded by
+/// `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
+///
+/// Before the fix, the gateway sits forever at `TcpStream::peek()` waiting for
+/// the silent peer's first byte and never even attempts the backend connect.
+/// After the fix, the peek returns `None` once the deadline expires and the
+/// gateway proceeds with whatever bytes were available (zero) — at which
+/// point the backend connection is initiated and the backend's accept queue
+/// records a new connection.
+///
+/// We assert on the backend-side accept count: it must reach 1 within
+/// roughly `timeout + slack`. If the bug were still present, the accept
+/// count would stay at 0 indefinitely.
+#[tokio::test]
+#[ignore]
+async fn test_tcp_passthrough_sni_peek_timeout_drops_silent_peer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Backend that just counts accepted connections and holds them open
+    // (so the OS doesn't reset them, and the gateway doesn't see EOF early).
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let accepts = Arc::new(AtomicU32::new(0));
+    let accepts_for_task = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, _)) = backend_listener.accept().await {
+                accepts_for_task.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let _hold = stream;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        }
+    });
+
+    // Gateway: 2-second handshake timeout for the passthrough SNI peek.
+    let (mut gateway, proxy_listen_port, _http_port, _admin_port, _dir) =
+        start_gateway_with_retry_env(
+            |stream_port, _dir_path| {
+                format!(
+                    r#"
+proxies:
+  - id: "tcp-passthrough-slow-loris"
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    listen_port: {stream_port}
+    passthrough: true
+
+consumers: []
+plugin_configs: []
+upstreams: []
+"#,
+                )
+            },
+            &[("FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS", "2")],
+        )
+        .await;
+
+    // Connect and never send anything — classic slow-loris.
+    let _silent = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_listen_port))
+        .await
+        .expect("connect to gateway");
+
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(5); // 2s timeout + 3s slack
+    let mut accept_observed = false;
+    while std::time::Instant::now() < deadline {
+        if accepts.load(Ordering::Relaxed) >= 1 {
+            accept_observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let elapsed = started.elapsed();
+
+    assert!(
+        accept_observed,
+        "Backend never saw a connection within {:?}; SNI peek timeout did not fire (slow-loris bug regressed)",
+        elapsed
+    );
+    // Sanity: the timeout shouldn't fire much earlier than the configured 2s.
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "Backend connection observed too early ({elapsed:?}) — peek timeout may be wired to the wrong knob"
     );
 
     gateway.kill().ok();
