@@ -3079,6 +3079,7 @@ mod h3_pool_health_tests {
             Arc::new(Http3PoolManager),
             pool_cfg,
             Duration::from_millis(50),
+            64,
         );
 
         let key = "evict-test-key".to_string();
