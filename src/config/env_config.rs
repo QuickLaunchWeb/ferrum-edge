@@ -78,26 +78,112 @@ impl std::fmt::Display for BackendAllowIps {
 /// Check whether an IP address falls within private/reserved ranges.
 ///
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
-/// - IPv4: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
-///   169.254.0.0/16 (link-local / cloud metadata), 0.0.0.0/8, 100.64.0.0/10 (CGNAT)
-/// - IPv6: ::1, ::, fe80::/10 (link-local), fd00::/8 (unique local)
+/// - IPv4: loopback, RFC1918, link-local / cloud metadata, 0.0.0.0/8,
+///   CGNAT, documentation, benchmarking, multicast, and reserved ranges.
+/// - IPv6: loopback, unspecified, IPv4-mapped/compatible private/reserved
+///   addresses, NAT64 private/reserved embeddings, discard-only,
+///   documentation, IETF special-purpose, deprecated 6to4, ULA, link-local,
+///   and multicast ranges.
 pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
             ip.is_loopback()                // 127.0.0.0/8
             || ip.is_private()              // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
             || ip.is_link_local()           // 169.254.0.0/16
             || ip.is_unspecified()          // 0.0.0.0
-            || ip.octets()[0] == 0          // 0.0.0.0/8 (full range)
-            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64) // 100.64.0.0/10 (CGNAT)
+            || a == 0                       // 0.0.0.0/8 (full range)
+            || (a == 100 && (b & 0xC0) == 64) // 100.64.0.0/10 (CGNAT)
+            || is_non_global_ietf_protocol_assignment_v4(a, b, c, d)
+            || (a == 192 && b == 0 && c == 2) // 192.0.2.0/24 (TEST-NET-1)
+            || (a == 192 && b == 88 && c == 99) // 192.88.99.0/24 (deprecated 6to4 relay)
+            || (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 (benchmarking)
+            || (a == 198 && b == 51 && c == 100) // 198.51.100.0/24 (TEST-NET-2)
+            || (a == 203 && b == 0 && c == 113) // 203.0.113.0/24 (TEST-NET-3)
+            || (224..=239).contains(&a)     // 224.0.0.0/4 (multicast)
+            || a >= 240 // 240.0.0.0/4 + 255.255.255.255
         }
         std::net::IpAddr::V6(ip) => {
-            ip.is_loopback()                                // ::1
-            || ip.is_unspecified()                          // ::
-            || (ip.segments()[0] & 0xffc0) == 0xfe80        // fe80::/10 (link-local)
-            || (ip.segments()[0] & 0xff00) == 0xfd00 // fd00::/8 (unique local)
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_private_ip(&std::net::IpAddr::V4(mapped));
+            }
+            if let Some(compatible) = ip.to_ipv4() {
+                return is_private_ip(&std::net::IpAddr::V4(compatible));
+            }
+
+            let segments = ip.segments();
+            ip.is_loopback()                            // ::1
+            || ip.is_unspecified()                      // ::
+            || is_well_known_nat64_private_ip(segments) // 64:ff9b::/96 with private/reserved embedded IPv4
+            || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001) // 64:ff9b:1::/48
+            || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64 (discard-only)
+            || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 1) // 100:0:0:1::/64 (dummy prefix)
+            || is_non_global_ietf_protocol_assignment_v6(segments)
+            || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 (documentation)
+            || segments[0] == 0x2002                  // 2002::/16 (deprecated 6to4)
+            || (segments[0] & 0xfe00) == 0xfc00        // fc00::/7 (unique local)
+            || (segments[0] & 0xffc0) == 0xfe80        // fe80::/10 (link-local)
+            || (segments[0] & 0xff00) == 0xff00 // ff00::/8 (multicast)
         }
     }
+}
+
+fn is_non_global_ietf_protocol_assignment_v4(a: u8, b: u8, c: u8, d: u8) -> bool {
+    if !(a == 192 && b == 0 && c == 0) {
+        return false;
+    }
+
+    // 192.0.0.9/32 and 192.0.0.10/32 are globally reachable anycast
+    // assignments inside the otherwise non-global 192.0.0.0/24 parent.
+    d != 9 && d != 10
+}
+
+fn is_non_global_ietf_protocol_assignment_v6(segments: [u16; 8]) -> bool {
+    if !(segments[0] == 0x2001 && segments[1] < 0x0200) {
+        return false;
+    }
+
+    // Allow the globally reachable more-specific assignments in 2001::/23.
+    if segments[1] == 0x0001
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+        && segments[6] == 0
+        && matches!(segments[7], 1..=3)
+    {
+        return false;
+    }
+
+    if segments[1] == 0x0003 {
+        return false;
+    }
+
+    if segments[1] == 0x0004 && segments[2] == 0x0112 {
+        return false;
+    }
+
+    if (segments[1] & 0xfff0) == 0x0020 || (segments[1] & 0xfff0) == 0x0030 {
+        return false;
+    }
+
+    true
+}
+
+fn is_well_known_nat64_private_ip(segments: [u16; 8]) -> bool {
+    if segments[0] != 0x0064
+        || segments[1] != 0xff9b
+        || segments[2] != 0
+        || segments[3] != 0
+        || segments[4] != 0
+        || segments[5] != 0
+    {
+        return false;
+    }
+
+    let [a, b] = segments[6].to_be_bytes();
+    let [c, d] = segments[7].to_be_bytes();
+    is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)))
 }
 
 /// Check whether an IP is allowed under the given backend IP policy.
