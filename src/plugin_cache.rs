@@ -72,6 +72,9 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.inner.requires_request_body_before_before_proxy()
     }
+    fn requires_request_body_before_authenticate(&self) -> bool {
+        self.inner.requires_request_body_before_authenticate()
+    }
     fn requires_request_body_buffering(&self) -> bool {
         self.inner.requires_request_body_buffering()
     }
@@ -281,6 +284,7 @@ impl PluginCapabilities {
     pub const MODIFIES_REQUEST_BODY: u8 = 1 << 2;
     pub const HAS_BODY_BEFORE_BEFORE_PROXY: u8 = 1 << 3;
     pub const NEEDS_REQUEST_BODY_BYTES: u8 = 1 << 4;
+    pub const HAS_BODY_BEFORE_AUTHENTICATE: u8 = 1 << 5;
 
     #[inline(always)]
     pub fn has(self, flag: u8) -> bool {
@@ -315,6 +319,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_request_body_before_before_proxy() {
             caps |= PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY;
+        }
+        if p.requires_request_body_before_authenticate() {
+            caps |= PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE;
         }
         if p.needs_request_body_bytes() {
             caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;

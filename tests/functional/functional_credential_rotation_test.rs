@@ -733,7 +733,9 @@ async fn test_credential_rotation_hmac() {
             "scope": "proxy",
             "proxy_id": "rot-hmac-proxy",
             "enabled": true,
-            "config": {"clock_skew_seconds": 300}
+            // Legacy 3-field signing string preserves the existing test
+            // expectations; the digest path has its own dedicated tests.
+            "config": {"clock_skew_seconds": 300, "require_digest": false}
         }),
     )
     .await

@@ -71,7 +71,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **JWT** (HS256) — bearer token with configurable claim field
 - **API Key** — header or query parameter lookup
 - **Basic Auth** — bcrypt or HMAC-SHA256 password verification
-- **HMAC** — request signature verification
+- **HMAC** — request signature verification with body integrity protection via Digest header (RFC 9421 / RFC 3230)
 - **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization
 - **LDAP Auth** — LDAP directory authentication via direct bind or search-then-bind with optional AD group filtering
 - **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML assertion validation, timestamp freshness, and nonce replay protection

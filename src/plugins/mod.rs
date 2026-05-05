@@ -1090,6 +1090,20 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs the raw request body to be available
+    /// during the `authenticate` phase.
+    ///
+    /// This is even narrower than `requires_request_body_before_before_proxy()`:
+    /// it forces request body buffering BEFORE the authenticate phase runs, so
+    /// auth plugins can verify body integrity (e.g., HMAC signing string that
+    /// covers a `Digest:` header per RFC 9421 / RFC 3230).
+    ///
+    /// Override this only for auth plugins that perform body integrity checks
+    /// at authentication time (e.g., `hmac_auth` with `require_digest = true`).
+    fn requires_request_body_before_authenticate(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs binary-safe access to the raw
     /// request body bytes via `ctx.request_body_bytes`.
     ///
@@ -1108,7 +1122,9 @@ pub trait Plugin: Send + Sync {
     /// Request-time body buffering can still remain disabled when
     /// `should_buffer_request_body()` returns `false` for the current request.
     fn requires_request_body_buffering(&self) -> bool {
-        self.modifies_request_body() || self.requires_request_body_before_before_proxy()
+        self.modifies_request_body()
+            || self.requires_request_body_before_before_proxy()
+            || self.requires_request_body_before_authenticate()
     }
 
     /// Called just before the request is proxied to the backend.

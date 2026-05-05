@@ -936,6 +936,48 @@ async fn handle_h3_request(
     // for HTTP/3 — preserves existing behavior).
     ctx.materialize_query_params_raw();
 
+    // Some auth plugins (e.g. `hmac_auth` with `require_digest=true`) verify
+    // request body integrity at authenticate time. Buffer the body before the
+    // auth phase runs so those plugins can read `ctx.request_body_bytes`.
+    let h3_requires_body_before_authenticate = capabilities
+        .has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_AUTHENTICATE)
+        && plugins.iter().any(|plugin| {
+            plugin.requires_request_body_before_authenticate()
+                && plugin.should_buffer_request_body(&ctx)
+        });
+
+    let mut prebuffered_body_data: Option<Vec<u8>> = if h3_requires_body_before_authenticate {
+        let mut body_data = Vec::new();
+        let max_body = if matches!(http_flavor, HttpFlavor::Grpc) {
+            state.max_grpc_recv_size_bytes
+        } else {
+            state.max_request_body_size_bytes
+        };
+        while let Some(chunk) = stream.recv_data().await? {
+            let bytes = chunk.chunk();
+            if max_body > 0 && body_data.len() + bytes.len() > max_body {
+                record_request(&state, 413);
+                send_h3_error_flavor_aware(
+                    &mut stream,
+                    http_flavor,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"Request body exceeds maximum size"}"#,
+                    crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                    "Request body exceeds maximum size",
+                )
+                .await?;
+                return Ok(());
+            }
+            body_data.extend_from_slice(bytes);
+        }
+        // Auth plugins that need bytes (hmac_auth digest verification) read
+        // `ctx.request_body_bytes`, so always populate the binary-safe handle.
+        crate::proxy::store_request_body_metadata(&mut ctx, &body_data, true);
+        Some(body_data)
+    } else {
+        None
+    };
+
     // Authentication phase (pre-computed auth plugin list — zero allocation).
     // `request_protocol` matches the HTTP/1.1 + HTTP/2 path so H3 gRPC
     // requests load the gRPC auth plugin set (not the HTTP-only set) —
@@ -1012,7 +1054,9 @@ async fn handle_h3_request(
     let h3_needs_body_bytes = needs_request_body_before_before_proxy
         && capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_REQUEST_BODY_BYTES);
 
-    let mut prebuffered_body_data = if needs_request_body_before_before_proxy {
+    // If we already buffered above for the body-before-authenticate path, the
+    // body is already drained from the stream — no extra recv_data work here.
+    if needs_request_body_before_before_proxy && prebuffered_body_data.is_none() {
         let mut body_data = Vec::new();
         // For gRPC requests, enforce the gRPC-specific recv ceiling (matches
         // H1/H2 gRPC). Other flavors use the shared HTTP body limit.
@@ -1039,10 +1083,8 @@ async fn handle_h3_request(
             body_data.extend_from_slice(bytes);
         }
         crate::proxy::store_request_body_metadata(&mut ctx, &body_data, h3_needs_body_bytes);
-        Some(body_data)
-    } else {
-        None
-    };
+        prebuffered_body_data = Some(body_data);
+    }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
