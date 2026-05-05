@@ -1526,8 +1526,51 @@ fn spec_content_response(
     request_headers: &hyper::HeaderMap,
     max_decompress_bytes: usize,
 ) -> Response<Full<Bytes>> {
+    // Content negotiation FIRST — the ETag must be representation-specific so
+    // a cached YAML ETag does not produce a false 304 when the client requests
+    // JSON (or vice-versa).
+    let target_fmt = match negotiate_accept_or_406(request_headers, spec.spec_format) {
+        Some(fmt) => fmt,
+        None => {
+            return json_resp(
+                StatusCode::NOT_ACCEPTABLE,
+                &json!({
+                    "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
+                }),
+            );
+        }
+    };
+
+    let fmt_suffix = match target_fmt {
+        SpecFormat::Json => "json",
+        SpecFormat::Yaml => "yaml",
+    };
+    let etag = format!("\"{}-{}\"", spec.content_hash, fmt_suffix);
+
+    // If-None-Match check (RFC 9110 §13.1.2: comma-separated list, W/ prefix)
+    let etag_matches = request_headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| {
+            inm == "*"
+                || inm.split(',').any(|entry| {
+                    let tag = entry.trim().strip_prefix("W/").unwrap_or(entry.trim());
+                    tag == etag
+                })
+        });
+    if etag_matches {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .header("Cache-Control", "no-store")
+            .header("Vary", "Accept")
+            .body(Full::new(Bytes::new()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+    }
+
     // Decompress with an output cap.  A corrupted or bomb-ratio row from the
-    // DB would otherwise expand to GB on every admin GET.
+    // DB would otherwise expand to GB on every admin GET. Deferred until after
+    // the 304 check so cache hits skip decompression entirely.
     let raw = match spec_codec::decompress_gzip_capped(&spec.spec_content, max_decompress_bytes) {
         Ok(b) => b,
         Err(e) => {
@@ -1544,58 +1587,12 @@ fn spec_content_response(
         }
     };
 
-    // ETag
-    let etag = format!("\"{}\"", spec.content_hash);
-
-    // If-None-Match check (RFC 9110 §13.1.2: comma-separated list, W/ prefix)
-    let etag_matches = request_headers
-        .get("if-none-match")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|inm| {
-            inm == "*"
-                || inm.split(',').any(|entry| {
-                    let tag = entry.trim().strip_prefix("W/").unwrap_or(entry.trim());
-                    tag == etag
-                })
-        });
-    if etag_matches {
-        return Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header("ETag", etag)
-            .header("Cache-Control", "no-store")
-            .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
-    }
-
-    // Content negotiation. RFC 7231: if the client explicitly sets q=0 on
-    // every format we can serve, we must respond with 406 Not Acceptable
-    // rather than serve a representation they have refused.
-    let target_fmt = match negotiate_accept_or_406(request_headers, spec.spec_format) {
-        Some(fmt) => fmt,
-        None => {
-            return json_resp(
-                StatusCode::NOT_ACCEPTABLE,
-                &json!({
-                    "error": "No representation acceptable per Accept header (all formats explicitly q=0)"
-                }),
-            );
-        }
-    };
     let (body_bytes, ct) = if target_fmt == spec.spec_format {
         (raw, content_type_for_format(spec.spec_format))
     } else {
         match convert_format(&raw, spec.spec_format, target_fmt) {
             Ok(converted) => (converted, content_type_for_format(target_fmt)),
             Err(e) => {
-                // Conversion failed — the stored document is corrupt or not valid
-                // in the stored format.  Return 406 so the caller knows the
-                // requested format is unavailable; silently serving the wrong
-                // Content-Type would confuse clients.
-                //
-                // Note: this path is hard to trigger in practice because
-                // documents are validated at submit time, but a DB row that was
-                // corrupted after storage or a future serialisation bug could
-                // reach here.
                 tracing::warn!(
                     "format conversion ({:?} → {:?}) failed for spec {}: {}",
                     spec.spec_format,
@@ -1624,15 +1621,12 @@ fn spec_content_response(
         .status(StatusCode::OK)
         .header("Content-Type", ct)
         .header("Content-Length", len.to_string())
-        .header("ETag", etag)
+        .header("ETag", &etag)
         .header("Cache-Control", "no-store")
         .header("Vary", "Accept")
         .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap_or_else(|_| {
-            // Response builder failed (only possible if a header value is invalid,
-            // which cannot happen with our static header strings + well-formed hash).
-            // Emit a 500 so the client never receives a 200 with an error body.
             let mut resp = Response::new(Full::new(Bytes::from_static(
                 b"{\"error\":\"Internal server error\"}",
             )));
