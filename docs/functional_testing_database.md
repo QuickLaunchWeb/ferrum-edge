@@ -398,6 +398,7 @@ cargo test --test functional_tests test_mongodb_plaintext_full_lifecycle -- --ig
 
 # Run TLS tests (requires TLS-enabled MongoDB — see tests/scripts/setup_mongo_tls.sh)
 cargo test --test functional_tests test_mongodb_tls_connection -- --ignored --nocapture
+cargo test --test functional_tests test_mongodb_tls_require_connection -- --ignored --nocapture
 cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --nocapture
 ```
 
@@ -406,7 +407,8 @@ cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --n
 | Test | Connection | What It Verifies |
 |---|---|---|
 | `test_mongodb_plaintext_full_lifecycle` | Plaintext | Health (reports `"type":"mongodb"`), CRUD (proxy, consumer, plugin), live proxy routing, update, delete |
-| `test_mongodb_tls_connection` | TLS | Same CRUD lifecycle over TLS-encrypted connection |
+| `test_mongodb_tls_connection` | TLS `verify-full` | Same CRUD lifecycle over TLS with server certificate verification |
+| `test_mongodb_tls_require_connection` | TLS `require` | Same CRUD lifecycle over TLS with server certificate verification disabled |
 | `test_mongodb_mtls_connection` | mTLS | Same CRUD lifecycle with client certificate auth |
 
 ### Environment Variable Overrides
@@ -415,6 +417,7 @@ cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --n
 |---|---|---|
 | `FERRUM_TEST_MONGO_URL` | `mongodb://localhost:27017/ferrum_test` | Plaintext test URL |
 | `FERRUM_TEST_MONGO_TLS_URL` | `mongodb://localhost:27018/ferrum_test` | TLS test URL |
+| `FERRUM_TEST_MONGO_TLS_REQUIRE_URL` | falls back to `FERRUM_TEST_MONGO_TLS_URL` | Optional TLS `require` test URL |
 | `FERRUM_TEST_MONGO_MTLS_URL` | `mongodb://localhost:27019/ferrum_test` | mTLS test URL |
 | `FERRUM_TEST_MONGO_CERT_DIR` | `/tmp/ferrum-mongo-tls-certs` | Directory with `ca.crt`, `client.crt`, `client.key` |
 

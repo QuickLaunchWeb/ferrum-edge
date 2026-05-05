@@ -1,5 +1,6 @@
 use ferrum_edge::proxy::sni::{
-    extract_sni_from_client_hello, extract_sni_from_dtls_client_hello, resolve_proxy_by_sni,
+    extract_sni_from_client_hello, extract_sni_from_dtls_client_hello, extract_sni_from_tcp_stream,
+    resolve_proxy_by_sni,
 };
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
@@ -463,4 +464,90 @@ fn test_resolve_proxy_single_id_always_matches() {
         resolve_proxy_by_sni(Some("anything.com"), &ids, &config),
         Some("only")
     );
+}
+
+// ── TCP stream peek timeout (slow-loris defense) ─────────────────────────────
+
+/// A peer that connects but never writes must not park the SNI peek forever.
+/// With `Some(timeout)`, the call returns `None` shortly after the deadline.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_times_out_when_peer_silent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_millis(50)))
+                .await;
+        (result, started.elapsed())
+    });
+
+    // Connect but never write — simulates the slow-loris attacker.
+    let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+    let (result, elapsed) = accept_task.await.expect("accept_task");
+    assert_eq!(result, None, "timeout must surface as None");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(40),
+        "returned before timeout fired: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "took far longer than timeout, suggests no bound: {elapsed:?}"
+    );
+}
+
+/// `None` preserves the historical unbounded behavior. We can't wait
+/// "forever" in a unit test, so instead we drive the success path:
+/// peer writes a valid ClientHello and the peek returns it.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_no_timeout_succeeds_on_clienthello() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello("example.com");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        extract_sni_from_tcp_stream(&server_stream, None).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    let result = accept_task.await.expect("accept_task");
+    assert_eq!(result, Some("example.com".to_string()));
+}
+
+/// A peer that writes a valid ClientHello within the timeout still gets
+/// its SNI extracted — the timeout only fires when the peer is silent.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_succeeds_within_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello("inside.example.com");
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    let result = accept_task.await.expect("accept_task");
+    assert_eq!(result, Some("inside.example.com".to_string()));
 }

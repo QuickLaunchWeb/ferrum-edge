@@ -1046,7 +1046,7 @@ pub struct Proxy {
     pub listen_port: Option<u16>,
     /// Whether to terminate TLS on the gateway side for incoming TCP connections.
     /// For TCP: uses the gateway's TLS certificate for TLS termination.
-    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or Ed25519).
+    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or P-384).
     #[serde(default)]
     pub frontend_tls: bool,
     /// When true, forward encrypted client bytes directly to the backend without
@@ -3835,6 +3835,27 @@ impl GatewayConfig {
                         "Proxy '{}': backend_host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
                         proxy.id, ip, backend_allow_ips
                     ));
+                }
+                if let Some(ref dns_override) = proxy.dns_override {
+                    match dns_override.parse::<std::net::IpAddr>() {
+                        Ok(ip) => {
+                            if !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips) {
+                                errors.push(format!(
+                                    "Proxy '{}': dns_override IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                                    proxy.id, ip, backend_allow_ips
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Proxy '{}': dns_override '{}' is not an IP address, so startup cannot classify it under FERRUM_BACKEND_ALLOW_IPS={} policy: {}",
+                                proxy.id,
+                                dns_override,
+                                backend_allow_ips,
+                                e
+                            );
+                        }
+                    }
                 }
             }
             for upstream in &self.upstreams {

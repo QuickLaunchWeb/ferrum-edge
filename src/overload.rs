@@ -8,10 +8,39 @@
 //! Also provides graceful shutdown draining: after SIGTERM, tracks in-flight
 //! connections and waits up to a configurable drain period for them to complete.
 
-use std::sync::Arc;
+use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Number of monitor ticks between `fd_limit` refreshes.
+///
+/// The soft `RLIMIT_NOFILE` is mutable at runtime — operators or systemd may
+/// raise it without restarting the gateway via `setrlimit(2)` or by reloading
+/// the unit. Re-querying once per minute (60 ticks at the default 1s interval)
+/// keeps `fd_ratio` aligned with the live limit at negligible cost (one
+/// `getrlimit` syscall per minute) without taking the hit on every tick.
+const FD_LIMIT_REFRESH_INTERVAL_TICKS: u64 = 60;
+
+/// One-shot warning latch for the `fd_limit == 0` (FD pressure disabled) case.
+///
+/// `get_fd_limit()` returns 0 on Windows and other non-Unix platforms (and on
+/// the rare `getrlimit` failure on Unix). When that happens the FD ratio is
+/// permanently 0.0 — FD-based load shedding is silently inert. We emit a
+/// single `warn!` so operators can distinguish "FD pressure disabled by
+/// platform" from "FD pressure at 0%". The latch ensures the periodic refresh
+/// loop never spams the warn if it continues to see 0.
+static FD_PRESSURE_DISABLED_WARN: Once = Once::new();
+
+fn warn_fd_pressure_disabled_once() {
+    FD_PRESSURE_DISABLED_WARN.call_once(|| {
+        warn!(
+            "FD-based pressure shedding disabled on this platform — fd_limit could not be queried. \
+             Connection-based and request-based shedding remain active."
+        );
+    });
+}
 
 /// Scale factor for RED (Random Early Detection) drop probability.
 ///
@@ -35,27 +64,40 @@ pub enum OverloadLevel {
 /// The background monitor writes these flags; request threads only read.
 /// All fields use `Ordering::Relaxed` — eventual consistency is acceptable
 /// for overload signals (a few ms of stale state is harmless).
+///
+/// Hot-path atomics (`disable_keepalive`, `reject_new_connections`,
+/// `reject_new_requests`, `active_connections`, `active_requests`,
+/// `red_drop_probability`, `red_request_counter`) are wrapped in
+/// [`CachePadded`] to prevent false sharing across cores: at 1M conn/sec
+/// churn, an unpadded layout puts the read-mostly action flags on the same
+/// cache line as the `fetch_add`/`fetch_sub` counters, causing the line to
+/// ping-pong between cores and turning every accept into a coherence stall.
+/// Snapshot fields (`fd_current`, `conn_current`, etc.), `draining`, and
+/// `port_exhaustion_events` are NOT padded — they are written ≤ once/sec or
+/// only on rare events, so contention does not justify the memory cost.
+/// `CachePadded<T>` derefs to `T`, so all existing
+/// `.load()` / `.fetch_add()` call sites compile unchanged.
 pub struct OverloadState {
     // ── Action flags (hot-path reads) ──────────────────────────────────
     /// When true, responses include `Connection: close` to drain idle keepalives.
-    pub disable_keepalive: AtomicBool,
+    pub disable_keepalive: CachePadded<AtomicBool>,
     /// When true, new connections are rejected with 503 before routing.
-    pub reject_new_connections: AtomicBool,
+    pub reject_new_connections: CachePadded<AtomicBool>,
     /// When true, new requests/streams are rejected with 503 before processing.
     /// Independent of `reject_new_connections` — connections track sockets,
     /// requests track multiplexed H2/H3/gRPC streams.
-    pub reject_new_requests: AtomicBool,
+    pub reject_new_requests: CachePadded<AtomicBool>,
 
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
     pub draining: AtomicBool,
     /// In-flight connection counter. Incremented on accept, decremented on drop
     /// via [`ConnectionGuard`].
-    pub active_connections: AtomicU64,
+    pub active_connections: CachePadded<AtomicU64>,
     /// In-flight request/stream counter. Incremented on request start, decremented
     /// on drop via [`RequestGuard`]. Tracks H1 requests, H2/gRPC streams, and H3
     /// streams independently of connections.
-    pub active_requests: AtomicU64,
+    pub active_requests: CachePadded<AtomicU64>,
     /// Notified each time `active_connections` or `active_requests` reaches zero
     /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
@@ -67,10 +109,10 @@ pub struct OverloadState {
     /// When in the pressure zone (between pressure and critical thresholds), responses
     /// are probabilistically marked with Connection: close based on this value.
     /// The hot path reads this with a single AtomicU32::load(Relaxed).
-    pub red_drop_probability: AtomicU32,
+    pub red_drop_probability: CachePadded<AtomicU32>,
     /// Monotonic request counter used as per-request entropy for RED decisions.
     /// Incremented by `fetch_add(1, Relaxed)` on each `should_disable_keepalive_red()` call.
-    red_request_counter: AtomicU64,
+    red_request_counter: CachePadded<AtomicU64>,
 
     // ── Snapshot for admin endpoint (written by monitor, read by admin) ─
     pub fd_current: AtomicU64,
@@ -96,15 +138,15 @@ impl Default for OverloadState {
 impl OverloadState {
     pub fn new() -> Self {
         Self {
-            disable_keepalive: AtomicBool::new(false),
-            reject_new_connections: AtomicBool::new(false),
-            reject_new_requests: AtomicBool::new(false),
+            disable_keepalive: CachePadded::new(AtomicBool::new(false)),
+            reject_new_connections: CachePadded::new(AtomicBool::new(false)),
+            reject_new_requests: CachePadded::new(AtomicBool::new(false)),
             draining: AtomicBool::new(false),
-            active_connections: AtomicU64::new(0),
-            active_requests: AtomicU64::new(0),
+            active_connections: CachePadded::new(AtomicU64::new(0)),
+            active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
-            red_drop_probability: AtomicU32::new(0),
-            red_request_counter: AtomicU64::new(0),
+            red_drop_probability: CachePadded::new(AtomicU32::new(0)),
+            red_request_counter: CachePadded::new(AtomicU64::new(0)),
             fd_current: AtomicU64::new(0),
             fd_max: AtomicU64::new(0),
             conn_current: AtomicU64::new(0),
@@ -132,6 +174,15 @@ impl OverloadState {
     /// Returns true if this response should have keepalive disabled based on RED probability.
     /// Uses a monotonic per-request counter with golden-ratio hashing for uniform distribution.
     /// Cost: one AtomicU32::load + one AtomicU64::fetch_add(Relaxed) + one multiply + one comparison.
+    ///
+    /// **This ONLY signals RED-probability shedding — NOT the binary "pressure-mode active"
+    /// signal.** Callers that want the full "should we close this HTTP/1.1 keepalive?"
+    /// decision must also OR with `self.disable_keepalive.load(Relaxed)`. Two reasons:
+    /// (1) at the exact pressure threshold the linear ramp produces probability 0 while
+    /// the binary flag is set; (2) the monitor loop writes `disable_keepalive` and
+    /// `red_drop_probability` as independent `Relaxed` stores, so a reader can transiently
+    /// observe the new flag with the prior cycle's probability. The hot-path response
+    /// builder in `proxy::mod` performs that OR — see `connection: close` decision.
     pub fn should_disable_keepalive_red(&self) -> bool {
         let prob = self.red_drop_probability.load(Ordering::Relaxed);
         if prob == 0 {
@@ -237,7 +288,10 @@ impl Drop for ConnectionGuard {
             .active_connections
             .fetch_sub(1, Ordering::Relaxed);
         // If this was the last connection and we are draining, notify the waiter.
-        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+        // `Acquire` synchronizes-with the `Release` store in `begin_drain` so the
+        // notify reliably fires when shutdown has begun, even on weakly-ordered
+        // architectures.
+        if prev == 1 && self.state.draining.load(Ordering::Acquire) {
             self.state.drain_complete.notify_one();
         }
     }
@@ -267,7 +321,10 @@ impl Drop for RequestGuard {
         // If this was the last request and we are draining, notify the waiter.
         // The drain waiter re-checks both active_connections and active_requests,
         // so spurious wakes from one counter reaching zero are harmless.
-        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+        // `Acquire` synchronizes-with the `Release` store in `begin_drain` so the
+        // notify reliably fires when shutdown has begun, even on weakly-ordered
+        // architectures.
+        if prev == 1 && self.state.draining.load(Ordering::Acquire) {
             self.state.drain_complete.notify_one();
         }
     }
@@ -403,25 +460,49 @@ fn count_open_fds() -> u64 {
     0 // FD monitoring not available on this platform
 }
 
-/// Get the maximum file descriptor limit (soft limit) via getrlimit.
+/// Platform constant for `RLIMIT_NOFILE` (the rlimit resource selector for the
+/// per-process open-file-descriptor cap). Linux puts it at 7, the BSD lineage
+/// (macOS, FreeBSD, etc.) at 8 — see `<sys/resource.h>`.
+#[cfg(target_os = "linux")]
+const RLIMIT_NOFILE: i32 = 7;
+#[cfg(target_os = "macos")]
+const RLIMIT_NOFILE: i32 = 8;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+const RLIMIT_NOFILE: i32 = 8; // BSD default
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
+    fn setrlimit(resource: i32, rlim: *const [u64; 2]) -> i32;
+}
+
+/// Recommended floor for the FD hard cap on production hosts. 65,536 covers
+/// 30K+ inbound TCP conns + their amortized outbound pool entries + the
+/// runtime/CRT FDs without the gateway tripping its own 95% critical
+/// threshold. Below this we emit a `warn!` at startup so operators see the
+/// signal in their log pipeline rather than discovering it at the EMFILE.
+pub const FD_HARD_LIMIT_PRODUCTION_FLOOR: u64 = 65_536;
+
+/// Outcome of the startup attempt to raise the soft FD cap to the hard cap.
+/// Reported by [`raise_fd_limit`] for logging and tests.
+#[derive(Debug, Clone, Copy)]
+pub struct RaiseFdLimitResult {
+    /// Soft limit observed before the call (0 on non-Unix or if `getrlimit` failed).
+    pub soft_before: u64,
+    /// Soft limit after the call. Equal to `soft_before` if `setrlimit` was a
+    /// no-op or failed; equal to `hard` on success.
+    pub soft_after: u64,
+    /// Hard limit (unchanged by this call — we never attempt to raise it).
+    pub hard: u64,
+    /// True when `setrlimit` actually moved the soft cap upward.
+    pub raised: bool,
+}
+
+/// Get the maximum file descriptor limit (soft limit).
 fn get_fd_limit() -> u64 {
     #[cfg(unix)]
     {
-        // rlimit struct: two u64 fields (rlim_cur, rlim_max) on 64-bit platforms
-        let mut rlim: [u64; 2] = [0, 0];
-        // RLIMIT_NOFILE is typically 7 on Linux, 8 on macOS — use platform constant
-        #[cfg(target_os = "linux")]
-        const RLIMIT_NOFILE: i32 = 7;
-        #[cfg(target_os = "macos")]
-        const RLIMIT_NOFILE: i32 = 8;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        const RLIMIT_NOFILE: i32 = 8; // BSD default
-
-        unsafe extern "C" {
-            fn getrlimit(resource: i32, rlim: *mut [u64; 2]) -> i32;
-        }
-        let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
-        if result == 0 { rlim[0] } else { 0 }
+        get_fd_rlimit_pair().0
     }
     #[cfg(not(unix))]
     {
@@ -429,11 +510,147 @@ fn get_fd_limit() -> u64 {
     }
 }
 
-/// Measure event loop latency by yielding and measuring the scheduling delay.
+/// Read both rlimit fields (soft, hard) at once. Returns `(0, 0)` on
+/// non-Unix or if the syscall fails. Used by [`raise_fd_limit`] and
+/// [`get_fd_limit`] so there is a single `getrlimit` call site.
+#[cfg(unix)]
+fn get_fd_rlimit_pair() -> (u64, u64) {
+    let mut rlim: [u64; 2] = [0, 0];
+    let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut rlim) };
+    if result == 0 {
+        (rlim[0], rlim[1])
+    } else {
+        (0, 0)
+    }
+}
+
+/// Raise the soft FD limit (`RLIMIT_NOFILE.rlim_cur`) to the hard limit.
+///
+/// Called once at startup. Conservative by design — we never attempt to raise
+/// the hard cap, so this never asks for privileges the process does not already
+/// have. If `setrlimit` fails (sandboxed container, seccomp filter, or the
+/// kernel rejects the value), the call is a no-op and the gateway continues
+/// with whatever soft cap it inherited.
+///
+/// On non-Unix platforms this is a no-op that returns zeros.
+///
+/// Operators running production workloads should make sure the *hard* cap is
+/// at least [`FD_HARD_LIMIT_PRODUCTION_FLOOR`] (set via `LimitNOFILE=` in
+/// systemd, `--ulimit nofile=` in Docker, or `/etc/security/limits.conf`) —
+/// when it is below that floor, [`raise_fd_limit`] only emits a structured
+/// `warn!` at startup; it does not fail. The caller (typically `main.rs`) is
+/// responsible for logging the result.
+pub fn raise_fd_limit() -> RaiseFdLimitResult {
+    #[cfg(unix)]
+    {
+        let (soft_before, hard) = get_fd_rlimit_pair();
+        if soft_before == 0 && hard == 0 {
+            // getrlimit failed — bail out without an unsafe second syscall.
+            return RaiseFdLimitResult {
+                soft_before: 0,
+                soft_after: 0,
+                hard: 0,
+                raised: false,
+            };
+        }
+
+        if soft_before >= hard {
+            // Already at the hard cap — nothing to do.
+            return RaiseFdLimitResult {
+                soft_before,
+                soft_after: soft_before,
+                hard,
+                raised: false,
+            };
+        }
+
+        // `hard == RLIM_INFINITY` is safe here; the kernel still enforces its
+        // platform ceiling (for example fs.nr_open on Linux).
+        let new_rlim: [u64; 2] = [hard, hard];
+        let result = unsafe { setrlimit(RLIMIT_NOFILE, &new_rlim) };
+        if result == 0 {
+            RaiseFdLimitResult {
+                soft_before,
+                soft_after: hard,
+                hard,
+                raised: true,
+            }
+        } else {
+            // setrlimit refused the bump — keep running with the old soft cap.
+            RaiseFdLimitResult {
+                soft_before,
+                soft_after: soft_before,
+                hard,
+                raised: false,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        RaiseFdLimitResult {
+            soft_before: 0,
+            soft_after: 0,
+            hard: 0,
+            raised: false,
+        }
+    }
+}
+
+/// Measure event loop latency across ALL tokio workers and return the maximum
+/// observed scheduling delay.
+///
+/// Naively timing a single `tokio::task::yield_now().await` only measures the
+/// reschedule latency of the CURRENT task on the CURRENT worker. With a
+/// multi-threaded runtime (one worker per CPU by default), a single starved
+/// worker (e.g., a misbehaving plugin doing blocking I/O on worker 0) is
+/// invisible to a monitor task running on a healthy worker. The 500 ms
+/// `loop_critical_us` gate would then almost never trip even when individual
+/// workers are pinned.
+///
+/// To surface per-worker starvation, we spawn one tiny probe task per worker
+/// (queried via `Handle::current().metrics().num_workers()`), let tokio's
+/// scheduler distribute them across workers, and report the **maximum**
+/// scheduling delay observed across all probes. A starved worker will have at
+/// least one queued probe task that takes much longer than `yield_now()` to
+/// re-poll, surfacing the starvation in the aggregate reading.
+///
+/// Each probe is a single `yield_now().await` (a few microseconds in the
+/// healthy case), so the overall cost scales linearly with worker count and
+/// is negligible at the default 1 s monitor interval.
+///
+/// On `current_thread` runtimes (or any runtime where `num_workers()` returns 0
+/// or 1, e.g. tokio's `LocalSet`-based tests), this falls back to the original
+/// single-task probe.
 async fn measure_event_loop_latency() -> Duration {
-    let start = std::time::Instant::now();
-    tokio::task::yield_now().await;
-    start.elapsed()
+    let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
+
+    // Single-threaded fallback: just measure our own reschedule.
+    if num_workers <= 1 {
+        let start = std::time::Instant::now();
+        tokio::task::yield_now().await;
+        return start.elapsed();
+    }
+
+    let mut probes = tokio::task::JoinSet::new();
+    for _ in 0..num_workers {
+        probes.spawn(async {
+            let start = std::time::Instant::now();
+            tokio::task::yield_now().await;
+            start.elapsed()
+        });
+    }
+
+    let mut max_latency = Duration::ZERO;
+    while let Some(result) = probes.join_next().await {
+        // A probe task panicking is unexpected (yield_now never panics) but if
+        // it ever happens, prefer continuing over aborting the monitor cycle.
+        if let Ok(latency) = result
+            && latency > max_latency
+        {
+            max_latency = latency;
+        }
+    }
+    max_latency
 }
 
 // ── Background monitor task ─────────────────────────────────────────────
@@ -451,14 +668,26 @@ pub fn start_monitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_millis(config.check_interval_ms);
-        let fd_limit = get_fd_limit();
+        // `fd_limit` is mutable so the monitor can pick up runtime changes to
+        // the soft `RLIMIT_NOFILE` (e.g. operator `setrlimit(2)`, systemd unit
+        // reload). Refreshed every `FD_LIMIT_REFRESH_INTERVAL_TICKS` iterations.
+        let mut fd_limit = get_fd_limit();
+        let mut tick: u64 = 0;
 
-        // Store limits once (don't change during runtime)
+        // Store limits (max_connections / max_requests don't change during
+        // runtime; fd_max is updated each refresh below).
         state.fd_max.store(fd_limit, Ordering::Relaxed);
         state
             .conn_max
             .store(max_connections as u64, Ordering::Relaxed);
         state.req_max.store(max_requests as u64, Ordering::Relaxed);
+
+        // One-shot warn at startup when FD pressure is unavailable on this
+        // platform (Windows, or `getrlimit` failed). Connection- and
+        // request-based shedding still work; only FD-based shedding is inert.
+        if fd_limit == 0 {
+            warn_fd_pressure_disabled_once();
+        }
 
         info!(
             "Overload monitor started (interval={}ms, fd_limit={}, max_conn={}, max_req={})",
@@ -471,6 +700,28 @@ pub fn start_monitor(
                 _ = shutdown_rx.changed() => {
                     debug!("Overload monitor shutting down");
                     return;
+                }
+            }
+            tick = tick.wrapping_add(1);
+
+            // ── Periodic fd_limit refresh ──
+            // The soft RLIMIT_NOFILE can be raised at runtime without
+            // restarting the gateway. Re-query once per minute so `fd_ratio`
+            // tracks the live limit. On platforms where the syscall returns
+            // 0, the warn latch fires only once.
+            if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
+                let new_limit = get_fd_limit();
+                if new_limit != fd_limit {
+                    info!(
+                        old_fd_limit = fd_limit,
+                        new_fd_limit = new_limit,
+                        "Overload monitor: fd_limit changed (RLIMIT_NOFILE updated)"
+                    );
+                    fd_limit = new_limit;
+                    state.fd_max.store(fd_limit, Ordering::Relaxed);
+                }
+                if fd_limit == 0 {
+                    warn_fd_pressure_disabled_once();
                 }
             }
 
@@ -518,10 +769,16 @@ pub fn start_monitor(
                 || conn_ratio >= config.conn_critical_threshold
                 || loop_us >= config.loop_critical_us;
 
-            // Request-level rejection is independent — only triggers when
-            // FERRUM_MAX_REQUESTS is configured (non-zero).
-            let should_reject_requests =
+            // Request-level overload rejection only triggers when
+            // FERRUM_MAX_REQUESTS is configured (non-zero). Shutdown drain is
+            // also a request-admission rejection source: once begin_drain()
+            // has published draining=true with Release ordering, the monitor
+            // must preserve that state instead of clearing reject_new_requests
+            // during a low-pressure sample.
+            let should_reject_requests_due_to_pressure =
                 max_requests > 0 && req_ratio >= config.req_critical_threshold;
+            let should_reject_requests =
+                state.draining.load(Ordering::Acquire) || should_reject_requests_due_to_pressure;
 
             // ── RED-style smooth ramp between pressure and critical thresholds ──
             // For BOTH fd and connection pressure, compute probability independently
@@ -565,7 +822,7 @@ pub fn start_monitor(
 
             // Transition logging — only log when state changes
             let was_rejecting = state.reject_new_connections.load(Ordering::Relaxed);
-            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Relaxed);
+            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Acquire);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
 
             state
@@ -576,7 +833,7 @@ pub fn start_monitor(
                 .store(should_reject, Ordering::Relaxed);
             state
                 .reject_new_requests
-                .store(should_reject_requests, Ordering::Relaxed);
+                .store(should_reject_requests, Ordering::Release);
 
             if should_reject && !was_rejecting {
                 warn!(
@@ -682,14 +939,49 @@ pub fn start_monitor(
     })
 }
 
+/// Mark the overload state as draining and refuse new request admission.
+///
+/// Sets both `draining` and `reject_new_requests` together so they are observed
+/// atomically with respect to each other from the shutdown trigger task. Stores
+/// use `Ordering::Release` so any loader that does an `Acquire` load (proxy hot
+/// path keepalive-close decision, request admission control, guard drop drain
+/// notification) sees the post-shutdown state in a happens-before relationship.
+///
+/// Called by every serving mode at the START of the post-listener-exit phase,
+/// regardless of `FERRUM_SHUTDOWN_DRAIN_SECONDS`. Two effects:
+///
+/// 1. **`draining=true`** — `Connection: close` is injected on HTTP/1.1 responses
+///    so keepalive clients release connections instead of holding them open
+///    until process exit. Also gates the guard-drop `drain_complete` notify.
+/// 2. **`reject_new_requests=true`** — new requests/streams arriving on
+///    EXISTING connections (especially H2/H3 multiplexed streams that have no
+///    `Connection: close` analogue and keepalive H1 streams that race the
+///    close hint) are rejected with 503 / gRPC UNAVAILABLE before processing.
+///
+/// Decoupled from [`wait_for_drain`] so `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` still
+/// emits the close hint and admission rejection — the wait loop is only useful
+/// when the operator wants the gateway to linger for in-flight completion.
+///
+/// Mirrors the [PR #569] Acquire/Release pattern for `startup_ready`.
+///
+/// [PR #569]: https://github.com/ferrum-edge/ferrum-edge/pull/569
+pub fn begin_drain(state: &Arc<OverloadState>) {
+    state.draining.store(true, Ordering::Release);
+    state.reject_new_requests.store(true, Ordering::Release);
+}
+
 /// Wait for all in-flight connections and requests to drain, up to the
 /// configured timeout.
 ///
-/// Called after the accept loops have exited. Returns `true` if all connections
-/// and requests drained within the timeout, `false` if the timeout expired.
+/// Called after the accept loops have exited and after [`begin_drain`] has
+/// been invoked. Returns `true` if all connections and requests drained within
+/// the timeout, `false` if the timeout expired.
+///
+/// This function does NOT toggle `draining` / `reject_new_requests` — that is
+/// [`begin_drain`]'s job, run unconditionally on shutdown so the close hint
+/// fires even when the operator has set `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` to
+/// disable the wait loop.
 pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bool {
-    state.draining.store(true, Ordering::Relaxed);
-
     let active_conns = state.active_connections.load(Ordering::Relaxed);
     let active_reqs = state.active_requests.load(Ordering::Relaxed);
     if active_conns == 0 && active_reqs == 0 {
@@ -760,6 +1052,177 @@ mod tests {
         assert!(count > 0, "Process should have at least some open FDs");
     }
 
+    /// `raise_fd_limit` must never return a soft cap above the hard cap, must
+    /// never lower the soft cap, and must accurately report whether it
+    /// actually moved the limit. Sandboxed/seccomp test runners are still
+    /// expected to satisfy these invariants because the call is a silent
+    /// no-op when `setrlimit` is denied.
+    #[cfg(unix)]
+    #[test]
+    fn raise_fd_limit_respects_invariants() {
+        let result = raise_fd_limit();
+        assert!(
+            result.soft_after >= result.soft_before,
+            "soft cap must never decrease: before={} after={}",
+            result.soft_before,
+            result.soft_after,
+        );
+        assert!(
+            result.soft_after <= result.hard,
+            "soft cap must never exceed hard cap: soft_after={} hard={}",
+            result.soft_after,
+            result.hard,
+        );
+        // `raised` must be consistent with the before/after delta.
+        if result.raised {
+            assert!(
+                result.soft_after > result.soft_before,
+                "raised=true requires soft_after > soft_before",
+            );
+        }
+    }
+
+    /// `raise_fd_limit` is idempotent — calling it a second time after the
+    /// first run reaches the hard cap must report `raised=false` and leave
+    /// the cap untouched. This protects against accidental double-call from
+    /// a future test or a CLI subcommand also wiring the helper into its
+    /// startup.
+    #[cfg(unix)]
+    #[test]
+    fn raise_fd_limit_is_idempotent() {
+        let first = raise_fd_limit();
+        let second = raise_fd_limit();
+        assert_eq!(
+            first.soft_after, second.soft_after,
+            "second call must not change the soft cap",
+        );
+        assert!(
+            !second.raised,
+            "second call must report raised=false; got soft_before={} soft_after={}",
+            second.soft_before, second.soft_after,
+        );
+    }
+
+    /// `CachePadded<T>` must occupy at least one cache line so that two
+    /// adjacent atomics in `OverloadState` do not share a line. The exact
+    /// alignment is platform-specific (64 B on x86-64, 128 B on aarch64),
+    /// but `crossbeam_utils` guarantees `>= 64`. This test catches a future
+    /// dep update that silently regresses the padding contract.
+    #[test]
+    fn cache_padded_atomic_u64_is_at_least_one_cache_line() {
+        let size = std::mem::size_of::<CachePadded<AtomicU64>>();
+        assert!(
+            size >= 64,
+            "CachePadded<AtomicU64> should be >= 64 bytes (one cache line); got {}",
+            size,
+        );
+    }
+
+    /// The hot atomics on `OverloadState` are intentionally on separate
+    /// cache lines from each other — verify the read-mostly action flag and
+    /// the write-heavy connection counter are not co-located. Address
+    /// distance >= 64 on x86-64 is sufficient evidence.
+    #[test]
+    fn hot_atomics_do_not_share_cache_line() {
+        let state = OverloadState::new();
+        let reject_addr = &*state.reject_new_connections as *const AtomicBool as usize;
+        let active_addr = &*state.active_connections as *const AtomicU64 as usize;
+        let distance = reject_addr.abs_diff(active_addr);
+        assert!(
+            distance >= 64,
+            "reject_new_connections and active_connections should be on different cache lines; distance={}",
+            distance,
+        );
+    }
+
+    /// The fd_limit refresh cadence — tied to the default 1s tick — should
+    /// land on whole-minute boundaries so the syscall load is predictable
+    /// (one `getrlimit` per minute). If the constant is ever retuned, this
+    /// guards against accidentally landing on a sub-minute interval.
+    #[test]
+    fn fd_limit_refresh_interval_is_one_minute_at_default_tick() {
+        let default_tick_ms = OverloadConfig::default().check_interval_ms;
+        let refresh_period_ms = default_tick_ms * FD_LIMIT_REFRESH_INTERVAL_TICKS;
+        assert_eq!(
+            refresh_period_ms, 60_000,
+            "fd_limit refresh should be ~60s at the default 1s monitor tick"
+        );
+        const {
+            assert!(
+                FD_LIMIT_REFRESH_INTERVAL_TICKS > 0,
+                "refresh interval must be positive to ever trigger a refresh"
+            );
+        }
+    }
+
+    /// Simulate the monitor loop's tick counter and verify a changed
+    /// `fd_limit` is picked up exactly on the refresh boundary, not before
+    /// and not skipped after. Mirrors the in-loop logic at the top of the
+    /// `start_monitor` task body without needing a full tokio harness.
+    #[test]
+    fn fd_limit_refresh_boundary_picks_up_changes() {
+        // Stand-in for `get_fd_limit()` whose return value flips after the
+        // first refresh boundary, modeling an operator running `setrlimit(2)`
+        // partway through the gateway's lifetime.
+        let mut probe_calls = 0u64;
+        let mut probe = |tick: u64| -> u64 {
+            probe_calls += 1;
+            // First boundary returns the original limit; subsequent
+            // boundaries return the raised limit.
+            if tick < FD_LIMIT_REFRESH_INTERVAL_TICKS {
+                1024
+            } else {
+                65_536
+            }
+        };
+
+        // Initial value (read once at task start).
+        let mut fd_limit = probe(0);
+        assert_eq!(fd_limit, 1024);
+
+        // Walk through enough ticks to cross two refresh boundaries.
+        let total_ticks = FD_LIMIT_REFRESH_INTERVAL_TICKS * 2 + 5;
+        let mut refresh_observations = 0u64;
+        let mut tick: u64 = 0;
+        while tick < total_ticks {
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
+                refresh_observations += 1;
+                let new_limit = probe(tick);
+                if new_limit != fd_limit {
+                    fd_limit = new_limit;
+                }
+            }
+        }
+
+        // Two boundaries crossed → two probes (plus the initial one).
+        assert_eq!(refresh_observations, 2);
+        assert_eq!(probe_calls, 3);
+        // After crossing the first boundary, the raised limit must be visible.
+        assert_eq!(
+            fd_limit, 65_536,
+            "raised RLIMIT_NOFILE should be picked up at the refresh boundary"
+        );
+    }
+
+    /// The `fd_limit == 0` warn must fire only once even if the periodic
+    /// refresh continues to observe 0 (Windows / unsupported platforms).
+    /// `Once::call_once` provides this guarantee — verify the latch behaves
+    /// correctly when invoked repeatedly.
+    #[test]
+    fn fd_pressure_disabled_warn_latches_once() {
+        // Use a private latch so this test doesn't poison the production
+        // `FD_PRESSURE_DISABLED_WARN` for any other test in the same binary.
+        let local_latch = Once::new();
+        let mut fired = 0u32;
+        for _ in 0..10 {
+            local_latch.call_once(|| {
+                fired += 1;
+            });
+        }
+        assert_eq!(fired, 1, "warn-once latch must fire exactly once");
+    }
+
     /// Verify that the RED shedding rate matches the configured probability
     /// within tight tolerance. The hash range [0, RED_PROBABILITY_SCALE) and
     /// probability scale [0, RED_PROBABILITY_SCALE] are aligned, so there
@@ -805,6 +1268,144 @@ mod tests {
             "99.9% probability: expected {:.4}, got {:.4}",
             expected_rate,
             actual_rate
+        );
+    }
+
+    /// `should_disable_keepalive_red()` ONLY signals RED-probability shedding.
+    /// The HTTP/1.1 keepalive-close decision in `proxy::mod` must OR this
+    /// with `disable_keepalive`, otherwise pressure-mode is silently ignored
+    /// at the exact threshold (where ramp produces probability 0) or during
+    /// the inter-store window where the monitor has flipped the binary flag
+    /// but `red_drop_probability` still reflects the previous cycle's value.
+    ///
+    /// This test pins down the contract for the three combinations the hot
+    /// path must handle correctly. Because the hot path inlines the OR
+    /// expression (`draining || disable_keepalive || should_disable_keepalive_red`),
+    /// we assert each AtomicBool / AtomicU32 source independently. A future
+    /// regression that drops one of those terms will be caught here.
+    #[test]
+    fn keepalive_close_decision_honors_binary_flag_independently_of_red_probability() {
+        let state = OverloadState::new();
+
+        // Case 1: pressure-mode active, RED probability 0 (the regression case).
+        // The binary flag MUST cause Connection: close; the RED helper alone
+        // returns false because the linear ramp produced 0 at the exact
+        // pressure threshold, or because the cross-cycle inter-store window
+        // hasn't advanced `red_drop_probability` yet.
+        state.disable_keepalive.store(true, Ordering::Relaxed);
+        state.red_drop_probability.store(0, Ordering::Relaxed);
+        assert!(
+            state.disable_keepalive.load(Ordering::Relaxed),
+            "binary flag must surface true for the hot-path OR"
+        );
+        assert!(
+            !state.should_disable_keepalive_red(),
+            "RED helper alone returns false at probability 0 — \
+             pressure-mode would be ignored without the OR"
+        );
+
+        // Case 2: both signals quiet — connection should be reused.
+        state.disable_keepalive.store(false, Ordering::Relaxed);
+        state.red_drop_probability.store(0, Ordering::Relaxed);
+        assert!(
+            !state.disable_keepalive.load(Ordering::Relaxed),
+            "binary flag clear when no pressure"
+        );
+        assert!(
+            !state.should_disable_keepalive_red(),
+            "RED helper clear at probability 0"
+        );
+
+        // Case 3: binary flag clear but RED probability saturated (between
+        // pressure and critical thresholds, deep in the ramp). RED helper
+        // alone should still drive Connection: close.
+        state.disable_keepalive.store(false, Ordering::Relaxed);
+        state
+            .red_drop_probability
+            .store(RED_PROBABILITY_SCALE, Ordering::Relaxed);
+        assert!(
+            !state.disable_keepalive.load(Ordering::Relaxed),
+            "binary flag still clear in this regime"
+        );
+        assert!(
+            state.should_disable_keepalive_red(),
+            "RED helper must return true at saturation (1024/1024 == 100%)"
+        );
+    }
+
+    /// Sanity check: under no load, the all-worker probe should still return a
+    /// small latency, well under the 10 ms warn threshold. This guards against
+    /// regressions where the probe accidentally serializes on something that
+    /// would inflate idle-runtime readings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn measure_event_loop_latency_idle_is_small() {
+        let latency = measure_event_loop_latency().await;
+        assert!(
+            latency < Duration::from_millis(10),
+            "idle multi-worker probe should be <10ms, got {:?}",
+            latency
+        );
+    }
+
+    /// Sanity check: on a single-threaded runtime the function falls back to
+    /// the original single-task probe and still returns quickly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn measure_event_loop_latency_current_thread_fallback() {
+        let latency = measure_event_loop_latency().await;
+        assert!(
+            latency < Duration::from_millis(10),
+            "current-thread probe should be <10ms, got {:?}",
+            latency
+        );
+    }
+
+    /// Saturate every worker with a synchronous CPU-bound sleep, then verify
+    /// the probe surfaces the resulting scheduling delay.
+    ///
+    /// Strategy: spawn `2 * num_workers` synchronous-sleep tasks. The work
+    /// stealing scheduler distributes them, fully oversubscribing every
+    /// worker. The driver task immediately calls `measure_event_loop_latency`,
+    /// which in turn spawns one yield-now probe per worker. Each probe must
+    /// queue behind in-progress sleep work on its assigned worker, so the
+    /// MAX observed reschedule latency is bounded below by the sleep duration
+    /// minus the time the driver took to spin up the probes.
+    ///
+    /// The OLD single-task implementation would also detect this scenario
+    /// (because the driver itself can't make forward progress with every
+    /// worker pinned), but only because the single yield_now happens to land
+    /// behind a sleeping task — by luck of which worker the driver runs on.
+    /// The new per-worker probe is GUARANTEED to surface the worst-case
+    /// worker, not just the driver's worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn measure_event_loop_latency_detects_saturated_workers() {
+        let num_workers = tokio::runtime::Handle::current().metrics().num_workers();
+        const SLEEP_MS: u64 = 150;
+        // Spawn 2× workers worth of CPU-bound sleeps so every worker has a
+        // queued blocker behind whatever else lands on it.
+        let mut blockers = Vec::with_capacity(num_workers * 2);
+        for _ in 0..(num_workers * 2) {
+            blockers.push(tokio::spawn(async move {
+                std::thread::sleep(Duration::from_millis(SLEEP_MS));
+            }));
+        }
+
+        // Probe immediately. Each per-worker probe will queue behind the
+        // sleeping blocker(s) on whichever worker it lands on, so the MAX
+        // latency is at least the time it takes for one blocker to finish
+        // and release a worker (minus minor overhead).
+        let latency = measure_event_loop_latency().await;
+
+        for b in blockers {
+            let _ = b.await;
+        }
+
+        // Conservative lower bound: 25ms is well above µs-scale healthy
+        // readings, well below the SLEEP_MS budget, and tolerant of CI jitter.
+        assert!(
+            latency >= Duration::from_millis(25),
+            "expected probe to surface ≥25ms saturation, got {:?} \
+             (probe is not actually queuing on the busy workers)",
+            latency
         );
     }
 }

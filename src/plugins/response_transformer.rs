@@ -215,6 +215,16 @@ impl Plugin for ResponseTransformer {
         !self.body_rules.is_empty()
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
+        // Body transforms operate on the assembled response body — applying
+        // them to an unbounded event stream would buffer until the
+        // max-response-body limit is hit and then 502. SSE transforms are
+        // out of scope; operators should configure body transforms only for
+        // non-SSE proxies, or layer a frame-level plugin on top.
+        !self.body_rules.is_empty() && !super::utils::sse::is_sse_request(ctx)
+    }
+
     async fn after_proxy(
         &self,
         _ctx: &mut RequestContext,

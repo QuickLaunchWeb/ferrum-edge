@@ -34,6 +34,7 @@ mod plugin_cache;
 mod plugins;
 mod pool;
 mod proxy;
+pub mod request_epoch;
 mod retry;
 mod router_cache;
 mod secrets;
@@ -43,10 +44,11 @@ mod startup;
 mod tls;
 #[allow(dead_code)]
 mod tls_offload;
+mod util;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
-use tracing::{Level, Metadata, error, info};
+use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -261,6 +263,41 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
 
     let (_stdout_guard, _stderr_guard) = init_logging();
 
+    // Raise the soft FD cap to the hard cap before any subsystem opens
+    // sockets. The call never asks for privileges we don't have (it caps at
+    // the existing hard limit), so a sandboxed/seccomp-restricted run is a
+    // silent no-op rather than a failure. We log the result so operators see
+    // the headroom they actually got, and emit a warn when the effective
+    // soft cap remains below the production floor — the gateway will still
+    // run, but its 95% FD-critical threshold will trigger early on busy hosts.
+    let fd_raise = overload::raise_fd_limit();
+    if fd_raise.raised {
+        info!(
+            soft_before = fd_raise.soft_before,
+            soft_after = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            "raised soft FD limit to hard cap"
+        );
+    }
+    if fd_raise.soft_after > 0 && fd_raise.soft_after < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
+        warn!(
+            soft_before = fd_raise.soft_before,
+            soft_after = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            recommended_floor = overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
+            "effective soft FD limit is {} (hard cap {}); recommend raising to >= {} via /etc/security/limits.conf, systemd LimitNOFILE=, or docker --ulimit nofile= for production workloads",
+            fd_raise.soft_after,
+            fd_raise.hard,
+            overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
+        );
+    } else if !fd_raise.raised && fd_raise.hard > 0 {
+        debug!(
+            soft = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            "FD soft limit already at hard cap"
+        );
+    }
+
     info!(
         "Ferrum Edge v{} ({}) starting...",
         env!("CARGO_PKG_VERSION"),
@@ -296,6 +333,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         "Proxy bind address: {}, Admin bind address: {}",
         env_config.proxy_bind_address, env_config.admin_bind_address
     );
+    if admin_bind_requires_cidr_warning(
+        &env_config.admin_bind_address,
+        &env_config.admin_allowed_cidrs,
+    ) {
+        warn!(
+            "Admin API is bound to {} with no FERRUM_ADMIN_ALLOWED_CIDRS; ensure the admin listener is not publicly reachable",
+            env_config.admin_bind_address
+        );
+    }
 
     // Detect IPv6 dual-stack support and log a hint if listeners are IPv4-only
     if (env_config.proxy_bind_address == "0.0.0.0" || env_config.admin_bind_address == "0.0.0.0")
@@ -389,4 +435,60 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     });
 
     gateway_exit_code
+}
+
+fn admin_bind_requires_cidr_warning(admin_bind_address: &str, admin_allowed_cidrs: &str) -> bool {
+    if !admin_allowed_cidrs.trim().is_empty() {
+        return false;
+    }
+
+    admin_bind_address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| admin_bind_may_be_publicly_reachable(&ip))
+}
+
+fn admin_bind_may_be_publicly_reachable(ip: &std::net::IpAddr) -> bool {
+    if ip.is_unspecified() {
+        return true;
+    }
+
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || octets[0] == 0
+                || (octets[0] == 100 && (octets[1] & 0xC0) == 64))
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_loopback()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || (ip.segments()[0] & 0xfe00) == 0xfc00)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admin_bind_requires_cidr_warning;
+
+    #[test]
+    fn admin_bind_warning_covers_unspecified_and_public_addresses() {
+        assert!(admin_bind_requires_cidr_warning("0.0.0.0", ""));
+        assert!(admin_bind_requires_cidr_warning("::", ""));
+        assert!(admin_bind_requires_cidr_warning("8.8.8.8", ""));
+        assert!(admin_bind_requires_cidr_warning("2001:4860:4860::8888", ""));
+    }
+
+    #[test]
+    fn admin_bind_warning_ignores_private_local_and_guarded_addresses() {
+        assert!(!admin_bind_requires_cidr_warning("127.0.0.1", ""));
+        assert!(!admin_bind_requires_cidr_warning("10.0.0.10", ""));
+        assert!(!admin_bind_requires_cidr_warning("192.168.1.10", ""));
+        assert!(!admin_bind_requires_cidr_warning("169.254.1.10", ""));
+        assert!(!admin_bind_requires_cidr_warning("::1", ""));
+        assert!(!admin_bind_requires_cidr_warning("fd00::10", ""));
+        assert!(!admin_bind_requires_cidr_warning("8.8.8.8", "10.0.0.0/8"));
+    }
 }

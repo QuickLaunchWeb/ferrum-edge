@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use super::utils::cache_headers::sanitize_cached_headers;
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
@@ -106,8 +107,17 @@ impl AiSemanticCache {
             .unwrap_or(104_857_600) as usize; // 100 MiB default
 
         let include_model_in_key = config["include_model_in_key"].as_bool().unwrap_or(true);
-        let include_params_in_key = config["include_params_in_key"].as_bool().unwrap_or(false);
-        let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(false);
+        // SECURITY: Default `true` so two requests that differ only in
+        // sampling parameters (temperature, top_p, max_tokens) cannot collapse
+        // to the same cache entry and serve a wrong-shape response. Operators
+        // who explicitly want cross-parameter cache reuse must set this to
+        // `false`.
+        let include_params_in_key = config["include_params_in_key"].as_bool().unwrap_or(true);
+        // SECURITY: Default `true` so cached responses are not replayed across
+        // different authenticated consumers. Operators who explicitly want a
+        // shared cache (e.g., a public LLM proxy with no per-tenant data)
+        // must set this to `false`.
+        let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(true);
 
         // Build optional Redis client
         let redis_client = RedisConfig::from_plugin_config(
@@ -145,10 +155,14 @@ impl AiSemanticCache {
     ///
     /// Normalization steps:
     /// 1. Parse the JSON request body
-    /// 2. Extract and sort the messages array by (role, content)
-    /// 3. Lowercase and collapse whitespace in content fields
-    /// 4. Optionally include model name and sampling parameters
-    /// 5. SHA-256 hash the normalized representation
+    /// 2. Optionally scope by proxy and authenticated consumer
+    /// 3. Optionally include model name and sampling parameters
+    /// 4. Lowercase and collapse whitespace in `messages[*].content`
+    /// 5. Include the Anthropic top-level `system` prompt (string or array form)
+    /// 6. Include `tools` / `tool_choice` / `response_format` / `seed` /
+    ///    `logit_bias` / `stream` when present — any change to these fields
+    ///    materially changes the response and must not collapse to the same key
+    /// 7. SHA-256 hash the normalized representation
     fn build_cache_key(&self, ctx: &RequestContext, body: &Value) -> Option<String> {
         let mut key_parts: Vec<String> = Vec::new();
 
@@ -173,11 +187,11 @@ impl AiSemanticCache {
 
         // Sampling parameters
         if self.include_params_in_key {
-            if let Some(temp) = body.get("temperature").and_then(|t| t.as_f64()) {
-                key_parts.push(format!("t:{:.2}", temp));
+            if let Some(temp) = body.get("temperature") {
+                key_parts.push(format!("t:{}", canonical_param_value(temp)));
             }
-            if let Some(top_p) = body.get("top_p").and_then(|t| t.as_f64()) {
-                key_parts.push(format!("p:{:.2}", top_p));
+            if let Some(top_p) = body.get("top_p") {
+                key_parts.push(format!("p:{}", canonical_param_value(top_p)));
             }
             if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
                 key_parts.push(format!("mt:{}", max_tokens));
@@ -203,6 +217,66 @@ impl AiSemanticCache {
         } else {
             // No messages array — not a chat completion request, skip caching
             return None;
+        }
+
+        // Top-level `system` prompt (Anthropic Messages API). Included AFTER
+        // the messages section so two requests that differ only in their
+        // system prompt cannot collapse to the same cache key. Anthropic
+        // accepts either a string or an array of content blocks (e.g.
+        // `[{"type": "text", "text": "..."}]`); we normalize both forms here.
+        if let Some(system) = body.get("system") {
+            let normalized = if let Some(s) = system.as_str() {
+                normalize_text(s)
+            } else if let Some(parts) = system.as_array() {
+                // Array of content blocks. Extract the `text` field of every
+                // `{"type":"text","text":"..."}` block, joined by spaces, then
+                // normalize. This mirrors `extract_message_content`'s
+                // multimodal branch but operates directly on the array (the
+                // system field IS the array, not nested under `"content"`).
+                let mut texts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(text) = part.get("text").and_then(|t| t.as_str())
+                    {
+                        texts.push(text);
+                    }
+                }
+                normalize_text(&texts.join(" "))
+            } else {
+                // Unknown shape — hash the JSON repr so any change breaks the key.
+                normalize_text(&system.to_string())
+            };
+            key_parts.push(format!("sys:{}", normalized));
+        }
+
+        // Other request fields that materially change the response shape or
+        // selection. Including these prevents cross-prompt poisoning where two
+        // distinct requests differing only in tool/format/seed/logit-bias/stream
+        // configuration would collapse to the same cache entry. We use the
+        // canonical JSON serialization (sort_keys not required at this level
+        // because it's the user-supplied payload) so any byte-level change
+        // breaks the key.
+        for field in &[
+            "tools",
+            "tool_choice",
+            "response_format",
+            "seed",
+            "logit_bias",
+        ] {
+            if let Some(value) = body.get(*field) {
+                key_parts.push(format!("{}:{}", field, value));
+            }
+        }
+
+        // `stream`: stream:true and stream:false produce different wire
+        // formats (SSE vs single JSON), so cached non-stream responses must
+        // not be replayed to a stream:true caller (or vice versa). We don't
+        // actually cache SSE responses (see `on_final_response_body`), but
+        // including this prevents a non-streaming MISS-then-store from being
+        // served to a streaming client whose stored entry would be wrongly
+        // formatted.
+        if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
+            key_parts.push(format!("stream:{}", stream));
         }
 
         // Hash the key parts into a fixed-size cache key
@@ -296,94 +370,9 @@ impl AiSemanticCache {
     }
 }
 
-/// Exact-match sensitive response headers. Comparisons are ASCII
-/// case-insensitive (RFC 9110 §5.1). See `SENSITIVE_HEADER_PREFIXES` for
-/// families that must match by prefix instead (provider rate-limit
-/// variants, multi-header B3 tracing).
-///
-/// Hop-by-hop headers (RFC 9110 §7.6.1: `connection`, `keep-alive`,
-/// `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
-/// `transfer-encoding`, `upgrade`) are intentionally NOT listed here —
-/// they are stripped upstream by the proxy response-collection paths
-/// (`collect_response_headers`, `collect_hyper_response_headers`,
-/// `grpc_proxy`, `http3/server`) before `on_final_response_body` runs,
-/// so they cannot reach this plugin.
-const SENSITIVE_EXACT_HEADERS: &[&str] = &[
-    // Per-response identity / session state.
-    "set-cookie",
-    "set-cookie2",
-    "authorization",
-    "www-authenticate",
-    "x-api-key",
-    "x-amz-security-token",
-    "x-amzn-requestid",
-    // Per-request trace identifiers — replaying these would splice the
-    // original request's trace into every subsequent cache hit.
-    "x-request-id",
-    "x-correlation-id",
-    "x-trace-id",
-    "traceparent",
-    "tracestate",
-    // Zipkin B3 single-header format (RFC-less; defined by openzipkin/b3-propagation).
-    // Multi-header B3 (`x-b3-traceid`, `x-b3-spanid`, `x-b3-parentspanid`,
-    // `x-b3-sampled`, `x-b3-flags`) is covered by the `x-b3-` prefix below.
-    "b3",
-    // Per-request retry signal — the stored value reflects the original
-    // response's retry timing and is misleading on a cache hit.
-    "retry-after",
-];
-
-/// Case-insensitive prefixes for sensitive header families. These exist
-/// because providers emit suffixed variants that an exact-match list
-/// cannot enumerate safely:
-///
-/// - `x-ratelimit-` covers the IETF-draft canonical names
-///   (`x-ratelimit-limit`, `-remaining`, `-reset`) AND provider variants
-///   like OpenAI's `x-ratelimit-limit-requests`, `-limit-tokens`,
-///   `-remaining-requests`, `-remaining-tokens`, `-reset-requests`,
-///   `-reset-tokens`.
-/// - `x-ai-ratelimit-` covers Ferrum Edge's own `ai_rate_limiter` output
-///   (`-limit`, `-remaining`, `-window`, `-usage`) and future additions.
-/// - `anthropic-ratelimit-` covers Anthropic's rate-limit family
-///   (`anthropic-ratelimit-requests-limit`, `-tokens-remaining`, etc.).
-/// - `x-b3-` covers the multi-header B3 tracing variant
-///   (`x-b3-traceid`, `-spanid`, `-parentspanid`, `-sampled`, `-flags`).
-const SENSITIVE_HEADER_PREFIXES: &[&str] = &[
-    "x-ratelimit-",
-    "x-ai-ratelimit-",
-    "anthropic-ratelimit-",
-    "x-b3-",
-];
-
-/// Case-insensitive check for whether a header name is sensitive.
-/// Uses byte-slice `eq_ignore_ascii_case` to avoid a per-call
-/// `to_ascii_lowercase` allocation. Prefix match is safe on byte
-/// boundaries because all prefixes are ASCII.
-fn is_sensitive_header(name: &str) -> bool {
-    if SENSITIVE_EXACT_HEADERS
-        .iter()
-        .any(|s| name.eq_ignore_ascii_case(s))
-    {
-        return true;
-    }
-    let name_bytes = name.as_bytes();
-    SENSITIVE_HEADER_PREFIXES.iter().any(|prefix| {
-        let prefix_bytes = prefix.as_bytes();
-        name_bytes.len() >= prefix_bytes.len()
-            && name_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes)
-    })
+fn canonical_param_value(value: &Value) -> String {
+    value.to_string()
 }
-
-/// Strip security-sensitive headers from a response header map before the
-/// cache stores or replays it.
-fn sanitize_cached_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
-    headers
-        .iter()
-        .filter(|(name, _)| !is_sensitive_header(name))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 /// Normalize text: lowercase, collapse whitespace to single spaces, trim.
 ///
 /// Single-pass: previously called `to_ascii_lowercase()` first (one extra
@@ -742,110 +731,5 @@ mod tests {
         );
         assert_eq!(normalize_text(""), "");
         assert_eq!(normalize_text("   "), "");
-    }
-
-    #[test]
-    fn sanitize_cached_headers_strips_security_sensitive_keys() {
-        // Cached responses must never replay per-response identity (cookies,
-        // auth tokens, trace IDs) or per-request rate-limit counters to a
-        // different consumer. The stripper is case-insensitive because HTTP
-        // header names are case-insensitive.
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert("Set-Cookie".to_string(), "session=abc123".to_string());
-        headers.insert("authorization".to_string(), "Bearer xyz".to_string());
-        headers.insert("X-Request-Id".to_string(), "req-12345-abcdef".to_string());
-        headers.insert("X-AI-RateLimit-Remaining".to_string(), "42".to_string());
-        headers.insert("retry-after".to_string(), "30".to_string());
-        headers.insert("x-custom-app-header".to_string(), "keep-me".to_string());
-
-        let sanitized = sanitize_cached_headers(&headers);
-        // Safe headers are retained
-        assert_eq!(
-            sanitized.get("content-type").map(String::as_str),
-            Some("application/json")
-        );
-        assert_eq!(
-            sanitized.get("x-custom-app-header").map(String::as_str),
-            Some("keep-me")
-        );
-        // Sensitive headers are stripped, regardless of case
-        assert!(!sanitized.contains_key("Set-Cookie"));
-        assert!(!sanitized.contains_key("authorization"));
-        assert!(!sanitized.contains_key("X-Request-Id"));
-        assert!(!sanitized.contains_key("X-AI-RateLimit-Remaining"));
-        assert!(!sanitized.contains_key("retry-after"));
-    }
-
-    #[test]
-    fn sanitize_cached_headers_strips_provider_ratelimit_suffix_variants() {
-        // Providers emit rate-limit headers with request/token suffixes
-        // (OpenAI: x-ratelimit-*-requests / -tokens; Anthropic:
-        // anthropic-ratelimit-requests-* / -tokens-*). Exact-match against
-        // a canonical list would miss these and replay the original
-        // consumer's quota to every cache hit. Prefix matching catches the
-        // whole family.
-        let mut headers = HashMap::new();
-        // OpenAI-style (exact canonical + suffix variants).
-        headers.insert("x-ratelimit-limit".to_string(), "3500".to_string());
-        headers.insert("x-ratelimit-limit-requests".to_string(), "3500".to_string());
-        headers.insert("X-RateLimit-Limit-Tokens".to_string(), "90000".to_string());
-        headers.insert(
-            "x-ratelimit-remaining-requests".to_string(),
-            "3499".to_string(),
-        );
-        headers.insert("x-ratelimit-reset-tokens".to_string(), "6ms".to_string());
-        // Anthropic family.
-        headers.insert(
-            "anthropic-ratelimit-requests-limit".to_string(),
-            "50".to_string(),
-        );
-        headers.insert(
-            "anthropic-ratelimit-tokens-remaining".to_string(),
-            "39000".to_string(),
-        );
-        // Ferrum Edge's own ai_rate_limiter (covered by x-ai-ratelimit-).
-        headers.insert("x-ai-ratelimit-usage".to_string(), "12".to_string());
-        // B3 multi-header tracing (x-b3-) and single-header (b3).
-        headers.insert(
-            "X-B3-TraceId".to_string(),
-            "80f198ee56343ba864fe8b2a57d3eff7".to_string(),
-        );
-        headers.insert("x-b3-sampled".to_string(), "1".to_string());
-        headers.insert("b3".to_string(), "80f198ee-e457912e-1".to_string());
-        // Safe headers that share neighbouring namespaces but must not match.
-        headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
-        headers.insert(
-            "x-ratelimited-by".to_string(), // no trailing dash — different prefix
-            "upstream".to_string(),
-        );
-        headers.insert("content-type".to_string(), "application/json".to_string());
-
-        let sanitized = sanitize_cached_headers(&headers);
-        // All rate-limit / tracing variants stripped.
-        assert!(!sanitized.contains_key("x-ratelimit-limit"));
-        assert!(!sanitized.contains_key("x-ratelimit-limit-requests"));
-        assert!(!sanitized.contains_key("X-RateLimit-Limit-Tokens"));
-        assert!(!sanitized.contains_key("x-ratelimit-remaining-requests"));
-        assert!(!sanitized.contains_key("x-ratelimit-reset-tokens"));
-        assert!(!sanitized.contains_key("anthropic-ratelimit-requests-limit"));
-        assert!(!sanitized.contains_key("anthropic-ratelimit-tokens-remaining"));
-        assert!(!sanitized.contains_key("x-ai-ratelimit-usage"));
-        assert!(!sanitized.contains_key("X-B3-TraceId"));
-        assert!(!sanitized.contains_key("x-b3-sampled"));
-        assert!(!sanitized.contains_key("b3"));
-        // Near-miss names that share a neighbouring namespace are retained.
-        assert_eq!(
-            sanitized.get("x-ai-cache-status").map(String::as_str),
-            Some("HIT"),
-        );
-        assert_eq!(
-            sanitized.get("x-ratelimited-by").map(String::as_str),
-            Some("upstream"),
-        );
-        assert_eq!(
-            sanitized.get("content-type").map(String::as_str),
-            Some("application/json"),
-        );
     }
 }

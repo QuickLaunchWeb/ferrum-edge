@@ -7,7 +7,10 @@
 //! Supports both plain UDP and DTLS-encrypted transport. When `dtls` is
 //! enabled, the plugin performs a DTLS handshake on first use and encrypts all
 //! log datagrams. DTLS client certificates and CA verification are configurable
-//! for mutual TLS environments.
+//! for mutual TLS environments. The gateway's CRL list
+//! (`FERRUM_TLS_CRL_FILE_PATH`) is applied to the DTLS server verifier with
+//! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`,
+//! matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
 //! Each batch is serialized as a JSON array and sent as a single UDP datagram.
 //! Operators should size `batch_size` to keep serialized payloads under the
@@ -18,6 +21,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rustls::pki_types::CertificateRevocationListDer;
 use serde_json::Value;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
@@ -39,6 +43,11 @@ struct UdpFlushConfig {
     dtls_key_path: Option<String>,
     dtls_ca_cert_path: Option<String>,
     dtls_no_verify: bool,
+    /// Gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`). Applied to the DTLS
+    /// `WebPkiServerVerifier` so that revoked log-sink certificates are
+    /// rejected, matching the proxy backend / DTLS / frontend mTLS surfaces.
+    /// Empty when no CRL file is configured.
+    dtls_crls: Vec<CertificateRevocationListDer<'static>>,
     dns_cache: Option<DnsCache>,
 }
 
@@ -90,6 +99,7 @@ impl UdpLogging {
             dtls_key_path,
             dtls_ca_cert_path,
             dtls_no_verify,
+            dtls_crls: http_client.tls_crls().to_vec(),
             dns_cache: http_client.dns_cache().cloned(),
         };
         let state = Arc::new(Mutex::new(UdpFlushState {
@@ -216,7 +226,10 @@ async fn build_sender_for_addr(
             };
             let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone())
                 .map_err(|_| format!("udp_logging: invalid DTLS server name: {}", cfg.host))?;
-            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &[])
+            // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so revoked
+            // DTLS log-sink certificates are rejected, matching the proxy
+            // backend / DTLS / frontend mTLS surfaces.
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &cfg.dtls_crls)
                 .map_err(|error| format!("udp_logging: DTLS verifier build failed: {error}"))?;
             (
                 Some(server_name),
@@ -229,6 +242,10 @@ async fn build_sender_for_addr(
             certificate,
             server_name,
             server_cert_verifier,
+            // The udp_logging plugin doesn't expose a connect timeout config,
+            // so preserve the historical 10s budget that this code path used
+            // before `BackendDtlsParams.connect_timeout_ms` existed.
+            connect_timeout_ms: 10_000,
         };
 
         let dtls_conn = crate::dtls::DtlsConnection::connect(socket, params)

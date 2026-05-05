@@ -57,6 +57,22 @@ For production with authentication, always use `?authSource=admin` (or your auth
 | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | `30` | How long the driver waits to find a suitable server |
 | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | `10` | TCP connection timeout per server |
 
+### MongoDB Driver Runtime Options
+
+MongoDB connection pooling and topology behavior mostly lives in the MongoDB URI. `FERRUM_DB_POOL_*` is not read on the MongoDB code path.
+
+| Concern | Configure with | Notes |
+|---|---|---|
+| Max pool size | `maxPoolSize` URI option | MongoDB equivalent of pool capacity. Example: `?maxPoolSize=100` |
+| Minimum idle pool size | `minPoolSize` URI option | Keeps warm driver connections open. Example: `?minPoolSize=5` |
+| Idle connection age | `maxIdleTimeMS` URI option | Driver-side idle eviction. Example: `?maxIdleTimeMS=600000` |
+| Pool checkout wait | `waitQueueTimeoutMS` URI option | Driver-side wait for an available connection. |
+| Server selection timeout | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` or `serverSelectionTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
+| TCP connect timeout | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` or `connectTimeoutMS` URI option | The env var is applied programmatically by Ferrum and overrides the URI value when set. |
+| Read/write splitting | `readPreference` URI option | Use `secondaryPreferred` to offload config polling reads. |
+| TLS | `FERRUM_DB_TLS_MODE` plus certificate path env vars, or URI options such as `tls=true`, `tlsCAFile`, `tlsCertificateKeyFile` | Env mode values supported for MongoDB are `disable`, `require`, and `verify-full`. |
+| App name | `FERRUM_MONGO_APP_NAME` or `appName` URI option | Helps identify Ferrum connections in MongoDB server diagnostics. The env var overrides the URI value when set. |
+
 ### Shared Settings (SQL + MongoDB)
 
 These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
@@ -69,11 +85,10 @@ These `FERRUM_DB_*` settings apply to both SQL and MongoDB backends:
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | On-disk JSON backup for startup failover (same as SQL) |
 | `FERRUM_DB_FAILOVER_URLS` | Comma-separated fallback MongoDB URLs (same pattern as SQL, but see [Failover](#failover) below) |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | Slow query warning threshold (same as SQL) |
-| `FERRUM_DB_TLS_ENABLED` | Enable TLS via programmatic `TlsOptions` (see [TLS](#tls)) |
+| `FERRUM_DB_TLS_MODE` | MongoDB TLS policy: `disable`, `require`, or `verify-full` (see [TLS](#tls)) |
 | `FERRUM_DB_TLS_CA_CERT_PATH` | CA certificate for server verification |
-| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mTLS |
-| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mTLS |
-| `FERRUM_DB_TLS_INSECURE` | Skip server certificate validation (testing only) |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Client certificate for mTLS; may be an already-combined cert+key PEM when `FERRUM_DB_TLS_CLIENT_KEY_PATH` is omitted |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | Client private key for mTLS when cert and key are supplied as separate files |
 
 ### SQL-Only Settings (Ignored for MongoDB)
 
@@ -89,10 +104,6 @@ These settings have no effect when `FERRUM_DB_TYPE=mongodb`:
 | `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | MongoDB driver manages connection cycling internally |
 | `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | Use `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` instead |
 | `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | MongoDB has no per-statement timeout (use `maxTimeMS` in queries if needed) |
-| `FERRUM_DB_SSL_MODE` | MongoDB uses `tls=true` in connection string or `FERRUM_DB_TLS_ENABLED=true` |
-| `FERRUM_DB_SSL_ROOT_CERT` | Use `FERRUM_DB_TLS_CA_CERT_PATH` or `tlsCAFile` in connection string |
-| `FERRUM_DB_SSL_CLIENT_CERT` | Use `FERRUM_DB_TLS_CLIENT_CERT_PATH` or `tlsCertificateKeyFile` in connection string |
-| `FERRUM_DB_SSL_CLIENT_KEY` | Use `FERRUM_DB_TLS_CLIENT_KEY_PATH` (auto-combined with cert into single PEM) |
 
 ## Read Preference
 
@@ -164,16 +175,18 @@ MongoDB TLS can be configured two ways. See [docs/database_tls.md](database_tls.
 
 ### Approach 1: FERRUM_DB_TLS_* Environment Variables (Recommended)
 
-Uses the same env vars as SQL backends. The gateway handles MongoDB-specific requirements (cert+key combination) automatically.
+Uses the canonical database TLS env vars. MongoDB supports `disable`, `require`, and `verify-full` here; use URI options for more specialized driver TLS settings.
 
 ```bash
-FERRUM_DB_TLS_ENABLED=true
+FERRUM_DB_TLS_MODE=verify-full
 FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem
 FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.crt    # mTLS
 FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key      # mTLS
 ```
 
-**Note:** MongoDB requires client cert + key in a single PEM file. When separate files are provided, the gateway automatically combines them into a PID-scoped temp file (`/tmp/ferrum-mongo-client-{pid}.pem`).
+`FERRUM_DB_TLS_MODE=require` enables encrypted MongoDB connections but allows invalid server certificates. `FERRUM_DB_TLS_MODE=verify-full` enables TLS and validates the server certificate chain, using `FERRUM_DB_TLS_CA_CERT_PATH` when provided.
+
+**Note:** MongoDB requires client cert + key in a single PEM file. Set only `FERRUM_DB_TLS_CLIENT_CERT_PATH` when it already points to a combined PEM, or provide separate cert/key files and the gateway automatically combines them into a PID-scoped temp file (`/tmp/ferrum-mongo-client-{pid}.pem`).
 
 ### Approach 2: Connection String Options
 
@@ -189,7 +202,7 @@ For passwordless authentication using client certificates:
 
 ```bash
 FERRUM_MONGO_AUTH_MECHANISM=MONGODB-X509
-FERRUM_DB_TLS_ENABLED=true
+FERRUM_DB_TLS_MODE=verify-full
 FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem
 FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.crt
 FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
@@ -202,12 +215,14 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | Feature | Standalone | Replica Set |
 |---|---|---|
 | Single-document CRUD | Atomic | Atomic |
-| Multi-document operations (e.g., delete proxy + plugins) | Idempotent (partial failure safe) | Transactional (ACID) |
+| Multi-document operations (e.g., delete proxy + plugins) | Fail-safe sequential ordering (partial failures leave recoverable orphans) | Transactional (ACID) via `ClientSession::start_transaction` |
 | Change streams (future) | Not available | Available |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
 
-For production, a **replica set is strongly recommended**. Without one, multi-document operations (like deleting a proxy and its associated plugin configs) are not transactional — partial failures are handled via idempotent cleanup on the next poll cycle.
+For production, a **replica set is strongly recommended**. Setting `FERRUM_MONGO_REPLICA_SET` (or `?replicaSet=...` in the connection string) enables true multi-document ACID transactions for `delete_proxy` / `update_proxy` — the proxy document, its proxy-scoped plugin configs, and the orphaned-proxy_group cleanup all commit atomically.
+
+Without a replica set, the gateway falls back to a fail-safe sequential ordering: the proxy document is deleted **before** its plugin configs, so a partial failure can only leave orphaned plugin configs (no proxy references them). Orphans are recoverable; the previous order — plugin configs first — could leave a proxy in the DB referencing now-deleted plugin_config IDs, which validation rejects on every subsequent polling cycle until manually cleaned up.
 
 ### Minimum Replica Set (Development)
 
@@ -257,15 +272,17 @@ AWS DocumentDB is MongoDB-compatible but has some differences:
 
 ```bash
 FERRUM_DB_TYPE=mongodb
-FERRUM_DB_URL="mongodb://ferrum-user:password@docdb-cluster.cluster-xxxx.us-east-1.docdb.amazonaws.com:27017/ferrum?tls=true&retryWrites=false"
+FERRUM_DB_URL="mongodb://ferrum-user:password@docdb-cluster.cluster-xxxx.us-east-1.docdb.amazonaws.com:27017/ferrum?retryWrites=false"
 FERRUM_MONGO_DATABASE=ferrum
-FERRUM_DB_TLS_ENABLED=true
+FERRUM_DB_TLS_MODE=verify-full
 FERRUM_DB_TLS_CA_CERT_PATH=/certs/rds-combined-ca-bundle.pem
 ```
 
 **DocumentDB differences:**
 - `retryWrites=false` required (DocumentDB doesn't support retryable writes)
 - Download the [Amazon RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) for TLS verification
+- When using `FERRUM_DB_TLS_MODE` and `FERRUM_DB_TLS_CA_CERT_PATH`, leave URI TLS options such as `tls=true` out of `FERRUM_DB_URL` so Ferrum builds the MongoDB driver's TLS options from the env settings.
+  If you configure TLS in the URI instead, include `tlsCAFile` in the URI and omit the env CA path.
 - Change streams require enabling them on the cluster parameter group
 
 ### Azure Cosmos DB (MongoDB API)

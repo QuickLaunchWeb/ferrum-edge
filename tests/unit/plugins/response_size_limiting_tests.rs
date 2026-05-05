@@ -216,3 +216,71 @@ async fn test_large_content_length_rejects() {
         _ => panic!("Expected Reject"),
     }
 }
+
+// === SSE bypass ===
+
+#[tokio::test]
+async fn test_sse_request_skips_response_buffering() {
+    // SSE clients (`Accept: text/event-stream`) must skip body buffering
+    // even when require_buffered_check is on — buffering an unbounded
+    // event stream would 502 once max_bytes is hit instead of streaming.
+    let plugin =
+        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
+            .unwrap();
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_non_sse_request_still_buffers() {
+    let plugin =
+        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
+            .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_buffering_disabled_stays_disabled_for_sse() {
+    // When require_buffered_check is off the buffer flag is false; SSE
+    // detection must not flip it on.
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    assert!(!plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_sse_content_length_fast_path_still_runs() {
+    // The Content-Length fast path in after_proxy is unaffected by the
+    // SSE bypass — backends that advertise a Content-Length larger than
+    // the limit are still rejected pre-streaming, even for SSE.
+    let plugin =
+        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
+            .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "2048".to_string());
+
+    match plugin.after_proxy(&mut ctx, 200, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(status_code, 502);
+        }
+        _ => panic!("Expected Reject when Content-Length exceeds limit"),
+    }
+}

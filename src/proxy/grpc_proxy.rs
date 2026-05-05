@@ -45,6 +45,7 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
+    parse_connection_listed_headers,
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
@@ -271,6 +272,7 @@ impl GrpcConnectionPool {
     ) -> Self {
         let cleanup_interval =
             Duration::from_secs(global_env_config.pool_cleanup_interval_seconds.max(1));
+        let shards = crate::util::sharding::pool_shard_amount(global_env_config.pool_shard_amount);
         let manager = Arc::new(GrpcPoolManager {
             global_pool_config: global_pool_config.clone(),
             global_env_config,
@@ -281,8 +283,8 @@ impl GrpcConnectionPool {
         });
 
         Self {
-            pool: GenericPool::new(manager, global_pool_config, cleanup_interval),
-            rr_counters: Arc::new(DashMap::new()),
+            pool: GenericPool::new(manager, global_pool_config, cleanup_interval, shards),
+            rr_counters: Arc::new(DashMap::with_shard_amount(shards)),
         }
     }
 
@@ -1320,8 +1322,16 @@ pub async fn proxy_grpc_request_streaming(
     // gRPC response paths cannot drift.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    // Snapshot any Connection-listed names before the canonical strip so
+    // we can also remove them per RFC 9110 §7.6.1. Hyper rejects
+    // `Connection` on H2 frames (RFC 9113 §8.2.2), so this is typically
+    // a no-op for valid gRPC backends — present for defence in depth.
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -1480,11 +1490,16 @@ pub(crate) async fn proxy_grpc_request_core(
     };
 
     // Extract response status and headers, stripping hop-by-hop headers
-    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`).
+    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`),
+    // including any header NAMED in the response's `Connection` field.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -1538,11 +1553,20 @@ pub(crate) async fn proxy_grpc_request_core(
                     if let Some(data) = frame.data_ref() {
                         body_bytes.extend_from_slice(data);
                     } else if let Ok(trailer_map) = frame.into_trailers() {
-                        for (k, v) in &trailer_map {
-                            if let Ok(vs) = v.to_str() {
-                                trailers.insert(k.as_str().to_string(), vs.to_string());
-                            }
-                        }
+                        // Strip RFC 9110 §7.6.1 response-direction
+                        // hop-by-hop names from gRPC trailers — same
+                        // predicate used for response headers above.
+                        // Without this, a misbehaving / malicious
+                        // backend can leak `connection: close`,
+                        // `proxy-authenticate`, `keep-alive`,
+                        // `transfer-encoding`, `upgrade`, etc. to the
+                        // downstream client through TRAILERS frames.
+                        // gRPC encodes trailers as response headers in
+                        // the trailers-only forward path further up the
+                        // call stack (see `mod.rs` Buffered branch),
+                        // which is exactly where the hop-by-hop
+                        // distinction matters.
+                        collect_buffered_grpc_trailers(&trailer_map, &mut trailers);
                     }
                 }
                 Err(e) => {
@@ -1576,6 +1600,38 @@ pub(crate) async fn proxy_grpc_request_core(
         body: body_bytes,
         trailers,
     }))
+}
+
+/// Drain a backend `HeaderMap` of gRPC trailers into the buffered-response
+/// `HashMap<String, String>` carried in [`GrpcResponse::trailers`], filtering
+/// RFC 9110 §7.6.1 response-direction hop-by-hop names.
+///
+/// gRPC carries `grpc-status` / `grpc-message` / `grpc-status-details-bin` in
+/// trailers, and at the forward boundary in `mod.rs` they are merged into
+/// the response header map (gRPC trailers-only encoding). A misbehaving or
+/// malicious backend that puts hop-by-hop directives like `connection:
+/// close`, `proxy-authenticate`, `keep-alive`, `transfer-encoding`, or
+/// `upgrade` in the trailer map would otherwise leak past the proxy
+/// boundary, because the response-headers strip earlier in this function
+/// only sees response *headers*, not trailers. Hyper's H2 trailer encoder
+/// rejects some hop-by-hop names at the frame layer but
+/// `proxy-authenticate`, `proxy-connection`, and `keep-alive` are not
+/// blocked, so the proxy must filter them itself.
+///
+/// Mirrors the streaming-path filter in `proxy::body::StripHopByHopTrailers`
+/// so both gRPC response paths apply the same predicate.
+pub(crate) fn collect_buffered_grpc_trailers(
+    trailer_map: &hyper::HeaderMap,
+    out: &mut HashMap<String, String>,
+) {
+    for (k, v) in trailer_map {
+        if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if let Ok(vs) = v.to_str() {
+            out.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
 }
 
 /// Check if a request is a gRPC request based on content-type.
@@ -1975,5 +2031,103 @@ mod tests {
                 line
             );
         }
+    }
+
+    // ── collect_buffered_grpc_trailers ─────────────────────────────────────
+    //
+    // Buffered-path companion to `proxy::body::StripHopByHopTrailers` for the
+    // streaming gRPC response path. Both must apply the identical RFC 9110
+    // §7.6.1 response-direction strip predicate so a backend cannot leak
+    // hop-by-hop names through TRAILERS regardless of which response mode
+    // (`Buffered` vs `Streaming`) the proxy negotiated.
+
+    #[test]
+    fn collect_buffered_grpc_trailers_strips_hop_by_hop_names() {
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert("grpc-message", "ok".parse().unwrap());
+        // Hop-by-hop directives a misbehaving / malicious backend might emit:
+        trailer_map.insert("connection", "close".parse().unwrap());
+        trailer_map.insert(
+            "proxy-authenticate",
+            "Basic realm=internal".parse().unwrap(),
+        );
+        trailer_map.insert("keep-alive", "timeout=5".parse().unwrap());
+        trailer_map.insert("transfer-encoding", "chunked".parse().unwrap());
+        trailer_map.insert("upgrade", "h2c".parse().unwrap());
+        trailer_map.insert("proxy-connection", "close".parse().unwrap());
+        trailer_map.insert("te", "trailers".parse().unwrap());
+        trailer_map.insert("trailer", "grpc-status".parse().unwrap());
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+
+        assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
+        assert_eq!(out.get("grpc-message").map(String::as_str), Some("ok"));
+        for hop_by_hop in [
+            "connection",
+            "proxy-authenticate",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            "te",
+            "trailer",
+        ] {
+            assert!(
+                !out.contains_key(hop_by_hop),
+                "buffered-path trailer `{hop_by_hop}` must be stripped — it \
+                 would otherwise be merged into the gRPC trailers-only \
+                 forward in mod.rs and leak past the proxy boundary",
+            );
+        }
+    }
+
+    #[test]
+    fn collect_buffered_grpc_trailers_preserves_legitimate_grpc_and_custom_trailers() {
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert("grpc-message", "ok".parse().unwrap());
+        trailer_map.insert("grpc-status-details-bin", "abc==".parse().unwrap());
+        trailer_map.insert("x-custom-trailer", "v".parse().unwrap());
+        trailer_map.insert("x-trace-id", "abc-123".parse().unwrap());
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+
+        assert_eq!(out.len(), 5);
+        for name in [
+            "grpc-status",
+            "grpc-message",
+            "grpc-status-details-bin",
+            "x-custom-trailer",
+            "x-trace-id",
+        ] {
+            assert!(
+                out.contains_key(name),
+                "legitimate gRPC trailer `{name}` must be preserved",
+            );
+        }
+    }
+
+    #[test]
+    fn collect_buffered_grpc_trailers_skips_non_utf8_values() {
+        // `to_str()` fails on non-ASCII; the helper silently drops those
+        // entries without leaking them. A malicious backend could otherwise
+        // smuggle binary garbage into the response header map. Legitimate
+        // binary trailers (e.g. `grpc-status-details-bin`) are
+        // base64-encoded by gRPC convention, so they do round-trip through
+        // `to_str()` cleanly.
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert(
+            "x-bin-trailer",
+            http::HeaderValue::from_bytes(&[0x80, 0x81]).unwrap(),
+        );
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("grpc-status").map(String::as_str), Some("0"));
     }
 }

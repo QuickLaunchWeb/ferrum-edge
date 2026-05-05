@@ -188,7 +188,7 @@ Backend TLS settings are controlled by the proxy's `backend_tls_*` fields:
 
 ### Frontend DTLS Termination (UDP)
 
-Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections from clients. The gateway uses ECDSA P-256 or Ed25519 certificates (configured via env vars) to terminate DTLS, then forwards decrypted datagrams to the backend.
+Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections from clients. The gateway uses ECDSA P-256 or P-384 certificates (configured via env vars) to terminate DTLS, then forwards decrypted datagrams to the backend.
 
 ```yaml
 proxies:
@@ -246,13 +246,13 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 
 ### DTLS Key Differences from TCP TLS
 
-- DTLS uses ECDSA P-256 or Ed25519 certificates only (RSA is not supported by the underlying DTLS library)
+- DTLS uses ECDSA P-256 or P-384 certificates only (RSA and Ed25519 are not supported by the underlying DTLS library)
 - Each UDP client session gets its own DTLS connection to the backend
 - Frontend DTLS allocates demux state when the first datagram arrives from a new client, before the session is accepted by the UDP proxy
 - Pre-handshake DTLS demux state is capped by `FERRUM_UDP_MAX_SESSIONS` and released on `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`
 - The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP
 - Frontend DTLS uses separate certificates from TLS (set via `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`)
-- Frontend DTLS mTLS uses a separate trust store from TCP TLS mTLS (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` vs `FERRUM_TLS_CLIENT_CA_CERT_PATH`)
+- Frontend DTLS mTLS uses a separate trust store from TCP TLS mTLS (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` vs `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`)
 
 ### Trust Store Model
 
@@ -262,7 +262,7 @@ The gateway uses separate trust stores for TCP and UDP encryption:
 |-------------|-------------|-------|---------|
 | Backend server CA (TCP + UDP) | `backend_tls_server_ca_cert_path` | Per-proxy | Verify backend's certificate. Falls back to system roots for TCP if unset. |
 | Backend client cert (TCP + UDP) | `backend_tls_client_cert_path` + `backend_tls_client_key_path` | Per-proxy | Gateway presents this cert to the backend (mTLS). |
-| Frontend TLS client CA (TCP) | `FERRUM_TLS_CLIENT_CA_CERT_PATH` | Gateway-wide | Verify TCP client certificates (frontend mTLS). |
+| Frontend TLS client CA (TCP) | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | Gateway-wide | Verify TCP client certificates (frontend mTLS). |
 | Frontend DTLS client CA (UDP) | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | Gateway-wide | Verify DTLS client certificates (frontend mTLS). |
 | Frontend TLS server cert (TCP) | `FERRUM_TLS_CERT_PATH` + `FERRUM_TLS_KEY_PATH` | Gateway-wide | Gateway's TLS certificate for TCP frontend termination. |
 | Frontend DTLS server cert (UDP) | `FERRUM_DTLS_CERT_PATH` + `FERRUM_DTLS_KEY_PATH` | Gateway-wide | Gateway's DTLS certificate for UDP frontend termination. |
@@ -411,9 +411,9 @@ Notes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners |
-| `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519) |
+| `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or P-384) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
-| `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_TLS_CLIENT_CA_CERT_PATH` used for TCP. |
+| `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |
 | `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | Seconds allowed for frontend TCP+TLS and UDP+DTLS handshakes. `0` disables; use only when an upstream load balancer enforces an equivalent pre-handshake deadline |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
@@ -479,6 +479,6 @@ Stream proxy connections track:
 - **Connection-phase retries only**: TCP/UDP connections support retries during the connection phase (before data transfer starts). On connect failure, the gateway selects a different load-balanced target and retries with backoff. Once bytes have been forwarded, retries are not possible — the stream cannot be replayed.
 - **UDP max datagram**: Limited to 65,535 bytes per datagram (UDP protocol limit)
 - **Session isolation**: UDP sessions are keyed by source address — NAT'd clients sharing an IP:port will share a session
-- **DTLS key types**: DTLS supports ECDSA P-256 and P-384 certificates — RSA keys are not supported by the underlying `dimpl` library
+- **DTLS key types**: DTLS supports ECDSA P-256 and P-384 certificates — RSA and Ed25519 keys are not supported by the underlying `dimpl` library
 - **DTLS protocol version**: Both DTLS 1.2 and DTLS 1.3 (RFC 9147) are supported. Version is auto-negotiated — the highest mutually supported version is used.
 - **DTLS cert separation**: Frontend DTLS uses separate cert/key from TLS (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` env vars, not the gateway's TLS cert)

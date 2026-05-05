@@ -39,11 +39,16 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
+        .map_err(anyhow::Error::msg)?
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
-    let failover_urls = env_config.effective_db_failover_urls();
+    let failover_urls = env_config
+        .effective_db_failover_urls()
+        .map_err(anyhow::Error::msg)?;
     let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 
-    let effective_replica_url = env_config.effective_db_read_replica_url();
+    let effective_replica_url = env_config
+        .effective_db_read_replica_url()
+        .map_err(anyhow::Error::msg)?;
 
     // Tracks whether the initial connect succeeded. When `true`, the gateway
     // started via `FERRUM_DB_CONFIG_BACKUP_PATH` because every configured DB
@@ -62,11 +67,11 @@ pub async fn run(
                 env_config.mongo_auth_mechanism.as_deref(),
                 env_config.mongo_server_selection_timeout_seconds,
                 env_config.mongo_connect_timeout_seconds,
-                env_config.db_tls_enabled,
+                env_config.db_tls_enabled(),
                 env_config.db_tls_ca_cert_path.as_deref(),
                 env_config.db_tls_client_cert_path.as_deref(),
                 env_config.db_tls_client_key_path.as_deref(),
-                env_config.db_tls_insecure,
+                env_config.mongodb_tls_allows_invalid_certs(),
                 &failover_urls,
             )
             .await?;
@@ -92,11 +97,6 @@ pub async fn run(
                 db_type,
                 &effective_url,
                 &failover_urls,
-                env_config.db_tls_enabled,
-                env_config.db_tls_ca_cert_path.as_deref(),
-                env_config.db_tls_client_cert_path.as_deref(),
-                env_config.db_tls_client_key_path.as_deref(),
-                env_config.db_tls_insecure,
                 pool_config.clone(),
             )
             .await
@@ -122,15 +122,10 @@ pub async fn run(
                         // polling loop's `try_failover_reconnect()` probes them
                         // — a primary that stays down must not prevent
                         // recovery when a configured failover DB is healthy.
-                        DatabaseStore::connect_offline_with_tls_config(
+                        DatabaseStore::connect_offline_with_pool_config(
                             db_type,
                             &effective_url,
                             &failover_urls,
-                            env_config.db_tls_enabled,
-                            env_config.db_tls_ca_cert_path.as_deref(),
-                            env_config.db_tls_client_cert_path.as_deref(),
-                            env_config.db_tls_client_key_path.as_deref(),
-                            env_config.db_tls_insecure,
                             pool_config,
                         )?
                     } else {
@@ -145,17 +140,7 @@ pub async fn run(
 
             // Connect read replica for config polling (reduces primary load)
             if let Some(ref replica_url) = effective_replica_url {
-                match store
-                    .connect_read_replica(
-                        replica_url,
-                        env_config.db_tls_enabled,
-                        env_config.db_tls_ca_cert_path.as_deref(),
-                        env_config.db_tls_client_cert_path.as_deref(),
-                        env_config.db_tls_client_key_path.as_deref(),
-                        env_config.db_tls_insecure,
-                    )
-                    .await
-                {
+                match store.connect_read_replica(replica_url).await {
                     Ok(()) => info!("Read replica connected for config polling"),
                     Err(e) => warn!(
                         "Read replica connection failed, polling will use primary: {}",
@@ -203,6 +188,20 @@ pub async fn run(
                 );
             }
         }
+    }
+
+    // Custom-plugin migrations: warn on pending, opt-in auto-apply.
+    // Skipped when bootstrap_from_backup is still true — the database is
+    // unreachable so we can't probe migration state. The polling loop will
+    // reconcile when the DB recovers; until then the operator's existing
+    // schema is what matters anyway.
+    if !bootstrap_from_backup {
+        crate::modes::handle_startup_plugin_migrations(
+            &db,
+            env_config.auto_apply_plugin_migrations,
+            "database",
+        )
+        .await?;
     }
 
     // Load initial config from database, falling back to backup file if configured
@@ -278,6 +277,7 @@ pub async fn run(
         max_active_requests: env_config.dns_max_active_requests,
         max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
     });
 
     // DNS warmup — resolve all hostnames (proxy backends, upstream targets,
@@ -314,12 +314,21 @@ pub async fn run(
 
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(
+    let (proxy_state, health_check_handles) = ProxyState::new(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
+
+    // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
+    // their accept loops exit promptly during graceful drain. Without this,
+    // stream listeners would only react to per-listener (config-driven)
+    // shutdown and keep accepting connections until the runtime is dropped.
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
 
     // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
@@ -344,7 +353,8 @@ pub async fn run(
     );
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
-    proxy_state.start_per_ip_cleanup_task();
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
 
     // Start background TTL refresh to keep cache warm (with shutdown)
     let dns_handle =
@@ -520,6 +530,7 @@ pub async fn run(
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+            let h3_client_crls = crls.clone();
             let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
@@ -532,6 +543,7 @@ pub async fn run(
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
+                        client_crls: h3_client_crls,
                         started_tx: Some(h3_started_tx),
                     },
                 )
@@ -583,6 +595,8 @@ pub async fn run(
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
     // the same JwtManager instance for the HTTPS listener (instead of calling
@@ -727,11 +741,6 @@ pub async fn run(
     let dns_cache_for_poll = dns_cache.clone();
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
-    let db_tls_enabled = env_config.db_tls_enabled;
-    let db_tls_ca_cert = env_config.db_tls_ca_cert_path.clone();
-    let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
-    let db_tls_client_key = env_config.db_tls_client_key_path.clone();
-    let db_tls_insecure = env_config.db_tls_insecure;
     let poll_namespace = env_config.namespace.clone();
 
     let db_poll_handle = tokio::spawn(async move {
@@ -775,14 +784,7 @@ pub async fn run(
                                 "Database DNS changed for '{}': {:?} -> {:?}, reconnecting pool",
                                 hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
                             );
-                            if let Err(e) = db_poll.reconnect(
-                                &db_url_for_reconnect,
-                                db_tls_enabled,
-                                db_tls_ca_cert.as_deref(),
-                                db_tls_client_cert.as_deref(),
-                                db_tls_client_key.as_deref(),
-                                db_tls_insecure,
-                            ).await {
+                            if let Err(e) = db_poll.reconnect(&db_url_for_reconnect).await {
                                 error!(
                                     "Failed to reconnect database pool after DNS change for '{}': {}",
                                     hostname, e
@@ -812,14 +814,7 @@ pub async fn run(
                                 "Read replica DNS changed for '{}': {:?} -> {:?}, reconnecting replica pool",
                                 replica_hostname, last_replica_ips.as_deref().unwrap_or(&[]), ips
                             );
-                            if let Err(e) = db_poll.reconnect_read_replica(
-                                replica_url,
-                                db_tls_enabled,
-                                db_tls_ca_cert.as_deref(),
-                                db_tls_client_cert.as_deref(),
-                                db_tls_client_key.as_deref(),
-                                db_tls_insecure,
-                            ).await {
+                            if let Err(e) = db_poll.reconnect_read_replica(replica_url).await {
                                 error!(
                                     "Failed to reconnect read replica pool after DNS change for '{}': {}",
                                     replica_hostname, e
@@ -870,18 +865,46 @@ pub async fn run(
                                 let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
                                 let removed_upstream_ids = result.removed_upstream_ids.clone();
 
-                                if proxy_state_poll.apply_incremental(result).await {
-                                    // Update known IDs only after successful apply to keep them
-                                    // in sync with actual proxy state. If apply is rejected
-                                    // (e.g. security plugin validation), known_ids stay unchanged
-                                    // so the next poll re-fetches the same changes.
-                                    update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
-                                    update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
-                                    update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
-                                    update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
-                                    debug!("Incremental config reload complete");
+                                match proxy_state_poll.apply_incremental(result).await {
+                                    proxy::IncrementalApplyOutcome::Applied => {
+                                        // Update known IDs only after successful apply to keep them
+                                        // in sync with actual proxy state.
+                                        update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
+                                        update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
+                                        update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
+                                        update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
+                                        debug!("Incremental config reload complete");
+                                        last_poll_at = Some(poll_ts);
+                                    }
+                                    proxy::IncrementalApplyOutcome::NoChanges => {
+                                        // Nothing to apply this cycle. Advance the cursor
+                                        // so the next poll only fetches truly newer rows.
+                                        last_poll_at = Some(poll_ts);
+                                    }
+                                    proxy::IncrementalApplyOutcome::Rejected => {
+                                        // Validation rejected the patched config (e.g. security
+                                        // plugin / unique listen-path). Leave `last_poll_at`
+                                        // unchanged so the next poll re-fetches the same rows
+                                        // and tries again. Without this, a rejected resource
+                                        // older than the 1-second `since_safe` margin would
+                                        // silently disappear from the gateway's view of the
+                                        // DB, leaving permanent divergence between DB state
+                                        // and in-memory config until a full reload.
+                                        //
+                                        // Known follow-up: if the same poll timestamp keeps
+                                        // failing validation (a malformed row stuck in the
+                                        // DB), the loop will spin re-fetching it forever.
+                                        // A future change should escalate after N consecutive
+                                        // rejections at the same `poll_ts` — log an error and
+                                        // trigger a full reload to recover (or mark the
+                                        // offending IDs and skip them with operator alert).
+                                        warn!(
+                                            "Incremental config update rejected by validation; \
+                                             leaving last_poll_at unchanged so the next poll \
+                                             retries the same rows"
+                                        );
+                                    }
                                 }
-                                last_poll_at = Some(poll_ts);
                             }
                             Err(e) => {
                                 warn!(
@@ -905,14 +928,7 @@ pub async fn run(
                                     Err(e2) => {
                                         // Both incremental and full reload failed —
                                         // try failover URLs before giving up.
-                                        match db_poll.try_failover_reconnect(
-                                            &db_url_for_reconnect,
-                                            db_tls_enabled,
-                                            db_tls_ca_cert.as_deref(),
-                                            db_tls_client_cert.as_deref(),
-                                            db_tls_client_key.as_deref(),
-                                            db_tls_insecure,
-                                        ).await {
+                                        match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
                                                 // Reconnected to a failover DB — try full reload
                                                 match db_poll.load_full_config(&poll_namespace).await {
@@ -1013,7 +1029,17 @@ pub async fn run(
         }
     }
 
-    // Graceful connection drain: wait for in-flight requests to complete.
+    // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
+    // also observe the global shutdown receiver wired above and will already
+    // be exiting; firing each per-listener channel here clears the listener
+    // map (releasing ports) and is a no-op if the loops have already exited.
+    proxy_state.stream_listener_manager.shutdown_all().await;
+
+    // Graceful connection drain: signal drain state to the proxy hot path
+    // (Connection: close + reject new requests) unconditionally so the close
+    // hint fires even when the operator has disabled the wait loop with
+    // FERRUM_SHUTDOWN_DRAIN_SECONDS=0. Only the wait loop itself is gated.
+    crate::overload::begin_drain(&proxy_state.overload);
     let drain_seconds = env_config.shutdown_drain_seconds;
     if drain_seconds > 0 {
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
@@ -1022,6 +1048,12 @@ pub async fn run(
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a DB query or DNS lookup).
+    // Active-health-check probes and the passive recovery timer observe the
+    // shutdown watch channel via `tokio::select!` (see `start_with_shutdown`)
+    // so they exit cleanly within the 5s cap rather than racing the
+    // `Drop for HealthChecker` abort that fires at process exit.
+    let mut health_check_handles = health_check_handles;
+    health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
     let bg_drain = async {
         let _ = dns_handle.await;
         if let Some(h) = dns_retry_handle {
@@ -1030,6 +1062,12 @@ pub async fn run(
         let _ = db_poll_handle.await;
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
+        if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
+        for h in health_check_handles {
+            let _ = h.await;
+        }
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await
@@ -1048,5 +1086,35 @@ fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &
     }
     for id in added {
         known.insert(id.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_known_ids_adds_and_removes() {
+        let mut known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec!["d".to_string()], &["b".to_string()]);
+        assert!(known.contains("a"));
+        assert!(!known.contains("b"));
+        assert!(known.contains("c"));
+        assert!(known.contains("d"));
+        assert_eq!(known.len(), 3);
+    }
+
+    #[test]
+    fn update_known_ids_remove_nonexistent_is_noop() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec![], &["zzz".to_string()]);
+        assert_eq!(known.len(), 1);
+    }
+
+    #[test]
+    fn update_known_ids_duplicate_add_is_idempotent() {
+        let mut known: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+        update_known_ids(&mut known, &vec!["a".to_string(), "a".to_string()], &[]);
+        assert_eq!(known.len(), 1);
     }
 }

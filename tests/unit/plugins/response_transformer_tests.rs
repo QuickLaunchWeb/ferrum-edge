@@ -636,3 +636,64 @@ async fn test_response_transformer_body_update_null_value() {
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(parsed["error"].is_null());
 }
+
+// ── SSE bypass ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_response_transformer_sse_request_skips_buffering() {
+    // Body transforms operate on the assembled response. SSE responses must
+    // bypass body buffering — otherwise the buffer collects events forever
+    // and the gateway 502s once max-response-body is hit.
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
+        ]
+    }))
+    .unwrap();
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_response_transformer_non_sse_request_still_buffers() {
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "old", "new_key": "new"}
+        ]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_response_transformer_header_only_rules_never_buffer() {
+    // Header-only rules (no body_rules) must not buffer regardless of SSE.
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "key": "X-Test", "value": "yes"}
+        ]
+    }))
+    .unwrap();
+    assert!(!plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    let mut ctx_json = make_ctx();
+    ctx_json
+        .headers
+        .insert("accept".to_string(), "application/json".to_string());
+    assert!(!plugin.should_buffer_response_body(&ctx_json));
+}

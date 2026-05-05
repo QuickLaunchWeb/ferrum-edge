@@ -11,7 +11,7 @@
 //! from being MITMed via any public CA.
 //!
 //! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
-//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_CURVES`. Applied to
 //! both inbound listeners and outbound backend connections.
 
 pub mod backend;
@@ -645,8 +645,13 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 
 /// Build a client certificate verifier from a CA bundle file.
 /// Used by the HTTP/3 listener to carry forward mTLS from the main TLS config.
+///
+/// When `crls` is non-empty, CRL revocation checking is enabled with the same
+/// policy used by H1/H2 frontend mTLS and DTLS:
+/// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
 pub fn build_client_cert_verifier(
     ca_bundle_path: &str,
+    crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, anyhow::Error> {
     let ca_file = File::open(ca_bundle_path)?;
     let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
@@ -663,7 +668,20 @@ pub fn build_client_cert_verifier(
         ));
     }
 
-    rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
+    let mut verifier_builder =
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+    if !crls.is_empty() {
+        verifier_builder = verifier_builder
+            .with_crls(crls.iter().cloned())
+            .allow_unknown_revocation_status()
+            .only_check_end_entity_revocation();
+        info!(
+            "HTTP/3 client certificate CRL checking enabled ({} CRL(s))",
+            crls.len()
+        );
+    }
+
+    verifier_builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))
 }

@@ -1177,6 +1177,17 @@ impl Plugin for BodyValidator {
         self.has_response_validation
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Skip body buffering for SSE requests (`Accept: text/event-stream`).
+        // Buffering an unbounded event stream would 502 once the gateway's
+        // max-response-body limit is reached. Validating SSE event-by-event
+        // is out of scope for this plugin's design (validation runs once on
+        // the assembled body); operators should disable response validation
+        // on SSE proxies or filter at the proxy level if event-level
+        // validation is required.
+        self.has_response_validation && !super::utils::sse::is_sse_request(ctx)
+    }
+
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,

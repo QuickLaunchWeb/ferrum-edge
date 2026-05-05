@@ -111,7 +111,7 @@ pub struct DbPoolConfig {
 impl Default for DbPoolConfig {
     fn default() -> Self {
         Self {
-            max_connections: 10,
+            max_connections: 32,
             min_connections: 1,
             acquire_timeout_seconds: 30,
             idle_timeout_seconds: 600,
@@ -170,7 +170,7 @@ pub struct DatabaseStore {
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendAllowIps,
     /// Set to `true` when the store was created via
-    /// [`DatabaseStore::connect_offline_with_tls_config`] — the lazy pool
+    /// [`DatabaseStore::connect_offline_with_pool_config`] — the lazy pool
     /// never ran migrations because the DB was unreachable at startup.
     /// Cleared once migrations succeed against a recovered DB. `reconnect()`
     /// checks this flag and runs migrations on the first successful reconnect
@@ -300,38 +300,17 @@ impl DatabaseStore {
         format!("{}{}connect_timeout={}", url, separator, timeout_seconds)
     }
 
-    /// Connect to the database with optional TLS configuration and run migrations.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn connect_with_tls_config(
+    /// Connect to the database with the provided pool configuration and run migrations.
+    pub async fn connect_with_pool_config(
         db_type: &str,
         db_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
         pool_config: DbPoolConfig,
     ) -> Result<Self, anyhow::Error> {
         // Install all drivers
         sqlx::any::install_default_drivers();
 
-        // Construct TLS-aware connection URL
-        let mut final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
-            Self::build_tls_connection_url(
-                db_url,
-                db_type,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
-            )?
-        } else {
-            db_url.to_string()
-        };
-
-        // Append driver-level connect timeout to the URL
-        final_url =
-            Self::append_connect_timeout(&final_url, db_type, pool_config.connect_timeout_seconds);
+        let final_url =
+            Self::append_connect_timeout(db_url, db_type, pool_config.connect_timeout_seconds);
 
         let pool = Self::build_pool_options_from_config(&pool_config, db_type)
             .connect(&final_url)
@@ -353,11 +332,8 @@ impl DatabaseStore {
         store.run_migrations().await?;
 
         info!(
-            "Database connected and migrations applied (type={}, tls_enabled={}, max_connections={}, min_connections={})",
-            db_type,
-            tls_enabled,
-            store.pool_config.max_connections,
-            store.pool_config.min_connections
+            "Database connected and migrations applied (type={}, max_connections={}, min_connections={})",
+            db_type, store.pool_config.max_connections, store.pool_config.min_connections
         );
         Ok(store)
     }
@@ -378,35 +354,16 @@ impl DatabaseStore {
     /// `reconnect()` (primary or failover) will run migrations, because a DB
     /// that comes back with a fresh or outdated schema must be brought up to
     /// the expected version before the polling loop can read from it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn connect_offline_with_tls_config(
+    pub fn connect_offline_with_pool_config(
         db_type: &str,
         db_url: &str,
         failover_urls: &[String],
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
         pool_config: DbPoolConfig,
     ) -> Result<Self, anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let mut final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
-            Self::build_tls_connection_url(
-                db_url,
-                db_type,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
-            )?
-        } else {
-            db_url.to_string()
-        };
-
-        final_url =
-            Self::append_connect_timeout(&final_url, db_type, pool_config.connect_timeout_seconds);
+        let final_url =
+            Self::append_connect_timeout(db_url, db_type, pool_config.connect_timeout_seconds);
 
         // `connect_lazy` does not attempt a connection — the pool is ready to
         // hand out connections on first query. Migrations are deferred until
@@ -427,69 +384,6 @@ impl DatabaseStore {
             backend_allow_ips: crate::config::BackendAllowIps::Both,
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
-    }
-
-    /// Build a TLS-aware connection URL for Postgres and MySQL.
-    fn build_tls_connection_url(
-        base_url: &str,
-        db_type: &str,
-        ca_cert_path: Option<&str>,
-        client_cert_path: Option<&str>,
-        client_key_path: Option<&str>,
-        insecure: bool,
-    ) -> Result<String, anyhow::Error> {
-        let mut url = base_url.to_string();
-
-        // Add a separator if the URL doesn't already have query parameters
-        let separator = if url.contains('?') { '&' } else { '?' };
-
-        match db_type {
-            "postgres" => {
-                if insecure {
-                    // sslmode=require: encrypts but does NOT verify the server certificate
-                    url.push_str(&format!("{}sslmode=require", separator));
-                } else {
-                    // sslmode=verify-full: encrypts AND verifies the server certificate
-                    url.push_str(&format!("{}sslmode=verify-full", separator));
-                    if let Some(ca_path) = ca_cert_path {
-                        url.push_str(&format!("&sslrootcert={}", ca_path));
-                    }
-                    if let Some(cert_path) = client_cert_path {
-                        url.push_str(&format!("&sslcert={}", cert_path));
-                    }
-                    if let Some(key_path) = client_key_path {
-                        url.push_str(&format!("&sslkey={}", key_path));
-                    }
-                }
-            }
-            "mysql" => {
-                if insecure {
-                    // REQUIRED: encrypts but does NOT verify the server certificate
-                    url.push_str(&format!("{}ssl-mode=REQUIRED", separator));
-                } else {
-                    // VERIFY_IDENTITY: encrypts AND verifies the server certificate
-                    url.push_str(&format!("{}ssl-mode=VERIFY_IDENTITY", separator));
-                    if let Some(ca_path) = ca_cert_path {
-                        url.push_str(&format!("&ssl-ca={}", ca_path));
-                    }
-                    if let Some(cert_path) = client_cert_path {
-                        url.push_str(&format!("&ssl-cert={}", cert_path));
-                    }
-                    if let Some(key_path) = client_key_path {
-                        url.push_str(&format!("&ssl-key={}", key_path));
-                    }
-                }
-            }
-            _ => {
-                // SQLite and others don't use network TLS
-                info!(
-                    "TLS configuration not supported for database type: {}",
-                    db_type
-                );
-            }
-        }
-
-        Ok(url)
     }
 
     /// Run versioned schema migrations using the MigrationRunner.
@@ -1062,12 +956,25 @@ impl DatabaseStore {
         Ok(Some(proxy))
     }
 
-    pub async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+    /// Check whether a proxy with the given ID exists in `namespace`.
+    ///
+    /// The `namespace` filter is required: admin-API callers must scope
+    /// reference checks to the requesting tenant's namespace so that, for
+    /// example, a `plugin_config.proxy_id` cannot point at a proxy that lives
+    /// in a different namespace (such a config would never load at runtime
+    /// because the polling path filters by namespace).
+    pub async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ?"))
-            .bind(proxy_id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?"))
+                .bind(proxy_id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
         self.check_slow_query("check_proxy_exists", start);
         Ok(row.is_some())
     }
@@ -2018,14 +1925,24 @@ impl DatabaseStore {
         Ok(rows.is_empty())
     }
 
-    /// Check if an upstream with the given ID exists.
-    /// Returns `true` if the upstream exists.
-    pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+    /// Check if an upstream with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace.
+    ///
+    /// The `namespace` filter is mandatory: cross-namespace references would
+    /// pass admin validation but silently 502 at runtime because the proxy
+    /// load path filters upstreams by namespace.
+    pub async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ?"))
-            .bind(upstream_id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
+                .bind(upstream_id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
         self.check_slow_query("check_upstream_exists", start);
         Ok(row.is_some())
     }
@@ -2033,9 +1950,15 @@ impl DatabaseStore {
     /// Validate that a proxy's plugin associations reference existing
     /// proxy-scoped plugin configs targeted at the same proxy, and that the
     /// resolved plugin names remain unique for that proxy.
+    ///
+    /// Plugin configs are resolved only within `namespace`. References to
+    /// plugin_configs in a different namespace surface as
+    /// `non-existent plugin_config '<id>'` errors so admin validation
+    /// cannot admit cross-namespace pollution.
     pub async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         associations: &[PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
         if associations.is_empty() {
@@ -2057,7 +1980,9 @@ impl DatabaseStore {
             }
         }
 
-        let plugin_refs = self.load_plugin_config_refs(&requested_ids).await?;
+        let plugin_refs = self
+            .load_plugin_config_refs(&requested_ids, namespace)
+            .await?;
 
         for assoc in associations {
             match plugin_refs.get(assoc.plugin_config_id.as_str()) {
@@ -2375,9 +2300,14 @@ impl DatabaseStore {
         Ok(ids)
     }
 
+    /// Load `(id, scope, proxy_id)` for each plugin_config ID **within
+    /// `namespace`**. Rows whose namespace does not match are filtered out
+    /// at the SQL layer, so callers using the result map to validate
+    /// references will report rows in other namespaces as missing.
     async fn load_plugin_config_refs(
         &self,
         ids: &[String],
+        namespace: &str,
     ) -> Result<std::collections::HashMap<String, PluginConfigRef>, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -2387,11 +2317,12 @@ impl DatabaseStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = self.q(&format!(
-            "SELECT id, scope, proxy_id FROM plugin_configs WHERE id IN ({})",
+            "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
             placeholders
         ));
 
         let mut query = sqlx::query(&sql);
+        query = query.bind(namespace);
         for id in ids {
             query = query.bind(id);
         }
@@ -2867,33 +2798,11 @@ impl DatabaseStore {
     /// Called by the DB polling loop when DnsCache detects that the database
     /// FQDN now resolves to a different set of IPs. The old pool is closed
     /// gracefully in the background — in-flight queries complete normally.
-    pub async fn reconnect(
-        &self,
-        db_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let mut final_url =
-            if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
-                Self::build_tls_connection_url(
-                    db_url,
-                    &self.db_type,
-                    tls_ca_cert_path,
-                    tls_client_cert_path,
-                    tls_client_key_path,
-                    tls_insecure,
-                )?
-            } else {
-                db_url.to_string()
-            };
-
-        final_url = Self::append_connect_timeout(
-            &final_url,
+        let final_url = Self::append_connect_timeout(
+            db_url,
             &self.db_type,
             self.pool_config.connect_timeout_seconds,
         );
@@ -2913,7 +2822,7 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
-        // If this store was bootstrapped via `connect_offline_with_tls_config`
+        // If this store was bootstrapped via `connect_offline_with_pool_config`
         // (backup-file startup with an unreachable DB), migrations never ran.
         // Now that the pool is reconnected to a live DB, run them before
         // returning so the polling loop finds tables at the expected schema.
@@ -2938,30 +2847,13 @@ impl DatabaseStore {
     /// Tries the primary URL first. If it fails and failover URLs are provided,
     /// tries each in order. The first successful connection is used. Migrations
     /// are run on the connected database.
-    #[allow(clippy::too_many_arguments)]
     pub async fn connect_with_failover(
         db_type: &str,
         primary_url: &str,
         failover_urls: &[String],
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
         pool_config: DbPoolConfig,
     ) -> Result<Self, anyhow::Error> {
-        match Self::connect_with_tls_config(
-            db_type,
-            primary_url,
-            tls_enabled,
-            tls_ca_cert_path,
-            tls_client_cert_path,
-            tls_client_key_path,
-            tls_insecure,
-            pool_config.clone(),
-        )
-        .await
-        {
+        match Self::connect_with_pool_config(db_type, primary_url, pool_config.clone()).await {
             Ok(mut store) => {
                 store.failover_urls = failover_urls.to_vec();
                 Ok(store)
@@ -2976,18 +2868,7 @@ impl DatabaseStore {
                     failover_urls.len()
                 );
                 for (i, url) in failover_urls.iter().enumerate() {
-                    match Self::connect_with_tls_config(
-                        db_type,
-                        url,
-                        tls_enabled,
-                        tls_ca_cert_path,
-                        tls_client_cert_path,
-                        tls_client_key_path,
-                        tls_insecure,
-                        pool_config.clone(),
-                    )
-                    .await
-                    {
+                    match Self::connect_with_pool_config(db_type, url, pool_config.clone()).await {
                         Ok(mut store) => {
                             info!(
                                 "Connected to failover database #{} ({})",
@@ -3020,33 +2901,11 @@ impl DatabaseStore {
     ///
     /// The read replica pool uses the same connection settings (max_connections,
     /// max_lifetime) as the primary. Migrations are NOT run on the replica.
-    pub async fn connect_read_replica(
-        &mut self,
-        replica_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn connect_read_replica(&mut self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let mut final_url =
-            if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
-                Self::build_tls_connection_url(
-                    replica_url,
-                    &self.db_type,
-                    tls_ca_cert_path,
-                    tls_client_cert_path,
-                    tls_client_key_path,
-                    tls_insecure,
-                )?
-            } else {
-                replica_url.to_string()
-            };
-
-        final_url = Self::append_connect_timeout(
-            &final_url,
+        let final_url = Self::append_connect_timeout(
+            replica_url,
             &self.db_type,
             self.pool_config.connect_timeout_seconds,
         );
@@ -3079,15 +2938,7 @@ impl DatabaseStore {
     ///
     /// Called by the DB polling loop when DnsCache detects that the read replica
     /// FQDN now resolves to a different set of IPs.
-    pub async fn reconnect_read_replica(
-        &self,
-        replica_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         let rp = match &self.read_replica_pool {
             Some(rp) => rp,
             None => return Ok(()), // no replica configured
@@ -3095,22 +2946,8 @@ impl DatabaseStore {
 
         sqlx::any::install_default_drivers();
 
-        let mut final_url =
-            if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
-                Self::build_tls_connection_url(
-                    replica_url,
-                    &self.db_type,
-                    tls_ca_cert_path,
-                    tls_client_cert_path,
-                    tls_client_key_path,
-                    tls_insecure,
-                )?
-            } else {
-                replica_url.to_string()
-            };
-
-        final_url = Self::append_connect_timeout(
-            &final_url,
+        let final_url = Self::append_connect_timeout(
+            replica_url,
             &self.db_type,
             self.pool_config.connect_timeout_seconds,
         );
@@ -3134,46 +2971,16 @@ impl DatabaseStore {
     ///
     /// Called by the polling loop when the current connection is failing.
     /// Returns the URL that succeeded, or an error if all failed.
-    pub async fn try_failover_reconnect(
-        &self,
-        primary_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<String, anyhow::Error> {
+    pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
         // Try primary first
-        if self
-            .reconnect(
-                primary_url,
-                tls_enabled,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
-            )
-            .await
-            .is_ok()
-        {
+        if self.reconnect(primary_url).await.is_ok() {
             info!("Reconnected to primary database");
             return Ok(primary_url.to_string());
         }
 
         // Try failover URLs in order
         for (i, url) in self.failover_urls.iter().enumerate() {
-            if self
-                .reconnect(
-                    url,
-                    tls_enabled,
-                    tls_ca_cert_path,
-                    tls_client_cert_path,
-                    tls_client_key_path,
-                    tls_insecure,
-                )
-                .await
-                .is_ok()
-            {
+            if self.reconnect(url).await.is_ok() {
                 info!(
                     "Reconnected to failover database #{} ({})",
                     i + 1,
@@ -3327,8 +3134,12 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::get_proxy(self, id).await
     }
 
-    async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_proxy_exists(self, proxy_id).await
+    async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_proxy_exists(self, proxy_id, namespace).await
     }
 
     async fn list_proxies_paginated(
@@ -3499,16 +3310,21 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
     }
 
-    async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_upstream_exists(self, upstream_id).await
+    async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_upstream_exists(self, upstream_id, namespace).await
     }
 
     async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         plugins: &[crate::config::types::PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
-        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, plugins).await
+        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, namespace, plugins).await
     }
 
     async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
@@ -3545,67 +3361,16 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::delete_all_resources(self, namespace).await
     }
 
-    async fn reconnect(
-        &self,
-        db_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error> {
-        DatabaseStore::reconnect(
-            self,
-            db_url,
-            tls_enabled,
-            tls_ca_cert_path,
-            tls_client_cert_path,
-            tls_client_key_path,
-            tls_insecure,
-        )
-        .await
+    async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
+        DatabaseStore::reconnect(self, db_url).await
     }
 
-    async fn reconnect_read_replica(
-        &self,
-        replica_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<(), anyhow::Error> {
-        DatabaseStore::reconnect_read_replica(
-            self,
-            replica_url,
-            tls_enabled,
-            tls_ca_cert_path,
-            tls_client_cert_path,
-            tls_client_key_path,
-            tls_insecure,
-        )
-        .await
+    async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
+        DatabaseStore::reconnect_read_replica(self, replica_url).await
     }
 
-    async fn try_failover_reconnect(
-        &self,
-        primary_url: &str,
-        tls_enabled: bool,
-        tls_ca_cert_path: Option<&str>,
-        tls_client_cert_path: Option<&str>,
-        tls_client_key_path: Option<&str>,
-        tls_insecure: bool,
-    ) -> Result<String, anyhow::Error> {
-        DatabaseStore::try_failover_reconnect(
-            self,
-            primary_url,
-            tls_enabled,
-            tls_ca_cert_path,
-            tls_client_cert_path,
-            tls_client_key_path,
-            tls_insecure,
-        )
-        .await
+    async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
+        DatabaseStore::try_failover_reconnect(self, primary_url).await
     }
 
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
@@ -3614,6 +3379,31 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
         DatabaseStore::maybe_apply_deferred_migrations(self).await
+    }
+
+    async fn pending_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        let status = runner.plugin_status(plugin_migrations).await?;
+        Ok(status.pending)
+    }
+
+    async fn apply_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        runner.run_plugin_pending(plugin_migrations).await
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {

@@ -1,8 +1,8 @@
 //! Tests for the ferrum.conf configuration file parser and integration
 //! with EnvConfig.
 
-use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::conf_file::ConfFile;
+use ferrum_edge::config::{DbTlsMode, EnvConfig};
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -225,7 +225,7 @@ FERRUM_DB_TYPE = postgres
 FERRUM_DB_URL = postgres://localhost/ferrum
 FERRUM_ADMIN_JWT_SECRET = secret123-padding-for-32-chars!!
 FERRUM_DB_POLL_INTERVAL = 60
-FERRUM_DB_SSL_MODE = verify-full
+FERRUM_DB_TLS_MODE = verify-full
 ";
     let conf = ConfFile::parse(conf_contents).unwrap();
 
@@ -241,7 +241,7 @@ FERRUM_DB_SSL_MODE = verify-full
             Some("secret123-padding-for-32-chars!!")
         );
         assert_eq!(config.db_poll_interval, 60);
-        assert_eq!(config.db_ssl_mode.as_deref(), Some("verify-full"));
+        assert_eq!(config.db_tls_mode, Some(DbTlsMode::VerifyFull));
     });
 }
 

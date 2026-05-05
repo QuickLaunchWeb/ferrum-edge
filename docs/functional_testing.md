@@ -31,20 +31,15 @@ Located in `tests/functional/functional_cp_dp_test.rs`, this file contains highe
    - Verifies initial config reception
    - Broadcasts config updates and verifies DP receives them
 
-2. **test_database_connection_with_tls_config** - Tests database connection with TLS parameters
+2. **test_database_connection_with_sqlite_config** - Tests SQLite database connection behavior
    - Tests plaintext SQLite connection
    - Creates and loads proxies from database
-   - Tests TLS configuration parameters (with and without certs)
-   - Tests TLS insecure mode
 
 3. **test_env_config_tls_fields** - Verifies all TLS fields are present in EnvConfig
-   - Checks db_tls_enabled
+   - Checks db_tls_mode
    - Checks db_tls_ca_cert_path
    - Checks db_tls_client_cert_path
    - Checks db_tls_client_key_path
-   - Checks db_tls_insecure
-
-4. **test_grpc_url_construction** - Tests URL construction for PostgreSQL and MySQL with TLS
 
 **Running (Ignored by Default):**
 ```bash
@@ -52,7 +47,7 @@ Located in `tests/functional/functional_cp_dp_test.rs`, this file contains highe
 cargo test --test functional_tests functional_cp_dp -- --ignored
 
 # Run specific test
-cargo test --test functional_tests functional_cp_dp -- test_database_connection_with_tls_config -- --ignored
+cargo test --test functional_tests functional_cp_dp -- test_database_connection_with_sqlite_config -- --ignored
 
 # Run with output
 cargo test --test functional_tests functional_cp_dp -- --ignored --nocapture
@@ -60,7 +55,7 @@ cargo test --test functional_tests functional_cp_dp -- --ignored --nocapture
 
 ## Database TLS Support
 
-The database layer now supports TLS configuration for PostgreSQL and MySQL connections.
+The database layer supports TLS configuration for PostgreSQL, MySQL, and MongoDB connections. SQLite has no network TLS; `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op, while certificate paths and other database TLS modes are rejected.
 
 ### Configuration
 
@@ -68,7 +63,7 @@ Set these environment variables to enable database TLS:
 
 ```bash
 # Enable TLS for database connection
-FERRUM_DB_TLS_ENABLED=true
+FERRUM_DB_TLS_MODE=verify-full
 
 # Path to CA certificate (for server verification)
 FERRUM_DB_TLS_CA_CERT_PATH=/path/to/ca.pem
@@ -79,8 +74,8 @@ FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.pem
 # Path to client private key (for mTLS)
 FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client-key.pem
 
-# Skip TLS certificate verification (testing only)
-FERRUM_DB_TLS_INSECURE=true
+# Encrypted but without certificate verification (testing only)
+FERRUM_DB_TLS_MODE=require
 ```
 
 ### Implementation Details
@@ -89,34 +84,35 @@ FERRUM_DB_TLS_INSECURE=true
 
 Added to `src/config/env_config.rs`:
 ```rust
-pub db_tls_enabled: bool,
+pub db_tls_mode: Option<DbTlsMode>,
 pub db_tls_ca_cert_path: Option<String>,
 pub db_tls_client_cert_path: Option<String>,
 pub db_tls_client_key_path: Option<String>,
-pub db_tls_insecure: bool,
 ```
 
-#### DatabaseStore Changes
+#### Database URL Handling
 
-Added to `src/config/db_loader.rs`:
-- New method: `connect_with_tls_config()` - Accepts TLS configuration and constructs appropriate connection URLs
-- New method: `build_tls_connection_url()` - Builds database-specific TLS URLs
-- Legacy method: `connect()` - Remains for backward compatibility, calls `connect_with_tls_config()` with default (no TLS) parameters
+SQL URLs are built by `EnvConfig::effective_db_url()`,
+`effective_db_failover_urls()`, and `effective_db_read_replica_url()` from the
+canonical `FERRUM_DB_TLS_MODE` and certificate path fields. `DatabaseStore`
+consumes those already-effective URLs and only appends pool-level driver options
+such as `connect_timeout`.
 
 **For PostgreSQL:**
-- Uses `sslmode=require` parameter
+- Uses the `sslmode` parameter (`require`, `verify-ca`, `verify-full`, etc.)
 - Supports `sslrootcert`, `sslcert`, `sslkey` parameters
 
 **For MySQL:**
-- Uses `ssl-mode=REQUIRED` parameter
-- Supports `ssl-ca`, `ssl-client-cert`, `ssl-client-key` parameters
+- Uses the `ssl-mode` parameter (`REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, etc.)
+- Supports `ssl-ca`, `ssl-cert`, `ssl-key` parameters
 
 **For SQLite:**
-- TLS parameters are ignored (SQLite doesn't use network TLS)
+- `FERRUM_DB_TLS_MODE=disable` is accepted as a no-op for shared templates
+- Certificate paths and other TLS modes are rejected because SQLite doesn't use network TLS
 
 #### Mode Changes
 
-Updated `src/modes/control_plane.rs` and `src/modes/database.rs` to pass TLS configuration to `DatabaseStore::connect_with_tls_config()`.
+Updated `src/modes/control_plane.rs` and `src/modes/database.rs` to apply canonical database TLS settings for SQL URLs and MongoDB driver options.
 
 ## CP/DP Mode Integration
 
@@ -269,11 +265,12 @@ curl http://localhost:8000/test/get
 
 For PostgreSQL or MySQL with TLS, set:
 ```bash
-FERRUM_DB_TLS_ENABLED=true
+FERRUM_DB_TLS_MODE=verify-full
 FERRUM_DB_TLS_CA_CERT_PATH=/path/to/ca.pem
 FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.pem
 FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client-key.pem
-FERRUM_DB_TLS_INSECURE=false  # For testing only, use true to skip verification
+# For testing only, use require to encrypt without certificate verification.
+# FERRUM_DB_TLS_MODE=require
 ```
 
 Then start CP/DP modes normally. The database connection will use TLS.
@@ -293,7 +290,7 @@ Then start CP/DP modes normally. The database connection will use TLS.
 ### Database Connection Failures
 - For TLS: Ensure certificate paths exist and are readable
 - For SQLite: Check file path and permissions
-- For PostgreSQL/MySQL: Verify FERRUM_DB_TLS_ENABLED and certificate validity
+- For PostgreSQL/MySQL: Verify FERRUM_DB_TLS_MODE and certificate validity
 
 ### Proxy Traffic Not Working
 - Verify proxy exists in CP database via Admin API
@@ -361,5 +358,5 @@ the test must verify:
 1. **JWT Secrets**: Use strong, random secrets for FERRUM_ADMIN_JWT_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET
 2. **TLS Database**: Always use TLS in production for remote databases
 3. **Admin API**: Restrict network access to CP Admin API port
-4. **Certificate Validation**: Avoid FERRUM_DB_TLS_INSECURE=true in production
+4. **Certificate Validation**: Avoid FERRUM_DB_TLS_MODE=require in production
 5. **DP gRPC**: Ensure DP is only accessible from authorized locations

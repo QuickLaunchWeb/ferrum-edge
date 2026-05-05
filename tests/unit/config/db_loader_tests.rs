@@ -52,7 +52,7 @@ fn test_append_connect_timeout_zero_disabled() {
 #[test]
 fn test_db_pool_config_default() {
     let config = DbPoolConfig::default();
-    assert_eq!(config.max_connections, 10);
+    assert_eq!(config.max_connections, 32);
     assert_eq!(config.min_connections, 1);
     assert_eq!(config.acquire_timeout_seconds, 30);
     assert_eq!(config.idle_timeout_seconds, 600);

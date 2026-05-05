@@ -1,7 +1,7 @@
-//! Global connection pool configuration
-//! Provides environment variable defaults and proxy-level overrides
+//! Global connection pool configuration.
+//! Provides env/ferrum.conf defaults and proxy-level overrides.
 
-use std::env;
+use super::conf_file::resolve_ferrum_var;
 
 /// Minimum allowed value for `max_idle_per_host`.
 ///
@@ -18,7 +18,7 @@ pub const MIN_IDLE_PER_HOST: usize = 4;
 /// 1024 rarely help because the backend itself becomes the bottleneck.
 pub const MAX_IDLE_PER_HOST: usize = 1024;
 
-/// Global connection pool configuration from environment variables
+/// Global connection pool configuration from environment variables or ferrum.conf.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub max_idle_per_host: usize,
@@ -65,7 +65,7 @@ pub struct PoolConfig {
     /// Maximum HTTP/2 frame payload size in bytes.
     /// Larger frames reduce per-frame overhead but increase head-of-line
     /// blocking risk.  Must be between 16_384 (spec minimum) and 1_048_576 (1 MiB).
-    /// Default: 65_535.
+    /// Default: 1_048_576 (1 MiB).
     pub http2_max_frame_size: u32,
 
     /// Maximum number of concurrent HTTP/2 streams the gateway will open
@@ -98,78 +98,79 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
-    /// Create pool configuration from environment variables with defaults
+    /// Create pool configuration from environment variables/ferrum.conf with defaults.
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        // Read from environment variables
-        if let Ok(val) = env::var("FERRUM_POOL_MAX_IDLE_PER_HOST")
+        // Read through `resolve_ferrum_var()` so values in ferrum.conf are
+        // honored anywhere the pool config is created outside EnvConfig.
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_MAX_IDLE_PER_HOST")
             && let Ok(parsed) = val.parse::<usize>()
         {
             config.max_idle_per_host = parsed;
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_IDLE_TIMEOUT_SECONDS")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_IDLE_TIMEOUT_SECONDS")
             && let Ok(parsed) = val.parse::<u64>()
         {
             config.idle_timeout_seconds = parsed;
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE") {
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE") {
             config.enable_http_keep_alive = val.parse::<bool>().unwrap_or(true);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_ENABLE_HTTP2") {
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_ENABLE_HTTP2") {
             config.enable_http2 = val.parse::<bool>().unwrap_or(true);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST")
             && let Ok(parsed) = val.parse::<usize>()
         {
             config.http2_connections_per_host = parsed.max(1);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS")
             && let Ok(parsed) = val.parse::<u64>()
         {
             config.tcp_keepalive_seconds = parsed;
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS")
             && let Ok(parsed) = val.parse::<u64>()
         {
             config.http2_keep_alive_interval_seconds = parsed;
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS")
             && let Ok(parsed) = val.parse::<u64>()
         {
             config.http2_keep_alive_timeout_seconds = parsed;
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
             config.http2_initial_stream_window_size = parsed.clamp(65_535, 128 * 1024 * 1024);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
             config.http2_initial_connection_window_size = parsed.clamp(65_535, 128 * 1024 * 1024);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
             config.http2_adaptive_window = val.parse::<bool>().unwrap_or(true);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
             config.http2_max_frame_size = parsed.clamp(16_384, 1_048_576);
         }
 
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS")
+        if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS")
             && let Ok(parsed) = val.parse::<u32>()
         {
             config.http2_max_concurrent_streams = Some(parsed);

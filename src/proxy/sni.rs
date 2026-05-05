@@ -12,10 +12,40 @@ const MAX_CLIENT_HELLO_LEN: usize = 4096;
 /// Uses `TcpStream::peek()` to read bytes without consuming them, so the same
 /// stream can be forwarded to the backend with the ClientHello intact.
 ///
-/// Returns `None` if the data is not a valid TLS ClientHello or has no SNI extension.
-pub async fn extract_sni_from_tcp_stream(stream: &tokio::net::TcpStream) -> Option<String> {
+/// `handshake_timeout` bounds how long the peek can wait for the ClientHello
+/// before giving up. A `None` value preserves the unbounded behavior used by
+/// internal callers that have already enforced a deadline elsewhere; passthrough
+/// listeners pass `Some(d)` (mapped from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
+/// so a peer that opens a TCP connection and sends nothing cannot park a
+/// connection-handler task indefinitely.
+///
+/// Returns `None` if the data is not a valid TLS ClientHello, has no SNI
+/// extension, the peek fails, or the timeout fires.
+pub async fn extract_sni_from_tcp_stream(
+    stream: &tokio::net::TcpStream,
+    handshake_timeout: Option<std::time::Duration>,
+) -> Option<String> {
     let mut buf = vec![0u8; MAX_CLIENT_HELLO_LEN];
-    let n = stream.peek(&mut buf).await.ok()?;
+    let peek_fut = stream.peek(&mut buf);
+    let n = match handshake_timeout {
+        Some(d) => match tokio::time::timeout(d, peek_fut).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return None,
+            Err(_) => {
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                tracing::debug!(
+                    peer = %peer,
+                    timeout_ms = d.as_millis() as u64,
+                    "TCP passthrough SNI peek timed out before ClientHello arrived"
+                );
+                return None;
+            }
+        },
+        None => peek_fut.await.ok()?,
+    };
     extract_sni_from_client_hello(&buf[..n])
 }
 
