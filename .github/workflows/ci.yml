@@ -139,7 +139,6 @@ jobs:
     name: Lint
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    needs: [fmt]
     steps:
       - uses: actions/checkout@v6
 
@@ -180,7 +179,6 @@ jobs:
     name: Performance Regression Check
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    needs: [test]
     environment: ci-perf
     steps:
       - uses: actions/checkout@v6
@@ -305,12 +303,11 @@ jobs:
             echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
           fi
 
-  # ── Cross-platform builds (PRs + main) & Release (main only) ──────────
+  # ── Cross-platform builds, release & Docker (main push only) ──────────
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
-    needs: [lint]
-    if: always() && (needs.lint.result == 'success' || (github.event_name == 'push' && needs.lint.result == 'skipped'))
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: ci-build
     runs-on: ${{ matrix.os }}
     strategy:

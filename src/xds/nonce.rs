@@ -119,4 +119,16 @@ impl XdsNonceTracker {
             })
             .and_then(|state| state.last_error.clone())
     }
+
+    pub fn remove_node(&self, node_id: &str) {
+        self.states.retain(|key, _| key.node_id != node_id);
+    }
+
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
 }
