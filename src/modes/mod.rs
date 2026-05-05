@@ -21,6 +21,8 @@ pub mod file;
 pub mod migrate;
 
 use std::sync::Arc;
+
+use anyhow::Context as _;
 use tracing::{info, warn};
 
 use crate::config::db_backend::DatabaseBackend;
@@ -74,6 +76,15 @@ async fn handle_startup_plugin_migrations_with_list(
     let pending = match db.pending_plugin_migrations(plugin_migrations).await {
         Ok(p) => p,
         Err(e) => {
+            if auto_apply {
+                return Err(e).with_context(|| {
+                    format!(
+                        "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true but pending \
+                         custom-plugin migrations could not be determined (mode={mode})"
+                    )
+                });
+            }
+
             // Probe failure shouldn't block startup; the operator can still
             // run `FERRUM_MIGRATE_ACTION=up` to recover. Log loud enough.
             warn!(
@@ -143,7 +154,7 @@ mod tests {
     use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
     use crate::config::migrations::CustomPluginMigration;
 
-    async fn fresh_store() -> (Arc<dyn DatabaseBackend>, tempfile::TempDir) {
+    async fn fresh_database_store() -> (Arc<DatabaseStore>, tempfile::TempDir) {
         // File-backed (not `::memory:`) so the multi-connection pool sees
         // a consistent view. `_ferrum_migrations` is created during
         // `connect_with_tls_config` and must be visible to subsequent
@@ -164,6 +175,23 @@ mod tests {
         .await
         .expect("test store should connect");
         (Arc::new(store), temp_dir)
+    }
+
+    async fn fresh_store() -> (Arc<dyn DatabaseBackend>, tempfile::TempDir) {
+        let (store, temp_dir) = fresh_database_store().await;
+        let db: Arc<dyn DatabaseBackend> = store;
+        (db, temp_dir)
+    }
+
+    async fn create_malformed_plugin_tracking_table(store: &DatabaseStore) {
+        sqlx::query(
+            "CREATE TABLE _ferrum_plugin_migrations (
+                plugin_name TEXT PRIMARY KEY
+            )",
+        )
+        .execute(&store.pool())
+        .await
+        .expect("malformed plugin tracking table should be created");
     }
 
     fn synthetic_pending_migration() -> Vec<(&'static str, Vec<CustomPluginMigration>)> {
@@ -236,6 +264,38 @@ mod tests {
         );
         assert_eq!(pending_after[0].plugin_name, "modes_handle_startup_test");
         assert_eq!(pending_after[0].version, 1);
+    }
+
+    #[tokio::test]
+    async fn auto_apply_true_is_fatal_when_pending_probe_fails() {
+        let (store, _tmp) = fresh_database_store().await;
+        create_malformed_plugin_tracking_table(&store).await;
+        let db: Arc<dyn DatabaseBackend> = store;
+        let migrations = synthetic_pending_migration();
+
+        let err = handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
+            .await
+            .expect_err("auto-apply must fail startup when pending probe fails");
+
+        assert!(
+            err.to_string().contains(
+                "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true but pending custom-plugin migrations \
+                 could not be determined"
+            ),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_apply_false_is_warn_only_when_pending_probe_fails() {
+        let (store, _tmp) = fresh_database_store().await;
+        create_malformed_plugin_tracking_table(&store).await;
+        let db: Arc<dyn DatabaseBackend> = store;
+        let migrations = synthetic_pending_migration();
+
+        handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations)
+            .await
+            .expect("warn-only path should swallow pending probe failures");
     }
 
     #[tokio::test]
