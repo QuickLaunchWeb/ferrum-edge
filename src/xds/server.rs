@@ -313,10 +313,14 @@ impl XdsAdsServer {
         node_id: &str,
         subscriptions: &HashMap<String, XdsSubscription>,
     ) -> Vec<DiscoveryResponse> {
+        let previous = self.snapshot_cache.get(node_id);
         let snapshot = self.rebuild_snapshot(node_id);
         self.snapshot_cache.insert(snapshot.clone());
         subscriptions
             .values()
+            .filter(|subscription| {
+                subscription_resources_changed(previous.as_deref(), &snapshot, subscription)
+            })
             .map(|subscription| self.sotw_response(&snapshot, subscription))
             .collect()
     }
@@ -331,6 +335,9 @@ impl XdsAdsServer {
         self.snapshot_cache.insert(snapshot.clone());
         subscriptions
             .values()
+            .filter(|subscription| {
+                subscription_resources_changed(previous.as_deref(), &snapshot, subscription)
+            })
             .map(|subscription| {
                 self.delta_response(
                     &snapshot,
@@ -409,17 +416,20 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                         };
-                        let next_node_id = request
-                            .node
-                            .as_ref()
-                            .and_then(|node| non_empty_string(&node.id))
-                            .or_else(|| node_id.clone());
-                        let Some(current_node_id) = next_node_id else {
-                            let _ = tx.send(Err(Status::invalid_argument("xDS Node.id is required"))).await;
-                            return;
+                        let current_node_id = match resolve_stream_node_id(
+                            node_id.as_deref(),
+                            request.node.as_ref().and_then(|node| non_empty_string(&node.id)),
+                        ) {
+                            Ok(node_id) => node_id,
+                            Err(status) => {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
                         };
-                        stream_guard.set_node_id(&current_node_id);
-                        node_id = Some(current_node_id.clone());
+                        if node_id.is_none() {
+                            stream_guard.set_node_id(&current_node_id);
+                            node_id = Some(current_node_id.clone());
+                        };
 
                         if request.type_url.is_empty() {
                             let _ = tx.send(Err(Status::invalid_argument("xDS type_url is required"))).await;
@@ -541,17 +551,20 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 return;
                             }
                         };
-                        let next_node_id = request
-                            .node
-                            .as_ref()
-                            .and_then(|node| non_empty_string(&node.id))
-                            .or_else(|| node_id.clone());
-                        let Some(current_node_id) = next_node_id else {
-                            let _ = tx.send(Err(Status::invalid_argument("xDS Node.id is required"))).await;
-                            return;
+                        let current_node_id = match resolve_stream_node_id(
+                            node_id.as_deref(),
+                            request.node.as_ref().and_then(|node| non_empty_string(&node.id)),
+                        ) {
+                            Ok(node_id) => node_id,
+                            Err(status) => {
+                                let _ = tx.send(Err(status)).await;
+                                return;
+                            }
                         };
-                        stream_guard.set_node_id(&current_node_id);
-                        node_id = Some(current_node_id.clone());
+                        if node_id.is_none() {
+                            stream_guard.set_node_id(&current_node_id);
+                            node_id = Some(current_node_id.clone());
+                        };
 
                         if request.type_url.is_empty() {
                             let _ = tx.send(Err(Status::invalid_argument("xDS type_url is required"))).await;
@@ -660,6 +673,52 @@ fn non_empty_string(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn resolve_stream_node_id(
+    current: Option<&str>,
+    requested: Option<String>,
+) -> Result<String, Status> {
+    match (current, requested) {
+        (None, Some(requested)) => Ok(requested),
+        (None, None) => Err(Status::invalid_argument("xDS Node.id is required")),
+        (Some(current), None) => Ok(current.to_string()),
+        (Some(current), Some(requested)) if requested == current => Ok(requested),
+        (Some(current), Some(requested)) => Err(Status::invalid_argument(format!(
+            "xDS Node.id cannot change on an established stream: {current} -> {requested}"
+        ))),
+    }
+}
+
+fn subscription_resources_changed(
+    previous: Option<&XdsSnapshot>,
+    snapshot: &XdsSnapshot,
+    subscription: &XdsSubscription,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    let previous_resources = previous.filtered_resources(
+        &subscription.type_url,
+        &subscription.resource_names,
+        subscription.wildcard,
+    );
+    let next_resources = snapshot.filtered_resources(
+        &subscription.type_url,
+        &subscription.resource_names,
+        subscription.wildcard,
+    );
+    !resources_equal_ignoring_version(&previous_resources, &next_resources)
+}
+
+fn resources_equal_ignoring_version(
+    left: &[super::snapshot::XdsResource],
+    right: &[super::snapshot::XdsResource],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.name == right.name && left.type_url == right.type_url && left.value == right.value
+        })
 }
 
 fn build_sotw_subscription(
@@ -808,6 +867,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_stream_node_id_rejects_mid_stream_mutation() {
+        assert_eq!(
+            resolve_stream_node_id(None, Some("node-a".to_string())).unwrap(),
+            "node-a"
+        );
+        assert_eq!(
+            resolve_stream_node_id(Some("node-a"), None).unwrap(),
+            "node-a"
+        );
+        assert!(resolve_stream_node_id(Some("node-a"), Some("node-a".to_string())).is_ok());
+        assert!(resolve_stream_node_id(Some("node-a"), Some("node-b".to_string())).is_err());
+    }
+
+    #[test]
     fn sotw_lag_recovery_rebuilds_and_sends_current_snapshot() {
         let server = test_server(gateway_config_with_service(true, 0));
         let subscriptions = cds_subscription();
@@ -824,6 +897,22 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].resources.len(), 0);
         assert_ne!(recovered[0].nonce, initial[0].nonce);
+    }
+
+    #[test]
+    fn sotw_update_skips_unchanged_effective_resources() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = cds_subscription();
+
+        let initial = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(initial.len(), 1);
+
+        server
+            .config
+            .store(Arc::new(gateway_config_with_service(true, 1)));
+        let unchanged = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+
+        assert!(unchanged.is_empty());
     }
 
     #[test]
@@ -847,6 +936,22 @@ mod tests {
             recovered[0].removed_resources,
             vec!["cluster/default/api/8080".to_string()]
         );
+    }
+
+    #[test]
+    fn delta_update_skips_unchanged_effective_resources() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let subscriptions = cds_subscription();
+
+        let initial = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(initial.len(), 1);
+
+        server
+            .config
+            .store(Arc::new(gateway_config_with_service(true, 1)));
+        let unchanged = server.delta_responses_for_subscriptions("node-a", &subscriptions);
+
+        assert!(unchanged.is_empty());
     }
 
     #[test]
