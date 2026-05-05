@@ -1,5 +1,6 @@
 use ferrum_edge::config::mesh::{
-    MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
+    MeshPolicy, MeshRule, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, WorkloadSelector,
 };
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::plugins::mesh_authz::MeshAuthz;
@@ -35,6 +36,24 @@ fn context_with_peer(path: &str, peer: &str) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
     ctx.peer_spiffe_id = Some(SpiffeId::new(peer).unwrap());
     ctx
+}
+
+fn context_without_peer_in_namespace(path: &str, namespace: &str) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), path.to_string());
+    let mut proxy = create_test_proxy();
+    proxy.namespace = namespace.to_string();
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    ctx
+}
+
+fn namespace_peer_auth(namespace: &str, mtls_mode: MtlsMode) -> PeerAuthentication {
+    PeerAuthentication {
+        name: "default".to_string(),
+        namespace: namespace.to_string(),
+        selector: None,
+        mtls_mode,
+        port_overrides: Default::default(),
+    }
 }
 
 #[tokio::test]
@@ -105,5 +124,82 @@ async fn mesh_authz_namespace_scope_requires_known_destination_namespace() {
     match plugin.authorize(&mut payments_destination).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
         other => panic!("expected namespace-scoped rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_strict_peer_authentication_requires_identity() {
+    let plugin = MeshAuthz::new(&json!({
+        "peer_authentications": [namespace_peer_auth("payments", MtlsMode::Strict)]
+    }))
+    .unwrap();
+    let mut ctx = context_without_peer_in_namespace("/api/orders", "payments");
+
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert!(body.contains("peer_authentication_strict_mtls_required"));
+        }
+        other => panic!("expected strict mTLS rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_permissive_peer_authentication_allows_missing_identity() {
+    let plugin = MeshAuthz::new(&json!({
+        "peer_authentications": [namespace_peer_auth("payments", MtlsMode::Permissive)]
+    }))
+    .unwrap();
+    let mut ctx = context_without_peer_in_namespace("/api/orders", "payments");
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn mesh_authz_peer_authentication_port_override_takes_precedence() {
+    let mut peer_auth = namespace_peer_auth("payments", MtlsMode::Strict);
+    peer_auth.port_overrides.insert(8080, MtlsMode::Disable);
+    let plugin = MeshAuthz::new(&json!({ "peer_authentications": [peer_auth] })).unwrap();
+    let mut ctx = context_without_peer_in_namespace("/api/orders", "payments");
+    ctx.metadata
+        .insert("destination_port".to_string(), "8080".to_string());
+
+    assert!(matches!(
+        plugin.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn mesh_authz_peer_authentication_selector_overrides_namespace_default() {
+    let namespace_default = namespace_peer_auth("payments", MtlsMode::Permissive);
+    let selector = PeerAuthentication {
+        name: "selected-strict".to_string(),
+        namespace: "payments".to_string(),
+        selector: Some(WorkloadSelector {
+            labels: [("app".to_string(), "checkout".to_string())]
+                .into_iter()
+                .collect(),
+            namespace: None,
+        }),
+        mtls_mode: MtlsMode::Strict,
+        port_overrides: Default::default(),
+    };
+    let plugin = MeshAuthz::new(&json!({
+        "peer_authentications": [namespace_default, selector]
+    }))
+    .unwrap();
+    let mut ctx = context_without_peer_in_namespace("/api/orders", "payments");
+    ctx.metadata
+        .insert("destination.label.app".to_string(), "checkout".to_string());
+
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 401),
+        other => panic!("expected selector strict mTLS rejection, got {other:?}"),
     }
 }

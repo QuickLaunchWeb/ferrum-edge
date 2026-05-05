@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use tracing::warn;
 
 use crate::config::mesh::{
-    ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    WorkloadSelector,
+    ConditionMatch, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch, RequestMatch, WorkloadSelector,
 };
 use crate::identity::spiffe::SpiffeId;
 
@@ -23,28 +23,38 @@ use super::{Plugin, PluginResult, RequestContext, StreamConnectionContext};
 struct MeshAuthzConfig {
     #[serde(default)]
     policies: Vec<MeshPolicy>,
+    #[serde(default)]
+    peer_authentications: Vec<PeerAuthentication>,
 }
 
 pub struct MeshAuthz {
     policies: Vec<MeshPolicy>,
+    peer_authentications: Vec<PeerAuthentication>,
 }
 
 impl MeshAuthz {
     pub fn new(config: &Value) -> Result<Self, String> {
         let parsed: MeshAuthzConfig =
             serde_json::from_value(config.clone()).map_err(|e| format!("mesh_authz: {e}"))?;
-        let errors =
-            crate::config::mesh::validate_mesh_config(&[], &[], &parsed.policies, &[], &[], None);
+        let errors = crate::config::mesh::validate_mesh_config(
+            &[],
+            &[],
+            &parsed.policies,
+            &parsed.peer_authentications,
+            &[],
+            None,
+        );
         if !errors.is_empty() {
             return Err(format!("mesh_authz: {}", errors.join("; ")));
         }
         Ok(Self {
             policies: parsed.policies,
+            peer_authentications: parsed.peer_authentications,
         })
     }
 
     fn evaluate_http(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.policies.is_empty() {
+        if self.policies.is_empty() && self.peer_authentications.is_empty() {
             return PluginResult::Continue;
         }
 
@@ -73,7 +83,14 @@ impl MeshAuthz {
                 .and_then(|p| p.parse::<u16>().ok()),
         };
 
-        match evaluate_policies(&self.policies, ctx.peer_spiffe_id.as_ref(), &request) {
+        let peer = ctx.peer_spiffe_id.as_ref();
+        if let Some(reason) =
+            evaluate_peer_authentications(&self.peer_authentications, peer, &request)
+        {
+            return reject_with_status(reason, 401);
+        }
+
+        match evaluate_policies(&self.policies, peer, &request) {
             PolicyDecision::Allow => PluginResult::Continue,
             PolicyDecision::Audit => {
                 ctx.metadata
@@ -85,7 +102,7 @@ impl MeshAuthz {
     }
 
     fn evaluate_stream(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
-        if self.policies.is_empty() {
+        if self.policies.is_empty() && self.peer_authentications.is_empty() {
             return PluginResult::Continue;
         }
 
@@ -99,15 +116,23 @@ impl MeshAuthz {
             .and_then(|raw| SpiffeId::new(raw.clone()).ok());
         let headers = HashMap::new();
         let empty_metadata = HashMap::new();
+        let destination_namespace =
+            metadata.and_then(|m| m.get("destination_namespace").map(String::as_str));
         let request = HttpRequestView {
             method: "CONNECT",
             path: "",
             host: None,
             headers: &headers,
-            destination_namespace: None,
+            destination_namespace,
             destination_labels: metadata.unwrap_or(&empty_metadata),
             port: Some(ctx.listen_port),
         };
+
+        if let Some(reason) =
+            evaluate_peer_authentications(&self.peer_authentications, peer.as_ref(), &request)
+        {
+            return reject_with_status(reason, 401);
+        }
 
         match evaluate_policies(&self.policies, peer.as_ref(), &request) {
             PolicyDecision::Allow | PolicyDecision::Audit => PluginResult::Continue,
@@ -195,6 +220,66 @@ fn evaluate_policies(
         return PolicyDecision::Audit;
     }
     PolicyDecision::Allow
+}
+
+fn evaluate_peer_authentications(
+    peer_auths: &[PeerAuthentication],
+    peer: Option<&SpiffeId>,
+    request: &HttpRequestView<'_>,
+) -> Option<&'static str> {
+    if !matches!(
+        effective_peer_authentication_mode(peer_auths, request),
+        Some(MtlsMode::Strict)
+    ) {
+        return None;
+    }
+    peer.is_none()
+        .then_some("peer_authentication_strict_mtls_required")
+}
+
+fn effective_peer_authentication_mode(
+    peer_auths: &[PeerAuthentication],
+    request: &HttpRequestView<'_>,
+) -> Option<MtlsMode> {
+    let mut best: Option<(u8, usize, MtlsMode)> = None;
+    for (index, peer_auth) in peer_auths.iter().enumerate() {
+        let Some(specificity) = peer_auth_specificity(peer_auth, request) else {
+            continue;
+        };
+        let mode = request
+            .port
+            .and_then(|port| peer_auth.port_overrides.get(&port).copied())
+            .unwrap_or(peer_auth.mtls_mode);
+        if best.is_none_or(|(best_specificity, best_index, _)| {
+            specificity > best_specificity
+                || (specificity == best_specificity && index >= best_index)
+        }) {
+            best = Some((specificity, index, mode));
+        }
+    }
+    best.map(|(_, _, mode)| mode)
+}
+
+fn peer_auth_specificity(
+    peer_auth: &PeerAuthentication,
+    request: &HttpRequestView<'_>,
+) -> Option<u8> {
+    match peer_auth.selector.as_ref() {
+        Some(selector) => {
+            if selector.namespace.is_none()
+                && request
+                    .destination_namespace
+                    .is_none_or(|dest| dest != peer_auth.namespace)
+            {
+                return None;
+            }
+            selector_matches(selector, request).then_some(2)
+        }
+        None => request
+            .destination_namespace
+            .is_some_and(|dest| dest == peer_auth.namespace)
+            .then_some(1),
+    }
 }
 
 fn policy_scope_matches(policy: &MeshPolicy, request: &HttpRequestView<'_>) -> bool {
@@ -354,12 +439,16 @@ fn insert_identity_metadata(metadata: &mut HashMap<String, String>, id: &SpiffeI
 }
 
 fn reject(reason: &'static str) -> PluginResult {
+    reject_with_status(reason, 403)
+}
+
+fn reject_with_status(reason: &'static str, status_code: u16) -> PluginResult {
     warn!(
         plugin = "mesh_authz",
         reason, "Mesh authorization rejected request"
     );
     PluginResult::Reject {
-        status_code: 403,
+        status_code,
         body: format!(r#"{{"error":"{reason}"}}"#),
         headers: HashMap::new(),
     }

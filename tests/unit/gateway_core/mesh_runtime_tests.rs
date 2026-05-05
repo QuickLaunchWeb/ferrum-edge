@@ -1,5 +1,6 @@
 use ferrum_edge::config::mesh::{
-    MeshConfig, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch,
+    MeshConfig, MeshPolicy, MeshRule, MtlsMode, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch,
 };
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::config::{EnvConfig, MeshConfigSource, MeshTopology};
@@ -81,6 +82,13 @@ fn mesh_runtime_prepares_global_mesh_plugins() {
     let config = GatewayConfig {
         mesh: Some(Box::new(MeshConfig {
             mesh_policies: vec![policy],
+            peer_authentications: vec![PeerAuthentication {
+                name: "default-strict".to_string(),
+                namespace: "payments".to_string(),
+                selector: None,
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: Default::default(),
+            }],
             ..MeshConfig::default()
         })),
         ..GatewayConfig::default()
@@ -117,6 +125,12 @@ fn mesh_runtime_prepares_global_mesh_plugins() {
         .and_then(|policies| policies.as_array())
         .expect("mesh_authz policies array");
     assert_eq!(mesh_authz_policies.len(), 1);
+    let peer_authentications = by_id(MESH_AUTHZ_PLUGIN_ID)
+        .config
+        .get("peer_authentications")
+        .and_then(|peer_authentications| peer_authentications.as_array())
+        .expect("mesh_authz peer_authentications array");
+    assert_eq!(peer_authentications.len(), 1);
 }
 
 #[test]

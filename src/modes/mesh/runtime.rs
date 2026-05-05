@@ -149,11 +149,19 @@ fn inject_mesh_global_plugins(config: &mut GatewayConfig, runtime: &MeshRuntimeC
         .as_ref()
         .map(|mesh| mesh.mesh_policies.clone())
         .unwrap_or_default();
+    let peer_authentications = config
+        .mesh
+        .as_ref()
+        .map(|mesh| mesh.peer_authentications.clone())
+        .unwrap_or_default();
     ensure_global_plugin(
         config,
         MESH_AUTHZ_PLUGIN_ID,
         "mesh_authz",
-        serde_json::json!({ "policies": policies }),
+        serde_json::json!({
+            "policies": policies,
+            "peer_authentications": peer_authentications,
+        }),
         &runtime.namespace,
     );
 
