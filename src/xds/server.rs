@@ -258,6 +258,7 @@ impl XdsAdsServer {
         subscription: &XdsSubscription,
         initial_resource_versions: &HashMap<String, String>,
         explicitly_subscribed_names: &[String],
+        explicitly_unsubscribed_names: &[String],
     ) -> DeltaDiscoveryResponse {
         let nonce = self.nonce_tracker.issue_nonce(
             &snapshot.node_id,
@@ -300,16 +301,15 @@ impl XdsAdsServer {
                 removed_resources.retain(|name| wanted.contains(name.as_str()));
             }
         }
-        let subscribed: HashSet<&str> = subscription
-            .resource_names
+        let response_resource_names: HashSet<&str> = resources
             .iter()
-            .map(String::as_str)
+            .map(|resource| resource.name.as_str())
             .collect();
-        for name in explicitly_subscribed_names {
-            if name == "*"
-                || current_names.contains(name)
-                || (!subscription.wildcard && !subscribed.contains(name.as_str()))
-            {
+        for name in explicitly_subscribed_names
+            .iter()
+            .chain(explicitly_unsubscribed_names)
+        {
+            if name == "*" || response_resource_names.contains(name.as_str()) {
                 continue;
             }
             removed_resources.push(name.clone());
@@ -443,6 +443,7 @@ impl XdsAdsServer {
                     previous.as_deref(),
                     subscription,
                     &HashMap::new(),
+                    &[],
                     &[],
                 )
             })
@@ -768,6 +769,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &subscription,
                                 &request.initial_resource_versions,
                                 &request.resource_names_subscribe,
+                                &request.resource_names_unsubscribe,
                             );
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
@@ -1302,6 +1304,7 @@ mod tests {
             &subscription,
             &request.initial_resource_versions,
             &request.resource_names_subscribe,
+            &request.resource_names_unsubscribe,
         );
 
         assert_eq!(
@@ -1428,6 +1431,7 @@ mod tests {
             },
             &initial_resource_versions,
             &[],
+            &[],
         );
 
         assert_eq!(
@@ -1451,6 +1455,7 @@ mod tests {
                 legacy_wildcard: false,
             },
             &HashMap::new(),
+            &[],
             &[],
         );
 
@@ -1589,10 +1594,52 @@ mod tests {
             },
             &HashMap::new(),
             std::slice::from_ref(&subscribed),
+            &[],
         );
 
         assert!(response.resources.is_empty());
         assert_eq!(response.removed_resources, vec![subscribed]);
+    }
+
+    #[test]
+    fn delta_explicit_unsubscribe_returns_removed_when_absent_from_response() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.rebuild_snapshot("node-a");
+        let unsubscribed = "cluster/default/missing/8080".to_string();
+        let previous_subscription = XdsSubscription {
+            node_id: "node-a".to_string(),
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: vec![unsubscribed.clone()],
+            wildcard: true,
+            legacy_wildcard: false,
+        };
+        let (subscription, changed, explicit) = build_delta_subscription(
+            Some(&previous_subscription),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+            std::slice::from_ref(&unsubscribed),
+        );
+
+        assert!(changed);
+        assert!(explicit);
+        assert!(subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
+
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &subscription,
+            &HashMap::new(),
+            &[],
+            std::slice::from_ref(&unsubscribed),
+        );
+
+        assert_eq!(
+            delta_cluster_names(&response),
+            vec!["cluster/default/api/8080".to_string()]
+        );
+        assert_eq!(response.removed_resources, vec![unsubscribed]);
     }
 
     #[test]
