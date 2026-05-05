@@ -88,18 +88,9 @@ fn test_pool_config() -> DbPoolConfig {
 async fn make_store(dir: &TempDir) -> DatabaseStore {
     let db_path = dir.path().join(format!("test-{}.db", uid("db")));
     let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &url,
-        false,
-        None,
-        None,
-        None,
-        false,
-        test_pool_config(),
-    )
-    .await
-    .expect("connect_with_tls_config failed")
+    DatabaseStore::connect_with_pool_config("sqlite", &url, test_pool_config())
+        .await
+        .expect("connect_with_pool_config failed")
 }
 
 // ---------------------------------------------------------------------------
