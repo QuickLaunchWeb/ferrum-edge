@@ -1,6 +1,7 @@
 //! Tests for database migration runner
 
 use ferrum_edge::config::migrations::MigrationRunner;
+use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
 /// With SQLite in-memory databases, each connection gets a separate DB,
@@ -15,6 +16,27 @@ async fn test_pool() -> sqlx::AnyPool {
         .unwrap()
 }
 
+/// Query sqlite_master for all index names in the database.
+async fn get_index_names(pool: &sqlx::AnyPool) -> Vec<String> {
+    let rows: Vec<sqlx::any::AnyRow> =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("name").unwrap())
+        .collect()
+}
+
+/// Compound and junction-table indexes created by V001.
+const EXPECTED_INDEX_NAMES: &[&str] = &[
+    "idx_proxy_plugins_plugin_config_id",
+    "idx_proxies_ns_updated",
+    "idx_consumers_ns_updated",
+    "idx_plugin_configs_ns_updated",
+    "idx_upstreams_ns_updated",
+];
+
 #[tokio::test]
 async fn test_migration_runner_fresh_database() {
     let pool = test_pool().await;
@@ -22,7 +44,7 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should be applied on a fresh database
+    // Only V1 should be applied on a fresh database
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
@@ -30,21 +52,52 @@ async fn test_migration_runner_fresh_database() {
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
     assert!(applied_again.is_empty());
+
+    // Verify that V001 creates the expected indexes
+    let index_names = get_index_names(&pool).await;
+    for expected in EXPECTED_INDEX_NAMES {
+        assert!(
+            index_names.iter().any(|n| n == expected),
+            "Expected index '{}' to exist after V001 migration, found: {:?}",
+            expected,
+            index_names
+        );
+    }
 }
 
 #[tokio::test]
 async fn test_migration_runner_bootstrap_existing_db() {
     let pool = test_pool().await;
 
-    // Simulate a pre-migration database by creating the proxies table directly
+    // Simulate a pre-migration database by creating the tables directly.
+    // A real pre-migration DB has all five tables; we create them all so V003
+    // can add its indexes without hitting "no such table".
     sqlx::query(
-        "CREATE TABLE proxies (id TEXT PRIMARY KEY, name TEXT, listen_path TEXT NOT NULL UNIQUE, backend_protocol TEXT NOT NULL DEFAULT 'http', backend_host TEXT NOT NULL, backend_port INTEGER NOT NULL DEFAULT 80, backend_path TEXT, strip_listen_path INTEGER NOT NULL DEFAULT 1, preserve_host_header INTEGER NOT NULL DEFAULT 0, backend_connect_timeout_ms INTEGER NOT NULL DEFAULT 5000, backend_read_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_write_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_tls_client_cert_path TEXT, backend_tls_client_key_path TEXT, backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1, backend_tls_server_ca_cert_path TEXT, dns_override TEXT, dns_cache_ttl_seconds INTEGER, auth_mode TEXT NOT NULL DEFAULT 'single', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE upstreams (id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'ferrum', name TEXT, targets TEXT NOT NULL DEFAULT '[]', algorithm TEXT NOT NULL DEFAULT 'round_robin', hash_on TEXT, hash_on_cookie_config TEXT, health_checks TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
-        "CREATE TABLE upstreams (id TEXT PRIMARY KEY, name TEXT, targets TEXT NOT NULL DEFAULT '[]', algorithm TEXT NOT NULL DEFAULT 'round_robin', hash_on TEXT, hash_on_cookie_config TEXT, health_checks TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        "CREATE TABLE consumers (id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'ferrum', username TEXT NOT NULL, custom_id TEXT, credentials TEXT NOT NULL DEFAULT '{}', acl_groups TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE proxies (id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'ferrum', name TEXT, hosts TEXT NOT NULL DEFAULT '[]', listen_path TEXT, backend_scheme TEXT NOT NULL DEFAULT 'https', backend_host TEXT NOT NULL, backend_port INTEGER NOT NULL DEFAULT 80, backend_path TEXT, strip_listen_path INTEGER NOT NULL DEFAULT 1, preserve_host_header INTEGER NOT NULL DEFAULT 0, backend_connect_timeout_ms INTEGER NOT NULL DEFAULT 5000, backend_read_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_write_timeout_ms INTEGER NOT NULL DEFAULT 30000, upstream_id TEXT REFERENCES upstreams(id), auth_mode TEXT NOT NULL DEFAULT 'single', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE plugin_configs (id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'ferrum', plugin_name TEXT NOT NULL, config TEXT NOT NULL DEFAULT '{}', scope TEXT NOT NULL DEFAULT 'global', proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE proxy_plugins (proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE, plugin_config_id TEXT NOT NULL REFERENCES plugin_configs(id) ON DELETE CASCADE, PRIMARY KEY (proxy_id, plugin_config_id))"
     )
     .execute(&pool)
     .await
@@ -53,8 +106,11 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should NOT be applied (bootstrapped instead) — nothing new to apply
-    assert!(applied.is_empty());
+    // V1 should NOT be applied (bootstrapped instead) — nothing else pending
+    assert!(
+        applied.is_empty(),
+        "No migrations should be newly applied; V1 is bootstrapped"
+    );
 
     // Check that V1 (bootstrapped) is recorded
     let status = runner.status().await.unwrap();
@@ -69,7 +125,7 @@ async fn test_migration_status() {
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
-    // Before running: everything should be pending
+    // Before running: V1 should be pending
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
     assert_eq!(status.pending.len(), 1);
@@ -77,10 +133,40 @@ async fn test_migration_status() {
     // Run migrations
     runner.run_pending().await.unwrap();
 
-    // After running: everything should be applied
+    // After running: V1 should be applied
     let status = runner.status().await.unwrap();
     assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
+}
+
+#[tokio::test]
+async fn test_v001_accepts_full_rfc3339_timestamps() {
+    let pool = test_pool().await;
+
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let applied = runner.run_pending().await.unwrap();
+
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].version, 1);
+
+    // Verify the schema accepts a full nanosecond-precision RFC 3339 timestamp
+    // (35 chars, the maximum chrono produces)
+    let long_ts = "2024-01-15T12:34:56.123456789+00:00";
+    sqlx::query(
+        "INSERT INTO proxies (id, name, listen_path, backend_host, backend_port, hosts, created_at, updated_at) VALUES ('ts-test', 'ts', '/ts', 'localhost', 8080, '[]', ?, ?)"
+    )
+    .bind(long_ts)
+    .bind(long_ts)
+    .execute(&pool)
+    .await
+    .expect("INSERT with 35-char RFC 3339 timestamp should succeed");
+
+    let row = sqlx::query("SELECT created_at FROM proxies WHERE id = 'ts-test'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let val: String = sqlx::Row::try_get(&row, "created_at").unwrap();
+    assert_eq!(val, long_ts);
 }
 
 #[tokio::test]

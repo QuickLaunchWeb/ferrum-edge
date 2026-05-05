@@ -4,12 +4,33 @@
 //! places:
 //! - strict mode forbids defaults on `TEXT`/`BLOB`, so MySQL uses bounded
 //!   `VARCHAR(N)` columns for primary keys and other fields that need defaults
-//! - timestamp columns stay as `VARCHAR(50)` because sqlx's `Any` driver does
-//!   not round-trip MySQL `DATETIME` values into the string-based config layer
+//! - timestamp columns use `VARCHAR(64)` (not native `DATETIME`) because sqlx's
+//!   `Any` driver does not round-trip MySQL `DATETIME` values into the
+//!   string-based config layer.  RFC 3339 nano-precision timestamps are at most
+//!   35 chars; `VARCHAR(64)` provides comfortable headroom
 //!
 //! The proxy schema also intentionally omits a unique index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
 //! namespace/name and namespace/listen_port constraints belong in V001.
+//!
+//! ## Foreign key constraints
+//!
+//! All four FK constraints are semantically identical across Postgres, MySQL,
+//! and SQLite. The surface syntax differs — MySQL uses explicit
+//! `CONSTRAINT <name> FOREIGN KEY (<col>) REFERENCES ...` while Postgres and
+//! SQLite use inline `<col> TYPE REFERENCES ...` — but the referenced tables,
+//! columns, ON DELETE actions, and nullability match exactly:
+//!
+//! | Table          | Column           | References             | ON DELETE |
+//! |----------------|------------------|------------------------|-----------|
+//! | proxies        | upstream_id      | upstreams(id)          | RESTRICT  |
+//! | plugin_configs | proxy_id         | proxies(id)            | CASCADE   |
+//! | proxy_plugins  | proxy_id         | proxies(id)            | CASCADE   |
+//! | proxy_plugins  | plugin_config_id | plugin_configs(id)     | CASCADE   |
+//!
+//! Named constraints on MySQL (e.g. `fk_proxies_upstream`) are cosmetic; they
+//! aid `ALTER TABLE DROP CONSTRAINT` but do not change enforcement behavior.
+//! The inline tests below regression-guard this cross-dialect consistency.
 
 use sqlx::AnyPool;
 
@@ -113,7 +134,7 @@ impl V001SqlBuilder {
 
     async fn execute_index_sql(&self, pool: &AnyPool, idx_sql: &str) -> Result<(), anyhow::Error> {
         if self.is_mysql() {
-            // MySQL < 8.0.29 does not support CREATE INDEX IF NOT EXISTS, so we
+            // MySQL does not reliably support CREATE INDEX IF NOT EXISTS, so we
             // strip the clause and ignore duplicate-key errors, matching the
             // previous migration behavior.
             let mysql_sql = idx_sql.replace("IF NOT EXISTS ", "");
@@ -159,8 +180,8 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path VARCHAR(2048),
                 backend_tls_verify_server_cert TINYINT NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path VARCHAR(2048),
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
             )
             "#
         } else {
@@ -196,8 +217,8 @@ impl V001SqlBuilder {
                 custom_id VARCHAR(255),
                 credentials TEXT NOT NULL,
                 acl_groups VARCHAR(8192) NOT NULL DEFAULT '[]',
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
             )
             "#
         } else {
@@ -266,8 +287,8 @@ impl V001SqlBuilder {
                 allowed_methods TEXT,
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
                 CONSTRAINT chk_proxies_backend_port CHECK (backend_port >= 0 AND backend_port <= 65535),
                 CONSTRAINT chk_proxies_listen_port CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
@@ -349,8 +370,8 @@ impl V001SqlBuilder {
                 proxy_id VARCHAR(255),
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
-                created_at VARCHAR(50) NOT NULL,
-                updated_at VARCHAR(50) NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
             )
             "#
@@ -467,5 +488,80 @@ mod tests {
                 .iter()
                 .any(|sql| sql.contains("WHERE name IS NOT NULL"))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // FK constraint consistency regression tests
+    //
+    // These verify that all three dialects define the same FK references
+    // with the same ON DELETE actions, preventing accidental divergence
+    // when editing one dialect branch but not the others.
+    // ------------------------------------------------------------------
+
+    /// Helper: checks that `sql` contains a REFERENCES clause pointing at
+    /// `target_table(target_col)` with the given `on_delete` action.
+    ///
+    /// Works for both MySQL-style (`FOREIGN KEY (col) REFERENCES t(c)`)
+    /// and inline-style (`col TYPE REFERENCES t(c)`).
+    fn assert_fk_present(sql: &str, target_table: &str, target_col: &str, on_delete: &str) {
+        let needle = format!("REFERENCES {target_table}({target_col}) ON DELETE {on_delete}");
+        assert!(
+            sql.contains(&needle),
+            "expected FK clause '{}' not found in:\n{}",
+            needle,
+            sql
+        );
+    }
+
+    #[test]
+    fn test_fk_proxies_upstream_consistent_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_proxies_sql();
+            assert_fk_present(sql, "upstreams", "id", "RESTRICT");
+        }
+    }
+
+    #[test]
+    fn test_fk_plugin_configs_proxy_consistent_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_plugin_configs_sql();
+            assert_fk_present(sql, "proxies", "id", "CASCADE");
+        }
+    }
+
+    #[test]
+    fn test_fk_proxy_plugins_consistent_across_dialects() {
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.create_proxy_plugins_sql();
+            // Both FKs in the junction table must be CASCADE
+            assert_fk_present(sql, "proxies", "id", "CASCADE");
+            assert_fk_present(sql, "plugin_configs", "id", "CASCADE");
+        }
+    }
+
+    #[test]
+    fn test_fk_count_matches_across_dialects() {
+        // Every dialect must define exactly 4 FK references (counted by
+        // occurrences of "REFERENCES" in the combined CREATE TABLE SQL).
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let all_sql = [
+                builder.create_upstreams_sql(),
+                builder.create_consumers_sql(),
+                builder.create_proxies_sql(),
+                builder.create_plugin_configs_sql(),
+                builder.create_proxy_plugins_sql(),
+            ]
+            .join("\n");
+
+            let count = all_sql.matches("REFERENCES").count();
+            assert_eq!(
+                count, 4,
+                "{dialect} dialect has {count} FK REFERENCES clauses, expected 4"
+            );
+        }
     }
 }

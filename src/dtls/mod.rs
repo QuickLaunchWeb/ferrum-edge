@@ -168,6 +168,7 @@ pub fn build_backend_dtls_config(
         certificate,
         server_name,
         server_cert_verifier,
+        connect_timeout_ms: proxy.backend_connect_timeout_ms,
     })
 }
 
@@ -177,6 +178,15 @@ pub struct BackendDtlsParams {
     pub certificate: DtlsCertificate,
     pub server_name: Option<rustls::pki_types::ServerName<'static>>,
     pub server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    /// End-to-end deadline for the DTLS handshake, in milliseconds.
+    ///
+    /// Sourced from `Proxy.backend_connect_timeout_ms` for proxy backends, or
+    /// from caller-supplied values for plugin/test contexts. Matches the
+    /// gRPC/TCP TLS handshake budget semantics: the value is consumed verbatim
+    /// via `Duration::from_millis(...)`, so `0` behaves like an immediate
+    /// timeout (not "unbounded"), keeping behavior consistent with sibling
+    /// backend handshake paths.
+    pub connect_timeout_ms: u64,
 }
 
 /// Build a DTLS server config for frontend termination (client → gateway).
@@ -247,6 +257,13 @@ pub struct DtlsConnection {
 impl DtlsConnection {
     /// Perform a DTLS client handshake over the given connected socket and return
     /// an established `DtlsConnection`.
+    ///
+    /// The handshake is bounded by `params.connect_timeout_ms`, which is the
+    /// per-proxy `backend_connect_timeout_ms` for proxy backends. The semantic
+    /// matches sibling backend handshake paths (gRPC h2/h2c in
+    /// `proxy/grpc_proxy.rs`, TCP TLS in `proxy/tcp_proxy.rs`): the value is
+    /// consumed verbatim via `Duration::from_millis(...)`, so `0` behaves like
+    /// an immediate timeout rather than "unbounded".
     pub async fn connect(
         socket: UdpSocket,
         params: BackendDtlsParams,
@@ -254,6 +271,8 @@ impl DtlsConnection {
         let socket = Arc::new(socket);
         let server_name = params.server_name;
         let server_cert_verifier = params.server_cert_verifier;
+        let connect_timeout = Duration::from_millis(params.connect_timeout_ms);
+        let handshake_deadline = Instant::now() + connect_timeout;
         let mut dtls = Dtls::new_auto(params.config, params.certificate, Instant::now());
         dtls.set_active(true); // client role
 
@@ -274,16 +293,20 @@ impl DtlsConnection {
         )
         .await?;
 
-        let handshake_deadline = Instant::now() + Duration::from_secs(10);
-
         loop {
-            if Instant::now() > handshake_deadline {
-                return Err(anyhow::anyhow!("DTLS handshake timed out"));
+            // Top-of-loop deadline check guards against a sustained datagram
+            // flood starving the deadline arm in the select below.
+            if Instant::now() >= handshake_deadline {
+                return Err(anyhow::anyhow!(
+                    "DTLS handshake timed out after {}ms",
+                    connect_timeout.as_millis()
+                ));
             }
 
             let sleep_dur = next_timeout
                 .map(|t| t.saturating_duration_since(Instant::now()))
                 .unwrap_or(Duration::from_secs(1));
+            let deadline_sleep_dur = handshake_deadline.saturating_duration_since(Instant::now());
 
             tokio::select! {
                 result = socket.recv(&mut recv_buf) => {
@@ -301,6 +324,15 @@ impl DtlsConnection {
                         }
                         next_timeout = None;
                     }
+                }
+                // Defense in depth: ensure the deadline fires even if the
+                // socket recv arm and the dimpl retransmit timer never wake
+                // up (e.g., backend silently drops every datagram).
+                _ = tokio::time::sleep(deadline_sleep_dur) => {
+                    return Err(anyhow::anyhow!(
+                        "DTLS handshake timed out after {}ms",
+                        connect_timeout.as_millis()
+                    ));
                 }
             }
 
@@ -1373,5 +1405,66 @@ mod tests {
         .expect("DTLS handshake timeout should release the reserved slot");
 
         assert!(server.sessions.is_empty());
+    }
+
+    /// Backend DTLS handshake honors the configured `connect_timeout_ms`
+    /// instead of the previously hardcoded 10s budget.
+    ///
+    /// Sets `connect_timeout_ms = 500` against a UDP socket whose peer is a
+    /// silent black-hole (binds + drops every datagram). The handshake must
+    /// fail well before the legacy 10s budget — generous slack of 5s catches
+    /// loaded CI runners while still distinguishing the configured budget
+    /// from the legacy default.
+    #[tokio::test]
+    async fn dtls_backend_handshake_honors_connect_timeout_ms() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+
+        // Black-hole peer: bind a UDP socket that never replies. The client
+        // socket is `connect()`-ed to it so all datagrams go to /dev/null.
+        let blackhole = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole");
+        let blackhole_addr = blackhole.local_addr().expect("blackhole local addr");
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        client_socket
+            .connect(blackhole_addr)
+            .await
+            .expect("client connect");
+
+        let certificate =
+            dimpl::certificate::generate_self_signed_certificate().expect("generate client cert");
+        let params = BackendDtlsParams {
+            config: Arc::new(Config::default()),
+            certificate,
+            server_name: None,
+            server_cert_verifier: None,
+            connect_timeout_ms: 500,
+        };
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            DtlsConnection::connect(client_socket, params),
+        )
+        .await
+        .expect("outer guard should not fire — connect_timeout_ms=500 must bound the handshake");
+        let elapsed = started.elapsed();
+
+        let err = match result {
+            Ok(_) => panic!("handshake against black hole should fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DTLS handshake timed out"),
+            "expected timeout error, got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "handshake should fail close to the configured 500ms budget, took {elapsed:?}"
+        );
     }
 }

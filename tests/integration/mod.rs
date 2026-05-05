@@ -1,11 +1,15 @@
 mod admin_backend_capabilities_tests;
 mod admin_cached_config_tests;
+mod admin_cross_namespace_refs_tests;
+mod apply_incremental_outcome_tests;
 mod backend_mtls_tests;
 mod connection_pool_tests;
 mod cp_dp_grpc_tests;
+mod db_incremental_poll_tests;
 mod db_offline_bootstrap_tests;
 mod deferred_log_tests;
 mod dtls_integration_tests;
+mod graceful_shutdown_tests;
 mod grpc_proxy_tests;
 mod http2_pool_tests;
 mod http3_integration_tests;

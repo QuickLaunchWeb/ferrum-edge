@@ -37,5 +37,6 @@ mod tls_tests;
 mod websocket_auth_tests;
 mod websocket_backend_tests;
 mod websocket_connection_limit_tests;
+mod websocket_drain_accounting_tests;
 mod websocket_relay_join_tests;
 mod websocket_tunnel_disconnect_tests;

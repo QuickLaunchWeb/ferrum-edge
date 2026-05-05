@@ -38,7 +38,7 @@ services:
   # ============================================================================
   postgres:
     image: postgres:16-alpine
-    container_name: ferrum-postgres
+    container_name: ferrum-postgres-db
     environment:
       POSTGRES_DB: ferrum
       POSTGRES_USER: ferrum
@@ -96,7 +96,7 @@ services:
   # Requires building with: cargo build --features mongodb
   mongodb:
     image: mongo:7-jammy
-    container_name: ferrum-mongodb
+    container_name: ferrum-mongodb-db
     environment:
       MONGO_INITDB_ROOT_USERNAME: ferrum
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-dev-password-change-in-production}

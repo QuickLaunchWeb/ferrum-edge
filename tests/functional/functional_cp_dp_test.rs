@@ -219,9 +219,13 @@ fn create_proxy_state() -> ProxyState {
         try_tcp_on_error: true,
         num_concurrent_reqs: 3,
         max_active_requests: 512,
+        max_concurrent_refreshes: 64,
+        shard_amount: 0,
     });
     let env_config = create_test_env_config();
-    ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None).unwrap()
+    let (state, _health_check_handles) =
+        ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None, None).unwrap();
+    state
 }
 
 #[ignore]

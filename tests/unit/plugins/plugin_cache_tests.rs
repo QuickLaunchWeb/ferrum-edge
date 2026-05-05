@@ -1,12 +1,12 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
-use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, PluginAssociation, PluginConfig,
     PluginScope, Proxy,
 };
 use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
+use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 
 /// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
@@ -247,6 +247,74 @@ fn test_rebuild_produces_updated_plugin_set() {
 
     assert_eq!(cache.get_plugins("p1").len(), 1);
     assert_eq!(cache.get_plugins("p1")[0].name(), "transaction_debugger");
+}
+
+#[test]
+fn test_request_view_stays_on_single_generation_after_rebuild() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    let request_view = cache.request_view("p1", ProxyProtocol::Http);
+
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2", "ps3"])],
+        vec![
+            make_plugin_config(
+                "ps1",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "ps2",
+                "body_validator",
+                json!({"required_fields": ["name"]}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "ps3",
+                "response_size_limiting",
+                json!({"max_bytes": 1048576, "require_buffered_check": true}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    cache.rebuild(&config2).unwrap();
+
+    let view_plugins = request_view.plugins();
+    let view_names: Vec<&str> = view_plugins.iter().map(|p| p.name()).collect();
+    assert_eq!(view_names, vec!["rate_limiting"]);
+    assert!(!request_view.requires_request_body_buffering());
+    assert!(!request_view.requires_response_body_buffering());
+    assert!(
+        !request_view
+            .capabilities()
+            .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+    );
+
+    let current_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let current_names: Vec<&str> = current_plugins.iter().map(|p| p.name()).collect();
+    assert!(current_names.contains(&"request_transformer"));
+    assert!(current_names.contains(&"body_validator"));
+    assert!(current_names.contains(&"response_size_limiting"));
+    assert!(cache.requires_request_body_buffering("p1"));
+    assert!(cache.requires_response_body_buffering("p1"));
+    assert!(
+        cache
+            .get_capabilities("p1", ProxyProtocol::Http)
+            .has(PluginCapabilities::MODIFIES_REQUEST_HEADERS)
+    );
 }
 
 #[test]

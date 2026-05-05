@@ -46,6 +46,7 @@ use ferrum_edge::overload::OverloadState;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::ProxyProtocol;
 use ferrum_edge::proxy::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics, start_tcp_listener};
+use ferrum_edge::request_epoch::RequestEpochStore;
 
 use crate::scaffolding::ports::reserve_port;
 
@@ -269,6 +270,12 @@ async fn try_spawn_fast_path_gateway(
     );
     let consumer_index = Arc::new(ConsumerIndex::new(&gateway_config.consumers));
     let load_balancer_cache = Arc::new(LoadBalancerCache::new(&gateway_config));
+    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
+        gateway_config.clone(),
+        &plugin_cache,
+        &consumer_index,
+        &load_balancer_cache,
+    ));
     let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
     let dns_cache = DnsCache::new(DnsConfig::default());
     let metrics = Arc::new(TcpProxyMetrics::default());
@@ -291,14 +298,13 @@ async fn try_spawn_fast_path_gateway(
             proxy_id: PROXY_ID.to_string(),
             config: config_swap,
             dns_cache,
-            load_balancer_cache,
-            consumer_index,
+            request_epoch,
             frontend_tls_config: None,
             shutdown: shutdown_rx,
+            global_shutdown: None,
             metrics: listener_metrics,
             tls_no_verify: false,
             tls_ca_bundle_path: None,
-            plugin_cache,
             // Globals MUST also be 0 to keep `bidirectional_copy()` on
             // the fast path. The per-proxy override on `Proxy` only
             // helps if it isn't ceiling'd by a non-zero global.

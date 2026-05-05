@@ -26,11 +26,11 @@ fn test_closed_allows_requests() {
 fn test_opens_after_threshold() {
     let cb = CircuitBreaker::new(default_config());
 
-    cb.record_failure(500, false);
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
     assert!(cb.can_execute().is_ok()); // Still closed
 
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
     assert!(cb.can_execute().is_err());
 }
@@ -40,9 +40,9 @@ fn test_non_configured_status_treated_as_success() {
     let cb = CircuitBreaker::new(default_config());
 
     // 404 is not in failure_status_codes, should be treated as success
-    cb.record_failure(404, false);
-    cb.record_failure(404, false);
-    cb.record_failure(404, false);
+    cb.record_failure(404, false, false);
+    cb.record_failure(404, false, false);
+    cb.record_failure(404, false, false);
     assert_eq!(cb.state_name(), "closed");
 }
 
@@ -50,11 +50,11 @@ fn test_non_configured_status_treated_as_success() {
 fn test_success_resets_failure_count() {
     let cb = CircuitBreaker::new(default_config());
 
-    cb.record_failure(500, false);
-    cb.record_failure(500, false);
-    cb.record_success(); // Should reset
-    cb.record_failure(500, false);
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
+    cb.record_success(false); // Should reset
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
     // Only 2 failures after reset, should still be closed
     assert_eq!(cb.state_name(), "closed");
 }
@@ -72,17 +72,17 @@ fn test_half_open_recovery() {
     let cb = CircuitBreaker::new(config);
 
     // Trip open
-    cb.record_failure(500, false);
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
 
     // Timeout elapsed (0 seconds), should transition to half-open
     assert!(cb.can_execute().is_ok());
     assert_eq!(cb.state_name(), "half_open");
 
-    // Successful probes
-    cb.record_success();
-    cb.record_success();
+    // Successful probes (admitted as half-open probes by can_execute)
+    cb.record_success(true);
+    cb.record_success(true);
     assert_eq!(cb.state_name(), "closed");
 }
 
@@ -99,14 +99,14 @@ fn test_half_open_probe_failure_reopens() {
     let cb = CircuitBreaker::new(config);
 
     // Trip open
-    cb.record_failure(500, false);
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
 
     // Transition to half-open
     assert!(cb.can_execute().is_ok());
 
-    // Probe fails
-    cb.record_failure(500, false);
+    // Probe fails (was admitted as half-open probe)
+    cb.record_failure(500, false, true);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -135,7 +135,7 @@ fn test_half_open_max_requests_enforced() {
     let cb = CircuitBreaker::new(config);
 
     // Trip open
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
 
     // First call transitions to half-open and admits (slot 1)
@@ -162,14 +162,14 @@ fn test_half_open_slot_freed_on_success() {
     let cb = CircuitBreaker::new(config);
 
     // Trip open, transition to half-open
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert!(cb.can_execute().is_ok()); // slot 1 taken
 
     // At max — should reject
     assert!(cb.can_execute().is_err());
 
-    // Record success frees a slot
-    cb.record_success();
+    // Record success frees a slot (was admitted as half-open probe)
+    cb.record_success(true);
 
     // Now should be able to get a slot again
     assert!(cb.can_execute().is_ok());
@@ -188,7 +188,7 @@ fn test_half_open_concurrent_slots() {
     let cb = Arc::new(CircuitBreaker::new(config));
 
     // Trip open
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
 
     // Spawn threads that all try to get a half-open slot
     let mut handles = Vec::new();
@@ -225,7 +225,7 @@ fn test_concurrent_failure_recording() {
     for _ in 0..100 {
         let cb_clone = cb.clone();
         handles.push(std::thread::spawn(move || {
-            cb_clone.record_failure(500, false);
+            cb_clone.record_failure(500, false, false);
         }));
     }
     for h in handles {
@@ -290,8 +290,8 @@ fn test_per_target_independent_breakers() {
 
     // Trip target A's breaker
     let cb_a = cache.get_or_create("proxy-1", Some(&tk_a), &config);
-    cb_a.record_failure(500, false);
-    cb_a.record_failure(500, false);
+    cb_a.record_failure(500, false, false);
+    cb_a.record_failure(500, false, false);
     assert_eq!(cb_a.state_name(), "open");
 
     // Target B should still be closed
@@ -317,8 +317,8 @@ fn test_per_target_does_not_share_with_direct_backend() {
 
     // Trip breaker for proxy-1 with no target (direct backend)
     let cb_direct = cache.get_or_create("proxy-1", None, &config);
-    cb_direct.record_failure(500, false);
-    cb_direct.record_failure(500, false);
+    cb_direct.record_failure(500, false, false);
+    cb_direct.record_failure(500, false, false);
     assert_eq!(cb_direct.state_name(), "open");
 
     // Same proxy with a target key should have its own breaker (closed)
@@ -392,10 +392,10 @@ fn test_tcp_direct_backend_circuit_breaker_opens() {
 
     // Simulate two backend connect failures (no upstream → None target key).
     let cb = cache.get_or_create("tcp-proxy-1", None, &config);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
     assert!(cache.can_execute("tcp-proxy-1", None, &config).is_ok()); // Still closed after 1
 
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
     // After threshold, circuit should be open.
     assert_eq!(cb.state_name(), "open");
     assert!(
@@ -421,8 +421,8 @@ fn test_tcp_upstream_backend_circuit_breaker_per_target() {
 
     // Simulate connection failures on the upstream target.
     let cb = cache.get_or_create("tcp-proxy-2", Some(&tk), &config);
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 
     // Proxy without this specific target should not be affected.
@@ -447,17 +447,17 @@ fn test_tcp_successful_connection_records_success() {
 
     // Trip the breaker open.
     let cb = cache.get_or_create("tcp-proxy-3", None, &config);
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 
     // Transition to half-open (timeout = 0).
     assert!(cb.can_execute().is_ok());
     assert_eq!(cb.state_name(), "half_open");
 
-    // Simulate a successful connection: record_success closes it.
-    cb.record_success();
+    // Simulate a successful connection: record_success closes it (half-open probe).
+    cb.record_success(true);
     assert_eq!(cb.state_name(), "closed");
 }
 
@@ -476,8 +476,8 @@ fn test_udp_session_failure_records_failure() {
 
     // Simulate two UDP socket connect failures.
     let cb = cache.get_or_create("udp-proxy-1", None, &config);
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
 
     assert_eq!(cb.state_name(), "open");
     assert!(
@@ -501,9 +501,9 @@ fn test_udp_successful_session_records_success() {
 
     let cb = cache.get_or_create("udp-proxy-2", None, &config);
     // One failure, then success — breaker should remain closed.
-    cb.record_failure(502, true);
-    cb.record_success();
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
+    cb.record_success(false);
+    cb.record_failure(502, true, false);
 
     // Only 1 failure after the reset — should remain closed.
     assert_eq!(cb.state_name(), "closed");
@@ -525,7 +525,7 @@ fn test_stream_proxy_rejects_when_circuit_open() {
 
     // Trip the breaker with a single failure.
     let cb = cache.get_or_create("stream-proxy-cb", None, &config);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 
     // Both TCP and UDP stream proxies call can_execute before opening sockets.
@@ -553,8 +553,8 @@ fn test_connection_errors_trip_breaker_by_default() {
 
     // Connection errors (connection_error=true) should count as failures
     // even though 502 is not in failure_status_codes.
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -572,14 +572,14 @@ fn test_connection_errors_ignored_when_disabled() {
     let cb = CircuitBreaker::new(config);
 
     // Connection errors should be ignored even though 502 is in failure_status_codes.
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "closed");
 
     // But real HTTP 502 responses (connection_error=false) should still trip it.
-    cb.record_failure(502, false);
-    cb.record_failure(502, false);
+    cb.record_failure(502, false, false);
+    cb.record_failure(502, false, false);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -596,8 +596,8 @@ fn test_status_code_failures_work_independently_of_connection_flag() {
     };
     let cb = CircuitBreaker::new(config);
 
-    cb.record_failure(500, false);
-    cb.record_failure(503, false);
+    cb.record_failure(500, false, false);
+    cb.record_failure(503, false, false);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -615,15 +615,15 @@ fn test_connection_error_reopens_half_open() {
     let cb = CircuitBreaker::new(config);
 
     // Trip open with a connection error
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 
     // Transition to half-open
     assert!(cb.can_execute().is_ok());
     assert_eq!(cb.state_name(), "half_open");
 
-    // Connection error during probe should reopen
-    cb.record_failure(502, true);
+    // Connection error during probe should reopen (half-open probe)
+    cb.record_failure(502, true, true);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -641,19 +641,19 @@ fn test_connection_error_ignored_in_half_open_when_disabled() {
     let cb = CircuitBreaker::new(config);
 
     // Trip open with a status code failure
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
 
     // Transition to half-open
     assert!(cb.can_execute().is_ok());
     assert_eq!(cb.state_name(), "half_open");
 
-    // Connection error during probe should be ignored
-    cb.record_failure(502, true);
+    // Connection error during probe should be ignored (trip_on_connection_errors=false)
+    cb.record_failure(502, true, true);
     assert_eq!(cb.state_name(), "half_open");
 
-    // But a status code failure should still reopen
-    cb.record_failure(500, false);
+    // But a status code failure should still reopen (half-open probe)
+    cb.record_failure(500, false, true);
     assert_eq!(cb.state_name(), "open");
 }
 
@@ -672,18 +672,18 @@ fn test_connection_errors_disabled_do_not_reset_failure_count() {
     let cb = CircuitBreaker::new(config);
 
     // Accumulate 2 real failures
-    cb.record_failure(500, false);
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "closed"); // threshold is 3
 
     // A connection error with trip_on_connection_errors=false should be neutral.
     // If it were incorrectly treated as a success, the failure count would reset
     // and the next failure wouldn't trip the breaker.
-    cb.record_failure(502, true);
+    cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "closed"); // still 2 failures, neutral
 
     // One more real failure should now trip the breaker (2 + 1 = 3 = threshold)
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert_eq!(
         cb.state_name(),
         "open",
@@ -753,7 +753,7 @@ fn test_timeout_zero_transitions_immediately_to_half_open() {
     };
     let cb = CircuitBreaker::new(config);
 
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
 
     // With timeout=0, can_execute should immediately transition to half_open
@@ -773,7 +773,7 @@ fn test_timeout_does_not_transition_before_elapsed() {
     };
     let cb = CircuitBreaker::new(config);
 
-    cb.record_failure(500, false);
+    cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
 
     // Should still be open (60s hasn't elapsed)
@@ -812,9 +812,9 @@ fn test_cache_keys_different_proxies_same_target() {
     let cb_b = cache.get_or_create("proxy-b", Some("10.0.0.1:8080"), &config);
 
     // Trip one breaker
-    cb_a.record_failure(500, false);
-    cb_a.record_failure(500, false);
-    cb_a.record_failure(500, false);
+    cb_a.record_failure(500, false, false);
+    cb_a.record_failure(500, false, false);
+    cb_a.record_failure(500, false, false);
     assert_eq!(cb_a.state_name(), "open");
 
     // Other proxy's breaker should be unaffected
@@ -845,7 +845,7 @@ fn test_concurrent_failure_and_success_recording() {
         let cb = cb.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
-                cb.record_failure(500, false);
+                cb.record_failure(500, false, false);
             }
         }));
     }
@@ -855,7 +855,7 @@ fn test_concurrent_failure_and_success_recording() {
         let cb = cb.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
-                cb.record_success();
+                cb.record_success(false);
             }
         }));
     }
@@ -871,6 +871,178 @@ fn test_concurrent_failure_and_success_recording() {
         "State should be valid: {}",
         state
     );
+}
+
+// ─── Concurrent Half-Open Probe Failures ────────────────────────────────────
+
+/// Regression test: concurrent half-open probe failures must not corrupt the
+/// in-flight counter. Before the fix, `record_failure` in the HALF_OPEN branch
+/// would atomically decrement `half_open_in_flight` (correct) but then
+/// unconditionally `store(0)`, racing with concurrent decrements from other
+/// probe threads and potentially clobbering a value that hadn't been
+/// decremented yet. When the breaker later re-entered HALF_OPEN, the counter
+/// started from a non-zero residue and fewer than `half_open_max_requests`
+/// probes could be admitted. The fix removes the redundant `store(0)`.
+///
+/// This test uses barriers to force the interleaving that triggers the bug:
+///   1. Admit all probe slots so `half_open_in_flight == half_open_max_requests`.
+///   2. Fire all probe failures concurrently via a barrier.
+///   3. Assert `half_open_in_flight == 0` after all probes drain.
+///   4. Transition to HALF_OPEN again and verify the full capacity is claimable.
+///
+/// Runs 200 iterations to maximise the chance of hitting a harmful interleaving.
+#[test]
+fn test_concurrent_half_open_probe_failures() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    for _ in 0..200 {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 10, // High so successes alone won't close it
+            timeout_seconds: 0,    // Immediate half-open transition
+            failure_status_codes: vec![500],
+            half_open_max_requests: 4,
+            trip_on_connection_errors: true,
+        };
+        let cb = Arc::new(CircuitBreaker::new(config));
+
+        // Trip open
+        cb.record_failure(500, false, false);
+        assert_eq!(cb.state_name(), "open");
+
+        // Transition to half-open and admit all 4 probe slots
+        assert!(cb.can_execute().is_ok()); // slot 1 (CAS winner)
+        assert!(cb.can_execute().is_ok()); // slot 2
+        assert!(cb.can_execute().is_ok()); // slot 3
+        assert!(cb.can_execute().is_ok()); // slot 4
+        assert_eq!(cb.state_name(), "half_open");
+        assert_eq!(cb.half_open_in_flight(), 4);
+
+        // All 4 slots taken — next should be rejected
+        assert!(cb.can_execute().is_err());
+
+        // Fire all 4 probe failures concurrently via a barrier.
+        // The barrier ensures all threads call record_failure at roughly the
+        // same instant, maximising the window for a store-after-decrement race.
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let cb_clone = cb.clone();
+            let barrier_clone = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                cb_clone.record_failure(500, false, true);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Must be open after all probe failures
+        assert_eq!(cb.state_name(), "open");
+
+        // ── Key assertion: the in-flight counter must have drained to 0. ──
+        // With the old code (unconditional store(0)), a late store could race
+        // with another thread's fetch_sub, leaving the counter at 0 even when
+        // that thread's decrement hadn't been applied yet — or conversely,
+        // a store(0) could run BEFORE another thread's fetch_sub, causing
+        // the counter to wrap around to u32::MAX. Either way, the next
+        // half-open cycle would start from a corrupt value.
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "half_open_in_flight must be 0 after all probes report failure"
+        );
+
+        // ── Verify full capacity in the next half-open cycle. ──
+        // Transition to half-open again (timeout=0).
+        assert!(cb.can_execute().is_ok()); // slot 1 (CAS winner)
+        assert_eq!(cb.state_name(), "half_open");
+
+        // Claim the remaining 3 slots — all must succeed if the counter reset
+        // correctly. With the old buggy code, residue in the counter would
+        // cause some of these to be rejected.
+        assert!(cb.can_execute().is_ok()); // slot 2
+        assert!(cb.can_execute().is_ok()); // slot 3
+        assert!(cb.can_execute().is_ok()); // slot 4
+        assert_eq!(cb.half_open_in_flight(), 4);
+
+        // Slot 5 must be rejected — exactly at capacity.
+        assert!(
+            cb.can_execute().is_err(),
+            "Should reject at capacity (half_open_max_requests=4)"
+        );
+    }
+}
+
+/// Verify that a mix of concurrent successes and failures in half-open
+/// produces a valid final state (open or closed) without corruption, and
+/// that the in-flight counter drains to 0 regardless of outcome.
+#[test]
+fn test_concurrent_half_open_mixed_success_and_failure() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    for _ in 0..200 {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 3,
+            timeout_seconds: 0,
+            failure_status_codes: vec![500],
+            half_open_max_requests: 4,
+            trip_on_connection_errors: true,
+        };
+        let cb = Arc::new(CircuitBreaker::new(config));
+
+        // Trip open
+        cb.record_failure(500, false, false);
+
+        // Admit 4 probes
+        for _ in 0..4 {
+            assert!(cb.can_execute().is_ok());
+        }
+        assert_eq!(cb.state_name(), "half_open");
+        assert_eq!(cb.half_open_in_flight(), 4);
+
+        // 2 threads record failure, 2 threads record success — concurrently
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for i in 0..4 {
+            let cb_clone = cb.clone();
+            let barrier_clone = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier_clone.wait();
+                if i < 2 {
+                    cb_clone.record_failure(500, false, true);
+                } else {
+                    cb_clone.record_success(true);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Any failure in half-open reopens the circuit, so it must be open
+        // (failures always win over successes in half-open).
+        let state = cb.state_name();
+        assert!(
+            state == "open" || state == "closed",
+            "State must be valid after concurrent mixed probes, got: {}",
+            state
+        );
+
+        // The in-flight counter must be 0 after all probes have reported,
+        // regardless of whether the final state is open or closed.
+        assert_eq!(
+            cb.half_open_in_flight(),
+            0,
+            "half_open_in_flight must be 0 after all probes drain (state={})",
+            state
+        );
+    }
 }
 
 // ─── Cache Capacity Tests ───────────────────────────────────────────────────
@@ -905,9 +1077,9 @@ fn test_cache_config_change_replaces_breaker() {
 
     // Create with config1 (failure_threshold=3) and trip it open
     let cb1 = cache.get_or_create("proxy1", Some("target1"), &config1);
-    cb1.record_failure(500, false);
-    cb1.record_failure(500, false);
-    cb1.record_failure(500, false);
+    cb1.record_failure(500, false, false);
+    cb1.record_failure(500, false, false);
+    cb1.record_failure(500, false, false);
     assert_eq!(
         cb1.state_name(),
         "open",
@@ -920,4 +1092,116 @@ fn test_cache_config_change_replaces_breaker() {
     // New breaker should be fresh (closed, not open) proving replacement
     assert_eq!(cb2.state_name(), "closed");
     assert!(cb2.can_execute().is_ok());
+}
+
+// ─── Half-open probe tracking regression tests ─────────────────────────────
+
+/// `can_execute()` returns `Ok(false)` in CLOSED state and `Ok(true)` in HALF_OPEN.
+#[test]
+fn test_can_execute_returns_half_open_probe_flag() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 2,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // CLOSED state: not a half-open probe
+    assert!(!cb.can_execute().unwrap());
+
+    // Trip open
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to HALF_OPEN: IS a half-open probe
+    assert!(cb.can_execute().unwrap());
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Second slot in HALF_OPEN: also a probe
+    assert!(cb.can_execute().unwrap());
+}
+
+/// Regression: a request admitted in CLOSED state that completes after the
+/// breaker transitions to OPEN must NOT decrement `half_open_in_flight`.
+/// Before the fix, recording success/failure with `is_half_open_probe=false`
+/// in STATE_OPEN would still decrement the counter, causing the next half-open
+/// cycle to admit more probes than `half_open_max_requests`.
+#[test]
+fn test_closed_request_completing_in_open_does_not_decrement_counter() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Request A admitted in CLOSED (is_half_open_probe=false)
+    let probe_a = cb.can_execute().unwrap();
+    assert!(!probe_a);
+
+    // Meanwhile, other requests trip the breaker CLOSED -> OPEN
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to HALF_OPEN
+    let probe_b = cb.can_execute().unwrap();
+    assert!(probe_b); // probe B is a half-open probe
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    // At max — reject
+    assert!(cb.can_execute().is_err());
+
+    // Probe B fails, reopening the circuit (correctly decrements)
+    cb.record_failure(500, false, true);
+    assert_eq!(cb.state_name(), "open");
+
+    // Request A (from CLOSED era) completes with success in OPEN state.
+    // Because is_half_open_probe=false, it must NOT decrement the counter.
+    cb.record_success(false);
+
+    // The counter should be 0 (from probe B's decrement), not wrapped/negative
+    assert_eq!(cb.half_open_in_flight(), 0);
+
+    // Transition to HALF_OPEN again — full capacity should be available
+    let probe_c = cb.can_execute().unwrap();
+    assert!(probe_c);
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 1);
+
+    // If the bug were present, the counter would have been decremented by
+    // request A's record_success, making it u32::MAX (wrapped), and
+    // no probes would be admissible.
+}
+
+/// Cache-level `can_execute` returns the half-open probe flag alongside the breaker.
+#[test]
+fn test_cache_can_execute_returns_probe_flag() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+
+    // CLOSED: not a probe
+    let (cb, is_probe) = cache.can_execute("p1", None, &config).unwrap();
+    assert!(!is_probe);
+
+    // Trip open
+    cb.record_failure(500, false, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // HALF_OPEN: IS a probe
+    let (_cb2, is_probe2) = cache.can_execute("p1", None, &config).unwrap();
+    assert!(is_probe2);
 }

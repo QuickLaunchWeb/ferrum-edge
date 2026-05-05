@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_diff_removed, parse_auth_mode, parse_scheme,
+    statement_timeout_sql,
 };
 use ferrum_edge::config::types::{AuthMode, BackendScheme};
 use std::collections::HashSet;
@@ -168,4 +169,40 @@ fn test_parse_auth_mode_case_insensitive() {
 fn test_parse_auth_mode_unknown_defaults_to_single() {
     assert!(matches!(parse_auth_mode("unknown"), AuthMode::Single));
     assert!(matches!(parse_auth_mode(""), AuthMode::Single));
+}
+
+// ── statement_timeout_sql ───────────────────────────────────────────────────
+
+#[test]
+fn test_statement_timeout_sql_zero_disables() {
+    // 0 = disabled — no SET emitted for any database type.
+    assert_eq!(statement_timeout_sql(0, true, false), None);
+    assert_eq!(statement_timeout_sql(0, false, true), None);
+    assert_eq!(statement_timeout_sql(0, false, false), None);
+}
+
+#[test]
+fn test_statement_timeout_sql_postgres_unquoted_numeric() {
+    // PostgreSQL: unquoted numeric milliseconds.
+    let sql = statement_timeout_sql(30, true, false).unwrap();
+    assert_eq!(sql, "SET statement_timeout = 30000");
+}
+
+#[test]
+fn test_statement_timeout_sql_postgres_at_max() {
+    // 3600 s = 3_600_000 ms — the maximum allowed value.
+    let sql = statement_timeout_sql(3600, true, false).unwrap();
+    assert_eq!(sql, "SET statement_timeout = 3600000");
+}
+
+#[test]
+fn test_statement_timeout_sql_mysql() {
+    let sql = statement_timeout_sql(30, false, true).unwrap();
+    assert_eq!(sql, "SET SESSION max_execution_time = 30000");
+}
+
+#[test]
+fn test_statement_timeout_sql_sqlite_returns_none() {
+    // SQLite does not support statement timeouts.
+    assert_eq!(statement_timeout_sql(30, false, false), None);
 }

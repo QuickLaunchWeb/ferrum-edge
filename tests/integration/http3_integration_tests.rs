@@ -275,14 +275,20 @@ async fn test_http3_proxy_state_creation() {
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
     let circuit_breaker_cache = Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new());
+    let request_epoch = Arc::new(
+        ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+            gc.clone(),
+            &plugin_cache,
+            &consumer_index,
+            &lb_cache,
+        ),
+    );
     let slm = Arc::new(
         ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             gateway_config.clone(),
             dns_cache.clone(),
-            lb_cache.clone(),
-            consumer_index.clone(),
-            plugin_cache.clone(),
+            request_epoch.clone(),
             circuit_breaker_cache.clone(),
             None,
             false,
@@ -311,6 +317,7 @@ async fn test_http3_proxy_state_creation() {
     let dns_cache_for_sd = dns_cache.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
+        request_epoch,
         dns_cache,
         connection_pool,
         router_cache,
@@ -332,6 +339,7 @@ async fn test_http3_proxy_state_creation() {
         ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        health_check_shutdown_rx: None,
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
         service_discovery_manager: {
             let hc = Arc::new(ferrum_edge::health_check::HealthChecker::new());
@@ -341,6 +349,7 @@ async fn test_http3_proxy_state_creation() {
                     dns_cache_for_sd,
                     hc,
                     ferrum_edge::plugins::PluginHttpClient::default(),
+                    None,
                 ),
             )
         },
@@ -511,14 +520,20 @@ async fn test_http3_full_integration() {
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
     let circuit_breaker_cache = Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new());
+    let request_epoch = Arc::new(
+        ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+            gc.clone(),
+            &plugin_cache,
+            &consumer_index,
+            &lb_cache,
+        ),
+    );
     let slm = Arc::new(
         ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             gateway_config.clone(),
             dns_cache.clone(),
-            lb_cache.clone(),
-            consumer_index.clone(),
-            plugin_cache.clone(),
+            request_epoch.clone(),
             circuit_breaker_cache.clone(),
             None,
             false,
@@ -547,6 +562,7 @@ async fn test_http3_full_integration() {
     let dns_cache_for_sd = dns_cache.clone();
     let proxy_state = ProxyState {
         config: gateway_config,
+        request_epoch,
         dns_cache,
         connection_pool,
         router_cache,
@@ -568,6 +584,7 @@ async fn test_http3_full_integration() {
         ),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        health_check_shutdown_rx: None,
         circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
         service_discovery_manager: {
             let hc = Arc::new(ferrum_edge::health_check::HealthChecker::new());
@@ -577,6 +594,7 @@ async fn test_http3_full_integration() {
                     dns_cache_for_sd,
                     hc,
                     ferrum_edge::plugins::PluginHttpClient::default(),
+                    None,
                 ),
             )
         },

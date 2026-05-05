@@ -64,6 +64,21 @@ fn generate_test_token(config: &TestConfig) -> String {
     encode(&header, &claims, &key).unwrap()
 }
 
+fn generate_expired_test_token(config: &TestConfig) -> String {
+    let now = chrono::Utc::now();
+    let claims = json!({
+        "iss": config.jwt_issuer,
+        "sub": "test-user",
+        "iat": (now - chrono::Duration::seconds(900)).timestamp(),
+        "nbf": (now - chrono::Duration::seconds(900)).timestamp(),
+        "exp": (now - chrono::Duration::seconds(300)).timestamp(),
+        "jti": uuid::Uuid::new_v4().to_string()
+    });
+    let header = Header::new(jsonwebtoken::Algorithm::HS256);
+    let key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+    encode(&header, &claims, &key).unwrap()
+}
+
 fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
@@ -805,7 +820,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
     assert_eq!(body["status"], "starting");
     assert_eq!(body["ready"], false);
 
-    startup_ready.store(true, Ordering::Relaxed);
+    startup_ready.store(true, Ordering::Release);
 
     let resp = client
         .get(format!("{}/health", base_url))
@@ -941,6 +956,67 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         dp_registry: None,
         cp_connection_state: None,
     }
+}
+
+#[tokio::test]
+async fn test_charges_requires_admin_jwt() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    let unauthenticated = client
+        .get(format!("{}/charges", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = unauthenticated.json().await.unwrap();
+    assert_eq!(body["error"], "Missing Authorization header");
+
+    let token = generate_test_token(&tc);
+    let authenticated_json = client
+        .get(format!("{}/charges?format=json", base_url))
+        .header("authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated_json.status(), reqwest::StatusCode::OK);
+    let body: Value = authenticated_json.json().await.unwrap();
+    assert!(body["consumers"].is_object());
+
+    let authenticated_prometheus = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authenticated_prometheus.status(), reqwest::StatusCode::OK);
+    let content_type = authenticated_prometheus
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(content_type.starts_with("text/plain"));
+    let body = authenticated_prometheus.text().await.unwrap();
+    assert!(body.contains("ferrum_api_chargeable_calls_total"));
+
+    let invalid = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", "Bearer not.a.jwt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let expired_token = generate_expired_test_token(&tc);
+    let expired = client
+        .get(format!("{}/charges", base_url))
+        .header("authorization", format!("Bearer {}", expired_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

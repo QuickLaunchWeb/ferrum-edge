@@ -214,6 +214,21 @@ impl ServeHandles {
             })
             .await
         };
+        // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
+        // also observe the global shutdown receiver wired in `serve()` and
+        // will already be exiting; firing each per-listener channel here
+        // clears the listener map (releasing ports) and is a no-op if the
+        // loops have already exited.
+        self.proxy_state
+            .stream_listener_manager
+            .shutdown_all()
+            .await;
+
+        // Signal drain state to the proxy hot path (Connection: close +
+        // reject new requests) unconditionally so the close hint fires even
+        // when the operator has disabled the wait loop with
+        // FERRUM_SHUTDOWN_DRAIN_SECONDS=0. Only the wait loop itself is gated.
+        crate::overload::begin_drain(&self.proxy_state.overload);
         if self.drain_seconds > 0 {
             crate::overload::wait_for_drain(
                 &self.proxy_state.overload,
@@ -221,7 +236,9 @@ impl ServeHandles {
             )
             .await;
         }
-        join_background_handles(self.background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
+        let mut background_handles = self.background_handles;
+        background_handles.extend(self.proxy_state.health_checker.take_active_check_handles());
+        join_background_handles(background_handles, BACKGROUND_DRAIN_TIMEOUT).await;
         listener_result
     }
 
@@ -258,7 +275,14 @@ impl ServeHandles {
 ///
 /// Pulled out of [`ServeHandles::join`] so the panic-propagation
 /// behaviour is unit-testable without constructing a `ProxyState`.
-async fn await_listener_handles(
+///
+/// Re-exported as `pub(crate)` so [`crate::modes::control_plane`] can
+/// reuse the same panic-propagation behaviour for its admin/gRPC
+/// listeners — a `tokio::select!` over the listener handles let the
+/// first one to exit short-circuit the others, dropping their handles
+/// (which detaches the tasks) and orphaning still-serving listeners
+/// when the runtime tore down.
+pub(crate) async fn await_listener_handles(
     handles: Vec<JoinHandle<()>>,
     shutdown_on_panic: impl FnOnce(),
 ) -> Result<(), tokio::task::JoinError> {
@@ -288,7 +312,10 @@ async fn await_listener_handles(
 /// a single warning and return — a stuck task is not allowed to wedge
 /// graceful shutdown. Pulled out of [`ServeHandles::join`] so the timeout
 /// behaviour is unit-testable without constructing a `ProxyState`.
-async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
+///
+/// Re-exported as `pub(crate)` so [`crate::modes::control_plane`] can
+/// reuse the same bounded background-drain shape for its DB-poll task.
+pub(crate) async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
     let drain = async {
         for handle in handles {
             let _ = handle.await;
@@ -558,7 +585,9 @@ pub async fn serve(
         try_tcp_on_error: env_config.dns_try_tcp_on_error,
         num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
         max_active_requests: env_config.dns_max_active_requests,
+        max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
+        shard_amount: env_config.pool_shard_amount,
     });
 
     // DNS warmup — collect every hostname referenced in the config (proxy
@@ -588,12 +617,21 @@ pub async fn serve(
             .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
 
-    let proxy_state = ProxyState::new(
+    let (proxy_state, health_check_handles) = ProxyState::new(
         config,
         dns_cache.clone(),
         env_config.clone(),
         Some(tls_policy.clone()),
+        Some(shutdown_tx.subscribe()),
     )?;
+
+    // Wire stream listeners (TCP/UDP/DTLS) to the global SIGTERM channel so
+    // their accept loops exit promptly during graceful drain. Without this,
+    // stream listeners would only react to per-listener (config-driven)
+    // shutdown and keep accepting connections until the runtime is dropped.
+    proxy_state
+        .stream_listener_manager
+        .set_global_shutdown_rx(shutdown_tx.subscribe());
 
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
     for host in plugin_hosts {
@@ -615,11 +653,12 @@ pub async fn serve(
     proxy_state
         .start_backend_capability_refresh_task(run_initial_refresh, Some(shutdown_tx.subscribe()));
 
-    proxy_state.start_per_ip_cleanup_task();
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
 
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
-    let _dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
+    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
 
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
@@ -674,7 +713,8 @@ pub async fn serve(
     if let Some(ref tls_cfg) = tls_config {
         proxy_state
             .stream_listener_manager
-            .set_frontend_tls_config(Some(tls_cfg.clone()));
+            .set_frontend_tls_config(Some(tls_cfg.clone()))
+            .await;
     }
 
     if let (Some(cert_path), Some(key_path)) =
@@ -698,7 +738,8 @@ pub async fn serve(
                 cert_path.clone(),
                 key_path.clone(),
                 env_config.dtls_client_ca_cert_path.clone(),
-            );
+            )
+            .await;
     }
 
     // Listen for SIGHUP — only meaningful for run(); skipped here.
@@ -954,6 +995,7 @@ pub async fn serve(
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+            let h3_client_crls = crls.clone();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
             let h = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
@@ -966,6 +1008,7 @@ pub async fn serve(
                     &h3_tls_policy,
                     crate::http3::server::Http3ListenerOptions {
                         client_ca_bundle_path: h3_client_ca,
+                        client_crls: h3_client_crls,
                         started_tx: Some(started_tx),
                     },
                 )
@@ -987,7 +1030,22 @@ pub async fn serve(
     // `tokio::time::timeout(Duration::from_secs(5), bg_drain)` block —
     // mixing them in with listener handles loses that bound and lets a
     // stuck DNS / metrics task wedge shutdown indefinitely.
-    let background_handles: Vec<JoinHandle<()>> = vec![dns_handle, overload_handle, metrics_handle];
+    let mut background_handles: Vec<JoinHandle<()>> =
+        vec![dns_handle, overload_handle, metrics_handle];
+    if let Some(h) = dns_retry_handle {
+        background_handles.push(h);
+    }
+    if let Some(h) = per_ip_cleanup_handle {
+        background_handles.push(h);
+    }
+    // Active-health-check probes and the passive recovery timer race
+    // their `interval.tick()` against the shutdown watch channel passed
+    // into `ProxyState::new`, so awaiting them here gives them a clean
+    // exit before `BACKGROUND_DRAIN_TIMEOUT`. Without this they'd live
+    // until `Drop for HealthChecker` aborts at process exit (after the
+    // drain window has already closed), which lets a probe mid-`http_probe`
+    // emit a misleading "unhealthy" log line right before tear-down.
+    background_handles.extend(health_check_handles);
 
     // Build `ServeHandles` BEFORE the late-startup `?` calls so that
     // failure to bind stream listeners / receive listener-started
@@ -1015,7 +1073,7 @@ pub async fn serve(
             .stream_listener_manager
             .wait_until_started(Duration::from_secs(10))
             .await?;
-        startup_ready.store(true, Ordering::Relaxed);
+        startup_ready.store(true, Ordering::Release);
         info!("Gateway startup complete; /health now reports ready");
         Ok(())
     }

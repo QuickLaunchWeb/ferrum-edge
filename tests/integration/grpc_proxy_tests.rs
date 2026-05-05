@@ -208,6 +208,8 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         try_tcp_on_error: true,
         num_concurrent_reqs: 3,
         max_active_requests: 512,
+        max_concurrent_refreshes: 64,
+        shard_amount: 0,
     });
     let config = GatewayConfig {
         version: "1".to_string(),
@@ -218,7 +220,9 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
     };
-    ProxyState::new(config, dns_cache, create_test_env_config(), None).unwrap()
+    let (state, _health_check_handles) =
+        ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();
+    state
 }
 
 /// Start a mock gRPC backend (h2c HTTP/2 server) that echoes requests.

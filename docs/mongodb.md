@@ -215,12 +215,14 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | Feature | Standalone | Replica Set |
 |---|---|---|
 | Single-document CRUD | Atomic | Atomic |
-| Multi-document operations (e.g., delete proxy + plugins) | Idempotent (partial failure safe) | Transactional (ACID) |
+| Multi-document operations (e.g., delete proxy + plugins) | Fail-safe sequential ordering (partial failures leave recoverable orphans) | Transactional (ACID) via `ClientSession::start_transaction` |
 | Change streams (future) | Not available | Available |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
 
-For production, a **replica set is strongly recommended**. Without one, multi-document operations (like deleting a proxy and its associated plugin configs) are not transactional — partial failures are handled via idempotent cleanup on the next poll cycle.
+For production, a **replica set is strongly recommended**. Setting `FERRUM_MONGO_REPLICA_SET` (or `?replicaSet=...` in the connection string) enables true multi-document ACID transactions for `delete_proxy` / `update_proxy` — the proxy document, its proxy-scoped plugin configs, and the orphaned-proxy_group cleanup all commit atomically.
+
+Without a replica set, the gateway falls back to a fail-safe sequential ordering: the proxy document is deleted **before** its plugin configs, so a partial failure can only leave orphaned plugin configs (no proxy references them). Orphans are recoverable; the previous order — plugin configs first — could leave a proxy in the DB referencing now-deleted plugin_config IDs, which validation rejects on every subsequent polling cycle until manually cleaned up.
 
 ### Minimum Replica Set (Development)
 

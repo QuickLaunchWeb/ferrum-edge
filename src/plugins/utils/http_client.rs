@@ -43,9 +43,10 @@
 //! }
 //! ```
 
-use crate::config::PoolConfig;
+use crate::config::{BackendAllowIps, PoolConfig};
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::retry::{ErrorClass, classify_reqwest_error};
+use crate::tls::CrlList;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -80,11 +81,22 @@ pub struct PluginHttpClient {
     /// Path to a PEM CA bundle for verifying outbound TLS connections.
     /// Mirrors `FERRUM_TLS_CA_BUNDLE_PATH` - shared with Redis rate limiting clients.
     tls_ca_bundle_path: Option<String>,
+    /// Certificate Revocation Lists for outbound TLS verification.
+    /// Loaded once at startup from `FERRUM_TLS_CRL_FILE_PATH` and shared via Arc.
+    /// Used by non-reqwest TLS sinks (tcp_logging, ws_logging, udp_logging DTLS)
+    /// so that revoked backend certificates are rejected on log-shipping paths,
+    /// matching the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
+    /// Empty when `FERRUM_TLS_CRL_FILE_PATH` is unset.
+    tls_crls: CrlList,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
     /// the same external backend.
     namespace: String,
+    /// Resolved backend IP policy (`FERRUM_BACKEND_ALLOW_IPS` after CLI/env/conf
+    /// precedence). Used by plugins that validate outbound endpoints outside the
+    /// proxy backend path.
+    backend_allow_ips: BackendAllowIps,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -96,9 +108,39 @@ impl std::fmt::Debug for PluginHttpClient {
             .field("has_dns_cache", &self.dns_cache.is_some())
             .field("tls_no_verify", &self.tls_no_verify)
             .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
+            .field("tls_crls_count", &self.tls_crls.len())
             .field("namespace", &self.namespace)
+            .field("backend_allow_ips", &self.backend_allow_ips)
             .finish()
     }
+}
+
+/// Build a minimal `reqwest::Client` that still uses the gateway's DNS cache
+/// when available.
+///
+/// Used as a fallback when a fully-configured builder fails (e.g., due to
+/// invalid TLS material). Keeps the DNS cache attached so plugin outbound
+/// calls do not silently fall through to system DNS — every call would
+/// otherwise burn an ephemeral port through a fresh OS resolver, which
+/// CLAUDE.md explicitly forbids ("DnsCacheResolver must be plugged into
+/// every reqwest::Client in production").
+///
+/// If even this minimal builder fails, only then fall back to
+/// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
+fn build_dns_cached_fallback_client(dns_cache: Option<DnsCache>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(dns_cache) = dns_cache {
+        let resolver = DnsCacheResolver::new(dns_cache);
+        builder = builder.dns_resolver(Arc::new(resolver));
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::error!(
+            "Failed to build minimal DNS-cached fallback plugin client: {}. \
+             Using reqwest::Client::new() as a last resort — DNS will bypass the gateway cache.",
+            e
+        );
+        reqwest::Client::new()
+    })
 }
 
 impl PluginHttpClient {
@@ -123,7 +165,9 @@ impl PluginHttpClient {
         retry_delay_ms: u64,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
+        tls_crls: CrlList,
         namespace: &str,
+        backend_allow_ips: BackendAllowIps,
     ) -> Self {
         let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
@@ -188,8 +232,12 @@ impl PluginHttpClient {
         }
 
         let client = builder.build().unwrap_or_else(|e| {
-            tracing::error!("Failed to build plugin HTTP client: {}, using default", e);
-            reqwest::Client::new()
+            tracing::error!(
+                "Failed to build plugin HTTP client: {}. \
+                 Falling back to a minimal DNS-cached client (TLS/pool/keepalive settings will not apply).",
+                e
+            );
+            build_dns_cached_fallback_client(Some(dns_cache_clone.clone()))
         });
 
         Self {
@@ -200,7 +248,9 @@ impl PluginHttpClient {
             dns_cache: Some(dns_cache_clone),
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
+            tls_crls,
             namespace: namespace.to_string(),
+            backend_allow_ips,
         }
     }
 
@@ -230,8 +280,16 @@ impl PluginHttpClient {
         }
 
         let client = builder.build().unwrap_or_else(|e| {
-            tracing::error!("Failed to build plugin HTTP client: {}, using default", e);
-            reqwest::Client::new()
+            tracing::error!(
+                "Failed to build plugin HTTP client: {}. \
+                 Falling back to a minimal client (no DNS cache available on this path).",
+                e
+            );
+            // No DNS cache to attach on this path — `from_pool_config` is
+            // explicitly the cache-less constructor (tests / fallback). Use
+            // the shared helper so the last-resort `Client::new()` path is
+            // logged uniformly across both `new()` and this code path.
+            build_dns_cached_fallback_client(None)
         });
 
         Self {
@@ -242,7 +300,9 @@ impl PluginHttpClient {
             dns_cache: None,
             tls_no_verify: false,
             tls_ca_bundle_path: None,
+            tls_crls: Arc::new(Vec::new()),
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
+            backend_allow_ips: BackendAllowIps::Both,
         }
     }
 
@@ -302,6 +362,18 @@ impl PluginHttpClient {
         self.tls_ca_bundle_path.as_deref()
     }
 
+    /// The gateway's loaded Certificate Revocation Lists (`FERRUM_TLS_CRL_FILE_PATH`).
+    ///
+    /// Empty when no CRL file is configured. Used by plugins that build their own
+    /// `rustls::ClientConfig` (tcp_logging, ws_logging, udp_logging DTLS) so that
+    /// revoked backend certificates are rejected on log-shipping paths, matching
+    /// the policy applied to the proxy backend / DTLS / frontend mTLS surfaces.
+    /// reqwest-based outbound calls are unaffected — reqwest does not expose CRL
+    /// configuration.
+    pub fn tls_crls(&self) -> &[rustls::pki_types::CertificateRevocationListDer<'static>] {
+        &self.tls_crls
+    }
+
     /// The gateway's namespace (`FERRUM_NAMESPACE`).
     ///
     /// Used by plugins to namespace Redis keys and metric labels when multiple
@@ -310,6 +382,14 @@ impl PluginHttpClient {
     /// for backward compatibility.
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Resolved backend IP allowlist policy.
+    ///
+    /// This is the gateway-level `FERRUM_BACKEND_ALLOW_IPS` value after the
+    /// normal CLI/env/conf/default precedence has been applied.
+    pub fn backend_allow_ips(&self) -> &BackendAllowIps {
+        &self.backend_allow_ips
     }
 
     /// Get the underlying `reqwest::Client` for building requests.
@@ -465,5 +545,51 @@ impl Default for PluginHttpClient {
     /// tuned settings and DNS cache. This default is provided for tests and fallback.
     fn default() -> Self {
         Self::from_pool_config(&PoolConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    //! Tests for the DNS-cached fallback path used by `PluginHttpClient`
+    //! when `reqwest::Client::builder().build()` fails (e.g., due to an
+    //! internal TLS connector failure).
+    //!
+    //! Targets a private helper, so these tests live inline.
+    use super::*;
+    use crate::dns::DnsConfig;
+
+    #[test]
+    fn fallback_client_builds_with_dns_cache() {
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let _client = build_dns_cached_fallback_client(Some(dns_cache));
+    }
+
+    #[test]
+    fn fallback_client_builds_without_dns_cache() {
+        let _client = build_dns_cached_fallback_client(None);
+    }
+
+    #[tokio::test]
+    async fn fallback_client_uses_dns_cache_resolver() {
+        // Verify the fallback client routes DNS through the gateway cache.
+        let dns_cache = DnsCache::new(DnsConfig::default());
+        let initial_len = dns_cache.cache_len();
+        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()));
+
+        let _ = client
+            .get("http://localhost:1/")
+            .timeout(Duration::from_millis(100))
+            .send()
+            .await;
+
+        let after_len = dns_cache.cache_len();
+        assert!(
+            after_len > initial_len,
+            "DNS cache should have populated via the cached resolver \
+             (initial={}, after={}). If the fallback bypassed the resolver \
+             via Client::new(), the cache would stay empty.",
+            initial_len,
+            after_len
+        );
     }
 }

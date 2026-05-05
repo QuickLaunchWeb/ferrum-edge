@@ -92,6 +92,12 @@ pub struct Http3ServerConfig {
     pub max_concurrent_streams: u32,
     /// Connection idle timeout
     pub idle_timeout: Duration,
+    /// Maximum time a QUIC handshake may take before the in-progress connection
+    /// is aborted. Mirrors the TCP/TLS and DTLS frontend handshake bounds and
+    /// is sourced from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`.
+    /// `Duration::ZERO` disables the bound (matches the "0 disables" semantic
+    /// shared by the TCP/TLS and DTLS frontends).
+    pub handshake_timeout: Duration,
 
     // ── QUIC transport tuning ────────────────────────────────────────────
     //
@@ -135,6 +141,7 @@ impl Http3ServerConfig {
             receive_window: env.http3_receive_window,
             send_window: env.http3_send_window,
             initial_mtu: env.http3_initial_mtu,
+            handshake_timeout: Duration::from_secs(env.frontend_tls_handshake_timeout_seconds),
         }
     }
 }
@@ -148,6 +155,9 @@ impl Default for Http3ServerConfig {
             receive_window: H3_RECEIVE_WINDOW_DEFAULT,
             send_window: H3_SEND_WINDOW_DEFAULT,
             initial_mtu: 1500,
+            // Default mirrors `EnvConfig::default().frontend_tls_handshake_timeout_seconds`
+            // (10 seconds). `Duration::ZERO` here would silently disable the bound.
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }

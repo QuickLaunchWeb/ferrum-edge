@@ -57,6 +57,7 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_DB_FAILOVER_URLS` | No | — | Comma-separated failover database URLs. For MongoDB replica sets, prefer listing all members in `FERRUM_DB_URL` instead |
 | `FERRUM_DB_READ_REPLICA_URL` | No | — | Read replica URL for config polling (SQL only). For MongoDB, use `readPreference` in the connection string |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | No | — | Log database queries slower than this threshold |
+| `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | No | `10000` | Max rows per query during full config loading (SQL only). Clamped to 100..=100000 |
 
 #### Database Backend Applicability
 
@@ -66,6 +67,7 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_DB_FAILOVER_URLS` | Yes | Yes | Yes | Yes, but replica sets should list all members in `FERRUM_DB_URL` |
 | `FERRUM_DB_READ_REPLICA_URL` | Yes | Yes | No | No; use MongoDB `readPreference` |
 | `FERRUM_DB_TLS_MODE` and DB TLS certificate paths | Yes | Yes | `disable` only as a no-op; cert paths rejected | Yes; `disable`, `require`, and `verify-full` via MongoDB driver `TlsOptions` |
+| `FERRUM_DB_FULL_LOAD_PAGE_SIZE` | Yes | Yes | Yes | Ignored; MongoDB uses cursor-based loading |
 | `FERRUM_DB_POOL_*` SQL pool fields | Yes | Yes | Yes | Ignored; use MongoDB URI pool options such as `maxPoolSize` and `minPoolSize` |
 | `FERRUM_MONGO_*` fields | No | No | No | Yes |
 
@@ -183,6 +185,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
 | `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 

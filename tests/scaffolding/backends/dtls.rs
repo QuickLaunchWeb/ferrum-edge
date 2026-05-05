@@ -412,6 +412,7 @@ mod tests {
             certificate: client_cert,
             server_name: None,
             server_cert_verifier: None,
+            connect_timeout_ms: 10_000,
         };
 
         let client = ferrum_edge::dtls::DtlsConnection::connect(client_socket, params)
