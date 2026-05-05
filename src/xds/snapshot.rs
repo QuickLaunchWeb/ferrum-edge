@@ -125,6 +125,10 @@ impl XdsSnapshotCache {
             .insert(snapshot.node_id.clone(), Arc::new(snapshot))
     }
 
+    pub fn remove(&self, node_id: &str) -> Option<(String, Arc<XdsSnapshot>)> {
+        self.snapshots.remove(node_id)
+    }
+
     pub fn len(&self) -> usize {
         self.snapshots.len()
     }

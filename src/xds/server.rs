@@ -1,4 +1,6 @@
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -42,6 +44,87 @@ pub struct XdsAdsServer {
     namespace: String,
     snapshot_cache: Arc<XdsSnapshotCache>,
     nonce_tracker: Arc<XdsNonceTracker>,
+    active_streams: Arc<XdsStreamRegistry>,
+}
+
+#[derive(Default)]
+struct XdsStreamRegistry {
+    counts: DashMap<String, usize>,
+}
+
+impl XdsStreamRegistry {
+    fn register(&self, node_id: &str) {
+        match self.counts.entry(node_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                *entry.get_mut() += 1;
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(1);
+            }
+        }
+    }
+
+    fn unregister(&self, node_id: &str) -> bool {
+        match self.counts.entry(node_id.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if *entry.get() > 1 {
+                    *entry.get_mut() -= 1;
+                    false
+                } else {
+                    entry.remove();
+                    true
+                }
+            }
+            Entry::Vacant(_) => true,
+        }
+    }
+}
+
+struct XdsStreamGuard {
+    node_id: Option<String>,
+    snapshot_cache: Arc<XdsSnapshotCache>,
+    nonce_tracker: Arc<XdsNonceTracker>,
+    active_streams: Arc<XdsStreamRegistry>,
+}
+
+impl XdsStreamGuard {
+    fn new(
+        snapshot_cache: Arc<XdsSnapshotCache>,
+        nonce_tracker: Arc<XdsNonceTracker>,
+        active_streams: Arc<XdsStreamRegistry>,
+    ) -> Self {
+        Self {
+            node_id: None,
+            snapshot_cache,
+            nonce_tracker,
+            active_streams,
+        }
+    }
+
+    fn set_node_id(&mut self, node_id: &str) {
+        if self.node_id.as_deref() == Some(node_id) {
+            return;
+        }
+        self.clear_current();
+        self.active_streams.register(node_id);
+        self.node_id = Some(node_id.to_string());
+    }
+
+    fn clear_current(&mut self) {
+        let Some(node_id) = self.node_id.take() else {
+            return;
+        };
+        if self.active_streams.unregister(&node_id) {
+            self.snapshot_cache.remove(&node_id);
+            self.nonce_tracker.remove_node(&node_id);
+        }
+    }
+}
+
+impl Drop for XdsStreamGuard {
+    fn drop(&mut self) {
+        self.clear_current();
+    }
 }
 
 impl XdsAdsServer {
@@ -60,6 +143,7 @@ impl XdsAdsServer {
             namespace,
             snapshot_cache: Arc::new(XdsSnapshotCache::new()),
             nonce_tracker: Arc::new(XdsNonceTracker::new()),
+            active_streams: Arc::new(XdsStreamRegistry::default()),
         }
     }
 
@@ -106,6 +190,14 @@ impl XdsAdsServer {
         let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone());
         let slice = MeshSlice::from_gateway_config(config.as_ref(), request);
         translate_mesh_slice_to_snapshot(&slice)
+    }
+
+    fn stream_guard(&self) -> XdsStreamGuard {
+        XdsStreamGuard::new(
+            self.snapshot_cache.clone(),
+            self.nonce_tracker.clone(),
+            self.active_streams.clone(),
+        )
     }
 
     fn sotw_response(
@@ -271,6 +363,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
+            let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
             loop {
@@ -295,6 +388,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             let _ = tx.send(Err(Status::invalid_argument("xDS Node.id is required"))).await;
                             return;
                         };
+                        stream_guard.set_node_id(&current_node_id);
                         node_id = Some(current_node_id.clone());
 
                         if request.type_url.is_empty() {
@@ -404,6 +498,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
+            let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
             loop {
@@ -428,6 +523,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             let _ = tx.send(Err(Status::invalid_argument("xDS Node.id is required"))).await;
                             return;
                         };
+                        stream_guard.set_node_id(&current_node_id);
                         node_id = Some(current_node_id.clone());
 
                         if request.type_url.is_empty() {
@@ -683,5 +779,48 @@ mod tests {
             response.removed_resources,
             vec!["cluster/default/stale/8080".to_string()]
         );
+    }
+
+    #[test]
+    fn stream_guard_cleans_node_state_when_last_stream_exits() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.rebuild_snapshot("node-a");
+        server.snapshot_cache.insert(snapshot);
+        server
+            .nonce_tracker
+            .issue_nonce("node-a", super::super::translator::CDS_TYPE_URL, "v1");
+
+        {
+            let mut guard = server.stream_guard();
+            guard.set_node_id("node-a");
+            assert!(server.snapshot_cache.get("node-a").is_some());
+            assert_eq!(server.nonce_tracker.len(), 1);
+        }
+
+        assert!(server.snapshot_cache.get("node-a").is_none());
+        assert!(server.nonce_tracker.is_empty());
+    }
+
+    #[test]
+    fn stream_guard_keeps_node_state_until_all_streams_exit() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.rebuild_snapshot("node-a");
+        server.snapshot_cache.insert(snapshot);
+        server
+            .nonce_tracker
+            .issue_nonce("node-a", super::super::translator::CDS_TYPE_URL, "v1");
+
+        let mut first = server.stream_guard();
+        first.set_node_id("node-a");
+        let mut second = server.stream_guard();
+        second.set_node_id("node-a");
+
+        drop(first);
+        assert!(server.snapshot_cache.get("node-a").is_some());
+        assert_eq!(server.nonce_tracker.len(), 1);
+
+        drop(second);
+        assert!(server.snapshot_cache.get("node-a").is_none());
+        assert!(server.nonce_tracker.is_empty());
     }
 }
