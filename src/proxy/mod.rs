@@ -8246,7 +8246,11 @@ pub(crate) async fn proxy_to_backend_retry(
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
-    // (canonical predicate in `proxy::headers`).
+    // (canonical predicate in `proxy::headers`). Also strip every header
+    // NAMED in the request's `Connection` field — see
+    // `parse_connection_listed_from_str_map` for the spec rationale and
+    // smuggling defence.
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -8259,6 +8263,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -8714,7 +8719,9 @@ async fn proxy_to_backend(
     }
 
     // Forward headers, stripping hop-by-hop headers per RFC 9110 §7.6.1
-    // (canonical predicate in `proxy::headers`).
+    // (canonical predicate in `proxy::headers`). Also strip every header
+    // NAMED in the request's `Connection` field.
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -8727,6 +8734,7 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -9297,10 +9305,16 @@ fn record_request(state: &ProxyState, status: u16) {
 /// **except** `Set-Cookie` (RFC 6265) which must be emitted as separate header
 /// lines. We store multiple Set-Cookie values separated by `\n` so they can be
 /// split back into individual headers when building the downstream response.
+///
+/// `connection_listed_strip` carries the lowercase names that the response's
+/// `Connection` header named as additional hop-by-hop headers (RFC 9110
+/// §7.6.1). These are removed in the same pass as the canonical
+/// response-direction strip predicate.
 fn collect_response_headers_generic<'a, I>(
     source_keys_len: usize,
     source: I,
     target: &mut HashMap<String, String>,
+    connection_listed_strip: &[http::header::HeaderName],
 ) where
     I: IntoIterator<Item = (&'a http::header::HeaderName, &'a http::header::HeaderValue)>,
 {
@@ -9310,6 +9324,12 @@ fn collect_response_headers_generic<'a, I>(
         // (canonical predicate in `proxy::headers`; response-direction set
         // differs from the request-direction set).
         if headers_mod::is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        // RFC 9110 §7.6.1: also strip every header NAMED in the response's
+        // `Connection` field. Linear scan is fine — the list is typically
+        // empty and bounded by realistic header counts.
+        if connection_listed_strip.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -9335,7 +9355,8 @@ fn collect_response_headers(
     source: &reqwest::header::HeaderMap,
     target: &mut HashMap<String, String>,
 ) {
-    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+    let listed = headers_mod::parse_connection_listed_headers(source);
+    collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }
 
 /// Collect hyper response headers into a HashMap.
@@ -9344,7 +9365,8 @@ fn collect_response_headers(
 /// comma folding for other headers) but for `hyper::HeaderMap` instead of
 /// `reqwest::header::HeaderMap`. Used by the HTTP/2 multiplexing pool path.
 fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
-    collect_response_headers_generic(source.keys_len(), source.iter(), target);
+    let listed = headers_mod::parse_connection_listed_headers(source);
+    collect_response_headers_generic(source.keys_len(), source.iter(), target, &listed);
 }
 
 /// Trim optional whitespace (OWS: SP / HTAB) from both ends of a byte slice.
@@ -9761,6 +9783,7 @@ async fn proxy_to_backend_http2(
     // Clear and rebuild headers from the plugin-processed headers map
     parts.headers.clear();
     let effective_host = &proxy.backend_host;
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -9779,6 +9802,9 @@ async fn proxy_to_backend_http2(
             // value risked an authoritative-size mismatch with the framed
             // body when a request_transformer plugin mutated the body.
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1: also strip every header NAMED in the
+            // request's `Connection` field — see `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -9925,9 +9951,16 @@ fn build_http3_backend_headers(
     content_length: Option<&str>,
 ) -> Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> {
     let mut http3_headers = Vec::with_capacity(headers.len() + 5);
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         match name.as_str() {
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1: also strip every header NAMED in the
+            // request's `Connection` field. Hyper rejects `Connection` on
+            // H2/H3 frames, but the materialised request map can carry it
+            // when the client used H1 — strip on the way out so the H3
+            // backend never sees the listed names.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -10655,6 +10688,7 @@ async fn proxy_to_backend_http3_retry(
     // Build HTTP/3 headers from the saved headers map
     let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
         Vec::new();
+    let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
     for (name, value) in headers {
         match name.as_str() {
             // Hop-by-hop headers per RFC 9110 §7.6.1, plus content-length
@@ -10662,6 +10696,10 @@ async fn proxy_to_backend_http3_retry(
             // is informational and risks mismatch with body length when
             // a request_transformer plugin mutated the body).
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1 also requires stripping every header NAMED
+            // in the request's `Connection` field — see
+            // `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {

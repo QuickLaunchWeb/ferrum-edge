@@ -15,6 +15,24 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 
+/// Summary of routing changes affected by proxy adds, removals, or modifications.
+///
+/// Path-keyed routes and host-only routes use different cache keys, so callers
+/// that need targeted invalidation can inspect them separately.
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+pub struct AffectedRoutes {
+    pub listen_paths: Vec<String>,
+    pub host_only_hosts: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl AffectedRoutes {
+    pub fn is_empty(&self) -> bool {
+        self.listen_paths.is_empty() && self.host_only_hosts.is_empty()
+    }
+}
+
 /// Identifies which resources changed between two config snapshots.
 ///
 /// Used by request-epoch builders to decide which pre-computed inners can be
@@ -158,6 +176,59 @@ impl ConfigDelta {
         }
 
         ids
+    }
+
+    /// Collect routing identities affected by proxy changes.
+    #[allow(dead_code)]
+    pub fn affected_routes(&self, old_config: &GatewayConfig) -> AffectedRoutes {
+        let mut listen_paths = Vec::new();
+        let mut host_only_hosts = Vec::new();
+
+        let record =
+            |listen_paths: &mut Vec<String>, host_only_hosts: &mut Vec<String>, p: &Proxy| {
+                if p.dispatch_kind.is_stream() {
+                    return;
+                }
+
+                match p.listen_path.as_deref() {
+                    Some(path) => listen_paths.push(path.to_string()),
+                    None => host_only_hosts.extend(p.hosts.iter().cloned()),
+                }
+            };
+
+        for p in &self.added_proxies {
+            record(&mut listen_paths, &mut host_only_hosts, p);
+        }
+
+        let old_proxy_map: HashMap<&str, &Proxy> = old_config
+            .proxies
+            .iter()
+            .map(|p| (p.id.as_str(), p))
+            .collect();
+
+        for id in &self.removed_proxy_ids {
+            if let Some(p) = old_proxy_map.get(id.as_str()) {
+                record(&mut listen_paths, &mut host_only_hosts, p);
+            }
+        }
+
+        for p in &self.modified_proxies {
+            record(&mut listen_paths, &mut host_only_hosts, p);
+            if let Some(old_proxy) = old_proxy_map.get(p.id.as_str()) {
+                let routing_changed = old_proxy.dispatch_kind.is_stream()
+                    != p.dispatch_kind.is_stream()
+                    || old_proxy.listen_path != p.listen_path
+                    || old_proxy.hosts != p.hosts;
+                if routing_changed {
+                    record(&mut listen_paths, &mut host_only_hosts, old_proxy);
+                }
+            }
+        }
+
+        AffectedRoutes {
+            listen_paths,
+            host_only_hosts,
+        }
     }
 }
 

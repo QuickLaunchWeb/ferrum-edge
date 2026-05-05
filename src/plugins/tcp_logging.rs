@@ -535,6 +535,7 @@ mod tests {
             Some(ca_path.to_str().unwrap()),
             crl_list.clone(),
             "ferrum",
+            crate::config::BackendAllowIps::Both,
         );
 
         let plugin = TcpLogging::new(

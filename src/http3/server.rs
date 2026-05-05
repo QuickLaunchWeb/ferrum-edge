@@ -27,7 +27,10 @@ use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
-use crate::proxy::headers::{is_backend_request_strip_header, is_backend_response_strip_header};
+use crate::proxy::headers::{
+    is_backend_request_strip_header, is_backend_response_strip_header,
+    parse_connection_listed_from_str_map,
+};
 use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
     run_after_proxy_hooks, run_authentication_phase,
@@ -2601,6 +2604,7 @@ fn build_h3_backend_headers(
         .map(|t| t.host.as_str())
         .unwrap_or(proxy.backend_host.as_str());
 
+    let connection_listed_strip = parse_connection_listed_from_str_map(headers);
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -2615,6 +2619,9 @@ fn build_h3_backend_headers(
             }
             // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
             n if is_backend_request_strip_header(n) => continue,
+            // RFC 9110 §7.6.1 Connection-listed strip — see
+            // `parse_connection_listed_from_str_map`.
+            n if connection_listed_strip.iter().any(|s| s == n) => continue,
             k if k.starts_with(':') => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (

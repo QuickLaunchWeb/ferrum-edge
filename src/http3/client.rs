@@ -31,7 +31,7 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolManager};
-use crate::proxy::headers::is_backend_request_strip_header;
+use crate::proxy::headers::{is_backend_request_strip_header, parse_connection_listed_headers};
 
 /// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
 ///
@@ -1331,6 +1331,12 @@ impl Http3ConnectionPool {
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
+        // iterating so any header NAMED in `Connection` is also skipped
+        // during collection. Hyper rejects `Connection` on H2/H3 frames
+        // (RFC 9114 §4.2), so this is typically empty for native H3
+        // backends — the snapshot exists for defence in depth.
+        let connection_listed = parse_connection_listed_headers(response.headers());
         for (name, value) in response.headers() {
             // Skip hop-by-hop headers during collection (avoids allocating
             // String keys that would be immediately removed by the caller).
@@ -1338,6 +1344,10 @@ impl Http3ConnectionPool {
                 "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
                 | "trailer" | "transfer-encoding" | "upgrade" => continue,
                 _ => {}
+            }
+            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
+            if connection_listed.iter().any(|n| n == name) {
+                continue;
             }
             if let Ok(value_str) = value.to_str() {
                 response_headers.insert(name.as_str().to_string(), value_str.to_string());
@@ -1416,6 +1426,12 @@ impl Http3ConnectionPool {
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
+        // iterating so any header NAMED in `Connection` is also skipped
+        // during collection. Hyper rejects `Connection` on H2/H3 frames
+        // (RFC 9114 §4.2), so this is typically empty for native H3
+        // backends — the snapshot exists for defence in depth.
+        let connection_listed = parse_connection_listed_headers(response.headers());
         for (name, value) in response.headers() {
             // Skip hop-by-hop headers during collection (avoids allocating
             // String keys that would be immediately removed by the caller).
@@ -1423,6 +1439,10 @@ impl Http3ConnectionPool {
                 "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
                 | "trailer" | "transfer-encoding" | "upgrade" => continue,
                 _ => {}
+            }
+            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
+            if connection_listed.iter().any(|n| n == name) {
+                continue;
             }
             if let Ok(value_str) = value.to_str() {
                 response_headers.insert(name.as_str().to_string(), value_str.to_string());
@@ -1531,6 +1551,12 @@ impl Http3ConnectionPool {
         let status = response.status().as_u16();
 
         let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        // RFC 9110 §7.6.1: snapshot the Connection-listed names before
+        // iterating so any header NAMED in `Connection` is also skipped
+        // during collection. Hyper rejects `Connection` on H2/H3 frames
+        // (RFC 9114 §4.2), so this is typically empty for native H3
+        // backends — the snapshot exists for defence in depth.
+        let connection_listed = parse_connection_listed_headers(response.headers());
         for (name, value) in response.headers() {
             // Skip hop-by-hop headers during collection (avoids allocating
             // String keys that would be immediately removed by the caller).
@@ -1538,6 +1564,10 @@ impl Http3ConnectionPool {
                 "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
                 | "trailer" | "transfer-encoding" | "upgrade" => continue,
                 _ => {}
+            }
+            // RFC 9110 §7.6.1: also skip every header NAMED in `Connection`.
+            if connection_listed.iter().any(|n| n == name) {
+                continue;
             }
             if let Ok(value_str) = value.to_str() {
                 response_headers.insert(name.as_str().to_string(), value_str.to_string());

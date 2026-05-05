@@ -45,6 +45,7 @@ use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
 use crate::proxy::headers::{
     is_backend_response_strip_header, merge_proxy_headers_and_strip_for_grpc,
+    parse_connection_listed_headers,
 };
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{BackendTlsConfigBuilder, BackendTlsConfigCache};
@@ -1320,8 +1321,16 @@ pub async fn proxy_grpc_request_streaming(
     // gRPC response paths cannot drift.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    // Snapshot any Connection-listed names before the canonical strip so
+    // we can also remove them per RFC 9110 §7.6.1. Hyper rejects
+    // `Connection` on H2 frames (RFC 9113 §8.2.2), so this is typically
+    // a no-op for valid gRPC backends — present for defence in depth.
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
@@ -1480,11 +1489,16 @@ pub(crate) async fn proxy_grpc_request_core(
     };
 
     // Extract response status and headers, stripping hop-by-hop headers
-    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`).
+    // per RFC 9110 §7.6.1 (canonical predicate in `proxy::headers`),
+    // including any header NAMED in the response's `Connection` field.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    let connection_listed = parse_connection_listed_headers(response.headers());
     for (k, v) in response.headers() {
         if is_backend_response_strip_header(k.as_str()) {
+            continue;
+        }
+        if connection_listed.iter().any(|n| n == k) {
             continue;
         }
         if let Ok(vs) = v.to_str() {
