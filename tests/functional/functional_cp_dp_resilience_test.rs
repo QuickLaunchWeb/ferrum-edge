@@ -182,6 +182,8 @@ fn build_cp_admin_state(
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: Some(registry),
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     }
 }
 
@@ -212,6 +214,8 @@ fn build_dp_admin_state(
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         cp_connection_state: Some(conn_state),
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     }
 }
 

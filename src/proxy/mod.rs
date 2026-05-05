@@ -5949,38 +5949,27 @@ async fn handle_proxy_request_inner(
     // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
-        if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            // real_ip_header is pre-lowercased at config load time — no allocation needed
-            let header_val = ctx.raw_header_get(real_ip_header.as_str());
-            if let Some(val) = header_val {
-                // Validate the direct connection is from a trusted proxy before
-                // trusting this header
-                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
-                    let trimmed = val.trim();
-                    // Only allocate if the resolved IP differs from socket_ip
-                    if trimmed != socket_ip {
-                        ctx.client_ip = trimmed.to_owned();
-                    }
-                }
-                // else: untrusted proxy, keep socket_ip (already set in ctx)
-            } else if let Some(ref addr) = socket_addr {
-                ctx.client_ip = client_ip::resolve_client_ip_parsed(
-                    &socket_ip,
-                    addr,
-                    ctx.raw_header_get("x-forwarded-for"),
-                    &state.trusted_proxies,
-                );
-            }
-            // else: no header + unparseable socket_ip, keep socket_ip (already set in ctx)
-        } else if let Some(ref addr) = socket_addr {
-            ctx.client_ip = client_ip::resolve_client_ip_parsed(
+        if let Some(ref addr) = socket_addr {
+            let real_ip_header_val =
+                state
+                    .env_config
+                    .real_ip_header
+                    .as_ref()
+                    .and_then(|real_ip_header| {
+                        // real_ip_header is pre-lowercased at config load time — no allocation needed
+                        ctx.raw_header_get(real_ip_header.as_str())
+                    });
+            if let Some(resolved) = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
                 addr,
+                real_ip_header_val,
                 ctx.raw_header_get("x-forwarded-for"),
                 &state.trusted_proxies,
-            );
+            ) {
+                ctx.client_ip = resolved;
+            }
         }
-        // else: unparseable socket_ip with no real_ip_header, keep socket_ip (already set in ctx)
+        // else: unparseable socket_ip, keep socket_ip (already set in ctx)
     }
 
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,

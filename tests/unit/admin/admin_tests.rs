@@ -10,6 +10,8 @@ use ferrum_edge::admin::{
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 /// Test configuration for admin API
@@ -63,6 +65,8 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     }
 }
 
@@ -134,6 +138,55 @@ async fn test_admin_api_integration() {
     let token = generate_test_token(&config, "test-user");
     let result = admin_state.jwt_manager.verify_token(&token);
     assert!(result.is_ok(), "Generated token should be valid");
+}
+
+#[tokio::test]
+async fn test_admin_http1_slow_header_timeout_closes_connection() {
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.admin_http_header_read_timeout_seconds = 1;
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(listener, admin_state, shutdown_rx, None).await
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener");
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .expect("write partial headers");
+
+    let mut buf = [0u8; 1];
+    let read_result = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("admin listener should close slow header connection");
+
+    match read_result {
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        other => panic!("expected EOF or reset after header timeout, got {other:?}"),
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("admin listener task should stop")
+        .expect("admin listener task join")
+        .expect("admin listener should exit cleanly");
 }
 
 #[tokio::test]
