@@ -14,10 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendScheme, GatewayConfig};
-use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
-use crate::load_balancer::LoadBalancerCache;
-use crate::plugin_cache::PluginCache;
 use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
 
@@ -126,9 +123,7 @@ impl StreamListenerManager {
         bind_addr: IpAddr,
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
         dns_cache: DnsCache,
-        load_balancer_cache: Arc<LoadBalancerCache>,
-        consumer_index: Arc<ConsumerIndex>,
-        plugin_cache: Arc<PluginCache>,
+        request_epoch: Arc<RequestEpochStore>,
         circuit_breaker_cache: Arc<CircuitBreakerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
@@ -151,13 +146,6 @@ impl StreamListenerManager {
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
     ) -> Self {
-        let config_snapshot = config.load_full();
-        let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
-            config_snapshot.as_ref().clone(),
-            &plugin_cache,
-            &consumer_index,
-            &load_balancer_cache,
-        ));
         Self::new_with_epoch(
             bind_addr,
             config,

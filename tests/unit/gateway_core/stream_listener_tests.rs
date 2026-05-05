@@ -11,6 +11,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::stream_listener::StreamListenerManager;
+use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,15 +90,19 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
     let lb_cache = Arc::new(LoadBalancerCache::new(&config));
     let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
     let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
+    let request_epoch = Arc::new(RequestEpochStore::from_runtime_parts(
+        config.clone(),
+        &plugin_cache,
+        &consumer_index,
+        &lb_cache,
+    ));
     let cb_cache = Arc::new(CircuitBreakerCache::new());
 
     StreamListenerManager::new(
         "127.0.0.1".parse::<IpAddr>().unwrap(),
         config_arc,
         dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
+        request_epoch,
         cb_cache,
         None, // no frontend TLS
         false,
@@ -158,45 +163,7 @@ async fn test_reconcile_starts_tcp_listener() {
         ..empty_config()
     };
 
-    // Create manager with config containing the TCP proxy
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     assert!(
@@ -226,44 +193,7 @@ async fn test_reconcile_starts_udp_listener() {
         ..empty_config()
     };
 
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     assert!(
@@ -305,44 +235,7 @@ async fn test_reconcile_detects_port_conflict() {
         ..empty_config()
     };
 
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     assert_eq!(
@@ -378,45 +271,8 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         ..empty_config()
     };
 
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
     // Create manager without TLS config (None)
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None, // No frontend TLS config
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     // No failures — the listener should be deferred, not failed
@@ -446,45 +302,8 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         ..empty_config()
     };
 
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
     // Create manager without DTLS config
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     assert!(
@@ -518,44 +337,7 @@ async fn test_shutdown_all_releases_ports() {
         ..empty_config()
     };
 
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     assert!(failures.is_empty());
@@ -600,44 +382,7 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         ..empty_config()
     };
 
-    let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let dns_cache = DnsCache::new(DnsConfig::default());
-    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
-    let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
-    let plugin_cache = Arc::new(PluginCache::new(&config).expect("PluginCache::new failed"));
-    let cb_cache = Arc::new(CircuitBreakerCache::new());
-
-    let manager = StreamListenerManager::new(
-        "127.0.0.1".parse::<IpAddr>().unwrap(),
-        config_arc,
-        dns_cache,
-        lb_cache,
-        consumer_index,
-        plugin_cache,
-        cb_cache,
-        None,
-        false,
-        None,
-        300,
-        300, // tcp_half_close_max_wait_seconds
-        10,  // frontend_tls_handshake_timeout_seconds
-        10_000,
-        10,
-        None,
-        Arc::new(Vec::new()),
-        Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
-            true, true, 300, 8192, 262_144, 65_536, 6000,
-        )),
-        64,
-        true,
-        Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false, // ktls_enabled
-        false, // io_uring_splice_enabled
-        0,     // so_busy_poll_us
-        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false, // udp_gso_enabled
-        false, // udp_pktinfo_enabled
-    );
+    let manager = create_manager(config);
 
     let failures = manager.reconcile().await;
     assert!(failures.is_empty());
