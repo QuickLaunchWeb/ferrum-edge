@@ -340,6 +340,47 @@ fn wait_for_drain_does_not_clear_begin_drain_flags() {
     assert!(state.reject_new_requests.load(Ordering::Acquire));
 }
 
+#[tokio::test]
+async fn overload_monitor_preserves_reject_new_requests_during_drain() {
+    let state = Arc::new(OverloadState::new());
+    let _conn_guard = ConnectionGuard::new(&state);
+    ferrum_edge::overload::begin_drain(&state);
+
+    let config = OverloadConfig {
+        check_interval_ms: 1,
+        ..OverloadConfig::default()
+    };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let monitor =
+        ferrum_edge::overload::start_monitor(state.clone(), config, 1000, 10, shutdown_rx);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while state.conn_current.load(Ordering::Relaxed) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("overload monitor did not tick");
+
+    assert!(
+        state.draining.load(Ordering::Acquire),
+        "monitor tick must not clear draining",
+    );
+    assert!(
+        state.reject_new_requests.load(Ordering::Acquire),
+        "monitor tick must preserve request rejection while draining, even \
+         when request pressure is below the critical threshold",
+    );
+
+    shutdown_tx
+        .send(true)
+        .expect("monitor shutdown receiver should still be alive");
+    tokio::time::timeout(Duration::from_secs(1), monitor)
+        .await
+        .expect("overload monitor did not stop")
+        .expect("overload monitor task panicked");
+}
+
 // ── OverloadConfig ──────────────────────────────────────────────────
 
 #[test]

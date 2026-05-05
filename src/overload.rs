@@ -648,10 +648,16 @@ pub fn start_monitor(
                 || conn_ratio >= config.conn_critical_threshold
                 || loop_us >= config.loop_critical_us;
 
-            // Request-level rejection is independent — only triggers when
-            // FERRUM_MAX_REQUESTS is configured (non-zero).
-            let should_reject_requests =
+            // Request-level overload rejection only triggers when
+            // FERRUM_MAX_REQUESTS is configured (non-zero). Shutdown drain is
+            // also a request-admission rejection source: once begin_drain()
+            // has published draining=true with Release ordering, the monitor
+            // must preserve that state instead of clearing reject_new_requests
+            // during a low-pressure sample.
+            let should_reject_requests_due_to_pressure =
                 max_requests > 0 && req_ratio >= config.req_critical_threshold;
+            let should_reject_requests =
+                state.draining.load(Ordering::Acquire) || should_reject_requests_due_to_pressure;
 
             // ── RED-style smooth ramp between pressure and critical thresholds ──
             // For BOTH fd and connection pressure, compute probability independently
@@ -695,7 +701,7 @@ pub fn start_monitor(
 
             // Transition logging — only log when state changes
             let was_rejecting = state.reject_new_connections.load(Ordering::Relaxed);
-            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Relaxed);
+            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Acquire);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
 
             state
@@ -706,7 +712,7 @@ pub fn start_monitor(
                 .store(should_reject, Ordering::Relaxed);
             state
                 .reject_new_requests
-                .store(should_reject_requests, Ordering::Relaxed);
+                .store(should_reject_requests, Ordering::Release);
 
             if should_reject && !was_rejecting {
                 warn!(
