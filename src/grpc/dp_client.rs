@@ -32,7 +32,7 @@ use super::proto::config_sync_client::ConfigSyncClient;
 use crate::FERRUM_VERSION;
 use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
-use crate::proxy::ProxyState;
+use crate::proxy::{IncrementalApplyOutcome, ProxyState};
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -67,16 +67,43 @@ impl DpCpConnectionState {
 /// This wrapper exists so the compiler catches callers who accidentally pass a
 /// pre-signed JWT token where a shared secret is now expected. Before this change
 /// both were `String`, so the old code compiled silently with the wrong value.
+///
+/// The wrapper also carries the expected `iss` claim
+/// (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) since the secret and issuer always travel
+/// together: every token minted with this secret needs to bear the configured
+/// issuer or the CP will reject it.
 #[derive(Clone, Debug)]
-pub struct GrpcJwtSecret(pub String);
+pub struct GrpcJwtSecret {
+    secret: String,
+    issuer: String,
+}
 
 impl GrpcJwtSecret {
+    /// Create a `GrpcJwtSecret` with the default issuer
+    /// (`crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER`).
+    ///
+    /// Used by tests and library callers; production binary code path uses
+    /// [`GrpcJwtSecret::with_issuer`] so the operator-configured
+    /// `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored.
+    #[allow(dead_code)]
     pub fn new(secret: String) -> Self {
-        Self(secret)
+        Self::with_issuer(
+            secret,
+            crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER.to_string(),
+        )
+    }
+
+    /// Create a `GrpcJwtSecret` with an operator-configured issuer.
+    pub fn with_issuer(secret: String, issuer: String) -> Self {
+        Self { secret, issuer }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.secret
+    }
+
+    pub fn issuer(&self) -> &str {
+        &self.issuer
     }
 }
 
@@ -98,18 +125,42 @@ pub struct DpGrpcTlsConfig {
 /// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
 const DP_JWT_TTL_SECONDS: i64 = 3540;
 
+/// Generate a short-lived HS256 JWT for authenticating the DP to the CP using
+/// the default issuer (`DEFAULT_CP_DP_JWT_ISSUER`).
+///
+/// Most production callers should prefer [`generate_dp_jwt_with_issuer`] so
+/// the operator-configured `FERRUM_CP_DP_GRPC_JWT_ISSUER` is honored. This
+/// helper is kept for tests and library callers that want the default behavior
+/// without threading the issuer through.
+#[allow(dead_code)]
+pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
+    generate_dp_jwt_with_issuer(
+        secret,
+        node_id,
+        crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER,
+    )
+}
+
 /// Generate a short-lived HS256 JWT for authenticating the DP to the CP.
 ///
 /// The token is signed with the shared `FERRUM_CP_DP_GRPC_JWT_SECRET` and
-/// includes `sub`, `iat`, `exp`, and `role` claims. A fresh token is minted
+/// includes `sub`, `iat`, `exp`, `iss`, and `role` claims. The `iss` claim
+/// is set to `issuer` (operator-configured via `FERRUM_CP_DP_GRPC_JWT_ISSUER`,
+/// default `"ferrum-edge-cp-dp"`) and MUST match the value the CP expects —
+/// the CP rejects any token with a different `iss`. A fresh token is minted
 /// on each gRPC connection attempt so that tokens captured from the wire
 /// are only valid for ~59 minutes.
-pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
+pub fn generate_dp_jwt_with_issuer(
+    secret: &str,
+    node_id: &str,
+    issuer: &str,
+) -> Result<String, anyhow::Error> {
     let now = chrono::Utc::now().timestamp();
     let claims = json!({
         "sub": node_id,
         "iat": now,
         "exp": now + DP_JWT_TTL_SECONDS,
+        "iss": issuer,
         "role": "data_plane",
     });
     let token = encode(
@@ -465,11 +516,15 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
     let channel = endpoint.connect().await?;
 
-    // Mint a fresh short-lived JWT for this connection attempt.
-    let auth_token = generate_dp_jwt(jwt_secret.as_str(), node_id)?;
+    // Mint a fresh short-lived JWT for this connection attempt. The `iss`
+    // claim is set from the operator-configured issuer carried alongside
+    // the shared secret; the CP rejects any token with a mismatched `iss`.
+    let auth_token =
+        generate_dp_jwt_with_issuer(jwt_secret.as_str(), node_id, jwt_secret.issuer())?;
     info!(
-        "Generated fresh DP JWT (TTL={}s) for CP authentication",
-        DP_JWT_TTL_SECONDS
+        "Generated fresh DP JWT (TTL={}s, iss='{}') for CP authentication",
+        DP_JWT_TTL_SECONDS,
+        jwt_secret.issuer()
     );
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
@@ -525,6 +580,21 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 // FULL_SNAPSHOT — replace entire config
                 match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
+                        // Defense in depth: even though the CP-side
+                        // namespace check should prevent any
+                        // cross-namespace resources from reaching this
+                        // DP, filter again locally so a CP regression or
+                        // buggy/malicious snapshot can't leak resources
+                        // from another tenant into this DP's
+                        // GatewayConfig. See `filter_config_to_namespace`.
+                        let filtered = filter_config_to_namespace(&mut config, namespace);
+                        if filtered > 0 {
+                            warn!(
+                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
+                                 the CP should have filtered these (verify CP namespace matches DP)",
+                                namespace, filtered
+                            );
+                        }
                         config.normalize_fields();
                         config.resolve_upstream_tls();
                         if let Err(errors) = config.validate_all_fields_with_ip_policy(
@@ -615,10 +685,95 @@ pub async fn connect_and_subscribe_with_startup_ready(
             1 => {
                 // DELTA — apply incremental changes only
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
-                    Ok(result) => {
-                        if proxy_state.apply_incremental(result).await {
-                            update_state_config_received(connection_state);
-                            info!("Incremental config delta applied from CP");
+                    Ok(mut result) => {
+                        // Defense in depth: filter cross-namespace
+                        // additions/modifications before applying. See
+                        // `filter_incremental_to_namespace`.
+                        let filtered = filter_incremental_to_namespace(&mut result, namespace);
+                        if filtered > 0 {
+                            warn!(
+                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP delta",
+                                namespace, filtered
+                            );
+                        }
+
+                        // Empty deltas mean "nothing changed since last poll" — the
+                        // CP poll loop suppresses these (see modes/control_plane.rs),
+                        // but a custom CP or test could still emit one. Treat as
+                        // benign so we don't trip the divergence log below.
+                        let was_empty = result.is_empty();
+
+                        // Capture summary BEFORE moving `result` into apply_incremental
+                        // so the rejection log can identify the divergent CP push.
+                        let added_proxy_ids: Vec<String> = result
+                            .added_or_modified_proxies
+                            .iter()
+                            .map(|p| p.id.clone())
+                            .collect();
+                        let added_upstream_ids: Vec<String> = result
+                            .added_or_modified_upstreams
+                            .iter()
+                            .map(|u| u.id.clone())
+                            .collect();
+                        let added_consumer_ids: Vec<String> = result
+                            .added_or_modified_consumers
+                            .iter()
+                            .map(|c| c.id.clone())
+                            .collect();
+                        let added_plugin_config_ids: Vec<String> = result
+                            .added_or_modified_plugin_configs
+                            .iter()
+                            .map(|pc| pc.id.clone())
+                            .collect();
+                        let removed_proxy_ids = result.removed_proxy_ids.clone();
+                        let removed_upstream_ids = result.removed_upstream_ids.clone();
+                        let removed_consumer_ids = result.removed_consumer_ids.clone();
+                        let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
+                        let cp_version = update.ferrum_version.clone();
+                        let update_version = update.version;
+
+                        match proxy_state.apply_incremental(result).await {
+                            IncrementalApplyOutcome::Applied => {
+                                update_state_config_received(connection_state);
+                                info!("Incremental config delta applied from CP");
+                            }
+                            IncrementalApplyOutcome::NoChanges => {
+                                // Empty delta — preserve original behavior of not
+                                // touching `last_config_received_at` so cluster
+                                // observability still reflects only deltas that
+                                // carried real changes.
+                                if was_empty {
+                                    tracing::debug!(
+                                        "Ignoring empty delta from CP (no resource changes)"
+                                    );
+                                }
+                            }
+                            IncrementalApplyOutcome::Rejected => {
+                                if was_empty {
+                                    tracing::debug!(
+                                        "Ignoring rejected empty delta from CP (no resource changes)"
+                                    );
+                                } else {
+                                    // apply_incremental rejected a non-empty delta
+                                    // — surface the divergence to operators so the
+                                    // DP does not silently keep serving its cached
+                                    // config until the next full snapshot.
+                                    error!(
+                                        cp_version = %cp_version,
+                                        update_version = update_version,
+                                        added_proxies = ?added_proxy_ids,
+                                        removed_proxies = ?removed_proxy_ids,
+                                        added_upstreams = ?added_upstream_ids,
+                                        removed_upstreams = ?removed_upstream_ids,
+                                        added_consumers = ?added_consumer_ids,
+                                        removed_consumers = ?removed_consumer_ids,
+                                        added_plugin_configs = ?added_plugin_config_ids,
+                                        removed_plugin_configs = ?removed_plugin_config_ids,
+                                        "DP rejected CP-pushed delta — divergence possible until next full snapshot. \
+                                         See preceding 'Incremental config rejected' log lines for the underlying reason."
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -633,6 +788,70 @@ pub async fn connect_and_subscribe_with_startup_ready(
     }
 
     Ok(())
+}
+
+/// Defense-in-depth: filter a full config snapshot to only the DP's
+/// configured namespace before applying.
+///
+/// The CP-side `check_namespace` guard already rejects DP subscriptions that
+/// advertise a mismatched namespace, so under normal operation this filter
+/// is a no-op (the snapshot the CP sends is already single-namespace).
+/// We still run it because:
+///
+/// 1. A future bug or regression on the CP side that re-enables
+///    cross-namespace serving would silently leak resources to the DP.
+///    The DP enforcing its own namespace bound prevents that.
+/// 2. The serialization is JSON, so a malicious or buggy CP could craft
+///    a snapshot whose `proxies[i].namespace != requested_namespace`.
+///    Belt-and-braces is cheap.
+///
+/// Returns the number of resources filtered out so the caller can warn.
+fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> usize {
+    let pre = (
+        config.proxies.len(),
+        config.consumers.len(),
+        config.plugin_configs.len(),
+        config.upstreams.len(),
+    );
+    config.proxies.retain(|p| p.namespace == namespace);
+    config.consumers.retain(|c| c.namespace == namespace);
+    config.plugin_configs.retain(|pc| pc.namespace == namespace);
+    config.upstreams.retain(|u| u.namespace == namespace);
+    (pre.0 - config.proxies.len())
+        + (pre.1 - config.consumers.len())
+        + (pre.2 - config.plugin_configs.len())
+        + (pre.3 - config.upstreams.len())
+}
+
+/// Defense-in-depth filter for incremental deltas. Applied to
+/// `added_or_modified_*` vectors only; removal IDs are namespace-agnostic
+/// and harmless on the DP side because they only delete resources the DP
+/// already has (which were themselves filtered through this same check).
+///
+/// Returns the number of resources filtered out so the caller can warn.
+fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
+    let pre = (
+        result.added_or_modified_proxies.len(),
+        result.added_or_modified_consumers.len(),
+        result.added_or_modified_plugin_configs.len(),
+        result.added_or_modified_upstreams.len(),
+    );
+    result
+        .added_or_modified_proxies
+        .retain(|p| p.namespace == namespace);
+    result
+        .added_or_modified_consumers
+        .retain(|c| c.namespace == namespace);
+    result
+        .added_or_modified_plugin_configs
+        .retain(|pc| pc.namespace == namespace);
+    result
+        .added_or_modified_upstreams
+        .retain(|u| u.namespace == namespace);
+    (pre.0 - result.added_or_modified_proxies.len())
+        + (pre.1 - result.added_or_modified_consumers.len())
+        + (pre.2 - result.added_or_modified_plugin_configs.len())
+        + (pre.3 - result.added_or_modified_upstreams.len())
 }
 
 /// Check whether the CP's reported version is compatible with this DP.
@@ -660,4 +879,164 @@ fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for the DP-side namespace filter helpers. These are
+    //! private functions, so they live alongside the implementation rather
+    //! than in `tests/`. The end-to-end behavior is exercised by
+    //! `tests/integration/cp_dp_grpc_tests.rs` via
+    //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn proxy_in_namespace(id: &str, ns: &str) -> crate::config::types::Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "backend_host": "example.com",
+            "backend_port": 443,
+        }))
+        .expect("proxy fixture should deserialize")
+    }
+
+    fn upstream_in_namespace(id: &str, ns: &str) -> crate::config::types::Upstream {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "targets": [{"host": "example.com", "port": 443, "weight": 100}],
+            "algorithm": "round_robin",
+        }))
+        .expect("upstream fixture should deserialize")
+    }
+
+    fn consumer_in_namespace(id: &str, ns: &str) -> crate::config::types::Consumer {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "username": id,
+            "credentials": {},
+        }))
+        .expect("consumer fixture should deserialize")
+    }
+
+    fn plugin_config_in_namespace(id: &str, ns: &str) -> crate::config::types::PluginConfig {
+        serde_json::from_value(json!({
+            "id": id,
+            "namespace": ns,
+            "plugin_name": "rate_limiting",
+            "config": {},
+            "scope": "global",
+        }))
+        .expect("plugin_config fixture should deserialize")
+    }
+
+    #[test]
+    fn filter_config_keeps_matching_namespace_only() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![
+                proxy_in_namespace("p-prod", "production"),
+                proxy_in_namespace("p-staging", "staging"),
+                proxy_in_namespace("p-prod-2", "production"),
+            ],
+            consumers: vec![
+                consumer_in_namespace("c-prod", "production"),
+                consumer_in_namespace("c-staging", "staging"),
+            ],
+            plugin_configs: vec![
+                plugin_config_in_namespace("pc-prod", "production"),
+                plugin_config_in_namespace("pc-staging", "staging"),
+            ],
+            upstreams: vec![
+                upstream_in_namespace("u-prod", "production"),
+                upstream_in_namespace("u-staging", "staging"),
+            ],
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+
+        let filtered = filter_config_to_namespace(&mut cfg, "production");
+        assert_eq!(filtered, 4, "1 proxy + 1 consumer + 1 plugin + 1 upstream");
+
+        assert_eq!(cfg.proxies.len(), 2);
+        assert!(cfg.proxies.iter().all(|p| p.namespace == "production"));
+        assert_eq!(cfg.consumers.len(), 1);
+        assert_eq!(cfg.consumers[0].namespace, "production");
+        assert_eq!(cfg.plugin_configs.len(), 1);
+        assert_eq!(cfg.plugin_configs[0].namespace, "production");
+        assert_eq!(cfg.upstreams.len(), 1);
+        assert_eq!(cfg.upstreams[0].namespace, "production");
+    }
+
+    #[test]
+    fn filter_config_returns_zero_when_clean() {
+        let mut cfg = GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy_in_namespace("p-prod", "production")],
+            consumers: vec![],
+            plugin_configs: vec![],
+            upstreams: vec![],
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+        };
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        assert_eq!(cfg.proxies.len(), 1);
+    }
+
+    #[test]
+    fn filter_incremental_keeps_matching_namespace_only() {
+        let mut delta = IncrementalResult {
+            added_or_modified_proxies: vec![
+                proxy_in_namespace("p-prod", "production"),
+                proxy_in_namespace("p-staging", "staging"),
+            ],
+            removed_proxy_ids: vec!["doesnt-matter".to_string()],
+            added_or_modified_consumers: vec![consumer_in_namespace("c-staging", "staging")],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![plugin_config_in_namespace(
+                "pc-prod",
+                "production",
+            )],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![
+                upstream_in_namespace("u-prod", "production"),
+                upstream_in_namespace("u-staging", "staging"),
+            ],
+            removed_upstream_ids: vec![],
+            poll_timestamp: Utc::now(),
+        };
+
+        let filtered = filter_incremental_to_namespace(&mut delta, "production");
+        assert_eq!(filtered, 3, "1 proxy + 1 consumer + 1 upstream filtered");
+
+        assert_eq!(delta.added_or_modified_proxies.len(), 1);
+        assert_eq!(delta.added_or_modified_proxies[0].namespace, "production");
+        assert!(delta.added_or_modified_consumers.is_empty());
+        assert_eq!(delta.added_or_modified_plugin_configs.len(), 1);
+        assert_eq!(delta.added_or_modified_upstreams.len(), 1);
+
+        // Removal IDs are intentionally NOT filtered — the DP only has
+        // resources in its own namespace anyway, so deleting an unknown ID
+        // is harmless.
+        assert_eq!(delta.removed_proxy_ids.len(), 1);
+    }
+
+    #[test]
+    fn filter_incremental_returns_zero_when_empty() {
+        let mut delta = IncrementalResult {
+            added_or_modified_proxies: vec![],
+            removed_proxy_ids: vec![],
+            added_or_modified_consumers: vec![],
+            removed_consumer_ids: vec![],
+            added_or_modified_plugin_configs: vec![],
+            removed_plugin_config_ids: vec![],
+            added_or_modified_upstreams: vec![],
+            removed_upstream_ids: vec![],
+            poll_timestamp: Utc::now(),
+        };
+        assert_eq!(filter_incremental_to_namespace(&mut delta, "production"), 0);
+    }
 }

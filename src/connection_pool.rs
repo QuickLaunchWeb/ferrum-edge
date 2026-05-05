@@ -206,6 +206,7 @@ impl ConnectionPool {
     ) -> Self {
         let cleanup_interval =
             Duration::from_secs(mtls_config.pool_cleanup_interval_seconds.max(1));
+        let shards = crate::util::sharding::pool_shard_amount(mtls_config.pool_shard_amount);
         let manager = Arc::new(ReqwestPoolManager {
             global_config: global_config.clone(),
             global_env_config: mtls_config,
@@ -216,7 +217,7 @@ impl ConnectionPool {
         });
 
         Self {
-            pool: GenericPool::new(manager, global_config, cleanup_interval),
+            pool: GenericPool::new(manager, global_config, cleanup_interval, shards),
         }
     }
 

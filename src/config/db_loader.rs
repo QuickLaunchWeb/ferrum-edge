@@ -1061,12 +1061,25 @@ impl DatabaseStore {
         Ok(Some(proxy))
     }
 
-    pub async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+    /// Check whether a proxy with the given ID exists in `namespace`.
+    ///
+    /// The `namespace` filter is required: admin-API callers must scope
+    /// reference checks to the requesting tenant's namespace so that, for
+    /// example, a `plugin_config.proxy_id` cannot point at a proxy that lives
+    /// in a different namespace (such a config would never load at runtime
+    /// because the polling path filters by namespace).
+    pub async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ?"))
-            .bind(proxy_id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ? AND namespace = ?"))
+                .bind(proxy_id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
         self.check_slow_query("check_proxy_exists", start);
         Ok(row.is_some())
     }
@@ -2017,14 +2030,24 @@ impl DatabaseStore {
         Ok(rows.is_empty())
     }
 
-    /// Check if an upstream with the given ID exists.
-    /// Returns `true` if the upstream exists.
-    pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+    /// Check if an upstream with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace.
+    ///
+    /// The `namespace` filter is mandatory: cross-namespace references would
+    /// pass admin validation but silently 502 at runtime because the proxy
+    /// load path filters upstreams by namespace.
+    pub async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ?"))
-            .bind(upstream_id)
-            .fetch_optional(&self.pool())
-            .await?;
+        let row: Option<AnyRow> =
+            sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ? AND namespace = ?"))
+                .bind(upstream_id)
+                .bind(namespace)
+                .fetch_optional(&self.pool())
+                .await?;
         self.check_slow_query("check_upstream_exists", start);
         Ok(row.is_some())
     }
@@ -2032,9 +2055,15 @@ impl DatabaseStore {
     /// Validate that a proxy's plugin associations reference existing
     /// proxy-scoped plugin configs targeted at the same proxy, and that the
     /// resolved plugin names remain unique for that proxy.
+    ///
+    /// Plugin configs are resolved only within `namespace`. References to
+    /// plugin_configs in a different namespace surface as
+    /// `non-existent plugin_config '<id>'` errors so admin validation
+    /// cannot admit cross-namespace pollution.
     pub async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         associations: &[PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
         if associations.is_empty() {
@@ -2056,7 +2085,9 @@ impl DatabaseStore {
             }
         }
 
-        let plugin_refs = self.load_plugin_config_refs(&requested_ids).await?;
+        let plugin_refs = self
+            .load_plugin_config_refs(&requested_ids, namespace)
+            .await?;
 
         for assoc in associations {
             match plugin_refs.get(assoc.plugin_config_id.as_str()) {
@@ -2374,9 +2405,14 @@ impl DatabaseStore {
         Ok(ids)
     }
 
+    /// Load `(id, scope, proxy_id)` for each plugin_config ID **within
+    /// `namespace`**. Rows whose namespace does not match are filtered out
+    /// at the SQL layer, so callers using the result map to validate
+    /// references will report rows in other namespaces as missing.
     async fn load_plugin_config_refs(
         &self,
         ids: &[String],
+        namespace: &str,
     ) -> Result<std::collections::HashMap<String, PluginConfigRef>, anyhow::Error> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -2386,11 +2422,12 @@ impl DatabaseStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = self.q(&format!(
-            "SELECT id, scope, proxy_id FROM plugin_configs WHERE id IN ({})",
+            "SELECT id, scope, proxy_id FROM plugin_configs WHERE namespace = ? AND id IN ({})",
             placeholders
         ));
 
         let mut query = sqlx::query(&sql);
+        query = query.bind(namespace);
         for id in ids {
             query = query.bind(id);
         }
@@ -3326,8 +3363,12 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::get_proxy(self, id).await
     }
 
-    async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_proxy_exists(self, proxy_id).await
+    async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_proxy_exists(self, proxy_id, namespace).await
     }
 
     async fn list_proxies_paginated(
@@ -3498,16 +3539,21 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
     }
 
-    async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_upstream_exists(self, upstream_id).await
+    async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_upstream_exists(self, upstream_id, namespace).await
     }
 
     async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         plugins: &[crate::config::types::PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
-        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, plugins).await
+        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, namespace, plugins).await
     }
 
     async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
@@ -3613,6 +3659,31 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
         DatabaseStore::maybe_apply_deferred_migrations(self).await
+    }
+
+    async fn pending_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        let status = runner.plugin_status(plugin_migrations).await?;
+        Ok(status.pending)
+    }
+
+    async fn apply_plugin_migrations(
+        &self,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let runner =
+            crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
+        runner.run_plugin_pending(plugin_migrations).await
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {

@@ -76,7 +76,9 @@ PRs: format check → tests (parallel) → lint → perf regression → build 5 
 
 ### Startup
 
-jemalloc (non-Windows) → CLI parse + env overrides (before `CONF_FILE_CACHE`) → rustls ring provider → tracing-subscriber non-blocking stdout → `validate` exits here → secret resolution (single-threaded rt, `std::env::set_var` is unsafe with concurrent threads) → `EnvConfig` parse → multi-threaded tokio → mode dispatch → SIGINT/SIGTERM via `watch::channel`.
+jemalloc (non-Windows) → CLI parse + env overrides (before `CONF_FILE_CACHE`) → rustls ring provider → tracing-subscriber non-blocking stdout → `validate` exits here → secret resolution (single-threaded rt, `std::env::set_var` is unsafe with concurrent threads) → `overload::raise_fd_limit()` (Unix only; raises `RLIMIT_NOFILE.rlim_cur` to `rlim_max`, never asks for privileges we don't have, no-op when denied) → `EnvConfig` parse → multi-threaded tokio → mode dispatch → SIGINT/SIGTERM via `watch::channel`.
+
+**FD soft-cap raise**: `raise_fd_limit()` runs once after logging is up so the result reaches stderr/structured logs. We never attempt to raise the *hard* cap (it requires `CAP_SYS_RESOURCE`) — operators set the hard cap via `LimitNOFILE=` (systemd), `--ulimit nofile=` (Docker), or `/etc/security/limits.conf`. When the effective soft cap after startup is below `FD_HARD_LIMIT_PRODUCTION_FLOOR` (65,536), startup emits a single structured `warn!` with the suggested remediation and continues. Below the floor the gateway will still serve, but its 95% FD-critical threshold trips earlier under load.
 
 Per serving mode: TLS policy → frontend TLS → admin TLS → DTLS → backend TLS validation → CP/DP gRPC TLS → stream port validation → stream listener bind (fatal in db/file, non-fatal in dp) → DNS warmup → connection pool warmup (if `FERRUM_POOL_WARMUP_ENABLED`) → overload monitor.
 
@@ -93,6 +95,8 @@ SIGTERM/SIGINT → accept loops exit → drain (`OverloadState.draining=true`, `
 ### Overload Manager (`src/overload.rs`)
 
 Progressive load shedding via atomic flags (`disable_keepalive`, `reject_new_connections`, `reject_new_requests`). Monitors FD, connections, requests, event-loop latency. Thresholds: FD ≥ 80% / Conn ≥ 85% / Req ≥ 85% → disable keepalive. FD ≥ 95% / Conn ≥ 95% / Loop ≥ 500ms → reject new connections. Req ≥ 95% → reject new requests (503 / gRPC UNAVAILABLE). `GET /overload` (unauth) returns pressure + `port_exhaustion_events`; 503 at critical. State transitions logged (warn enter, info recover) — no spam. RED probabilistic shedding between thresholds via golden-ratio hashing.
+
+Hot atomics on `OverloadState` (`disable_keepalive`, `reject_new_connections`, `reject_new_requests`, `active_connections`, `active_requests`, `red_drop_probability`, `red_request_counter`) are wrapped in `crossbeam_utils::CachePadded` so the read-mostly action flags don't share a cache line with the `fetch_add`/`fetch_sub` counters — at multi-core accept rates this prevents coherence-traffic stalls on the hot accept path. Snapshot fields (`fd_current`, `conn_current`, etc.), `port_exhaustion_events`, and `draining` are NOT padded (written ≤ 1 Hz or only on rare events). `CachePadded<T>` derefs to `T`, so all `.load()` / `.fetch_add()` call sites compile unchanged — do not unwrap or re-shape these fields.
 
 ### External Secret Resolution
 
@@ -197,6 +201,8 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 `TransactionSummary` (HTTP/gRPC/WS) and `StreamTransactionSummary` (TCP/UDP) in `src/plugins/mod.rs`. HTTP path has body-streaming fields (`body_error_class`, `body_completed`, `bytes_streamed_to_client`) — populated fully only after a forthcoming `DeferredTransactionLogger`. Stream path has disconnect-attribution fields (`disconnect_direction`: `ClientToBackend`/`BackendToClient`/`Unknown`; `disconnect_cause`: `IdleTimeout`/`RecvError`/`BackendError`/`GracefulShutdown`). Error classifiers: `classify_reqwest_error`, `classify_grpc_proxy_error`, `classify_boxed_error`, `classify_http2_pool_error`, `classify_http3_error`.
 
+**Metadata redaction**: Both summaries' `metadata: HashMap<String, String>` fields are sanitized at serialize time via `plugins::utils::metadata_redaction::serialize_redacted_metadata` (wired through `#[serde(serialize_with = ...)]`). Any key whose lowercased form contains a substring from `DEFAULT_SENSITIVE_METADATA_KEYS` (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `bearer`, `password`, `secret`, `token`) — or any operator-supplied substring from `FERRUM_LOG_REDACT_METADATA_KEYS` (comma-separated) — has its value replaced with `[REDACTED]` before going to any logger sink (stdout, http, tcp, kafka, loki, udp, ws, statsd). The in-memory map is untouched, so other plugin phases still see the original. New loggers do NOT need to redact themselves — they get redaction for free as long as they serialize `TransactionSummary` / `StreamTransactionSummary` through serde. Custom plugins that stash credentials, session IDs, or correlation tokens in `ctx.metadata` therefore cannot accidentally leak them through transaction logs.
+
 ### DNS Cache (`src/dns/mod.rs`)
 
 Shared singleton; pre-warmed. Native TTL by default, floored by `FERRUM_DNS_MIN_TTL_SECONDS`. Stale-while-revalidate + background refresh at `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` of TTL (90%). Priority: per-proxy `dns_cache_ttl_seconds` > `FERRUM_DNS_TTL_OVERRIDE_SECONDS` > native. Failed retries via background task. TCP fallback for truncated UDP. Concurrent nameserver races (`FERRUM_DNS_NUM_CONCURRENT_REQS`). **`DnsCacheResolver` must be plugged into every `reqwest::Client` in production.**
@@ -204,6 +210,8 @@ Shared singleton; pre-warmed. Native TTL by default, floored by `FERRUM_DNS_MIN_
 ### Centralized Rate Limiting (Redis)
 
 Four rate plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`) support `sync_mode: "redis"`. Shared client in `src/plugins/utils/redis_rate_limiter.rs`. Algorithm: two-window weighted via pipelined `INCR`/`GET`/`EXPIRE` — no Lua. Keys `{prefix}:{rate_key}:{window_index}`; default prefix `{FERRUM_NAMESPACE}:{plugin_name}` prevents cross-gateway collisions. Auto-fallback to in-memory on outage + background reconnect. TLS via `rediss://` uses global `FERRUM_TLS_*`. Works with Redis/Valkey/DragonflyDB/KeyDB/Garnet.
+
+**ACL credentials**: `redis_username` / `redis_password` plugin fields are honored on both plain and TLS code paths — they are injected into the parsed `redis::ConnectionInfo` (via `set_username` / `set_password`) before the client connects, and used by both the main connection and the background health-check pinger. Explicit fields override any user-info embedded in `redis_url`; with both unset, URL-embedded credentials flow through unchanged.
 
 ## Test Structure
 
@@ -254,11 +262,11 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 
 **Cert expiration** (`check_cert_expiry()` in `src/tls/mod.rs`): all surfaces check `notBefore`/`notAfter`. Expired = hard failure. Warning within `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` (default 30).
 
-**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS, all 6 rustls backend paths, DTLS. NOT applied to DP→CP gRPC (tonic-managed). Restart to reload. No hot reload for any TLS surface.
+**CRL** (`FERRUM_TLS_CRL_FILE_PATH`): PEM (multiple blocks OK), loaded once, `Arc`-shared. Policy: `allow_unknown_revocation_status` + `only_check_end_entity_revocation`. Applied to frontend mTLS (H1/H2 via `load_tls_config_with_client_auth`, H3 via `build_client_cert_verifier`, DTLS via `build_frontend_dtls_config`), all 6 rustls backend paths, and the rustls-based logging sinks (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS — plumbed via `PluginHttpClient::tls_crls()`). NOT applied to DP→CP gRPC (tonic-managed) or reqwest-based plugin paths (reqwest does not expose CRL configuration). Restart to reload. No hot reload for any TLS surface.
 
 **Pool-per-cert-path**: reqwest paths (HTTP/1.1, H2 via reqwest, H3 frontend→backend) → distinct `reqwest::Client`. rustls paths (gRPC pool, H2 direct) → per-connection.
 
-**Non-rustls paths**: `kafka_logging` (librdkafka/OpenSSL) — `FERRUM_TLS_CA_BUNDLE_PATH`→`ssl.ca.location`, `FERRUM_TLS_NO_VERIFY`→`enable.ssl.certificate.verification=false` (plugin fields override; CRL via `producer_config.ssl.crl.location`). `redis` applies global flags via `PluginHttpClient` accessors.
+**Non-rustls paths**: `kafka_logging` (librdkafka/OpenSSL) — `FERRUM_TLS_CA_BUNDLE_PATH`→`ssl.ca.location`, `FERRUM_TLS_NO_VERIFY`→`enable.ssl.certificate.verification=false` (plugin fields override; CRL via `producer_config.ssl.crl.location`). `redis` applies global flags via `PluginHttpClient` accessors. Logging sinks built on rustls (`tcp_logging` TLS, `ws_logging` wss, `udp_logging` DTLS) now apply the gateway CRL list via `PluginHttpClient::tls_crls()` → `build_server_verifier_with_crls`.
 
 **`PluginHttpClient` limits**: plugins bypassing proxy dispatch (`ai_federation` "terminate and respond") use shared `PluginHttpClient` with global TLS only — no per-proxy CA/CRL/cipher. For private endpoints, add internal CAs to global bundle (include public roots too since CA exclusivity disables webpki).
 
@@ -273,6 +281,7 @@ Use struct harness with `try_new()` retry wrapper (killing gateway on `wait_for_
 - `ProxyBody`-backed response coalescing uses one generic `Coalescing<S: FrameSource>` adapter in `src/proxy/body.rs` with three pluggable sources (`ReqwestFrameSource` for H1/H2-via-reqwest, `Incoming` for direct H2 / gRPC pool, `H3FrameSource` for native H3). Each path calls a thin builder (`coalescing_body`, `coalescing_h2_body`, `coalescing_h3_body`) over the shared adapter — there is no separate H1/H2/H3 `ProxyBody` coalescer to keep in sync. The H3 frontend cross-protocol bridge is separate (`src/http3/cross_protocol.rs`) because it writes directly to QUIC streams, but it shares the H3 coalescing knobs. Per-protocol bounds differ because native frame sizes differ: `FERRUM_HTTP3_COALESCE_MIN/MAX_BYTES` clamp to `[H3_COALESCE_MIN_FLOOR=1 KiB, H3_COALESCE_MAX_CAP=1 MiB]` (H3 framing is QUIC-packet-sized), `FERRUM_H2_COALESCE_TARGET_BYTES` clamps to `[16 KiB, 1 MiB]` (matches RFC 9113 default frame size). Latency-tracked H1/H2 paths inherit the same coalescing by composing `base_body.into_tracked(baseline)` over the regular streaming dispatch — no parallel "tracked" body builders.
 - Skip plugin phases when empty — guard with `plugins.is_empty()`.
 - **Every `reqwest::Client::builder()` must call `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`**. No production path should fall back to system DNS.
+- **Hot atomics use `CachePadded`** — see "Overload Manager" above. Co-locating a read-mostly action flag with a write-heavy counter on the same cache line forces inter-core coherence traffic on every load, turning a free atomic read into a pipeline stall under sustained load. Apply the same treatment to any new accept/dispatch-path atomic that is read concurrently with a hot writer.
 
 ### Protocol Paths
 
@@ -290,6 +299,7 @@ Dispatch in `src/proxy/mod.rs`: `detect_http_flavor(&req) -> HttpFlavor::{Plain,
 - `Plain + backend classified as h3` — native H3 fast path via `Http3ConnectionPool` (quinn/h3), fully streamed.
 - Everything else — cross-protocol bridge `http3::cross_protocol::run` reuses `state.connection_pool` (reqwest) / `state.grpc_pool`, so one `https` proxy serves H1/H2/H3 clients uniformly. WebSocket-over-H3 returns 501.
 - Cross-protocol buffering: request body buffered (`&mut RequestStream` can't be captured by reqwest's `'static` body), response streamed with the same coalesce window as the native H3 writer. gRPC trailers forwarded via `send_trailers` on both buffered and streaming responses.
+- **RFC 8470 0-RTT signalling**: when a request arrives via TLS 1.3 0-RTT (quinn `into_0rtt()`, `ctx.is_early_data == true`) the gateway strips any client-supplied `Early-Data` header from the inbound request and re-injects `Early-Data: 1` on the outbound backend request — both `build_h3_backend_headers` (native H3 backend) and `build_plain_request_builder` / the gRPC bridge `HeaderMap` (cross-protocol). The gateway already gates 0-RTT acceptance via `state.early_data_methods`; the header lets the origin server apply its own replay-safety policy on top.
 
 **QUIC connection migration**: `http3/server.rs` compares `remote_address()` per request (zero-alloc integer compare). `Arc<str>` re-created only on actual change. Fixes a security issue where migrated clients bypassed per-IP rate limits — do NOT revert to once-per-connection cache.
 
@@ -305,6 +315,8 @@ Shared shell in `src/pool/mod.rs`; per-pool key formats below. Key must include 
 - **HTTP/3** (`http3/client.rs`): `{host}|{port}|{index}|{dns_override}|{ca}|{mtls_cert}|{mtls_key}|{verify}` — matches `backend_capabilities::capability_key` so probe classification and QUIC reuse stay aligned. `pool_key_for_target(proxy, host, port, idx)` takes `&Proxy` for the same reason.
 
 Rules: never add policy fields (timeouts, pool sizes, keepalives); empty/default strings are free; keep `|` delimiter.
+
+**Pool DashMap shard sizing**: every pool's `entries` and `pending_creations` map (plus `rr_counters` on the H2/gRPC pools, `cache`/`refreshing` on the DNS cache, `per_ip_request_counts` on `ProxyState`, `prefix_cache`/`regex_cache` on `RouterCache`) is constructed via `DashMap::with_shard_amount(N)` instead of `DashMap::new()`. The shard count is resolved through `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)` — `0` (default) auto-derives `next_power_of_two(max(64, num_cpus * 16))`, any positive `FERRUM_POOL_SHARD_AMOUNT` override is rounded up to the next power of two (DashMap's API requires power-of-two shard counts). The default DashMap shard count of `4 * num_cpus` starves on writes at high cardinality (1K+ unique pool keys, distinct client IPs) — bumping to ≥ `num_cpus * 16` gives concurrent inserts/removals enough independent locks to actually parallelise. Memory cost: each shard is ~96 B + an empty inner map; 1024 shards × 6 maps ≈ 600 KB worst case. Negligible. New `DashMap::new()` callers on the request hot path should mirror this pattern; low-cardinality maps (`health_check`, `circuit_breaker`, plugin-internal) are intentionally left at the default to avoid wasting shards on bounded data.
 
 **Policy cross-proxy sharing**: Because pool keys exclude policy fields, proxies resolving to the same entry share the underlying `reqwest::Client`. Both `backend_connect_timeout_ms` and `backend_read_timeout_ms` are applied per-request on the dispatch side (`RequestBuilder::connect_timeout()` and `RequestBuilder::timeout()`), so two proxies with different timeouts on the same pool entry get independent per-request timeouts — no cross-proxy leakage, no need for a `dns_override` work-around. The `connect_timeout` per-request override comes from a vendored copy of reqwest 0.13.2 with PR seanmonstar/reqwest#3017 applied; see `vendor/reqwest-0.13.2-ferrum-patched/` and `docs/upstream-reqwest-patches/001-per-request-connect-timeout/` for the lifecycle and retirement plan.
 
@@ -440,6 +452,13 @@ Graceful degradation pattern (`geo_restriction` example): constructor logs `warn
 
 `custom_plugins/my_plugin.rs` with `create_plugin()` + exported `plugin_migrations() -> Vec<CustomPluginMigration>`. Fields: `version` (per-plugin), `name`, `checksum`, `sql` + optional `sql_postgres`/`sql_mysql`. Prefix tables with plugin name. Multi-statement supported. Run with `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up`; tracked in `_ferrum_plugin_migrations` with `(plugin_name, version)` PK. See `custom_plugins/example_audit_plugin.rs` + `CUSTOM_PLUGINS.md`. **MongoDB**: `CustomPluginMigration` is SQL-only; create MongoDB collections/indexes in `create_plugin()`.
 
+**Startup behavior** (`database` and `cp` modes): on boot, after core schema migrations (`run_pending`), the gateway calls `db.pending_plugin_migrations()` and:
+
+- If any are pending and `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=false` (default), emits a `warn!` listing them — the gateway does NOT auto-mutate the schema. Operators must run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` explicitly before serving traffic that depends on the new schema. This preserves the contract that schema changes never run silently at boot.
+- If `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true`, applies pending plugin migrations via `db.apply_plugin_migrations()` before `load_full_config`. A failed migration in this path is fatal — better to refuse startup than to come up with an inconsistent schema. Useful for embedded deployments (e.g., SQLite where the binary owns the database) that want a single binary upgrade to bring plugin schema up to date.
+
+The trait methods `pending_plugin_migrations` / `apply_plugin_migrations` default to no-op for backends that don't support SQL plugin migrations (e.g., MongoDB). The `database` and `cp` startup paths share `crate::modes::handle_startup_plugin_migrations()`. The standalone `migrate` mode is unchanged — it always applies plugin migrations regardless of this flag.
+
 ### Adding a New Config Field
 
 1. Struct in `src/config/types.rs` with `#[serde(default)]`
@@ -482,12 +501,14 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`migrate`
 - `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads
 - `FERRUM_LOG_LEVEL` (`error`)
+- `FERRUM_LOG_REDACT_METADATA_KEYS` (empty) — comma-separated extra substrings (case-insensitive) to redact from `TransactionSummary.metadata` / `StreamTransactionSummary.metadata` in addition to the built-in `authorization`/`cookie`/`set-cookie`/`x-api-key`/`x-auth-token`/`x-csrf-token`/`bearer`/`password`/`secret`/`token` defaults. Applies to every logging plugin (stdout/http/tcp/kafka/loki/udp/ws/statsd) via the central serde adapter.
 - `FERRUM_PROXY_HTTP_PORT`/`HTTPS_PORT` (8000/8443); `FERRUM_ADMIN_HTTP_PORT`/`HTTPS_PORT` (9000/9443) — `0` disables plaintext
 - `FERRUM_ADMIN_JWT_SECRET` (required db/cp, ≥32 chars)
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)
 - `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_POOL_MAX_CONNECTIONS` (10, bump for CP)
+- `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` (`false`; opt-in auto-apply of pending custom-plugin SQL migrations at startup in `database`/`cp`. Default off — gateway warns but does not auto-mutate schema; operators run `FERRUM_MODE=migrate` explicitly. Enable for embedded SQLite deployments)
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)
 - `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` (128; lagging DPs auto-snapshot)

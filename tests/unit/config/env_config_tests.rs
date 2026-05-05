@@ -3522,3 +3522,52 @@ fn test_db_full_load_page_size_clamped_to_maximum() {
         },
     );
 }
+
+// ── FERRUM_POOL_SHARD_AMOUNT ────────────────────────────────────────────────
+
+#[test]
+fn test_pool_shard_amount_default_is_zero() {
+    let config = EnvConfig::default();
+    assert_eq!(
+        config.pool_shard_amount, 0,
+        "Default 0 means auto-derive from CPU topology"
+    );
+}
+
+#[test]
+fn test_pool_shard_amount_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_POOL_SHARD_AMOUNT", "256"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.pool_shard_amount, 256,
+                "operator-supplied override must be passed through verbatim; \
+                 power-of-two rounding happens at the call site",
+            );
+        },
+    );
+}
+
+#[test]
+fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_POOL_SHARD_AMOUNT", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.pool_shard_amount, 0,
+                "FERRUM_POOL_SHARD_AMOUNT=0 must remain 0 (auto sentinel) — \
+                 the helper resolves it later, not the parser",
+            );
+        },
+    );
+}

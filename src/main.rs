@@ -32,6 +32,7 @@ mod plugin_cache;
 mod plugins;
 mod pool;
 mod proxy;
+pub mod request_epoch;
 mod retry;
 mod router_cache;
 mod secrets;
@@ -41,10 +42,11 @@ mod startup;
 mod tls;
 #[allow(dead_code)]
 mod tls_offload;
+mod util;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
-use tracing::{Level, Metadata, error, info};
+use tracing::{Level, Metadata, debug, error, info, warn};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -258,6 +260,41 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     }
 
     let (_stdout_guard, _stderr_guard) = init_logging();
+
+    // Raise the soft FD cap to the hard cap before any subsystem opens
+    // sockets. The call never asks for privileges we don't have (it caps at
+    // the existing hard limit), so a sandboxed/seccomp-restricted run is a
+    // silent no-op rather than a failure. We log the result so operators see
+    // the headroom they actually got, and emit a warn when the effective
+    // soft cap remains below the production floor — the gateway will still
+    // run, but its 95% FD-critical threshold will trigger early on busy hosts.
+    let fd_raise = overload::raise_fd_limit();
+    if fd_raise.raised {
+        info!(
+            soft_before = fd_raise.soft_before,
+            soft_after = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            "raised soft FD limit to hard cap"
+        );
+    }
+    if fd_raise.soft_after > 0 && fd_raise.soft_after < overload::FD_HARD_LIMIT_PRODUCTION_FLOOR {
+        warn!(
+            soft_before = fd_raise.soft_before,
+            soft_after = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            recommended_floor = overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
+            "effective soft FD limit is {} (hard cap {}); recommend raising to >= {} via /etc/security/limits.conf, systemd LimitNOFILE=, or docker --ulimit nofile= for production workloads",
+            fd_raise.soft_after,
+            fd_raise.hard,
+            overload::FD_HARD_LIMIT_PRODUCTION_FLOOR,
+        );
+    } else if !fd_raise.raised && fd_raise.hard > 0 {
+        debug!(
+            soft = fd_raise.soft_after,
+            hard = fd_raise.hard,
+            "FD soft limit already at hard cap"
+        );
+    }
 
     info!(
         "Ferrum Edge v{} ({}) starting...",

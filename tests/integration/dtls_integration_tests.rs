@@ -519,6 +519,7 @@ async fn test_dtls_client_server_handshake_and_echo() {
             .expect("generate client cert"),
         server_name: None,
         server_cert_verifier: None,
+        connect_timeout_ms: 10_000,
     };
 
     let conn = tokio::time::timeout(
@@ -611,6 +612,7 @@ async fn test_dtls_pem_cert_handshake() {
         certificate: dimpl::certificate::generate_self_signed_certificate().unwrap(),
         server_name: None,
         server_cert_verifier: None,
+        connect_timeout_ms: 10_000,
     };
 
     let conn = tokio::time::timeout(
