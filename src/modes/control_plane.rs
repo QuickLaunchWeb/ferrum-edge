@@ -673,50 +673,65 @@ pub async fn run(
         }
     });
 
-    // Wait for any listener handle to exit, or the shutdown signal if all
-    // listeners are disabled (e.g., admin_http=0, no admin TLS, gRPC port=0).
-    let mut wait_shutdown = shutdown_tx.subscribe();
-    tokio::select! {
-        _ = async {
-            if let Some(handle) = admin_http_handle {
-                let _ = handle.await;
-            } else {
-                std::future::pending::<()>().await;
+    // Wait for ALL listener handles to exit, or the shutdown signal if no
+    // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
+    //
+    // Reuses `crate::modes::file::await_listener_handles` to mirror file/db
+    // mode's shutdown shape:
+    //
+    // 1. On the shutdown signal, every listener observes it via its own
+    //    `shutdown_tx.subscribe()` receiver and exits gracefully —
+    //    `serve_with_incoming_shutdown` for gRPC (so tonic completes
+    //    in-flight RPCs and `TrackedStream`'s `Drop` deregisters the DP
+    //    from `DpNodeRegistry`), and the watch-driven shutdown loops for
+    //    admin HTTP/HTTPS.
+    // 2. If a listener panics, `await_listener_handles` fires the
+    //    `shutdown_on_panic` trigger so the remaining listeners observe
+    //    shutdown and exit promptly. The previous `tokio::select!`
+    //    instead detached the still-serving handles (the inner async
+    //    blocks were cancelled, dropping the moved `JoinHandle`s, which
+    //    detaches rather than aborts) — those listeners then died
+    //    abruptly when the runtime torn down at function return,
+    //    cutting in-flight DP streams without graceful drain and
+    //    yielding a partial-shutdown anomaly.
+    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(handle) = admin_http_handle {
+        listener_handles.push(handle);
+    }
+    if let Some(handle) = grpc_handle {
+        listener_handles.push(handle);
+    }
+    if let Some(handle) = admin_https_handle {
+        listener_handles.push(handle);
+    }
+
+    if listener_handles.is_empty() {
+        let mut wait_shutdown = shutdown_tx.subscribe();
+        while !*wait_shutdown.borrow() {
+            if wait_shutdown.changed().await.is_err() {
+                break;
             }
-        } => {}
-        _ = async {
-            if let Some(handle) = grpc_handle {
-                let _ = handle.await;
-            } else {
-                std::future::pending::<()>().await;
+        }
+        info!("Shutdown signal received with no active listeners");
+    } else {
+        let shutdown_on_panic = {
+            let shutdown_tx = shutdown_tx.clone();
+            move || {
+                let _ = shutdown_tx.send(true);
             }
-        } => {}
-        _ = async {
-            if let Some(handle) = admin_https_handle {
-                let _ = handle.await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        } => {}
-        _ = async {
-            while !*wait_shutdown.borrow() {
-                if wait_shutdown.changed().await.is_err() {
-                    return;
-                }
-            }
-        } => {
-            info!("Shutdown signal received with no active listeners");
+        };
+        if let Err(err) =
+            crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+        {
+            error!("CP listener task failed: {}", err);
         }
     }
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent
-    // hanging if a task is stuck (e.g., blocked on a DB query).
-    if tokio::time::timeout(Duration::from_secs(5), db_poll_handle)
-        .await
-        .is_err()
-    {
-        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
-    }
+    // hanging if a task is stuck (e.g., blocked on a DB query). Same 5 s
+    // cap as the pre-refactor inline timeout — a stuck DB poll is never
+    // allowed to wedge graceful shutdown.
+    crate::modes::file::join_background_handles(vec![db_poll_handle], Duration::from_secs(5)).await;
 
     Ok(())
 }
@@ -826,6 +841,7 @@ mod tests {
     use crate::config::types::*;
     use chrono::Utc;
     use std::collections::HashSet;
+    use std::time::Instant;
 
     fn empty_incremental() -> IncrementalResult {
         IncrementalResult {
@@ -952,7 +968,7 @@ mod tests {
         assert_eq!(items.len(), 1);
     }
 
-    // ── update_known_ids ───────────────────────────────────────��───────
+    // update_known_ids
 
     #[test]
     fn update_known_ids_adds_and_removes() {
@@ -979,7 +995,7 @@ mod tests {
         assert_eq!(known.len(), 1);
     }
 
-    // ── apply_incremental_to_config ────────────────────────────────────
+    // apply_incremental_to_config
 
     #[test]
     fn apply_incremental_empty_is_noop() {
@@ -1049,5 +1065,122 @@ mod tests {
         assert!(!config.proxies.iter().any(|p| p.id == "remove"));
         assert_eq!(config.consumers.len(), 1);
         assert_eq!(config.consumers[0].id, "c2");
+    }
+
+    // Regression: prior to this fix, CP mode used `tokio::select!` over the
+    // admin/HTTPS/gRPC listener handles. The first listener to exit (panic
+    // or otherwise) short-circuited the select and dropped the inner
+    // async blocks for the others. Those `JoinHandle`s were *moved* into
+    // the cancelled inner blocks, so dropping them detached the still
+    // serving listener tasks rather than aborting them. The function then
+    // returned, the runtime tore down at the binary boundary, and the
+    // detached listeners died abruptly mid-flight — DPs subscribing to
+    // the gRPC stream saw their connections cut without a graceful
+    // shutdown signal.
+    //
+    // The fix routes the listener handles through
+    // `crate::modes::file::await_listener_handles`, which both:
+    //   1. Awaits ALL handles concurrently so a single exit does not
+    //      strand the others; and
+    //   2. Fires `shutdown_on_panic` on the first panic so the remaining
+    //      listeners observe the shared shutdown watch channel via their
+    //      own subscribers and exit promptly.
+    //
+    // This test models that with three fake CP listeners (admin_http,
+    // grpc, admin_https). One panics; the other two must still drain
+    // cleanly through the watch trigger fired by `shutdown_on_panic`.
+    // Bound the wait at 2 s — without the trigger, the remaining
+    // listeners would block forever on their watch receivers.
+    #[tokio::test]
+    async fn cp_shutdown_drains_remaining_listeners_when_one_panics() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http = tokio::spawn(async move {
+            let _ = admin_http_rx.changed().await;
+        });
+
+        let grpc = tokio::spawn(async {
+            panic!("simulated gRPC listener crash");
+        });
+
+        let mut admin_https_rx = shutdown_tx.subscribe();
+        let admin_https = tokio::spawn(async move {
+            let _ = admin_https_rx.changed().await;
+        });
+
+        // Mirror the CP run() composition: collect Some-handles into a
+        // Vec, then drive them through await_listener_handles with a
+        // panic trigger that flips the shared shutdown watch.
+        let listener_handles: Vec<tokio::task::JoinHandle<()>> =
+            vec![admin_http, grpc, admin_https];
+
+        let trigger_tx = shutdown_tx.clone();
+        let started = Instant::now();
+        let result = crate::modes::file::await_listener_handles(listener_handles, move || {
+            let _ = trigger_tx.send(true);
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        // The panicking gRPC listener must surface as a JoinError…
+        let err = result.expect_err("the gRPC listener panicked, helper must return Err");
+        assert!(
+            err.is_panic(),
+            "JoinError should report `is_panic()` for a panicked listener; got {err:?}",
+        );
+        // …and the admin HTTP/HTTPS listeners must have observed the
+        // shutdown trigger and exited promptly. Without the trigger
+        // they would hang on their watch receivers forever.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "remaining listeners should drain via shutdown trigger; took {elapsed:?}",
+        );
+    }
+
+    // Sanity: when no listener panics and the shared shutdown watch is
+    // simply set to true (the normal SIGTERM path), every listener's
+    // own `.subscribe()` receiver fires `changed()` and the helper
+    // returns Ok without ever invoking the panic trigger. This verifies
+    // the "happy path" is preserved end-to-end through the same
+    // composition the CP mode uses.
+    #[tokio::test]
+    async fn cp_shutdown_drains_all_listeners_on_signal() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let mut admin_http_rx = shutdown_tx.subscribe();
+        let admin_http = tokio::spawn(async move {
+            let _ = admin_http_rx.changed().await;
+        });
+        let mut grpc_rx = shutdown_tx.subscribe();
+        let grpc = tokio::spawn(async move {
+            let _ = grpc_rx.changed().await;
+        });
+        let mut admin_https_rx = shutdown_tx.subscribe();
+        let admin_https = tokio::spawn(async move {
+            let _ = admin_https_rx.changed().await;
+        });
+
+        let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggered_clone = triggered.clone();
+
+        // Fire shutdown after spawning so the listeners are already
+        // parked on changed() — models the SIGTERM path.
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+
+        let result = crate::modes::file::await_listener_handles(
+            vec![admin_http, grpc, admin_https],
+            move || {
+                triggered_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        result.expect("no listener panicked; helper must return Ok");
+        assert!(
+            !triggered.load(std::sync::atomic::Ordering::SeqCst),
+            "panic trigger must NOT fire on a clean shutdown",
+        );
     }
 }

@@ -273,7 +273,14 @@ impl ServeHandles {
 ///
 /// Pulled out of [`ServeHandles::join`] so the panic-propagation
 /// behaviour is unit-testable without constructing a `ProxyState`.
-async fn await_listener_handles(
+///
+/// Re-exported as `pub(crate)` so [`crate::modes::control_plane`] can
+/// reuse the same panic-propagation behaviour for its admin/gRPC
+/// listeners — a `tokio::select!` over the listener handles let the
+/// first one to exit short-circuit the others, dropping their handles
+/// (which detaches the tasks) and orphaning still-serving listeners
+/// when the runtime tore down.
+pub(crate) async fn await_listener_handles(
     handles: Vec<JoinHandle<()>>,
     shutdown_on_panic: impl FnOnce(),
 ) -> Result<(), tokio::task::JoinError> {
@@ -303,7 +310,10 @@ async fn await_listener_handles(
 /// a single warning and return — a stuck task is not allowed to wedge
 /// graceful shutdown. Pulled out of [`ServeHandles::join`] so the timeout
 /// behaviour is unit-testable without constructing a `ProxyState`.
-async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
+///
+/// Re-exported as `pub(crate)` so [`crate::modes::control_plane`] can
+/// reuse the same bounded background-drain shape for its DB-poll task.
+pub(crate) async fn join_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
     let drain = async {
         for handle in handles {
             let _ = handle.await;
