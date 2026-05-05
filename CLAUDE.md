@@ -299,6 +299,7 @@ Dispatch in `src/proxy/mod.rs`: `detect_http_flavor(&req) -> HttpFlavor::{Plain,
 - `Plain + backend classified as h3` — native H3 fast path via `Http3ConnectionPool` (quinn/h3), fully streamed.
 - Everything else — cross-protocol bridge `http3::cross_protocol::run` reuses `state.connection_pool` (reqwest) / `state.grpc_pool`, so one `https` proxy serves H1/H2/H3 clients uniformly. WebSocket-over-H3 returns 501.
 - Cross-protocol buffering: request body buffered (`&mut RequestStream` can't be captured by reqwest's `'static` body), response streamed with the same coalesce window as the native H3 writer. gRPC trailers forwarded via `send_trailers` on both buffered and streaming responses.
+- **RFC 8470 0-RTT signalling**: when a request arrives via TLS 1.3 0-RTT (quinn `into_0rtt()`, `ctx.is_early_data == true`) the gateway strips any client-supplied `Early-Data` header from the inbound request and re-injects `Early-Data: 1` on the outbound backend request — both `build_h3_backend_headers` (native H3 backend) and `build_plain_request_builder` / the gRPC bridge `HeaderMap` (cross-protocol). The gateway already gates 0-RTT acceptance via `state.early_data_methods`; the header lets the origin server apply its own replay-safety policy on top.
 
 **QUIC connection migration**: `http3/server.rs` compares `remote_address()` per request (zero-alloc integer compare). `Arc<str>` re-created only on actual change. Fixes a security issue where migrated clients bypassed per-IP rate limits — do NOT revert to once-per-connection cache.
 
