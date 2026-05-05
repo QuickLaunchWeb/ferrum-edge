@@ -9,10 +9,38 @@
 //! connections and waits up to a configurable drain period for them to complete.
 
 use crossbeam_utils::CachePadded;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Number of monitor ticks between `fd_limit` refreshes.
+///
+/// The soft `RLIMIT_NOFILE` is mutable at runtime — operators or systemd may
+/// raise it without restarting the gateway via `setrlimit(2)` or by reloading
+/// the unit. Re-querying once per minute (60 ticks at the default 1s interval)
+/// keeps `fd_ratio` aligned with the live limit at negligible cost (one
+/// `getrlimit` syscall per minute) without taking the hit on every tick.
+const FD_LIMIT_REFRESH_INTERVAL_TICKS: u64 = 60;
+
+/// One-shot warning latch for the `fd_limit == 0` (FD pressure disabled) case.
+///
+/// `get_fd_limit()` returns 0 on Windows and other non-Unix platforms (and on
+/// the rare `getrlimit` failure on Unix). When that happens the FD ratio is
+/// permanently 0.0 — FD-based load shedding is silently inert. We emit a
+/// single `warn!` so operators can distinguish "FD pressure disabled by
+/// platform" from "FD pressure at 0%". The latch ensures the periodic refresh
+/// loop never spams the warn if it continues to see 0.
+static FD_PRESSURE_DISABLED_WARN: Once = Once::new();
+
+fn warn_fd_pressure_disabled_once() {
+    FD_PRESSURE_DISABLED_WARN.call_once(|| {
+        warn!(
+            "FD-based pressure shedding disabled on this platform — fd_limit could not be queried. \
+             Connection-based and request-based shedding remain active."
+        );
+    });
+}
 
 /// Scale factor for RED (Random Early Detection) drop probability.
 ///
@@ -590,14 +618,26 @@ pub fn start_monitor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_millis(config.check_interval_ms);
-        let fd_limit = get_fd_limit();
+        // `fd_limit` is mutable so the monitor can pick up runtime changes to
+        // the soft `RLIMIT_NOFILE` (e.g. operator `setrlimit(2)`, systemd unit
+        // reload). Refreshed every `FD_LIMIT_REFRESH_INTERVAL_TICKS` iterations.
+        let mut fd_limit = get_fd_limit();
+        let mut tick: u64 = 0;
 
-        // Store limits once (don't change during runtime)
+        // Store limits (max_connections / max_requests don't change during
+        // runtime; fd_max is updated each refresh below).
         state.fd_max.store(fd_limit, Ordering::Relaxed);
         state
             .conn_max
             .store(max_connections as u64, Ordering::Relaxed);
         state.req_max.store(max_requests as u64, Ordering::Relaxed);
+
+        // One-shot warn at startup when FD pressure is unavailable on this
+        // platform (Windows, or `getrlimit` failed). Connection- and
+        // request-based shedding still work; only FD-based shedding is inert.
+        if fd_limit == 0 {
+            warn_fd_pressure_disabled_once();
+        }
 
         info!(
             "Overload monitor started (interval={}ms, fd_limit={}, max_conn={}, max_req={})",
@@ -610,6 +650,28 @@ pub fn start_monitor(
                 _ = shutdown_rx.changed() => {
                     debug!("Overload monitor shutting down");
                     return;
+                }
+            }
+            tick = tick.wrapping_add(1);
+
+            // ── Periodic fd_limit refresh ──
+            // The soft RLIMIT_NOFILE can be raised at runtime without
+            // restarting the gateway. Re-query once per minute so `fd_ratio`
+            // tracks the live limit. On platforms where the syscall returns
+            // 0, the warn latch fires only once.
+            if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
+                let new_limit = get_fd_limit();
+                if new_limit != fd_limit {
+                    info!(
+                        old_fd_limit = fd_limit,
+                        new_fd_limit = new_limit,
+                        "Overload monitor: fd_limit changed (RLIMIT_NOFILE updated)"
+                    );
+                    fd_limit = new_limit;
+                    state.fd_max.store(fd_limit, Ordering::Relaxed);
+                }
+                if fd_limit == 0 {
+                    warn_fd_pressure_disabled_once();
                 }
             }
 
@@ -1021,6 +1083,92 @@ mod tests {
             "reject_new_connections and active_connections should be on different cache lines; distance={}",
             distance,
         );
+    }
+
+    /// The fd_limit refresh cadence — tied to the default 1s tick — should
+    /// land on whole-minute boundaries so the syscall load is predictable
+    /// (one `getrlimit` per minute). If the constant is ever retuned, this
+    /// guards against accidentally landing on a sub-minute interval.
+    #[test]
+    fn fd_limit_refresh_interval_is_one_minute_at_default_tick() {
+        let default_tick_ms = OverloadConfig::default().check_interval_ms;
+        let refresh_period_ms = default_tick_ms * FD_LIMIT_REFRESH_INTERVAL_TICKS;
+        assert_eq!(
+            refresh_period_ms, 60_000,
+            "fd_limit refresh should be ~60s at the default 1s monitor tick"
+        );
+        assert!(
+            FD_LIMIT_REFRESH_INTERVAL_TICKS > 0,
+            "refresh interval must be positive to ever trigger a refresh"
+        );
+    }
+
+    /// Simulate the monitor loop's tick counter and verify a changed
+    /// `fd_limit` is picked up exactly on the refresh boundary, not before
+    /// and not skipped after. Mirrors the in-loop logic at the top of the
+    /// `start_monitor` task body without needing a full tokio harness.
+    #[test]
+    fn fd_limit_refresh_boundary_picks_up_changes() {
+        // Stand-in for `get_fd_limit()` whose return value flips after the
+        // first refresh boundary, modeling an operator running `setrlimit(2)`
+        // partway through the gateway's lifetime.
+        let mut probe_calls = 0u64;
+        let mut probe = |tick: u64| -> u64 {
+            probe_calls += 1;
+            // First boundary returns the original limit; subsequent
+            // boundaries return the raised limit.
+            if tick < FD_LIMIT_REFRESH_INTERVAL_TICKS {
+                1024
+            } else {
+                65_536
+            }
+        };
+
+        // Initial value (read once at task start).
+        let mut fd_limit = probe(0);
+        assert_eq!(fd_limit, 1024);
+
+        // Walk through enough ticks to cross two refresh boundaries.
+        let total_ticks = FD_LIMIT_REFRESH_INTERVAL_TICKS * 2 + 5;
+        let mut refresh_observations = 0u64;
+        let mut tick: u64 = 0;
+        while tick < total_ticks {
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(FD_LIMIT_REFRESH_INTERVAL_TICKS) {
+                refresh_observations += 1;
+                let new_limit = probe(tick);
+                if new_limit != fd_limit {
+                    fd_limit = new_limit;
+                }
+            }
+        }
+
+        // Two boundaries crossed → two probes (plus the initial one).
+        assert_eq!(refresh_observations, 2);
+        assert_eq!(probe_calls, 3);
+        // After crossing the first boundary, the raised limit must be visible.
+        assert_eq!(
+            fd_limit, 65_536,
+            "raised RLIMIT_NOFILE should be picked up at the refresh boundary"
+        );
+    }
+
+    /// The `fd_limit == 0` warn must fire only once even if the periodic
+    /// refresh continues to observe 0 (Windows / unsupported platforms).
+    /// `Once::call_once` provides this guarantee — verify the latch behaves
+    /// correctly when invoked repeatedly.
+    #[test]
+    fn fd_pressure_disabled_warn_latches_once() {
+        // Use a private latch so this test doesn't poison the production
+        // `FD_PRESSURE_DISABLED_WARN` for any other test in the same binary.
+        let local_latch = Once::new();
+        let mut fired = 0u32;
+        for _ in 0..10 {
+            local_latch.call_once(|| {
+                fired += 1;
+            });
+        }
+        assert_eq!(fired, 1, "warn-once latch must fire exactly once");
     }
 
     /// Verify that the RED shedding rate matches the configured probability
