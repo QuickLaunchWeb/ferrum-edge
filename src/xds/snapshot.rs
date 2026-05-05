@@ -67,10 +67,18 @@ impl XdsSnapshot {
             .unwrap_or_default()
     }
 
-    pub fn filtered_resources(&self, type_url: &str, names: &[String]) -> Vec<XdsResource> {
+    pub fn filtered_resources(
+        &self,
+        type_url: &str,
+        names: &[String],
+        wildcard: bool,
+    ) -> Vec<XdsResource> {
         let resources = self.resources(type_url);
-        if names.is_empty() {
+        if wildcard {
             return resources;
+        }
+        if names.is_empty() {
+            return Vec::new();
         }
         let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
         resources

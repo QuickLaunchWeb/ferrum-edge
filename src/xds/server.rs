@@ -32,6 +32,7 @@ struct XdsSubscription {
     node_id: String,
     type_url: String,
     resource_names: Vec<String>,
+    wildcard: bool,
 }
 
 /// Envoy ADS implementation for Phase B.
@@ -203,21 +204,26 @@ impl XdsAdsServer {
     fn sotw_response(
         &self,
         snapshot: &XdsSnapshot,
-        type_url: &str,
-        resource_names: &[String],
+        subscription: &XdsSubscription,
     ) -> DiscoveryResponse {
-        let nonce = self
-            .nonce_tracker
-            .issue_nonce(&snapshot.node_id, type_url, &snapshot.version);
+        let nonce = self.nonce_tracker.issue_nonce(
+            &snapshot.node_id,
+            &subscription.type_url,
+            &snapshot.version,
+        );
         DiscoveryResponse {
             version_info: snapshot.version.clone(),
             resources: snapshot
-                .filtered_resources(type_url, resource_names)
+                .filtered_resources(
+                    &subscription.type_url,
+                    &subscription.resource_names,
+                    subscription.wildcard,
+                )
                 .into_iter()
                 .map(|resource| resource.to_any())
                 .collect(),
             canary: false,
-            type_url: type_url.to_string(),
+            type_url: subscription.type_url.clone(),
             nonce,
             control_plane: Some(ControlPlane {
                 identifier: format!("ferrum-edge/{FERRUM_VERSION}"),
@@ -229,24 +235,30 @@ impl XdsAdsServer {
         &self,
         snapshot: &XdsSnapshot,
         previous: Option<&XdsSnapshot>,
-        type_url: &str,
-        resource_names: &[String],
+        subscription: &XdsSubscription,
         initial_resource_versions: &HashMap<String, String>,
+        explicitly_subscribed_names: &[String],
     ) -> DeltaDiscoveryResponse {
-        let nonce = self
-            .nonce_tracker
-            .issue_nonce(&snapshot.node_id, type_url, &snapshot.version);
-        let resources = snapshot.filtered_resources(type_url, resource_names);
+        let nonce = self.nonce_tracker.issue_nonce(
+            &snapshot.node_id,
+            &subscription.type_url,
+            &snapshot.version,
+        );
+        let resources = snapshot.filtered_resources(
+            &subscription.type_url,
+            &subscription.resource_names,
+            subscription.wildcard,
+        );
+        let current_names: HashSet<String> = snapshot
+            .resources(&subscription.type_url)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
         let mut removed_resources = if initial_resource_versions.is_empty() {
             previous
-                .map(|prev| prev.removed_resource_names(snapshot, type_url))
+                .map(|prev| prev.removed_resource_names(snapshot, &subscription.type_url))
                 .unwrap_or_default()
         } else {
-            let current_names: HashSet<String> = snapshot
-                .resources(type_url)
-                .into_iter()
-                .map(|r| r.name)
-                .collect();
             let mut removed: Vec<String> = initial_resource_versions
                 .keys()
                 .filter(|name| !current_names.contains(*name))
@@ -256,17 +268,41 @@ impl XdsAdsServer {
             removed.dedup();
             removed
         };
-        if !resource_names.is_empty() && !removed_resources.is_empty() {
-            let wanted: HashSet<&str> = resource_names.iter().map(String::as_str).collect();
-            removed_resources.retain(|name| wanted.contains(name.as_str()));
+        if !subscription.wildcard && !removed_resources.is_empty() {
+            if subscription.resource_names.is_empty() {
+                removed_resources.clear();
+            } else {
+                let wanted: HashSet<&str> = subscription
+                    .resource_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                removed_resources.retain(|name| wanted.contains(name.as_str()));
+            }
         }
+        let subscribed: HashSet<&str> = subscription
+            .resource_names
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for name in explicitly_subscribed_names {
+            if name == "*"
+                || current_names.contains(name)
+                || (!subscription.wildcard && !subscribed.contains(name.as_str()))
+            {
+                continue;
+            }
+            removed_resources.push(name.clone());
+        }
+        removed_resources.sort();
+        removed_resources.dedup();
         DeltaDiscoveryResponse {
             system_version_info: snapshot.version.clone(),
             resources: resources
                 .into_iter()
                 .map(|resource| resource.to_delta_resource())
                 .collect(),
-            type_url: type_url.to_string(),
+            type_url: subscription.type_url.clone(),
             nonce,
             removed_resources,
         }
@@ -281,13 +317,7 @@ impl XdsAdsServer {
         self.snapshot_cache.insert(snapshot.clone());
         subscriptions
             .values()
-            .map(|subscription| {
-                self.sotw_response(
-                    &snapshot,
-                    &subscription.type_url,
-                    &subscription.resource_names,
-                )
-            })
+            .map(|subscription| self.sotw_response(&snapshot, subscription))
             .collect()
     }
 
@@ -305,9 +335,9 @@ impl XdsAdsServer {
                 self.delta_response(
                     &snapshot,
                     previous.as_deref(),
-                    &subscription.type_url,
-                    &subscription.resource_names,
+                    subscription,
                     &HashMap::new(),
+                    &[],
                 )
             })
             .collect()
@@ -425,23 +455,20 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             }
                         }
 
-                        let subscription = XdsSubscription {
-                            node_id: current_node_id.clone(),
-                            type_url: request.type_url.clone(),
-                            resource_names: request.resource_names.clone(),
-                        };
+                        let subscription = build_sotw_subscription(
+                            previous_subscription.as_ref(),
+                            &current_node_id,
+                            &request.type_url,
+                            &request.resource_names,
+                        );
                         let resource_names_changed = previous_subscription
                             .as_ref()
-                            .is_none_or(|previous| previous.resource_names != subscription.resource_names);
+                            .is_none_or(|previous| previous != &subscription);
                         subscriptions.insert(request.type_url.clone(), subscription.clone());
                         if request.response_nonce.is_empty() || resource_names_changed {
                             let snapshot = server.rebuild_snapshot(&current_node_id);
                             server.snapshot_cache.insert(snapshot.clone());
-                            let response = server.sotw_response(
-                                &snapshot,
-                                &subscription.type_url,
-                                &subscription.resource_names,
-                            );
+                            let response = server.sotw_response(&snapshot, &subscription);
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
                             }
@@ -531,7 +558,6 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             return;
                         }
 
-                        let previous_subscription = subscriptions.get(&request.type_url).cloned();
                         if !request.response_nonce.is_empty() {
                             match server.record_delta_ack(&current_node_id, &request) {
                                 AckOutcome::Acked | AckOutcome::VersionDrift { .. } => debug!(
@@ -546,7 +572,6 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         error = %message,
                                         "xDS delta NACK received"
                                     );
-                                    continue;
                                 }
                                 outcome => {
                                     warn!(
@@ -555,54 +580,34 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         outcome = ?outcome,
                                         "xDS delta ACK ignored"
                                     );
-                                    continue;
                                 }
                             }
                         }
 
-                        let mut resource_names = subscriptions
-                            .get(&request.type_url)
-                            .map(|subscription| subscription.resource_names.clone())
-                            .unwrap_or_default();
-                        if !request.resource_names_subscribe.is_empty() {
-                            for name in &request.resource_names_subscribe {
-                                if !resource_names.contains(name) {
-                                    resource_names.push(name.clone());
-                                }
-                            }
-                            resource_names.sort();
-                        }
-                        if !request.resource_names_unsubscribe.is_empty() {
-                            let removed: HashSet<&str> = request
-                                .resource_names_unsubscribe
-                                .iter()
-                                .map(String::as_str)
-                                .collect();
-                            resource_names.retain(|name| !removed.contains(name.as_str()));
-                        }
-
-                        let subscription = XdsSubscription {
-                            node_id: current_node_id.clone(),
-                            type_url: request.type_url.clone(),
-                            resource_names,
-                        };
-                        let resource_names_changed = previous_subscription
-                            .as_ref()
-                            .is_none_or(|previous| previous.resource_names != subscription.resource_names);
+                        let previous_subscription = subscriptions.get(&request.type_url);
+                        let (subscription, resource_names_changed, explicit_subscription_request) =
+                            build_delta_subscription(
+                                previous_subscription,
+                                &current_node_id,
+                                &request.type_url,
+                                &request.resource_names_subscribe,
+                                &request.resource_names_unsubscribe,
+                            );
                         subscriptions.insert(request.type_url.clone(), subscription.clone());
-                        if request.response_nonce.is_empty()
-                            || resource_names_changed
-                            || !request.initial_resource_versions.is_empty()
-                        {
+                        if should_send_delta_response(
+                            &request,
+                            resource_names_changed,
+                            explicit_subscription_request,
+                        ) {
                             let previous = server.snapshot_cache.get(&current_node_id);
                             let snapshot = server.rebuild_snapshot(&current_node_id);
                             server.snapshot_cache.insert(snapshot.clone());
                             let response = server.delta_response(
                                 &snapshot,
                                 previous.as_deref(),
-                                &subscription.type_url,
-                                &subscription.resource_names,
+                                &subscription,
                                 &request.initial_resource_versions,
+                                &request.resource_names_subscribe,
                             );
                             if tx.send(Ok(response)).await.is_err() {
                                 return;
@@ -655,6 +660,93 @@ fn non_empty_string(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn build_sotw_subscription(
+    previous: Option<&XdsSubscription>,
+    node_id: &str,
+    type_url: &str,
+    resource_names: &[String],
+) -> XdsSubscription {
+    let has_wildcard = resource_names.iter().any(|name| name == "*");
+    let legacy_wildcard = resource_names.is_empty()
+        && previous.is_none_or(|subscription| {
+            subscription.wildcard && subscription.resource_names.is_empty()
+        });
+    let mut resource_names = resource_names
+        .iter()
+        .filter(|name| name.as_str() != "*")
+        .cloned()
+        .collect::<Vec<_>>();
+    resource_names.sort();
+    resource_names.dedup();
+
+    XdsSubscription {
+        node_id: node_id.to_string(),
+        type_url: type_url.to_string(),
+        resource_names,
+        wildcard: has_wildcard || legacy_wildcard,
+    }
+}
+
+fn build_delta_subscription(
+    previous: Option<&XdsSubscription>,
+    node_id: &str,
+    type_url: &str,
+    resource_names_subscribe: &[String],
+    resource_names_unsubscribe: &[String],
+) -> (XdsSubscription, bool, bool) {
+    let explicit_subscription_request =
+        !resource_names_subscribe.is_empty() || !resource_names_unsubscribe.is_empty();
+    let mut resource_names = previous
+        .map(|subscription| subscription.resource_names.clone())
+        .unwrap_or_default();
+    let mut wildcard = previous
+        .map(|subscription| subscription.wildcard)
+        .unwrap_or(!explicit_subscription_request);
+
+    for name in resource_names_subscribe {
+        if name == "*" {
+            wildcard = true;
+            continue;
+        }
+        if !resource_names.contains(name) {
+            resource_names.push(name.clone());
+        }
+    }
+    if !resource_names_subscribe.is_empty() {
+        resource_names.sort();
+    }
+    if !resource_names_unsubscribe.is_empty() {
+        let removed: HashSet<&str> = resource_names_unsubscribe
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if removed.contains("*") {
+            wildcard = false;
+        }
+        resource_names.retain(|name| !removed.contains(name.as_str()));
+    }
+
+    let subscription = XdsSubscription {
+        node_id: node_id.to_string(),
+        type_url: type_url.to_string(),
+        resource_names,
+        wildcard,
+    };
+    let changed = previous.is_none_or(|previous| previous != &subscription);
+    (subscription, changed, explicit_subscription_request)
+}
+
+fn should_send_delta_response(
+    request: &DeltaDiscoveryRequest,
+    resource_names_changed: bool,
+    explicit_subscription_request: bool,
+) -> bool {
+    request.response_nonce.is_empty()
+        || resource_names_changed
+        || explicit_subscription_request
+        || !request.initial_resource_versions.is_empty()
 }
 
 #[cfg(test)]
@@ -710,6 +802,7 @@ mod tests {
                 node_id: "node-a".to_string(),
                 type_url: super::super::translator::CDS_TYPE_URL.to_string(),
                 resource_names: Vec::new(),
+                wildcard: true,
             },
         )])
     }
@@ -770,15 +863,173 @@ mod tests {
         let response = server.delta_response(
             &snapshot,
             cached_previous.as_deref(),
-            super::super::translator::CDS_TYPE_URL,
-            &[],
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: true,
+            },
             &initial_resource_versions,
+            &[],
         );
 
         assert_eq!(
             response.removed_resources,
             vec!["cluster/default/stale/8080".to_string()]
         );
+    }
+
+    #[test]
+    fn delta_explicit_empty_subscription_returns_no_resources() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.rebuild_snapshot("node-a");
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: Vec::new(),
+                wildcard: false,
+            },
+            &HashMap::new(),
+            &[],
+        );
+
+        assert!(response.resources.is_empty());
+        assert!(response.removed_resources.is_empty());
+    }
+
+    #[test]
+    fn delta_subscription_resubscribe_is_explicit_without_state_change() {
+        let previous = XdsSubscription {
+            node_id: "node-a".to_string(),
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: vec!["cluster/default/api/8080".to_string()],
+            wildcard: false,
+        };
+        let (subscription, changed, explicit) = build_delta_subscription(
+            Some(&previous),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &["cluster/default/api/8080".to_string()],
+            &[],
+        );
+
+        assert_eq!(subscription, previous);
+        assert!(!changed);
+        assert!(explicit);
+
+        let request = DeltaDiscoveryRequest {
+            response_nonce: "stale-nonce".to_string(),
+            resource_names_subscribe: vec!["cluster/default/api/8080".to_string()],
+            ..DeltaDiscoveryRequest::default()
+        };
+        assert!(should_send_delta_response(&request, changed, explicit));
+    }
+
+    #[test]
+    fn sotw_empty_after_explicit_subscription_is_not_wildcard() {
+        let previous = build_sotw_subscription(
+            None,
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &["cluster/default/api/8080".to_string()],
+        );
+        let subscription = build_sotw_subscription(
+            Some(&previous),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+        );
+
+        assert!(!subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
+    }
+
+    #[test]
+    fn delta_named_subscription_keeps_existing_wildcard_until_star_unsubscribed() {
+        let previous = XdsSubscription {
+            node_id: "node-a".to_string(),
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: Vec::new(),
+            wildcard: true,
+        };
+        let (subscription, changed, explicit) = build_delta_subscription(
+            Some(&previous),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &["cluster/default/api/8080".to_string()],
+            &[],
+        );
+
+        assert!(changed);
+        assert!(explicit);
+        assert!(subscription.wildcard);
+        assert_eq!(
+            subscription.resource_names,
+            vec!["cluster/default/api/8080".to_string()]
+        );
+
+        let (subscription, changed, explicit) = build_delta_subscription(
+            Some(&subscription),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+            &["*".to_string()],
+        );
+
+        assert!(changed);
+        assert!(explicit);
+        assert!(!subscription.wildcard);
+        assert_eq!(
+            subscription.resource_names,
+            vec!["cluster/default/api/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn delta_explicit_missing_subscription_returns_removed_resource() {
+        let server = test_server(gateway_config_with_service(false, 0));
+        let snapshot = server.rebuild_snapshot("node-a");
+        let subscribed = "cluster/default/missing/8080".to_string();
+        let response = server.delta_response(
+            &snapshot,
+            None,
+            &XdsSubscription {
+                node_id: "node-a".to_string(),
+                type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+                resource_names: vec![subscribed.clone()],
+                wildcard: false,
+            },
+            &HashMap::new(),
+            std::slice::from_ref(&subscribed),
+        );
+
+        assert!(response.resources.is_empty());
+        assert_eq!(response.removed_resources, vec![subscribed]);
+    }
+
+    #[test]
+    fn delta_subscription_unsubscribe_all_is_empty_not_wildcard() {
+        let previous = XdsSubscription {
+            node_id: "node-a".to_string(),
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            resource_names: vec!["cluster/default/api/8080".to_string()],
+            wildcard: false,
+        };
+        let (subscription, changed, explicit) = build_delta_subscription(
+            Some(&previous),
+            "node-a",
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+            &["cluster/default/api/8080".to_string()],
+        );
+
+        assert!(changed);
+        assert!(explicit);
+        assert!(!subscription.wildcard);
+        assert!(subscription.resource_names.is_empty());
     }
 
     #[test]
