@@ -926,17 +926,16 @@ mod inner {
                                 .find_one(mongodb::bson::doc! { "proxy_id": *id })
                                 .session(&mut *s)
                                 .await
+                                && let Ok(sid) = spec_doc.get_str("_id")
                             {
-                                if let Ok(sid) = spec_doc.get_str("_id") {
-                                    let _ = this
-                                        .proxies()
-                                        .update_one(
-                                            mongodb::bson::doc! { "_id": *id },
-                                            mongodb::bson::doc! { "$set": { "api_spec_id": sid } },
-                                        )
-                                        .session(&mut *s)
-                                        .await;
-                                }
+                                let _ = this
+                                    .proxies()
+                                    .update_one(
+                                        mongodb::bson::doc! { "_id": *id },
+                                        mongodb::bson::doc! { "$set": { "api_spec_id": sid } },
+                                    )
+                                    .session(&mut *s)
+                                    .await;
                             }
                             this.cleanup_orphaned_proxy_group_plugins_opt_session(Some(s))
                                 .await
@@ -955,16 +954,15 @@ mod inner {
                     .api_specs()
                     .find_one(doc! { "proxy_id": &proxy.id })
                     .await
+                    && let Ok(sid) = spec_doc.get_str("_id")
                 {
-                    if let Ok(sid) = spec_doc.get_str("_id") {
-                        let _ = self
-                            .proxies()
-                            .update_one(
-                                doc! { "_id": &proxy.id },
-                                doc! { "$set": { "api_spec_id": sid } },
-                            )
-                            .await;
-                    }
+                    let _ = self
+                        .proxies()
+                        .update_one(
+                            doc! { "_id": &proxy.id },
+                            doc! { "$set": { "api_spec_id": sid } },
+                        )
+                        .await;
                 }
                 self.cleanup_orphaned_proxy_group_plugins().await?;
             }
