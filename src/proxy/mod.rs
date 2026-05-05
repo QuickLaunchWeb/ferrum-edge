@@ -68,11 +68,11 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::config::PoolConfig;
 use crate::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, HttpFlavor, Proxy, ResponseBodyMode,
     UpstreamTarget,
 };
+use crate::config::{EnvConfig, OperatingMode, PoolConfig};
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
@@ -583,6 +583,20 @@ pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
             .extensions()
             .get::<hyper::ext::Protocol>()
             .is_some_and(|p| p.as_ref().eq_ignore_ascii_case(b"websocket"))
+}
+
+/// Check if this is an Istio-flavored HBONE CONNECT request admitted by mesh mode.
+///
+/// HBONE is ordinary HTTP/2 CONNECT over mTLS. Unlike RFC 8441 WebSocket
+/// Extended CONNECT, it does not use a `:protocol` value. Requiring the
+/// `Protocol` extension to be absent keeps other Extended CONNECT variants
+/// (for example `connect-udp`) on the existing fail-closed path.
+pub fn is_hbone_connect_request<B>(req: &Request<B>, env_config: &EnvConfig) -> bool {
+    env_config.mode == OperatingMode::Mesh
+        && env_config.mesh_hbone_enabled
+        && req.method() == hyper::Method::CONNECT
+        && req.version() == hyper::Version::HTTP_2
+        && req.extensions().get::<hyper::ext::Protocol>().is_none()
 }
 
 #[allow(dead_code)]
@@ -5896,13 +5910,22 @@ async fn handle_proxy_request_inner(
     // Note: we enable_connect_protocol() on the h2 server to support WebSocket,
     // which means h2 will deliver Extended CONNECT requests to us — we must
     // filter non-WebSocket ones here before routing.
-    if method == "CONNECT" && !is_h2_websocket_connect(&req) {
+    let is_hbone_connect = is_hbone_connect_request(&req, &state.env_config);
+    if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect {
         warn!("Rejected non-WebSocket CONNECT request");
         record_request(&state, 405);
         return Ok(build_response(
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
+    }
+    if is_hbone_connect {
+        ctx.metadata
+            .insert("request_protocol".to_string(), "hbone".to_string());
+        ctx.metadata.insert(
+            "connection_security_policy".to_string(),
+            "hbone".to_string(),
+        );
     }
 
     // TLS 1.3 0-RTT early data enforcement (RFC 8470).
@@ -6346,6 +6369,29 @@ async fn handle_proxy_request_inner(
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    if is_hbone_connect {
+        let reject = finalize_reject_response_with_after_proxy_hooks(
+            &plugins,
+            &mut ctx,
+            StatusCode::NOT_IMPLEMENTED,
+            br#"{"error":"HBONE tunnel relay is not implemented yet"}"#,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        log_rejected_request(
+            &plugins,
+            &ctx,
+            reject.http_status.as_u16(),
+            start_time,
+            "hbone_relay_unimplemented",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(&state, reject.http_status.as_u16());
+        return Ok(build_response_from_normalized_reject(reject));
     }
 
     let maybe_requires_request_body_buffering = plugin_cache_view.requires_request_body_buffering();

@@ -1,7 +1,7 @@
 use ferrum_edge::proxy::{
     build_forwarded_value, check_host_authority_consistency, check_protocol_headers,
-    is_h2_websocket_connect, is_valid_websocket_key, normalize_request_host_for_routing,
-    ws_accept_from_key,
+    is_h2_websocket_connect, is_hbone_connect_request, is_valid_websocket_key,
+    normalize_request_host_for_routing, ws_accept_from_key,
 };
 use hyper::header::HeaderValue;
 
@@ -900,6 +900,78 @@ fn h2_connect_without_websocket_protocol_is_not_ws() {
         .unwrap();
     // No Protocol extension set — should NOT be detected as WebSocket
     assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_connect_without_protocol_is_hbone_only_in_mesh_mode() {
+    let req = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_2)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .unwrap();
+    let mesh_env = ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::Mesh,
+        mesh_hbone_enabled: true,
+        ..Default::default()
+    };
+    let non_mesh_env = ferrum_edge::config::EnvConfig::default();
+
+    assert!(is_hbone_connect_request(&req, &mesh_env));
+    assert!(!is_hbone_connect_request(&req, &non_mesh_env));
+}
+
+#[test]
+fn hbone_detection_requires_http2_and_enabled_listener() {
+    let h1_connect = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_11)
+        .uri("orders.default.svc.cluster.local:8080")
+        .body(())
+        .unwrap();
+    let disabled_env = ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::Mesh,
+        mesh_hbone_enabled: false,
+        ..Default::default()
+    };
+    let enabled_env = ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::Mesh,
+        mesh_hbone_enabled: true,
+        ..Default::default()
+    };
+
+    assert!(!is_hbone_connect_request(&h1_connect, &enabled_env));
+    assert!(!is_hbone_connect_request(&h1_connect, &disabled_env));
+}
+
+#[test]
+fn extended_connect_protocols_are_not_hbone() {
+    let mut websocket = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_2)
+        .uri("/")
+        .body(())
+        .unwrap();
+    websocket
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    let mut connect_udp = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_2)
+        .uri("/")
+        .body(())
+        .unwrap();
+    connect_udp
+        .extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("connect-udp"));
+    let env = ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::Mesh,
+        mesh_hbone_enabled: true,
+        ..Default::default()
+    };
+
+    assert!(!is_hbone_connect_request(&websocket, &env));
+    assert!(!is_hbone_connect_request(&connect_udp, &env));
 }
 
 #[test]
