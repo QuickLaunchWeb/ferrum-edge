@@ -293,6 +293,34 @@ fn real_ip_header_normalizes_single_ip_value() {
 }
 
 #[test]
+fn real_ip_header_accepts_cloudfront_viewer_address_with_port() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.10:46532", &tp).as_deref(),
+        Some("198.51.100.10")
+    );
+}
+
+#[test]
+fn real_ip_header_accepts_bracketed_ipv6_with_port() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header(
+            "10.0.0.1",
+            &socket_addr,
+            "[2001:0db8:0000:0000:0000:0000:0000:0001]:46532",
+            &tp
+        )
+        .as_deref(),
+        Some("2001:db8::1")
+    );
+}
+
+#[test]
 fn real_ip_header_rejects_empty_value() {
     let tp = TrustedProxies::parse("10.0.0.0/8");
     let socket_addr = "10.0.0.1".parse().unwrap();
@@ -369,6 +397,17 @@ fn real_ip_header_rejects_malformed_value() {
 
     assert_eq!(
         resolve_real_ip_header("10.0.0.1", &socket_addr, "not-an-ip", &tp),
+        None
+    );
+}
+
+#[test]
+fn real_ip_header_rejects_malformed_source_port() {
+    let tp = TrustedProxies::parse("10.0.0.0/8");
+    let socket_addr = "10.0.0.1".parse().unwrap();
+
+    assert_eq!(
+        resolve_real_ip_header("10.0.0.1", &socket_addr, "198.51.100.10:not-a-port", &tp),
         None
     );
 }

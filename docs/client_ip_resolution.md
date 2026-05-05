@@ -15,7 +15,7 @@ When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP s
 
 The gateway uses a three-step process to resolve the real client IP:
 
-1. **Check authoritative header** (optional): If `FERRUM_REAL_IP_HEADER` is set (e.g., `CF-Connecting-IP`), the gateway checks that header first. This is only trusted when the direct connection comes from a trusted proxy. Accepted values are parsed as a single `IpAddr` and normalized before use.
+1. **Check authoritative header** (optional): If `FERRUM_REAL_IP_HEADER` is set (e.g., `CF-Connecting-IP`), the gateway checks that header first. This is only trusted when the direct connection comes from a trusted proxy. Accepted values are parsed as a single `IpAddr`, or as an `ip:source-port` socket address for headers such as CloudFront's `CloudFront-Viewer-Address`, and normalized before use.
 
 2. **Walk `X-Forwarded-For` right-to-left**: If the configured real-IP header is absent, parse the XFF header into a list of IPs. Starting from the rightmost entry, skip any IP that matches a trusted proxy CIDR. The first non-trusted IP is the real client.
 
@@ -78,7 +78,7 @@ FERRUM_REAL_IP_HEADER="True-Client-IP"
 
 **Security note**: This header is only trusted when the direct TCP connection comes from a trusted proxy (as defined by `FERRUM_TRUSTED_PROXIES`). If a client connects directly and sends this header, the socket IP is kept rather than falling through to `X-Forwarded-For`.
 
-Values must contain exactly one parseable IP address. Whitespace is trimmed, and accepted values are normalized with Rust's `IpAddr` formatter before being used in plugin context, rate-limit keys, and logs. For example, `2001:0db8:0000::0001` is stored as `2001:db8::1`.
+Values must contain exactly one parseable IP address or one parseable socket address whose host is an IP. Whitespace is trimmed, accepted values are normalized with Rust's `IpAddr` formatter, and any source port is discarded before the value is used in plugin context, rate-limit keys, and logs. For example, `2001:0db8:0000::0001` is stored as `2001:db8::1`, and CloudFront's `198.51.100.10:46532` is stored as `198.51.100.10`.
 
 ## Security Model
 
@@ -99,6 +99,7 @@ The client IP resolution follows these security principles:
 | Client connects directly (no proxy), sends fake XFF | XFF ignored; socket IP used |
 | Client behind proxy prepends fake IP to XFF | Right-to-left walk returns the real client IP (added by your proxy) |
 | Client behind proxy sends fake `CF-Connecting-IP` | Header ignored because the direct connection isn't from a trusted proxy; socket IP used |
+| CloudFront sends `CloudFront-Viewer-Address: 198.51.100.10:46532` | Source port is discarded; client IP is `198.51.100.10` |
 | Trusted proxy sends empty, malformed, or comma-separated real-IP header | Socket IP used |
 | All XFF entries are trusted proxy IPs | Falls back to socket IP |
 | XFF contains unparseable garbage entries | Stops at the first unparseable entry (conservative) |

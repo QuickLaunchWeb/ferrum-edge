@@ -285,9 +285,10 @@ pub fn resolve_client_ip_parsed(
 /// Resolve a configured single-hop real-IP header from a trusted direct proxy.
 ///
 /// Unlike `X-Forwarded-For`, configured headers such as `CF-Connecting-IP` or
-/// `X-Real-IP` are expected to contain exactly one IP address. Comma-separated
-/// chains or malformed values are ignored so client-controlled header text
-/// cannot feed ACLs, rate limits, or logs.
+/// `X-Real-IP` are expected to contain exactly one IP address. The AWS
+/// `CloudFront-Viewer-Address` form (`ip:source-port`) is also accepted.
+/// Comma-separated chains or malformed values are ignored so client-controlled
+/// header text cannot feed ACLs, rate limits, or logs.
 pub fn resolve_real_ip_header(
     socket_ip: &str,
     socket_addr: &IpAddr,
@@ -306,21 +307,27 @@ pub fn resolve_real_ip_header(
     if value.is_empty() || value.contains(',') {
         debug!(
             value = value,
-            "Configured real-IP header must contain a single IP address"
+            "Configured real-IP header must contain a single IP address or IP:port value"
         );
         return None;
     }
 
-    match value.parse::<IpAddr>() {
+    match parse_single_real_ip_value(value) {
         Ok(ip) => Some(ip.to_string()),
         Err(_) => {
             debug!(
                 value = value,
-                "Configured real-IP header was not a parseable IP address"
+                "Configured real-IP header was not a parseable IP address or IP:port value"
             );
             None
         }
     }
+}
+
+fn parse_single_real_ip_value(value: &str) -> Result<IpAddr, std::net::AddrParseError> {
+    value
+        .parse::<IpAddr>()
+        .or_else(|_| value.parse::<std::net::SocketAddr>().map(|addr| addr.ip()))
 }
 
 /// Resolve client IP when a caller has already performed targeted header

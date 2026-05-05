@@ -732,9 +732,10 @@ pub struct EnvConfig {
     /// When true, add a Forwarded header (RFC 7239) alongside X-Forwarded-* headers.
     pub add_forwarded_header: bool,
     /// Header to use as the authoritative source of client IP. When set, this
-    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare, or
-    /// "X-Real-IP" for nginx). If the configured header is absent, falls back
-    /// to the X-Forwarded-For walk. If it is present but rejected, the socket IP
+    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare,
+    /// "X-Real-IP" for nginx, or CloudFront's "CloudFront-Viewer-Address"
+    /// ip:source-port value). If the configured header is absent, falls back to
+    /// the X-Forwarded-For walk. If it is present but rejected, the socket IP
     /// remains the source of truth.
     pub real_ip_header: Option<String>,
 
