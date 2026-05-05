@@ -5203,6 +5203,12 @@ components:
           type: boolean
           default: true
           description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy."
+        max_response_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 1048576
+          description: "Cap on bytes read from a mirror response when deriving its size. Only consulted when the response has no `content-length` header — streaming is aborted as soon as the limit is crossed and the mirror task records the truncated count. Bytes are discarded after measurement, so this only bounds memory pressure from misbehaving mirror sinks. Default is 1 MiB."
 
     ServerlessFunctionConfig:
       type: object

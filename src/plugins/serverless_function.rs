@@ -69,6 +69,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use super::utils::aws_sigv4;
+use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 /// Cloud provider for the serverless function.
@@ -511,18 +512,19 @@ impl ServerlessFunction {
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
             .collect();
 
-        let body = response
-            .bytes()
+        // Stream the response body with a hard cap. Calling `.bytes().await`
+        // would buffer the whole payload before any size check fires — a
+        // misbehaving function could exhaust gateway memory regardless of
+        // `max_response_body_bytes`. The bounded reader aborts the stream as
+        // soon as the running total crosses the limit.
+        let body = read_response_body_bounded(response, self.max_response_body_bytes)
             .await
-            .map_err(|e| format!("serverless_function: failed to read response body: {e}"))?;
-
-        if body.len() > self.max_response_body_bytes {
-            return Err(format!(
-                "serverless_function: response body size {} exceeds max_response_body_bytes {}",
-                body.len(),
-                self.max_response_body_bytes,
-            ));
-        }
+            .map_err(|e| match e {
+                BoundedReadError::LimitExceeded { .. } => format!("serverless_function: {e}"),
+                BoundedReadError::Stream(_) => {
+                    format!("serverless_function: failed to read response body: {e}")
+                }
+            })?;
 
         // AWS Lambda returns HTTP 200 even on function errors, signaling via
         // X-Amz-Function-Error header. Treat this as an invocation failure.
@@ -536,7 +538,7 @@ impl ServerlessFunction {
             ));
         }
 
-        Ok((status, response_headers, body.to_vec()))
+        Ok((status, response_headers, body))
     }
 }
 

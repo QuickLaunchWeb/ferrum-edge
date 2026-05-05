@@ -16,6 +16,7 @@ pub mod log_helpers;
 pub mod metadata_redaction;
 pub mod rate_limit;
 pub mod redis_rate_limiter;
+pub mod response_body;
 pub mod size_limit;
 pub mod sse;
 pub mod tcp_endpoint;
