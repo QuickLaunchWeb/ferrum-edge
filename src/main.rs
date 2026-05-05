@@ -329,11 +329,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         "Proxy bind address: {}, Admin bind address: {}",
         env_config.proxy_bind_address, env_config.admin_bind_address
     );
-    let admin_bind_is_unspecified = env_config
-        .admin_bind_address
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_unspecified());
-    if admin_bind_is_unspecified && env_config.admin_allowed_cidrs.trim().is_empty() {
+    if admin_bind_requires_cidr_warning(
+        &env_config.admin_bind_address,
+        &env_config.admin_allowed_cidrs,
+    ) {
         warn!(
             "Admin API is bound to {} with no FERRUM_ADMIN_ALLOWED_CIDRS; ensure the admin listener is not publicly reachable",
             env_config.admin_bind_address
@@ -432,4 +431,60 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     });
 
     gateway_exit_code
+}
+
+fn admin_bind_requires_cidr_warning(admin_bind_address: &str, admin_allowed_cidrs: &str) -> bool {
+    if !admin_allowed_cidrs.trim().is_empty() {
+        return false;
+    }
+
+    admin_bind_address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| admin_bind_may_be_publicly_reachable(&ip))
+}
+
+fn admin_bind_may_be_publicly_reachable(ip: &std::net::IpAddr) -> bool {
+    if ip.is_unspecified() {
+        return true;
+    }
+
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || octets[0] == 0
+                || (octets[0] == 100 && (octets[1] & 0xC0) == 64))
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_loopback()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || (ip.segments()[0] & 0xfe00) == 0xfc00)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admin_bind_requires_cidr_warning;
+
+    #[test]
+    fn admin_bind_warning_covers_unspecified_and_public_addresses() {
+        assert!(admin_bind_requires_cidr_warning("0.0.0.0", ""));
+        assert!(admin_bind_requires_cidr_warning("::", ""));
+        assert!(admin_bind_requires_cidr_warning("8.8.8.8", ""));
+        assert!(admin_bind_requires_cidr_warning("2001:4860:4860::8888", ""));
+    }
+
+    #[test]
+    fn admin_bind_warning_ignores_private_local_and_guarded_addresses() {
+        assert!(!admin_bind_requires_cidr_warning("127.0.0.1", ""));
+        assert!(!admin_bind_requires_cidr_warning("10.0.0.10", ""));
+        assert!(!admin_bind_requires_cidr_warning("192.168.1.10", ""));
+        assert!(!admin_bind_requires_cidr_warning("169.254.1.10", ""));
+        assert!(!admin_bind_requires_cidr_warning("::1", ""));
+        assert!(!admin_bind_requires_cidr_warning("fd00::10", ""));
+        assert!(!admin_bind_requires_cidr_warning("8.8.8.8", "10.0.0.0/8"));
+    }
 }
