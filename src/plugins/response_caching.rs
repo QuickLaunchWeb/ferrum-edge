@@ -10,6 +10,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +34,33 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 const CACHE_BASE_KEY: &str = "cache_base_key";
 const CACHE_STATUS: &str = "cache_status";
 const CACHE_PREDICT_KEY: &str = "cache_predict_key";
+
+fn sha256_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn cache_key_host_part(host: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    if host.is_empty() {
+        String::new()
+    } else {
+        format!("h-{}", sha256_hex(&host))
+    }
+}
+
+fn is_sensitive_vary_header(header: &str) -> bool {
+    header.eq_ignore_ascii_case("authorization")
+        || header.eq_ignore_ascii_case("proxy-authorization")
+        || header.eq_ignore_ascii_case("cookie")
+}
+
+fn cache_key_vary_value(header: &str, value: &str) -> String {
+    if is_sensitive_vary_header(header) {
+        format!("sha256-{}", sha256_hex(value))
+    } else {
+        value.to_string()
+    }
+}
 
 /// A cached response entry.
 #[derive(Debug, Clone)]
@@ -277,13 +305,12 @@ impl ResponseCaching {
 
         // Include the request `Host` header in the base key so multi-host
         // proxies (e.g. `hosts: ["a.example.com", "b.example.com"]`) don't
-        // collide. Without this, two virtual hosts served by the same proxy
-        // share one cache namespace and a response cached under host A is
-        // served to clients addressing host B. ASCII-lowercased so the key is
-        // case-insensitive (per RFC 9110 §4.2.3).
+        // collide. Hash the ASCII-lowercased host before putting it into the
+        // colon-delimited key so host:port and bracketed IPv6 literals cannot
+        // be mistaken for structural delimiters during invalidation.
         let host_part: String = request_headers
             .get("host")
-            .map(|h| h.to_ascii_lowercase())
+            .map(|h| cache_key_host_part(h))
             .unwrap_or_default();
 
         let query_part = if self.config.cache_key_include_query {
@@ -328,6 +355,7 @@ impl ResponseCaching {
                     .get(header.as_str())
                     .map(String::as_str)
                     .unwrap_or("");
+                let value = cache_key_vary_value(header, value);
                 format!("{}={}", header, value)
             })
             .collect::<Vec<_>>()
@@ -527,7 +555,7 @@ impl ResponseCaching {
 
 /// Check if a cache key's path segment matches the invalidation path.
 ///
-/// Cache key format: `proxy_id:host:method:path:query:consumer[:vary...]`.
+/// Cache key format: `proxy_id:host_hash:method:path:query:consumer[:vary...]`.
 /// Returns true if the cached path equals `target_path` or starts with it
 /// as a proper path prefix (followed by `/` or end of string).
 fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
@@ -865,5 +893,103 @@ impl Plugin for ResponseCaching {
 
         self.evict_if_needed();
         PluginResult::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn plugin_with_config(config: serde_json::Value) -> ResponseCaching {
+        ResponseCaching::new(&config).expect("response_caching config should be valid")
+    }
+
+    fn make_ctx(method: &str, path: &str) -> RequestContext {
+        RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            path.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sensitive_vary_values_are_hashed_in_predict_and_storage_keys() {
+        let plugin = plugin_with_config(json!({
+            "ttl_seconds": 60,
+            "vary_by_headers": ["authorization"]
+        }));
+        let bearer = "Bearer reviewer-secret-token";
+
+        let mut ctx = make_ctx("GET", "/api/public-auth");
+        ctx.headers
+            .insert("authorization".to_string(), bearer.to_string());
+        let mut request_headers = ctx.headers.clone();
+
+        let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+
+        let predict_key = ctx
+            .metadata
+            .get(CACHE_PREDICT_KEY)
+            .expect("before_proxy should store variant predict key");
+        assert!(!predict_key.contains(bearer));
+        assert!(!predict_key.contains("reviewer-secret-token"));
+        assert!(predict_key.contains("authorization=sha256-"));
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"authorized-body")
+            .await;
+
+        let cache_keys: Vec<String> = plugin
+            .cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        assert_eq!(cache_keys.len(), 1);
+        let stored_key = &cache_keys[0];
+        assert!(!stored_key.contains(bearer));
+        assert!(!stored_key.contains("reviewer-secret-token"));
+        assert!(stored_key.contains("authorization=sha256-"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_method_invalidates_cached_hosts_with_ports_and_ipv6_literals() {
+        for host in ["Example.com:8443", "[::1]:8443"] {
+            let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+            let mut get_ctx = make_ctx("GET", "/api/items");
+            get_ctx.headers.insert("host".to_string(), host.to_string());
+            let mut get_headers = get_ctx.headers.clone();
+            plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+            plugin
+                .on_final_response_body(&mut get_ctx, 200, &HashMap::new(), b"cached-items")
+                .await;
+
+            let cache_keys: Vec<String> = plugin
+                .cache
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect();
+            assert_eq!(cache_keys.len(), 1);
+            assert!(!cache_keys[0].contains(host));
+
+            let mut post_ctx = make_ctx("POST", "/api/items");
+            post_ctx
+                .headers
+                .insert("host".to_string(), host.to_string());
+            let mut post_headers = post_ctx.headers.clone();
+            plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+
+            assert!(
+                plugin.cache.is_empty(),
+                "unsafe method should invalidate cached key for host {host}"
+            );
+        }
     }
 }
