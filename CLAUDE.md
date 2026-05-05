@@ -201,6 +201,8 @@ Priority order, lower = first. Multiple instances per proxy allowed. Each has `i
 
 `TransactionSummary` (HTTP/gRPC/WS) and `StreamTransactionSummary` (TCP/UDP) in `src/plugins/mod.rs`. HTTP path has body-streaming fields (`body_error_class`, `body_completed`, `bytes_streamed_to_client`) — populated fully only after a forthcoming `DeferredTransactionLogger`. Stream path has disconnect-attribution fields (`disconnect_direction`: `ClientToBackend`/`BackendToClient`/`Unknown`; `disconnect_cause`: `IdleTimeout`/`RecvError`/`BackendError`/`GracefulShutdown`). Error classifiers: `classify_reqwest_error`, `classify_grpc_proxy_error`, `classify_boxed_error`, `classify_http2_pool_error`, `classify_http3_error`.
 
+**Metadata redaction**: Both summaries' `metadata: HashMap<String, String>` fields are sanitized at serialize time via `plugins::utils::metadata_redaction::serialize_redacted_metadata` (wired through `#[serde(serialize_with = ...)]`). Any key whose lowercased form contains a substring from `DEFAULT_SENSITIVE_METADATA_KEYS` (`authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `bearer`, `password`, `secret`, `token`) — or any operator-supplied substring from `FERRUM_LOG_REDACT_METADATA_KEYS` (comma-separated) — has its value replaced with `[REDACTED]` before going to any logger sink (stdout, http, tcp, kafka, loki, udp, ws, statsd). The in-memory map is untouched, so other plugin phases still see the original. New loggers do NOT need to redact themselves — they get redaction for free as long as they serialize `TransactionSummary` / `StreamTransactionSummary` through serde. Custom plugins that stash credentials, session IDs, or correlation tokens in `ctx.metadata` therefore cannot accidentally leak them through transaction logs.
+
 ### DNS Cache (`src/dns/mod.rs`)
 
 Shared singleton; pre-warmed. Native TTL by default, floored by `FERRUM_DNS_MIN_TTL_SECONDS`. Stale-while-revalidate + background refresh at `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` of TTL (90%). Priority: per-proxy `dns_cache_ttl_seconds` > `FERRUM_DNS_TTL_OVERRIDE_SECONDS` > native. Failed retries via background task. TCP fallback for truncated UDP. Concurrent nameserver races (`FERRUM_DNS_NUM_CONCURRENT_REQS`). **`DnsCacheResolver` must be plugged into every `reqwest::Client` in production.**
@@ -487,6 +489,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`migrate`
 - `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads
 - `FERRUM_LOG_LEVEL` (`error`)
+- `FERRUM_LOG_REDACT_METADATA_KEYS` (empty) — comma-separated extra substrings (case-insensitive) to redact from `TransactionSummary.metadata` / `StreamTransactionSummary.metadata` in addition to the built-in `authorization`/`cookie`/`set-cookie`/`x-api-key`/`x-auth-token`/`x-csrf-token`/`bearer`/`password`/`secret`/`token` defaults. Applies to every logging plugin (stdout/http/tcp/kafka/loki/udp/ws/statsd) via the central serde adapter.
 - `FERRUM_PROXY_HTTP_PORT`/`HTTPS_PORT` (8000/8443); `FERRUM_ADMIN_HTTP_PORT`/`HTTPS_PORT` (9000/9443) — `0` disables plaintext
 - `FERRUM_ADMIN_JWT_SECRET` (required db/cp, ≥32 chars)
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
