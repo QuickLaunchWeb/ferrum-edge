@@ -145,24 +145,25 @@ impl XdsAdsServer {
             .nonce_tracker
             .issue_nonce(&snapshot.node_id, type_url, &snapshot.version);
         let resources = snapshot.filtered_resources(type_url, resource_names);
-        let mut removed_resources = previous
-            .map(|prev| prev.removed_resource_names(snapshot, type_url))
-            .unwrap_or_default();
-        if previous.is_none() && !initial_resource_versions.is_empty() {
+        let mut removed_resources = if initial_resource_versions.is_empty() {
+            previous
+                .map(|prev| prev.removed_resource_names(snapshot, type_url))
+                .unwrap_or_default()
+        } else {
             let current_names: HashSet<String> = snapshot
                 .resources(type_url)
                 .into_iter()
                 .map(|r| r.name)
                 .collect();
-            removed_resources.extend(
-                initial_resource_versions
-                    .keys()
-                    .filter(|name| !current_names.contains(*name))
-                    .cloned(),
-            );
-            removed_resources.sort();
-            removed_resources.dedup();
-        }
+            let mut removed: Vec<String> = initial_resource_versions
+                .keys()
+                .filter(|name| !current_names.contains(*name))
+                .cloned()
+                .collect();
+            removed.sort();
+            removed.dedup();
+            removed
+        };
         if !resource_names.is_empty() && !removed_resources.is_empty() {
             let wanted: HashSet<&str> = resource_names.iter().map(String::as_str).collect();
             removed_resources.retain(|name| wanted.contains(name.as_str()));
@@ -656,6 +657,31 @@ mod tests {
         assert_eq!(
             recovered[0].removed_resources,
             vec!["cluster/default/api/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn delta_initial_resource_versions_drive_removals_even_with_cached_snapshot() {
+        let server = test_server(gateway_config_with_service(true, 0));
+        let snapshot = server.rebuild_snapshot("node-a");
+        server.snapshot_cache.insert(snapshot.clone());
+        let cached_previous = server.snapshot_cache.get("node-a");
+        let initial_resource_versions = HashMap::from([(
+            "cluster/default/stale/8080".to_string(),
+            "v-old".to_string(),
+        )]);
+
+        let response = server.delta_response(
+            &snapshot,
+            cached_previous.as_deref(),
+            super::super::translator::CDS_TYPE_URL,
+            &[],
+            &initial_resource_versions,
+        );
+
+        assert_eq!(
+            response.removed_resources,
+            vec!["cluster/default/stale/8080".to_string()]
         );
     }
 }
