@@ -5508,12 +5508,12 @@ components:
           description: Include the model name in the cache key (different models get separate cache entries)
         include_params_in_key:
           type: boolean
-          default: false
-          description: Include request parameters (temperature, max_tokens, etc.) in the cache key
+          default: true
+          description: Include request parameters (temperature, top_p, max_tokens) in the cache key. Default `true` — different sampling params produce different responses and must not collide. Set `false` only when cross-parameter cache reuse is intentional.
         scope_by_consumer:
           type: boolean
-          default: false
-          description: Scope cache entries per consumer (authenticated consumer ID is included in the cache key)
+          default: true
+          description: Scope cache entries per consumer (authenticated consumer ID is included in the cache key). Default `true` — different consumers must not see each other's cached responses. Set `false` only on a public LLM proxy with no per-tenant data.
         sync_mode:
           type: string
           enum: [local, redis]

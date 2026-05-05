@@ -106,8 +106,17 @@ impl AiSemanticCache {
             .unwrap_or(104_857_600) as usize; // 100 MiB default
 
         let include_model_in_key = config["include_model_in_key"].as_bool().unwrap_or(true);
-        let include_params_in_key = config["include_params_in_key"].as_bool().unwrap_or(false);
-        let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(false);
+        // SECURITY: Default `true` so two requests that differ only in
+        // sampling parameters (temperature, top_p, max_tokens) cannot collapse
+        // to the same cache entry and serve a wrong-shape response. Operators
+        // who explicitly want cross-parameter cache reuse must set this to
+        // `false`.
+        let include_params_in_key = config["include_params_in_key"].as_bool().unwrap_or(true);
+        // SECURITY: Default `true` so cached responses are not replayed across
+        // different authenticated consumers. Operators who explicitly want a
+        // shared cache (e.g., a public LLM proxy with no per-tenant data)
+        // must set this to `false`.
+        let scope_by_consumer = config["scope_by_consumer"].as_bool().unwrap_or(true);
 
         // Build optional Redis client
         let redis_client = RedisConfig::from_plugin_config(
@@ -145,10 +154,14 @@ impl AiSemanticCache {
     ///
     /// Normalization steps:
     /// 1. Parse the JSON request body
-    /// 2. Extract and sort the messages array by (role, content)
-    /// 3. Lowercase and collapse whitespace in content fields
-    /// 4. Optionally include model name and sampling parameters
-    /// 5. SHA-256 hash the normalized representation
+    /// 2. Optionally scope by proxy and authenticated consumer
+    /// 3. Optionally include model name and sampling parameters
+    /// 4. Lowercase and collapse whitespace in `messages[*].content`
+    /// 5. Include the Anthropic top-level `system` prompt (string or array form)
+    /// 6. Include `tools` / `tool_choice` / `response_format` / `seed` /
+    ///    `logit_bias` / `stream` when present — any change to these fields
+    ///    materially changes the response and must not collapse to the same key
+    /// 7. SHA-256 hash the normalized representation
     fn build_cache_key(&self, ctx: &RequestContext, body: &Value) -> Option<String> {
         let mut key_parts: Vec<String> = Vec::new();
 
@@ -173,11 +186,11 @@ impl AiSemanticCache {
 
         // Sampling parameters
         if self.include_params_in_key {
-            if let Some(temp) = body.get("temperature").and_then(|t| t.as_f64()) {
-                key_parts.push(format!("t:{:.2}", temp));
+            if let Some(temp) = body.get("temperature") {
+                key_parts.push(format!("t:{}", canonical_param_value(temp)));
             }
-            if let Some(top_p) = body.get("top_p").and_then(|t| t.as_f64()) {
-                key_parts.push(format!("p:{:.2}", top_p));
+            if let Some(top_p) = body.get("top_p") {
+                key_parts.push(format!("p:{}", canonical_param_value(top_p)));
             }
             if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
                 key_parts.push(format!("mt:{}", max_tokens));
@@ -203,6 +216,66 @@ impl AiSemanticCache {
         } else {
             // No messages array — not a chat completion request, skip caching
             return None;
+        }
+
+        // Top-level `system` prompt (Anthropic Messages API). Included AFTER
+        // the messages section so two requests that differ only in their
+        // system prompt cannot collapse to the same cache key. Anthropic
+        // accepts either a string or an array of content blocks (e.g.
+        // `[{"type": "text", "text": "..."}]`); we normalize both forms here.
+        if let Some(system) = body.get("system") {
+            let normalized = if let Some(s) = system.as_str() {
+                normalize_text(s)
+            } else if let Some(parts) = system.as_array() {
+                // Array of content blocks. Extract the `text` field of every
+                // `{"type":"text","text":"..."}` block, joined by spaces, then
+                // normalize. This mirrors `extract_message_content`'s
+                // multimodal branch but operates directly on the array (the
+                // system field IS the array, not nested under `"content"`).
+                let mut texts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(text) = part.get("text").and_then(|t| t.as_str())
+                    {
+                        texts.push(text);
+                    }
+                }
+                normalize_text(&texts.join(" "))
+            } else {
+                // Unknown shape — hash the JSON repr so any change breaks the key.
+                normalize_text(&system.to_string())
+            };
+            key_parts.push(format!("sys:{}", normalized));
+        }
+
+        // Other request fields that materially change the response shape or
+        // selection. Including these prevents cross-prompt poisoning where two
+        // distinct requests differing only in tool/format/seed/logit-bias/stream
+        // configuration would collapse to the same cache entry. We use the
+        // canonical JSON serialization (sort_keys not required at this level
+        // because it's the user-supplied payload) so any byte-level change
+        // breaks the key.
+        for field in &[
+            "tools",
+            "tool_choice",
+            "response_format",
+            "seed",
+            "logit_bias",
+        ] {
+            if let Some(value) = body.get(*field) {
+                key_parts.push(format!("{}:{}", field, value));
+            }
+        }
+
+        // `stream`: stream:true and stream:false produce different wire
+        // formats (SSE vs single JSON), so cached non-stream responses must
+        // not be replayed to a stream:true caller (or vice versa). We don't
+        // actually cache SSE responses (see `on_final_response_body`), but
+        // including this prevents a non-streaming MISS-then-store from being
+        // served to a streaming client whose stored entry would be wrongly
+        // formatted.
+        if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
+            key_parts.push(format!("stream:{}", stream));
         }
 
         // Hash the key parts into a fixed-size cache key
@@ -382,6 +455,10 @@ fn sanitize_cached_headers(headers: &HashMap<String, String>) -> HashMap<String,
         .filter(|(name, _)| !is_sensitive_header(name))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+fn canonical_param_value(value: &Value) -> String {
+    value.to_string()
 }
 
 /// Normalize text: lowercase, collapse whitespace to single spaces, trim.
