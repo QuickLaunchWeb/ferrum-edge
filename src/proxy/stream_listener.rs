@@ -70,7 +70,7 @@ pub struct StreamListenerManager {
     frontend_tls_config: arc_swap::ArcSwap<Option<Arc<rustls::ServerConfig>>>,
     /// DTLS cert/key paths for frontend DTLS termination on UDP proxies.
     /// When a UDP proxy has `frontend_tls: true`, these paths are used to build
-    /// the DTLS server config. Requires ECDSA P-256 or Ed25519 certificates.
+    /// the DTLS server config. Requires ECDSA P-256 or P-384 certificates.
     frontend_dtls_cert_key: arc_swap::ArcSwap<Option<(String, String)>>,
     /// Optional DTLS client CA certificate path for frontend mTLS.
     /// When set, the gateway requires and verifies client DTLS certificates

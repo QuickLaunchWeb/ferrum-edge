@@ -14,18 +14,9 @@ async fn sqlite_store() -> (DatabaseStore, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("incremental_poll_test.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        false,
-        None,
-        None,
-        None,
-        false,
-        DbPoolConfig::default(),
-    )
-    .await
-    .expect("SQLite store creation must succeed");
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("SQLite store creation must succeed");
     (store, temp_dir)
 }
 

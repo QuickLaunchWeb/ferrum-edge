@@ -62,7 +62,7 @@ PRs: format check → tests (parallel) → lint → perf regression → build 5 
 
 **Admin JWT asymmetry (intentional)**: the admin API only *validates* JWTs — it never mints them (operators pre-sign tokens externally). DB/CP require `FERRUM_ADMIN_JWT_SECRET` (≥32 chars) because their R/W admin API needs a stable, known secret so operator-minted tokens stay valid across instances and restarts. File mode is read-only, so it generates a random secret at startup — externally crafted tokens can never validate.
 
-**`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 10). Do not remove. Response includes `database.pool` stats when connected.
+**`/health` DB check cached 15s via lock-free `ArcSwap`** (`AdminState.CachedDbHealthResult`). Endpoints unauthenticated; without caching an attacker could flood `SELECT 1` and exhaust `FERRUM_DB_POOL_MAX_CONNECTIONS` (default 32). Do not remove. Response includes `database.pool` stats when connected.
 
 **`GET /cluster`** (JWT-auth): CP returns connected DPs (from `DpNodeRegistry`, auto-removed on stream drop via `TrackedStream`); DP returns CP connection state (from `DpCpConnectionState`, primary vs fallback, `last_config_received_at`).
 
@@ -463,7 +463,7 @@ The trait methods `pending_plugin_migrations` / `apply_plugin_migrations` defaul
 
 1. Struct in `src/config/types.rs` with `#[serde(default)]`
 2. Env-driven → `src/config/env_config.rs`
-3. **Update `ferrum.conf`** — every new `FERRUM_*` needs commented default + comment. Conf and env vars MUST stay in sync.
+3. **Update config docs** — `docs/configuration.md` is the canonical human-readable `FERRUM_*` reference; `ferrum.conf` is the editable operator template. Every new `FERRUM_*` needs a table entry in `docs/configuration.md` and a concise commented default in `ferrum.conf`; both MUST stay in sync with `env_config.rs`.
 4. SQL storage → migration in `src/config/migrations/` + row parsing in `db_loader.rs`
 5. MongoDB auto-persists via serde BSON — only add indexes in `MongoStore::run_migrations()` if queried
 6. Unit tests in `tests/unit/config/`; update `openapi.yaml` if admin-exposed
@@ -478,9 +478,9 @@ PostgreSQL/MySQL/SQLite (sqlx), MongoDB. SQLite uses `PRAGMA journal_mode=WAL`/`
 
 **Transactions**: SQL wraps multi-step CRUD in `sqlx::Transaction`. MongoDB: single-doc atomic; multi-doc requires replica set (`FERRUM_MONGO_REPLICA_SET`), else idempotent with poll-cycle cleanup.
 
-**Incremental polling** (`FERRUM_DB_POLL_INTERVAL_SECONDS`, default 30s): startup = full `SELECT *`; subsequent = indexed `updated_at > ?` + lightweight `SELECT id` deletion diff. 1s safety margin. Validated before apply; known IDs unchanged on reject. Auto-fallback to full reload on failure. **CP broadcasts deltas** via tokio `broadcast` (capacity = `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging DPs auto-get a full snapshot.
+**Incremental polling** (`FERRUM_DB_POLL_INTERVAL`, default 30s): startup = full `SELECT *`; subsequent = indexed `updated_at > ?` + lightweight `SELECT id` deletion diff. 1s safety margin. Validated before apply; known IDs unchanged on reject. Auto-fallback to full reload on failure. **CP broadcasts deltas** via tokio `broadcast` (capacity = `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`); lagging DPs auto-get a full snapshot.
 
-**Failover**: `FERRUM_DB_FAILOVER_URLS` (same `FERRUM_DB_TYPE`); `FERRUM_DB_READ_REPLICA_URL` offloads polling (writes always primary). **MongoDB** (`docs/mongodb.md`): `readPreference` in URL replaces read-replica var; replica sets handle failover natively (list members in `FERRUM_DB_URL`); pool via driver (`maxPoolSize`/`minPoolSize` in URL) — `FERRUM_DB_POOL_*` ignored.
+**Failover**: `FERRUM_DB_FAILOVER_URLS` (same `FERRUM_DB_TYPE`); `FERRUM_DB_READ_REPLICA_URL` offloads polling (writes always primary). **Database TLS**: canonical envs are `FERRUM_DB_TLS_MODE` (`disable`/`allow`/`prefer`/`require`/`verify-ca`/`verify-full`) plus `FERRUM_DB_TLS_CA_CERT_PATH`, `FERRUM_DB_TLS_CLIENT_CERT_PATH`, and `FERRUM_DB_TLS_CLIENT_KEY_PATH`; MySQL rejects `allow`, MongoDB env mode supports only `disable`/`require`/`verify-full`, and SQLite accepts only `disable` as a no-op while rejecting cert paths and other TLS modes. **MongoDB** (`docs/mongodb.md`): `readPreference` in URL replaces read-replica var; replica sets handle failover natively (list members in `FERRUM_DB_URL`); pool via driver (`maxPoolSize`/`minPoolSize` in URL) — `FERRUM_DB_POOL_*` ignored.
 
 ### Dependency Version Sync
 
@@ -496,7 +496,7 @@ Imperative mood, concise (e.g., `Fix rate limiter to handle zero-window edge cas
 
 ## Key Environment Variables
 
-Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common essentials below.
+Full docs reference: `docs/configuration.md`. Runtime parsing/defaults: `src/config/env_config.rs`. Editable template: `ferrum.conf`. Most-common essentials below.
 
 - `FERRUM_MODE` (required): `database`/`file`/`cp`/`dp`/`migrate`
 - `FERRUM_NAMESPACE` (`ferrum`): which namespace this instance loads
@@ -507,7 +507,7 @@ Full list: 90+ vars in `src/config/env_config.rs` and `ferrum.conf`. Most-common
 - `FERRUM_FRONTEND_TLS_CERT_PATH`/`KEY_PATH`
 - `FERRUM_TLS_CA_BUNDLE_PATH` (global backend CA, exclusive); `FERRUM_TLS_NO_VERIFY` (**testing only**); `FERRUM_TLS_CRL_FILE_PATH`
 - `FERRUM_FILE_CONFIG_PATH` (required file mode)
-- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_POOL_MAX_CONNECTIONS` (10, bump for CP)
+- `FERRUM_DB_TYPE`/`DB_URL` (required db); `FERRUM_DB_FAILOVER_URLS`, `FERRUM_DB_READ_REPLICA_URL`; `FERRUM_DB_TLS_MODE` + DB TLS cert paths; `FERRUM_DB_POOL_MAX_CONNECTIONS` (32, bump for large CP)
 - `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS` (`false`; opt-in auto-apply of pending custom-plugin SQL migrations at startup in `database`/`cp`. Default off — gateway warns but does not auto-mutate schema; operators run `FERRUM_MODE=migrate` explicitly. Enable for embedded SQLite deployments)
 - `FERRUM_CP_GRPC_LISTEN_ADDR` (`0.0.0.0:50051`; port `0` disables)
 - `FERRUM_CP_DP_GRPC_JWT_SECRET` (required cp/dp, ≥32 chars)

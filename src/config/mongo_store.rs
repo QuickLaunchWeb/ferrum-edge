@@ -59,6 +59,11 @@ mod inner {
         pub auth_mechanism: Option<String>,
         pub server_selection_timeout_secs: u64,
         pub connect_timeout_secs: u64,
+        pub tls_enabled: bool,
+        pub tls_ca_cert_path: Option<String>,
+        pub tls_client_cert_path: Option<String>,
+        pub tls_client_key_path: Option<String>,
+        pub tls_insecure: bool,
     }
 
     /// Decide whether multi-document transactions are available based on the
@@ -127,12 +132,13 @@ mod inner {
         /// `mongodb://[username:password@]host[:port]/[database][?options]`
         ///
         /// **TLS/mTLS configuration**: When `tls_enabled` is true, TLS is configured
-        /// programmatically via `TlsOptions` using the existing `FERRUM_DB_TLS_*`
-        /// env vars:
+        /// programmatically via `TlsOptions` using the canonical database TLS env vars:
         /// - `FERRUM_DB_TLS_CA_CERT_PATH` → `TlsOptions::ca_file_path`
-        /// - `FERRUM_DB_TLS_CLIENT_CERT_PATH` → Combined with key into a temp PEM
-        ///   for `TlsOptions::cert_key_file_path` (MongoDB requires a single file)
-        /// - `FERRUM_DB_TLS_INSECURE` → `TlsOptions::allow_invalid_certificates`
+        /// - `FERRUM_DB_TLS_CLIENT_CERT_PATH` → `TlsOptions::cert_key_file_path`
+        ///   when supplied alone as a combined PEM; combined with
+        ///   `FERRUM_DB_TLS_CLIENT_KEY_PATH` into a temp PEM when supplied as
+        ///   separate cert/key files (MongoDB requires a single file)
+        /// - `FERRUM_DB_TLS_MODE=require` → `TlsOptions::allow_invalid_certificates`
         ///
         /// TLS can also be configured directly via connection string options
         /// (`tls=true&tlsCAFile=...`), which takes precedence over the programmatic
@@ -159,6 +165,11 @@ mod inner {
                 auth_mechanism: auth_mechanism.map(str::to_string),
                 server_selection_timeout_secs,
                 connect_timeout_secs,
+                tls_enabled,
+                tls_ca_cert_path: tls_ca_cert_path.map(str::to_string),
+                tls_client_cert_path: tls_client_cert_path.map(str::to_string),
+                tls_client_key_path: tls_client_key_path.map(str::to_string),
+                tls_insecure,
             };
 
             let (client, db, replica_set_configured) = Self::build_client_and_db(
@@ -225,7 +236,7 @@ mod inner {
             client_options.connect_timeout =
                 Some(Duration::from_secs(settings.connect_timeout_secs));
 
-            // Configure TLS via the existing FERRUM_DB_TLS_* env vars.
+            // Configure TLS via the canonical database TLS env vars.
             // Only set programmatic TLS if the connection string doesn't already
             // include TLS options (connection string takes precedence).
             if tls_enabled && client_options.tls.is_none() {
@@ -1511,15 +1522,7 @@ mod inner {
         // Connection lifecycle
         // -------------------------------------------------------------------
 
-        async fn reconnect(
-            &self,
-            db_url: &str,
-            tls_enabled: bool,
-            tls_ca_cert_path: Option<&str>,
-            tls_client_cert_path: Option<&str>,
-            tls_client_key_path: Option<&str>,
-            tls_insecure: bool,
-        ) -> Result<(), anyhow::Error> {
+        async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
             // Build a fresh Client + Database against the requested URL using
             // the captured connection settings. `build_client_and_db` runs a
             // ping before returning, so on `Ok` we know the new client can
@@ -1529,11 +1532,11 @@ mod inner {
             let (new_client, new_db, replica_set_configured) = Self::build_client_and_db(
                 db_url,
                 &self.conn_settings,
-                tls_enabled,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
+                self.conn_settings.tls_enabled,
+                self.conn_settings.tls_ca_cert_path.as_deref(),
+                self.conn_settings.tls_client_cert_path.as_deref(),
+                self.conn_settings.tls_client_key_path.as_deref(),
+                self.conn_settings.tls_insecure,
             )
             .await?;
 
@@ -1555,46 +1558,19 @@ mod inner {
             Ok(())
         }
 
-        async fn reconnect_read_replica(
-            &self,
-            _replica_url: &str,
-            _tls_enabled: bool,
-            _tls_ca_cert_path: Option<&str>,
-            _tls_client_cert_path: Option<&str>,
-            _tls_client_key_path: Option<&str>,
-            _tls_insecure: bool,
-        ) -> Result<(), anyhow::Error> {
+        async fn reconnect_read_replica(&self, _replica_url: &str) -> Result<(), anyhow::Error> {
             // MongoDB driver handles read preference routing internally via
             // the connection string (e.g., ?readPreference=secondaryPreferred).
             // No separate replica pool needed.
             Ok(())
         }
 
-        async fn try_failover_reconnect(
-            &self,
-            primary_url: &str,
-            tls_enabled: bool,
-            tls_ca_cert_path: Option<&str>,
-            tls_client_cert_path: Option<&str>,
-            tls_client_key_path: Option<&str>,
-            tls_insecure: bool,
-        ) -> Result<String, anyhow::Error> {
+        async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
             // Try primary first. `reconnect()` rebuilds the underlying
             // `Client` against the primary URL and pings it; on success
             // the swap is committed and the gateway is back on the
             // primary.
-            if self
-                .reconnect(
-                    primary_url,
-                    tls_enabled,
-                    tls_ca_cert_path,
-                    tls_client_cert_path,
-                    tls_client_key_path,
-                    tls_insecure,
-                )
-                .await
-                .is_ok()
-            {
+            if self.reconnect(primary_url).await.is_ok() {
                 info!(
                     "Reconnected to primary MongoDB ({})",
                     crate::config::db_backend::redact_url(primary_url)
@@ -1606,18 +1582,7 @@ mod inner {
             // pings wins; subsequent URLs are not tried until the next
             // failover-reconnect cycle.
             for (i, url) in self.failover_urls.iter().enumerate() {
-                if self
-                    .reconnect(
-                        url,
-                        tls_enabled,
-                        tls_ca_cert_path,
-                        tls_client_cert_path,
-                        tls_client_key_path,
-                        tls_insecure,
-                    )
-                    .await
-                    .is_ok()
-                {
+                if self.reconnect(url).await.is_ok() {
                     info!(
                         "Reconnected to failover MongoDB #{} ({})",
                         i + 1,
@@ -2473,6 +2438,11 @@ mod inner {
                 auth_mechanism: None,
                 server_selection_timeout_secs: 1,
                 connect_timeout_secs: 1,
+                tls_enabled: false,
+                tls_ca_cert_path: None,
+                tls_client_cert_path: None,
+                tls_client_key_path: None,
+                tls_insecure: false,
             };
             // Build a client against a non-routable URL. `Client::with_options`
             // is lazy — no connection is attempted here.
@@ -2516,14 +2486,7 @@ mod inner {
             ]);
 
             let result = store
-                .try_failover_reconnect(
-                    "mongodb://240.0.0.3:27017/test",
-                    false,
-                    None,
-                    None,
-                    None,
-                    false,
-                )
+                .try_failover_reconnect("mongodb://240.0.0.3:27017/test")
                 .await;
 
             assert!(
@@ -2550,14 +2513,7 @@ mod inner {
         async fn try_failover_reconnect_no_failovers_returns_clean_err() {
             let store = make_test_store(vec![]);
             let result = store
-                .try_failover_reconnect(
-                    "mongodb://240.0.0.1:27017/test",
-                    false,
-                    None,
-                    None,
-                    None,
-                    false,
-                )
+                .try_failover_reconnect("mongodb://240.0.0.1:27017/test")
                 .await;
 
             assert!(result.is_err());

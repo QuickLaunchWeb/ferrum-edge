@@ -82,18 +82,9 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("cross_ns_refs.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let db = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        false,
-        None,
-        None,
-        None,
-        false,
-        DbPoolConfig::default(),
-    )
-    .await
-    .expect("DB connect must succeed");
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("DB connect must succeed");
 
     let state = AdminState {
         db: Some(Arc::new(db)),

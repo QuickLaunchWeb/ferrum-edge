@@ -69,6 +69,8 @@ fn test_default_config() {
     assert_eq!(config.tcp_keepalive_seconds, 60);
     assert_eq!(config.http2_keep_alive_interval_seconds, 30);
     assert_eq!(config.http2_keep_alive_timeout_seconds, 45);
+    assert!(config.http2_adaptive_window);
+    assert_eq!(config.http2_max_frame_size, 1_048_576);
     assert!(config.enable_http_keep_alive);
     assert!(config.enable_http2);
 }

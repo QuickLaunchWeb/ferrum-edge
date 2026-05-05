@@ -1046,7 +1046,7 @@ pub struct Proxy {
     pub listen_port: Option<u16>,
     /// Whether to terminate TLS on the gateway side for incoming TCP connections.
     /// For TCP: uses the gateway's TLS certificate for TLS termination.
-    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or Ed25519).
+    /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or P-384).
     #[serde(default)]
     pub frontend_tls: bool,
     /// When true, forward encrypted client bytes directly to the backend without
