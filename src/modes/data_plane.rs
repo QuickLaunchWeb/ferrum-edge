@@ -88,7 +88,8 @@ pub async fn run(
     proxy_state.start_backend_capability_refresh_task(false, Some(shutdown_tx.subscribe()));
 
     // Start per-IP request counter cleanup (removes stale zero-count entries)
-    proxy_state.start_per_ip_cleanup_task();
+    let per_ip_cleanup_handle =
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
 
     // Start service discovery background tasks (initially no-op with empty config;
     // tasks are reconciled when CP pushes config via update_config)
@@ -585,6 +586,9 @@ pub async fn run(
         let _ = dp_client_handle.await;
         let _ = overload_handle.await;
         let _ = metrics_handle.await;
+        if let Some(h) = per_ip_cleanup_handle {
+            let _ = h.await;
+        }
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await
