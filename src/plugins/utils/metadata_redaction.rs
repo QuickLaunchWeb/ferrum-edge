@@ -3,7 +3,7 @@
 //! Plugins (built-in or custom) can write arbitrary key/value pairs into
 //! `TransactionSummary.metadata` and `StreamTransactionSummary.metadata`.
 //! Without redaction, anything they put there — auth tokens, cookies, session
-//! IDs, correlation tokens — flows verbatim through every logging sink
+//! IDs, credential tokens — flows verbatim through every logging sink
 //! (stdout, http, tcp, kafka, loki, udp, ws, statsd). That has bitten us
 //! before with `transaction_debugger.rs` (which only redacts request HEADERS).
 //!
@@ -17,10 +17,11 @@
 //!   * an operator-extensible list parsed once from
 //!     `FERRUM_LOG_REDACT_METADATA_KEYS` (comma-separated).
 //!
-//! Matching strategy: substring-on-lowercased-key. So a key like
-//! `request_authorization_header` redacts because it contains `authorization`.
-//! This mirrors the expectation that custom plugins often prefix or suffix
-//! sensitive token names.
+//! Matching strategy: most built-in keys use substring-on-lowercased-key, so a
+//! key like `request_authorization_header` redacts because it contains
+//! `authorization`. Token keys are narrower: only singular `token` keys with a
+//! credential/session/auth context redact. This keeps usage metrics like
+//! `ai_total_tokens` visible while still protecting real token secrets.
 
 use serde::Serializer;
 use serde::ser::SerializeMap;
@@ -29,7 +30,9 @@ use std::sync::OnceLock;
 
 /// Default substrings (lowercase) that mark a metadata key as sensitive.
 ///
-/// Substring match, not exact match — see module docs.
+/// Substring match, not exact match — see module docs. Broad `token` matching
+/// is intentionally excluded; token-shaped keys go through
+/// `is_sensitive_token_metadata_key` so token-count metrics do not disappear.
 pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "authorization",
     "cookie",
@@ -40,8 +43,38 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "bearer",
     "password",
     "secret",
-    "token",
 ];
+
+/// Key segments that make a singular `token` metadata key credential-shaped.
+const SENSITIVE_TOKEN_CONTEXT_SEGMENTS: &[&str] = &[
+    "access",
+    "api",
+    "auth",
+    "authorization",
+    "bearer",
+    "client",
+    "csrf",
+    "github",
+    "gitlab",
+    "id",
+    "identity",
+    "jwt",
+    "oauth",
+    "oidc",
+    "pat",
+    "personal",
+    "refresh",
+    "request",
+    "saml",
+    "security",
+    "session",
+    "slack",
+    "webhook",
+    "xsrf",
+];
+
+/// Generic descriptors that commonly wrap a raw token key.
+const TOKEN_VALUE_SEGMENTS: &[&str] = &["digest", "hash", "hashed", "raw", "sha256", "value"];
 
 /// Placeholder string written in place of sensitive metadata values.
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
@@ -73,6 +106,62 @@ pub fn parse_extras_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn metadata_key_segments(key: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+
+    for ch in key.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+
+        if ch.is_ascii_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+
+        current.push(ch.to_ascii_lowercase());
+        previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+
+    segments
+}
+
+fn segment_is_any(segment: &str, candidates: &[&str]) -> bool {
+    candidates.iter().any(|candidate| segment == *candidate)
+}
+
+fn is_sensitive_token_metadata_key(key: &str) -> bool {
+    let segments = metadata_key_segments(key);
+    if !segments.iter().any(|segment| segment == "token") {
+        return false;
+    }
+
+    if segments.len() == 1 {
+        return true;
+    }
+
+    let has_sensitive_context = segments
+        .iter()
+        .any(|segment| segment_is_any(segment, SENSITIVE_TOKEN_CONTEXT_SEGMENTS));
+    if has_sensitive_context {
+        return true;
+    }
+
+    segments
+        .iter()
+        .filter(|segment| segment.as_str() != "token")
+        .all(|segment| segment_is_any(segment, TOKEN_VALUE_SEGMENTS))
+}
+
 /// Returns true when the given metadata key matches any sensitive substring
 /// from `DEFAULT_SENSITIVE_METADATA_KEYS` plus the supplied operator extras
 /// (case-insensitive). The lower-level entry point used by tests; production
@@ -82,6 +171,7 @@ pub fn is_sensitive_metadata_key_with_extras(key: &str, extras: &[String]) -> bo
     if DEFAULT_SENSITIVE_METADATA_KEYS
         .iter()
         .any(|needle| lowered.contains(needle))
+        || is_sensitive_token_metadata_key(key)
     {
         return true;
     }
@@ -176,17 +266,47 @@ mod tests {
             "legacy.cookie.value",
             &extras
         ));
-        // `token` is a default substring — matches any key that contains it.
-        assert!(is_sensitive_metadata_key_with_extras(
-            "session_token_v2",
-            &extras
-        ));
         assert!(is_sensitive_metadata_key_with_extras(
             "auth.bearer.value",
             &extras
         ));
         // `x-api-key` (hyphenated) only matches when the key uses hyphens.
         assert!(is_sensitive_metadata_key_with_extras("X-API-KEY", &extras));
+    }
+
+    #[test]
+    fn token_secret_keys_match_without_redacting_token_metrics() {
+        let extras: Vec<String> = Vec::new();
+
+        for key in [
+            "token",
+            "token_value",
+            "session_token_v2",
+            "access_token",
+            "refreshToken",
+            "id-token",
+            "apiToken",
+            "csrf_token",
+            "auth.session.token",
+        ] {
+            assert!(
+                is_sensitive_metadata_key_with_extras(key, &extras),
+                "{key} should be redacted"
+            );
+        }
+
+        for key in [
+            "ai_total_tokens",
+            "ai_prompt_tokens",
+            "ai_completion_tokens",
+            "llm_total_tokens",
+            "completion_tokens",
+        ] {
+            assert!(
+                !is_sensitive_metadata_key_with_extras(key, &extras),
+                "{key} should remain visible"
+            );
+        }
     }
 
     #[test]
@@ -207,6 +327,10 @@ mod tests {
         ));
         assert!(!is_sensitive_metadata_key_with_extras(
             "response_size_bytes",
+            &extras
+        ));
+        assert!(!is_sensitive_metadata_key_with_extras(
+            "ai_total_tokens",
             &extras
         ));
         assert!(!is_sensitive_metadata_key_with_extras("", &extras));

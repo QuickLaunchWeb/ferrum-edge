@@ -752,7 +752,7 @@ pub struct TransactionSummary {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub mirror: bool,
     /// Plugin-injected metadata. Sensitive keys (authorization, cookie,
-    /// tokens, secrets — see
+    /// credential/session tokens, secrets — see
     /// `plugins::utils::metadata_redaction::DEFAULT_SENSITIVE_METADATA_KEYS`
     /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
     /// replaced with `[REDACTED]` at serialize time. The in-memory value is
@@ -937,7 +937,7 @@ pub struct StreamTransactionSummary {
     pub sni_hostname: Option<String>,
     /// Plugin-injected metadata (e.g., correlation ID, trace ID) carried
     /// from `on_stream_connect` to `on_stream_disconnect`. Sensitive keys
-    /// (authorization, cookie, tokens, secrets — see
+    /// (authorization, cookie, credential/session tokens, secrets — see
     /// `plugins::utils::metadata_redaction::DEFAULT_SENSITIVE_METADATA_KEYS`
     /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
     /// replaced with `[REDACTED]` at serialize time.

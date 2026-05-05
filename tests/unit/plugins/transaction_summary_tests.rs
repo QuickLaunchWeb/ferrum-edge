@@ -584,7 +584,6 @@ fn test_summary_redacts_authorization_metadata_value() {
 #[test]
 fn test_summary_redacts_default_sensitive_substring_keys() {
     let mut summary = make_full_summary();
-    // Each key contains a default sensitive substring.
     summary
         .metadata
         .insert("Cookie".to_string(), "sid=abc".to_string());
@@ -616,6 +615,48 @@ fn test_summary_redacts_default_sensitive_substring_keys() {
         assert!(
             !json.contains(needle),
             "Sensitive value {:?} leaked into output: {}",
+            needle,
+            json
+        );
+    }
+}
+
+#[test]
+fn test_summary_keeps_ai_token_metrics_visible_while_redacting_token_secrets() {
+    let mut summary = make_full_summary();
+    summary
+        .metadata
+        .insert("ai_total_tokens".to_string(), "150".to_string());
+    summary
+        .metadata
+        .insert("ai_prompt_tokens".to_string(), "100".to_string());
+    summary
+        .metadata
+        .insert("ai_completion_tokens".to_string(), "50".to_string());
+    summary
+        .metadata
+        .insert("session_token".to_string(), "session-secret".to_string());
+    summary
+        .metadata
+        .insert("accessToken".to_string(), "access-secret".to_string());
+    summary
+        .metadata
+        .insert("auth_token".to_string(), "auth-secret".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["metadata"]["ai_total_tokens"], "150");
+    assert_eq!(parsed["metadata"]["ai_prompt_tokens"], "100");
+    assert_eq!(parsed["metadata"]["ai_completion_tokens"], "50");
+    assert_eq!(parsed["metadata"]["session_token"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["accessToken"], "[REDACTED]");
+    assert_eq!(parsed["metadata"]["auth_token"], "[REDACTED]");
+
+    for needle in ["session-secret", "access-secret", "auth-secret"] {
+        assert!(
+            !json.contains(needle),
+            "Token secret {:?} leaked into output: {}",
             needle,
             json
         );
