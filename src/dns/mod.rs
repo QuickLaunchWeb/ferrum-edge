@@ -260,6 +260,9 @@ impl DnsCache {
         record_type: Option<CachedRecordType>,
         ttl: Duration,
     ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        // This is the single success insertion path for foreground resolves,
+        // stale refreshes, proactive background refreshes, and failed-retry
+        // recovery. Cache reads intentionally trust entries accepted here.
         self.check_backend_addresses_policy(&addresses, hostname)?;
 
         self.cache.insert(
@@ -306,7 +309,6 @@ impl DnsCache {
 
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
-                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses[0]);
             }
 
@@ -350,7 +352,6 @@ impl DnsCache {
                         hostname
                     );
                 }
-                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses[0]);
             }
 
@@ -421,7 +422,6 @@ impl DnsCache {
             let now = Instant::now();
 
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
-                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses.clone());
             }
 
@@ -445,7 +445,6 @@ impl DnsCache {
                         }
                     }
                 }
-                self.check_backend_addresses_policy(&entry.addresses, hostname)?;
                 return Ok(entry.addresses.clone());
             }
 
@@ -1271,5 +1270,32 @@ impl reqwest::dns::Resolve for DnsCacheResolver {
             let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(addr));
             Ok(addrs)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendAllowIps;
+
+    #[test]
+    fn cache_success_entry_rejects_denied_addresses_without_caching() {
+        let cache = DnsCache::new(DnsConfig {
+            backend_allow_ips: BackendAllowIps::Public,
+            ..DnsConfig::default()
+        });
+
+        let result = cache.cache_success_entry(
+            "metadata.internal",
+            vec!["169.254.169.254".parse().unwrap()],
+            Some(CachedRecordType::A),
+            Duration::from_secs(60),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            cache.cache.get("metadata.internal").is_none(),
+            "Denied DNS answers must not be inserted for foreground or background refresh paths"
+        );
     }
 }

@@ -80,9 +80,10 @@ impl std::fmt::Display for BackendAllowIps {
 /// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
 /// - IPv4: loopback, RFC1918, link-local / cloud metadata, 0.0.0.0/8,
 ///   CGNAT, documentation, benchmarking, multicast, and reserved ranges.
-/// - IPv6: loopback, unspecified, IPv4-mapped private/reserved addresses,
-///   discard-only, documentation, IETF special-purpose, deprecated 6to4,
-///   ULA, link-local, and multicast ranges.
+/// - IPv6: loopback, unspecified, IPv4-mapped/compatible private/reserved
+///   addresses, NAT64 private/reserved embeddings, discard-only,
+///   documentation, IETF special-purpose, deprecated 6to4, ULA, link-local,
+///   and multicast ranges.
 pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(ip) => {
@@ -106,12 +107,16 @@ pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_private_ip(&std::net::IpAddr::V4(mapped));
             }
+            if let Some(compatible) = ip.to_ipv4() {
+                return is_private_ip(&std::net::IpAddr::V4(compatible));
+            }
 
             let segments = ip.segments();
             ip.is_loopback()                            // ::1
             || ip.is_unspecified()                      // ::
+            || is_well_known_nat64_private_ip(segments) // 64:ff9b::/96 with private/reserved embedded IPv4
             || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001) // 64:ff9b:1::/48
-            || (segments[0] == 0x0100 && segments[1] == 0) // 100::/64 (discard-only)
+            || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64 (discard-only)
             || (segments[0] == 0x2001 && segments[1] < 0x0200) // 2001::/23 (IETF special-purpose)
             || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 (documentation)
             || segments[0] == 0x2002                  // 2002::/16 (deprecated 6to4)
@@ -120,6 +125,22 @@ pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
             || (segments[0] & 0xff00) == 0xff00 // ff00::/8 (multicast)
         }
     }
+}
+
+fn is_well_known_nat64_private_ip(segments: [u16; 8]) -> bool {
+    if segments[0] != 0x0064
+        || segments[1] != 0xff9b
+        || segments[2] != 0
+        || segments[3] != 0
+        || segments[4] != 0
+        || segments[5] != 0
+    {
+        return false;
+    }
+
+    let [a, b] = segments[6].to_be_bytes();
+    let [c, d] = segments[7].to_be_bytes();
+    is_private_ip(&std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d)))
 }
 
 /// Check whether an IP is allowed under the given backend IP policy.

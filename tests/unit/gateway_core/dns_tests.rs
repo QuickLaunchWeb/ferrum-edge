@@ -815,6 +815,19 @@ async fn test_dns_public_policy_denies_localhost() {
 }
 
 #[tokio::test]
+async fn test_dns_resolve_all_public_policy_denies_localhost_and_does_not_cache() {
+    let cache = DnsCache::new(public_dns_config(HashMap::new()));
+
+    let result = cache.resolve_all("localhost", None, None).await;
+    assert!(result.is_err());
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "Denied DNS answers must not be inserted into the shared cache"
+    );
+}
+
+#[tokio::test]
 async fn test_dns_resolve_all_global_override() {
     let mut overrides = HashMap::new();
     overrides.insert("db.internal".to_string(), "10.0.0.5".to_string());
