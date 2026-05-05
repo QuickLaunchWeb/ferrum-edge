@@ -882,12 +882,13 @@ async fn assign_ids_for_put(
     // unmatched entries with different configs (the original Fix 5 case —
     // operator must use explicit IDs to disambiguate).
     let mut assigned_ids: Vec<Option<String>> = Vec::with_capacity(bundle.plugins.len());
-    let mut unmatched_name_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut unmatched_configs_per_name: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
 
     for pc in &bundle.plugins {
         if !pc.id.is_empty() {
-            // Operator supplied an explicit ID — keep as-is.
             assigned_ids.push(Some(pc.id.clone()));
             continue;
         }
@@ -898,27 +899,30 @@ async fn assign_ids_for_put(
             assigned_ids.push(Some(matched.id.clone()));
             continue;
         }
-        // Unmatched — record for the name-ambiguity check.
+        // Unmatched — record the canonical config for ambiguity detection.
         assigned_ids.push(None);
-        *unmatched_name_counts
+        unmatched_configs_per_name
             .entry(pc.plugin_name.clone())
-            .or_default() += 1;
+            .or_default()
+            .insert(key.1.clone());
     }
 
     for (pc, slot) in bundle.plugins.iter_mut().zip(assigned_ids.iter()) {
         pc.proxy_id = Some(proxy_id_snap.clone());
         match slot {
             Some(id) => {
-                // Either operator-supplied or canonical-matched.
                 pc.id = id.clone();
             }
             None => {
-                // Unmatched. If this name has more than one unmatched entry,
-                // we genuinely can't tell them apart — reject. If it's the
-                // sole unmatched instance for that name (the others matched
-                // canonically), it's an unambiguous addition: mint a UUID.
-                let n = *unmatched_name_counts.get(&pc.plugin_name).unwrap_or(&0);
-                if n > 1 {
+                // Reject only when multiple unmatched entries for the same
+                // name have DIFFERENT canonical configs — those are genuinely
+                // ambiguous. Multiple unmatched entries with identical configs
+                // (e.g. adding two instances of the same plugin) are safe to
+                // mint fresh UUIDs for since they are interchangeable.
+                let distinct = unmatched_configs_per_name
+                    .get(&pc.plugin_name)
+                    .map_or(0, |s| s.len());
+                if distinct > 1 {
                     return Err(ApiSpecError::ValidationFailures {
                         spec_version: spec_version.to_string(),
                         failures: vec![ValidationFailure {
@@ -933,7 +937,6 @@ async fn assign_ids_for_put(
                         }],
                     });
                 }
-                // Sole unmatched instance for this name — new plugin.
                 pc.id = Uuid::new_v4().to_string();
             }
         }
@@ -2164,8 +2167,8 @@ pub async fn handle_list_api_specs(
         })
         .collect();
 
-    let next_offset: Option<usize> = if items.len() == limit {
-        Some(offset + limit)
+    let next_offset: Option<usize> = if (offset + items.len()) < (paginated.total.max(0) as usize) {
+        Some(offset + items.len())
     } else {
         None
     };
