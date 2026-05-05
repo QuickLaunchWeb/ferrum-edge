@@ -87,14 +87,14 @@ impl std::fmt::Display for BackendAllowIps {
 pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
     match addr {
         std::net::IpAddr::V4(ip) => {
-            let [a, b, c, _] = ip.octets();
+            let [a, b, c, d] = ip.octets();
             ip.is_loopback()                // 127.0.0.0/8
             || ip.is_private()              // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
             || ip.is_link_local()           // 169.254.0.0/16
             || ip.is_unspecified()          // 0.0.0.0
             || a == 0                       // 0.0.0.0/8 (full range)
             || (a == 100 && (b & 0xC0) == 64) // 100.64.0.0/10 (CGNAT)
-            || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 (IETF protocol assignments)
+            || is_non_global_ietf_protocol_assignment_v4(a, b, c, d)
             || (a == 192 && b == 0 && c == 2) // 192.0.2.0/24 (TEST-NET-1)
             || (a == 192 && b == 88 && c == 99) // 192.88.99.0/24 (deprecated 6to4 relay)
             || (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 (benchmarking)
@@ -117,7 +117,7 @@ pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
             || is_well_known_nat64_private_ip(segments) // 64:ff9b::/96 with private/reserved embedded IPv4
             || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001) // 64:ff9b:1::/48
             || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64 (discard-only)
-            || (segments[0] == 0x2001 && segments[1] < 0x0200) // 2001::/23 (IETF special-purpose)
+            || is_non_global_ietf_protocol_assignment_v6(segments)
             || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 (documentation)
             || segments[0] == 0x2002                  // 2002::/16 (deprecated 6to4)
             || (segments[0] & 0xfe00) == 0xfc00        // fc00::/7 (unique local)
@@ -125,6 +125,48 @@ pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
             || (segments[0] & 0xff00) == 0xff00 // ff00::/8 (multicast)
         }
     }
+}
+
+fn is_non_global_ietf_protocol_assignment_v4(a: u8, b: u8, c: u8, d: u8) -> bool {
+    if !(a == 192 && b == 0 && c == 0) {
+        return false;
+    }
+
+    // 192.0.0.9/32 and 192.0.0.10/32 are globally reachable anycast
+    // assignments inside the otherwise non-global 192.0.0.0/24 parent.
+    d != 9 && d != 10
+}
+
+fn is_non_global_ietf_protocol_assignment_v6(segments: [u16; 8]) -> bool {
+    if !(segments[0] == 0x2001 && segments[1] < 0x0200) {
+        return false;
+    }
+
+    // Allow the globally reachable more-specific assignments in 2001::/23.
+    if segments[1] == 0x0001
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+        && segments[6] == 0
+        && matches!(segments[7], 1..=3)
+    {
+        return false;
+    }
+
+    if segments[1] == 0x0003 {
+        return false;
+    }
+
+    if segments[1] == 0x0004 && segments[2] == 0x0112 {
+        return false;
+    }
+
+    if (segments[1] & 0xfff0) == 0x0020 || (segments[1] & 0xfff0) == 0x0030 {
+        return false;
+    }
+
+    true
 }
 
 fn is_well_known_nat64_private_ip(segments: [u16; 8]) -> bool {
