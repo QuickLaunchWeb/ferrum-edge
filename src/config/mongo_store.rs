@@ -34,10 +34,11 @@ mod inner {
     use chrono::{DateTime, Utc};
     use mongodb::bson::{Bson, Document, doc};
     use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
-    use mongodb::{Client, Collection, Database, IndexModel};
+    use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tracing::{debug, info, warn};
 
@@ -59,6 +60,31 @@ mod inner {
         pub server_selection_timeout_secs: u64,
         pub connect_timeout_secs: u64,
     }
+
+    /// Decide whether multi-document transactions are available based on the
+    /// effective replica set name (after any explicit override has been
+    /// applied to `ClientOptions::repl_set_name`).
+    fn resolve_replica_set_configured(repl_set_name: Option<&str>) -> bool {
+        matches!(repl_set_name, Some(name) if !name.is_empty())
+    }
+
+    /// Step labels for the standalone-mongod (no-replica-set) `delete_proxy`
+    /// path, in execution order. Documented as data so the order can be
+    /// regression-tested without a running MongoDB server.
+    pub(super) const DELETE_PROXY_SEQUENTIAL_ORDER: &[&str] = &[
+        "delete_proxy_document",
+        "delete_proxy_scoped_plugin_configs",
+        "cleanup_orphaned_proxy_group_plugins",
+    ];
+
+    /// Step labels for the standalone-mongod (no-replica-set) `update_proxy`
+    /// path, in execution order. Cleanup runs after the replace because the
+    /// new proxy.plugins array determines which proxy_group plugin_configs
+    /// are still referenced.
+    pub(super) const UPDATE_PROXY_SEQUENTIAL_ORDER: &[&str] = &[
+        "replace_proxy_document",
+        "cleanup_orphaned_proxy_group_plugins",
+    ];
 
     /// MongoDB-backed config store.
     ///
@@ -91,6 +117,7 @@ mod inner {
         cert_expiry_warning_days: u64,
         backend_allow_ips: crate::config::BackendAllowIps,
         failover_urls: Vec<String>,
+        replica_set_configured: Arc<AtomicBool>,
     }
 
     impl MongoStore {
@@ -134,7 +161,7 @@ mod inner {
                 connect_timeout_secs,
             };
 
-            let (client, db) = Self::build_client_and_db(
+            let (client, db, replica_set_configured) = Self::build_client_and_db(
                 mongo_url,
                 &conn_settings,
                 tls_enabled,
@@ -154,6 +181,7 @@ mod inner {
                 cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
                 backend_allow_ips: crate::config::BackendAllowIps::Both,
                 failover_urls: Vec::new(),
+                replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
             })
         }
 
@@ -173,7 +201,7 @@ mod inner {
             tls_client_cert_path: Option<&str>,
             tls_client_key_path: Option<&str>,
             tls_insecure: bool,
-        ) -> Result<(Client, Database), anyhow::Error> {
+        ) -> Result<(Client, Database, bool), anyhow::Error> {
             let mut client_options = ClientOptions::parse(mongo_url).await?;
 
             if let Some(name) = &settings.app_name {
@@ -182,6 +210,8 @@ mod inner {
             if let Some(rs) = &settings.replica_set {
                 client_options.repl_set_name = Some(rs.clone());
             }
+            let replica_set_configured =
+                resolve_replica_set_configured(client_options.repl_set_name.as_deref());
             if let Some(mechanism) = &settings.auth_mechanism {
                 client_options
                     .credential
@@ -239,12 +269,13 @@ mod inner {
             })?;
 
             info!(
-                "MongoDB connected (database='{}', url={})",
+                "MongoDB connected (database='{}', url={}, replica_set={})",
                 settings.database_name,
-                crate::config::db_backend::redact_url(mongo_url)
+                crate::config::db_backend::redact_url(mongo_url),
+                replica_set_configured
             );
 
-            Ok((client, db))
+            Ok((client, db, replica_set_configured))
         }
 
         /// Combine separate PEM cert and key files into a single temporary file.
@@ -464,6 +495,49 @@ mod inner {
         /// by any proxy's embedded `plugins` array. Called after proxy deletion or
         /// update (which may remove associations).
         async fn cleanup_orphaned_proxy_group_plugins(&self) -> Result<(), anyhow::Error> {
+            self.cleanup_orphaned_proxy_group_plugins_opt_session(None)
+                .await
+        }
+
+        /// Same as [`Self::cleanup_orphaned_proxy_group_plugins`] but optionally
+        /// participates in a `ClientSession`-scoped transaction.
+        async fn cleanup_orphaned_proxy_group_plugins_opt_session(
+            &self,
+            session: Option<&mut ClientSession>,
+        ) -> Result<(), anyhow::Error> {
+            if let Some(s) = session {
+                let mut cursor = self
+                    .plugin_configs()
+                    .find(doc! { "scope": "proxy_group" })
+                    .projection(doc! { "_id": 1 })
+                    .session(&mut *s)
+                    .await?;
+                let mut group_ids: Vec<String> = Vec::new();
+                while cursor.advance(&mut *s).await? {
+                    let doc = cursor.deserialize_current()?;
+                    if let Ok(id) = doc.get_str("_id") {
+                        group_ids.push(id.to_string());
+                    }
+                }
+                drop(cursor);
+
+                for id in &group_ids {
+                    let count = self
+                        .proxies()
+                        .count_documents(doc! { "plugins.plugin_config_id": id })
+                        .session(&mut *s)
+                        .await?;
+                    if count == 0 {
+                        info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+                        self.plugin_configs()
+                            .delete_one(doc! { "_id": id })
+                            .session(&mut *s)
+                            .await?;
+                    }
+                }
+                return Ok(());
+            }
+
             // Find all proxy_group-scoped plugin config IDs
             let mut cursor = self
                 .plugin_configs()
@@ -776,24 +850,71 @@ mod inner {
         async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
             let start = std::time::Instant::now();
             let doc = proxy_to_doc(proxy)?;
-            self.proxies()
-                .replace_one(doc! { "_id": &proxy.id }, doc)
-                .await?;
-            // Clean up orphaned proxy_group plugin configs (update may remove associations)
-            self.cleanup_orphaned_proxy_group_plugins().await?;
+
+            if self.replica_set_configured.load(Ordering::Acquire) {
+                let mut session = self.client.load().start_session().await?;
+                session
+                    .start_transaction()
+                    .and_run((self, &proxy.id, doc), |s, (this, id, doc)| {
+                        Box::pin(async move {
+                            this.proxies()
+                                .replace_one(mongodb::bson::doc! { "_id": *id }, doc.clone())
+                                .session(&mut *s)
+                                .await?;
+                            this.cleanup_orphaned_proxy_group_plugins_opt_session(Some(s))
+                                .await
+                                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("update_proxy transaction failed: {}", e))?;
+            } else {
+                self.proxies()
+                    .replace_one(doc! { "_id": &proxy.id }, doc)
+                    .await?; // step 1: replace_proxy_document
+                self.cleanup_orphaned_proxy_group_plugins().await?; // step 2: cleanup_orphaned_proxy_group_plugins
+            }
+
             self.check_slow_query("update_proxy", start);
             Ok(())
         }
 
         async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
-            // Also remove associated plugin_config entries scoped to this proxy
+
+            if self.replica_set_configured.load(Ordering::Acquire) {
+                let mut session = self.client.load().start_session().await?;
+                let deleted = session
+                    .start_transaction()
+                    .and_run((self, id.to_string()), |s, (this, id)| {
+                        Box::pin(async move {
+                            this.plugin_configs()
+                                .delete_many(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                .session(&mut *s)
+                                .await?;
+                            let result = this
+                                .proxies()
+                                .delete_one(mongodb::bson::doc! { "_id": id.as_str() })
+                                .session(&mut *s)
+                                .await?;
+                            this.cleanup_orphaned_proxy_group_plugins_opt_session(Some(s))
+                                .await
+                                .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
+                            Ok(result.deleted_count > 0)
+                        })
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("delete_proxy transaction failed: {}", e))?;
+                self.check_slow_query("delete_proxy", start);
+                return Ok(deleted);
+            }
+
+            let result = self.proxies().delete_one(doc! { "_id": id }).await?; // step 1: delete_proxy_document
             self.plugin_configs()
                 .delete_many(doc! { "proxy_id": id })
-                .await?;
-            let result = self.proxies().delete_one(doc! { "_id": id }).await?;
-            // Clean up orphaned proxy_group plugin configs (no proxy references them)
-            self.cleanup_orphaned_proxy_group_plugins().await?;
+                .await?; // step 2: delete_proxy_scoped_plugin_configs
+            self.cleanup_orphaned_proxy_group_plugins().await?; // step 3: cleanup_orphaned_proxy_group_plugins
             self.check_slow_query("delete_proxy", start);
             Ok(result.deleted_count > 0)
         }
@@ -1405,7 +1526,7 @@ mod inner {
             // actually talk to MongoDB. On `Err` the swap is skipped and the
             // existing (possibly degraded) client stays in place — same
             // contract as `DatabaseStore::reconnect` for sqlx.
-            let (new_client, new_db) = Self::build_client_and_db(
+            let (new_client, new_db, replica_set_configured) = Self::build_client_and_db(
                 db_url,
                 &self.conn_settings,
                 tls_enabled,
@@ -1423,10 +1544,13 @@ mod inner {
             // connections in the background.
             let _old_db = self.db.swap(Arc::new(new_db));
             let _old_client = self.client.swap(Arc::new(new_client));
+            self.replica_set_configured
+                .store(replica_set_configured, Ordering::Release);
 
             info!(
-                "MongoDB client reconnected to {}",
-                crate::config::db_backend::redact_url(db_url)
+                "MongoDB client reconnected to {} (replica_set={})",
+                crate::config::db_backend::redact_url(db_url),
+                replica_set_configured
             );
             Ok(())
         }
@@ -2367,6 +2491,9 @@ mod inner {
                 cert_expiry_warning_days: 30,
                 backend_allow_ips: crate::config::BackendAllowIps::Both,
                 failover_urls,
+                replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
             }
         }
 
@@ -2484,6 +2611,67 @@ mod inner {
                  (proxies/consumers/plugin_configs/upstreams) all flow through \
                  db(), so a stale handle would mean every read still goes to \
                  the dead primary even after a successful reconnect"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Replica-set / transactional-path detection
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn resolve_replica_set_configured_none_means_standalone() {
+            assert!(!resolve_replica_set_configured(None));
+        }
+
+        #[test]
+        fn resolve_replica_set_configured_empty_string_treated_as_unset() {
+            assert!(!resolve_replica_set_configured(Some("")));
+        }
+
+        #[test]
+        fn resolve_replica_set_configured_named_replica_set_enables_transactions() {
+            assert!(resolve_replica_set_configured(Some("rs0")));
+            assert!(resolve_replica_set_configured(Some("ferrum-cluster")));
+        }
+
+        // -------------------------------------------------------------------
+        // delete_proxy / update_proxy step-order regression guards
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn delete_proxy_sequential_order_proxy_first() {
+            assert_eq!(
+                DELETE_PROXY_SEQUENTIAL_ORDER,
+                &[
+                    "delete_proxy_document",
+                    "delete_proxy_scoped_plugin_configs",
+                    "cleanup_orphaned_proxy_group_plugins",
+                ],
+                "delete_proxy must delete the proxy document BEFORE its plugin_configs \
+                 so a partial failure can't leave a dangling-reference proxy in the DB"
+            );
+        }
+
+        #[test]
+        fn delete_proxy_sequential_order_first_step_is_proxy() {
+            assert_eq!(
+                DELETE_PROXY_SEQUENTIAL_ORDER.first().copied(),
+                Some("delete_proxy_document"),
+                "delete_proxy MUST start by removing the proxy document"
+            );
+        }
+
+        #[test]
+        fn update_proxy_sequential_order_replace_then_cleanup() {
+            assert_eq!(
+                UPDATE_PROXY_SEQUENTIAL_ORDER,
+                &[
+                    "replace_proxy_document",
+                    "cleanup_orphaned_proxy_group_plugins",
+                ],
+                "update_proxy must replace the proxy document BEFORE cleaning up \
+                 orphan proxy_group plugin_configs so the cleanup observes the new \
+                 plugins.plugin_config_id references"
             );
         }
     }
