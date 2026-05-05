@@ -563,7 +563,37 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
-    // API chargeback endpoint (unauthenticated for scraping, like /metrics)
+    // Authenticate
+    match state.jwt_manager.verify_request(
+        req.headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok()),
+    ) {
+        Ok(_) => {
+            // Token is valid, continue processing
+        }
+        Err(JwtError::MissingHeader) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Missing Authorization header"}),
+            ));
+        }
+        Err(JwtError::InvalidHeaderFormat) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Invalid Authorization header format"}),
+            ));
+        }
+        Err(JwtError::VerificationFailed(msg)) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": format!("Token verification failed: {}", msg)}),
+            ));
+        }
+    }
+
+    // API chargeback endpoint. Chargeback output contains customer/business data,
+    // so it stays behind the standard admin JWT gate even though it is scrapeable.
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::global_registry();
         // Support ?format=json for JSON output, default to Prometheus text format
@@ -591,35 +621,6 @@ pub async fn handle_admin_request(
                     Response::new(Full::new(Bytes::from("# error rendering charges\n")))
                 });
             return Ok(resp);
-        }
-    }
-
-    // Authenticate
-    match state.jwt_manager.verify_request(
-        req.headers()
-            .get("authorization")
-            .and_then(|h| h.to_str().ok()),
-    ) {
-        Ok(_) => {
-            // Token is valid, continue processing
-        }
-        Err(JwtError::MissingHeader) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Missing Authorization header"}),
-            ));
-        }
-        Err(JwtError::InvalidHeaderFormat) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Invalid Authorization header format"}),
-            ));
-        }
-        Err(JwtError::VerificationFailed(msg)) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": format!("Token verification failed: {}", msg)}),
-            ));
         }
     }
 
