@@ -778,7 +778,9 @@ async fn test_auth_acl_comprehensive() {
             "scope": "proxy",
             "proxy_id": "proxy-hmacauth",
             "enabled": true,
-            "config": {"clock_skew_seconds": 300}
+            // Legacy 3-field signing string (no Digest header); the dedicated
+            // digest-mode functional tests cover the secure-by-default path.
+            "config": {"clock_skew_seconds": 300, "require_digest": false}
         }),
         json!({
             "id": "plugin-keyauth-acl-allow",
@@ -2283,7 +2285,7 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-allow",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {"clock_skew_seconds": 300, "require_digest": false}
             }),
             acl_plugin_id: "plugin-hmac-allow-acl",
             acl_config: json!({"allowed_consumers": ["hmac-alice"]}),
@@ -2306,7 +2308,7 @@ async fn test_hmac_auth_plus_acl() {
                 "scope": "proxy",
                 "proxy_id": "proxy-hmac-deny",
                 "enabled": true,
-                "config": {"clock_skew_seconds": 300}
+                "config": {"clock_skew_seconds": 300, "require_digest": false}
             }),
             acl_plugin_id: "plugin-hmac-deny-acl",
             acl_config: json!({"disallowed_consumers": ["hmac-mallory"]}),

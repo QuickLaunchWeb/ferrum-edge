@@ -17,20 +17,27 @@
 //!
 //! ## TLS integration
 //!
-//! Both `ldaps://` and STARTTLS connections use native-tls (OpenSSL). The
-//! plugin respects:
+//! Both `ldaps://` and STARTTLS connections use rustls (matching the gateway's
+//! TLS stack everywhere else). The plugin respects:
 //! - `FERRUM_TLS_CA_BUNDLE_PATH` — custom CA bundle for verifying the LDAP
-//!   server certificate
+//!   server certificate. When set, the rustls trust store is built from this
+//!   bundle ALONE (CA exclusivity per CLAUDE.md "TLS Architecture") — public
+//!   CAs in the system / webpki bundle are NOT trusted, preventing a
+//!   public-CA-issued certificate from MITM-ing the LDAP connection.
 //! - `FERRUM_TLS_NO_VERIFY` — skip TLS certificate verification (testing only)
 //!
-//! This is a non-rustls TLS path (ldap3 uses native-tls internally), similar
-//! to the kafka_logging plugin which uses librdkafka/OpenSSL. CRL checking is
-//! not applied — use the LDAP server's own revocation mechanisms.
+//! CRL checking is NOT currently applied — `PluginHttpClient` does not yet
+//! expose the gateway's parsed CRL list to plugins. TODO: plumb
+//! `Vec<CertificateRevocationListDer<'static>>` through `PluginHttpClient`
+//! and pass it to `build_server_verifier_with_crls()` here so LDAP TLS gains
+//! the same revocation guarantees as the proxy backend paths.
 
 use async_trait::async_trait;
 use base64::Engine;
 use dashmap::DashMap;
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+use rustls::ClientConfig;
+use rustls::pki_types::CertificateDer;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,9 +78,11 @@ pub struct LdapAuth {
     max_cache_entries: usize,
     /// Whether to try mapping to a gateway Consumer via consumer_index
     consumer_mapping: bool,
-    /// Pre-built native-tls connector for LDAP TLS connections.
-    /// Integrates `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`.
-    tls_connector: Option<native_tls::TlsConnector>,
+    /// Pre-built rustls `ClientConfig` for LDAP TLS connections.
+    /// Integrates `FERRUM_TLS_CA_BUNDLE_PATH` (exclusive trust) and
+    /// `FERRUM_TLS_NO_VERIFY`. `Arc` so reuse across reconnects is cheap and
+    /// matches `LdapConnSettings::set_config()`'s expected type.
+    tls_config: Option<Arc<ClientConfig>>,
     /// Whether to skip TLS verification (passed to ldap3 for IP-address handling).
     tls_no_verify: bool,
     /// Extracted hostname from ldap_url for DNS pre-warming.
@@ -236,11 +245,11 @@ impl LdapAuth {
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()));
 
-        // Build TLS connector respecting gateway settings
+        // Build rustls TLS config respecting gateway settings
         let tls_no_verify = http_client.tls_no_verify();
         let needs_tls = ldap_url.starts_with("ldaps://") || starttls;
-        let tls_connector = if needs_tls {
-            Some(build_ldap_tls_connector(
+        let tls_config = if needs_tls {
+            Some(build_ldap_tls_config(
                 tls_no_verify,
                 http_client.tls_ca_bundle_path(),
             )?)
@@ -265,7 +274,7 @@ impl LdapAuth {
             cache: Arc::new(DashMap::new()),
             max_cache_entries,
             consumer_mapping,
-            tls_connector,
+            tls_config,
             tls_no_verify,
             ldap_hostname,
         })
@@ -326,8 +335,8 @@ impl LdapAuth {
             .set_starttls(self.starttls)
             .set_no_tls_verify(self.tls_no_verify);
 
-        if let Some(ref connector) = self.tls_connector {
-            settings = settings.set_connector(connector.clone());
+        if let Some(ref config) = self.tls_config {
+            settings = settings.set_config(config.clone());
         }
 
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.ldap_url)
@@ -487,63 +496,123 @@ impl LdapAuth {
     }
 }
 
-/// Build a native-tls `TlsConnector` for LDAP connections.
+/// Build a rustls `ClientConfig` for LDAP connections.
 ///
-/// Integrates with gateway TLS settings:
-/// - `FERRUM_TLS_CA_BUNDLE_PATH` → loads PEM CA certs as trusted roots
-/// - `FERRUM_TLS_NO_VERIFY` → disables server certificate verification
-fn build_ldap_tls_connector(
+/// Integrates with gateway TLS settings while honouring the project-wide
+/// "CA exclusivity" rule (CLAUDE.md "TLS Architecture"):
+///
+/// - `FERRUM_TLS_CA_BUNDLE_PATH` set: builds the trust store from
+///   `RootCertStore::empty()` and adds ONLY the PEM certs from this bundle.
+///   The system / webpki public-CA roots are NOT trusted, so a
+///   public-CA-issued certificate cannot MITM the LDAP connection — the same
+///   guarantee the proxy backend paths and `PluginHttpClient` provide.
+///
+/// - `FERRUM_TLS_CA_BUNDLE_PATH` unset: falls back to webpki bundled roots.
+///   This matches the proxy backend paths' webpki fallback (rather than
+///   `rustls-platform-verifier`) so behaviour is consistent across all
+///   gateway TLS surfaces on Linux containers.
+///
+/// - `FERRUM_TLS_NO_VERIFY` set: installs the shared [`crate::tls::NoVerifier`]
+///   custom certificate verifier (mirroring the proxy backend / WebSocket /
+///   gRPC paths) which accepts every cert presented.
+///
+/// CRL: not currently applied. `PluginHttpClient` does not expose the parsed
+/// CRL list to plugins; once it does, route `crls` into
+/// `crate::tls::build_server_verifier_with_crls()` here.
+fn build_ldap_tls_config(
     no_verify: bool,
     ca_bundle_path: Option<&str>,
-) -> Result<native_tls::TlsConnector, String> {
-    let mut builder = native_tls::TlsConnector::builder();
+) -> Result<Arc<ClientConfig>, String> {
+    // ldap3's `tls-rustls-ring` feature forwards `rustls/ring`, which selects
+    // the ring crypto provider for TLS primitives but DOES NOT install it as
+    // the rustls global default. Anywhere we hand a `ClientConfig` to ldap3
+    // we therefore have to construct it via `with_provider(ring)` so the
+    // builder doesn't fall back to the (uninstalled) global default and
+    // panic at first use. The gateway's own startup installs ring at
+    // `main.rs::install_default()`, but that only matters for code paths
+    // that go through the global accessor — `ClientConfig::builder()`
+    // without `with_provider()` would also work in production but breaks
+    // unit tests that exercise `LdapAuth::new()` before `install_default()`
+    // has run. Always supplying the provider explicitly avoids that ordering
+    // hazard.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("ldap_auth: failed to build rustls client config: {e}"))?;
 
-    if no_verify {
+    let config = if no_verify {
         warn!("ldap_auth: TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY=true)");
-        builder.danger_accept_invalid_certs(true);
-        builder.danger_accept_invalid_hostnames(true);
-    }
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+            .with_no_client_auth()
+    } else {
+        let root_store = build_ldap_root_store(ca_bundle_path)?;
+        builder
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
 
-    if let Some(ca_path) = ca_bundle_path {
-        let ca_data = std::fs::read(ca_path)
-            .map_err(|e| format!("ldap_auth: failed to read CA bundle '{}': {e}", ca_path))?;
+    Ok(Arc::new(config))
+}
 
-        // Parse PEM certificates and add each as a root
-        let mut added = 0;
-        let mut reader = &ca_data[..];
-        for item in std::iter::from_fn(move || rustls_pemfile::read_one(&mut reader).transpose()) {
-            match item {
-                Ok(rustls_pemfile::Item::X509Certificate(cert_der)) => {
-                    let cert = native_tls::Certificate::from_der(&cert_der)
-                        .map_err(|e| format!("ldap_auth: invalid CA cert in '{}': {e}", ca_path))?;
-                    builder.add_root_certificate(cert);
-                    added += 1;
-                }
-                Ok(_) => {} // Skip non-cert PEM items
-                Err(e) => {
-                    warn!(
-                        "ldap_auth: skipping malformed PEM item in '{}': {e}",
-                        ca_path
-                    );
-                }
+/// Build the LDAP TLS trust store, enforcing CA exclusivity when a custom CA
+/// is configured. Returns `RootCertStore::empty()` + the bundle's certs when
+/// a path is supplied; otherwise webpki bundled roots.
+fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCertStore, String> {
+    let Some(ca_path) = ca_bundle_path else {
+        // No custom CA — fall back to webpki bundled roots, matching the
+        // proxy backend path. We deliberately do NOT mix in OS roots: the
+        // gateway runs server-side, the LDAP server is internal, and the
+        // operator opted into "ferrum's TLS stack".
+        return Ok(rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        ));
+    };
+
+    let ca_data = std::fs::read(ca_path)
+        .map_err(|e| format!("ldap_auth: failed to read CA bundle '{}': {e}", ca_path))?;
+
+    // Parse only X.509 entries; tolerate other PEM blocks (private keys, etc.)
+    // by ignoring them, but log them so operators can spot malformed bundles.
+    let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+    let mut reader = &ca_data[..];
+    for item in std::iter::from_fn(move || rustls_pemfile::read_one(&mut reader).transpose()) {
+        match item {
+            Ok(rustls_pemfile::Item::X509Certificate(cert_der)) => {
+                certs.push(cert_der);
+            }
+            Ok(_) => {} // Skip non-cert PEM items
+            Err(e) => {
+                warn!(
+                    "ldap_auth: skipping malformed PEM item in '{}': {e}",
+                    ca_path
+                );
             }
         }
-
-        if added == 0 {
-            return Err(format!(
-                "ldap_auth: no valid CA certificates found in '{}'",
-                ca_path
-            ));
-        }
-        debug!(
-            "ldap_auth: loaded {} CA certificate(s) from '{}'",
-            added, ca_path
-        );
     }
 
-    builder
-        .build()
-        .map_err(|e| format!("ldap_auth: failed to build TLS connector: {e}"))
+    // CA exclusivity: empty store, then load only the configured bundle.
+    let mut root_store = rustls::RootCertStore::empty();
+    let (added, ignored) = root_store.add_parsable_certificates(certs);
+
+    if added == 0 {
+        return Err(format!(
+            "ldap_auth: no valid CA certificates found in '{}'",
+            ca_path
+        ));
+    }
+    if ignored > 0 {
+        warn!(
+            "ldap_auth: ignored {} invalid CA certificate(s) while loading '{}'",
+            ignored, ca_path
+        );
+    }
+    debug!(
+        "ldap_auth: loaded {} CA certificate(s) from '{}' (CA exclusivity enforced)",
+        added, ca_path
+    );
+    Ok(root_store)
 }
 
 /// Escape a string for use in an LDAP DN value (RFC 4514 §2.4).
@@ -750,5 +819,231 @@ impl LdapAuth {
             Some(username.to_string()),
             Some(username.to_string()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests for private TLS-config helpers. Lives here per CLAUDE.md
+    //! "Test Placement": private fns are tested via inline `#[cfg(test)]`
+    //! modules — they cannot be promoted to `pub` solely for external testing.
+
+    use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+    use rustls::pki_types::ServerName;
+    use std::io::Write;
+    use std::sync::Once;
+    use tempfile::NamedTempFile;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    static INIT_CRYPTO: Once = Once::new();
+
+    fn ensure_crypto_provider() {
+        INIT_CRYPTO.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    struct TestCa {
+        cert_pem: String,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn generate_test_ca(cn: &str) -> TestCa {
+        let key_pair =
+            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key");
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        let cert = params.self_signed(&key_pair).expect("self-sign CA");
+        TestCa {
+            cert_pem: cert.pem(),
+            issuer: Issuer::new(params, key_pair),
+        }
+    }
+
+    /// Generate a leaf certificate (cert PEM + key PEM) signed by `ca` for the
+    /// given SANs. Used to stand up a TLS listener in CA-exclusivity tests.
+    fn generate_signed_leaf(ca: &TestCa, cn: &str, sans: &[&str]) -> (String, String) {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params =
+            CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect("leaf params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    fn write_pem_to_temp(pem: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().expect("temp ca file");
+        f.write_all(pem.as_bytes()).expect("write ca pem");
+        f
+    }
+
+    /// Build a rustls server `ServerConfig` from leaf PEM cert + PEM key.
+    fn build_server_config(cert_pem: &str, key_pem: &str) -> Arc<rustls::ServerConfig> {
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse leaf cert");
+        let key: rustls::pki_types::PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .expect("parse key")
+                .expect("present key");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("server protos")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server cert");
+        Arc::new(cfg)
+    }
+
+    /// Stand up a one-shot TLS listener on 127.0.0.1, return the bound port +
+    /// the listener task handle (which completes after one accepted handshake).
+    async fn spawn_oneshot_tls_server(
+        server_cfg: Arc<rustls::ServerConfig>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let acceptor = TlsAcceptor::from(server_cfg);
+        let task = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = acceptor.accept(stream).await; // ignore - test asserts on client side
+            }
+        });
+        (port, task)
+    }
+
+    async fn dial_with_config(port: u16, client_cfg: Arc<ClientConfig>) -> std::io::Result<()> {
+        let connector = TlsConnector::from(client_cfg);
+        let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+        let server_name =
+            ServerName::try_from("localhost").map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut tls = connector.connect(server_name, stream).await?;
+        // Drive the handshake to completion via a tiny round-trip, otherwise some
+        // failures only surface on first I/O.
+        let _ = tls.write_all(b"x").await;
+        let mut buf = [0u8; 1];
+        let _ = tls.read(&mut buf).await;
+        Ok(())
+    }
+
+    #[test]
+    fn no_verify_returns_arc_clientconfig() {
+        ensure_crypto_provider();
+        let cfg = build_ldap_tls_config(true, None).expect("config");
+        // Cheap structural smoke check: must be an Arc<ClientConfig>.
+        let _: &ClientConfig = cfg.as_ref();
+    }
+
+    #[test]
+    fn missing_ca_bundle_path_falls_back_to_webpki() {
+        ensure_crypto_provider();
+        let cfg = build_ldap_tls_config(false, None).expect("config");
+        let _: &ClientConfig = cfg.as_ref();
+    }
+
+    #[test]
+    fn empty_ca_bundle_rejected() {
+        ensure_crypto_provider();
+        let f = NamedTempFile::new().expect("temp");
+        let err = build_ldap_tls_config(false, f.path().to_str()).unwrap_err();
+        assert!(
+            err.contains("no valid CA certificates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_ca_bundle_file_rejected() {
+        ensure_crypto_provider();
+        let err = build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem")).unwrap_err();
+        assert!(err.contains("failed to read"), "unexpected error: {err}");
+    }
+
+    /// Proves CA exclusivity: a config built with CA-A successfully completes a
+    /// TLS handshake against a server whose cert is signed by CA-A.
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_ca_accepts_matching_cert() {
+        ensure_crypto_provider();
+        let ca_a = generate_test_ca("Test CA A");
+        let (leaf_pem, leaf_key_pem) = generate_signed_leaf(&ca_a, "localhost", &["localhost"]);
+
+        let ca_file = write_pem_to_temp(&ca_a.cert_pem);
+        let client_cfg = build_ldap_tls_config(false, ca_file.path().to_str()).expect("client cfg");
+
+        let server_cfg = build_server_config(&leaf_pem, &leaf_key_pem);
+        let (port, _task) = spawn_oneshot_tls_server(server_cfg).await;
+
+        let result = dial_with_config(port, client_cfg).await;
+        assert!(
+            result.is_ok(),
+            "handshake should succeed against matching CA, got: {result:?}"
+        );
+    }
+
+    /// Proves CA exclusivity: a config built with CA-A REJECTS a server cert
+    /// signed by CA-B. If the system / webpki public roots were leaking into
+    /// the trust store (the native-tls regression we're fixing), this test
+    /// would still fail — but for the wrong reason — because both CA-A and
+    /// CA-B are private and not in any public root program. The point of the
+    /// test is the positive direction: when we trust CA-A and the server
+    /// uses CA-B, we explicitly fail.
+    #[tokio::test(flavor = "current_thread")]
+    async fn custom_ca_rejects_mismatched_cert() {
+        ensure_crypto_provider();
+        let ca_a = generate_test_ca("Test CA A");
+        let ca_b = generate_test_ca("Test CA B");
+        let (leaf_pem_b, leaf_key_pem_b) = generate_signed_leaf(&ca_b, "localhost", &["localhost"]);
+
+        // Build config trusting only CA-A; server presents CA-B-signed cert.
+        let ca_file = write_pem_to_temp(&ca_a.cert_pem);
+        let client_cfg = build_ldap_tls_config(false, ca_file.path().to_str()).expect("client cfg");
+
+        let server_cfg = build_server_config(&leaf_pem_b, &leaf_key_pem_b);
+        let (port, _task) = spawn_oneshot_tls_server(server_cfg).await;
+
+        let result = dial_with_config(port, client_cfg).await;
+        assert!(
+            result.is_err(),
+            "handshake should FAIL when server cert is signed by an untrusted CA"
+        );
+    }
+
+    /// Proves CA exclusivity at the trust-store layer (no handshake):
+    /// `RootCertStore::empty()` + the configured bundle is the ENTIRE trust
+    /// store. We verify this by counting roots in the constructed store and
+    /// asserting it matches the bundle's cert count exactly — i.e. the
+    /// system / webpki roots (~150) were NOT mixed in.
+    #[test]
+    fn custom_ca_excludes_webpki_roots() {
+        ensure_crypto_provider();
+        let ca = generate_test_ca("Test CA Exclusive");
+        let ca_file = write_pem_to_temp(&ca.cert_pem);
+        let store = build_ldap_root_store(ca_file.path().to_str()).expect("trust store");
+        // Single CA in bundle → exactly 1 trust anchor.
+        assert_eq!(
+            store.len(),
+            1,
+            "Custom CA must produce a single-anchor trust store; \
+             a value > 1 indicates webpki / system roots leaked in"
+        );
+
+        // Sanity: the no-CA path falls back to webpki bundled roots, which
+        // is many anchors — proves our test setup wasn't trivially passing.
+        let webpki_store = build_ldap_root_store(None).expect("webpki store");
+        assert!(
+            webpki_store.len() > 10,
+            "webpki fallback should populate many trust anchors"
+        );
     }
 }

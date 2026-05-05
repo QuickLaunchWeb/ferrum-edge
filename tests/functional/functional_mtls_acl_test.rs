@@ -622,6 +622,7 @@ async fn dtls_send(
         certificate: client_cert,
         server_name: None,
         server_cert_verifier: None,
+        connect_timeout_ms: 5_000,
     };
 
     let conn = match tokio::time::timeout(

@@ -396,3 +396,231 @@ async fn test_inflight_marker_carries_timestamp() {
     // All 5 distinct keys should be tracked
     assert_eq!(plugin.tracked_keys_count(), Some(5));
 }
+
+/// A cached response with `Set-Cookie: session=A` from the first client must
+/// NOT be replayed verbatim to a second client sharing the same idempotency
+/// key. Without sanitization, the second client would receive the first
+/// client's session cookie — a direct session-hijack vector when
+/// `scope_by_consumer=false` or for anonymous traffic. Replay must still
+/// surface the `x-idempotent-replayed: true` marker so operators can tell a
+/// replay apart from a fresh response.
+#[tokio::test]
+async fn test_replay_strips_set_cookie_session_hijack_protection() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    // First client: cache a response carrying a session cookie.
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/checkout".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "shared-key".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert(
+        "Set-Cookie".to_string(),
+        "session=USER_A_SESSION_TOKEN; HttpOnly; Secure".to_string(),
+    );
+    response_headers.insert("set-cookie2".to_string(), "legacy=USER_A".to_string());
+    let body = b"{\"order_id\": 42}";
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, body)
+        .await;
+
+    // Second client (anonymous, same idempotency key): must NOT receive
+    // user A's Set-Cookie even though replay returns user A's body.
+    let mut ctx2 = RequestContext::new(
+        "10.0.0.99".to_string(),
+        "POST".to_string(),
+        "/api/checkout".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "shared-key".to_string());
+
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            // Critical: session-bearing headers must be stripped on replay.
+            assert!(
+                !headers.contains_key("Set-Cookie"),
+                "Set-Cookie must be stripped from replayed response (session hijack vector)"
+            );
+            assert!(
+                !headers.contains_key("set-cookie2"),
+                "set-cookie2 must be stripped from replayed response"
+            );
+            // Replay marker still added so operators / clients can detect a replay.
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+            // Body and safe headers still flow through.
+            assert_eq!(&body[..], b"{\"order_id\": 42}");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        other => panic!("Expected RejectBinary replay, got {:?}", other),
+    }
+}
+
+/// Authorization, www-authenticate, and per-request trace IDs must be
+/// stripped on replay. The original request's `Authorization: Bearer <leaked>`
+/// being echoed back to a different consumer is an information-disclosure
+/// vector, and replaying the original `traceparent` would splice every cache
+/// hit into the original transaction's trace.
+#[tokio::test]
+async fn test_replay_strips_authorization_and_trace_headers() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "auth-key".to_string());
+    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "Authorization".to_string(),
+        "Bearer leaked-token".to_string(),
+    );
+    response_headers.insert(
+        "WWW-Authenticate".to_string(),
+        "Bearer realm=\"api\"".to_string(),
+    );
+    response_headers.insert("X-Request-Id".to_string(), "req-original-12345".to_string());
+    response_headers.insert(
+        "traceparent".to_string(),
+        "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+    );
+    response_headers.insert("X-RateLimit-Remaining".to_string(), "42".to_string());
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
+        .await;
+
+    let mut ctx2 = RequestContext::new(
+        "10.0.0.99".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "auth-key".to_string());
+
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary { headers, .. } => {
+            // Sensitive headers stripped (case-insensitive check).
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("Authorization")),
+                "Authorization must be stripped (info-disclosure vector)"
+            );
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("WWW-Authenticate"))
+            );
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("X-Request-Id")),
+                "Per-request trace IDs must be stripped"
+            );
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("traceparent"))
+            );
+            assert!(
+                !headers
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case("X-RateLimit-Remaining")),
+                "Rate-limit counters must be stripped"
+            );
+            // Replay marker still present.
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+            // Safe headers retained.
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        other => panic!("Expected RejectBinary replay, got {:?}", other),
+    }
+}
+
+/// `Set-Cookie` set on a different case (case-insensitive HTTP header
+/// matching) must still be stripped on replay. Backends emit cookies under
+/// many casings (`Set-Cookie`, `set-cookie`, `SET-COOKIE`); a case-sensitive
+/// strip would silently leak sessions.
+#[tokio::test]
+async fn test_replay_strips_set_cookie_case_insensitively() {
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "case-key".to_string());
+    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+
+    let mut response_headers = HashMap::new();
+    // Mixed casings — all must be stripped.
+    response_headers.insert("set-cookie".to_string(), "session=A".to_string());
+    response_headers.insert("Set-Cookie".to_string(), "session=B".to_string());
+    response_headers.insert("SET-COOKIE".to_string(), "session=C".to_string());
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
+        .await;
+
+    let mut ctx2 = RequestContext::new(
+        "10.0.0.99".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "case-key".to_string());
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers.keys().any(|k| k.eq_ignore_ascii_case("set-cookie")),
+                "All casings of Set-Cookie must be stripped"
+            );
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        other => panic!("Expected RejectBinary replay, got {:?}", other),
+    }
+}

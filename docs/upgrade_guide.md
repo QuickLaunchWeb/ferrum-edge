@@ -111,6 +111,13 @@ TLS and HTTP/2 or HTTP/3 handshakes. Operators who previously sized this field
 assuming it applied only to the TCP SYN phase should validate cold-connection
 latency during rollout.
 
+### Chargeback Scrape Authentication
+
+`GET /charges` now requires an admin JWT. Update Prometheus or external billing
+collectors that scrape this endpoint to send `Authorization: Bearer <token>`
+(for example, Prometheus `bearer_token_file`) before upgrading. `/metrics`,
+`/health`, `/status`, and `/overload` remain unauthenticated.
+
 #### 4. Cut Over Production
 
 Once validation passes, stop the old binary and start the new one against the production database. The new binary will run any pending migrations automatically on startup (or you can run them explicitly first with `FERRUM_MODE=migrate`).

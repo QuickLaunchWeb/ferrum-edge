@@ -629,3 +629,345 @@ async fn read_http_response(conn: &mut TcpStream) -> Option<String> {
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
+
+// ============================================================================
+// TCP/UDP stream-listener SIGTERM tests
+// ============================================================================
+//
+// Regression coverage for the bug where TCP/UDP stream listeners ignored the
+// gateway-wide SIGTERM and kept accepting connections until the runtime was
+// dropped. The fix wires `StreamListenerManager` to the same `watch::Sender`
+// `main.rs` uses for HTTP listeners and additionally calls `shutdown_all()`
+// before `wait_for_drain` so the per-listener watch channels also fire.
+//
+// Each test starts the real binary in file mode with a TCP or UDP stream
+// proxy, sends SIGTERM, and asserts that:
+//   * The proxy port stops accepting connections / datagrams reasonably soon.
+//   * The gateway process exits within `FERRUM_SHUTDOWN_DRAIN_SECONDS` plus
+//     a small overhead.
+
+/// Spawn a basic TCP echo backend on a pre-bound listener.
+async fn start_tcp_echo_backend_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut stream, _)) => {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    if stream.write_all(&buf[..n]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+/// Spawn a basic UDP echo backend on a pre-bound socket.
+async fn start_udp_echo_backend_on(socket: tokio::net::UdpSocket) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, addr)) => {
+                    let _ = socket.send_to(&buf[..n], addr).await;
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+/// Build a file-mode YAML config with one TCP stream proxy + one HTTP echo
+/// proxy. The HTTP proxy gives us an admin-port-style health check target so
+/// `wait_for_gateway` works the same way as the existing tests.
+fn write_tcp_stream_config(
+    dir: &TempDir,
+    tcp_listen_port: u16,
+    tcp_backend_port: u16,
+) -> std::path::PathBuf {
+    let config_path = dir.path().join("config.yaml");
+    let config_content = format!(
+        r#"
+proxies:
+  - id: "tcp-echo"
+    listen_port: {tcp_listen_port}
+    backend_scheme: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {tcp_backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+    );
+    let mut f = std::fs::File::create(&config_path).expect("create config");
+    f.write_all(config_content.as_bytes())
+        .expect("write config");
+    drop(f);
+    config_path
+}
+
+/// Same as [`write_tcp_stream_config`] but for a UDP stream proxy.
+fn write_udp_stream_config(
+    dir: &TempDir,
+    udp_listen_port: u16,
+    udp_backend_port: u16,
+) -> std::path::PathBuf {
+    let config_path = dir.path().join("config.yaml");
+    let config_content = format!(
+        r#"
+proxies:
+  - id: "udp-echo"
+    listen_port: {udp_listen_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {udp_backend_port}
+
+consumers: []
+plugin_configs: []
+"#
+    );
+    let mut f = std::fs::File::create(&config_path).expect("create config");
+    f.write_all(config_content.as_bytes())
+        .expect("write config");
+    drop(f);
+    config_path
+}
+
+/// Start the gateway binary with a stream proxy listen port pre-known. We
+/// can't reuse `start_gateway_with_retry` because it always allocates a fresh
+/// proxy listen port at retry time, but stream proxies need the listen port
+/// embedded in the config file, so we accept a pre-allocated `stream_port`.
+async fn start_gateway_with_stream_port<F>(
+    write_config: F,
+    stream_port: u16,
+    drain_seconds: u64,
+) -> Option<(std::process::Child, u16, u16, TempDir)>
+where
+    F: Fn(&TempDir, u16) -> std::path::PathBuf,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let dir = TempDir::new().unwrap();
+        let proxy_port = ephemeral_port().await;
+        let admin_port = ephemeral_port().await;
+        let config_path = write_config(&dir, stream_port);
+
+        let mut child = start_gateway(
+            config_path.to_str().unwrap(),
+            proxy_port,
+            admin_port,
+            drain_seconds,
+        );
+
+        if wait_for_gateway(admin_port).await {
+            return Some((child, proxy_port, admin_port, dir));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!(
+            "Gateway startup attempt {}/{} failed (stream_port={}, http={}, admin={})",
+            attempt, MAX_ATTEMPTS, stream_port, proxy_port, admin_port
+        );
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    None
+}
+
+/// Verify TCP stream listener stops accepting after SIGTERM and the gateway
+/// exits within the drain window.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_tcp_stream_listener_stops_on_sigterm() {
+    // Backend echo on its own ephemeral port.
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let backend_task = start_tcp_echo_backend_on(backend_listener).await;
+
+    // Pre-allocate the stream listener port.
+    let stream_port = ephemeral_port().await;
+
+    let (mut gateway, _proxy_port, _admin_port, _dir) = match start_gateway_with_stream_port(
+        |dir, port| write_tcp_stream_config(dir, port, backend_port),
+        stream_port,
+        5,
+    )
+    .await
+    {
+        Some(v) => v,
+        None => {
+            backend_task.abort();
+            panic!("gateway failed to start with TCP stream listener");
+        }
+    };
+
+    // Give the stream listener a moment to bind.
+    sleep(Duration::from_millis(500)).await;
+
+    // Open a long-lived TCP connection through the stream proxy and exchange
+    // a frame so we know the relay is up.
+    let addr = format!("127.0.0.1:{}", stream_port);
+    let mut conn = TcpStream::connect(&addr)
+        .await
+        .expect("connect to stream listener");
+    conn.write_all(b"hello").await.expect("write first frame");
+    let mut buf = [0u8; 5];
+    let n = timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
+        .await
+        .expect("read first echo (timeout)")
+        .expect("read first echo");
+    assert_eq!(n, 5);
+    assert_eq!(&buf, b"hello");
+
+    // Send SIGTERM.
+    let start = Instant::now();
+    send_sigterm(gateway.id());
+
+    // Give the listener a moment to react to the global shutdown.
+    sleep(Duration::from_millis(500)).await;
+
+    // New TCP connections to the stream port must be refused (or closed
+    // immediately) — the accept loop should have exited. Retry for ~3s to
+    // survive OS-level residual backlog.
+    let mut refused = false;
+    for _ in 0..30 {
+        match timeout(Duration::from_millis(300), TcpStream::connect(&addr)).await {
+            Err(_) => {
+                refused = true;
+                break;
+            }
+            Ok(Err(_)) => {
+                refused = true;
+                break;
+            }
+            Ok(Ok(mut s)) => {
+                // Either the socket was closed immediately by the OS backlog
+                // drain, or it was accepted by a not-yet-exited loop. Try a
+                // small write+read; if the relay tears it down quickly, count
+                // as refused.
+                let _ = s.write_all(b"x").await;
+                let mut tmp = [0u8; 8];
+                match timeout(Duration::from_millis(300), s.read(&mut tmp)).await {
+                    Ok(Ok(0)) | Err(_) => {
+                        refused = true;
+                        break;
+                    }
+                    _ => {
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        refused,
+        "TCP stream listener continued accepting new connections after SIGTERM"
+    );
+
+    // The gateway must exit cleanly within the drain window plus a small
+    // overhead (background task drain caps at 5s). Drain is 5s, total budget
+    // 12s.
+    let status = wait_with_timeout(&mut gateway, Duration::from_secs(12));
+    assert!(
+        status.is_some(),
+        "gateway did not exit within 12s of SIGTERM (elapsed={:?})",
+        start.elapsed()
+    );
+
+    drop(conn);
+    backend_task.abort();
+}
+
+/// Verify UDP stream listener stops receiving after SIGTERM and the gateway
+/// exits within the drain window.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_udp_stream_listener_stops_on_sigterm() {
+    // Backend echo on its own ephemeral UDP port.
+    let backend_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_socket.local_addr().unwrap().port();
+    let backend_task = start_udp_echo_backend_on(backend_socket).await;
+
+    // Pre-allocate the stream listener port. We pre-bind a TCP listener to
+    // grab a port — the OS treats TCP/UDP ports independently so the same
+    // number can be used for the UDP listener once we drop the TCP one.
+    let stream_port = ephemeral_port().await;
+
+    let (mut gateway, _proxy_port, _admin_port, _dir) = match start_gateway_with_stream_port(
+        |dir, port| write_udp_stream_config(dir, port, backend_port),
+        stream_port,
+        5,
+    )
+    .await
+    {
+        Some(v) => v,
+        None => {
+            backend_task.abort();
+            panic!("gateway failed to start with UDP stream listener");
+        }
+    };
+
+    // Give the listener a moment to bind.
+    sleep(Duration::from_millis(500)).await;
+
+    // Send a datagram and confirm the relay round-trips it.
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect(format!("127.0.0.1:{}", stream_port))
+        .await
+        .expect("client connect");
+    client.send(b"ping").await.expect("send ping");
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(5), client.recv(&mut buf))
+        .await
+        .expect("recv echo (timeout)")
+        .expect("recv echo");
+    assert_eq!(&buf[..n], b"ping");
+
+    let start = Instant::now();
+    send_sigterm(gateway.id());
+
+    // Give the listener a moment to react.
+    sleep(Duration::from_millis(500)).await;
+
+    // After shutdown, the listener should not be bound to the stream port
+    // anymore. We confirm by binding a fresh UDP socket on that port — it
+    // must succeed.
+    let mut released = false;
+    for _ in 0..30 {
+        match tokio::net::UdpSocket::bind(format!("127.0.0.1:{}", stream_port)).await {
+            Ok(_) => {
+                released = true;
+                break;
+            }
+            Err(_) => sleep(Duration::from_millis(100)).await,
+        }
+    }
+    assert!(
+        released,
+        "UDP stream listener continued holding port {} after SIGTERM",
+        stream_port
+    );
+
+    // The gateway must exit cleanly within the drain window + overhead.
+    let status = wait_with_timeout(&mut gateway, Duration::from_secs(12));
+    assert!(
+        status.is_some(),
+        "gateway did not exit within 12s of SIGTERM (elapsed={:?})",
+        start.elapsed()
+    );
+
+    backend_task.abort();
+}

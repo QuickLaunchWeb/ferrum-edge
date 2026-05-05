@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
@@ -111,6 +111,10 @@ pub struct AdminState {
     pub dp_registry: Option<Arc<DpNodeRegistry>>,
     /// Connection state to the CP (DP mode only).
     pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    /// Admin HTTP header read timeout (seconds). 0 disables.
+    pub admin_http_header_read_timeout_seconds: u64,
+    /// Admin TLS handshake timeout (seconds). 0 disables.
+    pub admin_tls_handshake_timeout_seconds: u64,
 }
 
 impl AdminState {
@@ -239,20 +243,16 @@ async fn handle_admin_tls_connection(
     use tokio_rustls::TlsAcceptor;
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(stream).await {
-        Ok(stream) => {
-            info!("Admin TLS connection established from {}", remote_addr.ip());
-            stream
-        }
-        Err(e) => {
-            warn!(
-                "Admin TLS handshake failed from {}: {}",
-                remote_addr.ip(),
-                e
-            );
-            return Err(e.into());
-        }
-    };
+    let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
+    let header_read_timeout = state.admin_http_header_read_timeout_seconds;
+    let tls_stream = crate::tls::accept_with_optional_timeout(
+        &acceptor,
+        stream,
+        tls_handshake_timeout,
+        &remote_addr,
+    )
+    .await?;
+    info!("Admin TLS connection established from {}", remote_addr.ip());
 
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -266,8 +266,15 @@ async fn handle_admin_tls_connection(
     // Use auto builder to support both HTTP/1.1 and HTTP/2 via ALPN negotiation.
     // The TLS config advertises both h2 and http/1.1, so clients can negotiate
     // either protocol.
-    let builder =
+    let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // This header timer only applies to the HTTP/1 admin path; this builder
+    // does not expose an equivalent HTTP/2 admin header deadline.
+    if header_read_timeout > 0 {
+        let mut http1 = builder.http1();
+        http1.timer(hyper_util::rt::TokioTimer::new());
+        http1.header_read_timeout(Duration::from_secs(header_read_timeout));
+    }
     let conn = builder.serve_connection(io, svc);
 
     if let Err(e) = conn.await {
@@ -284,12 +291,19 @@ async fn handle_admin_connection(
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let io = TokioIo::new(stream);
+    let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         async move { handle_admin_request(req, state).await }
     });
 
-    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+    let mut builder = http1::Builder::new();
+    if header_read_timeout_seconds > 0 {
+        builder.timer(hyper_util::rt::TokioTimer::new());
+        builder.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
+    }
+
+    if let Err(e) = builder.serve_connection(io, svc).await {
         error!("Admin HTTP connection error: {}", e);
     }
 
@@ -563,7 +577,37 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
-    // API chargeback endpoint (unauthenticated for scraping, like /metrics)
+    // Authenticate
+    match state.jwt_manager.verify_request(
+        req.headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok()),
+    ) {
+        Ok(_) => {
+            // Token is valid, continue processing
+        }
+        Err(JwtError::MissingHeader) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Missing Authorization header"}),
+            ));
+        }
+        Err(JwtError::InvalidHeaderFormat) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Invalid Authorization header format"}),
+            ));
+        }
+        Err(JwtError::VerificationFailed(msg)) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": format!("Token verification failed: {}", msg)}),
+            ));
+        }
+    }
+
+    // API chargeback endpoint. Chargeback output contains customer/business data,
+    // so it stays behind the standard admin JWT gate even though it is scrapeable.
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::global_registry();
         // Support ?format=json for JSON output, default to Prometheus text format
@@ -591,35 +635,6 @@ pub async fn handle_admin_request(
                     Response::new(Full::new(Bytes::from("# error rendering charges\n")))
                 });
             return Ok(resp);
-        }
-    }
-
-    // Authenticate
-    match state.jwt_manager.verify_request(
-        req.headers()
-            .get("authorization")
-            .and_then(|h| h.to_str().ok()),
-    ) {
-        Ok(_) => {
-            // Token is valid, continue processing
-        }
-        Err(JwtError::MissingHeader) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Missing Authorization header"}),
-            ));
-        }
-        Err(JwtError::InvalidHeaderFormat) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Invalid Authorization header format"}),
-            ));
-        }
-        Err(JwtError::VerificationFailed(msg)) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": format!("Token verification failed: {}", msg)}),
-            ));
         }
     }
 
@@ -1278,7 +1293,6 @@ fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
 // ---- Metrics ----
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 /// Process-global cache for the metrics JSON response.
 static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
@@ -1674,12 +1688,23 @@ async fn handle_batch_create(
         if let Some(upstream_id) = proxy.upstream_id.as_deref()
             && !batch_upstream_ids.contains(upstream_id)
         {
-            match db.check_upstream_exists(upstream_id).await {
+            match db.check_upstream_exists(upstream_id, namespace).await {
                 Ok(true) => {}
-                Ok(false) => validation_errors.push(format!(
-                    "Proxy '{}' references non-existent upstream_id '{}'",
-                    proxy.id, upstream_id
-                )),
+                Ok(false) => {
+                    // Distinguish "missing" from "wrong namespace" so the
+                    // operator's diagnostic points at the real problem.
+                    let message = match db.get_upstream(upstream_id).await {
+                        Ok(Some(other)) => format!(
+                            "Proxy '{}' references upstream_id '{}' from namespace '{}' (proxy is in namespace '{}'); cross-namespace references are forbidden",
+                            proxy.id, upstream_id, other.namespace, namespace
+                        ),
+                        _ => format!(
+                            "Proxy '{}' references non-existent upstream_id '{}'",
+                            proxy.id, upstream_id
+                        ),
+                    };
+                    validation_errors.push(message);
+                }
                 Err(err) => validation_errors.push(format!(
                     "Proxy '{}' upstream reference check failed: {}",
                     proxy.id, err
@@ -1720,7 +1745,7 @@ async fn handle_batch_create(
 
         if !unresolved.is_empty() {
             match db
-                .validate_proxy_plugin_associations(&proxy.id, &unresolved)
+                .validate_proxy_plugin_associations(&proxy.id, namespace, &unresolved)
                 .await
             {
                 Ok(errs) => validation_errors.extend(errs),
@@ -1736,12 +1761,24 @@ async fn handle_batch_create(
         if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
             && !batch_proxy_ids.contains(proxy_id)
         {
-            match db.check_proxy_exists(proxy_id).await {
+            match db.check_proxy_exists(proxy_id, namespace).await {
                 Ok(true) => {}
-                Ok(false) => validation_errors.push(format!(
-                    "PluginConfig '{}' references non-existent proxy_id '{}'",
-                    plugin_config.id, proxy_id
-                )),
+                Ok(false) => {
+                    // Distinguish "missing" from "wrong namespace" — the
+                    // referenced proxy may exist in another namespace, in
+                    // which case the operator must move or recreate it.
+                    let message = match db.get_proxy(proxy_id).await {
+                        Ok(Some(other)) => format!(
+                            "PluginConfig '{}' references proxy_id '{}' from namespace '{}' (plugin_config is in namespace '{}'); cross-namespace references are forbidden",
+                            plugin_config.id, proxy_id, other.namespace, namespace
+                        ),
+                        _ => format!(
+                            "PluginConfig '{}' references non-existent proxy_id '{}'",
+                            plugin_config.id, proxy_id
+                        ),
+                    };
+                    validation_errors.push(message);
+                }
                 Err(err) => validation_errors.push(format!(
                     "PluginConfig '{}' proxy reference check failed: {}",
                     plugin_config.id, err

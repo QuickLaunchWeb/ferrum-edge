@@ -142,14 +142,17 @@ fn create_proxy_state() -> ProxyState {
         num_concurrent_reqs: 3,
         max_active_requests: 512,
         max_concurrent_refreshes: 64,
+        shard_amount: 0,
     });
-    ProxyState::new(
+    let (state, _health_check_handles) = ProxyState::new(
         GatewayConfig::default(),
         dns_cache,
         create_test_env_config(),
         None,
+        None,
     )
-    .expect("ProxyState::new failed")
+    .expect("ProxyState::new failed");
+    state
 }
 
 /// Build a CP-scoped admin `AdminState` that exposes `GET /cluster` with the
@@ -179,6 +182,8 @@ fn build_cp_admin_state(
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: Some(registry),
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     }
 }
 
@@ -209,6 +214,8 @@ fn build_dp_admin_state(
         cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         cp_connection_state: Some(conn_state),
+        admin_http_header_read_timeout_seconds: 10,
+        admin_tls_handshake_timeout_seconds: 10,
     }
 }
 

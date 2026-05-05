@@ -521,3 +521,190 @@ async fn test_mirror_falls_back_to_metadata_when_no_body_bytes() {
         "Mirror should be dispatched using metadata fallback"
     );
 }
+
+// === max_response_body_bytes config validation ===
+
+#[test]
+fn test_max_response_body_bytes_default() {
+    // No config field set → defaults to 1 MiB. Plugin construction should
+    // succeed.
+    let plugin = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local" }),
+        PluginHttpClient::default(),
+    );
+    assert!(plugin.is_ok());
+}
+
+#[test]
+fn test_max_response_body_bytes_zero_is_error() {
+    let result = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": 0 }),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    assert!(
+        result.err().unwrap().contains("max_response_body_bytes"),
+        "error must mention the field"
+    );
+}
+
+#[test]
+fn test_max_response_body_bytes_negative_is_error() {
+    let result = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": -1 }),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_max_response_body_bytes_string_is_error() {
+    let result = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": "1024" }),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_max_response_body_bytes_valid_value() {
+    let plugin = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_response_body_bytes": 4096 }),
+        PluginHttpClient::default(),
+    );
+    assert!(plugin.is_ok());
+}
+
+// === Bounded mirror response-body reads ===
+//
+// When the mirror response has no `content-length` header, the size is
+// derived by streaming and counting bytes — bounded by
+// `max_response_body_bytes`. A misbehaving sink returning a body larger than
+// the cap must NOT exhaust gateway memory in a fire-and-forget mirror task.
+
+/// Mirror endpoint returns a 10 KiB body without Content-Length, plugin caps
+/// at 1 KiB. The mirror task aborts early; the reported size is just over the
+/// cap (one chunk past), NOT the full 10 KiB.
+#[tokio::test]
+async fn test_mirror_response_body_bounded_when_oversized_no_content_length() {
+    use tokio::net::TcpListener;
+
+    // Spawn a minimal HTTP/1.1 server that responds with chunked 10 KiB. We
+    // hand-write the response so we don't have to fight a higher-level
+    // framework into omitting Content-Length.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            // Read and discard the request (read until \r\n\r\n).
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+
+            // Write a chunked response with no Content-Length.
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Transfer-Encoding: chunked\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+
+            // Send 10 chunks of 1024 bytes each = 10 KiB total.
+            for _ in 0..10 {
+                let chunk = "400\r\n".to_string() + &"A".repeat(1024) + "\r\n";
+                let _ = stream.write_all(chunk.as_bytes()).await;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "max_response_body_bytes": 1024
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+
+    // Wait for the mirror task to finish and surface its meta via the watch
+    // channel. The truncated size should be just over the limit, NOT the full
+    // 10 KiB — proving the bounded reader aborted the stream.
+    let meta = ctx
+        .collect_mirror_result()
+        .await
+        .expect("mirror should report metadata");
+    assert!(meta.mirror_error.is_none());
+    let size = meta
+        .mirror_response_size_bytes
+        .expect("size should be reported");
+    assert!(
+        size > 1024,
+        "reported size should reflect at-least one byte past the limit, got {}",
+        size
+    );
+    assert!(
+        size <= 2048,
+        "bounded read must NOT consume the full 10 KiB body — got {}",
+        size
+    );
+}
+
+/// When the mirror response carries Content-Length, the body is never read
+/// (CL fast path). The reported size is the CL header value, regardless of
+/// `max_response_body_bytes`.
+#[tokio::test]
+async fn test_mirror_response_body_uses_content_length_fast_path() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = vec![b'C'; 4096];
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let server_addr = server.uri();
+    let server_url = url::Url::parse(&server_addr).unwrap();
+    let host = server_url.host_str().unwrap().to_string();
+    let port = server_url.port().unwrap();
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": host,
+            "mirror_port": port,
+            // 1 KiB cap, but CL is 4 KiB — fast path skips the bounded read.
+            "max_response_body_bytes": 1024,
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+
+    let meta = ctx
+        .collect_mirror_result()
+        .await
+        .expect("mirror metadata should arrive");
+    let size = meta
+        .mirror_response_size_bytes
+        .expect("size should be reported");
+    assert_eq!(size, 4096, "CL fast-path should report the full 4 KiB size");
+}

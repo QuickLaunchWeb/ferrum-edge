@@ -159,7 +159,15 @@ pub trait DatabaseBackend: Send + Sync {
     async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
     async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error>;
     async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
-    async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error>;
+    /// Check whether a proxy with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace, so
+    /// admin-side reference checks cannot be satisfied by a row that lives
+    /// in a different namespace.
+    async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error>;
     async fn list_proxies_paginated(
         &self,
         namespace: &str,
@@ -282,11 +290,24 @@ pub trait DatabaseBackend: Send + Sync {
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
-    async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error>;
+    /// Check whether an upstream with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace, so a
+    /// proxy in namespace A cannot reference an upstream that actually lives
+    /// in namespace B (which would silently 502 at runtime).
+    async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error>;
 
+    /// Validate that a proxy's plugin association list references existing
+    /// plugin configs. Plugin configs are looked up only within `namespace`
+    /// — references to plugin_configs in other namespaces are rejected as
+    /// non-existent so cross-namespace pollution is impossible.
     async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         plugins: &[crate::config::types::PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error>;
 
@@ -363,6 +384,37 @@ pub trait DatabaseBackend: Send + Sync {
     /// an offline-bootstrap / lazy-pool concept (e.g., MongoDB).
     async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
         Ok(false)
+    }
+
+    /// Return the list of custom-plugin migrations that have not yet been
+    /// applied to the database. Used at startup to warn operators when a
+    /// gateway upgrade brings in new plugin schema changes that have not yet
+    /// been applied.
+    ///
+    /// The default implementation returns an empty list — appropriate for
+    /// backends that do not support SQL-based plugin migrations (e.g.,
+    /// MongoDB; per the docs, `CustomPluginMigration` is SQL-only and
+    /// MongoDB plugins create collections/indexes inside `create_plugin()`).
+    async fn pending_plugin_migrations(
+        &self,
+        _plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Apply all pending custom-plugin migrations. Used by the opt-in
+    /// `FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS=true` startup path so operators
+    /// can ship a binary upgrade with bundled plugin schema changes without
+    /// running a separate `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up`
+    /// step.
+    ///
+    /// The default implementation is a no-op for backends that do not
+    /// support SQL-based plugin migrations (e.g., MongoDB).
+    async fn apply_plugin_migrations(
+        &self,
+        _plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
+        Ok(Vec::new())
     }
 
     /// Return all distinct namespaces across all resource tables.

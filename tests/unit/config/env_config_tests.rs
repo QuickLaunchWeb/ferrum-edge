@@ -1838,10 +1838,26 @@ fn test_is_private_ip_cgnat() {
 }
 
 #[test]
+fn test_is_private_ip_special_use_v4() {
+    assert!(is_private_ip(&"192.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.0.8".parse().unwrap()));
+    assert!(!is_private_ip(&"192.0.0.9".parse().unwrap()));
+    assert!(!is_private_ip(&"192.0.0.10".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.0.170".parse().unwrap()));
+    assert!(is_private_ip(&"192.0.2.5".parse().unwrap()));
+    assert!(is_private_ip(&"192.88.99.1".parse().unwrap()));
+    assert!(is_private_ip(&"198.18.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"198.51.100.5".parse().unwrap()));
+    assert!(is_private_ip(&"203.0.113.5".parse().unwrap()));
+    assert!(is_private_ip(&"224.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"240.0.0.1".parse().unwrap()));
+}
+
+#[test]
 fn test_is_private_ip_public_v4() {
     assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
     assert!(!is_private_ip(&"1.1.1.1".parse().unwrap()));
-    assert!(!is_private_ip(&"203.0.113.5".parse().unwrap()));
+    assert!(!is_private_ip(&"100.128.0.1".parse().unwrap()));
 }
 
 #[test]
@@ -1849,10 +1865,31 @@ fn test_is_private_ip_ipv6() {
     assert!(is_private_ip(&"::1".parse().unwrap()));
     assert!(is_private_ip(&"::".parse().unwrap()));
     assert!(is_private_ip(&"fe80::1".parse().unwrap()));
+    assert!(is_private_ip(&"fc00::1".parse().unwrap()));
     assert!(is_private_ip(&"fd00::1".parse().unwrap()));
+    assert!(is_private_ip(&"ff02::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:db8::1".parse().unwrap()));
+    assert!(is_private_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"::127.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"64:ff9b::192.168.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"100::1".parse().unwrap()));
+    assert!(is_private_ip(&"100:0:0:1::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:1::4".parse().unwrap()));
+    assert!(is_private_ip(&"2001:2::1".parse().unwrap()));
+    assert!(is_private_ip(&"2001:10::1".parse().unwrap()));
     // Public IPv6
-    assert!(!is_private_ip(&"2001:db8::1".parse().unwrap()));
     assert!(!is_private_ip(&"2607:f8b0:4004:800::200e".parse().unwrap()));
+    assert!(!is_private_ip(&"::8.8.8.8".parse().unwrap()));
+    assert!(!is_private_ip(&"64:ff9b::8.8.8.8".parse().unwrap()));
+    assert!(!is_private_ip(&"100:0:0:2::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:1::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:1::2".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:1::3".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:3::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:4:112::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:20::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2001:30::1".parse().unwrap()));
 }
 
 #[test]
@@ -3482,6 +3519,55 @@ fn test_db_full_load_page_size_clamped_to_maximum() {
             assert_eq!(
                 config.db_full_load_page_size, 100_000,
                 "values above 100000 should be clamped to the maximum"
+            );
+        },
+    );
+}
+
+// ── FERRUM_POOL_SHARD_AMOUNT ────────────────────────────────────────────────
+
+#[test]
+fn test_pool_shard_amount_default_is_zero() {
+    let config = EnvConfig::default();
+    assert_eq!(
+        config.pool_shard_amount, 0,
+        "Default 0 means auto-derive from CPU topology"
+    );
+}
+
+#[test]
+fn test_pool_shard_amount_parsed_from_env() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_POOL_SHARD_AMOUNT", "256"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.pool_shard_amount, 256,
+                "operator-supplied override must be passed through verbatim; \
+                 power-of-two rounding happens at the call site",
+            );
+        },
+    );
+}
+
+#[test]
+fn test_pool_shard_amount_zero_kept_as_auto_sentinel() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_POOL_SHARD_AMOUNT", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.pool_shard_amount, 0,
+                "FERRUM_POOL_SHARD_AMOUNT=0 must remain 0 (auto sentinel) — \
+                 the helper resolves it later, not the parser",
             );
         },
     );

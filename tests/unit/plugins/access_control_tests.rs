@@ -207,6 +207,76 @@ async fn test_access_control_consumer_rules_still_apply_when_authenticated_ident
 }
 
 #[tokio::test]
+async fn test_access_control_disallowed_external_identity_is_rejected() {
+    // External identity in disallowed_consumers must be rejected, even when
+    // `allow_authenticated_identity = true` and no Consumer is mapped.
+    let config = json!({
+        "disallowed_consumers": ["alice"],
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("alice".to_string());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn test_access_control_allowed_external_identity_continues() {
+    // External identity NOT in disallowed_consumers must pass when
+    // `allow_authenticated_identity = true` and no Consumer is mapped.
+    let config = json!({
+        "disallowed_consumers": ["alice"],
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("bob".to_string());
+    let result = plugin.authorize(&mut ctx).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_access_control_no_authenticated_identity_still_rejects_with_deny_list() {
+    // Regression: with `allow_authenticated_identity = true` and a deny list,
+    // a request with no Consumer AND no external identity must still be rejected
+    // with 401 (no identity at all to gate on).
+    let config = json!({
+        "disallowed_consumers": ["alice"],
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = None;
+    let result = plugin.authorize(&mut ctx).await;
+    assert_reject(result, Some(401));
+}
+
+#[tokio::test]
+async fn test_access_control_consumer_path_unchanged_when_disallowed_with_external_auth_enabled() {
+    // Regression: an identified Consumer named "alice" with the deny list applied
+    // must still be rejected via the existing Consumer path (independent of
+    // `allow_authenticated_identity`).
+    let config = json!({
+        "disallowed_consumers": ["alice"],
+        "allow_authenticated_identity": true
+    });
+    let plugin = AccessControl::new(&config).unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("alice", vec![])));
+    ctx.authenticated_identity = None;
+    let result = plugin.authorize(&mut ctx).await;
+    assert_reject(result, Some(403));
+}
+
+#[tokio::test]
 async fn test_access_control_disallowed_consumer_takes_precedence() {
     let config = json!({
         "allowed_consumers": ["testuser"],
