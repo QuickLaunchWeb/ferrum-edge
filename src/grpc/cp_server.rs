@@ -360,7 +360,7 @@ impl CpGrpcServer {
         Ok(update)
     }
 
-    fn apply_incremental_to_config_snapshot(
+    pub(crate) fn apply_incremental_to_config_snapshot(
         config: &mut GatewayConfig,
         result: crate::config::db_loader::IncrementalResult,
     ) {
