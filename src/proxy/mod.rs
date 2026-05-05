@@ -1035,6 +1035,28 @@ fn reject_result_to_backend_response(
     }
 }
 
+/// Outcome of [`ProxyState::apply_incremental`].
+///
+/// The DB polling loop in `src/modes/database.rs` distinguishes these states
+/// to decide whether to advance `last_poll_at` (the `since` cursor for the
+/// next incremental query). Empty results and applied changes both mean the
+/// poll completed safely and the cursor must move forward; rejected updates
+/// must leave the cursor untouched so the next poll re-fetches the same rows
+/// and gets another chance to apply them. Without that, a row whose
+/// `updated_at` falls outside the 1-second `since_safe` margin would silently
+/// disappear from the gateway's view of the DB, leaving permanent
+/// divergence between DB state and in-memory config until a full reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrementalApplyOutcome {
+    /// Changes were applied to in-memory config.
+    Applied,
+    /// `IncrementalResult` was empty — nothing to apply, no error.
+    NoChanges,
+    /// Validation rejected the patched config; in-memory config unchanged.
+    /// Callers tracking a `since` cursor MUST NOT advance it on this outcome.
+    Rejected,
+}
+
 /// Shared state for the proxy engine.
 #[derive(Clone)]
 pub struct ProxyState {
@@ -2767,13 +2789,16 @@ impl ProxyState {
     /// directly from the DB layer's `load_incremental_config()`. This avoids
     /// loading and diffing the full config on every poll cycle.
     ///
-    /// Returns `true` if changes were applied.
+    /// Returns an [`IncrementalApplyOutcome`] so callers can distinguish
+    /// "nothing to do" (`NoChanges`) from "changes were rejected by validation"
+    /// (`Rejected`). The DB poller relies on this to avoid advancing
+    /// `last_poll_at` on rejection — see `src/modes/database.rs`.
     pub async fn apply_incremental(
         &self,
         result: crate::config::db_loader::IncrementalResult,
-    ) -> bool {
+    ) -> IncrementalApplyOutcome {
         if result.is_empty() {
-            return false;
+            return IncrementalApplyOutcome::NoChanges;
         }
 
         // Patch the stored GatewayConfig: clone current, apply mutations, store
@@ -2914,31 +2939,31 @@ impl ProxyState {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
+            return IncrementalApplyOutcome::Rejected;
         }
         if let Err(errors) = new_config.validate_unique_listen_paths() {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
+            return IncrementalApplyOutcome::Rejected;
         }
         if let Err(errors) = new_config.validate_stream_proxies() {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
+            return IncrementalApplyOutcome::Rejected;
         }
         if let Err(errors) = new_config.validate_upstream_references() {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
+            return IncrementalApplyOutcome::Rejected;
         }
         if let Err(errors) = new_config.validate_plugin_references() {
             for msg in &errors {
                 error!("Incremental config rejected: {}", msg);
             }
-            return false;
+            return IncrementalApplyOutcome::Rejected;
         }
         let reserved_ports = self.env_config.reserved_gateway_ports();
         if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
@@ -2956,7 +2981,7 @@ impl ProxyState {
                 for msg in &errors {
                     error!("Incremental config rejected: {}", msg);
                 }
-                return false;
+                return IncrementalApplyOutcome::Rejected;
             }
         }
 
@@ -2985,13 +3010,13 @@ impl ProxyState {
         );
         let published = match publish_result {
             Ok(Some(epoch)) => epoch,
-            Ok(None) => return false,
+            Ok(None) => return IncrementalApplyOutcome::NoChanges,
             Err(e) => {
                 error!(
-                    "Config reload rejected — security plugin validation failed: {}",
+                    "Incremental config rejected — security plugin validation failed: {}",
                     e
                 );
-                return false;
+                return IncrementalApplyOutcome::Rejected;
             }
         };
         PluginCache::retain_active_uris_for_inner(&published.plugin_cache);
@@ -3139,7 +3164,7 @@ impl ProxyState {
                 .restart_with_shutdown(&new_cfg, self.health_check_shutdown_rx.clone());
         }
 
-        true
+        IncrementalApplyOutcome::Applied
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
