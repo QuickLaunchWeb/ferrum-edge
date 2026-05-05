@@ -1648,6 +1648,7 @@ async fn handle_h3_request(
                 }
                 error!("Backend request failed (HTTP/3 streaming body): {}", e);
                 let h3_error_class = classify_h3_error(&e);
+                crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
                 // H3 frontend → H3 backend path: QUIC failure here means the
                 // cached H3 capability lied (backend probably lost UDP), so
                 // downgrade the classification. The next H3 request is free
@@ -2960,6 +2961,7 @@ async fn proxy_to_backend_h3_streaming(
             // that case.
             let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
                     .backend_capabilities
@@ -3369,6 +3371,7 @@ async fn proxy_to_backend_h3(
             // signal correctly reports `false` (no commitment).
             let request_on_wire = e.request_on_wire();
             let h3_error_class = classify_h3_error(&e);
+            crate::proxy::record_port_exhaustion_if_class(&state.overload, h3_error_class);
             if crate::proxy::is_h3_transport_error_class(h3_error_class) {
                 state
                     .backend_capabilities

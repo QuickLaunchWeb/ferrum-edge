@@ -10327,6 +10327,7 @@ async fn proxy_to_backend_http3(
                                 Ok(body) => body,
                                 Err(e) => {
                                     let (error_kind, error_class) = classify_h3_error(&e);
+                                    record_port_exhaustion_if_class(&state.overload, error_class);
                                     // We have already received response headers and
                                     // started reading the body — the request was on
                                     // the wire and the backend already processed it.
@@ -10438,6 +10439,7 @@ async fn proxy_to_backend_http3(
                             // Trust the pool's typed signal.
                             let is_conn_error = !e.request_on_wire();
                             let (error_kind, error_class) = classify_h3_pool_error(&e);
+                            record_port_exhaustion_if_class(&state.overload, error_class);
                             error!(
                                 proxy_id = %proxy.id,
                                 backend_url = %backend_url,
@@ -10643,6 +10645,7 @@ async fn proxy_to_backend_http3(
                 // the error-class contribution here.
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -10720,6 +10723,7 @@ async fn proxy_to_backend_http3(
                 // H3 branch above for why we drop the class contribution.
                 let is_conn_error = !e.request_on_wire();
                 let (error_kind, error_class) = classify_h3_pool_error(&e);
+                record_port_exhaustion_if_class(&state.overload, error_class);
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
@@ -10765,6 +10769,36 @@ async fn proxy_to_backend_http3(
 fn classify_h3_error(err: &(dyn std::error::Error + 'static)) -> (&'static str, retry::ErrorClass) {
     let class = crate::http3::client::classify_http3_error(err);
     (retry::error_class_log_kind(class), class)
+}
+
+/// Bump the `port_exhaustion_events` counter when `class` is
+/// [`retry::ErrorClass::PortExhaustion`].
+///
+/// Used by the native HTTP/3 dispatch sites (
+/// [`proxy_to_backend_http3`] / [`proxy_to_backend_http3_retry`] in this
+/// module, plus the H3 frontend → H3 backend fast paths in
+/// [`crate::http3::server`]) to bring the H3 native paths in line with
+/// the reqwest path ([`mod@crate::proxy`] line 8113-style sites), the
+/// gRPC pool, the H2 pool, the TCP backend connect, and the H3
+/// cross-protocol bridge — all of which already record port exhaustion
+/// when their per-protocol classifier returns `PortExhaustion`. Without
+/// this, `/overload.port_exhaustion_events` undercounts whenever a
+/// QUIC/H3 dispatch hits ephemeral-port exhaustion (typically
+/// EADDRNOTAVAIL on Linux, EADDRINUSE on macOS) at high RPS.
+///
+/// Returns `true` when the counter was bumped — used by unit tests to
+/// assert the wiring without re-creating a full H3 classification
+/// pipeline.
+pub(crate) fn record_port_exhaustion_if_class(
+    overload: &crate::overload::OverloadState,
+    class: retry::ErrorClass,
+) -> bool {
+    if matches!(class, retry::ErrorClass::PortExhaustion) {
+        overload.record_port_exhaustion();
+        true
+    } else {
+        false
+    }
 }
 
 /// Classifier overload for [`crate::http3::client::H3PoolError`] that
@@ -10945,6 +10979,7 @@ async fn proxy_to_backend_http3_retry(
             // H3 branch above for why we drop the class contribution.
             let is_conn_error = !e.request_on_wire();
             let (error_kind, error_class) = classify_h3_pool_error(&e);
+            record_port_exhaustion_if_class(&state.overload, error_class);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -11492,6 +11527,98 @@ mod tests {
         assert!(
             super::is_h3_transport_error_class(class),
             "Post-wire transport failure must still trigger H3 downgrade"
+        );
+    }
+
+    // ── `record_port_exhaustion_if_class` (H3 native paths) ─────────────
+    //
+    // The H3 native dispatcher (`proxy_to_backend_http3`,
+    // `proxy_to_backend_http3_retry`) and the H3 frontend → H3 backend
+    // fast path in `http3::server` were missing the `record_port_exhaustion`
+    // bump that every other backend dispatcher performs (reqwest path,
+    // gRPC pool, H2 pool, TCP backend connect, H3 cross-protocol bridge).
+    // Result: `/overload.port_exhaustion_events` undercounted any time
+    // an H3 frontend → H3 backend dispatch hit ephemeral-port exhaustion
+    // (e.g. EADDRNOTAVAIL on a high-RPS gateway with constrained
+    // `ip_local_port_range`). All eight H3 sites now funnel through this
+    // helper, so verifying the helper itself is sufficient regression
+    // protection: if a future H3 dispatch site forgets the call,
+    // `port_exhaustion_events` will silently undercount on that path —
+    // but the helper signature documents the contract.
+
+    #[test]
+    fn record_port_exhaustion_if_class_bumps_counter_only_for_port_exhaustion() {
+        let overload = crate::overload::OverloadState::new();
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should start at 0"
+        );
+
+        // Synthetic H3 PortExhaustion outcome: the dispatch site obtains
+        // `ErrorClass::PortExhaustion` from the H3 classifier (e.g. via
+        // an EADDRNOTAVAIL surfaced as "bind: address not available")
+        // and hands it to this helper. The helper must bump the counter
+        // and return true.
+        let bumped =
+            super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        assert!(bumped, "PortExhaustion must bump the counter");
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Repeated bumps accumulate — every dispatch site that hits
+        // PortExhaustion contributes independently.
+        super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        super::record_port_exhaustion_if_class(&overload, retry::ErrorClass::PortExhaustion);
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[test]
+    fn record_port_exhaustion_if_class_is_no_op_for_non_port_exhaustion() {
+        let overload = crate::overload::OverloadState::new();
+
+        // Every other class the H3 classifier can return — including the
+        // transport-class siblings that DO trigger `mark_h3_unsupported`
+        // — must NOT bump the port-exhaustion counter. The metric is
+        // narrow: only ephemeral-port exhaustion. Other transport
+        // failures have their own diagnostics (FD pressure, conn count,
+        // last_probe_error on the capability registry).
+        for class in [
+            retry::ErrorClass::ConnectionRefused,
+            retry::ErrorClass::ConnectionTimeout,
+            retry::ErrorClass::ConnectionReset,
+            retry::ErrorClass::ConnectionClosed,
+            retry::ErrorClass::TlsError,
+            retry::ErrorClass::ProtocolError,
+            retry::ErrorClass::DnsLookupError,
+            retry::ErrorClass::ConnectionPoolError,
+            retry::ErrorClass::ReadWriteTimeout,
+            retry::ErrorClass::ClientDisconnect,
+            retry::ErrorClass::RequestBodyTooLarge,
+            retry::ErrorClass::ResponseBodyTooLarge,
+            retry::ErrorClass::GracefulRemoteClose,
+            retry::ErrorClass::RequestError,
+        ] {
+            let bumped = super::record_port_exhaustion_if_class(&overload, class);
+            assert!(!bumped, "{class:?} must not bump port_exhaustion_events");
+        }
+        assert_eq!(
+            overload
+                .port_exhaustion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should remain 0 across non-PortExhaustion classes"
         );
     }
 
