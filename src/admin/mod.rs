@@ -14,7 +14,6 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -234,33 +233,6 @@ pub async fn serve_admin_on_listener(
     }
 }
 
-async fn accept_admin_tls_with_optional_timeout(
-    acceptor: &tokio_rustls::TlsAcceptor,
-    stream: tokio::net::TcpStream,
-    timeout_secs: u64,
-    peer: &SocketAddr,
-) -> io::Result<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-    let accept_fut = acceptor.accept(stream);
-    if timeout_secs == 0 {
-        return accept_fut.await;
-    }
-
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), accept_fut).await {
-        Ok(result) => result,
-        Err(_) => {
-            warn!(
-                "Admin TLS handshake timed out from {} after {}s",
-                peer.ip(),
-                timeout_secs
-            );
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "admin TLS handshake timed out",
-            ))
-        }
-    }
-}
-
 /// Handle TLS connections for Admin API.
 async fn handle_admin_tls_connection(
     stream: tokio::net::TcpStream,
@@ -273,27 +245,14 @@ async fn handle_admin_tls_connection(
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
     let header_read_timeout = state.admin_http_header_read_timeout_seconds;
-    let tls_stream = match accept_admin_tls_with_optional_timeout(
+    let tls_stream = crate::tls::accept_with_optional_timeout(
         &acceptor,
         stream,
         tls_handshake_timeout,
         &remote_addr,
     )
-    .await
-    {
-        Ok(stream) => {
-            info!("Admin TLS connection established from {}", remote_addr.ip());
-            stream
-        }
-        Err(e) => {
-            warn!(
-                "Admin TLS handshake failed from {}: {}",
-                remote_addr.ip(),
-                e
-            );
-            return Err(e.into());
-        }
-    };
+    .await?;
+    info!("Admin TLS connection established from {}", remote_addr.ip());
 
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -309,6 +268,8 @@ async fn handle_admin_tls_connection(
     // either protocol.
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // This header timer only applies to the HTTP/1 admin path; this builder
+    // does not expose an equivalent HTTP/2 admin header deadline.
     if header_read_timeout > 0 {
         let mut http1 = builder.http1();
         http1.timer(hyper_util::rt::TokioTimer::new());

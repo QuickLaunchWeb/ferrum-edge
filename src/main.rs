@@ -329,9 +329,11 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         "Proxy bind address: {}, Admin bind address: {}",
         env_config.proxy_bind_address, env_config.admin_bind_address
     );
-    if (env_config.admin_bind_address == "0.0.0.0" || env_config.admin_bind_address == "::")
-        && env_config.admin_allowed_cidrs.trim().is_empty()
-    {
+    let admin_bind_is_unspecified = env_config
+        .admin_bind_address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_unspecified());
+    if admin_bind_is_unspecified && env_config.admin_allowed_cidrs.trim().is_empty() {
         warn!(
             "Admin API is bound to {} with no FERRUM_ADMIN_ALLOWED_CIDRS; ensure the admin listener is not publicly reachable",
             env_config.admin_bind_address
