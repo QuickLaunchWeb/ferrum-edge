@@ -1,5 +1,9 @@
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
+use ferrum_edge::{
+    config::{BackendAllowIps, PoolConfig},
+    dns::{DnsCache, DnsConfig},
+};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -992,10 +996,7 @@ fn test_base_url_unsupported_scheme_rejected() {
 #[test]
 fn test_construction_rejects_metadata_base_url() {
     // End-to-end: AiFederation::new() must refuse to construct when an
-    // operator base_url uses an unsafe scheme. The IP-policy half of the
-    // guard is covered by `validate_base_url_test` above (no env mutation);
-    // here we rely on the scheme branch which doesn't read FERRUM_BACKEND_ALLOW_IPS,
-    // so this test runs safely in parallel with the rest of the suite.
+    // operator base_url uses an unsafe scheme.
     let config = json!({
         "providers": [{
             "name": "openai",
@@ -1010,6 +1011,24 @@ fn test_construction_rejects_metadata_base_url() {
         .unwrap();
     assert!(err.contains("http://"), "got: {err}");
     assert!(err.contains("allow_plaintext"), "got: {err}");
+}
+
+#[test]
+fn test_construction_uses_resolved_backend_allow_ips_policy() {
+    let config = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "api_key": "sk-test",
+            "base_url": "https://169.254.169.254/latest/meta-data/",
+        }]
+    });
+    let http_client = create_test_http_client_with_backend_allow_ips(BackendAllowIps::Public);
+    let err = ferrum_edge::plugins::ai_federation::AiFederation::new(&config, http_client)
+        .err()
+        .unwrap();
+    assert!(err.contains("169.254.169.254"), "got: {err}");
+    assert!(err.contains("public"), "got: {err}");
 }
 
 #[test]
@@ -1052,4 +1071,22 @@ fn test_construction_accepts_https_base_url() {
 
 fn create_test_http_client() -> ferrum_edge::plugins::PluginHttpClient {
     ferrum_edge::plugins::PluginHttpClient::default()
+}
+
+fn create_test_http_client_with_backend_allow_ips(
+    backend_allow_ips: BackendAllowIps,
+) -> ferrum_edge::plugins::PluginHttpClient {
+    let mut dns_config = DnsConfig::default();
+    dns_config.backend_allow_ips = backend_allow_ips.clone();
+    ferrum_edge::plugins::PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(dns_config),
+        1000,
+        0,
+        100,
+        false,
+        None,
+        ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        backend_allow_ips,
+    )
 }

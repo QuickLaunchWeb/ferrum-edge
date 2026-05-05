@@ -403,30 +403,6 @@ fn validate_base_url(
     Ok(())
 }
 
-/// Read the gateway's backend IP policy from the environment.
-///
-/// Plugin construction runs single-threaded at startup before secrets are
-/// resolved (see [`main.rs`]), so reading `std::env` here is safe. Defaults
-/// to [`BackendAllowIps::Both`] when unset or unparseable.
-fn read_backend_allow_ips_env() -> crate::config::BackendAllowIps {
-    use crate::config::BackendAllowIps;
-    match std::env::var("FERRUM_BACKEND_ALLOW_IPS") {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "private" => BackendAllowIps::Private,
-            "public" => BackendAllowIps::Public,
-            "both" => BackendAllowIps::Both,
-            other => {
-                warn!(
-                    raw = %other,
-                    "ai_federation: FERRUM_BACKEND_ALLOW_IPS unrecognized, defaulting to 'both'"
-                );
-                BackendAllowIps::Both
-            }
-        },
-        Err(_) => BackendAllowIps::Both,
-    }
-}
-
 /// Build the URL template for a provider at config-load time.
 ///
 /// The eight-argument shape is intentional: each field comes from a
@@ -518,9 +494,9 @@ impl AiFederation {
 
         let mut providers = Vec::with_capacity(providers_val.len());
 
-        // Read the gateway IP allowlist policy once. Used to validate every
-        // operator-supplied `base_url` below — see `validate_base_url`.
-        let backend_allow_ips = read_backend_allow_ips_env();
+        // Use the already-resolved gateway IP allowlist policy so provider
+        // validation honors CLI/env/conf/default precedence.
+        let backend_allow_ips = http_client.backend_allow_ips().clone();
 
         for (i, pv) in providers_val.iter().enumerate() {
             let name = pv["name"]
@@ -2007,9 +1983,8 @@ pub mod test_helpers {
 
     /// Expose `base_url` validation for tests with an explicit IP policy.
     ///
-    /// Skips the `FERRUM_BACKEND_ALLOW_IPS` env read so parallel tests don't
-    /// race on the global env table. Mirrors what `AiFederation::new` does
-    /// per provider once the policy has been resolved.
+    /// Mirrors what `AiFederation::new` does per provider once the policy has
+    /// been resolved by gateway startup.
     pub fn validate_base_url_test(
         provider_name: &str,
         base_url: &str,

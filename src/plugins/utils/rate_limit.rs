@@ -1131,6 +1131,7 @@ mod tests {
             false,
             None,
             namespace,
+            crate::config::BackendAllowIps::Both,
         )
     }
 
