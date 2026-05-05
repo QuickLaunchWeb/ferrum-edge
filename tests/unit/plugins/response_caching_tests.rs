@@ -1305,3 +1305,89 @@ async fn test_host_header_case_insensitive_in_cache_key() {
     );
     assert_eq!(body, b"host-data");
 }
+
+// === SSE bypass ===
+
+#[tokio::test]
+async fn test_sse_request_skips_response_buffering() {
+    // When the client requests SSE via `Accept: text/event-stream`, the
+    // response body MUST NOT be buffered — buffering an unbounded event
+    // stream collects frames forever and 502s once the
+    // FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES ceiling is hit.
+    let plugin = default_plugin();
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut ctx = make_ctx("GET", "/events");
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_sse_request_bypasses_preexisting_cached_response() {
+    let plugin = default_plugin();
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/events",
+        200,
+        &resp_headers,
+        b"{\"cached\":true}",
+    )
+    .await;
+
+    let mut cached_ctx = make_ctx("GET", "/events");
+    let mut cached_headers = HashMap::new();
+    assert!(is_reject(
+        &plugin
+            .before_proxy(&mut cached_ctx, &mut cached_headers)
+            .await
+    ));
+
+    let mut sse_ctx = make_ctx("GET", "/events");
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("accept".to_string(), "text/event-stream".to_string());
+
+    let result = plugin.before_proxy(&mut sse_ctx, &mut sse_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(sse_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert!(!sse_ctx.metadata.contains_key("cache_base_key"));
+
+    let mut bypass_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut sse_ctx, 200, &mut bypass_headers)
+        .await;
+    assert_eq!(bypass_headers.get("x-cache-status").unwrap(), "BYPASS");
+}
+
+#[tokio::test]
+async fn test_non_sse_request_still_buffers() {
+    // Plain JSON requests must still take the buffered/cacheable path.
+    let plugin = default_plugin();
+
+    let mut ctx = make_ctx("GET", "/api/data");
+    ctx.headers
+        .insert("accept".to_string(), "application/json".to_string());
+
+    assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_sse_in_accept_list_skips_buffering() {
+    // EventSource clients send `Accept: text/event-stream` but other clients
+    // may include it as one of several alternatives. Any presence of SSE in
+    // the Accept list signals streaming intent.
+    let plugin = default_plugin();
+
+    let mut ctx = make_ctx("GET", "/events");
+    ctx.headers.insert(
+        "accept".to_string(),
+        "text/html, text/event-stream;q=0.9, */*".to_string(),
+    );
+
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
