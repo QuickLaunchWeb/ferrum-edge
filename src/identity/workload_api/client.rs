@@ -12,8 +12,11 @@
 //! - [`WorkloadApiClient::fetch_x509_svid_once`] — convenience helper that
 //!   returns the FIRST bundle from the stream and drops the connection.
 
+#[cfg(unix)]
 use hyper_util::rt::TokioIo;
+#[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
@@ -21,9 +24,14 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
 use tonic::metadata::AsciiMetadataValue;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
+#[cfg(unix)]
+use tonic::transport::Endpoint;
+#[cfg(unix)]
 use tower::service_fn;
-use tracing::{debug, info, warn};
+#[cfg(unix)]
+use tracing::info;
+use tracing::{debug, warn};
 
 use super::proto::X509svidRequest;
 use super::proto::spiffe_workload_api_client::SpiffeWorkloadApiClient;
@@ -69,6 +77,7 @@ impl WorkloadApiClient {
     /// expected `Read + Write` shape. The base URI is a dummy — it's only
     /// used as the HTTP/2 `:authority`; the actual transport is the UDS
     /// the connector returns.
+    #[cfg(unix)]
     pub async fn connect(socket_path: impl Into<String>) -> Result<Self, WorkloadApiClientError> {
         let socket_path = socket_path.into();
         let socket_for_connector = socket_path.clone();
@@ -93,6 +102,14 @@ impl WorkloadApiClient {
         let inner = SpiffeWorkloadApiClient::new(channel);
         info!(socket = %socket_path, "connected to SPIFFE Workload API agent");
         Ok(Self { inner, socket_path })
+    }
+
+    #[cfg(not(unix))]
+    pub async fn connect(socket_path: impl Into<String>) -> Result<Self, WorkloadApiClientError> {
+        let socket_path = socket_path.into();
+        Err(WorkloadApiClientError::Config(format!(
+            "SPIFFE Workload API Unix-socket transport is only supported on Unix platforms (requested {socket_path})"
+        )))
     }
 
     /// The underlying socket path, useful for diagnostics.

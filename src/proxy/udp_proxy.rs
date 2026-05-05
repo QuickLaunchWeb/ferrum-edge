@@ -730,6 +730,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
                                                     local2,
+                                                    &shutdown_rx,
+                                                    global_shutdown_rx.as_ref(),
                                                     &overload,
                                                 )
                                                 .await;
@@ -767,6 +769,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &adaptive_buffer,
                                         udp_gso_enabled,
                                         local2,
+                                        &shutdown_rx,
+                                        global_shutdown_rx.as_ref(),
                                         &overload,
                                     )
                                     .await;
@@ -841,6 +845,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &adaptive_buffer,
                     udp_gso_enabled,
                     None,
+                    &shutdown_rx,
+                    global_shutdown_rx.as_ref(),
                     &overload,
                 )
                 .await;
@@ -906,6 +912,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
                                                     local2,
+                                                    &shutdown_rx,
+                                                    global_shutdown_rx.as_ref(),
                                                     &overload,
                                                 )
                                                 .await;
@@ -943,6 +951,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &adaptive_buffer,
                                         udp_gso_enabled,
                                         local2,
+                                        &shutdown_rx,
+                                        global_shutdown_rx.as_ref(),
                                         &overload,
                                     )
                                     .await;
@@ -986,6 +996,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &adaptive_buffer,
                                     udp_gso_enabled,
                                     None,
+                                    &shutdown_rx,
+                                    global_shutdown_rx.as_ref(),
                                     &overload,
                                 )
                                 .await;
@@ -1050,6 +1062,8 @@ async fn process_datagram(
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     local_addr: Option<crate::socket_opts::PktinfoLocal>,
+    listener_shutdown: &watch::Receiver<bool>,
+    global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<(), anyhow::Error> {
     // Fast path: check last-client cache before hitting DashMap.
@@ -1120,6 +1134,8 @@ async fn process_datagram(
             data,
             adaptive_buffer,
             udp_gso_enabled,
+            listener_shutdown,
+            global_shutdown,
             overload,
         )
         .await?
@@ -1184,6 +1200,8 @@ async fn lookup_or_create_session(
     initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    listener_shutdown: &watch::Receiver<bool>,
+    global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
@@ -1217,6 +1235,8 @@ async fn lookup_or_create_session(
         initial_data,
         adaptive_buffer,
         udp_gso_enabled,
+        listener_shutdown,
+        global_shutdown,
         overload,
     )
     .await
@@ -2173,6 +2193,8 @@ async fn create_session(
     _initial_data: &[u8],
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    listener_shutdown: &watch::Receiver<bool>,
+    global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
@@ -2448,6 +2470,8 @@ async fn create_session(
     let reply_dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let reply_dgram_proxy_name2: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let reply_listen_port = listen_port;
+    let mut reply_listener_shutdown = listener_shutdown.clone();
+    let mut reply_global_shutdown = global_shutdown.cloned();
     let is_dtls = reply_dtls.is_some();
     #[cfg(target_os = "linux")]
     let reply_udp_gso = udp_gso_enabled;
@@ -2478,18 +2502,37 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         loop {
+            if *reply_listener_shutdown.borrow()
+                || reply_global_shutdown
+                    .as_ref()
+                    .is_some_and(|rx| *rx.borrow())
+            {
+                break;
+            }
+
             // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
             let (data_slice, data_vec);
             let len;
             if let Some(ref dtls) = reply_dtls {
-                match dtls.recv().await {
-                    Ok(d) if d.is_empty() => break,
-                    Ok(d) => {
+                let recv_result = tokio::select! {
+                    result = dtls.recv() => Some(result),
+                    _ = reply_listener_shutdown.changed() => None,
+                    _ = async {
+                        match reply_global_shutdown.as_mut() {
+                            Some(rx) => { let _ = rx.changed().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => None,
+                };
+                match recv_result {
+                    None => break,
+                    Some(Ok(d)) if d.is_empty() => break,
+                    Some(Ok(d)) => {
                         len = d.len();
                         data_vec = Some(d);
                         data_slice = None;
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
                             client = %client_addr,
@@ -2509,14 +2552,25 @@ async fn create_session(
                     }
                 }
             } else if let Some(ref sock) = backend_socket {
-                match sock.recv(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
+                let recv_result = tokio::select! {
+                    result = sock.recv(&mut buf) => Some(result),
+                    _ = reply_listener_shutdown.changed() => None,
+                    _ = async {
+                        match reply_global_shutdown.as_mut() {
+                            Some(rx) => { let _ = rx.changed().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => None,
+                };
+                match recv_result {
+                    None => break,
+                    Some(Ok(0)) => break,
+                    Some(Ok(n)) => {
                         len = n;
                         data_vec = None;
                         data_slice = Some(&buf[..n]);
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
                             client = %client_addr,

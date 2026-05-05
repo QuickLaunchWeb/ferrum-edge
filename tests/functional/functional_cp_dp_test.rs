@@ -25,7 +25,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::grpc::cp_server::CpGrpcServer;
+use ferrum_edge::grpc::cp_server::{CpGrpcServer, DpNodeRegistry};
 use ferrum_edge::grpc::dp_client;
 use ferrum_edge::proxy::ProxyState;
 use tokio::time::sleep;
@@ -644,7 +644,13 @@ async fn test_cp_dp_namespace_isolation_over_grpc() {
     };
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(prod_only_config.clone())));
-    let (cp_server, update_tx) = CpGrpcServer::new(config_arc.clone(), GRPC_JWT_SECRET.to_string());
+    let (cp_server, update_tx) = CpGrpcServer::with_channel_capacity_registry_and_namespace(
+        config_arc.clone(),
+        GRPC_JWT_SECRET.to_string(),
+        1024,
+        Arc::new(DpNodeRegistry::new()),
+        "production".to_string(),
+    );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
