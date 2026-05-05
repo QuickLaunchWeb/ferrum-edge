@@ -87,6 +87,7 @@ mod tests {
             pool_http2_max_concurrent_streams: None,
             pool_http3_connections_per_backend: None,
             upstream_id: None,
+            api_spec_id: None,
             circuit_breaker: None,
             retry: None,
             response_body_mode: Default::default(),
@@ -128,6 +129,7 @@ mod tests {
             backend_tls_client_key_path: None,
             backend_tls_verify_server_cert: true,
             backend_tls_server_ca_cert_path: None,
+            api_spec_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -161,6 +163,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             priority_override: None,
+            api_spec_id: None,
         }
     }
 

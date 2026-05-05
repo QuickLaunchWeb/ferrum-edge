@@ -45,6 +45,7 @@ This page is the canonical human-readable reference for `FERRUM_*` variables and
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | PEM CA bundle for Admin API client certificate verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Skip Admin API TLS certificate verification (testing only) |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` |
+| `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` | No | `25` | Max request body size in MiB for `POST/PUT /api-specs`. Specs are stored gzip-compressed; large API definitions (e.g. AWS combined services) can approach 30–50 MiB uncompressed. MongoDB backends are additionally bounded by the BSON 16 MB document limit, enforced at write time |
 
 ### Database
 

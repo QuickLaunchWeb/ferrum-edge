@@ -456,6 +456,14 @@ pub(crate) async fn check_credential_value_uniqueness(
     Ok(None)
 }
 
+// Strip api_spec_id from client-submitted resources.  This field is
+// admin-only ownership metadata set exclusively by the spec import
+// handlers.  Allowing clients to set it via regular CRUD endpoints
+// would let them claim spec ownership of hand-managed resources,
+// causing unintended deletion during spec lifecycle operations.
+// SQL INSERT/UPDATE statements already exclude the column, but Mongo's
+// replace_one serializes the full struct.
+
 impl AdminResource for Upstream {
     const RESOURCE_NAME: &'static str = "upstream";
     const RESOURCE_LABEL: &'static str = "Upstream";
@@ -487,6 +495,7 @@ impl AdminResource for Upstream {
     }
 
     fn normalize(&mut self) {
+        self.api_spec_id = None;
         self.normalize_fields();
     }
 
@@ -599,6 +608,7 @@ impl AdminResource for PluginConfig {
     }
 
     fn normalize(&mut self) {
+        self.api_spec_id = None;
         self.normalize_fields();
     }
 
@@ -755,6 +765,7 @@ impl AdminResource for Proxy {
     }
 
     fn normalize(&mut self) {
+        self.api_spec_id = None;
         if let Some(methods) = self.allowed_methods.as_mut() {
             for method in methods {
                 *method = method.to_uppercase();

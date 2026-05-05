@@ -72,6 +72,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         pool_http2_max_concurrent_streams: None,
         pool_http3_connections_per_backend: None,
         upstream_id: None,
+        api_spec_id: None,
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
@@ -199,6 +200,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         dtls_client_ca_cert_path: None,
         plugin_http_slow_threshold_ms: 1000,
         admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
         migrate_action: "up".into(),
         migrate_dry_run: false,
         worker_threads: None,
@@ -1857,6 +1859,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         backend_tls_client_key_path: None,
         backend_tls_verify_server_cert: true,
         backend_tls_server_ca_cert_path: None,
+        api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

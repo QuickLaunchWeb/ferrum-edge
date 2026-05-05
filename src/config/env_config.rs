@@ -918,6 +918,10 @@ pub struct EnvConfig {
     /// Default: 100 MiB.
     pub admin_restore_max_body_size_mib: usize,
 
+    /// Max request body size in MiB for POST/PUT /api-specs.
+    /// Default: 25 MiB.
+    pub admin_spec_max_body_size_mib: usize,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -1276,6 +1280,7 @@ impl Default for EnvConfig {
             tls_crl_file_path: None,
             admin_allowed_cidrs: String::new(),
             admin_restore_max_body_size_mib: 100,
+            admin_spec_max_body_size_mib: 25,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -1550,6 +1555,7 @@ impl EnvConfig {
             tls_crl_file_path: Option<String> = "FERRUM_TLS_CRL_FILE_PATH";
             admin_allowed_cidrs: String = "FERRUM_ADMIN_ALLOWED_CIDRS" => String::new();
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
+            admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -1871,6 +1877,7 @@ impl EnvConfig {
             tls_crl_file_path,
             admin_allowed_cidrs,
             admin_restore_max_body_size_mib,
+            admin_spec_max_body_size_mib,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,
