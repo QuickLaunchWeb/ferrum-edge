@@ -360,7 +360,7 @@ impl CpGrpcServer {
         Ok(update)
     }
 
-    fn apply_incremental_to_config_snapshot(
+    pub(crate) fn apply_incremental_to_config_snapshot(
         config: &mut GatewayConfig,
         result: crate::config::db_loader::IncrementalResult,
     ) {
@@ -401,22 +401,22 @@ impl CpGrpcServer {
         upsert_by_id(
             &mut config.proxies,
             result.added_or_modified_proxies,
-            |proxy| proxy.id.clone(),
+            |proxy| proxy.id.as_str(),
         );
         upsert_by_id(
             &mut config.consumers,
             result.added_or_modified_consumers,
-            |consumer| consumer.id.clone(),
+            |consumer| consumer.id.as_str(),
         );
         upsert_by_id(
             &mut config.plugin_configs,
             result.added_or_modified_plugin_configs,
-            |plugin| plugin.id.clone(),
+            |plugin| plugin.id.as_str(),
         );
         upsert_by_id(
             &mut config.upstreams,
             result.added_or_modified_upstreams,
-            |upstream| upstream.id.clone(),
+            |upstream| upstream.id.as_str(),
         );
         config.loaded_at = result.poll_timestamp;
     }
@@ -761,19 +761,24 @@ impl ConfigSync for CpGrpcServer {
     }
 }
 
-fn upsert_by_id<T>(existing: &mut Vec<T>, updates: Vec<T>, get_id: fn(&T) -> String) {
-    let index: std::collections::HashMap<String, usize> = existing
+fn upsert_by_id<T, F>(existing: &mut Vec<T>, updates: Vec<T>, get_id: F)
+where
+    F: Fn(&T) -> &str,
+{
+    let mut index: std::collections::HashMap<String, usize> = existing
         .iter()
         .enumerate()
-        .map(|(i, item)| (get_id(item), i))
+        .map(|(i, item)| (get_id(item).to_string(), i))
         .collect();
 
     for item in updates {
-        let id = get_id(&item);
-        if let Some(&pos) = index.get(&id) {
+        let id = get_id(&item).to_string();
+        if let Some(&pos) = index.get(id.as_str()) {
             existing[pos] = item;
         } else {
+            let pos = existing.len();
             existing.push(item);
+            index.insert(id, pos);
         }
     }
 }

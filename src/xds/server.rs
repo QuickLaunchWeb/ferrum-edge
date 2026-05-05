@@ -25,6 +25,7 @@ use super::snapshot::{XdsSnapshot, XdsSnapshotCache};
 use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::types::GatewayConfig;
+use crate::grpc::cp_server::CpGrpcServer;
 use crate::grpc::proto::ConfigUpdate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub struct XdsAdsServer {
 
 #[derive(Default)]
 struct XdsStreamRegistry {
+    // ADS stream counts are outside the proxy hot path and exist only when
+    // FERRUM_XDS_ENABLED=true, so default DashMap sharding is intentional here.
     counts: DashMap<String, usize>,
 }
 
@@ -188,9 +191,25 @@ impl XdsAdsServer {
 
     fn rebuild_snapshot(&self, node_id: &str) -> XdsSnapshot {
         let config = self.config.load_full();
+        self.rebuild_snapshot_from_config(node_id, config.as_ref())
+    }
+
+    fn rebuild_snapshot_from_config(&self, node_id: &str, config: &GatewayConfig) -> XdsSnapshot {
         let request = MeshSliceRequest::from_xds_node(node_id.to_string(), self.namespace.clone());
-        let slice = MeshSlice::from_gateway_config(config.as_ref(), request);
+        let slice = MeshSlice::from_gateway_config(config, request);
         translate_mesh_slice_to_snapshot(&slice)
+    }
+
+    fn snapshot_for_config(&self, node_id: &str, config: &GatewayConfig) -> Arc<XdsSnapshot> {
+        let version = config.loaded_at.to_rfc3339();
+        if let Some(snapshot) = self.snapshot_cache.get(node_id)
+            && snapshot.version == version
+        {
+            return snapshot;
+        }
+
+        self.snapshot_cache
+            .insert(self.rebuild_snapshot_from_config(node_id, config))
     }
 
     fn stream_guard(&self) -> XdsStreamGuard {
@@ -313,9 +332,18 @@ impl XdsAdsServer {
         node_id: &str,
         subscriptions: &HashMap<String, XdsSubscription>,
     ) -> Vec<DiscoveryResponse> {
+        let config = self.config.load_full();
+        self.sotw_responses_for_subscriptions_from_config(node_id, subscriptions, config.as_ref())
+    }
+
+    fn sotw_responses_for_subscriptions_from_config(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: &GatewayConfig,
+    ) -> Vec<DiscoveryResponse> {
         let previous = self.snapshot_cache.get(node_id);
-        let snapshot = self.rebuild_snapshot(node_id);
-        self.snapshot_cache.insert(snapshot.clone());
+        let snapshot = self.snapshot_for_config(node_id, config);
         subscriptions
             .values()
             .filter(|subscription| {
@@ -328,6 +356,7 @@ impl XdsAdsServer {
     fn sotw_response_for_request(
         &self,
         node_id: &str,
+        config: &GatewayConfig,
         subscriptions: &mut HashMap<String, XdsSubscription>,
         request: &DiscoveryRequest,
     ) -> Option<DiscoveryResponse> {
@@ -369,8 +398,16 @@ impl XdsAdsServer {
             .is_none_or(|previous| previous != &subscription);
         subscriptions.insert(request.type_url.clone(), subscription.clone());
         if should_send_sotw_response(request, resource_names_changed) {
-            let snapshot = self.rebuild_snapshot(node_id);
-            self.snapshot_cache.insert(snapshot.clone());
+            let snapshot = self.snapshot_for_config(node_id, config);
+            if !request.response_nonce.is_empty()
+                && !subscription_change_affects_resources(
+                    &snapshot,
+                    previous_subscription.as_ref(),
+                    &subscription,
+                )
+            {
+                return None;
+            }
             Some(self.sotw_response(&snapshot, &subscription))
         } else {
             None
@@ -382,9 +419,18 @@ impl XdsAdsServer {
         node_id: &str,
         subscriptions: &HashMap<String, XdsSubscription>,
     ) -> Vec<DeltaDiscoveryResponse> {
+        let config = self.config.load_full();
+        self.delta_responses_for_subscriptions_from_config(node_id, subscriptions, config.as_ref())
+    }
+
+    fn delta_responses_for_subscriptions_from_config(
+        &self,
+        node_id: &str,
+        subscriptions: &HashMap<String, XdsSubscription>,
+        config: &GatewayConfig,
+    ) -> Vec<DeltaDiscoveryResponse> {
         let previous = self.snapshot_cache.get(node_id);
-        let snapshot = self.rebuild_snapshot(node_id);
-        self.snapshot_cache.insert(snapshot.clone());
+        let snapshot = self.snapshot_for_config(node_id, config);
         subscriptions
             .values()
             .filter(|subscription| {
@@ -431,6 +477,42 @@ impl XdsAdsServer {
             error_message,
         )
     }
+
+    fn apply_update_to_stream_config(
+        stream_config: &mut GatewayConfig,
+        update: &ConfigUpdate,
+    ) -> bool {
+        match update.update_type {
+            0 => match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                Ok(mut config) => {
+                    config.normalize_fields();
+                    *stream_config = config;
+                    true
+                }
+                Err(err) => {
+                    warn!("Failed to deserialize full config for xDS stream: {}", err);
+                    false
+                }
+            },
+            1 => match serde_json::from_str::<crate::config::db_loader::IncrementalResult>(
+                &update.config_json,
+            ) {
+                Ok(delta) => {
+                    CpGrpcServer::apply_incremental_to_config_snapshot(stream_config, delta);
+                    stream_config.normalize_fields();
+                    true
+                }
+                Err(err) => {
+                    warn!("Failed to deserialize delta config for xDS stream: {}", err);
+                    false
+                }
+            },
+            update_type => {
+                warn!("Ignoring unknown xDS config update type: {}", update_type);
+                false
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -455,6 +537,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
+            let mut stream_config = server.config.load_full().as_ref().clone();
             loop {
                 tokio::select! {
                     maybe_request = requests.next() => {
@@ -488,8 +571,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             return;
                         }
 
-                        let send_failed = if let Some(response) =
-                            server.sotw_response_for_request(&current_node_id, &mut subscriptions, &request)
+                        let send_failed = if let Some(response) = server.sotw_response_for_request(
+                            &current_node_id,
+                            &stream_config,
+                            &mut subscriptions,
+                            &request,
+                        )
                         {
                             tx.send(Ok(response)).await.is_err()
                         } else {
@@ -501,13 +588,17 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     }
                     update = updates.recv(), if !subscriptions.is_empty() => {
                         match update {
-                            Ok(_) => {
+                            Ok(update) => {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                for response in server.sotw_responses_for_subscriptions(
+                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                    continue;
+                                }
+                                for response in server.sotw_responses_for_subscriptions_from_config(
                                     current_node_id,
                                     &subscriptions,
+                                    &stream_config,
                                 ) {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
@@ -519,9 +610,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                for response in server.sotw_responses_for_subscriptions(
+                                let current = server.config.load_full();
+                                stream_config = current.as_ref().clone();
+                                for response in server.sotw_responses_for_subscriptions_from_config(
                                     current_node_id,
                                     &subscriptions,
+                                    &stream_config,
                                 ) {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
@@ -553,6 +647,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut subscriptions: HashMap<String, XdsSubscription> = HashMap::new();
+            let mut stream_config = server.config.load_full().as_ref().clone();
             loop {
                 tokio::select! {
                     maybe_request = requests.next() => {
@@ -628,8 +723,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                             explicit_subscription_request,
                         ) {
                             let previous = server.snapshot_cache.get(&current_node_id);
-                            let snapshot = server.rebuild_snapshot(&current_node_id);
-                            server.snapshot_cache.insert(snapshot.clone());
+                            let snapshot =
+                                server.snapshot_for_config(&current_node_id, &stream_config);
                             let response = server.delta_response(
                                 &snapshot,
                                 previous.as_deref(),
@@ -644,13 +739,17 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                     }
                     update = updates.recv(), if !subscriptions.is_empty() => {
                         match update {
-                            Ok(_) => {
+                            Ok(update) => {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                for response in server.delta_responses_for_subscriptions(
+                                if !Self::apply_update_to_stream_config(&mut stream_config, &update) {
+                                    continue;
+                                }
+                                for response in server.delta_responses_for_subscriptions_from_config(
                                     current_node_id,
                                     &subscriptions,
+                                    &stream_config,
                                 ) {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
@@ -662,9 +761,12 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 let Some(current_node_id) = node_id.as_ref() else {
                                     continue;
                                 };
-                                for response in server.delta_responses_for_subscriptions(
+                                let current = server.config.load_full();
+                                stream_config = current.as_ref().clone();
+                                for response in server.delta_responses_for_subscriptions_from_config(
                                     current_node_id,
                                     &subscriptions,
+                                    &stream_config,
                                 ) {
                                     if tx.send(Ok(response)).await.is_err() {
                                         return;
@@ -723,6 +825,24 @@ fn subscription_resources_changed(
         &subscription.resource_names,
         subscription.wildcard,
     );
+    !resources_equal_ignoring_version(&previous_resources, &next_resources)
+}
+
+fn subscription_change_affects_resources(
+    snapshot: &XdsSnapshot,
+    previous: Option<&XdsSubscription>,
+    next: &XdsSubscription,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    let previous_resources = snapshot.filtered_resources(
+        &previous.type_url,
+        &previous.resource_names,
+        previous.wildcard,
+    );
+    let next_resources =
+        snapshot.filtered_resources(&next.type_url, &next.resource_names, next.wildcard);
     !resources_equal_ignoring_version(&previous_resources, &next_resources)
 }
 
@@ -830,29 +950,36 @@ fn should_send_delta_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::db_loader::IncrementalResult;
     use crate::config::mesh::{AppProtocol, MeshConfig, MeshService, ServicePort};
     use chrono::{TimeZone, Utc};
+    use prost::Message;
 
     fn gateway_config_with_service(include_service: bool, version_second: u32) -> GatewayConfig {
-        let services = if include_service {
-            vec![MeshService {
-                name: "api".to_string(),
-                namespace: "default".to_string(),
-                ports: vec![ServicePort {
-                    port: 8080,
-                    protocol: AppProtocol::Http,
-                    name: Some("http".to_string()),
-                }],
-                workloads: Vec::new(),
-                protocol_overrides: HashMap::new(),
-            }]
+        if include_service {
+            gateway_config_with_named_service("api", version_second)
         } else {
-            Vec::new()
-        };
+            GatewayConfig {
+                mesh: Some(Box::new(MeshConfig {
+                    services: Vec::new(),
+                    ..MeshConfig::default()
+                })),
+                loaded_at: Utc
+                    .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+                    .unwrap(),
+                ..GatewayConfig::default()
+            }
+        }
+    }
 
+    fn gateway_config_with_named_service(name: &str, version_second: u32) -> GatewayConfig {
+        gateway_config_with_services(&[name], version_second)
+    }
+
+    fn gateway_config_with_services(names: &[&str], version_second: u32) -> GatewayConfig {
         GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                services,
+                services: names.iter().map(|name| mesh_service(name)).collect(),
                 ..MeshConfig::default()
             })),
             loaded_at: Utc
@@ -860,6 +987,74 @@ mod tests {
                 .unwrap(),
             ..GatewayConfig::default()
         }
+    }
+
+    fn mesh_service(name: &str) -> MeshService {
+        MeshService {
+            name: name.to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+        }
+    }
+
+    fn cluster_names(response: &DiscoveryResponse) -> Vec<String> {
+        response
+            .resources
+            .iter()
+            .map(|resource| {
+                super::super::proto::Cluster::decode(resource.value.as_slice())
+                    .expect("cluster resource should decode")
+                    .name
+            })
+            .collect()
+    }
+
+    fn empty_delta(version_second: u32) -> IncrementalResult {
+        IncrementalResult {
+            added_or_modified_proxies: Vec::new(),
+            removed_proxy_ids: Vec::new(),
+            added_or_modified_consumers: Vec::new(),
+            removed_consumer_ids: Vec::new(),
+            added_or_modified_plugin_configs: Vec::new(),
+            removed_plugin_config_ids: Vec::new(),
+            added_or_modified_upstreams: Vec::new(),
+            removed_upstream_ids: Vec::new(),
+            poll_timestamp: Utc
+                .with_ymd_and_hms(2026, 5, 5, 12, 0, version_second)
+                .unwrap(),
+        }
+    }
+
+    fn config_update(update_type: i32, config_json: String, version: String) -> ConfigUpdate {
+        ConfigUpdate {
+            update_type,
+            config_json,
+            version,
+            timestamp: 0,
+            ferrum_version: crate::FERRUM_VERSION.to_string(),
+        }
+    }
+
+    fn full_config_update(config: &GatewayConfig) -> ConfigUpdate {
+        config_update(
+            0,
+            serde_json::to_string(config).expect("full config should serialize"),
+            config.loaded_at.to_rfc3339(),
+        )
+    }
+
+    fn delta_config_update(delta: &IncrementalResult) -> ConfigUpdate {
+        config_update(
+            1,
+            serde_json::to_string(delta).expect("delta config should serialize"),
+            delta.poll_timestamp.to_rfc3339(),
+        )
     }
 
     fn test_server(config: GatewayConfig) -> XdsAdsServer {
@@ -935,8 +1130,85 @@ mod tests {
     }
 
     #[test]
-    fn sotw_ack_outcome_still_applies_subscription_change() {
-        let server = test_server(gateway_config_with_service(true, 0));
+    fn sotw_update_uses_broadcast_payload_before_shared_config_swap() {
+        let server = test_server(gateway_config_with_named_service("old", 0));
+        let subscriptions = cds_subscription();
+        let initial = server.sotw_responses_for_subscriptions("node-a", &subscriptions);
+        assert_eq!(
+            cluster_names(&initial[0]),
+            vec!["cluster/default/old/8080".to_string()]
+        );
+
+        let mut stream_config = gateway_config_with_named_service("old", 0);
+        let update_config = gateway_config_with_named_service("new", 1);
+        let update = full_config_update(&update_config);
+
+        assert!(XdsAdsServer::apply_update_to_stream_config(
+            &mut stream_config,
+            &update
+        ));
+        let responses = server.sotw_responses_for_subscriptions_from_config(
+            "node-a",
+            &subscriptions,
+            &stream_config,
+        );
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            cluster_names(&responses[0]),
+            vec!["cluster/default/new/8080".to_string()]
+        );
+    }
+
+    #[test]
+    fn stream_config_delta_update_uses_broadcast_payload_version() {
+        let mut stream_config = gateway_config_with_service(true, 0);
+        let delta = empty_delta(42);
+        let update = delta_config_update(&delta);
+
+        assert!(XdsAdsServer::apply_update_to_stream_config(
+            &mut stream_config,
+            &update
+        ));
+
+        assert_eq!(stream_config.loaded_at, delta.poll_timestamp);
+    }
+
+    #[test]
+    fn sotw_subscription_change_skips_response_when_effective_resources_match() {
+        let config = gateway_config_with_service(true, 0);
+        let server = test_server(config.clone());
+        let mut subscriptions = cds_subscription();
+        let snapshot = server.snapshot_for_config("node-a", &config);
+        assert_eq!(
+            snapshot
+                .resources(super::super::translator::CDS_TYPE_URL)
+                .len(),
+            1
+        );
+        let name = "cluster/default/api/8080".to_string();
+        let request = DiscoveryRequest {
+            type_url: super::super::translator::CDS_TYPE_URL.to_string(),
+            response_nonce: "stale-or-unknown".to_string(),
+            resource_names: vec![name.clone()],
+            ..DiscoveryRequest::default()
+        };
+
+        let response =
+            server.sotw_response_for_request("node-a", &config, &mut subscriptions, &request);
+
+        assert!(response.is_none());
+        let subscription = subscriptions
+            .get(super::super::translator::CDS_TYPE_URL)
+            .expect("subscription should be tracked");
+        assert!(!subscription.wildcard);
+        assert_eq!(subscription.resource_names, vec![name]);
+    }
+
+    #[test]
+    fn sotw_ack_outcome_still_applies_effective_subscription_change() {
+        let config = gateway_config_with_services(&["api", "admin"], 0);
+        let server = test_server(config.clone());
         let mut subscriptions = cds_subscription();
         let name = "cluster/default/api/8080".to_string();
         let request = DiscoveryRequest {
@@ -947,7 +1219,7 @@ mod tests {
         };
 
         let response = server
-            .sotw_response_for_request("node-a", &mut subscriptions, &request)
+            .sotw_response_for_request("node-a", &config, &mut subscriptions, &request)
             .expect("subscription update should send the requested resource");
 
         let subscription = subscriptions

@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use super::proto;
 
+// `proto::Any` is Ferrum's minimal wire-compatible xDS surface, not the
+// generated `google.protobuf.Any` type.
 /// One xDS resource encoded as an Any payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XdsResource {
@@ -112,6 +114,9 @@ impl XdsSnapshot {
 /// Lock-free per-node snapshot cache for ADS.
 #[derive(Default)]
 pub struct XdsSnapshotCache {
+    // ADS is gated by FERRUM_XDS_ENABLED and Phase B keeps node cardinality low.
+    // Use DashMap's default sharding here; revisit with util::sharding when
+    // mesh node counts become hot-path scale in later phases.
     snapshots: DashMap<String, Arc<XdsSnapshot>>,
 }
 
@@ -128,9 +133,11 @@ impl XdsSnapshotCache {
             .map(|snapshot| Arc::clone(snapshot.value()))
     }
 
-    pub fn insert(&self, snapshot: XdsSnapshot) -> Option<Arc<XdsSnapshot>> {
-        self.snapshots
-            .insert(snapshot.node_id.clone(), Arc::new(snapshot))
+    pub fn insert(&self, snapshot: XdsSnapshot) -> Arc<XdsSnapshot> {
+        let node_id = snapshot.node_id.clone();
+        let snapshot = Arc::new(snapshot);
+        self.snapshots.insert(node_id, Arc::clone(&snapshot));
+        snapshot
     }
 
     pub fn remove(&self, node_id: &str) -> Option<(String, Arc<XdsSnapshot>)> {
