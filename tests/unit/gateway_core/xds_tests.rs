@@ -5,7 +5,8 @@ use prost::Message;
 
 use ferrum_edge::config::mesh::{
     AppProtocol, MeshConfig, MeshPolicy, MeshRule, MeshService, MtlsMode, PeerAuthentication,
-    PolicyAction, PolicyScope, ServicePort, Workload, WorkloadPort, WorkloadSelector,
+    PolicyAction, PolicyScope, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    Workload, WorkloadPort, WorkloadSelector,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
@@ -131,6 +132,40 @@ fn translators_emit_all_phase_b_type_urls() {
     let listener = proto::Listener::decode(listener_resource.value.as_slice())
         .expect("minimal listener should decode");
     assert_eq!(listener.name, "listener/default/api/8080");
+}
+
+#[test]
+fn translators_deduplicate_colliding_cluster_resources() {
+    let mut mesh = mesh_config();
+    mesh.service_entries.push(ServiceEntry {
+        name: "api".to_string(),
+        namespace: "default".to_string(),
+        hosts: vec!["api.example.test".to_string()],
+        endpoints: Vec::new(),
+        resolution: Resolution::Dns,
+        location: ServiceEntryLocation::MeshExternal,
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+    });
+    let config = GatewayConfig {
+        mesh: Some(Box::new(mesh)),
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let request = MeshSliceRequest::from_xds_node("node-a".to_string(), "default".to_string());
+    let slice = MeshSlice::from_gateway_config(&config, request);
+    let snapshot = translate_mesh_slice_to_snapshot(&slice);
+
+    let cds = snapshot.resources(CDS_TYPE_URL);
+    assert_eq!(cds.len(), 1);
+    assert_eq!(cds[0].name, "cluster/default/api/8080");
+
+    let eds = snapshot.resources(EDS_TYPE_URL);
+    assert_eq!(eds.len(), 1);
+    assert_eq!(eds[0].name, "cluster/default/api/8080");
 }
 
 #[test]

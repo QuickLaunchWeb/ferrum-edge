@@ -1,4 +1,5 @@
 use prost::Message;
+use std::collections::HashSet;
 
 use super::proto;
 use super::slice::MeshSlice;
@@ -66,26 +67,31 @@ pub fn translate_rds(slice: &MeshSlice) -> Vec<XdsResource> {
 
 pub fn translate_cds(slice: &MeshSlice) -> Vec<XdsResource> {
     let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
     for service in &slice.services {
         for port in &service.ports {
             let name = cluster_name(&service.namespace, &service.name, port.port);
-            resources.push(resource(
+            push_unique_resource(
+                &mut resources,
+                &mut seen_names,
                 name.clone(),
                 CDS_TYPE_URL,
                 &slice.version,
                 proto::Cluster { name },
-            ));
+            );
         }
     }
     for entry in &slice.service_entries {
         for port in &entry.ports {
             let name = cluster_name(&entry.namespace, &entry.name, port.port);
-            resources.push(resource(
+            push_unique_resource(
+                &mut resources,
+                &mut seen_names,
                 name.clone(),
                 CDS_TYPE_URL,
                 &slice.version,
                 proto::Cluster { name },
-            ));
+            );
         }
     }
     resources
@@ -93,26 +99,31 @@ pub fn translate_cds(slice: &MeshSlice) -> Vec<XdsResource> {
 
 pub fn translate_eds(slice: &MeshSlice) -> Vec<XdsResource> {
     let mut resources = Vec::new();
+    let mut seen_names = HashSet::new();
     for service in &slice.services {
         for port in &service.ports {
             let name = cluster_name(&service.namespace, &service.name, port.port);
-            resources.push(resource(
+            push_unique_resource(
+                &mut resources,
+                &mut seen_names,
                 name.clone(),
                 EDS_TYPE_URL,
                 &slice.version,
                 proto::ClusterLoadAssignment { cluster_name: name },
-            ));
+            );
         }
     }
     for entry in &slice.service_entries {
         for port in &entry.ports {
             let name = cluster_name(&entry.namespace, &entry.name, port.port);
-            resources.push(resource(
+            push_unique_resource(
+                &mut resources,
+                &mut seen_names,
                 name.clone(),
                 EDS_TYPE_URL,
                 &slice.version,
                 proto::ClusterLoadAssignment { cluster_name: name },
-            ));
+            );
         }
     }
     resources
@@ -146,6 +157,21 @@ pub fn translate_sds(slice: &MeshSlice) -> Vec<XdsResource> {
 
 fn cluster_name(namespace: &str, name: &str, port: u16) -> String {
     format!("cluster/{namespace}/{name}/{port}")
+}
+
+fn push_unique_resource<M>(
+    resources: &mut Vec<XdsResource>,
+    seen_names: &mut HashSet<String>,
+    name: String,
+    type_url: &str,
+    version: &str,
+    message: M,
+) where
+    M: Message,
+{
+    if seen_names.insert(name.clone()) {
+        resources.push(resource(name, type_url, version, message));
+    }
 }
 
 fn resource<M>(name: String, type_url: &str, version: &str, message: M) -> XdsResource
