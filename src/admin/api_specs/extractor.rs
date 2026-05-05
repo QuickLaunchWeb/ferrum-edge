@@ -655,7 +655,8 @@ fn extract_spec_metadata(root: &serde_json::Value, version: &str) -> ExtractedMe
                 .filter_map(|path_item| path_item.as_object())
                 .flat_map(|path_item| path_item.keys())
                 .filter(|k| HTTP_METHODS.contains(&k.as_str()))
-                .count() as u32
+                .count()
+                .min(u32::MAX as usize) as u32
         })
         .unwrap_or(0);
 
@@ -774,8 +775,9 @@ fn detect_version(root: &serde_json::Value) -> Result<String, ExtractError> {
 
 /// Maximum number of `serde_json::Value` nodes allowed after YAML → JSON
 /// conversion.  500k nodes is generous for any real OpenAPI spec (the largest
-/// public specs top out around 50k nodes) while still capping the memory cost
-/// of alias expansion to a few hundred MB.
+/// public specs top out around 50k nodes). serde_yaml expands aliases while
+/// parsing, so this is a post-parse guard rather than a hard pre-parse memory
+/// cap; the HTTP body-size limit remains the outer bound for parser input.
 const MAX_YAML_EXPANDED_NODES: usize = 500_000;
 
 /// Walk a `serde_json::Value` tree, decrementing `budget` for each node

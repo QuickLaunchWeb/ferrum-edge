@@ -3753,25 +3753,27 @@ impl DatabaseStore {
         // Delete only spec-owned plugin_configs. Hand-added plugins (api_spec_id IS NULL)
         // are intentionally preserved. The proxy itself is updated in place (not deleted)
         // so FK cascades do not wipe hand-added plugins.
-        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ?"))
+        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
             .bind(&spec.id)
+            .bind(&spec.namespace)
             .execute(&mut *tx)
             .await?;
 
         // Fix 3: proxies.upstream_id FK is ON DELETE RESTRICT (not SET NULL).
         // We must clear proxy.upstream_id BEFORE deleting the old upstream row,
         // otherwise the DELETE violates the FK and rolls back the transaction.
-        sqlx::query(
-            &self.q("UPDATE proxies SET upstream_id = NULL WHERE id = ? AND api_spec_id = ?"),
-        )
+        sqlx::query(&self.q("UPDATE proxies SET upstream_id = NULL \
+                 WHERE id = ? AND api_spec_id = ? AND namespace = ?"))
         .bind(&spec.proxy_id)
         .bind(&spec.id)
+        .bind(&spec.namespace)
         .execute(&mut *tx)
         .await?;
 
         // Now safe to delete spec-owned upstreams — no proxy references them.
-        sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ?"))
+        sqlx::query(&self.q("DELETE FROM upstreams WHERE api_spec_id = ? AND namespace = ?"))
             .bind(&spec.id)
+            .bind(&spec.namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -4299,8 +4301,9 @@ impl DatabaseStore {
         // Delete spec-owned plugin_configs by api_spec_id (belt-and-suspenders;
         // the proxy FK cascade below would handle proxy-scoped ones, but
         // being explicit ensures correctness even if FK enforcement is disabled).
-        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ?"))
+        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE api_spec_id = ? AND namespace = ?"))
             .bind(id)
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -5350,7 +5353,7 @@ fn row_to_api_spec(row: &AnyRow) -> Result<crate::config::types::ApiSpec, anyhow
         .unwrap_or_default();
     let operation_count: u32 = row
         .try_get::<i64, _>("operation_count")
-        .map(|v| v.max(0) as u32)
+        .map(|v| v.clamp(0, u32::MAX as i64) as u32)
         .unwrap_or(0);
     let resource_hash: String = row
         .try_get::<String, _>("resource_hash")

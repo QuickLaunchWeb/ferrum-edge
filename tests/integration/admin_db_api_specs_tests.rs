@@ -468,6 +468,96 @@ async fn replace_bundle_spec_owned_replaced_hand_added_survives() {
     );
 }
 
+#[tokio::test]
+async fn replace_api_spec_bundle_does_not_delete_same_api_spec_id_in_other_namespace() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let other_ns = "other-ns";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let spec_plugin_id = uid("plugin");
+    let other_plugin_id = uid("plugin-other-ns");
+    let other_upstream_id = uid("upstream-other-ns");
+
+    let bundle_v1 = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![make_plugin(&spec_plugin_id, &proxy_id, ns, None)],
+    };
+    let spec_v1 = make_spec(&spec_id, &proxy_id, ns, b"v1 spec");
+    store
+        .submit_api_spec_bundle(&bundle_v1, &spec_v1)
+        .await
+        .expect("initial submit failed");
+
+    let other_plugin = PluginConfig {
+        id: other_plugin_id.clone(),
+        namespace: other_ns.to_string(),
+        plugin_name: "cors".to_string(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store
+        .create_plugin_config(&other_plugin)
+        .await
+        .expect("create other namespace plugin");
+    let other_upstream = make_upstream(&other_upstream_id, other_ns);
+    store
+        .create_upstream(&other_upstream)
+        .await
+        .expect("create other namespace upstream");
+
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE id = ?")
+        .bind(&spec_id)
+        .bind(&other_plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag other namespace plugin");
+    sqlx::query("UPDATE upstreams SET api_spec_id = ? WHERE id = ?")
+        .bind(&spec_id)
+        .bind(&other_upstream_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag other namespace upstream");
+
+    let new_spec_plugin_id = uid("plugin");
+    let bundle_v2 = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![make_plugin(&new_spec_plugin_id, &proxy_id, ns, None)],
+    };
+    let spec_v2 = make_spec(&spec_id, &proxy_id, ns, b"v2 spec");
+    store
+        .replace_api_spec_bundle(&bundle_v2, &spec_v2)
+        .await
+        .expect("replace failed");
+
+    assert!(
+        store
+            .get_plugin_config(&other_plugin_id)
+            .await
+            .expect("get other namespace plugin")
+            .is_some(),
+        "replace must not delete a plugin_config in another namespace even if api_spec_id matches"
+    );
+    assert!(
+        store
+            .get_upstream(&other_upstream_id)
+            .await
+            .expect("get other namespace upstream")
+            .is_some(),
+        "replace must not delete an upstream in another namespace even if api_spec_id matches"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // get_api_spec round-trip (spec_content bytes are preserved)
 // ---------------------------------------------------------------------------
@@ -725,6 +815,90 @@ async fn delete_api_spec_cascades_and_spares_hand_upstreams() {
     assert!(
         plugin_row.is_none(),
         "spec-owned plugin must be gone after spec delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_api_spec_does_not_delete_same_api_spec_id_in_other_namespace() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+    let other_ns = "other-ns";
+
+    let proxy_id = uid("proxy");
+    let spec_id = uid("spec");
+    let other_plugin_id = uid("plugin-other-ns");
+    let other_upstream_id = uid("upstream-other-ns");
+
+    let bundle = ExtractedBundle {
+        proxy: make_proxy(&proxy_id, ns),
+        upstream: None,
+        plugins: vec![],
+    };
+    let spec = make_spec(&spec_id, &proxy_id, ns, b"delete namespace guard");
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("submit failed");
+
+    let other_plugin = PluginConfig {
+        id: other_plugin_id.clone(),
+        namespace: other_ns.to_string(),
+        plugin_name: "cors".to_string(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    store
+        .create_plugin_config(&other_plugin)
+        .await
+        .expect("create other namespace plugin");
+    let other_upstream = make_upstream(&other_upstream_id, other_ns);
+    store
+        .create_upstream(&other_upstream)
+        .await
+        .expect("create other namespace upstream");
+
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE id = ?")
+        .bind(&spec_id)
+        .bind(&other_plugin_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag other namespace plugin");
+    sqlx::query("UPDATE upstreams SET api_spec_id = ? WHERE id = ?")
+        .bind(&spec_id)
+        .bind(&other_upstream_id)
+        .execute(&store.pool())
+        .await
+        .expect("tag other namespace upstream");
+
+    assert!(
+        store
+            .delete_api_spec(ns, &spec_id)
+            .await
+            .expect("delete_api_spec failed"),
+        "expected delete to find the spec"
+    );
+    assert!(
+        store
+            .get_plugin_config(&other_plugin_id)
+            .await
+            .expect("get other namespace plugin")
+            .is_some(),
+        "delete must not remove a plugin_config in another namespace even if api_spec_id matches"
+    );
+    assert!(
+        store
+            .get_upstream(&other_upstream_id)
+            .await
+            .expect("get other namespace upstream")
+            .is_some(),
+        "delete must not remove an upstream in another namespace even if api_spec_id matches"
     );
 }
 

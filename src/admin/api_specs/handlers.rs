@@ -107,10 +107,13 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": format!("Request body too large (max {} MiB)", max_mib)}),
         ),
-        ApiSpecError::BodyCollect(msg) => json_resp(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": format!("Failed to read request body: {}", msg)}),
-        ),
+        ApiSpecError::BodyCollect(msg) => {
+            tracing::warn!("failed to read api spec request body: {}", msg);
+            json_resp(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Failed to read request body"}),
+            )
+        }
         ApiSpecError::BadRequest(msg) => json_resp(StatusCode::BAD_REQUEST, &json!({"error": msg})),
         ApiSpecError::Extract(e) => {
             let code = extract_error_code(&e);
@@ -677,7 +680,7 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
 // ---------------------------------------------------------------------------
 
 async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>, ApiSpecError> {
-    let max_bytes = max_mib * 1024 * 1024;
+    let max_bytes = max_mib.saturating_mul(1024).saturating_mul(1024);
     match Limited::new(req.into_body(), max_bytes).collect().await {
         Ok(collected) => Ok(collected.to_bytes().to_vec()),
         Err(e) => {
@@ -1727,10 +1730,13 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
             }
             "updated_since" if !val.is_empty() => {
                 // Accept ISO-8601 / RFC-3339 format.
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&val) {
-                    filter.updated_since = Some(dt.to_utc());
-                }
-                // Silently ignore unparseable values (best-effort).
+                let dt = chrono::DateTime::parse_from_rfc3339(&val).map_err(|_| {
+                    ApiSpecError::BadRequest(format!(
+                        "invalid updated_since value '{}'; expected RFC3339 timestamp",
+                        val
+                    ))
+                })?;
+                filter.updated_since = Some(dt.to_utc());
             }
             "has_tag" if !val.is_empty() => {
                 // SAFETY-CRITICAL CROSS-FILE INVARIANT (mirrors the ingest-time
@@ -1789,6 +1795,13 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
     }
 
     Ok(filter)
+}
+
+fn max_spec_decompress_bytes(max_mib: usize) -> usize {
+    max_mib
+        .saturating_mul(2)
+        .saturating_mul(1024)
+        .saturating_mul(1024)
 }
 
 /// Simple percent-decode for query parameter values.
@@ -2091,7 +2104,7 @@ pub async fn handle_get_api_spec(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    let max_decompress = 2 * state.admin_spec_max_body_size_mib * 1024 * 1024;
+    let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
     Ok(spec_content_response(&spec, req.headers(), max_decompress))
 }
 
@@ -2116,7 +2129,7 @@ pub async fn handle_get_api_spec_by_proxy(
         Err(e) => return Ok(error_response(classify_db_error(e))),
     };
 
-    let max_decompress = 2 * state.admin_spec_max_body_size_mib * 1024 * 1024;
+    let max_decompress = max_spec_decompress_bytes(state.admin_spec_max_body_size_mib);
     Ok(spec_content_response(&spec, req.headers(), max_decompress))
 }
 
@@ -2354,6 +2367,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn max_spec_decompress_bytes_saturates() {
+        assert_eq!(max_spec_decompress_bytes(25), 50 * 1024 * 1024);
+        assert_eq!(max_spec_decompress_bytes(usize::MAX), usize::MAX);
+    }
+
     // -----------------------------------------------------------------------
     // Error → HTTP status mapping
     // -----------------------------------------------------------------------
@@ -2362,6 +2381,18 @@ mod tests {
     fn payload_too_large_maps_to_413() {
         let resp = error_response(ApiSpecError::PayloadTooLarge(25));
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn body_collect_error_masks_transport_details() {
+        let resp = error_response(ApiSpecError::BodyCollect(
+            "hyper internal transport details".to_string(),
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.into_body().collect().await.unwrap();
+        let body = String::from_utf8(body.to_bytes().to_vec()).unwrap();
+        assert!(body.contains("Failed to read request body"));
+        assert!(!body.contains("hyper internal transport details"));
     }
 
     #[test]
@@ -2470,6 +2501,16 @@ mod tests {
         let uri: hyper::Uri = "/api-specs?limit=9999".parse().unwrap();
         let f = parse_list_filter(&uri).expect("parse failed");
         assert_eq!(f.limit, 200);
+    }
+
+    #[test]
+    fn parse_list_filter_invalid_updated_since_returns_400() {
+        let uri: hyper::Uri = "/api-specs?updated_since=not-a-date".parse().unwrap();
+        let err = parse_list_filter(&uri).unwrap_err();
+        assert!(
+            matches!(err, ApiSpecError::BadRequest(_)),
+            "invalid updated_since must return 400; got: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

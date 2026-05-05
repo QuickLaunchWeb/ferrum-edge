@@ -927,15 +927,19 @@ mod inner {
                                 .session(&mut *s)
                                 .await
                                 && let Ok(sid) = spec_doc.get_str("_id")
-                            {
-                                let _ = this
+                                && let Err(e) = this
                                     .proxies()
                                     .update_one(
                                         mongodb::bson::doc! { "_id": *id },
                                         mongodb::bson::doc! { "$set": { "api_spec_id": sid } },
                                     )
                                     .session(&mut *s)
-                                    .await;
+                                    .await
+                            {
+                                warn!(
+                                    "update_proxy: failed to restore api_spec_id for proxy {}: {}",
+                                    *id, e
+                                );
                             }
                             this.cleanup_orphaned_proxy_group_plugins_opt_session(Some(s))
                                 .await
@@ -955,14 +959,18 @@ mod inner {
                     .find_one(doc! { "proxy_id": &proxy.id })
                     .await
                     && let Ok(sid) = spec_doc.get_str("_id")
-                {
-                    let _ = self
+                    && let Err(e) = self
                         .proxies()
                         .update_one(
                             doc! { "_id": &proxy.id },
                             doc! { "$set": { "api_spec_id": sid } },
                         )
-                        .await;
+                        .await
+                {
+                    warn!(
+                        "update_proxy: failed to restore api_spec_id for proxy {}: {}",
+                        proxy.id, e
+                    );
                 }
                 self.cleanup_orphaned_proxy_group_plugins().await?;
             }
@@ -1236,14 +1244,19 @@ mod inner {
             self.plugin_configs()
                 .replace_one(doc! { "_id": &pc.id }, doc)
                 .await?;
-            if let Some(sid) = existing_spec_id {
-                let _ = self
+            if let Some(sid) = existing_spec_id
+                && let Err(e) = self
                     .plugin_configs()
                     .update_one(
                         doc! { "_id": &pc.id },
                         doc! { "$set": { "api_spec_id": &sid } },
                     )
-                    .await;
+                    .await
+            {
+                warn!(
+                    "update_plugin_config: failed to restore api_spec_id for plugin_config {}: {}",
+                    pc.id, e
+                );
             }
             self.check_slow_query("update_plugin_config", start);
             Ok(())
@@ -1321,14 +1334,19 @@ mod inner {
             self.upstreams()
                 .replace_one(doc! { "_id": &upstream.id }, doc)
                 .await?;
-            if let Some(sid) = existing_spec_id {
-                let _ = self
+            if let Some(sid) = existing_spec_id
+                && let Err(e) = self
                     .upstreams()
                     .update_one(
                         doc! { "_id": &upstream.id },
                         doc! { "$set": { "api_spec_id": &sid } },
                     )
-                    .await;
+                    .await
+            {
+                warn!(
+                    "update_upstream: failed to restore api_spec_id for upstream {}: {}",
+                    upstream.id, e
+                );
             }
             self.check_slow_query("update_upstream", start);
             Ok(())
@@ -2150,7 +2168,7 @@ mod inner {
             // Measure the actual serialized BSON size rather than estimating
             // with a hardcoded overhead constant.
             let spec_doc = api_spec_to_doc(spec)?;
-            let bson_bytes = mongodb::bson::to_vec(&spec_doc).unwrap_or_default();
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
             if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
                     "MongoDB document limit exceeded: serialized spec is {} bytes \
@@ -2270,7 +2288,10 @@ mod inner {
                         // Only update metadata fields on the spec doc.
                         let spec_doc = api_spec_to_doc(spec)?;
                         self.api_specs()
-                            .replace_one(doc! { "_id": &spec.id }, spec_doc)
+                            .replace_one(
+                                doc! { "_id": &spec.id, "namespace": &spec.namespace },
+                                spec_doc,
+                            )
                             .await?;
                         return Ok(());
                     }
@@ -2279,7 +2300,7 @@ mod inner {
 
             // Pre-flight size check: measure actual BSON size.
             let spec_doc_check = api_spec_to_doc(spec)?;
-            let bson_bytes = mongodb::bson::to_vec(&spec_doc_check).unwrap_or_default();
+            let bson_bytes = mongodb::bson::to_vec(&spec_doc_check)?;
             if bson_bytes.len() > 15 * 1024 * 1024 {
                 anyhow::bail!(
                     "MongoDB document limit exceeded: serialized spec is {} bytes \
@@ -2308,7 +2329,7 @@ mod inner {
                 let old_spec_plugin_ids: std::collections::HashSet<String> = {
                     let mut cursor = self
                         .plugin_configs()
-                        .find(doc! { "api_spec_id": &spec.id })
+                        .find(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                         .await?;
                     let mut ids = std::collections::HashSet::new();
                     while cursor.advance().await? {
@@ -2323,7 +2344,7 @@ mod inner {
                 // 2. Existing proxy doc (may be absent on first replace or orphaned).
                 let existing_proxy_doc = self
                     .proxies()
-                    .find_one(doc! { "_id": &spec.proxy_id })
+                    .find_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
                     .await?;
 
                 if let Some(existing_doc) = existing_proxy_doc {
@@ -2374,20 +2395,20 @@ mod inner {
 
                 // Delete spec-owned resources (leaf-first).
                 self.plugin_configs()
-                    .delete_many(doc! { "api_spec_id": &spec.id })
+                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .session(&mut session)
                     .await?;
                 self.proxies()
-                    .delete_many(doc! { "api_spec_id": &spec.id })
+                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .session(&mut session)
                     .await?;
                 self.upstreams()
-                    .delete_many(doc! { "api_spec_id": &spec.id })
+                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .session(&mut session)
                     .await?;
                 // The api_specs doc itself.
                 self.api_specs()
-                    .delete_one(doc! { "_id": &spec.id })
+                    .delete_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
                     .session(&mut session)
                     .await?;
 
@@ -2442,7 +2463,7 @@ mod inner {
                 // Delete leaf-first, log any failure but proceed.
                 if let Err(e) = self
                     .plugin_configs()
-                    .delete_many(doc! { "api_spec_id": &spec.id })
+                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .await
                 {
                     warn!(
@@ -2453,7 +2474,7 @@ mod inner {
                 }
                 if let Err(e) = self
                     .proxies()
-                    .delete_many(doc! { "api_spec_id": &spec.id })
+                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .await
                 {
                     warn!(
@@ -2464,7 +2485,7 @@ mod inner {
                 }
                 if let Err(e) = self
                     .upstreams()
-                    .delete_many(doc! { "api_spec_id": &spec.id })
+                    .delete_many(doc! { "api_spec_id": &spec.id, "namespace": &spec.namespace })
                     .await
                 {
                     warn!(
@@ -2473,7 +2494,11 @@ mod inner {
                         spec.id, e
                     );
                 }
-                if let Err(e) = self.api_specs().delete_one(doc! { "_id": &spec.id }).await {
+                if let Err(e) = self
+                    .api_specs()
+                    .delete_one(doc! { "_id": &spec.id, "namespace": &spec.namespace })
+                    .await
+                {
                     warn!(
                         "replace_api_spec_bundle: failed to delete api_spec row {}: {}",
                         spec.id, e
@@ -2707,7 +2732,7 @@ mod inner {
 
                 // 1. Spec-owned plugin_configs.
                 self.plugin_configs()
-                    .delete_many(doc! { "api_spec_id": id })
+                    .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
                     .session(&mut session)
                     .await?;
                 // 2. All plugin_configs attached to the proxy (catches proxy-scoped
@@ -2715,22 +2740,22 @@ mod inner {
                 //    with api_spec_id).
                 if let Some(ref pid) = proxy_id {
                     self.plugin_configs()
-                        .delete_many(doc! { "proxy_id": pid })
+                        .delete_many(doc! { "proxy_id": pid, "namespace": namespace })
                         .session(&mut session)
                         .await?;
                     self.proxies()
-                        .delete_one(doc! { "_id": pid })
+                        .delete_one(doc! { "_id": pid, "namespace": namespace })
                         .session(&mut session)
                         .await?;
                 }
                 // 3. Spec-owned upstreams.
                 self.upstreams()
-                    .delete_many(doc! { "api_spec_id": id })
+                    .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
                     .session(&mut session)
                     .await?;
                 // 4. The spec row itself.
                 self.api_specs()
-                    .delete_one(doc! { "_id": id })
+                    .delete_one(doc! { "_id": id, "namespace": namespace })
                     .session(&mut session)
                     .await?;
 
@@ -2743,7 +2768,7 @@ mod inner {
                 // replica set (see FERRUM_MONGO_REPLICA_SET).
                 if let Err(e) = self
                     .plugin_configs()
-                    .delete_many(doc! { "api_spec_id": id })
+                    .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
                     .await
                 {
                     warn!(
@@ -2755,7 +2780,7 @@ mod inner {
                 if let Some(ref pid) = proxy_id {
                     if let Err(e) = self
                         .plugin_configs()
-                        .delete_many(doc! { "proxy_id": pid })
+                        .delete_many(doc! { "proxy_id": pid, "namespace": namespace })
                         .await
                     {
                         warn!(
@@ -2764,7 +2789,11 @@ mod inner {
                             pid, e
                         );
                     }
-                    if let Err(e) = self.proxies().delete_one(doc! { "_id": pid }).await {
+                    if let Err(e) = self
+                        .proxies()
+                        .delete_one(doc! { "_id": pid, "namespace": namespace })
+                        .await
+                    {
                         warn!(
                             "delete_api_spec: failed to delete proxy {} for spec {}: {}",
                             pid, id, e
@@ -2773,7 +2802,7 @@ mod inner {
                 }
                 if let Err(e) = self
                     .upstreams()
-                    .delete_many(doc! { "api_spec_id": id })
+                    .delete_many(doc! { "api_spec_id": id, "namespace": namespace })
                     .await
                 {
                     warn!(
@@ -2783,7 +2812,9 @@ mod inner {
                 }
                 // The spec row deletion is the one we must succeed on — if this fails
                 // the spec appears to still exist, which is worse than an orphan.
-                self.api_specs().delete_one(doc! { "_id": id }).await?;
+                self.api_specs()
+                    .delete_one(doc! { "_id": id, "namespace": namespace })
+                    .await?;
             }
 
             self.check_slow_query("delete_api_spec", start);
