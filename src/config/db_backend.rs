@@ -159,7 +159,15 @@ pub trait DatabaseBackend: Send + Sync {
     async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error>;
     async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error>;
     async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error>;
-    async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error>;
+    /// Check whether a proxy with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace, so
+    /// admin-side reference checks cannot be satisfied by a row that lives
+    /// in a different namespace.
+    async fn check_proxy_exists(
+        &self,
+        proxy_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error>;
     async fn list_proxies_paginated(
         &self,
         namespace: &str,
@@ -282,11 +290,24 @@ pub trait DatabaseBackend: Send + Sync {
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
-    async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error>;
+    /// Check whether an upstream with the given ID exists in `namespace`.
+    /// Returns `true` only when the row is in the requested namespace, so a
+    /// proxy in namespace A cannot reference an upstream that actually lives
+    /// in namespace B (which would silently 502 at runtime).
+    async fn check_upstream_exists(
+        &self,
+        upstream_id: &str,
+        namespace: &str,
+    ) -> Result<bool, anyhow::Error>;
 
+    /// Validate that a proxy's plugin association list references existing
+    /// plugin configs. Plugin configs are looked up only within `namespace`
+    /// — references to plugin_configs in other namespaces are rejected as
+    /// non-existent so cross-namespace pollution is impossible.
     async fn validate_proxy_plugin_associations(
         &self,
         proxy_id: &str,
+        namespace: &str,
         plugins: &[crate::config::types::PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error>;
 

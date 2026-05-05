@@ -808,10 +808,17 @@ mod inner {
             }
         }
 
-        async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+        async fn check_proxy_exists(
+            &self,
+            proxy_id: &str,
+            namespace: &str,
+        ) -> Result<bool, anyhow::Error> {
+            // Namespace filter is mandatory: a proxy_id that exists in another
+            // namespace must NOT satisfy the reference check, otherwise admin
+            // would admit a config that fails to resolve at runtime.
             let count = self
                 .proxies()
-                .count_documents(doc! { "_id": proxy_id })
+                .count_documents(doc! { "_id": proxy_id, "namespace": namespace })
                 .await?;
             Ok(count > 0)
         }
@@ -1250,10 +1257,15 @@ mod inner {
             Ok(count == 0)
         }
 
-        async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+        async fn check_upstream_exists(
+            &self,
+            upstream_id: &str,
+            namespace: &str,
+        ) -> Result<bool, anyhow::Error> {
+            // Namespace filter is mandatory: see [`check_proxy_exists`].
             let count = self
                 .upstreams()
-                .count_documents(doc! { "_id": upstream_id })
+                .count_documents(doc! { "_id": upstream_id, "namespace": namespace })
                 .await?;
             Ok(count > 0)
         }
@@ -1261,13 +1273,20 @@ mod inner {
         async fn validate_proxy_plugin_associations(
             &self,
             _proxy_id: &str,
+            namespace: &str,
             plugins: &[PluginAssociation],
         ) -> Result<Vec<String>, anyhow::Error> {
+            // Plugin configs in a different namespace must surface as missing
+            // so admin validation cannot let a proxy bind to a plugin_config
+            // that lives outside its namespace.
             let mut missing = Vec::new();
             for assoc in plugins {
                 let count = self
                     .plugin_configs()
-                    .count_documents(doc! { "_id": &assoc.plugin_config_id })
+                    .count_documents(doc! {
+                        "_id": &assoc.plugin_config_id,
+                        "namespace": namespace,
+                    })
                     .await?;
                 if count == 0 {
                     missing.push(assoc.plugin_config_id.clone());
