@@ -106,6 +106,7 @@ use crate::load_balancer::LoadBalancer;
 use crate::plugins::{Plugin, PluginResult, RequestContext};
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome;
+use crate::proxy::grpc_proxy::{self, GrpcResponseKind, proxy_grpc_request_from_bytes};
 use crate::proxy::headers::{is_backend_response_strip_header, parse_connection_listed_headers};
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
