@@ -35,12 +35,17 @@ use crate::proxy::{
     ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
     run_after_proxy_hooks, run_authentication_phase,
 };
-use crate::tls::TlsPolicy;
+use crate::tls::{CrlList, TlsPolicy};
 
 /// Optional HTTP/3 listener settings that don't affect the core bind contract.
 #[derive(Default)]
 pub struct Http3ListenerOptions {
     pub client_ca_bundle_path: Option<String>,
+    /// Loaded CRLs for client certificate revocation checking. When non-empty
+    /// and `client_ca_bundle_path` is set, the H3 mTLS verifier checks revocation
+    /// with the same policy as H1/H2/DTLS frontend mTLS:
+    /// `allow_unknown_revocation_status` + `only_check_end_entity_revocation`.
+    pub client_crls: CrlList,
     pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -50,6 +55,7 @@ pub struct Http3ListenerOptions {
 /// TLS 1.3, this function will override it to force TLS 1.3 for the QUIC listener
 /// and log a warning.
 #[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_http3_listener(
     addr: SocketAddr,
     state: ProxyState,
@@ -58,6 +64,7 @@ pub async fn start_http3_listener(
     h3_config: Http3ServerConfig,
     tls_policy: &TlsPolicy,
     client_ca_bundle_path: Option<String>,
+    client_crls: CrlList,
 ) -> Result<(), anyhow::Error> {
     start_http3_listener_with_signal(
         addr,
@@ -68,6 +75,7 @@ pub async fn start_http3_listener(
         tls_policy,
         Http3ListenerOptions {
             client_ca_bundle_path,
+            client_crls,
             started_tx: None,
         },
     )
@@ -86,6 +94,7 @@ pub async fn start_http3_listener_with_signal(
 ) -> Result<(), anyhow::Error> {
     let Http3ListenerOptions {
         client_ca_bundle_path,
+        client_crls,
         started_tx,
     } = options;
 
@@ -138,7 +147,7 @@ pub async fn start_http3_listener_with_signal(
     // Reuse the cert chain and key from the original config.
     // Carry forward mTLS (client cert verification) if configured.
     let mut server_tls_config = if let Some(ref ca_path) = client_ca_bundle_path {
-        match crate::tls::build_client_cert_verifier(ca_path) {
+        match crate::tls::build_client_cert_verifier(ca_path, &client_crls) {
             Ok(verifier) => h3_builder
                 .with_client_cert_verifier(verifier)
                 .with_cert_resolver(tls_config.cert_resolver.clone()),
