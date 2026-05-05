@@ -4,8 +4,8 @@ info:
   description: |
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
-    All endpoints except `/health`, `/status`, `/metrics`, `/charges`, and
-    `/overload` require JWT bearer token authentication via the
+    All endpoints except `/health`, `/status`, `/metrics`, and `/overload`
+    require JWT bearer token authentication via the
     `Authorization: Bearer <token>` header.
 
     ## Namespaces
@@ -197,13 +197,14 @@ paths:
       summary: API chargeback data
       description: |
         Returns per-consumer API usage charges tracked by the `api_chargeback` plugin.
-        Unauthenticated so it can be scraped by Prometheus without credentials.
+        Requires a valid admin JWT because chargeback output can contain
+        customer and business data. Prometheus scrapes must supply
+        `Authorization: Bearer <token>` credentials.
         Default format is Prometheus text exposition; use `?format=json` for JSON.
 
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
       tags: [Metrics]
-      security: []
       parameters:
         - name: format
           in: query
@@ -231,6 +232,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChargebackResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /admin/metrics:
     get:

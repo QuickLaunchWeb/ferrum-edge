@@ -1098,7 +1098,9 @@ codes not listed in any pricing tier are free (not tracked).
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task |
 
-**Admin endpoint:** `GET /charges` (unauthenticated, like `/metrics`).
+**Admin endpoint:** `GET /charges` requires a valid admin JWT in
+`Authorization: Bearer <token>`. Unlike `/metrics`, this endpoint is
+authenticated because chargeback output can contain customer and billing data.
 
 | Query Parameter | Description |
 |---|---|
@@ -1140,7 +1142,12 @@ scrape_configs:
           - dp-2:9000
           - dp-3:9000
     metrics_path: /charges
+    bearer_token_file: /etc/prometheus/secrets/ferrum-admin-token
 ```
+
+Existing Prometheus scrapes of `/charges` must be updated to send admin JWT
+credentials, for example with `bearer_token_file`, `authorization.credentials_file`,
+or an auth proxy that injects the `Authorization: Bearer <token>` header.
 
 ### `otel_tracing`
 
