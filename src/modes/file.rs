@@ -781,6 +781,8 @@ pub async fn serve(
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
 
     // Listener handles (proxy/admin HTTP/HTTPS/H3) — `join()` waits on

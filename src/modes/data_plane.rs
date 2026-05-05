@@ -421,6 +421,8 @@ pub async fn run(
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         dp_registry: None,
         cp_connection_state: Some(cp_connection_state.clone()),
+        admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
     // the same JwtManager instance for the HTTPS listener (instead of calling
