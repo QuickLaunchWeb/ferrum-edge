@@ -276,8 +276,10 @@ impl DnsCache {
         }
 
         // 3. Check cache with stale-while-revalidate
+        let mut prior_per_proxy_ttl = None;
         if let Some(entry) = self.cache.get(hostname) {
             let now = Instant::now();
+            prior_per_proxy_ttl = entry.original_per_proxy_ttl;
 
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
@@ -295,7 +297,7 @@ impl DnsCache {
                     match self.refresh_semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let cache = self.clone();
-                            let ttl = per_proxy_ttl;
+                            let ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
                             tokio::spawn(async move {
                                 if let Err(e) = cache.refresh_entry(&host, ttl).await {
                                     warn!("DNS stale refresh failed for {}: {}", host, e);
@@ -332,6 +334,8 @@ impl DnsCache {
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
+
+        let per_proxy_ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
 
         // 4. Perform actual DNS resolution
         match self.timed_resolve(hostname).await {
@@ -383,11 +387,11 @@ impl DnsCache {
                 Ok(addr)
             }
             Ok(_) => {
-                self.cache_error(hostname);
+                self.cache_error(hostname, per_proxy_ttl);
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
-                self.cache_error(hostname);
+                self.cache_error(hostname, per_proxy_ttl);
                 Err(e)
             }
         }
@@ -417,8 +421,10 @@ impl DnsCache {
         }
 
         // 3. Cache with stale-while-revalidate
+        let mut prior_per_proxy_ttl = None;
         if let Some(entry) = self.cache.get(hostname) {
             let now = Instant::now();
+            prior_per_proxy_ttl = entry.original_per_proxy_ttl;
 
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
                 return Ok(entry.addresses.clone());
@@ -430,7 +436,7 @@ impl DnsCache {
                     match self.refresh_semaphore.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let cache = self.clone();
-                            let ttl = per_proxy_ttl;
+                            let ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
                             tokio::spawn(async move {
                                 if let Err(e) = cache.refresh_entry(&host, ttl).await {
                                     warn!("DNS stale refresh failed for {}: {}", host, e);
@@ -451,6 +457,8 @@ impl DnsCache {
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
+
+        let per_proxy_ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
 
         // 4. Actual DNS resolution
         match self.timed_resolve(hostname).await {
@@ -491,11 +499,11 @@ impl DnsCache {
                 Ok(addrs)
             }
             Ok(_) => {
-                self.cache_error(hostname);
+                self.cache_error(hostname, per_proxy_ttl);
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
-                self.cache_error(hostname);
+                self.cache_error(hostname, per_proxy_ttl);
                 Err(e)
             }
         }
@@ -551,7 +559,7 @@ impl DnsCache {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     }
 
-    fn cache_error(&self, hostname: &str) {
+    fn cache_error(&self, hostname: &str, per_proxy_ttl: Option<u64>) {
         // Preserve any prior per-proxy TTL recorded for this hostname so that
         // when the failed-retry task promotes the entry back to success, it can
         // re-thread the original per-proxy TTL through `effective_ttl` rather
@@ -569,7 +577,7 @@ impl DnsCache {
                 applied_ttl: self.error_ttl,
                 record_type_used: None,
                 is_error: true,
-                original_per_proxy_ttl: prior_ttl,
+                original_per_proxy_ttl: per_proxy_ttl.or(prior_ttl),
             },
         );
         debug!(
@@ -1064,7 +1072,7 @@ impl DnsCache {
                         }
                         Ok(_) => {
                             // Re-cache the error with fresh error TTL
-                            cache.cache_error(&hostname);
+                            cache.cache_error(&hostname, per_proxy_ttl);
                             warn!(
                                 "DNS failed retry: '{}' still returning no addresses",
                                 hostname
@@ -1072,7 +1080,7 @@ impl DnsCache {
                         }
                         Err(e) => {
                             // Re-cache the error with fresh error TTL
-                            cache.cache_error(&hostname);
+                            cache.cache_error(&hostname, per_proxy_ttl);
                             warn!("DNS failed retry: '{}' still failing: {}", hostname, e);
                         }
                     }
@@ -1544,6 +1552,26 @@ mod tests {
         );
     }
 
+    /// First failed lookups must record the request's per-proxy TTL immediately
+    /// so the failed-retry task can preserve it on later success.
+    #[tokio::test]
+    async fn cache_error_records_first_failure_per_proxy_ttl() {
+        let cache = DnsCache::new(config_with_global_override(None));
+
+        cache.cache_error("example.invalid", Some(600));
+
+        let err_entry = cache
+            .cache
+            .get("example.invalid")
+            .expect("error entry exists");
+        assert!(err_entry.is_error);
+        assert_eq!(
+            err_entry.original_per_proxy_ttl,
+            Some(600),
+            "first failed lookup must keep the request's per-proxy TTL"
+        );
+    }
+
     /// `cache_error` preserves any prior `original_per_proxy_ttl` so that when
     /// the failed-retry task later promotes the error back to a success, it
     /// can re-thread the original per-proxy TTL through `effective_ttl`.
@@ -1567,7 +1595,7 @@ mod tests {
 
         // Now cache an error for the same hostname (simulating a transient
         // resolve failure picked up by the on-demand path).
-        cache.cache_error("example.invalid");
+        cache.cache_error("example.invalid", None);
 
         let err_entry = cache
             .cache
@@ -1579,6 +1607,65 @@ mod tests {
             Some(600),
             "cache_error must carry forward the prior per-proxy TTL so the \
              failed-retry task can preserve it on re-resolution success"
+        );
+    }
+
+    /// If a cached error expires and the next `resolve()` call has no explicit
+    /// TTL, the prior entry's TTL must still win over global/native TTLs.
+    #[tokio::test]
+    async fn resolve_preserves_prior_ttl_from_expired_error() {
+        let cache = DnsCache::new(config_with_global_override(Some(3600)));
+        cache.cache.insert(
+            "127.0.0.1".to_string(),
+            DnsCacheEntry {
+                addresses: vec![],
+                expires_at: Instant::now() - Duration::from_secs(1),
+                stale_deadline: Instant::now() - Duration::from_secs(1),
+                applied_ttl: Duration::from_secs(5),
+                record_type_used: None,
+                is_error: true,
+                original_per_proxy_ttl: Some(600),
+            },
+        );
+
+        let _ = cache.resolve("127.0.0.1", None, None).await.unwrap();
+
+        let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+        assert!(!entry.is_error);
+        assert_eq!(entry.original_per_proxy_ttl, Some(600));
+        assert_eq!(
+            entry.applied_ttl,
+            Duration::from_secs(600),
+            "resolve must reuse the expired error entry's per-proxy TTL"
+        );
+    }
+
+    /// Same prior-TTL preservation contract for `resolve_all()`.
+    #[tokio::test]
+    async fn resolve_all_preserves_prior_ttl_from_expired_error() {
+        let cache = DnsCache::new(config_with_global_override(Some(3600)));
+        cache.cache.insert(
+            "127.0.0.1".to_string(),
+            DnsCacheEntry {
+                addresses: vec![],
+                expires_at: Instant::now() - Duration::from_secs(1),
+                stale_deadline: Instant::now() - Duration::from_secs(1),
+                applied_ttl: Duration::from_secs(5),
+                record_type_used: None,
+                is_error: true,
+                original_per_proxy_ttl: Some(450),
+            },
+        );
+
+        let _ = cache.resolve_all("127.0.0.1", None, None).await.unwrap();
+
+        let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+        assert!(!entry.is_error);
+        assert_eq!(entry.original_per_proxy_ttl, Some(450));
+        assert_eq!(
+            entry.applied_ttl,
+            Duration::from_secs(450),
+            "resolve_all must reuse the expired error entry's per-proxy TTL"
         );
     }
 }
