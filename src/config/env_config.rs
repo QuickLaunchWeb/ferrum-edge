@@ -117,6 +117,7 @@ pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
             || is_well_known_nat64_private_ip(segments) // 64:ff9b::/96 with private/reserved embedded IPv4
             || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001) // 64:ff9b:1::/48
             || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0) // 100::/64 (discard-only)
+            || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 1) // 100:0:0:1::/64 (dummy prefix)
             || is_non_global_ietf_protocol_assignment_v6(segments)
             || (segments[0] == 0x2001 && segments[1] == 0x0db8) // 2001:db8::/32 (documentation)
             || segments[0] == 0x2002                  // 2002::/16 (deprecated 6to4)

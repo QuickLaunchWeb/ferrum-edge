@@ -1873,6 +1873,7 @@ fn test_is_private_ip_ipv6() {
     assert!(is_private_ip(&"::127.0.0.1".parse().unwrap()));
     assert!(is_private_ip(&"64:ff9b::192.168.0.1".parse().unwrap()));
     assert!(is_private_ip(&"100::1".parse().unwrap()));
+    assert!(is_private_ip(&"100:0:0:1::1".parse().unwrap()));
     assert!(is_private_ip(&"2001::1".parse().unwrap()));
     assert!(is_private_ip(&"2001:1::4".parse().unwrap()));
     assert!(is_private_ip(&"2001:2::1".parse().unwrap()));
@@ -1881,7 +1882,7 @@ fn test_is_private_ip_ipv6() {
     assert!(!is_private_ip(&"2607:f8b0:4004:800::200e".parse().unwrap()));
     assert!(!is_private_ip(&"::8.8.8.8".parse().unwrap()));
     assert!(!is_private_ip(&"64:ff9b::8.8.8.8".parse().unwrap()));
-    assert!(!is_private_ip(&"100:0:0:1::1".parse().unwrap()));
+    assert!(!is_private_ip(&"100:0:0:2::1".parse().unwrap()));
     assert!(!is_private_ip(&"2001:1::1".parse().unwrap()));
     assert!(!is_private_ip(&"2001:1::2".parse().unwrap()));
     assert!(!is_private_ip(&"2001:1::3".parse().unwrap()));
