@@ -12731,6 +12731,7 @@ mod tests {
             upstreams: vec![],
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
+            mesh: None,
         }
     }
 

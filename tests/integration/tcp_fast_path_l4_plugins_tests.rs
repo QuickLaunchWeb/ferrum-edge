@@ -250,6 +250,7 @@ async fn try_spawn_fast_path_gateway(
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let plugin_cache = Arc::new(
         PluginCache::new(&gateway_config)

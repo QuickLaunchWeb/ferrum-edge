@@ -168,6 +168,7 @@ fn create_test_gateway_config() -> GatewayConfig {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -963,6 +964,7 @@ fn create_pagination_test_config() -> GatewayConfig {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 

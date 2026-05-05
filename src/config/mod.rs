@@ -17,6 +17,10 @@ pub mod db_backend;
 pub mod db_loader;
 pub mod env_config;
 pub mod file_loader;
+// Mesh model (Layer 2 — Phase A scaffolding). Functions are unused from the
+// binary's perspective until Phase B/C; `dead_code` is intentionally allowed.
+#[allow(dead_code)]
+pub mod mesh;
 pub mod migrations;
 pub mod mongo_store;
 pub mod pool_config;

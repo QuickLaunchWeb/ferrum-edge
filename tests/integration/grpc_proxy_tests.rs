@@ -219,6 +219,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     let (state, _health_check_handles) =
         ProxyState::new(config, dns_cache, create_test_env_config(), None, None).unwrap();

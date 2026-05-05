@@ -759,6 +759,7 @@ mod inner {
                 upstreams,
                 loaded_at,
                 known_namespaces: Vec::new(),
+                ..Default::default()
             })
         }
 

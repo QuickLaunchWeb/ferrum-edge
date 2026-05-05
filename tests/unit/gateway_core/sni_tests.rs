@@ -112,6 +112,7 @@ fn make_test_config(
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 

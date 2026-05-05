@@ -73,6 +73,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 

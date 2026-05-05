@@ -101,6 +101,7 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 

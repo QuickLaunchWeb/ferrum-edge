@@ -114,6 +114,7 @@ fn empty_config() -> GatewayConfig {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -234,6 +235,7 @@ fn test_unique_listen_paths_valid() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     assert!(config.validate_unique_listen_paths().is_ok());
 }
@@ -355,6 +357,7 @@ fn test_unique_listen_paths_duplicate() {
         upstreams: vec![],
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
+        ..Default::default()
     };
     assert!(config.validate_unique_listen_paths().is_err());
 }
